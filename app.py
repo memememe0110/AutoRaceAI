@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver15.2詳細6周シミュレーション・選手履歴登録・GitHub DB保存対応版")
+st.caption("Ver15.2系詳細6周シミュレーション・券種別確率・選手履歴登録・GitHub DB保存対応版")
 
 
 def qident(name: str) -> str:
@@ -43,6 +43,42 @@ def db_summary(db_path: str) -> dict:
             info["import_history"] = int(con.execute("SELECT COUNT(*) FROM v15_player_history_imports").fetchone()[0])
     return info
 
+
+
+def ticket_probability_table(bets: dict, key: str, trials: int, top_n: int = 20) -> pd.DataFrame:
+    """シミュレーションの券種別カウントを、表示用の確率表へ変換する。"""
+    counter = bets.get(key, {}) if isinstance(bets, dict) else {}
+    total = max(int(trials), 1)
+    rows = []
+    for rank, (combo, count) in enumerate(
+        sorted(counter.items(), key=lambda item: item[1], reverse=True)[:top_n], 1
+    ):
+        if not isinstance(combo, (tuple, list)):
+            combo = (combo,)
+        rows.append({
+            "順位": rank,
+            "組み合わせ": "-".join(map(str, combo)),
+            "確率": float(count) / total * 100.0,
+            "的中回数": int(count),
+        })
+    return pd.DataFrame(rows, columns=["順位", "組み合わせ", "確率", "的中回数"])
+
+
+def show_ticket_table(title: str, bets: dict, key: str, trials: int, top_n: int = 20) -> None:
+    st.subheader(f"{title} 上位{top_n}")
+    table = ticket_probability_table(bets, key, trials, top_n)
+    if table.empty:
+        st.info(f"{title}の集計結果がありません。")
+        return
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "確率": st.column_config.NumberColumn("確率", format="%.2f%%"),
+            "的中回数": st.column_config.NumberColumn("的中回数", format="%d回"),
+        },
+    )
 
 def install_uploaded_db(uploaded) -> tuple[bool, str]:
     data = uploaded.getvalue()
@@ -306,19 +342,24 @@ with prediction_tab:
             top_scenario = scenario_df.iloc[0]["展開"] if not scenario_df.empty else "不明"
             st.caption(f"中心展開：{top_scenario}。Ver15.2のシミュレーションで使う4展開の事前確率です。")
 
-            total = int(trials)
-            top = sorted(bets["三連単"].items(), key=lambda x: x[1], reverse=True)[:20]
-            tri = pd.DataFrame([
-                {"順位": i, "三連単": "-".join(map(str, combo)), "確率": (count / total) * 100}
-                for i, (combo, count) in enumerate(top, 1)
-            ])
-            st.subheader("三連単確率 上位20")
-            st.dataframe(
-                tri,
-                use_container_width=True,
-                hide_index=True,
-                column_config={"確率": st.column_config.NumberColumn("確率", format="%.2f%%")},
-            )
+            st.subheader("今回条件の反映状況")
+            condition_rows = [
+                {"条件": "走路状態", "入力値": meta.get("走路状態") or "未取得", "反映": "直接反映（履歴の走路適合重み）"},
+                {"条件": "走路温度", "入力値": f"{meta.get('走路温度')}℃" if pd.notna(meta.get("走路温度")) else "未取得", "反映": "直接反映（6周展開・変動幅）"},
+                {"条件": "気温", "入力値": f"{meta.get('気温')}℃" if pd.notna(meta.get("気温")) else "未取得", "反映": "取得・保存・類似レース検索（直接補正は未実装）"},
+                {"条件": "湿度", "入力値": f"{meta.get('湿度')}%" if pd.notna(meta.get("湿度")) else "未取得", "反映": "取得・保存・類似レース検索（直接補正は未実装）"},
+            ]
+            st.dataframe(pd.DataFrame(condition_rows), use_container_width=True, hide_index=True)
+
+            ticket_tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
+            with ticket_tabs[0]:
+                show_ticket_table("2連単（2車単）確率", bets, "2車単", int(trials), 20)
+            with ticket_tabs[1]:
+                show_ticket_table("2連複（2車複）確率", bets, "2車複", int(trials), 20)
+            with ticket_tabs[2]:
+                show_ticket_table("3連複確率", bets, "三連複", int(trials), 20)
+            with ticket_tabs[3]:
+                show_ticket_table("3連単確率", bets, "三連単", int(trials), 20)
 
             if Path(output).exists():
                 st.download_button(
