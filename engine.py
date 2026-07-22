@@ -1,93 +1,22 @@
-import os
-
-import io
-import math
-import re
+from __future__ import annotations
+import io, math, re, sqlite3, hashlib, time, traceback
 from collections import Counter
 from datetime import datetime, date
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
-
-
-def _hidden_display(*args, **kwargs): return None
-def _hidden_clear_output(*args, **kwargs): return None
-class _WidgetDummy:
-    def __init__(self, *args, **kwargs):
-        self.value = kwargs.get("value", None)
-        self.children = kwargs.get("children", [])
-    def __getattr__(self, name):
-        return _WidgetDummy()
-    def __call__(self, *args, **kwargs):
-        return _WidgetDummy(*args, **kwargs)
-    def on_click(self, *args, **kwargs): return None
-    def observe(self, *args, **kwargs): return None
-    def __enter__(self): return self
-    def __exit__(self, *args): return False
-class _WidgetsDummy:
-    def __getattr__(self, name): return _WidgetDummy
-widgets = _WidgetsDummy()
-def display(*args, **kwargs): return None
-def clear_output(*args, **kwargs): return None
-
-
-
-from openpyxl import Workbook, load_workbook
+from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.cell.cell import MergedCell
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.datetime import to_excel
 
-print("AutoRaceAI engine loading")
-
-
-
-from pathlib import Path
-
-
-
-DB_DIR = Path(os.environ.get('AUTORACEAI_DATA_DIR', str(Path(__file__).resolve().parent / 'data')))
-DB_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DB_DIR / "autorace_players.sqlite3"
-
-# ============================================================
-# Ver13.0 選手マスタDB管理（Google Drive + SQLite）
-# ============================================================
-import io, re, sqlite3, hashlib
-from datetime import datetime
-from pathlib import Path
-import numpy as np
-import pandas as pd
-
-class _WidgetDummy:
-    def __init__(self, *args, **kwargs):
-        self.value = kwargs.get("value", None)
-        self.children = kwargs.get("children", [])
-    def __getattr__(self, name):
-        return _WidgetDummy()
-    def __call__(self, *args, **kwargs):
-        return _WidgetDummy(*args, **kwargs)
-    def on_click(self, *args, **kwargs): return None
-    def observe(self, *args, **kwargs): return None
-    def __enter__(self): return self
-    def __exit__(self, *args): return False
-class _WidgetsDummy:
-    def __getattr__(self, name): return _WidgetDummy
-widgets = _WidgetsDummy()
-def display(*args, **kwargs): return None
-def clear_output(*args, **kwargs): return None
-
-
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-
-
-DB_DIR = Path(os.environ.get('AUTORACEAI_DATA_DIR', str(Path(__file__).resolve().parent / 'data')))
-DB_PATH = DB_DIR / 'autorace_players.sqlite3'
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = APP_DIR / "autorace_players.sqlite3"
+DB_DIR = APP_DIR
 HISTORY_COLS_DB = ['開催日','開催場','レース','着順','出走','走路','ハンデ','試走T','競走T','ST']
 
 def mount_and_init_db():
-    
     DB_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as con:
         con.executescript("""
@@ -112,208 +41,7 @@ def mount_and_init_db():
         """)
     return DB_PATH
 
-def _s(v):
-    if v is None or (isinstance(v,float) and np.isnan(v)): return ''
-    return str(v).strip()
-
-def _num(v):
-    if v in (None,''): return None
-    if isinstance(v,(int,float)) and not isinstance(v,bool): return float(v) if np.isfinite(v) else None
-    m=re.search(r'-?\d+(?:\.\d+)?',str(v).replace(',',''))
-    return float(m.group()) if m else None
-
-def _date_text(v):
-    if v in (None,''): return ''
-    if isinstance(v,datetime): return v.strftime('%Y-%m-%d')
-    if hasattr(v,'strftime'):
-        try: return v.strftime('%Y-%m-%d')
-        except Exception: pass
-    d=pd.to_datetime(v,errors='coerce')
-    return d.strftime('%Y-%m-%d') if not pd.isna(d) else _s(v)
-
-def _find_header(ws):
-    aliases={'開催日':['開催日'],'開催場':['開催場'],'レース':['レース'],'着順':['着順'],'出走':['出走'],
-             '走路':['走路'],'ハンデ':['ハンデ'],'試走T':['試走T','試走'],'競走T':['競走T','競走'],'ST':['ST','ＳＴ']}
-    for r in range(1,min(ws.max_row,40)+1):
-        vals={_s(ws.cell(r,c).value):c for c in range(1,ws.max_column+1)}; cmap={}
-        for key,names in aliases.items():
-            for name in names:
-                if name in vals: cmap[key]=vals[name]; break
-        if all(k in cmap for k in ['開催日','開催場','着順','試走T','競走T','ST']):
-            for k in HISTORY_COLS_DB: cmap.setdefault(k,HISTORY_COLS_DB.index(k)+1)
-            return r,cmap
-    raise ValueError(f'{ws.title}: 履歴見出しが見つかりません')
-
-def _player_name(ws):
-    return _s(ws['B2'].value) or ws.title
-
-def _record_key(player,row):
-    raw='|'.join([player,row['開催日'],row['開催場'],row['レース'],_s(row['着順']),_s(row['ハンデ']),
-                  _s(row['試走T']),_s(row['競走T']),_s(row['ST']),row.get('結果区分','通常')])
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-def _ensure_player(con,name):
-    con.execute('INSERT OR IGNORE INTO players(player_name) VALUES (?)',(name,))
-    con.execute('UPDATE players SET updated_at=CURRENT_TIMESTAMP WHERE player_name=?',(name,))
-    return con.execute('SELECT player_id FROM players WHERE player_name=?',(name,)).fetchone()[0]
-
-def add_history_rows(player,rows,source='Excel取込'):
-    added=skipped=0
-    with sqlite3.connect(DB_PATH) as con:
-        pid=_ensure_player(con,player)
-        for row in rows:
-            status=_s(row.get('結果区分','通常')) or '通常'
-            use=0 if status in ['反妨','落車','故障','他落','反則','不成立'] else 1
-            try:
-                con.execute("""INSERT INTO race_history(
-                    player_id,race_date,venue,race_no,finish,starters,surface,handicap,
-                    trial_time,race_time,start_time,result_status,use_for_model,source,record_key)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (pid,row['開催日'],row['開催場'],row['レース'],row['着順'],row['出走'],row['走路'],row['ハンデ'],
-                     row['試走T'],row['競走T'],row['ST'],status,use,source,_record_key(player,row)))
-                added+=1
-            except sqlite3.IntegrityError: skipped+=1
-    return added,skipped
-
-def _sheet_rows(ws):
-    hr,cmap=_find_header(ws); rows=[]
-    for r in range(hr+1,ws.max_row+1):
-        vals={k:ws.cell(r,cmap[k]).value for k in HISTORY_COLS_DB}
-        if all(v in (None,'') for v in vals.values()): continue
-        rows.append({'開催日':_date_text(vals['開催日']),'開催場':_s(vals['開催場']),'レース':_s(vals['レース']),
-                     '着順':_num(vals['着順']),'出走':_num(vals['出走']),'走路':_s(vals['走路']),'ハンデ':_s(vals['ハンデ']),
-                     '試走T':_num(vals['試走T']),'競走T':_num(vals['競走T']),'ST':_num(vals['ST']),'結果区分':'通常'})
-    return hr,cmap,rows
-
-def import_workbook_to_db(content,filename='uploaded.xlsx'):
-    wb=load_workbook(io.BytesIO(content),data_only=True); report=[]
-    for ws in wb.worksheets:
-        if not re.fullmatch(r'選手\d+',ws.title): continue
-        name=_player_name(ws)
-        try: _,_,rows=_sheet_rows(ws); a,s=add_history_rows(name,rows,filename); report.append((name,a,s,'OK'))
-        except Exception as e: report.append((name,0,0,str(e)))
-    return pd.DataFrame(report,columns=['選手名','追加','重複スキップ','状態'])
-
-def get_player_history(name,model_only=False):
-    extra='AND h.use_for_model=1' if model_only else ''
-    with sqlite3.connect(DB_PATH) as con:
-        return pd.read_sql_query(f"""SELECT h.race_date AS 開催日,h.venue AS 開催場,h.race_no AS レース,
-        h.finish AS 着順,h.starters AS 出走,h.surface AS 走路,h.handicap AS ハンデ,h.trial_time AS 試走T,
-        h.race_time AS 競走T,h.start_time AS ST,h.result_status AS 結果区分
-        FROM race_history h JOIN players p ON p.player_id=h.player_id
-        WHERE p.player_name=? {extra} ORDER BY h.race_date DESC,h.history_id DESC""",con,params=(name,))
-
-def enrich_workbook_from_db(content):
-    wb=load_workbook(io.BytesIO(content)); summary=[]
-    for ws in wb.worksheets:
-        if not re.fullmatch(r'選手\d+',ws.title): continue
-        name=_player_name(ws)
-        try: hr,cmap,local=_sheet_rows(ws)
-        except Exception: continue
-        a,_=add_history_rows(name,local,'予測Excel自動追加')
-        dbdf=get_player_history(name)
-        for r in range(hr+1,ws.max_row+1):
-            for col in set(cmap.values()): ws.cell(r,col).value=None
-        for i,row in dbdf.iterrows():
-            rr=hr+1+i
-            for col in HISTORY_COLS_DB:
-                v=row[col]; ws.cell(rr,cmap[col]).value=None if pd.isna(v) else v
-        summary.append((name,len(dbdf),a))
-    bio=io.BytesIO(); wb.save(bio)
-    return bio.getvalue(),pd.DataFrame(summary,columns=['選手名','DB履歴件数','今回新規追加'])
-
-def make_result_entry_workbook(content):
-    wb=load_workbook(io.BytesIO(content))
-    if '結果入力' in wb.sheetnames: del wb['結果入力']
-    ws=wb.create_sheet('結果入力',0)
-    headers=['選手名','着順','競走T','ST','結果区分','開催日','開催場','レース','出走','走路','ハンデ','試走T']
-    ws.append(headers)
-    for c in ws[1]: c.font=Font(bold=True,color='FFFFFF'); c.fill=PatternFill('solid',fgColor='17365D'); c.alignment=Alignment(horizontal='center')
-    race_ws=wb['レース予測'] if 'レース予測' in wb.sheetnames else None; labels={}
-    if race_ws:
-        for r in range(1,min(30,race_ws.max_row)+1): labels[_s(race_ws.cell(r,1).value)]=race_ws.cell(r,2).value
-    players=[w for w in wb.worksheets if re.fullmatch(r'選手\d+',w.title)]
-    for pws in players:
-        ws.append([_player_name(pws),'','','','通常',_date_text(labels.get('レース開催日')),_s(labels.get('今回の開催場')),
-                   '',len(players),_s(labels.get('今回の走路')),_s(pws['G2'].value),_num(pws['E2'].value)])
-    ws.freeze_panes='A2'; ws.auto_filter.ref=f'A1:L{ws.max_row}'
-    bio=io.BytesIO(); wb.save(bio); return bio.getvalue()
-
-def register_results_workbook(content,filename='result.xlsx'):
-    wb=load_workbook(io.BytesIO(content),data_only=True)
-    if '結果入力' not in wb.sheetnames: raise ValueError('「結果入力」シートがありません')
-    ws=wb['結果入力']; h={_s(ws.cell(1,c).value):c for c in range(1,ws.max_column+1)}; report=[]
-    required=['選手名','着順','競走T','ST','結果区分','開催日','開催場','レース','出走','走路','ハンデ','試走T']
-    if any(x not in h for x in required): raise ValueError('結果入力シートの列が不足しています')
-    for r in range(2,ws.max_row+1):
-        name=_s(ws.cell(r,h['選手名']).value)
-        if not name: continue
-        status=_s(ws.cell(r,h['結果区分']).value) or '通常'
-        row={'開催日':_date_text(ws.cell(r,h['開催日']).value),'開催場':_s(ws.cell(r,h['開催場']).value),'レース':_s(ws.cell(r,h['レース']).value),
-             '着順':_num(ws.cell(r,h['着順']).value),'出走':_num(ws.cell(r,h['出走']).value),'走路':_s(ws.cell(r,h['走路']).value),
-             'ハンデ':_s(ws.cell(r,h['ハンデ']).value),'試走T':_num(ws.cell(r,h['試走T']).value),'競走T':_num(ws.cell(r,h['競走T']).value),
-             'ST':_num(ws.cell(r,h['ST']).value),'結果区分':status}
-        if status=='通常' and row['着順'] is None: report.append((name,0,'着順未入力')); continue
-        a,_=add_history_rows(name,[row],filename); report.append((name,a,'追加' if a else '重複'))
-    return pd.DataFrame(report,columns=['選手名','追加件数','状態'])
-
-mount_and_init_db(); print(f'選手DB: {DB_PATH}')
-upload_db=widgets.FileUpload(accept='.xlsx',multiple=False,description='履歴をDB登録')
-upload_enrich=widgets.FileUpload(accept='.xlsx',multiple=False,description='DB履歴を補充')
-upload_template=widgets.FileUpload(accept='.xlsx',multiple=False,description='結果入力票を作成')
-upload_result=widgets.FileUpload(accept='.xlsx',multiple=False,description='結果をDB追加')
-out_db=widgets.Output()
-
-def file_bytes(u):
-    v=u.value
-    if not v:return None,None
-    if isinstance(v,dict):
-        name=next(iter(v)); return name,bytes(v[name]['content'])
-    item=v[0]; return item['name'],bytes(item['content'])
-
-def on_import(change):
-    name,data=file_bytes(upload_db)
-    if data:
-        with out_db:
-            _hidden_clear_output()
-            try: _hidden_display(import_workbook_to_db(data,name))
-            except Exception as e: print('エラー:',e)
-
-def on_enrich(change):
-    name,data=file_bytes(upload_enrich)
-    if data:
-        with out_db:
-            _hidden_clear_output()
-            try:
-                result,summary=enrich_workbook_from_db(data); outname='DB補充済み_'+name
-                Path('/content/'+outname).write_bytes(result); _hidden_display(summary); files.download('/content/'+outname)
-            except Exception as e: print('エラー:',e)
-
-def on_template(change):
-    name,data=file_bytes(upload_template)
-    if data:
-        with out_db:
-            _hidden_clear_output()
-            try:
-                outname='結果入力用_'+name; Path('/content/'+outname).write_bytes(make_result_entry_workbook(data))
-                print('着順・競走T・ST・結果区分を入力してください。'); files.download('/content/'+outname)
-            except Exception as e: print('エラー:',e)
-
-def on_result(change):
-    name,data=file_bytes(upload_result)
-    if data:
-        with out_db:
-            _hidden_clear_output()
-            try: _hidden_display(register_results_workbook(data,name))
-            except Exception as e: print('エラー:',e)
-
-upload_db.observe(on_import,names='value'); upload_enrich.observe(on_enrich,names='value')
-upload_template.observe(on_template,names='value'); upload_result.observe(on_result,names='value')
-_hidden_display(widgets.HTML('<h3>① 初回・未登録履歴をDBへ追加</h3>'),upload_db)
-_hidden_display(widgets.HTML('<h3>② 今回のExcelへ登録済み履歴を自動補充</h3>'),upload_enrich)
-_hidden_display(widgets.HTML('<h3>③ レース前に結果入力票を作成</h3>'),upload_template)
-_hidden_display(widgets.HTML('<h3>④ レース後、入力済み結果をDBへ追加</h3>'),upload_result,out_db)
-
+mount_and_init_db()
 
 HISTORY_COLUMNS = [
     "開催日", "開催場", "レース", "着順", "出走",
@@ -3839,7 +3567,7 @@ def create_result_excel(content, filename, df, finish_counts, bet_counts, trials
         ws.freeze_panes = "A4"
         auto_width(ws)
 
-    path = f"/content/{Path(filename).stem}_AutoRaceAI_Ver12_0_位置依存_二極化タイプ.xlsx"
+    path = str(APP_DIR / f"{Path(filename).stem}_prediction.xlsx")
     wb.save(path)
     return path
 
@@ -3937,1243 +3665,7 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
     return df, bet_counts, output
 
 
-upload = widgets.FileUpload(
-    accept=".xlsx",
-    multiple=False,
-    description="Excelを選択",
-    button_style="info",
-)
 
-trial_slider = widgets.IntSlider(
-    value=10000,
-    min=1000,
-    max=100000,
-    step=1000,
-    description="試行回数（超高速10000）",
-    continuous_update=False,
-    layout=widgets.Layout(width="600px"),
-    style={"description_width": "initial"},
-)
-
-seed_input = widgets.IntText(
-    value=20260719,
-    description="乱数シード",
-    style={"description_width": "initial"},
-)
-
-track_temp_slider = widgets.FloatSlider(
-    value=30.0,
-    min=15.0,
-    max=70.0,
-    step=1.0,
-    description="走路温度(℃)",
-    continuous_update=False,
-    layout=widgets.Layout(width="600px"),
-    style={"description_width": "initial"},
-)
-
-run_button = widgets.Button(
-    description="Ver12.3 高速計算",
-    button_style="success",
-    icon="calculator",
-    layout=widgets.Layout(width="280px", height="44px"),
-)
-
-output_area = widgets.Output()
-
-
-def clicked(_):
-    with output_area:
-        _hidden_clear_output()
-
-        try:
-            import time
-            _calc_started = time.perf_counter()
-            filename, content = uploaded_file(upload.value)
-            if not content:
-                print("先にExcelを選択してください。")
-                return
-
-            heat = float(np.clip((float(track_temp_slider.value) - 50.0) / 8.0, 0.0, 1.0))
-            chaos = float(np.clip((float(track_temp_slider.value) - 48.0) / 16.0, 0.0, 1.0))
-            heat_label = "通常" if heat <= 0 else ("やや前残り" if heat < 0.50 else "前残り強め")
-            if chaos >= 0.65:
-                heat_label += "・荒れ強め"
-            elif chaos > 0:
-                heat_label += "・荒れ注意"
-            print(f"AutoRaceAI Ver12.3 高速版を計算中（走路温度 {track_temp_slider.value:.0f}℃・{heat_label}）...")
-            df, bet_counts, output = run_model(
-                content,
-                filename,
-                min(int(trial_slider.value), 20000),
-                int(seed_input.value),
-                float(track_temp_slider.value),
-            )
-            globals()["LATEST_PREDICTION_DF"] = df.copy()
-            globals()["LATEST_BET_COUNTS"] = bet_counts
-            globals()["LATEST_TRACK_TEMP"] = float(track_temp_slider.value)
-            globals()["LATEST_PREDICTION_FILENAME"] = filename
-
-            requested_display_cols = [
-                "車", "選手名", "レースタイプ", "逃げ成功率", "内枠残存率", "位置活用率",
-                "同ハンデST優位度", "試走信頼度", "レース巧者指数",
-                "直近5走生3着内率", "直近5走生凡走率", "近況信頼度", "短期上振れ抑制",
-                "近況信頼度補正", "直近内容補正", "速度実戦変換補正",
-                "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
-                "選手タイプ", "選手タイプVer2", "上昇カーブ指数", "上昇カーブ補正",
-                "終盤指数", "終盤力補正", "相手レベル耐性補正",
-                "中位粘り率", "中位粘り補正", "条件改善再現補正",
-                "スタート一気指数", "スタート伸び指数", "先行転換力", "隊列残存指数", "ゴール前伸び指数", "安定上位指数", "安定上位評価補正", "混戦突破適性", "集団突破力", "好位置維持指数", "後方追上げ指数", "位置依存指数", "二極化指数", "自己比試走指数", "自己試走変化秒", "当日状態指数", "試走突出度", "爆発指数", "爆発能力補正", "前団主導指数", "当日勝ち切り指数", "後方追走不成立リスク", "当日レース指数", "基礎履歴総合点", "改良総合点", "改善後総合点", "改善後順位"
-            ]
-            # Ver10で廃止・変更された旧列があっても表示処理を止めない
-            display_cols = [col for col in requested_display_cols if col in df.columns]
-            missing_display_cols = [col for col in requested_display_cols if col not in df.columns]
-            if missing_display_cols:
-                print("表示対象から除外した未生成列:", ", ".join(missing_display_cols))
-
-            _hidden_display(
-                df.loc[:, display_cols]
-                .sort_values(["改善後順位", "車"])
-                .reset_index(drop=True)
-                .style.format({
-                    "逃げ成功率": "{:.1%}",
-                    "内枠残存率": "{:.1%}",
-                    "位置活用率": "{:.1%}",
-                    "同ハンデST優位度": "{:.3f}",
-                    "試走信頼度": "{:.3f}",
-                    "レース巧者指数": "{:.3f}",
-                    "スタート一気指数": "{:.3f}",
-                    "先行転換力": "{:.3f}",
-                    "当日状態指数": "{:.3f}",
-                    "試走突出度": "{:.3f}",
-                    "爆発指数": "{:.3f}",
-                    "爆発能力補正": "{:.3f}",
-                    "当日レース指数": "{:.3f}",
-                    "基礎履歴総合点": "{:.3f}",
-                    "直近5走生3着内率": "{:.1%}",
-                    "直近5走生凡走率": "{:.1%}",
-                    "近況信頼度": "{:.3f}",
-                    "短期上振れ抑制": "{:.3f}",
-                    "近況信頼度補正": "{:.3f}",
-                    "直近内容補正": "{:.3f}",
-                    "速度実戦変換補正": "{:.3f}",
-                    "改良総合点": "{:.3f}",
-                    "ハンデ変化点": "{:.3f}",
-                    "改善後総合点": "{:.3f}",
-                })
-            )
-
-            print("\n三連単確率 上位10通り")
-            for rank, (combo, count) in enumerate(
-                sorted(bet_counts["三連単"].items(), key=lambda x: x[1], reverse=True)[:10],
-                1,
-            ):
-                probability = count / int(trial_slider.value) * 100
-                print(
-                    f"{rank:>2}. {combo[0]}-{combo[1]}-{combo[2]} "
-                    f"{probability:.3f}%"
-                )
-
-            for ticket in ["三連複", "2車単", "2車複"]:
-                print(f"\n{ticket}確率 上位5通り")
-                for rank, (combo, count) in enumerate(
-                    sorted(bet_counts[ticket].items(), key=lambda x: x[1], reverse=True)[:5], 1
-                ):
-                    probability = count / int(trial_slider.value) * 100
-                    print(f"{rank:>2}. {'-'.join(map(str, combo))} {probability:.3f}%")
-
-            _elapsed = time.perf_counter() - _calc_started
-            print(f"\n計算時間: {_elapsed:.1f}秒")
-            print("結果Excelをダウンロードします。")
-            files.download(output)
-
-        except Exception as exc:
-            print("エラー:", exc)
-
-
-run_button.on_click(clicked)
-
-_hidden_display(
-    widgets.VBox([
-        upload,
-        trial_slider,
-        seed_input,
-        track_temp_slider,
-        run_button,
-        output_area,
-    ])
-)
-
-# ============================================================
-# Ver13.1 周回順位貼り付け・展開分析
-# ============================================================
-LAP_STATUS_GOAL = 'ゴール線通過'
-
-def init_lap_tables():
-    mount_and_init_db()
-    with sqlite3.connect(DB_PATH) as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS races (
-            race_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            race_key TEXT NOT NULL UNIQUE,
-            race_date TEXT, venue TEXT, race_no TEXT, race_name TEXT,
-            distance_m INTEGER, total_laps INTEGER,
-            weather TEXT, surface_condition TEXT,
-            track_temp REAL, air_temp REAL, humidity REAL,
-            start_time_text TEXT, source TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS lap_history (
-            lap_history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            race_id INTEGER NOT NULL,
-            lap_index INTEGER NOT NULL,
-            lap_label TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            car_no INTEGER NOT NULL,
-            player_id INTEGER,
-            is_goal INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(race_id, lap_index, position),
-            UNIQUE(race_id, lap_index, car_no),
-            FOREIGN KEY(race_id) REFERENCES races(race_id),
-            FOREIGN KEY(player_id) REFERENCES players(player_id)
-        );
-        CREATE TABLE IF NOT EXISTS lap_features (
-            feature_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            race_id INTEGER NOT NULL,
-            car_no INTEGER NOT NULL,
-            player_id INTEGER,
-            first_lap_pos INTEGER, final_pos INTEGER, best_pos INTEGER, worst_pos INTEGER,
-            net_gain INTEGER, overtakes INTEGER, passed_by INTEGER,
-            front_pack_laps INTEGER, front_pack_rate REAL,
-            late_gain INTEGER, late_peak_gain INTEGER,
-            lead_laps INTEGER, position_variance REAL,
-            finish_vs_first INTEGER,
-            UNIQUE(race_id, car_no),
-            FOREIGN KEY(race_id) REFERENCES races(race_id),
-            FOREIGN KEY(player_id) REFERENCES players(player_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_lap_player ON lap_history(player_id, race_id, lap_index);
-        CREATE INDEX IF NOT EXISTS idx_lap_race ON lap_history(race_id, lap_index, position);
-        """)
-
-def _normalize_paste(text):
-    return str(text or '').replace('\r\n','\n').replace('\r','\n').replace('\u3000',' ')
-
-def parse_lap_paste(text):
-    text=_normalize_paste(text)
-    lines=[x.strip() for x in text.split('\n') if x.strip()]
-    rows=[]
-    for line in lines:
-        parts=[p for p in re.split(r'[\t ,，]+',line) if p]
-        if len(parts)<9 or not (parts[0] in ['ゴール線通過','ゴール'] or re.fullmatch(r'\d+周目',parts[0])):
-            continue
-        label=parts[0]
-        cars=[int(x) for x in parts[1:9] if re.fullmatch(r'\d+',x)]
-        if len(cars)!=8 or sorted(cars)!=list(range(1,9)):
-            raise ValueError(f'「{line}」の車番が1～8の並びになっていません')
-        is_goal=label in ['ゴール線通過','ゴール']
-        lap_no=10**6 if is_goal else int(re.search(r'\d+',label).group())
-        rows.append({'label':LAP_STATUS_GOAL if is_goal else label,'lap_no':lap_no,'is_goal':is_goal,'cars':cars})
-    if not rows:
-        raise ValueError('周回順位表を読み取れませんでした。見出しを含めてそのまま貼り付けてください。')
-    unique={r['label']:r for r in rows}
-    normal=sorted([r for r in unique.values() if not r['is_goal']],key=lambda r:r['lap_no'])
-    goals=[r for r in unique.values() if r['is_goal']]
-    ordered=normal+goals
-    for i,r in enumerate(ordered,1): r['lap_index']=i
-    meta={}
-    m=re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日',text)
-    if m: meta['race_date']=f'{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}'
-    m=re.search(r'([^\n]*?(?:優勝戦|一般戦|選抜戦|準決勝戦|特別選抜戦|予選|最終予選|二次予選))\s*(\d+)m\s*\((\d+)周\)',text)
-    if m:
-        meta['race_name']=m.group(1).strip(); meta['distance_m']=int(m.group(2)); meta['total_laps']=int(m.group(3))
-    else:
-        m=re.search(r'(\d+)m\s*\((\d+)周\)',text)
-        if m: meta['distance_m']=int(m.group(1)); meta['total_laps']=int(m.group(2))
-    patterns={
-        'weather':r'天候[：:]\s*([^\s　]+)',
-        'surface_condition':r'走路状況[：:]\s*([^\s　]+)',
-        'track_temp':r'走路温度[：:]\s*([\d.]+)',
-        'air_temp':r'気温[：:]\s*([\d.]+)',
-        'humidity':r'湿度[：:]\s*([\d.]+)',
-        'start_time_text':r'発走時間\s*([0-2]?\d:[0-5]\d)'
-    }
-    for k,p in patterns.items():
-        m=re.search(p,text)
-        if m: meta[k]=float(m.group(1)) if k in ['track_temp','air_temp','humidity'] else m.group(1)
-    return ordered,meta
-
-def extract_result_mapping(content):
-    if not content: return {},{}
-    wb=load_workbook(io.BytesIO(content),data_only=True)
-    mapping={}; meta={}
-    if '結果入力' in wb.sheetnames:
-        ws=wb['結果入力']; h={_s(ws.cell(1,c).value):c for c in range(1,ws.max_column+1)}
-        for r in range(2,ws.max_row+1):
-            name=_s(ws.cell(r,h.get('選手名',1)).value)
-            if name: mapping[r-1]=name
-        if ws.max_row>=2:
-            for col,key in [('開催日','race_date'),('開催場','venue'),('レース','race_no')]:
-                if col in h:
-                    v=ws.cell(2,h[col]).value
-                    meta[key]=_date_text(v) if col=='開催日' else _s(v)
-    else:
-        players=[w for w in wb.worksheets if re.fullmatch(r'選手\d+',w.title)]
-        for i,w in enumerate(players,1): mapping[i]=_player_name(w)
-    return mapping,meta
-
-def _race_key(meta, rows):
-    core=[_s(meta.get('race_date')),_s(meta.get('venue')),_s(meta.get('race_no')),_s(meta.get('race_name')),
-          _s(meta.get('distance_m')),_s(meta.get('total_laps'))]
-    if not any(core[:4]): core.append('|'.join(','.join(map(str,r['cars'])) for r in rows))
-    return hashlib.sha256('|'.join(core).encode()).hexdigest()
-
-def calculate_lap_features(rows):
-    positions={c:[] for c in range(1,9)}
-    for r in rows:
-        for pos,c in enumerate(r['cars'],1): positions[c].append(pos)
-    n=len(rows); late_start=max(0,n-3); feats={}
-    for c,p in positions.items():
-        gains=[p[i-1]-p[i] for i in range(1,len(p))]
-        front=sum(x<=3 for x in p)
-        feats[c]={
-            'first_lap_pos':p[0],'final_pos':p[-1],'best_pos':min(p),'worst_pos':max(p),
-            'net_gain':p[0]-p[-1],'overtakes':sum(max(0,x) for x in gains),
-            'passed_by':sum(max(0,-x) for x in gains),'front_pack_laps':front,
-            'front_pack_rate':round(front/len(p),4),'late_gain':p[late_start]-p[-1],
-            'late_peak_gain':sum(max(0,p[i-1]-p[i]) for i in range(max(1,late_start+1),len(p))),
-            'lead_laps':sum(x==1 for x in p),'position_variance':round(float(np.var(p)),4),
-            'finish_vs_first':p[0]-p[-1]
-        }
-    return feats
-
-def save_lap_data(rows, meta, player_mapping=None, source='貼り付け'):
-    init_lap_tables(); player_mapping=player_mapping or {}; key=_race_key(meta,rows)
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""INSERT INTO races(race_key,race_date,venue,race_no,race_name,distance_m,total_laps,
-          weather,surface_condition,track_temp,air_temp,humidity,start_time_text,source)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-          ON CONFLICT(race_key) DO UPDATE SET race_date=excluded.race_date,venue=excluded.venue,
-          race_no=excluded.race_no,race_name=excluded.race_name,distance_m=excluded.distance_m,
-          total_laps=excluded.total_laps,weather=excluded.weather,surface_condition=excluded.surface_condition,
-          track_temp=excluded.track_temp,air_temp=excluded.air_temp,humidity=excluded.humidity,
-          start_time_text=excluded.start_time_text,source=excluded.source,updated_at=CURRENT_TIMESTAMP""",
-          (key,meta.get('race_date'),meta.get('venue'),meta.get('race_no'),meta.get('race_name'),meta.get('distance_m'),
-           meta.get('total_laps'),meta.get('weather'),meta.get('surface_condition'),meta.get('track_temp'),
-           meta.get('air_temp'),meta.get('humidity'),meta.get('start_time_text'),source))
-        race_id=con.execute('SELECT race_id FROM races WHERE race_key=?',(key,)).fetchone()[0]
-        pids={int(car):_ensure_player(con,name) for car,name in player_mapping.items() if name}
-        con.execute('DELETE FROM lap_history WHERE race_id=?',(race_id,)); con.execute('DELETE FROM lap_features WHERE race_id=?',(race_id,))
-        for r in rows:
-            for pos,car in enumerate(r['cars'],1):
-                con.execute("INSERT INTO lap_history(race_id,lap_index,lap_label,position,car_no,player_id,is_goal) VALUES(?,?,?,?,?,?,?)",
-                            (race_id,r['lap_index'],r['label'],pos,car,pids.get(car),int(r['is_goal'])))
-        feats=calculate_lap_features(rows)
-        for car,f in feats.items():
-            con.execute("""INSERT INTO lap_features(race_id,car_no,player_id,first_lap_pos,final_pos,best_pos,worst_pos,
-                net_gain,overtakes,passed_by,front_pack_laps,front_pack_rate,late_gain,late_peak_gain,
-                lead_laps,position_variance,finish_vs_first) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (race_id,car,pids.get(car),f['first_lap_pos'],f['final_pos'],f['best_pos'],f['worst_pos'],f['net_gain'],
-                 f['overtakes'],f['passed_by'],f['front_pack_laps'],f['front_pack_rate'],f['late_gain'],f['late_peak_gain'],
-                 f['lead_laps'],f['position_variance'],f['finish_vs_first']))
-    return race_id,feats
-
-def lap_analysis_dataframe(feats, mapping=None):
-    mapping=mapping or {}; data=[]
-    for c,f in feats.items():
-        typ=[]
-        if f['first_lap_pos']<=3 and f['front_pack_rate']>=0.6: typ.append('前団維持')
-        if f['net_gain']>=3: typ.append('追上げ')
-        if f['late_gain']>=2: typ.append('終盤伸び')
-        if f['first_lap_pos']<=3 and f['final_pos']>=6: typ.append('先行失速')
-        if f['position_variance']>=3: typ.append('展開変動大')
-        data.append({'車番':c,'選手名':mapping.get(c,''),'1周目':f['first_lap_pos'],'最終':f['final_pos'],
-                     '最高順位':f['best_pos'],'最低順位':f['worst_pos'],'純上昇':f['net_gain'],
-                     '追抜き量':f['overtakes'],'被追抜き量':f['passed_by'],'前団率':f['front_pack_rate'],
-                     '終盤上昇':f['late_gain'],'先頭周回':f['lead_laps'],'展開タイプ':'・'.join(typ) or '中間型'})
-    return pd.DataFrame(data).sort_values('最終').reset_index(drop=True)
-
-def player_lap_profile(name):
-    init_lap_tables()
-    with sqlite3.connect(DB_PATH) as con:
-        return pd.read_sql_query("""SELECT COUNT(*) AS レース数,
-          ROUND(AVG(first_lap_pos),2) AS 一周目平均順位, ROUND(AVG(final_pos),2) AS ゴール平均順位,
-          ROUND(AVG(net_gain),2) AS 平均順位上昇, ROUND(AVG(front_pack_rate)*100,1) AS 前団滞在率,
-          ROUND(AVG(late_gain),2) AS 終盤平均上昇, ROUND(AVG(overtakes),2) AS 平均追抜き量,
-          ROUND(AVG(CASE WHEN first_lap_pos<=3 AND final_pos<=3 THEN 1.0 ELSE 0 END)*100,1) AS 好位置維持率,
-          ROUND(AVG(CASE WHEN first_lap_pos>=6 AND final_pos<=3 THEN 1.0 ELSE 0 END)*100,1) AS 後方三着内率
-          FROM lap_features f JOIN players p ON p.player_id=f.player_id WHERE p.player_name=?""",con,params=(name,))
-
-init_lap_tables()
-lap_excel_upload=widgets.FileUpload(accept='.xlsx',multiple=False,description='結果Excel（任意）')
-lap_paste=widgets.Textarea(value='',placeholder='公式ページの「周回・順位」からレース情報まで、そのまま貼り付け',
-    description='周回表:',layout=widgets.Layout(width='100%',height='330px'),style={'description_width':'70px'})
-venue_box=widgets.Text(description='開催場:',placeholder='Excelがない場合に入力')
-race_no_box=widgets.Text(description='レース:',placeholder='例：12R')
-save_lap_button=widgets.Button(description='周回データを解析・DB保存',button_style='success',icon='database')
-lap_out=widgets.Output()
-
-def on_save_laps(_):
-    with lap_out:
-        _hidden_clear_output()
-        try:
-            rows,meta=parse_lap_paste(lap_paste.value)
-            fname,xbytes=file_bytes(lap_excel_upload)
-            mapping,xmeta=extract_result_mapping(xbytes) if xbytes else ({},{})
-            for k,v in xmeta.items():
-                if v and not meta.get(k): meta[k]=v
-            if venue_box.value.strip(): meta['venue']=venue_box.value.strip()
-            if race_no_box.value.strip(): meta['race_no']=race_no_box.value.strip()
-            race_id,feats=save_lap_data(rows,meta,mapping,source=fname or '公式周回表貼付')
-            print(f'保存完了：race_id={race_id} / {len(rows)}地点 × 8選手')
-            print('抽出したレース情報:',meta)
-            _hidden_display(lap_analysis_dataframe(feats,mapping))
-            if not mapping: print('※結果入力Excelも指定すると、車番と選手名を結び付けて保存できます。')
-        except Exception as e: print('エラー:',e)
-
-save_lap_button.on_click(on_save_laps)
-_hidden_display(widgets.HTML('<h3>⑤ 周回順位表をそのまま貼り付け</h3><p>結果入力Excelを指定すると、1行目＝1号車として選手名を自動対応します。</p>'))
-_hidden_display(lap_excel_upload,widgets.HBox([venue_box,race_no_box]),lap_paste,save_lap_button,lap_out)
-
-# ============================================================
-# Ver13.2 公式結果全文貼り付け・一括登録
-# ============================================================
-
-def _split_result_line(line):
-    line = line.replace('\u3000', ' ').strip()
-    if '\t' in line:
-        return [x.strip() for x in line.split('\t')]
-    return [x.strip() for x in re.split(r'\s{2,}', line) if x.strip()]
-
-
-def _normalize_status(accident='', abnormal=''):
-    raw = (_s(accident) + ' ' + _s(abnormal)).strip()
-    if not raw:
-        return '通常'
-    aliases = [
-        ('反妨', '反妨'), ('妨害', '反妨'), ('落車', '落車'), ('他落', '他落'),
-        ('故障', '故障'), ('反則', '反則'), ('不成立', '不成立'), ('欠車', '欠車'),
-        ('停止', '停止'), ('再試走', '再試走')
-    ]
-    for key, val in aliases:
-        if key in raw:
-            return val
-    return raw
-
-
-def parse_full_official_result(text):
-    if not _s(text):
-        raise ValueError('貼り付け内容が空です')
-    clean = text.replace('\r\n', '\n').replace('\r', '\n')
-    lap_rows, meta = parse_lap_paste(clean)
-
-    m = re.search(r'1着賞金\s*[\u3000 ]*([\d,]+)円', clean)
-    if m:
-        meta['first_prize_yen'] = int(m.group(1).replace(',', ''))
-
-    lines = [x.rstrip() for x in clean.split('\n')]
-    header_idx = None
-    for i, line in enumerate(lines):
-        compact = line.replace('\u3000', ' ').replace(' ', '')
-        if all(x in compact for x in ['着', '車', '選手名', '試走タイム', '競走タイム']):
-            header_idx = i
-            break
-    if header_idx is None:
-        raise ValueError('着順結果表の見出しが見つかりません')
-
-    results = []
-    for line in lines[header_idx + 1:]:
-        if 'グランドノート' in line or '周回・順位' in line:
-            break
-        if not line.strip():
-            continue
-        if '\t' in line:
-            parts = [x.strip() for x in line.replace('\u3000', ' ').split('\t')]
-            parts += [''] * max(0, 12 - len(parts))
-            finish, accident, car, name, age_term, lg, handicap, trial, race_t, st, abnormal, popularity = parts[:12]
-        else:
-            parts = _split_result_line(line)
-            if len(parts) < 9 or not re.fullmatch(r'\d+', parts[0]) or not re.fullmatch(r'\d+', parts[1]):
-                continue
-            finish, car = parts[0], parts[1]
-            name = parts[2]
-            age_term = parts[3] if len(parts) > 3 else ''
-            lg = parts[4] if len(parts) > 4 else ''
-            handicap = parts[5] if len(parts) > 5 else ''
-            trial = parts[6] if len(parts) > 6 else ''
-            race_t = parts[7] if len(parts) > 7 else ''
-            st = parts[8] if len(parts) > 8 else ''
-            popularity = parts[-1] if len(parts) > 9 and re.fullmatch(r'\d+', parts[-1]) else ''
-            accident = ''
-            abnormal = ''
-        if not re.fullmatch(r'\d+', _s(finish)) or not re.fullmatch(r'\d+', _s(car)):
-            continue
-        results.append({
-            '着順': int(finish), '事故': _s(accident), '車番': int(car), '選手名': _s(name),
-            '年齢期': _s(age_term), 'LG': _s(lg), 'ハンデ': _s(handicap),
-            '試走T': _num(trial), '競走T': _num(race_t), 'ST': _num(st),
-            '異常': _s(abnormal), '人気': _num(popularity),
-            '結果区分': _normalize_status(accident, abnormal)
-        })
-    if not results:
-        raise ValueError('選手結果を読み取れませんでした')
-    cars = sorted(r['車番'] for r in results)
-    if cars != list(range(1, len(results) + 1)):
-        raise ValueError(f'車番の読取結果が不正です: {cars}')
-    return meta, results, lap_rows
-
-
-def init_full_result_tables():
-    init_lap_tables()
-    with sqlite3.connect(DB_PATH) as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS race_entries (
-            entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            race_id INTEGER NOT NULL,
-            car_no INTEGER NOT NULL,
-            player_id INTEGER,
-            finish INTEGER,
-            accident TEXT,
-            age_term TEXT,
-            lg TEXT,
-            handicap TEXT,
-            trial_time REAL,
-            race_time REAL,
-            start_time REAL,
-            abnormal TEXT,
-            popularity INTEGER,
-            result_status TEXT,
-            UNIQUE(race_id, car_no),
-            FOREIGN KEY(race_id) REFERENCES races(race_id),
-            FOREIGN KEY(player_id) REFERENCES players(player_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_race_entries_player ON race_entries(player_id);
-        """)
-
-
-def save_full_official_result(text, venue='', race_no='', source='公式結果全文貼付'):
-    init_full_result_tables()
-    meta, results, lap_rows = parse_full_official_result(text)
-    if _s(venue):
-        meta['venue'] = _s(venue)
-    if _s(race_no):
-        meta['race_no'] = _s(race_no)
-    mapping = {r['車番']: r['選手名'] for r in results}
-    race_id, features = save_lap_data(lap_rows, meta, mapping, source=source)
-
-    added_history = 0
-    skipped_history = 0
-    with sqlite3.connect(DB_PATH) as con:
-        for r in results:
-            pid = _ensure_player(con, r['選手名'])
-            con.execute("""INSERT INTO race_entries(
-                race_id,car_no,player_id,finish,accident,age_term,lg,handicap,
-                trial_time,race_time,start_time,abnormal,popularity,result_status)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(race_id,car_no) DO UPDATE SET
-                player_id=excluded.player_id,finish=excluded.finish,accident=excluded.accident,
-                age_term=excluded.age_term,lg=excluded.lg,handicap=excluded.handicap,
-                trial_time=excluded.trial_time,race_time=excluded.race_time,
-                start_time=excluded.start_time,abnormal=excluded.abnormal,
-                popularity=excluded.popularity,result_status=excluded.result_status""",
-                (race_id, r['車番'], pid, r['着順'], r['事故'], r['年齢期'], r['LG'], r['ハンデ'],
-                 r['試走T'], r['競走T'], r['ST'], r['異常'], r['人気'], r['結果区分']))
-
-    starters = len(results)
-    surface = meta.get('surface_condition', '')
-    for r in results:
-        row = {
-            '開催日': meta.get('race_date', ''), '開催場': meta.get('venue', ''),
-            'レース': meta.get('race_no') or meta.get('race_name', ''),
-            '着順': r['着順'], '出走': starters, '走路': surface, 'ハンデ': r['ハンデ'],
-            '試走T': r['試走T'], '競走T': r['競走T'], 'ST': r['ST'], '結果区分': r['結果区分']
-        }
-        a, s = add_history_rows(r['選手名'], [row], source)
-        added_history += a
-        skipped_history += s
-    return race_id, meta, results, features, added_history, skipped_history
-
-
-def full_result_summary(results, features):
-    rows = []
-    for r in sorted(results, key=lambda x: x['着順']):
-        f = features.get(r['車番'], {})
-        rows.append({
-            '着': r['着順'], '車': r['車番'], '選手名': r['選手名'], '結果区分': r['結果区分'],
-            '試走T': r['試走T'], '競走T': r['競走T'], 'ST': r['ST'], '人気': r['人気'],
-            '1周目': f.get('first_lap_pos'), '最終': f.get('final_pos'),
-            '純上昇': f.get('net_gain'), '前団率': f.get('front_pack_rate'),
-            '終盤上昇': f.get('late_gain'), '追抜き量': f.get('overtakes')
-        })
-    return pd.DataFrame(rows)
-
-
-init_full_result_tables()
-full_paste = widgets.Textarea(
-    value='',
-    placeholder='公式結果ページの「レース情報～着順表～グランドノート～周回順位」をまとめて貼り付け',
-    description='結果全文:',
-    layout=widgets.Layout(width='100%', height='520px'),
-    style={'description_width': '80px'}
-)
-full_venue = widgets.Text(description='開催場:', placeholder='本文に無い場合のみ 例：川口')
-full_race_no = widgets.Text(description='レース:', placeholder='本文に無い場合のみ 例：12R')
-full_save_btn = widgets.Button(description='結果・周回を一括DB登録', button_style='success', icon='database')
-full_out = widgets.Output()
-
-
-def on_save_full_result(_):
-    with full_out:
-        _hidden_clear_output()
-        try:
-            race_id, meta, results, features, a, s = save_full_official_result(
-                full_paste.value, full_venue.value, full_race_no.value
-            )
-            print(f'保存完了：race_id={race_id}')
-            print(f'選手履歴 新規追加={a} / 重複スキップ={s}')
-            if not meta.get('venue'):
-                print('注意：開催場が本文から取得できませんでした。開催場欄へ入力してください。')
-            if not meta.get('race_no'):
-                print('注意：レース番号が本文から取得できませんでした。レース欄へ入力してください。')
-            print('抽出したレース情報:', meta)
-            _hidden_display(full_result_summary(results, features))
-        except Exception as e:
-            print('エラー:', e)
-
-
-full_save_btn.on_click(on_save_full_result)
-_hidden_display(widgets.HTML(
-    '<h3>⑥ 公式結果ページ全文をそのまま貼り付け</h3>'
-    '<p>着順表と周回順位を一度に保存します。開催場・レース番号が本文に無い場合だけ補助欄へ入力してください。</p>'
-))
-_hidden_display(widgets.HBox([full_venue, full_race_no]), full_paste, full_save_btn, full_out)
-
-
-# ============================================================
-# Ver14.0 全結果再学習・設定変化表示
-# ============================================================
-import json, sqlite3, hashlib, math
-from datetime import datetime
-
-LEARN_FEATURES = {
-    "基礎能力": ["基礎履歴総合点", "基礎スピード点", "実戦能力点", "勝負強さ点"],
-    "スタート": ["スタート一気指数", "スタート伸び指数", "先行転換力", "同ハンデST優位度"],
-    "前団維持": ["隊列残存指数", "好位置維持指数", "前団主導指数", "安定上位指数"],
-    "追い上げ": ["混戦突破適性", "集団突破力", "後方追上げ指数"],
-    "終盤": ["終盤指数", "ゴール前伸び指数"],
-    "当日気配": ["当日状態指数", "自己比試走指数", "試走突出度", "爆発指数"],
-    "安定性": ["近況信頼度", "試走信頼度", "レース巧者指数"],
-}
-INITIAL_WEIGHTS = {
-    "基礎能力": 1.00, "スタート": 0.72, "前団維持": 0.68,
-    "追い上げ": 0.62, "終盤": 0.58, "当日気配": 0.74, "安定性": 0.55,
-}
-
-def init_learning_tables():
-    mount_and_init_db()
-    with sqlite3.connect(DB_PATH) as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS prediction_races (
-            prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            race_key TEXT NOT NULL UNIQUE,
-            race_date TEXT, venue TEXT, race_no TEXT,
-            track_temp REAL, created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS prediction_features (
-            prediction_id INTEGER NOT NULL,
-            car_no INTEGER NOT NULL,
-            player_name TEXT,
-            features_json TEXT NOT NULL,
-            PRIMARY KEY(prediction_id, car_no)
-        );
-        CREATE TABLE IF NOT EXISTS learning_settings (
-            setting_name TEXT PRIMARY KEY,
-            initial_value REAL NOT NULL,
-            current_value REAL NOT NULL,
-            updated_at TEXT,
-            sample_races INTEGER DEFAULT 0,
-            reason TEXT
-        );
-        CREATE TABLE IF NOT EXISTS learning_history (
-            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            learned_at TEXT, sample_races INTEGER,
-            old_score REAL, new_score REAL,
-            settings_json TEXT, changes_json TEXT
-        );
-        """)
-        for k,v in INITIAL_WEIGHTS.items():
-            con.execute("""INSERT OR IGNORE INTO learning_settings
-                (setting_name,initial_value,current_value,updated_at,sample_races,reason)
-                VALUES(?,?,?,?,?,?)""",(k,v,v,datetime.now().isoformat(timespec='seconds'),0,'初期設定'))
-        con.commit()
-
-def _race_key(date_text, venue, race_no):
-    d=re.sub(r'[^0-9]','',str(date_text))[:8]
-    r=re.sub(r'[^0-9]','',str(race_no))
-    return f"{d}_{str(venue).strip()}_{r}R"
-
-def _layer_value(row, cols):
-    vals=[]
-    for c in cols:
-        if c in row.index:
-            try:
-                x=float(row[c])
-                if np.isfinite(x): vals.append(x)
-            except: pass
-    return float(np.mean(vals)) if vals else 0.0
-
-def save_latest_prediction(date_text, venue, race_no):
-    init_learning_tables()
-    if 'LATEST_PREDICTION_DF' not in globals():
-        raise RuntimeError('先に予測セルで計算してください。')
-    df=LATEST_PREDICTION_DF.copy()
-    key=_race_key(date_text,venue,race_no)
-    now=datetime.now().isoformat(timespec='seconds')
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""INSERT INTO prediction_races(race_key,race_date,venue,race_no,track_temp,created_at)
-          VALUES(?,?,?,?,?,?) ON CONFLICT(race_key) DO UPDATE SET
-          track_temp=excluded.track_temp,created_at=excluded.created_at""",
-          (key,str(date_text),str(venue),str(race_no),float(globals().get('LATEST_TRACK_TEMP',np.nan)),now))
-        pid=con.execute('SELECT prediction_id FROM prediction_races WHERE race_key=?',(key,)).fetchone()[0]
-        con.execute('DELETE FROM prediction_features WHERE prediction_id=?',(pid,))
-        for _,row in df.iterrows():
-            car=int(float(row.get('車',row.get('車番',0))))
-            feats={layer:_layer_value(row,cols) for layer,cols in LEARN_FEATURES.items()}
-            # race内標準化は学習時に実施
-            con.execute('INSERT INTO prediction_features VALUES(?,?,?,?)',
-                        (pid,car,str(row.get('選手名','')),json.dumps(feats,ensure_ascii=False)))
-        con.commit()
-    return key,len(df)
-
-def _load_training():
-    init_learning_tables()
-    with sqlite3.connect(DB_PATH) as con:
-        prs=pd.read_sql_query('SELECT * FROM prediction_races',con)
-        pfs=pd.read_sql_query('SELECT * FROM prediction_features',con)
-        # Ver13.2 races/results schemaに合わせ、存在列を確認
-        tables={x[0] for x in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if 'race_results' in tables:
-            res=pd.read_sql_query('SELECT * FROM race_results',con)
-        elif 'results' in tables:
-            res=pd.read_sql_query('SELECT * FROM results',con)
-        else:
-            return []
-        races=pd.read_sql_query('SELECT * FROM races',con) if 'races' in tables else pd.DataFrame()
-    datasets=[]
-    for _,pr in prs.iterrows():
-        sub=pfs[pfs.prediction_id==pr.prediction_id].copy()
-        if sub.empty: continue
-        # race_key直接または日付/場/Rで結果レースを照合
-        rid=None
-        if not races.empty and 'race_key' in races.columns:
-            m=races[races.race_key.astype(str)==str(pr.race_key)]
-            if not m.empty: rid=m.iloc[0].get('race_id')
-        if rid is None and not races.empty:
-            m=races[(races.get('race_date','').astype(str)==str(pr.race_date)) &
-                    (races.get('venue','').astype(str)==str(pr.venue))]
-            if 'race_no' in races.columns:
-                m=m[m.race_no.astype(str).str.replace('R','',regex=False)==str(pr.race_no).replace('R','')]
-            if not m.empty: rid=m.iloc[0].get('race_id')
-        if rid is None: continue
-        rr=res[res.race_id==rid].copy() if 'race_id' in res.columns else pd.DataFrame()
-        if rr.empty: continue
-        carcol='car_no' if 'car_no' in rr.columns else ('車' if '車' in rr.columns else None)
-        rankcol='finish_rank' if 'finish_rank' in rr.columns else ('着順' if '着順' in rr.columns else None)
-        statuscol='result_status' if 'result_status' in rr.columns else None
-        if not carcol or not rankcol: continue
-        merged=sub.merge(rr[[carcol,rankcol]+([statuscol] if statuscol else [])],left_on='car_no',right_on=carcol)
-        if statuscol:
-            bad='反妨|落車|故障|反則|他落|不成立'
-            merged=merged[~merged[statuscol].fillna('').astype(str).str.contains(bad,regex=True)]
-        merged[rankcol]=pd.to_numeric(merged[rankcol],errors='coerce')
-        merged=merged.dropna(subset=[rankcol])
-        if len(merged)>=5:
-            datasets.append((str(pr.race_key),merged,rankcol))
-    return datasets
-
-def _matrix_for_race(df):
-    raw=np.array([[json.loads(x).get(k,0.0) for k in INITIAL_WEIGHTS] for x in df.features_json],float)
-    mu=np.nanmean(raw,axis=0); sd=np.nanstd(raw,axis=0)
-    sd=np.where(sd<1e-8,1.0,sd)
-    return np.nan_to_num((raw-mu)/sd)
-
-def _loss(weights,datasets,reg_strength):
-    w=np.array([weights[k] for k in INITIAL_WEIGHTS],float)
-    losses=[]
-    for _,df,rankcol in datasets:
-        X=_matrix_for_race(df); score=X@w
-        ranks=df[rankcol].to_numpy(float)
-        # 全ペア順位logloss
-        for i in range(len(df)):
-            for j in range(i+1,len(df)):
-                if ranks[i]==ranks[j]: continue
-                y=1.0 if ranks[i]<ranks[j] else 0.0
-                z=np.clip(score[i]-score[j],-20,20)
-                p=1/(1+np.exp(-z))
-                losses.append(-(y*np.log(p+1e-12)+(1-y)*np.log(1-p+1e-12)))
-    base=np.mean(losses) if losses else 99.0
-    initial=np.array(list(INITIAL_WEIGHTS.values()))
-    return float(base + reg_strength*np.mean((w-initial)**2))
-
-def learn_best_weights(search_rounds=3500,seed=42):
-    datasets=_load_training()
-    n=len(datasets)
-    if n<3:
-        raise RuntimeError(f'学習可能な予測＋結果が{n}レースです。最低3レース蓄積してください。')
-    init_learning_tables()
-    with sqlite3.connect(DB_PATH) as con:
-        cur={r[0]:float(r[1]) for r in con.execute('SELECT setting_name,current_value FROM learning_settings')}
-    # 少数時は初期値へ強く寄せる
-    reg=max(0.015,0.30/(n**0.65))
-    rng=np.random.default_rng(seed)
-    best=dict(cur); best_loss=_loss(best,datasets,reg)
-    old_loss=best_loss
-    scales=np.array([0.42,0.35,0.38,0.38,0.34,0.40,0.30])
-    centers=np.array([cur[k] for k in INITIAL_WEIGHTS])
-    for t in range(int(search_rounds)):
-        shrink=0.25+0.75*(1-t/max(search_rounds,1))
-        cand_arr=centers+rng.normal(0,scales*shrink)
-        cand_arr=np.clip(cand_arr,0.05,1.80)
-        cand={k:float(v) for k,v in zip(INITIAL_WEIGHTS,cand_arr)}
-        loss=_loss(cand,datasets,reg)
-        if loss<best_loss:
-            best,best_loss=cand,loss
-            centers=cand_arr
-    now=datetime.now().isoformat(timespec='seconds')
-    changes={k:best[k]-cur[k] for k in best}
-    with sqlite3.connect(DB_PATH) as con:
-        for k,v in best.items():
-            con.execute('UPDATE learning_settings SET current_value=?,updated_at=?,sample_races=?,reason=? WHERE setting_name=?',
-                        (v,now,n,'全登録レースの順位ペア誤差を最小化',k))
-        con.execute('INSERT INTO learning_history(learned_at,sample_races,old_score,new_score,settings_json,changes_json) VALUES(?,?,?,?,?,?)',
-                    (now,n,old_loss,best_loss,json.dumps(best,ensure_ascii=False),json.dumps(changes,ensure_ascii=False)))
-        con.commit()
-    return settings_table(),old_loss,best_loss,n
-
-def settings_table():
-    init_learning_tables()
-    with sqlite3.connect(DB_PATH) as con:
-        df=pd.read_sql_query('SELECT setting_name AS 設定,initial_value AS 初期値,current_value AS 現在値,updated_at AS 最終更新,sample_races AS 採用レース数,reason AS 変更理由 FROM learning_settings ORDER BY rowid',con)
-    df['変化量']=df['現在値']-df['初期値']
-    df['変化率%']=np.where(df['初期値']!=0,df['変化量']/df['初期値']*100,0)
-    df['方向']=np.where(df['変化量']>0.005,'↑ 強化',np.where(df['変化量']<-0.005,'↓ 弱化','→ ほぼ同じ'))
-    return df[['設定','初期値','現在値','変化量','変化率%','方向','採用レース数','最終更新','変更理由']]
-
-def learning_history_table(limit=20):
-    init_learning_tables()
-    with sqlite3.connect(DB_PATH) as con:
-        return pd.read_sql_query('SELECT learned_at AS 学習日時,sample_races AS レース数,old_score AS 更新前誤差,new_score AS 更新後誤差,changes_json AS 変更内容 FROM learning_history ORDER BY history_id DESC LIMIT ?',con,params=(int(limit),))
-
-def reset_weights_to_initial():
-    init_learning_tables(); now=datetime.now().isoformat(timespec='seconds')
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute('UPDATE learning_settings SET current_value=initial_value,updated_at=?,sample_races=0,reason=?',(now,'初期設定へ手動復元'))
-        con.commit()
-    return settings_table()
-
-# UI
-v14_date=widgets.Text(description='開催日',placeholder='2026/07/20')
-v14_venue=widgets.Text(description='開催場',placeholder='川口')
-v14_race=widgets.Text(description='レース',placeholder='12')
-v14_save=widgets.Button(description='最新予測をDB保存',button_style='info')
-v14_learn=widgets.Button(description='全結果から重み再学習',button_style='success')
-v14_show=widgets.Button(description='初期値との差を表示')
-v14_history=widgets.Button(description='学習履歴を表示')
-v14_reset=widgets.Button(description='初期設定へ戻す',button_style='warning')
-v14_out=widgets.Output()
-
-def _v14_save(_):
-    with v14_out:
-        _hidden_clear_output()
-        try:
-            key,n=save_latest_prediction(v14_date.value,v14_venue.value,v14_race.value)
-            print(f'保存完了: {key} / {n}選手')
-            print('レース結果を全文登録した後、「全結果から重み再学習」を押してください。')
-        except Exception as e: print('エラー:',e)
-def _v14_learn(_):
-    with v14_out:
-        _hidden_clear_output()
-        try:
-            df,a,b,n=learn_best_weights()
-            print(f'{n}レースを使って再学習しました。誤差 {a:.4f} → {b:.4f}')
-            _hidden_display(df.style.format({'初期値':'{:.3f}','現在値':'{:.3f}','変化量':'{:+.3f}','変化率%':'{:+.1f}%'}))
-        except Exception as e: print('エラー:',e)
-def _v14_show(_):
-    with v14_out:
-        _hidden_clear_output(); _hidden_display(settings_table().style.format({'初期値':'{:.3f}','現在値':'{:.3f}','変化量':'{:+.3f}','変化率%':'{:+.1f}%'}))
-def _v14_hist(_):
-    with v14_out:
-        _hidden_clear_output(); _hidden_display(learning_history_table())
-def _v14_reset(_):
-    with v14_out:
-        _hidden_clear_output(); print('初期設定へ戻しました。'); _hidden_display(reset_weights_to_initial())
-v14_save.on_click(_v14_save); v14_learn.on_click(_v14_learn); v14_show.on_click(_v14_show); v14_history.on_click(_v14_hist); v14_reset.on_click(_v14_reset)
-_hidden_display(widgets.VBox([
-    widgets.HTML('<b>Ver14.0 全履歴再学習</b><br>予測直後に開催情報を入力して保存し、結果全文登録後に再学習します。'),
-    widgets.HBox([v14_date,v14_venue,v14_race]),
-    widgets.HBox([v14_save,v14_learn,v14_show,v14_history,v14_reset]),v14_out
-]))
-
-# ============================================================
-# Ver14.1 条件依存特徴・選手別適用
-# ============================================================
-import re, sqlite3, json, math
-from datetime import datetime
-
-CONDITION_DEFAULTS = {
-    'min_condition_races': 5,
-    'min_other_races': 8,
-    'min_total_races': 14,
-    'min_effect': 0.11,
-    'min_confidence': 0.72,
-    'max_adjustment': 0.38,
-    'shrink_k': 8.0,
-}
-
-
-def init_condition_tables():
-    mount_and_init_db()
-    with sqlite3.connect(DB_PATH) as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS player_condition_profiles (
-            player_id INTEGER NOT NULL,
-            condition_type TEXT NOT NULL,
-            condition_value TEXT NOT NULL,
-            sample_condition INTEGER NOT NULL,
-            sample_other INTEGER NOT NULL,
-            score_condition REAL,
-            score_other REAL,
-            raw_effect REAL,
-            shrunk_effect REAL,
-            confidence REAL,
-            adjustment REAL,
-            is_active INTEGER NOT NULL DEFAULT 0,
-            calculated_at TEXT,
-            PRIMARY KEY(player_id, condition_type, condition_value)
-        );
-        CREATE TABLE IF NOT EXISTS condition_learning_history (
-            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            calculated_at TEXT,
-            player_count INTEGER,
-            active_profile_count INTEGER,
-            settings_json TEXT
-        );
-        """)
-        # 既存prediction_racesを条件保存対応へ拡張
-        cols={r[1] for r in con.execute('PRAGMA table_info(prediction_races)')}
-        additions={
-            'start_time_text':'TEXT','air_temp':'REAL','humidity':'REAL',
-            'weather':'TEXT','surface_condition':'TEXT','distance_m':'INTEGER',
-            'total_laps':'INTEGER','handicap_pattern':'TEXT'
-        }
-        for name,typ in additions.items():
-            if name not in cols:
-                con.execute(f'ALTER TABLE prediction_races ADD COLUMN {name} {typ}')
-        con.commit()
-
-
-def _num(x):
-    try:
-        v=float(x)
-        return v if np.isfinite(v) else np.nan
-    except Exception:
-        return np.nan
-
-
-def _time_band(text):
-    m=re.search(r'(\d{1,2}):(\d{2})',str(text or ''))
-    if not m: return '時間不明'
-    h=int(m.group(1))
-    if h < 15: return '昼'
-    if h < 18: return '夕方'
-    return '夜'
-
-
-def _temp_band(x, kind='走路'):
-    x=_num(x)
-    if not np.isfinite(x): return f'{kind}不明'
-    if kind=='走路':
-        if x < 20: return '低温(<20℃)'
-        if x < 35: return '中温(20-34℃)'
-        if x < 45: return '高温(35-44℃)'
-        return '酷熱(45℃以上)'
-    if x < 15: return '低温(<15℃)'
-    if x < 28: return '中温(15-27℃)'
-    return '高温(28℃以上)'
-
-
-def _humidity_band(x):
-    x=_num(x)
-    if not np.isfinite(x): return '湿度不明'
-    if x < 45: return '低湿度(<45%)'
-    if x < 70: return '中湿度(45-69%)'
-    return '高湿度(70%以上)'
-
-
-def _handicap_num(x):
-    m=re.search(r'-?\d+',str(x or ''))
-    return int(m.group()) if m else None
-
-
-def _handicap_band(x):
-    n=_handicap_num(x)
-    if n is None: return 'ハンデ不明'
-    if n <= 0: return '0m'
-    if n <= 10: return '10m以内'
-    if n <= 20: return '20m以内'
-    return '30m以上'
-
-
-def _surface_group(x):
-    s=str(x or '').strip()
-    if not s: return '走路不明'
-    if '良' in s: return '良走路'
-    if '湿' in s or '濡' in s: return '湿走路'
-    if '斑' in s: return '斑走路'
-    return s
-
-
-def _distance_band(x):
-    x=_num(x)
-    if not np.isfinite(x): return '距離不明'
-    if x <= 3100: return '通常距離(3100m以下)'
-    if x <= 4100: return '長距離(3101-4100m)'
-    return '超長距離(4100m超)'
-
-
-def _performance_score(rank, field_size):
-    rank=_num(rank); field_size=_num(field_size)
-    if not np.isfinite(rank) or not np.isfinite(field_size) or field_size <= 1: return np.nan
-    return float(np.clip((field_size-rank)/(field_size-1),0,1))
-
-
-def _load_condition_rows():
-    init_condition_tables()
-    with sqlite3.connect(DB_PATH) as con:
-        tables={r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if not {'races','race_entries','players'}.issubset(tables):
-            return pd.DataFrame()
-        q="""
-        SELECT e.race_id,e.player_id,p.player_name,e.car_no,e.finish,e.result_status,
-               e.handicap,e.trial_time,e.race_time,e.start_time,
-               r.race_date,r.venue,r.race_no,r.race_name,r.distance_m,r.total_laps,
-               r.weather,r.surface_condition,r.track_temp,r.air_temp,r.humidity,r.start_time_text
-        FROM race_entries e
-        JOIN races r ON r.race_id=e.race_id
-        LEFT JOIN players p ON p.player_id=e.player_id
-        """
-        df=pd.read_sql_query(q,con)
-    if df.empty: return df
-    bad='反妨|落車|故障|反則|他落|不成立'
-    df=df[~df['result_status'].fillna('').astype(str).str.contains(bad,regex=True)].copy()
-    df['finish']=pd.to_numeric(df['finish'],errors='coerce')
-    df=df.dropna(subset=['player_id','finish'])
-    sizes=df.groupby('race_id')['car_no'].transform('count')
-    df['field_size']=sizes
-    df['performance']=[_performance_score(a,b) for a,b in zip(df.finish,df.field_size)]
-    # 同レース内ハンデ構成
-    def dense_line(g):
-        hs=g['handicap'].map(_handicap_num)
-        counts=hs.value_counts(dropna=True)
-        return '同ハンデ多数' if (not counts.empty and counts.max()>=5) else '通常ハンデ構成'
-    patterns={rid:dense_line(g) for rid,g in df.groupby('race_id')}
-    df['handicap_pattern']=df['race_id'].map(patterns).fillna('通常ハンデ構成')
-    df['時間帯']=df['start_time_text'].map(_time_band)
-    df['走路温度帯']=df['track_temp'].map(lambda x:_temp_band(x,'走路'))
-    df['気温帯']=df['air_temp'].map(lambda x:_temp_band(x,'気温'))
-    df['湿度帯']=df['humidity'].map(_humidity_band)
-    df['走路状態']=df['surface_condition'].map(_surface_group)
-    df['天候条件']=df['weather'].fillna('天候不明').astype(str).str.strip().replace('','天候不明')
-    df['開催場条件']=df['venue'].fillna('開催場不明').astype(str)
-    df['ハンデ帯']=df['handicap'].map(_handicap_band)
-    df['ハンデ構成']=df['handicap_pattern']
-    df['距離帯']=df['distance_m'].map(_distance_band)
-    return df
-
-
-CONDITION_COLUMNS=['時間帯','走路温度帯','気温帯','湿度帯','走路状態','天候条件','開催場条件','ハンデ帯','ハンデ構成','距離帯']
-
-
-def _confidence_from_effect(a,b,effect):
-    # Welch型の標準誤差から、0.5～0.99の扱いやすい信頼度へ変換
-    na,nb=len(a),len(b)
-    if na<2 or nb<2: return 0.0
-    se=math.sqrt(float(np.var(a,ddof=1))/na + float(np.var(b,ddof=1))/nb + 1e-12)
-    z=abs(effect)/se if se>0 else 0.0
-    return float(np.clip(0.5 + 0.49*(1-math.exp(-0.55*z)),0,0.99))
-
-
-def rebuild_player_condition_profiles(settings=None):
-    cfg=dict(CONDITION_DEFAULTS)
-    if settings: cfg.update(settings)
-    df=_load_condition_rows()
-    if df.empty:
-        raise RuntimeError('公式結果データがまだありません。')
-    now=datetime.now().isoformat(timespec='seconds')
-    records=[]
-    for pid,g in df.groupby('player_id'):
-        if len(g)<cfg['min_total_races']: continue
-        for ctype in CONDITION_COLUMNS:
-            for cval,cg in g.groupby(ctype):
-                other=g[g[ctype]!=cval]
-                if len(cg)<cfg['min_condition_races'] or len(other)<cfg['min_other_races']: continue
-                a=cg.performance.dropna().to_numpy(float); b=other.performance.dropna().to_numpy(float)
-                if len(a)<cfg['min_condition_races'] or len(b)<cfg['min_other_races']: continue
-                ma=float(np.mean(a)); mb=float(np.mean(b)); raw=ma-mb
-                shrink=len(a)/(len(a)+cfg['shrink_k'])
-                shrunk=raw*shrink
-                conf=_confidence_from_effect(a,b,raw)
-                active=(abs(shrunk)>=cfg['min_effect'] and conf>=cfg['min_confidence'])
-                adj=float(np.clip(shrunk*1.8,-cfg['max_adjustment'],cfg['max_adjustment'])) if active else 0.0
-                records.append((int(pid),ctype,str(cval),len(a),len(b),ma,mb,raw,shrunk,conf,adj,int(active),now))
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute('DELETE FROM player_condition_profiles')
-        con.executemany("""INSERT INTO player_condition_profiles(
-            player_id,condition_type,condition_value,sample_condition,sample_other,
-            score_condition,score_other,raw_effect,shrunk_effect,confidence,
-            adjustment,is_active,calculated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",records)
-        active=sum(r[11] for r in records)
-        con.execute('INSERT INTO condition_learning_history(calculated_at,player_count,active_profile_count,settings_json) VALUES(?,?,?,?)',
-                    (now,int(df.player_id.nunique()),int(active),json.dumps(cfg,ensure_ascii=False)))
-        con.commit()
-    return condition_profile_table(active_only=True),len(records),sum(r[11] for r in records)
-
-
-def condition_profile_table(player_name='',active_only=True):
-    init_condition_tables()
-    where=[]; params=[]
-    if active_only: where.append('c.is_active=1')
-    if str(player_name).strip():
-        where.append('p.player_name LIKE ?'); params.append('%'+str(player_name).strip()+'%')
-    sql="""SELECT p.player_name AS 選手名,c.condition_type AS 条件種類,c.condition_value AS 条件,
-           c.sample_condition AS 条件内件数,c.sample_other AS 比較件数,
-           c.score_condition AS 条件内成績,c.score_other AS その他成績,
-           c.shrunk_effect AS 補正前効果,c.confidence AS 信頼度,
-           c.adjustment AS 予測補正,
-           CASE WHEN c.adjustment>0 THEN '得意' ELSE '不得意' END AS 判定,
-           c.calculated_at AS 算出日時
-           FROM player_condition_profiles c LEFT JOIN players p ON p.player_id=c.player_id"""
-    if where: sql+=' WHERE '+' AND '.join(where)
-    sql+=' ORDER BY ABS(c.adjustment) DESC,c.sample_condition DESC'
-    with sqlite3.connect(DB_PATH) as con:
-        return pd.read_sql_query(sql,con,params=params)
-
-
-def _current_condition_map(meta):
-    return {
-        '時間帯':_time_band(meta.get('start_time_text','')),
-        '走路温度帯':_temp_band(meta.get('track_temp'),'走路'),
-        '気温帯':_temp_band(meta.get('air_temp'),'気温'),
-        '湿度帯':_humidity_band(meta.get('humidity')),
-        '走路状態':_surface_group(meta.get('surface_condition')),
-        '天候条件':str(meta.get('weather') or '天候不明').strip(),
-        '開催場条件':str(meta.get('venue') or '開催場不明').strip(),
-        'ハンデ構成':str(meta.get('handicap_pattern') or '通常ハンデ構成'),
-        '距離帯':_distance_band(meta.get('distance_m')),
-    }
-
-
-def apply_condition_profiles(pred_df,meta):
-    init_condition_tables()
-    out=pred_df.copy()
-    name_col='選手名' if '選手名' in out.columns else None
-    if not name_col: raise ValueError('予測表に選手名列がありません。')
-    cmap=_current_condition_map(meta)
-    with sqlite3.connect(DB_PATH) as con:
-        prof=pd.read_sql_query("""SELECT p.player_name,c.* FROM player_condition_profiles c
-          JOIN players p ON p.player_id=c.player_id WHERE c.is_active=1""",con)
-    adjustments=[]; reasons=[]
-    for _,row in out.iterrows():
-        name=str(row[name_col]).strip(); ps=prof[prof.player_name.astype(str).str.strip()==name]
-        total=0.0; rs=[]
-        # 個人ハンデ帯も現在行から判定
-        local=dict(cmap); local['ハンデ帯']=_handicap_band(row.get('ハンデ',row.get('ハンデm','')))
-        for ctype,cval in local.items():
-            m=ps[(ps.condition_type==ctype)&(ps.condition_value.astype(str)==str(cval))]
-            if m.empty: continue
-            r=m.iloc[0]; a=float(r.adjustment)
-            total+=a
-            rs.append(f"{ctype}:{cval} {a:+.3f}(n={int(r.sample_condition)},信頼{float(r.confidence):.0%})")
-        total=float(np.clip(total,-0.55,0.55))
-        adjustments.append(total); reasons.append(' / '.join(rs) if rs else '適用なし')
-    out['条件依存補正']=adjustments
-    out['条件補正理由']=reasons
-    # 総合点系があれば表示用に反映。元列は残す
-    target=next((c for c in ['総合点','AI総合点','予測スコア'] if c in out.columns),None)
-    if target:
-        out['条件補正後'+target]=pd.to_numeric(out[target],errors='coerce').fillna(0)+out['条件依存補正']
-    return out
-
-
-def apply_conditions_to_latest_prediction(meta):
-    global LATEST_PREDICTION_DF
-    if 'LATEST_PREDICTION_DF' not in globals():
-        raise RuntimeError('先に予測を実行してください。')
-    LATEST_PREDICTION_DF=apply_condition_profiles(LATEST_PREDICTION_DF,meta)
-    return LATEST_PREDICTION_DF
-
-# UI
-v141_time=widgets.Text(description='発走時刻',placeholder='20:45')
-v141_track=widgets.FloatText(description='走路温度',value=0.0)
-v141_air=widgets.FloatText(description='気温',value=0.0)
-v141_hum=widgets.FloatText(description='湿度',value=0.0)
-v141_weather=widgets.Text(description='天候',placeholder='晴')
-v141_surface=widgets.Text(description='走路',placeholder='良走路')
-v141_venue=widgets.Text(description='開催場',placeholder='川口')
-v141_distance=widgets.IntText(description='距離m',value=3100)
-v141_pattern=widgets.Dropdown(description='ハンデ構成',options=['通常ハンデ構成','同ハンデ多数'])
-v141_rebuild=widgets.Button(description='全結果から条件特徴を再分析',button_style='success')
-v141_apply=widgets.Button(description='今回予測へ条件補正を適用',button_style='info')
-v141_show=widgets.Button(description='有効な条件特徴を表示')
-v141_player=widgets.Text(description='選手検索',placeholder='空欄なら全員')
-v141_out=widgets.Output()
-
-def _v141_meta():
-    return {'start_time_text':v141_time.value,'track_temp':v141_track.value or np.nan,
-            'air_temp':v141_air.value or np.nan,'humidity':v141_hum.value or np.nan,
-            'weather':v141_weather.value,'surface_condition':v141_surface.value,
-            'venue':v141_venue.value,'distance_m':v141_distance.value,
-            'handicap_pattern':v141_pattern.value}
-
-def _v141_rebuild(_):
-    with v141_out:
-        _hidden_clear_output()
-        try:
-            df,n,a=rebuild_player_condition_profiles()
-            print(f'条件候補 {n}件を検証し、信頼条件を満たす特徴 {a}件を有効化しました。')
-            if df.empty: print('まだ有効な条件特徴はありません。結果件数を蓄積してください。')
-            else: _hidden_display(df.style.format({'条件内成績':'{:.3f}','その他成績':'{:.3f}','補正前効果':'{:+.3f}','信頼度':'{:.1%}','予測補正':'{:+.3f}'}))
-        except Exception as e: print('エラー:',e)
-
-def _v141_apply(_):
-    with v141_out:
-        _hidden_clear_output()
-        try:
-            df=apply_conditions_to_latest_prediction(_v141_meta())
-            cols=[c for c in ['車','車番','選手名','条件依存補正','条件補正理由','条件補正後総合点','条件補正後AI総合点','条件補正後予測スコア'] if c in df.columns]
-            _hidden_display(df[cols] if cols else df)
-        except Exception as e: print('エラー:',e)
-
-def _v141_show(_):
-    with v141_out:
-        _hidden_clear_output()
-        df=condition_profile_table(v141_player.value,True)
-        if df.empty: print('該当する有効特徴はありません。')
-        else: _hidden_display(df.style.format({'条件内成績':'{:.3f}','その他成績':'{:.3f}','補正前効果':'{:+.3f}','信頼度':'{:.1%}','予測補正':'{:+.3f}'}))
-
-v141_rebuild.on_click(_v141_rebuild)
-v141_apply.on_click(_v141_apply)
-v141_show.on_click(_v141_show)
-_hidden_display(widgets.VBox([
-    widgets.HTML('<b>Ver14.1 選手別・条件依存特徴</b><br>特定条件で差が繰り返し確認できた選手だけ補正します。'),
-    widgets.HBox([v141_time,v141_venue,v141_distance]),
-    widgets.HBox([v141_track,v141_air,v141_hum]),
-    widgets.HBox([v141_weather,v141_surface,v141_pattern]),
-    widgets.HBox([v141_rebuild,v141_apply]),
-    widgets.HBox([v141_player,v141_show]),v141_out
-]))
 
 # ============================================================
 # AutoRaceAI Ver15.0
@@ -5191,29 +3683,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-class _WidgetDummy:
-    def __init__(self, *args, **kwargs):
-        self.value = kwargs.get("value", None)
-        self.children = kwargs.get("children", [])
-    def __getattr__(self, name):
-        return _WidgetDummy()
-    def __call__(self, *args, **kwargs):
-        return _WidgetDummy(*args, **kwargs)
-    def on_click(self, *args, **kwargs): return None
-    def observe(self, *args, **kwargs): return None
-    def __enter__(self): return self
-    def __exit__(self, *args): return False
-class _WidgetsDummy:
-    def __getattr__(self, name): return _WidgetDummy
-widgets = _WidgetsDummy()
-def display(*args, **kwargs): return None
-def clear_output(*args, **kwargs): return None
 
-HTML = lambda x=None, *args, **kwargs: x
 
 # Ver14.1までのDB_PATHを優先して利用します。
 if "DB_PATH" not in globals():
-    DB_DIR = Path(os.environ.get('AUTORACEAI_DATA_DIR', str(Path(__file__).resolve().parent / 'data')))
+    DB_DIR = Path("/content/drive/MyDrive/AutoRaceAI")
 DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = str(DB_DIR / "autorace_players.sqlite3")
 
@@ -5972,268 +4446,7 @@ def v15_save_result_using_existing(text):
 v15_init_tables()
 
 style = {"description_width": "110px"}
-wide_layout = widgets.Layout(width="100%", min_height="220px")
-button_layout = widgets.Layout(width="180px", height="42px")
 
-prediction_text = widgets.Textarea(
-    description="予測ページ全文",
-    placeholder="公式サイトのレース情報・出走表をまとめて貼り付け",
-    layout=wide_layout,
-    style=style,
-)
-btn_prediction_preview = widgets.Button(
-    description="① 解析プレビュー",
-    button_style="info",
-    layout=button_layout,
-)
-btn_prediction_save = widgets.Button(
-    description="② DB保存",
-    button_style="success",
-    layout=button_layout,
-)
-btn_prediction_apply = widgets.Button(
-    description="③ 予測へ反映",
-    button_style="primary",
-    layout=button_layout,
-)
-btn_similar = widgets.Button(
-    description="類似レース表示",
-    layout=button_layout,
-)
-out_prediction = widgets.Output()
-
-player_name_input = widgets.Text(
-    description="選手名",
-    placeholder="ページから取れない場合だけ入力",
-    layout=widgets.Layout(width="100%"),
-    style=style,
-)
-player_text = widgets.Textarea(
-    description="選手履歴全文",
-    placeholder="選手ページの過去成績表を貼り付け",
-    layout=wide_layout,
-    style=style,
-)
-btn_player_preview = widgets.Button(
-    description="① 履歴プレビュー",
-    button_style="info",
-    layout=button_layout,
-)
-btn_player_save = widgets.Button(
-    description="② 履歴DB追加",
-    button_style="success",
-    layout=button_layout,
-)
-out_player = widgets.Output()
-
-result_text = widgets.Textarea(
-    description="結果ページ全文",
-    placeholder="公式結果ページを最初から周回順位までまとめて貼り付け",
-    layout=wide_layout,
-    style=style,
-)
-btn_result_preview = widgets.Button(
-    description="① 結果プレビュー",
-    button_style="info",
-    layout=button_layout,
-)
-btn_result_save = widgets.Button(
-    description="② 結果を登録",
-    button_style="success",
-    layout=button_layout,
-)
-out_result = widgets.Output()
-
-
-def _v15_prediction_preview(_):
-    with out_prediction:
-        _hidden_clear_output()
-        text = prediction_text.value
-        meta, entries = v15_parse_prediction_page(text)
-        V15_STATE["race_meta"] = meta
-        V15_STATE["entries"] = entries
-        V15_STATE["raw_prediction_text"] = text
-
-        print("【解析したレース情報】")
-        _hidden_display(pd.DataFrame([meta]).T.rename(columns={0: "値"}))
-
-        print("\n【解析した出走選手】")
-        if entries.empty:
-            print("出走選手を読み取れませんでした。車番から始まる行を含めて貼り付けてください。")
-        else:
-            _hidden_display(entries)
-
-        missing = [k for k in ["開催日", "開催場", "レース", "距離"] if not meta.get(k)]
-        if missing:
-            print("\n⚠ 未取得項目:", "、".join(missing))
-        print("\n内容を確認してから「DB保存」または「予測へ反映」を押してください。")
-
-
-def _v15_prediction_save(_):
-    with out_prediction:
-        if not V15_STATE["race_meta"]:
-            print("先に解析プレビューを実行してください。")
-            return
-        key = v15_save_race_input(
-            V15_STATE["race_meta"],
-            V15_STATE["entries"],
-            V15_STATE["raw_prediction_text"],
-        )
-        print(f"✅ レース入力をDBへ保存しました。登録キー: {key}")
-
-
-def _v15_prediction_apply(_):
-    with out_prediction:
-        if not V15_STATE["race_meta"]:
-            print("先に解析プレビューを実行してください。")
-            return
-        meta, entries = v15_apply_to_prediction(
-            V15_STATE["race_meta"],
-            V15_STATE["entries"],
-        )
-        print("✅ 解析内容を予測用変数へ反映しました。")
-        print("利用変数: CURRENT_RACE_META / CURRENT_ENTRY_DF")
-        if entries.empty:
-            print("⚠ 出走表が空です。既存Excel入力と組み合わせて利用してください。")
-
-
-def _v15_similar(_):
-    with out_prediction:
-        if not V15_STATE["race_meta"]:
-            print("先に解析プレビューを実行してください。")
-            return
-        df = v15_find_similar_races(
-            V15_STATE["race_meta"],
-            V15_STATE["entries"],
-            top_n=10,
-        )
-        print("【類似レース候補】")
-        if df.empty:
-            print("比較できる保存済みレースがまだありません。")
-        else:
-            _hidden_display(df)
-            print("※ 類似度は初期重みによる参考値です。結果蓄積後に重みを再学習します。")
-
-
-def _v15_player_preview(_):
-    with out_player:
-        _hidden_clear_output()
-        df = v15_parse_player_history(
-            player_text.value,
-            player_name=player_name_input.value.strip() or None,
-        )
-        V15_STATE["player_history"] = df
-        V15_STATE["raw_player_text"] = player_text.value
-        if df.empty:
-            print("履歴行を読み取れませんでした。開催日を含む成績表を貼り付けてください。")
-        else:
-            print(f"解析件数: {len(df)}件")
-            _hidden_display(df.drop(columns=["_raw"], errors="ignore"))
-            if (df["選手名"].fillna("").str.strip() == "").any():
-                print("⚠ 選手名が空です。上の選手名欄へ入力して、もう一度プレビューしてください。")
-
-
-def _v15_player_save(_):
-    with out_player:
-        df = V15_STATE.get("player_history")
-        if df is None or df.empty:
-            print("先に履歴プレビューを実行してください。")
-            return
-        if (df["選手名"].fillna("").str.strip() == "").any():
-            print("選手名が空のため保存できません。")
-            return
-        inserted, skipped = v15_save_player_history(df)
-        print(f"✅ 新規追加: {inserted}件 / 重複スキップ: {skipped}件")
-
-
-def _v15_result_preview(_):
-    with out_result:
-        _hidden_clear_output()
-        V15_STATE["raw_result_text"] = result_text.value
-        parsed = v15_parse_result_preview(result_text.value)
-        print("【結果解析プレビュー】")
-        if isinstance(parsed, dict):
-            summary = {}
-            for k, v in parsed.items():
-                if isinstance(v, pd.DataFrame):
-                    print(f"\n{k}")
-                    _hidden_display(v)
-                elif isinstance(v, (list, tuple)) and v and isinstance(v[0], dict):
-                    print(f"\n{k}")
-                    _hidden_display(pd.DataFrame(v))
-                elif k != "raw_text":
-                    summary[k] = v
-            if summary:
-                _hidden_display(pd.DataFrame([summary]).T.rename(columns={0: "値"}))
-        else:
-            _hidden_display(parsed)
-        print("\n内容を確認してから「結果を登録」を押してください。")
-
-
-def _v15_result_save(_):
-    with out_result:
-        if not result_text.value.strip():
-            print("結果ページ全文を貼り付けてください。")
-            return
-        try:
-            result = v15_save_result_using_existing(result_text.value)
-            print("✅ 公式結果をDBへ登録しました。")
-            if result is not None:
-                _hidden_display(result) if isinstance(result, pd.DataFrame) else print(result)
-        except Exception as exc:
-            print("❌ 登録できませんでした。")
-            print(type(exc).__name__, str(exc))
-
-
-btn_prediction_preview.on_click(_v15_prediction_preview)
-btn_prediction_save.on_click(_v15_prediction_save)
-btn_prediction_apply.on_click(_v15_prediction_apply)
-btn_similar.on_click(_v15_similar)
-btn_player_preview.on_click(_v15_player_preview)
-btn_player_save.on_click(_v15_player_save)
-btn_result_preview.on_click(_v15_result_preview)
-btn_result_save.on_click(_v15_result_save)
-
-prediction_box = widgets.VBox([
-    widgets.HTML("<h3>📋 予測前：公式ページ全文を貼り付け</h3>"),
-    prediction_text,
-    widgets.HBox([
-        btn_prediction_preview,
-        btn_prediction_save,
-        btn_prediction_apply,
-        btn_similar,
-    ]),
-    out_prediction,
-])
-
-player_box = widgets.VBox([
-    widgets.HTML("<h3>👤 選手履歴：選手ページを貼り付け</h3>"),
-    player_name_input,
-    player_text,
-    widgets.HBox([btn_player_preview, btn_player_save]),
-    out_player,
-])
-
-result_box = widgets.VBox([
-    widgets.HTML("<h3>🏁 レース後：公式結果ページ全文を貼り付け</h3>"),
-    result_text,
-    widgets.HBox([btn_result_preview, btn_result_save]),
-    out_result,
-])
-
-v15_tabs = widgets.Tab(children=[prediction_box, player_box, result_box])
-v15_tabs.set_title(0, "予測入力")
-v15_tabs.set_title(1, "選手履歴")
-v15_tabs.set_title(2, "結果登録")
-
-_hidden_display(HTML("""
-<div style="padding:12px;border:1px solid #bbb;border-radius:10px;margin-bottom:10px">
-<b>AutoRaceAI Ver15.0</b><br>
-スマホでは公式ページを長押しコピーし、各タブの欄へ貼り付けます。
-必ずプレビューで解析内容を確認してから保存してください。
-</div>
-"""))
-_hidden_display(v15_tabs)
 
 # ============================================================
 # Ver15.1 縦型選手履歴コピペ対応
@@ -6546,7 +4759,7 @@ def v15_save_player_history(df, db_path=DB_PATH):
     return inserted, skipped
 
 
-print("✅ Ver15.1 縦型選手履歴パーサーを読み込みました。")
+
 
 # ============================================================
 # Ver15.2 縦型出走表コピペ対応
@@ -6797,221 +5010,187 @@ def v15_parse_race_meta(text):
     return meta
 
 
-print("✅ Ver15.2 縦型出走表パーサーを読み込みました。")
-class _FilesShim:
-    @staticmethod
-    def download(path):
-        return path
-files = _FilesShim()
 
 
-# Ver17 outer compatibility functions
-def read_history(ws):
-    df = _original_read_history(ws)
-    required = [
-        "開催日","開催場","レース","着順","出走","走路","ハンデ",
-        "ハンデ数値","試走T","競走T","ST","タイム差","有効"
-    ]
-    for col in required:
-        if col not in df.columns:
-            df[col] = pd.Series(dtype="bool" if col == "有効" else "float64")
-    return df[required]
 
-def prepare_history(df, current, race, settings):
-    x = _original_prepare_history(df, current, race, settings)
+# ============================================================
+# AutoRaceAI Ver16.0
+# 出走表コピペ + SQLite履歴 → Ver15.2本体へ直接接続
+# ============================================================
 
-    required_columns = {
-        "開催日": "float64",
-        "開催場": "object",
-        "レース": "object",
-        "着順": "float64",
-        "出走": "float64",
-        "走路": "object",
-        "ハンデ": "object",
-        "ハンデ数値": "float64",
-        "試走T": "float64",
-        "競走T": "float64",
-        "ST": "float64",
-        "タイム差": "float64",
-        "有効": "bool",
-        "経過日数": "float64",
-        "最近重み": "float64",
-        "場重み": "float64",
-        "走路適合重み": "float64",
-        "走路重み": "float64",
-        "ハンデ重み": "float64",
-        "総合重み": "float64",
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils.datetime import to_excel
+from datetime import datetime
+import traceback
+
+VER16_LATEST_DF = None
+VER16_LATEST_BETS = None
+VER16_LATEST_OUTPUT = None
+
+def ver16_safe_float(v, default=None):
+    try:
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+def ver16_surface(v):
+    s = str(v or "")
+    if "湿" in s:
+        return "湿"
+    if "斑" in s:
+        return "斑"
+    if "良" in s:
+        return "良"
+    return s or "良"
+
+def ver16_get_history(name):
+    # Ver13 DB管理関数を優先
+    try:
+        df = get_player_history(v15_normalize_name(name), model_only=True)
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+
+    # 名前空白差のフォールバック
+    try:
+        target = re.sub(r"[\s　]+", "", str(name))
+        with sqlite3.connect(str(DB_PATH)) as con:
+            return pd.read_sql_query("""
+                SELECT
+                    h.race_date AS 開催日,
+                    h.venue AS 開催場,
+                    h.race_no AS レース,
+                    h.finish AS 着順,
+                    h.starters AS 出走,
+                    h.surface AS 走路,
+                    h.handicap AS ハンデ,
+                    h.trial_time AS 試走T,
+                    h.race_time AS 競走T,
+                    h.start_time AS ST,
+                    h.result_status AS 結果区分
+                FROM race_history h
+                JOIN players p ON p.player_id=h.player_id
+                WHERE REPLACE(REPLACE(p.player_name,' ',''),'　','')=?
+                  AND COALESCE(h.use_for_model,1)=1
+                ORDER BY h.race_date DESC, h.history_id DESC
+            """, con, params=(target,))
+    except Exception:
+        return pd.DataFrame()
+
+def ver16_make_settings_sheet(ws):
+    ws["A1"] = "設定項目"
+    ws["B1"] = "値"
+    defaults = {
+        4:30, 5:1.35, 6:0.85, 7:1.5, 8:0.7, 9:1.4, 10:1.1, 11:0.75,
+        12:0.04, 22:0.018, 29:24, 31:8, 32:8, 33:5, 34:5, 35:6,
+        36:8, 37:6, 38:4, 39:2, 40:1, 43:6, 44:20, 45:0.6,
+        49:6, 50:6, 51:4, 52:6
     }
+    labels = {
+        4:"最近重視日数",5:"同一開催場倍率",6:"別開催場倍率",
+        7:"同一走路倍率",8:"別走路倍率",9:"同一ハンデ倍率",
+        10:"近接ハンデ倍率",11:"遠隔ハンデ倍率",12:"ST補正係数",
+        22:"10m換算秒",29:"試走点",31:"ST点",32:"ハンデ適性点",
+        33:"開催場適性点",34:"走路適性点",35:"位置取り点",
+        36:"着順指数点",37:"勝率点",38:"連対率点",39:"上昇度点",
+        40:"再現性点",43:"ハンデ改善点",44:"満点改善幅",
+        45:"前走比率",49:"3着以内率点",50:"平均着順点",
+        51:"着順安定度点",52:"審査Pランク点"
+    }
+    for r, value in defaults.items():
+        ws.cell(r, 1, labels.get(r, f"設定{r}"))
+        ws.cell(r, 2, value)
 
-    for column, dtype in required_columns.items():
-        if column not in x.columns:
-            x[column] = pd.Series(index=x.index, dtype=dtype)
+def ver16_build_virtual_excel(text):
+    meta = v15_parse_race_meta(text)
+    entries = v15_parse_entries(text)
 
-    return x
+    if entries.empty:
+        raise ValueError("出走表を解析できませんでした。公式ページを全文コピーして貼り付けてください。")
+    if entries["車番"].nunique() < 2:
+        raise ValueError("解析できた選手が少なすぎます。車番から選手情報まで含めて貼り付けてください。")
 
-def _has_value(v):
-    if v is None:
-        return False
-    if isinstance(v, float) and np.isnan(v):
-        return False
-    return str(v).strip() not in ("", "—", "-", "－", "nan", "None")
+    wb = Workbook()
+    wb.remove(wb.active)
 
-def _normalized_race_no(v):
-    s = _s(v).upper().replace("Ｒ", "R").strip()
-    if not s:
-        return ""
-    m = re.search(r"(\d+)", s)
-    return f"{int(m.group(1))}R" if m else s
+    # レース予測
+    race_ws = wb.create_sheet("レース予測")
+    date_text = meta.get("開催日") or datetime.now().strftime("%Y-%m-%d")
+    venue = meta.get("開催場") or ""
+    surface = ver16_surface(meta.get("走路状態") or meta.get("走路状況") or "良")
+    race_ws.append(["レース開催日", date_text])
+    race_ws.append(["今回の開催場", venue])
+    race_ws.append(["今回の走路", surface])
+    race_ws.append(["レース", meta.get("レース") or meta.get("レース番号") or ""])
+    race_ws.append(["距離", meta.get("距離") or 3100])
+    race_ws.append(["周回数", meta.get("周回数") or 6])
 
-def _find_existing_history(con, player_id, row):
-    race_date = _date_text(row.get("開催日"))
-    venue = _s(row.get("開催場"))
-    race_no = _normalized_race_no(row.get("レース"))
+    # 設定
+    set_ws = wb.create_sheet("設定")
+    ver16_make_settings_sheet(set_ws)
 
-    if not race_date or not venue:
-        return None
+    history_headers = ["開催日","開催場","レース","着順","出走","走路","ハンデ","試走T","競走T","ST"]
 
-    # Rあり: 完全一致を優先し、なければ同日同場のR空欄を統合対象にする
-    if race_no:
-        exact = con.execute("""
-            SELECT history_id FROM race_history
-            WHERE player_id=? AND race_date=? AND venue=?
-              AND UPPER(REPLACE(COALESCE(race_no,''),'Ｒ','R'))=?
-            ORDER BY history_id LIMIT 1
-        """, (player_id, race_date, venue, race_no)).fetchone()
-        if exact:
-            return exact[0]
+    entry_map = {int(r["車番"]): r for _, r in entries.iterrows()}
 
-        blank = con.execute("""
-            SELECT history_id FROM race_history
-            WHERE player_id=? AND race_date=? AND venue=?
-              AND TRIM(COALESCE(race_no,''))=''
-            ORDER BY history_id
-        """, (player_id, race_date, venue)).fetchall()
-        return blank[0][0] if len(blank) == 1 else None
+    # 本体は選手1～8を要求するため、8枚必ず生成
+    for car in range(1, 9):
+        ws = wb.create_sheet(f"選手{car}")
+        row = entry_map.get(car)
 
-    # Rなし: 同日同場の候補が1件だけなら統合。複数Rなら誤結合防止で新規扱い。
-    candidates = con.execute("""
-        SELECT history_id FROM race_history
-        WHERE player_id=? AND race_date=? AND venue=?
-        ORDER BY history_id
-    """, (player_id, race_date, venue)).fetchall()
-    return candidates[0][0] if len(candidates) == 1 else None
+        if row is None:
+            ws["B2"] = f"未登録{car}"
+            ws["E2"] = 3.99
+            ws["G2"] = 0
+            ws["E3"] = surface
+            ws["I2"] = 0
+            ws["I3"] = "B-999"
+            hist = pd.DataFrame()
+        else:
+            name = str(row.get("選手名", "")).strip()
+            ws["B2"] = name
+            ws["E2"] = ver16_safe_float(row.get("試走T"), ver16_safe_float(row.get("平均試走T"), 3.50))
+            ws["G2"] = ver16_safe_float(row.get("ハンデ"), 0)
+            ws["E3"] = surface
+            ws["I2"] = ver16_safe_float(row.get("審査P"), 0)
+            ws["I3"] = str(row.get("現ランク") or row.get("級別") or "B-999")
+            hist = ver16_get_history(name)
 
-def add_history_rows(player, rows, source="履歴登録"):
-    added = updated = 0
-    canonical = _canonical_player_name(player)
+        header_row = 6
+        for c, h in enumerate(history_headers, 1):
+            ws.cell(header_row, c, h)
 
-    with sqlite3.connect(str(DB_PATH)) as con:
-        pid = _ensure_player(con, canonical)
+        if not hist.empty:
+            hist = hist.copy()
+            for i, (_, hrow) in enumerate(hist.head(100).iterrows(), header_row + 1):
+                for c, h in enumerate(history_headers, 1):
+                    value = hrow.get(h)
+                    if h == "開催日" and value not in (None, ""):
+                        dt = pd.to_datetime(value, errors="coerce")
+                        if not pd.isna(dt):
+                            value = dt.to_pydatetime()
+                    if pd.isna(value) if not isinstance(value, str) else False:
+                        value = None
+                    ws.cell(i, c, value)
 
-        for row in rows:
-            normalized = {
-                "開催日": _date_text(row.get("開催日")),
-                "開催場": _s(row.get("開催場")),
-                "レース": _normalized_race_no(row.get("レース")),
-                "着順": _num(row.get("着順")),
-                "出走": _num(row.get("出走")),
-                "走路": _s(row.get("走路")),
-                "ハンデ": _s(row.get("ハンデ")),
-                "試走T": _num(row.get("試走T")),
-                "競走T": _num(row.get("競走T")),
-                "ST": _num(row.get("ST")),
-                "結果区分": _s(row.get("結果区分", "通常")) or "通常",
-            }
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue(), meta, entries
 
-            if not normalized["開催日"] or not normalized["開催場"]:
-                continue
-
-            status = normalized["結果区分"]
-            use = 0 if status in ["反妨","落車","故障","他落","反則","不成立"] else 1
-            existing_id = _find_existing_history(con, pid, normalized)
-
-            if existing_id is None:
-                key_row = normalized.copy()
-                key_row["レース"] = normalized["レース"]
-                record_key = _record_key(canonical, key_row)
-                # 同じ内容由来のキー衝突を避けるため、必要時だけ連番化
-                suffix = 0
-                base_key = record_key
-                while con.execute(
-                    "SELECT 1 FROM race_history WHERE record_key=?", (record_key,)
-                ).fetchone():
-                    suffix += 1
-                    record_key = hashlib.sha256(
-                        f"{base_key}|{suffix}".encode()
-                    ).hexdigest()
-
-                con.execute("""
-                    INSERT INTO race_history(
-                        player_id,race_date,venue,race_no,finish,starters,surface,
-                        handicap,trial_time,race_time,start_time,result_status,
-                        use_for_model,source,record_key
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    pid, normalized["開催日"], normalized["開催場"],
-                    normalized["レース"], normalized["着順"], normalized["出走"],
-                    normalized["走路"], normalized["ハンデ"],
-                    normalized["試走T"], normalized["競走T"], normalized["ST"],
-                    status, use, source, record_key
-                ))
-                added += 1
-                continue
-
-            current = con.execute("""
-                SELECT race_no,finish,starters,surface,handicap,
-                       trial_time,race_time,start_time,result_status,source
-                FROM race_history WHERE history_id=?
-            """, (existing_id,)).fetchone()
-
-            columns = [
-                "race_no","finish","starters","surface","handicap",
-                "trial_time","race_time","start_time","result_status"
-            ]
-            incoming = [
-                normalized["レース"], normalized["着順"], normalized["出走"],
-                normalized["走路"], normalized["ハンデ"],
-                normalized["試走T"], normalized["競走T"], normalized["ST"], status
-            ]
-
-            updates = {}
-            for col, old_value, new_value in zip(columns, current[:9], incoming):
-                # 既存空欄を補完。結果系は新しい有効値があれば更新。
-                if _has_value(new_value) and (
-                    not _has_value(old_value)
-                    or col in {"finish","trial_time","race_time","start_time","result_status"}
-                ):
-                    updates[col] = new_value
-
-            updates["use_for_model"] = use
-            updates["source"] = source
-
-            if updates:
-                set_sql = ", ".join(f"{k}=?" for k in updates)
-                con.execute(
-                    f"UPDATE race_history SET {set_sql} WHERE history_id=?",
-                    (*updates.values(), existing_id)
-                )
-                updated += 1
-
-    return added, updated
-
-def _canonical_player_name(name):
-    return re.sub(r"[\s　]+", "", str(name or "")).strip()
-
-def _ensure_player(con, name):
-    canonical = _canonical_player_name(name)
-    if not canonical:
-        raise ValueError("選手名が空です")
-    con.execute(
-        "INSERT OR IGNORE INTO players(player_name) VALUES (?)",
-        (canonical,)
+def ver16_run_prediction(text, trials=10000, seed=20260719):
+    content, meta, entries = ver16_build_virtual_excel(text)
+    track_temp = ver16_safe_float(meta.get("走路温度"), 30.0)
+    filename = f"AutoRaceAI_Ver16_{meta.get('開催場') or 'race'}_{meta.get('レース') or ''}R.xlsx"
+    df, bets, output = run_model(
+        content,
+        filename,
+        min(int(trials), 20000),
+        int(seed),
+        float(track_temp)
     )
-    con.execute(
-        "UPDATE players SET updated_at=CURRENT_TIMESTAMP WHERE player_name=?",
-        (canonical,)
-    )
-    return con.execute(
-        "SELECT player_id FROM players WHERE player_name=?",
-        (canonical,)
-    ).fetchone()[0]
+    return df, bets, output, entries, meta
+
