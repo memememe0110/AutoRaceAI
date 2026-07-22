@@ -1,0 +1,7017 @@
+import os
+
+import io
+import math
+import re
+from collections import Counter
+from datetime import datetime, date
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+def _hidden_display(*args, **kwargs): return None
+def _hidden_clear_output(*args, **kwargs): return None
+class _WidgetDummy:
+    def __init__(self, *args, **kwargs):
+        self.value = kwargs.get("value", None)
+        self.children = kwargs.get("children", [])
+    def __getattr__(self, name):
+        return _WidgetDummy()
+    def __call__(self, *args, **kwargs):
+        return _WidgetDummy(*args, **kwargs)
+    def on_click(self, *args, **kwargs): return None
+    def observe(self, *args, **kwargs): return None
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+class _WidgetsDummy:
+    def __getattr__(self, name): return _WidgetDummy
+widgets = _WidgetsDummy()
+def display(*args, **kwargs): return None
+def clear_output(*args, **kwargs): return None
+
+
+
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.cell.cell import MergedCell
+from openpyxl.utils import get_column_letter
+
+print("AutoRaceAI engine loading")
+
+
+
+from pathlib import Path
+
+
+
+DB_DIR = Path(os.environ.get('AUTORACEAI_DATA_DIR', str(Path(__file__).resolve().parent / 'data')))
+DB_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DB_DIR / "autorace_players.sqlite3"
+
+# ============================================================
+# Ver13.0 選手マスタDB管理（Google Drive + SQLite）
+# ============================================================
+import io, re, sqlite3, hashlib
+from datetime import datetime
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+class _WidgetDummy:
+    def __init__(self, *args, **kwargs):
+        self.value = kwargs.get("value", None)
+        self.children = kwargs.get("children", [])
+    def __getattr__(self, name):
+        return _WidgetDummy()
+    def __call__(self, *args, **kwargs):
+        return _WidgetDummy(*args, **kwargs)
+    def on_click(self, *args, **kwargs): return None
+    def observe(self, *args, **kwargs): return None
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+class _WidgetsDummy:
+    def __getattr__(self, name): return _WidgetDummy
+widgets = _WidgetsDummy()
+def display(*args, **kwargs): return None
+def clear_output(*args, **kwargs): return None
+
+
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
+
+DB_DIR = Path(os.environ.get('AUTORACEAI_DATA_DIR', str(Path(__file__).resolve().parent / 'data')))
+DB_PATH = DB_DIR / 'autorace_players.sqlite3'
+HISTORY_COLS_DB = ['開催日','開催場','レース','着順','出走','走路','ハンデ','試走T','競走T','ST']
+
+def mount_and_init_db():
+    
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS players (
+            player_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS race_history (
+            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            race_date TEXT, venue TEXT, race_no TEXT, finish REAL, starters REAL,
+            surface TEXT, handicap TEXT, trial_time REAL, race_time REAL, start_time REAL,
+            result_status TEXT NOT NULL DEFAULT '通常',
+            use_for_model INTEGER NOT NULL DEFAULT 1,
+            source TEXT, record_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(player_id) REFERENCES players(player_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_history_player_date ON race_history(player_id, race_date DESC);
+        """)
+    return DB_PATH
+
+def _s(v):
+    if v is None or (isinstance(v,float) and np.isnan(v)): return ''
+    return str(v).strip()
+
+def _num(v):
+    if v in (None,''): return None
+    if isinstance(v,(int,float)) and not isinstance(v,bool): return float(v) if np.isfinite(v) else None
+    m=re.search(r'-?\d+(?:\.\d+)?',str(v).replace(',',''))
+    return float(m.group()) if m else None
+
+def _date_text(v):
+    if v in (None,''): return ''
+    if isinstance(v,datetime): return v.strftime('%Y-%m-%d')
+    if hasattr(v,'strftime'):
+        try: return v.strftime('%Y-%m-%d')
+        except Exception: pass
+    d=pd.to_datetime(v,errors='coerce')
+    return d.strftime('%Y-%m-%d') if not pd.isna(d) else _s(v)
+
+def _find_header(ws):
+    aliases={'開催日':['開催日'],'開催場':['開催場'],'レース':['レース'],'着順':['着順'],'出走':['出走'],
+             '走路':['走路'],'ハンデ':['ハンデ'],'試走T':['試走T','試走'],'競走T':['競走T','競走'],'ST':['ST','ＳＴ']}
+    for r in range(1,min(ws.max_row,40)+1):
+        vals={_s(ws.cell(r,c).value):c for c in range(1,ws.max_column+1)}; cmap={}
+        for key,names in aliases.items():
+            for name in names:
+                if name in vals: cmap[key]=vals[name]; break
+        if all(k in cmap for k in ['開催日','開催場','着順','試走T','競走T','ST']):
+            for k in HISTORY_COLS_DB: cmap.setdefault(k,HISTORY_COLS_DB.index(k)+1)
+            return r,cmap
+    raise ValueError(f'{ws.title}: 履歴見出しが見つかりません')
+
+def _player_name(ws):
+    return _s(ws['B2'].value) or ws.title
+
+def _record_key(player,row):
+    raw='|'.join([player,row['開催日'],row['開催場'],row['レース'],_s(row['着順']),_s(row['ハンデ']),
+                  _s(row['試走T']),_s(row['競走T']),_s(row['ST']),row.get('結果区分','通常')])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+def _ensure_player(con,name):
+    con.execute('INSERT OR IGNORE INTO players(player_name) VALUES (?)',(name,))
+    con.execute('UPDATE players SET updated_at=CURRENT_TIMESTAMP WHERE player_name=?',(name,))
+    return con.execute('SELECT player_id FROM players WHERE player_name=?',(name,)).fetchone()[0]
+
+def add_history_rows(player,rows,source='Excel取込'):
+    added=skipped=0
+    with sqlite3.connect(DB_PATH) as con:
+        pid=_ensure_player(con,player)
+        for row in rows:
+            status=_s(row.get('結果区分','通常')) or '通常'
+            use=0 if status in ['反妨','落車','故障','他落','反則','不成立'] else 1
+            try:
+                con.execute("""INSERT INTO race_history(
+                    player_id,race_date,venue,race_no,finish,starters,surface,handicap,
+                    trial_time,race_time,start_time,result_status,use_for_model,source,record_key)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (pid,row['開催日'],row['開催場'],row['レース'],row['着順'],row['出走'],row['走路'],row['ハンデ'],
+                     row['試走T'],row['競走T'],row['ST'],status,use,source,_record_key(player,row)))
+                added+=1
+            except sqlite3.IntegrityError: skipped+=1
+    return added,skipped
+
+def _sheet_rows(ws):
+    hr,cmap=_find_header(ws); rows=[]
+    for r in range(hr+1,ws.max_row+1):
+        vals={k:ws.cell(r,cmap[k]).value for k in HISTORY_COLS_DB}
+        if all(v in (None,'') for v in vals.values()): continue
+        rows.append({'開催日':_date_text(vals['開催日']),'開催場':_s(vals['開催場']),'レース':_s(vals['レース']),
+                     '着順':_num(vals['着順']),'出走':_num(vals['出走']),'走路':_s(vals['走路']),'ハンデ':_s(vals['ハンデ']),
+                     '試走T':_num(vals['試走T']),'競走T':_num(vals['競走T']),'ST':_num(vals['ST']),'結果区分':'通常'})
+    return hr,cmap,rows
+
+def import_workbook_to_db(content,filename='uploaded.xlsx'):
+    wb=load_workbook(io.BytesIO(content),data_only=True); report=[]
+    for ws in wb.worksheets:
+        if not re.fullmatch(r'選手\d+',ws.title): continue
+        name=_player_name(ws)
+        try: _,_,rows=_sheet_rows(ws); a,s=add_history_rows(name,rows,filename); report.append((name,a,s,'OK'))
+        except Exception as e: report.append((name,0,0,str(e)))
+    return pd.DataFrame(report,columns=['選手名','追加','重複スキップ','状態'])
+
+def get_player_history(name,model_only=False):
+    extra='AND h.use_for_model=1' if model_only else ''
+    with sqlite3.connect(DB_PATH) as con:
+        return pd.read_sql_query(f"""SELECT h.race_date AS 開催日,h.venue AS 開催場,h.race_no AS レース,
+        h.finish AS 着順,h.starters AS 出走,h.surface AS 走路,h.handicap AS ハンデ,h.trial_time AS 試走T,
+        h.race_time AS 競走T,h.start_time AS ST,h.result_status AS 結果区分
+        FROM race_history h JOIN players p ON p.player_id=h.player_id
+        WHERE p.player_name=? {extra} ORDER BY h.race_date DESC,h.history_id DESC""",con,params=(name,))
+
+def enrich_workbook_from_db(content):
+    wb=load_workbook(io.BytesIO(content)); summary=[]
+    for ws in wb.worksheets:
+        if not re.fullmatch(r'選手\d+',ws.title): continue
+        name=_player_name(ws)
+        try: hr,cmap,local=_sheet_rows(ws)
+        except Exception: continue
+        a,_=add_history_rows(name,local,'予測Excel自動追加')
+        dbdf=get_player_history(name)
+        for r in range(hr+1,ws.max_row+1):
+            for col in set(cmap.values()): ws.cell(r,col).value=None
+        for i,row in dbdf.iterrows():
+            rr=hr+1+i
+            for col in HISTORY_COLS_DB:
+                v=row[col]; ws.cell(rr,cmap[col]).value=None if pd.isna(v) else v
+        summary.append((name,len(dbdf),a))
+    bio=io.BytesIO(); wb.save(bio)
+    return bio.getvalue(),pd.DataFrame(summary,columns=['選手名','DB履歴件数','今回新規追加'])
+
+def make_result_entry_workbook(content):
+    wb=load_workbook(io.BytesIO(content))
+    if '結果入力' in wb.sheetnames: del wb['結果入力']
+    ws=wb.create_sheet('結果入力',0)
+    headers=['選手名','着順','競走T','ST','結果区分','開催日','開催場','レース','出走','走路','ハンデ','試走T']
+    ws.append(headers)
+    for c in ws[1]: c.font=Font(bold=True,color='FFFFFF'); c.fill=PatternFill('solid',fgColor='17365D'); c.alignment=Alignment(horizontal='center')
+    race_ws=wb['レース予測'] if 'レース予測' in wb.sheetnames else None; labels={}
+    if race_ws:
+        for r in range(1,min(30,race_ws.max_row)+1): labels[_s(race_ws.cell(r,1).value)]=race_ws.cell(r,2).value
+    players=[w for w in wb.worksheets if re.fullmatch(r'選手\d+',w.title)]
+    for pws in players:
+        ws.append([_player_name(pws),'','','','通常',_date_text(labels.get('レース開催日')),_s(labels.get('今回の開催場')),
+                   '',len(players),_s(labels.get('今回の走路')),_s(pws['G2'].value),_num(pws['E2'].value)])
+    ws.freeze_panes='A2'; ws.auto_filter.ref=f'A1:L{ws.max_row}'
+    bio=io.BytesIO(); wb.save(bio); return bio.getvalue()
+
+def register_results_workbook(content,filename='result.xlsx'):
+    wb=load_workbook(io.BytesIO(content),data_only=True)
+    if '結果入力' not in wb.sheetnames: raise ValueError('「結果入力」シートがありません')
+    ws=wb['結果入力']; h={_s(ws.cell(1,c).value):c for c in range(1,ws.max_column+1)}; report=[]
+    required=['選手名','着順','競走T','ST','結果区分','開催日','開催場','レース','出走','走路','ハンデ','試走T']
+    if any(x not in h for x in required): raise ValueError('結果入力シートの列が不足しています')
+    for r in range(2,ws.max_row+1):
+        name=_s(ws.cell(r,h['選手名']).value)
+        if not name: continue
+        status=_s(ws.cell(r,h['結果区分']).value) or '通常'
+        row={'開催日':_date_text(ws.cell(r,h['開催日']).value),'開催場':_s(ws.cell(r,h['開催場']).value),'レース':_s(ws.cell(r,h['レース']).value),
+             '着順':_num(ws.cell(r,h['着順']).value),'出走':_num(ws.cell(r,h['出走']).value),'走路':_s(ws.cell(r,h['走路']).value),
+             'ハンデ':_s(ws.cell(r,h['ハンデ']).value),'試走T':_num(ws.cell(r,h['試走T']).value),'競走T':_num(ws.cell(r,h['競走T']).value),
+             'ST':_num(ws.cell(r,h['ST']).value),'結果区分':status}
+        if status=='通常' and row['着順'] is None: report.append((name,0,'着順未入力')); continue
+        a,_=add_history_rows(name,[row],filename); report.append((name,a,'追加' if a else '重複'))
+    return pd.DataFrame(report,columns=['選手名','追加件数','状態'])
+
+mount_and_init_db(); print(f'選手DB: {DB_PATH}')
+upload_db=widgets.FileUpload(accept='.xlsx',multiple=False,description='履歴をDB登録')
+upload_enrich=widgets.FileUpload(accept='.xlsx',multiple=False,description='DB履歴を補充')
+upload_template=widgets.FileUpload(accept='.xlsx',multiple=False,description='結果入力票を作成')
+upload_result=widgets.FileUpload(accept='.xlsx',multiple=False,description='結果をDB追加')
+out_db=widgets.Output()
+
+def file_bytes(u):
+    v=u.value
+    if not v:return None,None
+    if isinstance(v,dict):
+        name=next(iter(v)); return name,bytes(v[name]['content'])
+    item=v[0]; return item['name'],bytes(item['content'])
+
+def on_import(change):
+    name,data=file_bytes(upload_db)
+    if data:
+        with out_db:
+            _hidden_clear_output()
+            try: _hidden_display(import_workbook_to_db(data,name))
+            except Exception as e: print('エラー:',e)
+
+def on_enrich(change):
+    name,data=file_bytes(upload_enrich)
+    if data:
+        with out_db:
+            _hidden_clear_output()
+            try:
+                result,summary=enrich_workbook_from_db(data); outname='DB補充済み_'+name
+                Path('/content/'+outname).write_bytes(result); _hidden_display(summary); files.download('/content/'+outname)
+            except Exception as e: print('エラー:',e)
+
+def on_template(change):
+    name,data=file_bytes(upload_template)
+    if data:
+        with out_db:
+            _hidden_clear_output()
+            try:
+                outname='結果入力用_'+name; Path('/content/'+outname).write_bytes(make_result_entry_workbook(data))
+                print('着順・競走T・ST・結果区分を入力してください。'); files.download('/content/'+outname)
+            except Exception as e: print('エラー:',e)
+
+def on_result(change):
+    name,data=file_bytes(upload_result)
+    if data:
+        with out_db:
+            _hidden_clear_output()
+            try: _hidden_display(register_results_workbook(data,name))
+            except Exception as e: print('エラー:',e)
+
+upload_db.observe(on_import,names='value'); upload_enrich.observe(on_enrich,names='value')
+upload_template.observe(on_template,names='value'); upload_result.observe(on_result,names='value')
+_hidden_display(widgets.HTML('<h3>① 初回・未登録履歴をDBへ追加</h3>'),upload_db)
+_hidden_display(widgets.HTML('<h3>② 今回のExcelへ登録済み履歴を自動補充</h3>'),upload_enrich)
+_hidden_display(widgets.HTML('<h3>③ レース前に結果入力票を作成</h3>'),upload_template)
+_hidden_display(widgets.HTML('<h3>④ レース後、入力済み結果をDBへ追加</h3>'),upload_result,out_db)
+
+
+HISTORY_COLUMNS = [
+    "開催日", "開催場", "レース", "着順", "出走",
+    "走路", "ハンデ", "試走T", "競走T", "ST"
+]
+
+
+
+def same_or_stronger_repass_penalty(chaser_strength, leader_strength):
+    """
+    一度前へ出た相手が同レベル以上なら、抜き返しに必要な差を大きくする。
+    leader_strength >= chaser_strength のとき強い追加障壁を与える。
+    """
+    chaser = float(chaser_strength)
+    leader = float(leader_strength)
+    gap = leader - chaser
+
+    if gap >= 5.0:
+        return 2.4
+    if gap >= 2.0:
+        return 1.8
+    if gap >= 0.0:
+        return 1.35
+    if gap >= -2.0:
+        return 0.75
+    return 0.25
+
+
+def uploaded_file(value):
+    if not value:
+        return None, None
+    if isinstance(value, dict):
+        name = next(iter(value))
+        return name, bytes(value[name]["content"])
+    item = value[0]
+    return item["name"], bytes(item["content"])
+
+
+def text(v):
+    return "" if v is None else str(v).strip()
+
+
+def number(v, default=np.nan):
+    if v is None or v == "":
+        return default
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    try:
+        return float(str(v).replace(",", "").strip())
+    except Exception:
+        return default
+
+
+def handicap_number(v, default=np.nan):
+    if v is None or v == "":
+        return default
+    if isinstance(v, (int, float)):
+        return float(v)
+    m = re.search(r"-?\d+(?:\.\d+)?", str(v))
+    return float(m.group()) if m else default
+
+
+def excel_serial(v):
+    if v is None or v == "":
+        return np.nan
+    if isinstance(v, datetime):
+        base = datetime(1899, 12, 30)
+        return float((v - base).days)
+    if isinstance(v, date):
+        base = date(1899, 12, 30)
+        return float((v - base).days)
+    return number(v)
+
+
+def mean_or_blank(values):
+    vals = [float(v) for v in values if not pd.isna(v)]
+    return float(np.mean(vals)) if vals else np.nan
+
+
+def sample_std(values):
+    vals = [float(v) for v in values if not pd.isna(v)]
+    return float(np.std(vals, ddof=1)) if len(vals) >= 2 else np.nan
+
+
+def find_header(ws):
+    for r in range(1, min(ws.max_row, 20) + 1):
+        vals = [text(ws.cell(r, c).value) for c in range(1, 20)]
+        if all(col in vals for col in HISTORY_COLUMNS):
+            return r, {col: vals.index(col) + 1 for col in HISTORY_COLUMNS}
+    raise ValueError(f"{ws.title}: 履歴10列の見出しが見つかりません")
+
+
+def read_history(ws):
+    header_row, col_map = find_header(ws)
+    rows = []
+
+    for r in range(header_row + 1, ws.max_row + 1):
+        raw = {col: ws.cell(r, col_map[col]).value for col in HISTORY_COLUMNS}
+        if all(v in (None, "") for v in raw.values()):
+            continue
+
+        trial = number(raw["試走T"])
+        race_t = number(raw["競走T"])
+
+        rows.append({
+            "開催日": excel_serial(raw["開催日"]),
+            "開催場": text(raw["開催場"]),
+            "レース": text(raw["レース"]),
+            "着順": number(raw["着順"]),
+            "出走": number(raw["出走"]),
+            "走路": text(raw["走路"]),
+            "ハンデ": text(raw["ハンデ"]),
+            "ハンデ数値": handicap_number(raw["ハンデ"]),
+            "試走T": trial,
+            "競走T": race_t,
+            "ST": number(raw["ST"]),
+            "タイム差": (
+                race_t - trial
+                if not pd.isna(trial)
+                and not pd.isna(race_t)
+                and (race_t - trial) > 0
+                else np.nan
+            ),
+            "有効": (
+                not pd.isna(trial)
+                and not pd.isna(race_t)
+                and (race_t - trial) > 0
+            ),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def read_race(ws):
+    labels = {}
+    for r in range(1, min(ws.max_row, 30) + 1):
+        key = text(ws.cell(r, 1).value)
+        if key:
+            labels[key] = ws.cell(r, 2).value
+
+    return {
+        "開催日": excel_serial(labels.get("レース開催日")),
+        "開催場": text(labels.get("今回の開催場")),
+        "走路": text(labels.get("今回の走路")),
+    }
+
+
+def read_settings(ws):
+    # 元Excelでは設定値の位置が固定
+    def b(row, default):
+        return number(ws.cell(row, 2).value, default)
+
+    return {
+        "最近重視日数": b(4, 30),
+        "同一開催場倍率": b(5, 1.35),
+        "別開催場倍率": b(6, 0.85),
+        "同一走路倍率": b(7, 1.5),
+        "別走路倍率": b(8, 0.7),
+        "同一ハンデ倍率": b(9, 1.4),
+        "近接ハンデ倍率": b(10, 1.1),
+        "遠隔ハンデ倍率": b(11, 0.75),
+        "ST補正係数": b(12, 0.04),
+        "10m換算秒": b(22, 0.018),
+
+        "試走点": b(29, 24),
+        "最近5走点": 10.0,
+        "ST点": b(31, 8),
+        "ハンデ適性点": b(32, 8),
+        "開催場適性点": b(33, 5),
+        "走路適性点": b(34, 5),
+        "位置取り点": b(35, 6),
+        "着順指数点": b(36, 8),
+        "勝率点": b(37, 6),
+        "連対率点": b(38, 4),
+        "上昇度点": b(39, 2),
+        "再現性点": b(40, 1),
+        "今回ハンデ勝率点": 4.0,
+
+        "ハンデ改善点": b(43, 6),
+        "満点改善幅": b(44, 20),
+        "前走比率": b(45, 0.6),
+        "3着以内率点": b(49, 6),
+        "平均着順点": b(50, 6),
+        "着順安定度点": b(51, 4),
+        "審査Pランク点": b(52, 6),
+    }
+
+
+def current_player(ws):
+    return {
+        "選手名": text(ws["B2"].value) or ws.title,
+        "今回試走T": number(ws["E2"].value),
+        "今回ハンデ": handicap_number(ws["G2"].value),
+        "今回走路": text(ws["E3"].value),
+        "審査P": number(ws["I2"].value),
+        "現ランク": text(ws["I3"].value).upper(),
+    }
+
+
+def normalize_surface(value):
+    """走路表記を 良・斑・湿 にそろえる。"""
+    s = text(value)
+    if "良" in s:
+        return "良"
+    if "斑" in s:
+        return "斑"
+    if "湿" in s:
+        return "湿"
+    return s
+
+
+def surface_compatibility_weight(history_surface, current_surface):
+    """
+    今回走路に対する過去走路の採用率。
+    同一条件を中心にし、異なる条件はほぼ度外視する。
+    """
+    past = normalize_surface(history_surface)
+    now = normalize_surface(current_surface)
+
+    if not past or not now:
+        return 0.05
+    if past == now:
+        return 1.0
+
+    weights = {
+        # 今回が良走路
+        ("斑", "良"): 0.30,
+        ("湿", "良"): 0.02,
+
+        # 今回が湿走路
+        ("斑", "湿"): 0.20,
+        ("良", "湿"): 0.02,
+
+        # 今回が斑走路（良と湿の中間として扱う）
+        ("良", "斑"): 0.15,
+        ("湿", "斑"): 0.20,
+    }
+    return weights.get((past, now), 0.05)
+
+
+def weighted_mean_series(values, weights):
+    v = pd.to_numeric(values, errors="coerce")
+    w = pd.to_numeric(weights, errors="coerce")
+    mask = v.notna() & w.notna() & (w > 0)
+    if not mask.any() or float(w[mask].sum()) == 0:
+        return np.nan
+    return float((v[mask] * w[mask]).sum() / w[mask].sum())
+
+
+def weighted_rate(condition, weights):
+    c = pd.Series(condition, dtype=float)
+    w = pd.to_numeric(weights, errors="coerce")
+    mask = c.notna() & w.notna() & (w > 0)
+    if not mask.any() or float(w[mask].sum()) == 0:
+        return np.nan
+    return float((c[mask] * w[mask]).sum() / w[mask].sum())
+
+
+def weighted_std_series(values, weights):
+    v = pd.to_numeric(values, errors="coerce")
+    w = pd.to_numeric(weights, errors="coerce")
+    mask = v.notna() & w.notna() & (w > 0)
+    if mask.sum() < 2 or float(w[mask].sum()) == 0:
+        return np.nan
+
+    vv = v[mask].astype(float)
+    ww = w[mask].astype(float)
+    avg = float((vv * ww).sum() / ww.sum())
+    variance = float((ww * (vv - avg) ** 2).sum() / ww.sum())
+    return float(np.sqrt(max(variance, 0.0)))
+
+
+def prepare_history(df, current, race, settings):
+    x = df.copy()
+
+    if x.empty:
+        return x
+
+    # Ver10.6: 公式プロフィール取得時に、予測対象レースの確定結果が
+    # 履歴先頭へ混入している場合がある。同日・同開催場の行は予測から除外する。
+    same_day_result = (
+        pd.to_numeric(x["開催日"], errors="coerce") == float(race["開催日"])
+    ) & (x["開催場"].astype(str) == str(race["開催場"]))
+    x = x.loc[~same_day_result].copy()
+    if x.empty:
+        return x
+
+    x["経過日数"] = np.maximum(0, race["開催日"] - x["開催日"])
+    x["最近重み"] = np.exp(-x["経過日数"] / settings["最近重視日数"])
+
+    x["場重み"] = np.where(
+        x["開催場"] == race["開催場"],
+        settings["同一開催場倍率"],
+        settings["別開催場倍率"],
+    )
+
+    # 走路が異なる履歴は一律倍率ではなく、今回走路との近さで採用率を変える
+    x["走路適合重み"] = x["走路"].apply(
+        lambda surface: surface_compatibility_weight(surface, race["走路"])
+    )
+
+    # 従来の設定倍率は使用せず、1.0 / 0.20 / 0.15 / 0.10 / 0.02 を直接使用
+    x["走路重み"] = x["走路適合重み"]
+
+    diff = np.abs(x["ハンデ数値"] - current["今回ハンデ"])
+    x["ハンデ重み"] = np.where(
+        diff == 0,
+        settings["同一ハンデ倍率"],
+        np.where(
+            diff <= 10,
+            settings["近接ハンデ倍率"],
+            settings["遠隔ハンデ倍率"],
+        ),
+    )
+
+    x["総合重み"] = (
+        x["最近重み"]
+        * x["場重み"]
+        * x["走路重み"]
+        * x["ハンデ重み"]
+    )
+
+    x.loc[~x["有効"], "総合重み"] = np.nan
+    return x
+
+
+def smooth_points(values, maximum, lower_is_better=True, zero_is_zero=False):
+    """
+    順位だけではなく、平均との差とばらつきを使って点数化する。
+    平均値付近は最大点の50%、おおむね±2標準偏差で0～最大点に収まる。
+    """
+    arr = np.array(values, dtype=float)
+    valid = arr[~np.isnan(arr)]
+
+    if len(valid) == 0:
+        return [np.nan] * len(arr)
+
+    mean = float(np.mean(valid))
+    std = float(np.std(valid, ddof=1)) if len(valid) >= 2 else 0.0
+
+    # 全員ほぼ同じ場合は中間点
+    if std < 1e-9:
+        result = []
+        for v in arr:
+            if np.isnan(v):
+                result.append(np.nan)
+            elif zero_is_zero and v == 0:
+                result.append(0.0)
+            else:
+                result.append(maximum * 0.5)
+        return result
+
+    result = []
+    for v in arr:
+        if np.isnan(v):
+            result.append(np.nan)
+            continue
+
+        if zero_is_zero and v == 0:
+            result.append(0.0)
+            continue
+
+        z = (v - mean) / std
+        if lower_is_better:
+            z = -z
+
+        # z=-2で0点、z=0で50%、z=+2で満点
+        normalized = np.clip(0.5 + z / 4.0, 0.0, 1.0)
+        result.append(float(normalized * maximum))
+
+    return result
+
+
+def player_metrics(car, current, hist, race, settings):
+    x = prepare_history(hist, current, race, settings)
+
+    valid = x[x["有効"]].copy()
+    first5 = valid.head(5)
+    first10 = valid.head(10)
+    first30 = valid.head(30)
+
+    converted_trial = (
+        current["今回試走T"]
+        + current["今回ハンデ"] / 10 * settings["10m換算秒"]
+    )
+
+    # タイム差も今回走路との適合度で加重する
+    recent5_diff = weighted_mean_series(
+        first5["タイム差"],
+        first5["走路適合重み"],
+    )
+
+    # 最近の試走水準と今回試走の悪化幅。
+    # 過去ハンデも今回と同じ10m換算秒で補正して比較する。
+    recent_trial_converted = (
+        pd.to_numeric(first5["試走T"], errors="coerce")
+        + pd.to_numeric(first5["ハンデ数値"], errors="coerce").fillna(0.0)
+        / 10 * settings["10m換算秒"]
+    )
+    recent_trial_baseline = weighted_mean_series(
+        recent_trial_converted,
+        first5["走路適合重み"],
+    )
+    current_trial_deterioration = (
+        max(0.0, converted_trial - recent_trial_baseline)
+        if not pd.isna(recent_trial_baseline) else 0.0
+    )
+    # Ver12.2: 選手自身の平常試走からの良化・悪化を測る。
+    # 絶対タイムだけではなく、普段より何秒速いかを当日の仕上がりとして使う。
+    recent_trial_sd = weighted_std_series(
+        recent_trial_converted, first5["走路適合重み"]
+    )
+    current_trial_change = (
+        float(recent_trial_baseline - converted_trial)
+        if not pd.isna(recent_trial_baseline) else 0.0
+    )
+
+    weighted_rows = x[
+        x["ST"].notna() & x["総合重み"].notna()
+    ]
+    weighted_st = (
+        float((weighted_rows["ST"] * weighted_rows["総合重み"]).sum()
+              / weighted_rows["総合重み"].sum())
+        if not weighted_rows.empty and weighted_rows["総合重み"].sum() != 0
+        else np.nan
+    )
+
+    # STの安定性: 平均が速くてもばらつきが大きい選手は少し評価を下げる
+    st_std = weighted_std_series(
+        weighted_rows["ST"], weighted_rows["総合重み"]
+    ) if not weighted_rows.empty else np.nan
+    st_stability = (
+        1 / (1 + st_std * 25)
+        if not pd.isna(st_std) else np.nan
+    )
+
+    # 試走再現率: 本走タイムと試走タイムの差が小さく、安定する選手を評価
+    trial_rows = first10[
+        first10["試走T"].notna() & first10["競走T"].notna()
+    ].copy()
+    if not trial_rows.empty:
+        trial_rows["試走本走差"] = (
+            pd.to_numeric(trial_rows["競走T"], errors="coerce")
+            - pd.to_numeric(trial_rows["試走T"], errors="coerce")
+        ).abs()
+        trial_gap_mean = weighted_mean_series(
+            trial_rows["試走本走差"], trial_rows["走路適合重み"]
+        )
+        trial_gap_std = weighted_std_series(
+            trial_rows["試走本走差"], trial_rows["走路適合重み"]
+        )
+        trial_reproduction = (
+            1 / (1 + trial_gap_mean * 12 + trial_gap_std * 10)
+            if not pd.isna(trial_gap_mean) else np.nan
+        )
+    else:
+        trial_gap_mean = np.nan
+        trial_gap_std = np.nan
+        trial_reproduction = np.nan
+
+    # Ver6.9: 試走信頼度とレース巧者指数
+    craft_rows = first30[
+        first30["試走T"].notna() & first30["着順"].notna()
+    ].copy()
+    if len(craft_rows) >= 5:
+        craft_rows["試走換算履歴"] = (
+            pd.to_numeric(craft_rows["試走T"], errors="coerce")
+            + pd.to_numeric(craft_rows["ハンデ数値"], errors="coerce").fillna(0.0)
+            / 10 * settings["10m換算秒"]
+        )
+        craft_rows["試走百分位"] = craft_rows["試走換算履歴"].rank(
+            pct=True, method="average", ascending=True
+        )
+        craft_rows["着順百分位"] = pd.to_numeric(
+            craft_rows["着順"], errors="coerce"
+        ).rank(pct=True, method="average", ascending=True)
+        trial_finish_corr = craft_rows["試走百分位"].corr(
+            craft_rows["着順百分位"], method="spearman"
+        )
+        if pd.isna(trial_finish_corr):
+            trial_finish_corr = 0.0
+        trial_trust = float(np.clip(
+            0.50 + 0.50 * trial_finish_corr, 0.20, 1.00
+        ))
+        craft_rows["巧者差"] = (
+            craft_rows["試走百分位"] - craft_rows["着順百分位"]
+        )
+        race_craft_index = weighted_mean_series(
+            craft_rows["巧者差"], craft_rows["走路適合重み"]
+        )
+    else:
+        trial_finish_corr = np.nan
+        trial_trust = 0.50
+        race_craft_index = 0.0
+
+    same_h = valid[
+        valid["ハンデ"] == f"{int(current['今回ハンデ'])}m"
+    ]
+    same_h_diff = (
+        mean_or_blank(same_h["タイム差"].tolist())
+        if not same_h.empty else recent5_diff
+    )
+
+    same_venue = valid[valid["開催場"] == race["開催場"]]
+    venue_diff = mean_or_blank(same_venue["タイム差"].tolist())
+
+    same_surface = valid[valid["走路"] == race["走路"]]
+    surface_diff = mean_or_blank(same_surface["タイム差"].tolist())
+
+    # 着順系も今回走路との適合度で加重する
+    finish_scores = {1: 10, 2: 8, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1}
+
+    scored_finish10 = first10["着順"].map(
+        lambda v: finish_scores.get(int(v), np.nan) if not pd.isna(v) else np.nan
+    )
+    finish_index = weighted_mean_series(
+        scored_finish10,
+        first10["走路適合重み"],
+    )
+
+    finish30 = pd.to_numeric(first30["着順"], errors="coerce")
+    road_weight30 = first30["走路適合重み"]
+
+    win_rate = weighted_rate(
+        (finish30 == 1).where(finish30.notna(), np.nan),
+        road_weight30,
+    )
+    quinella_rate = weighted_rate(
+        finish30.isin([1, 2]).where(finish30.notna(), np.nan),
+        road_weight30,
+    )
+    show_rate = weighted_rate(
+        finish30.isin([1, 2, 3]).where(finish30.notna(), np.nan),
+        road_weight30,
+    )
+
+    average_finish = weighted_mean_series(
+        first10["着順"],
+        first10["走路適合重み"],
+    )
+    finish_std10 = weighted_std_series(
+        first10["着順"],
+        first10["走路適合重み"],
+    )
+    finish_stability = (
+        1 / (1 + finish_std10)
+        if not pd.isna(finish_std10) else np.nan
+    )
+
+    newest5_df = valid.head(5)
+    previous5_df = valid.iloc[5:10]
+    newest5_avg = weighted_mean_series(
+        newest5_df["着順"], newest5_df["走路適合重み"]
+    )
+    previous5_avg = weighted_mean_series(
+        previous5_df["着順"], previous5_df["走路適合重み"]
+    )
+    improvement = (
+        float(previous5_avg - newest5_avg)
+        if not pd.isna(newest5_avg) and not pd.isna(previous5_avg)
+        else np.nan
+    )
+
+    diff_std = weighted_std_series(
+        first10["タイム差"],
+        first10["走路適合重み"],
+    )
+    reproducibility = (
+        1 / (1 + diff_std * 100)
+        if not pd.isna(diff_std) else np.nan
+    )
+
+    same_h_30 = first30[
+        first30["ハンデ"] == f"{int(current['今回ハンデ'])}m"
+    ]
+    current_h_win_rate = (
+        float((same_h_30["着順"] == 1).sum() / len(same_h_30))
+        if len(same_h_30) else 0.0
+    )
+
+    prev_h = (
+        float(valid.iloc[0]["ハンデ数値"])
+        if len(valid) and not pd.isna(valid.iloc[0]["ハンデ数値"])
+        else np.nan
+    )
+    avg5_h = mean_or_blank(valid.head(5)["ハンデ数値"].tolist())
+
+    handicap_improvement = (
+        max(0, prev_h - current["今回ハンデ"]) * settings["前走比率"]
+        + max(0, avg5_h - current["今回ハンデ"]) * (1 - settings["前走比率"])
+        if not pd.isna(prev_h) and not pd.isna(avg5_h)
+        else np.nan
+    )
+
+    handicap_change_score = (
+        min(handicap_improvement / settings["満点改善幅"], 1)
+        * settings["ハンデ改善点"]
+        if not pd.isna(handicap_improvement) and settings["満点改善幅"] != 0
+        else 0.0
+    )
+
+    # 直近3走の好調補正
+    # 今回走路との適合度を使うため、湿走路の好走だけで大きく上がりにくい。
+    recent3 = valid.head(3).copy()
+    if len(recent3):
+        recent3_top3_rate = weighted_rate(
+            (pd.to_numeric(recent3["着順"], errors="coerce") <= 3)
+            .where(pd.to_numeric(recent3["着順"], errors="coerce").notna(), np.nan),
+            recent3["走路適合重み"],
+        )
+    else:
+        recent3_top3_rate = 0.0
+
+    if len(recent3) >= 3 and recent3_top3_rate >= (2 / 3):
+        recent3_form_bonus = 3.0
+    elif len(recent3) >= 3 and recent3_top3_rate >= (1 / 3):
+        recent3_form_bonus = 1.2
+    else:
+        recent3_form_bonus = 0.0
+
+    # 直近5走補正: 一時的な1走だけでなく、5走全体の好調・不調を反映
+    recent5_finish = pd.to_numeric(first5["着順"], errors="coerce")
+    recent5_top3_rate = weighted_rate(
+        (recent5_finish <= 3).where(recent5_finish.notna(), np.nan),
+        first5["走路適合重み"],
+    ) if len(first5) else np.nan
+    recent5_avg_finish = weighted_mean_series(
+        recent5_finish, first5["走路適合重み"]
+    ) if len(first5) else np.nan
+
+    if len(first5) >= 5 and not pd.isna(recent5_avg_finish):
+        if recent5_avg_finish <= 3.0 and recent5_top3_rate >= 0.60:
+            recent5_form_bonus = 3.0
+        elif recent5_avg_finish <= 4.0 and recent5_top3_rate >= 0.40:
+            recent5_form_bonus = 1.5
+        elif recent5_avg_finish >= 6.0:
+            recent5_form_bonus = -2.0
+        elif recent5_avg_finish >= 5.0:
+            recent5_form_bonus = -0.8
+        else:
+            recent5_form_bonus = 0.0
+    else:
+        recent5_form_bonus = 0.0
+
+    # Ver6.8: 今回走路だけに絞り過ぎず、直近の着順そのものから
+    # 「今回の試走不振が単発の外れだった可能性」を推定する。
+    # 湿走路の能力評価を上げる処理ではなく、試走1回の信頼度だけを緩める。
+    raw_recent3_finish = pd.to_numeric(valid.head(3)["着順"], errors="coerce")
+    raw_recent5_finish = pd.to_numeric(valid.head(5)["着順"], errors="coerce")
+    raw_recent3_top3 = (
+        float((raw_recent3_finish <= 3).mean())
+        if raw_recent3_finish.notna().any() else 0.0
+    )
+    raw_recent3_top2 = (
+        float((raw_recent3_finish <= 2).mean())
+        if raw_recent3_finish.notna().any() else 0.0
+    )
+    raw_recent5_top3 = (
+        float((raw_recent5_finish <= 3).mean())
+        if raw_recent5_finish.notna().any() else 0.0
+    )
+    raw_recent5_poor = (
+        float((raw_recent5_finish >= 6).mean())
+        if raw_recent5_finish.notna().any() else 0.0
+    )
+    raw_recent4_top3 = (
+        float((raw_recent5_finish.head(4) <= 3).mean())
+        if raw_recent5_finish.head(4).notna().any() else 0.0
+    )
+    raw_recent2_poor = (
+        float((raw_recent5_finish.head(2) >= 6).mean())
+        if raw_recent5_finish.head(2).notna().any() else 0.0
+    )
+
+    # Ver10.6: 上昇カーブ指数。validは新しい履歴から並ぶ前提で、
+    # 古い3走平均から新しい3走平均への改善幅を、回帰傾向と合わせて連続値化する。
+    curve_finish = pd.to_numeric(valid.head(8)["着順"], errors="coerce").dropna().to_numpy(float)
+    if len(curve_finish) >= 4:
+        recent_n = min(3, len(curve_finish) // 2)
+        old_part = curve_finish[-recent_n:]
+        new_part = curve_finish[:recent_n]
+        level_gain = float(np.mean(old_part) - np.mean(new_part))
+        # 時系列を古い→新しいへ反転し、負の傾きほど着順改善
+        chrono = curve_finish[::-1]
+        x_curve = np.arange(len(chrono), dtype=float)
+        slope = float(np.polyfit(x_curve, chrono, 1)[0]) if len(chrono) >= 3 else 0.0
+        upward_curve_index = float(np.clip(level_gain * 0.18 - slope * 0.55, -1.0, 1.0))
+    else:
+        upward_curve_index = 0.0
+
+    # Ver10.6: 終盤指数。対戦相手ごとの試走順位は入力に無いため、
+    # 選手自身の履歴内で「試走水準より着順が良かったか」を標準化して推定する。
+    late_rows = valid.head(20).copy()
+    late_rows = late_rows[late_rows["試走T"].notna() & late_rows["着順"].notna()]
+    if len(late_rows) >= 5:
+        late_trial = (
+            pd.to_numeric(late_rows["試走T"], errors="coerce")
+            + pd.to_numeric(late_rows["ハンデ数値"], errors="coerce").fillna(0.0)
+            / 10 * settings["10m換算秒"]
+        )
+        late_finish = pd.to_numeric(late_rows["着順"], errors="coerce")
+        trial_sd = float(late_trial.std(ddof=0))
+        finish_sd_local = float(late_finish.std(ddof=0))
+        trial_z = (late_trial - late_trial.mean()) / (trial_sd if trial_sd > 1e-9 else 1.0)
+        finish_z = (late_finish - late_finish.mean()) / (finish_sd_local if finish_sd_local > 1e-9 else 1.0)
+        # 試走が悪い側（正）でも着順が良い側（負）なら正の終盤力
+        conversion_advantage = trial_z - finish_z
+        recency_w = np.exp(-np.arange(len(late_rows), dtype=float) / 7.0)
+        final_kick_index = float(np.clip(np.average(conversion_advantage, weights=recency_w) / 1.8, -1.0, 1.0))
+    else:
+        final_kick_index = 0.0
+
+    # 直近3走の複数好走を重視。1走だけの好走では救済を弱くする。
+    trial_outlier_confidence = np.clip(
+        (raw_recent3_top3 - 1 / 3) * 1.05
+        + raw_recent3_top2 * 0.45
+        + max(0.0, raw_recent5_top3 - 0.40) * 0.55,
+        0.0,
+        1.0,
+    )
+
+    # Ver12.2: 過去レースから「好位置を取れた時の粘り」と「出遅れ時の追上げ」を推定する。
+    # 1周目順位は履歴にないため、ST・枠位置・ハンデ帯から序盤位置を確率的に推定する。
+    pos_rows = first30[
+        first30["ST"].notna() & first30["着順"].notna()
+    ].copy()
+    position_sample = int(len(pos_rows))
+    if position_sample >= 6:
+        st_num = pd.to_numeric(pos_rows["ST"], errors="coerce")
+        finish_num = pd.to_numeric(pos_rows["着順"], errors="coerce")
+        lane_num = pd.to_numeric(pos_rows["出走"], errors="coerce").fillna(4.5)
+        hand_num = pd.to_numeric(pos_rows["ハンデ数値"], errors="coerce").fillna(0.0)
+        st_center = float(st_num.median())
+        st_scale = float(st_num.std(ddof=1)) if len(st_num) >= 2 else 0.04
+        st_scale = max(0.025, min(0.10, st_scale if np.isfinite(st_scale) else 0.04))
+        # 小さいほど序盤で前にいる可能性が高い。内枠効果は控えめにする。
+        early_score = (st_num - st_center) / st_scale + (lane_num - 4.5) * 0.075 + hand_num * 0.010
+        good_cut = float(early_score.quantile(0.38))
+        poor_cut = float(early_score.quantile(0.68))
+        good_mask = early_score <= good_cut
+        poor_mask = early_score >= poor_cut
+        good_n = int(good_mask.sum()); poor_n = int(poor_mask.sum())
+        good_top3 = float((finish_num[good_mask] <= 3).mean()) if good_n >= 2 else np.nan
+        good_top2 = float((finish_num[good_mask] <= 2).mean()) if good_n >= 2 else np.nan
+        good_avg = float(finish_num[good_mask].mean()) if good_n >= 2 else np.nan
+        poor_top3 = float((finish_num[poor_mask] <= 3).mean()) if poor_n >= 2 else np.nan
+        poor_avg = float(finish_num[poor_mask].mean()) if poor_n >= 2 else np.nan
+        # 少数標本は全体平均へ縮約し、極端な判定を避ける。
+        overall_top3 = float((finish_num <= 3).mean())
+        shrink_good = min(1.0, good_n / 8.0)
+        shrink_poor = min(1.0, poor_n / 8.0)
+        good_top3_s = overall_top3 + (good_top3 - overall_top3) * shrink_good if np.isfinite(good_top3) else overall_top3
+        good_top2_s = float((finish_num <= 2).mean()) + (good_top2 - float((finish_num <= 2).mean())) * shrink_good if np.isfinite(good_top2) else float((finish_num <= 2).mean())
+        poor_top3_s = overall_top3 + (poor_top3 - overall_top3) * shrink_poor if np.isfinite(poor_top3) else overall_top3
+        position_hold_index = float(np.clip(good_top3_s * 0.72 + good_top2_s * 0.28, 0.0, 1.0))
+        rear_chase_index = float(np.clip(poor_top3_s, 0.0, 1.0))
+        position_dependency = float(np.clip((good_top3_s - poor_top3_s + 0.45) / 0.90, 0.0, 1.0))
+        bipolar_index = float(np.clip(abs(good_top3_s - poor_top3_s) * 0.80 + min(1.0, float(finish_num.std(ddof=1)) / 2.6) * 0.20, 0.0, 1.0))
+    else:
+        good_n = poor_n = 0
+        good_avg = poor_avg = np.nan
+        position_hold_index = 0.50
+        rear_chase_index = 0.35
+        position_dependency = 0.50
+        bipolar_index = 0.30
+
+    return {
+        "車": car,
+        "選手名": current["選手名"],
+        "ハンデ": current["今回ハンデ"],
+        "試走換算": converted_trial,
+        "直近5差": recent5_diff,
+        "平均ST": weighted_st,
+        "ST標準偏差": st_std,
+        "ST安定性": st_stability,
+        "試走本走差": trial_gap_mean,
+        "試走本走差標準偏差": trial_gap_std,
+        "試走再現率": trial_reproduction,
+        "試走着順相関": trial_finish_corr,
+        "試走信頼度": trial_trust,
+        "レース巧者指数": race_craft_index,
+        "同ハンデ差": same_h_diff,
+        "開催場差": venue_diff,
+        "走路差": surface_diff,
+        "着順指数": finish_index,
+        "勝率": win_rate,
+        "連対率": quinella_rate,
+        "上昇度": improvement,
+        "再現性": reproducibility,
+        "今回ハンデ勝率": current_h_win_rate,
+        "3着以内率": show_rate,
+        "平均着順": average_finish,
+        "着順安定度": finish_stability,
+        "審査P": current["審査P"],
+        "現ランク": current["現ランク"],
+        "前走ハンデ": prev_h,
+        "直近5走平均ハンデ": avg5_h,
+        "ハンデ改善量": handicap_improvement,
+        "ハンデ変化点": handicap_change_score,
+        "着順標準偏差": sample_std(first30["着順"].tolist()),
+        "直近3走好調補正": recent3_form_bonus,
+        "直近5走補正": recent5_form_bonus,
+        "直近5走平均着順": recent5_avg_finish,
+        "直近5走3着内率": recent5_top3_rate,
+        "直近3走生3着内率": raw_recent3_top3,
+        "直近3走生2着内率": raw_recent3_top2,
+        "直近5走生3着内率": raw_recent5_top3,
+        "直近5走生凡走率": raw_recent5_poor,
+        "直近4走生3着内率": raw_recent4_top3,
+        "直近2走生凡走率": raw_recent2_poor,
+        "上昇カーブ指数": upward_curve_index,
+        "終盤指数": final_kick_index,
+        "試走単発外れ信頼度": float(trial_outlier_confidence),
+        "直近試走基準": recent_trial_baseline,
+        "直近試走標準偏差": recent_trial_sd,
+        "自己試走変化秒": current_trial_change,
+        "今回試走悪化幅": float(current_trial_deterioration),
+        "位置分析走数": position_sample,
+        "好位置推定走数": good_n,
+        "後方推定走数": poor_n,
+        "好位置時平均着順": good_avg,
+        "後方時平均着順": poor_avg,
+        "好位置維持指数": position_hold_index,
+        "後方追上げ指数": rear_chase_index,
+        "位置依存指数": position_dependency,
+        "二極化指数": bipolar_index,
+    }
+
+
+def outer_lane_penalty(df, max_penalty=4.5):
+    """
+    10m以上の同ハンデ帯で横並びが3人以上の場合、外側ほど減点する。
+
+    - 0m線は対象外
+    - 同ハンデ2人以下は対象外
+    - 人数が多いほど補正を強くする
+    - 最外枠でも最大4.5点まで
+    """
+    penalty = pd.Series(0.0, index=df.index)
+    same_line_count = pd.Series(1, index=df.index, dtype=int)
+    outer_order = pd.Series(1, index=df.index, dtype=int)
+
+    for handicap, group in df.groupby("ハンデ", dropna=False):
+        if pd.isna(handicap):
+            continue
+
+        ordered = group.sort_values("車")
+        count = len(ordered)
+
+        for order, idx in enumerate(ordered.index, 1):
+            same_line_count.loc[idx] = count
+            outer_order.loc[idx] = order
+
+        if float(handicap) < 10 or count < 3:
+            continue
+
+        # 3人で1/3、4人で2/3、5人以上で最大強度
+        crowd_factor = min(1.0, max(0.0, (count - 2) / 3.0))
+
+        for order, idx in enumerate(ordered.index, 1):
+            # 内から外への位置を0～1で表す
+            outer_ratio = (order - 1) / (count - 1)
+
+            # 内側半分は減点せず、外側半分から滑らかに減点
+            outer_exposure = max(0.0, (outer_ratio - 0.5) / 0.5)
+            penalty.loc[idx] = -max_penalty * crowd_factor * outer_exposure
+
+    return penalty, same_line_count, outer_order
+
+
+def add_race_type_features(df):
+    """逃げ成功率・内枠残存率・レースタイプを当該レースの相対比較から作る。"""
+    df = df.copy()
+    handicap = pd.to_numeric(df["ハンデ"], errors="coerce").fillna(0.0)
+    front_h = float(handicap.min())
+    front_mask = handicap == front_h
+
+    escape_prob = np.zeros(len(df), dtype=float)
+    inner_hold_prob = np.zeros(len(df), dtype=float)
+    inner_ratio = np.zeros(len(df), dtype=float)
+    st_speed_score = np.zeros(len(df), dtype=float)
+
+    front = df.loc[front_mask].sort_values("車")
+    count = len(front)
+    if count:
+        st_vals = pd.to_numeric(front["平均ST"], errors="coerce").fillna(0.20)
+        st_rank = st_vals.rank(method="average", ascending=True)
+        if count > 1:
+            speed = 1.0 - (st_rank - 1.0) / (count - 1.0)
+        else:
+            speed = pd.Series(0.60, index=front.index)
+
+        st_std = pd.to_numeric(front["ST標準偏差"], errors="coerce").fillna(0.055)
+        stability = 1.0 - np.clip((st_std - 0.020) / 0.075, 0.0, 1.0)
+
+        if count > 1:
+            lane = pd.Series(
+                [1.0 - i / (count - 1.0) for i in range(count)],
+                index=front.index,
+                dtype=float,
+            )
+        else:
+            lane = pd.Series(0.70, index=front.index, dtype=float)
+
+        quinella = pd.to_numeric(front["連対率"], errors="coerce").fillna(0.15).clip(0, 1)
+        show = pd.to_numeric(front["3着以内率"], errors="coerce").fillna(0.25).clip(0, 1)
+        recent_avg = pd.to_numeric(front["直近5走平均着順"], errors="coerce").fillna(5.0)
+        recent_hold = np.clip((6.5 - recent_avg) / 5.5, 0.0, 1.0)
+        sustain = np.clip(quinella * 0.45 + show * 0.25 + recent_hold * 0.30, 0.0, 1.0)
+
+        escape_raw = (
+            0.06
+            + speed.to_numpy(float) * 0.46
+            + stability.to_numpy(float) * 0.22
+            + lane.to_numpy(float) * 0.12
+            + sustain.to_numpy(float) * 0.20
+        )
+        escape_raw = np.clip(escape_raw, 0.08, 0.88)
+
+        # 逃げ切れなくても、最内寄り・ST安定・近況の粘りがあれば
+        # 2～4番手でコースを守る確率を別に持たせる。
+        hold_raw = (
+            0.10
+            + lane.to_numpy(float) * 0.38
+            + stability.to_numpy(float) * 0.18
+            + show.to_numpy(float) * 0.17
+            + quinella.to_numpy(float) * 0.08
+            + recent_hold.to_numpy(float) * 0.11
+            + escape_raw * 0.05
+            - (1.0 - speed.to_numpy(float)) * 0.04
+        )
+        hold_raw = np.clip(hold_raw, 0.10, 0.86)
+
+        for idx, escape_value, hold_value in zip(front.index, escape_raw, hold_raw):
+            pos = df.index.get_loc(idx)
+            escape_prob[pos] = float(escape_value)
+            inner_hold_prob[pos] = float(hold_value)
+            inner_ratio[pos] = float(lane.loc[idx])
+            st_speed_score[pos] = float(speed.loc[idx])
+
+    df["前線ハンデ"] = front_h
+    df["前線内側度"] = inner_ratio
+    df["同ハンデST優位度"] = st_speed_score
+    df["逃げ成功率"] = escape_prob
+    df["内枠残存率"] = inner_hold_prob
+
+    race_types = []
+    for _, row in df.iterrows():
+        is_front = float(row["ハンデ"]) == front_h
+        escape = float(row["逃げ成功率"])
+        hold = float(row["内枠残存率"])
+        craft = float(row.get("レース巧者指数", 0.0) or 0.0)
+        trust = float(row.get("試走信頼度", 0.5) or 0.5)
+        finish_sd = float(row.get("着順標準偏差", 1.5) or 1.5)
+        st_sd = float(row.get("ST標準偏差", 0.05) or 0.05)
+
+        if is_front and escape >= 0.58:
+            race_types.append("逃げ型")
+        elif is_front and hold >= 0.58:
+            race_types.append("内枠粘り型")
+        elif craft >= 0.08:
+            race_types.append("追込型")
+        elif trust >= 0.62 and craft < -0.03:
+            race_types.append("試走型")
+        elif finish_sd >= 2.35 or st_sd >= 0.070:
+            race_types.append("ムラ型")
+        else:
+            race_types.append("バランス型")
+    df["レースタイプ"] = race_types
+    return df
+
+def calculate_excel_model(metrics, settings):
+    df = pd.DataFrame(metrics)
+    df = add_race_type_features(df)
+
+    df["試走点"] = smooth_points(
+        df["試走換算"].tolist(),
+        settings["試走点"],
+        lower_is_better=True,
+    )
+    # 信頼度が低い選手は、良い試走も悪い試走も中間点へ圧縮する。
+    trial_midpoint = settings["試走点"] * 0.50
+    trial_trust = pd.to_numeric(
+        df["試走信頼度"], errors="coerce"
+    ).fillna(0.50).clip(0.20, 1.00)
+    df["試走点"] = (
+        trial_midpoint
+        + (df["試走点"] - trial_midpoint) * trial_trust
+    ) * 0.85
+
+    # Ver6.8: 直近に複数回の好走がある選手は、今回試走が悪くても
+    # その1回だけが外れ値だった可能性を残す。全員一律ではなく、
+    # 試走点が集団中央値を下回った分だけ最大55%戻す。
+    trial_median = float(pd.to_numeric(df["試走点"], errors="coerce").median())
+    relief_conf = pd.to_numeric(
+        df["試走単発外れ信頼度"], errors="coerce"
+    ).fillna(0.0).clip(0.0, 1.0)
+    trial_shortfall = np.maximum(0.0, trial_median - df["試走点"])
+    trial_deterioration = pd.to_numeric(
+        df["今回試走悪化幅"], errors="coerce"
+    ).fillna(0.0).clip(lower=0.0)
+
+    # 集団平均との差だけでなく、その選手自身の最近の試走水準から
+    # 0.05秒以上悪化していれば最大効果として扱う。
+    personal_outlier_scale = np.clip(trial_deterioration / 0.05, 0.0, 1.0)
+    df["試走単発救済点"] = (
+        trial_shortfall * relief_conf * 0.35
+        + personal_outlier_scale * relief_conf * 4.0
+    )
+
+    # Ver8.1: 直近好調で今回試走だけ悪い選手を「近況主役候補」として点数側でも評価。
+    # 車番ではなく、直近3走・5走と試走単発外れ信頼度の組合せで決める。
+    recent3_lead = np.clip(
+        (pd.to_numeric(df["直近3走好調補正"], errors="coerce").fillna(0.0) + 1.0) / 4.5,
+        0.0, 1.0,
+    )
+    recent5_lead = np.clip(
+        (pd.to_numeric(df["直近5走補正"], errors="coerce").fillna(0.0) + 1.0) / 4.5,
+        0.0, 1.0,
+    )
+    df["近況主役点"] = (
+        relief_conf
+        * (0.58 * recent3_lead + 0.42 * recent5_lead)
+        * (2.8 + personal_outlier_scale * 2.7)
+    )
+
+    df["最近点"] = smooth_points(
+        df["直近5差"].tolist(),
+        settings["最近5走点"],
+        lower_is_better=True,
+    )
+    df["ST点"] = smooth_points(
+        df["平均ST"].tolist(),
+        settings["ST点"],
+        lower_is_better=True,
+    )
+    df["ST安定点"] = smooth_points(
+        df["ST安定性"].tolist(),
+        2.5,
+        lower_is_better=False,
+    )
+    df["試走再現点"] = smooth_points(
+        df["試走再現率"].tolist(),
+        3.5,
+        lower_is_better=False,
+    )
+    df["レース巧者点"] = smooth_points(
+        df["レース巧者指数"].tolist(),
+        4.0,
+        lower_is_better=False,
+    )
+    df["ハンデ点"] = smooth_points(
+        df["同ハンデ差"].tolist(),
+        settings["ハンデ適性点"],
+        lower_is_better=True,
+    )
+    df["開催場点"] = smooth_points(
+        df["開催場差"].tolist(),
+        settings["開催場適性点"],
+        lower_is_better=True,
+    )
+    df["走路点"] = smooth_points(
+        df["走路差"].tolist(),
+        settings["走路適性点"],
+        lower_is_better=True,
+    )
+
+    # Ver7.4: 位置の利を「逃げ切り」だけでなく「インで残る力」でも評価。
+    # 逃げ成功率が低めでも、最内でコースを守れる選手の位置点を失わせない。
+    front_h = float(pd.to_numeric(df["ハンデ"], errors="coerce").min())
+    position_use = (
+        pd.to_numeric(df["逃げ成功率"], errors="coerce").fillna(0.0) * 0.48
+        + pd.to_numeric(df["内枠残存率"], errors="coerce").fillna(0.0) * 0.52
+    ).clip(0.0, 1.0)
+    df["位置活用率"] = position_use
+    df["位置点"] = [
+        settings["位置取り点"] * (0.30 + 0.70 * float(use))
+        if float(h) == front_h
+        else settings["位置取り点"] * 0.2
+        if float(h) == front_h + 10
+        else 0.0
+        for h, use in zip(df["ハンデ"], position_use)
+    ]
+
+    # Ver7.5: 最前線の最内は、逃げ切れなくても距離ロスが少なく、
+    # コースを守って後続の壁になりやすい。その戦略価値を点数側にも反映する。
+    front_mask = pd.to_numeric(df["ハンデ"], errors="coerce").fillna(0.0) == front_h
+    lane_value = pd.to_numeric(df["前線内側度"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    hold_value = pd.to_numeric(df["内枠残存率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    recent_value = np.clip(
+        (6.5 - pd.to_numeric(df["直近5走平均着順"], errors="coerce").fillna(5.0)) / 5.5,
+        0.0, 1.0
+    )
+    # Ver8.3: 内枠は総合能力そのものではなく補助的な戦略価値として扱う。
+    # Ver8.2より加算幅を約55%へ縮小し、元から強い最内車の過剰評価を防ぐ。
+    df["内枠展開点"] = np.where(
+        front_mask,
+        settings["位置取り点"] * 0.55 * (
+            lane_value * 0.46 + hold_value * 0.34 + recent_value * 0.20
+        ),
+        0.0,
+    )
+
+    # Ver8.3: 勝ち切り力は表示用の参考指標。総合点には直接加算しない。
+    # 最内だけでなく、逃げ、連対力、近況の裏付けがある場合のみ高くなる。
+    escape_value = pd.to_numeric(df["逃げ成功率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    quinella_value = pd.to_numeric(df["連対率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    st_value = pd.to_numeric(df["同ハンデST優位度"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    craft_value = np.clip(
+        0.50 + pd.to_numeric(df["レース巧者指数"], errors="coerce").fillna(0.0) * 2.0,
+        0.0, 1.0,
+    )
+    df["最内勝ち切り点"] = np.where(
+        front_mask,
+        settings["位置取り点"] * 0.45 * (
+            lane_value * 0.18
+            + escape_value * 0.25
+            + quinella_value * 0.20
+            + recent_value * 0.15
+            + st_value * 0.12
+            + craft_value * 0.10
+        ),
+        0.0,
+    )
+
+    df["着順点"] = smooth_points(
+        df["着順指数"].tolist(),
+        settings["着順指数点"],
+        lower_is_better=False,
+    )
+    df["勝率点"] = smooth_points(
+        df["勝率"].tolist(),
+        settings["勝率点"],
+        lower_is_better=False,
+    )
+    df["連対点"] = smooth_points(
+        df["連対率"].tolist(),
+        settings["連対率点"],
+        lower_is_better=False,
+    )
+    df["上昇点"] = smooth_points(
+        df["上昇度"].tolist(),
+        settings["上昇度点"],
+        lower_is_better=False,
+    )
+    df["再現性点"] = smooth_points(
+        df["再現性"].tolist(),
+        settings["再現性点"],
+        lower_is_better=False,
+    )
+    df["ハンデ勝率点"] = smooth_points(
+        df["今回ハンデ勝率"].tolist(),
+        settings["今回ハンデ勝率点"],
+        lower_is_better=False,
+        zero_is_zero=True,
+    )
+
+    df["3着以内率点"] = smooth_points(
+        df["3着以内率"].tolist(),
+        settings["3着以内率点"],
+        lower_is_better=False,
+    )
+    df["平均着順点"] = smooth_points(
+        df["平均着順"].tolist(),
+        settings["平均着順点"],
+        lower_is_better=True,
+    )
+    df["着順安定度点"] = smooth_points(
+        df["着順安定度"].tolist(),
+        settings["着順安定度点"],
+        lower_is_better=False,
+    )
+
+    def parse_rank_strength(rank):
+        """
+        S1 / S-1 / A103 / B-204 などを数値化する。
+        S級 > A級 > B級を維持し、同じ級では数字が小さいほど高評価。
+        """
+        value = str(rank).strip().upper().replace("－", "-")
+        match = re.fullmatch(r"([SAB])\s*-?\s*(\d{1,3})", value)
+        if not match:
+            return np.nan
+
+        grade = match.group(1)
+        rank_no = int(match.group(2))
+        if rank_no < 1:
+            return np.nan
+
+        # 1位を1.0、200位をほぼ0.0として級内評価。
+        # 201以上も解析し、0未満にはしない。
+        within_grade = max(0.0, 1.0 - (rank_no - 1) / 200.0)
+        grade_base = {"S": 2.0, "A": 1.0, "B": 0.0}[grade]
+        return grade_base + within_grade
+
+    rank_values = [
+        parse_rank_strength(rank)
+        for rank in df["現ランク"]
+    ]
+
+    judge_points = smooth_points(
+        df["審査P"].tolist(),
+        settings["審査Pランク点"] * 0.50,
+        lower_is_better=False,
+    )
+    rank_points = smooth_points(
+        rank_values,
+        settings["審査Pランク点"] * 0.50,
+        lower_is_better=False,
+    )
+
+    df["審査Pランク点"] = [
+        (
+            jp if not pd.isna(jp)
+            else settings["審査Pランク点"] * 0.50 * 0.5
+        )
+        + (
+            rp if not pd.isna(rp)
+            else settings["審査Pランク点"] * 0.50 * 0.5
+        )
+        for jp, rp in zip(judge_points, rank_points)
+    ]
+
+
+    # Ver9.0: 「走れる能力」と「1着まで取り切る力」を分離する。
+    # 3着以内が多くても1着が少ない選手は、総合能力を大きく落とさず、
+    # シミュレーション上の1着昇格だけを抑える。
+    win_rate_v = pd.to_numeric(df["勝率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    quinella_v = pd.to_numeric(df["連対率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    top3_v = pd.to_numeric(df["3着以内率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    recent_avg_v = pd.to_numeric(df["直近5走平均着順"], errors="coerce").fillna(5.0)
+    craft_v = np.clip(
+        0.50 + pd.to_numeric(df["レース巧者指数"], errors="coerce").fillna(0.0) * 2.0,
+        0.0, 1.0,
+    )
+    win_given_top3 = (win_rate_v / (top3_v + 0.08)).clip(0.0, 1.0)
+    win_given_top2 = (win_rate_v / (quinella_v + 0.06)).clip(0.0, 1.0)
+    recent_win_shape = np.clip((4.8 - recent_avg_v) / 3.8, 0.0, 1.0)
+    df["勝ち切り指数"] = np.clip(
+        win_given_top3 * 0.42
+        + win_given_top2 * 0.26
+        + win_rate_v * 0.18
+        + recent_win_shape * 0.08
+        + craft_v * 0.06,
+        0.0, 1.0,
+    )
+    # 連下力は、能力は高いが勝ち切れないタイプを2～3着候補として残す指標。
+    df["連下安定指数"] = np.clip(
+        top3_v * 0.52 + quinella_v * 0.28 + craft_v * 0.20,
+        0.0, 1.0,
+    )
+
+    # Ver12.2: 勝ち切り率とは別に、上位へ安定して残る再現性を評価する。
+    # 車番や今回の結果は使わず、長期・直近成績、凡走の少なさ、着順安定度で構成する。
+    finish_stability_v = pd.to_numeric(
+        df.get("着順安定度", pd.Series(0.45, index=df.index)), errors="coerce"
+    ).fillna(0.45).clip(0.0, 1.0)
+    recent_top3_stable = pd.to_numeric(
+        df.get("直近5走生3着内率", pd.Series(0.0, index=df.index)), errors="coerce"
+    ).fillna(0.0).clip(0.0, 1.0)
+    recent_poor_stable = pd.to_numeric(
+        df.get("直近5走生凡走率", pd.Series(0.0, index=df.index)), errors="coerce"
+    ).fillna(0.0).clip(0.0, 1.0)
+    df["安定上位指数"] = np.clip(
+        top3_v * 0.30
+        + quinella_v * 0.16
+        + recent_top3_stable * 0.23
+        + (1.0 - recent_poor_stable) * 0.13
+        + finish_stability_v * 0.12
+        + craft_v * 0.06,
+        0.0, 1.0,
+    )
+
+    # Ver10.0: 能力評価を4層へ再設計する。
+    # 1) 基礎スピード: 今回試走・ST・格・適性
+    # 2) 実戦能力: 近況の着順構成・安定性・速度を結果へ変える力
+    # 3) 勝負強さ: 上位進出時に1着まで取り切る力
+    # 4) 展開適性: 逃げ・差し・混戦・位置維持への対応力
+    # 車番自体は能力点へ使わず、最内の逃げ残りはシミュレーション側で扱う。
+
+    # ---------- 直近内容 ----------
+    recent_top3 = pd.to_numeric(df["直近5走生3着内率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    recent_poor = pd.to_numeric(df["直近5走生凡走率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    recent4_top3 = pd.to_numeric(df["直近4走生3着内率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    recent2_poor = pd.to_numeric(df["直近2走生凡走率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    recent3_top3 = pd.to_numeric(df["直近3走生3着内率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+
+    craft_reliability = np.clip(
+        0.50 + pd.to_numeric(df["レース巧者指数"], errors="coerce").fillna(0.0) * 2.0,
+        0.0, 1.0,
+    )
+    df["近況信頼度"] = np.clip(
+        pd.to_numeric(df["試走信頼度"], errors="coerce").fillna(0.50) * 0.58
+        + craft_reliability * 0.42,
+        0.0, 1.0,
+    )
+
+    raw_recent_content = (
+        (recent_top3 - 0.35) * 13.0
+        - recent_poor * 10.0
+        + (recent4_top3 - 0.50) * 6.5
+        - recent2_poor * 8.0
+        + np.maximum(0.0, recent3_top3 - 1.0 / 3.0) * 3.5
+    )
+    positive_recent = np.maximum(raw_recent_content, 0.0)
+    negative_recent = np.minimum(raw_recent_content, 0.0)
+    reliability_gate = np.clip(0.72 + 0.38 * df["近況信頼度"], 0.72, 1.0)
+    low_reliability_penalty = np.maximum(0.0, 0.48 - df["近況信頼度"]) * 7.0
+    sustainable_top3 = 0.40 + 0.55 * df["近況信頼度"]
+    df["短期上振れ抑制"] = np.clip(
+        np.maximum(0.0, recent_top3 - sustainable_top3) * 4.0,
+        0.0, 2.0,
+    )
+    df["近況信頼度補正"] = (
+        positive_recent * (reliability_gate - 1.0)
+        - low_reliability_penalty
+        - df["短期上振れ抑制"]
+    )
+    df["直近内容補正"] = np.clip(
+        negative_recent
+        + positive_recent * reliability_gate
+        - low_reliability_penalty
+        - df["短期上振れ抑制"],
+        -10.0, 8.0,
+    )
+
+    # ---------- 1. 基礎スピード層 ----------
+    # 試走だけで順位を作らず、ST・格・ハンデ/場/走路適性と組み合わせる。
+    df["基礎スピード点"] = (
+        pd.to_numeric(df["試走点"], errors="coerce").fillna(0.0) * 0.88
+        + pd.to_numeric(df["試走単発救済点"], errors="coerce").fillna(0.0) * 0.55
+        + pd.to_numeric(df["試走再現点"], errors="coerce").fillna(0.0) * 0.65
+        + pd.to_numeric(df["ST点"], errors="coerce").fillna(0.0) * 0.78
+        + pd.to_numeric(df["ST安定点"], errors="coerce").fillna(0.0) * 0.62
+        + pd.to_numeric(df["審査Pランク点"], errors="coerce").fillna(0.0) * 0.72
+        + pd.to_numeric(df["ハンデ点"], errors="coerce").fillna(0.0) * 0.65
+        + pd.to_numeric(df["開催場点"], errors="coerce").fillna(0.0) * 0.55
+        + pd.to_numeric(df["走路点"], errors="coerce").fillna(0.0) * 0.55
+    )
+
+    # ---------- 2. 実戦能力層 ----------
+    # 相関の強い着順系を丸ごと足さず、長期実績・直近内容・安定性へ整理する。
+    long_result = (
+        pd.to_numeric(df["着順点"], errors="coerce").fillna(0.0) * 0.72
+        + pd.to_numeric(df["3着以内率点"], errors="coerce").fillna(0.0) * 0.92
+        + pd.to_numeric(df["平均着順点"], errors="coerce").fillna(0.0) * 0.82
+        + pd.to_numeric(df["着順安定度点"], errors="coerce").fillna(0.0) * 0.95
+        + pd.to_numeric(df["レース巧者点"], errors="coerce").fillna(0.0) * 0.85
+        + pd.to_numeric(df["再現性点"], errors="coerce").fillna(0.0) * 0.65
+    )
+    speed_core = (
+        pd.to_numeric(df["試走点"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(df["ST点"], errors="coerce").fillna(0.0)
+    )
+    conversion = np.clip(
+        recent_top3 * 0.58
+        + (1.0 - recent_poor) * 0.27
+        + craft_reliability * 0.15,
+        0.0, 1.0,
+    )
+    df["速度実戦変換補正"] = np.clip(
+        speed_core * (conversion - 0.52) * 0.68,
+        -4.5, 4.0,
+    )
+    df["実戦能力点"] = (
+        long_result
+        + pd.to_numeric(df["最近点"], errors="coerce").fillna(0.0) * 0.52
+        + pd.to_numeric(df["近況主役点"], errors="coerce").fillna(0.0) * 0.42
+        + df["直近内容補正"]
+        + df["速度実戦変換補正"]
+    )
+
+    # ---------- 3. 勝負強さ層 ----------
+    # ここは能力順位への寄与を限定し、主にシミュレーションの1着昇格へ使う。
+    df["勝負強さ点"] = (
+        pd.to_numeric(df["勝率点"], errors="coerce").fillna(0.0) * 0.82
+        + pd.to_numeric(df["連対点"], errors="coerce").fillna(0.0) * 0.48
+        + pd.to_numeric(df["上昇点"], errors="coerce").fillna(0.0) * 0.60
+        + pd.to_numeric(df["勝ち切り指数"], errors="coerce").fillna(0.35) * 5.0
+    )
+
+    # ---------- 4. 展開適性層 ----------
+    # 車番位置の直接点は含めない。位置維持・混戦対応・ハンデ実績のみを評価。
+    df["展開適性点"] = (
+        craft_reliability * 4.0
+        + pd.to_numeric(df["ST安定性"], errors="coerce").fillna(0.50).clip(0.0, 1.0) * 2.0
+        + pd.to_numeric(df["ハンデ勝率点"], errors="coerce").fillna(0.0) * 0.35
+        + pd.to_numeric(df["連下安定指数"], errors="coerce").fillna(0.35) * 2.5
+    )
+
+    # 選手タイプを履歴から自動分類。表示とシミュレーション補助に使用する。
+    front_trait = np.clip(
+        recent_top3 * 0.35
+        + pd.to_numeric(df["ST安定性"], errors="coerce").fillna(0.5) * 0.30
+        + pd.to_numeric(df["連下安定指数"], errors="coerce").fillna(0.35) * 0.35,
+        0.0, 1.0,
+    )
+    chase_trait = np.clip(
+        pd.to_numeric(df["勝ち切り指数"], errors="coerce").fillna(0.35) * 0.42
+        + craft_reliability * 0.33
+        + conversion * 0.25,
+        0.0, 1.0,
+    )
+    volatile_trait = np.clip(recent_poor * 0.60 + recent2_poor * 0.40, 0.0, 1.0)
+    df["選手タイプ"] = np.select(
+        [
+            volatile_trait >= 0.55,
+            (front_trait >= 0.67) & (pd.to_numeric(df["勝ち切り指数"], errors="coerce").fillna(0.35) < 0.48),
+            chase_trait >= 0.62,
+            front_trait >= 0.58,
+        ],
+        ["ムラ型", "安定連下型", "勝負型", "安定型"],
+        default="標準型",
+    )
+
+    # 4層の最終能力点。実戦能力を最大、基礎スピードを次点とする。
+    # 勝負強さは能力順位を独占しないよう15%、展開適性は10%に制限する。
+    df["改良総合点"] = (
+        df["基礎スピード点"] * 0.35
+        + df["実戦能力点"] * 0.45
+        + df["勝負強さ点"] * 0.10
+        + df["展開適性点"] * 0.10
+        + pd.to_numeric(df["ハンデ変化点"], errors="coerce").fillna(0.0) * 0.30
+    )
+
+    # 10m以上の同ハンデ帯で、人数が多い外枠を補助的に減点
+    (
+        df["同ハンデ人数"],
+        df["同ハンデ外順"],
+    ) = (np.nan, np.nan)
+    outer_penalty, line_count, outer_order = outer_lane_penalty(
+        df, max_penalty=4.5
+    )
+    df["同ハンデ人数"] = line_count
+    df["同ハンデ外順"] = outer_order
+    df["外枠不利補正"] = outer_penalty
+
+    df["改善後総合点"] = (
+        df["改良総合点"]
+        + df["ハンデ変化点"] * 0.70
+        + df["外枠不利補正"]
+    )
+
+    # Ver10.2: 実戦評価の裏付けを確認する。
+    # 過去の実戦成績が、今回の試走・ST・格などの基礎速度を大きく上回る場合は、
+    # 一時的な上振れとして能力点だけを穏やかに割り引く。展開確率は維持する。
+    practical_overhang = np.maximum(
+        0.0,
+        pd.to_numeric(df["実戦能力点"], errors="coerce").fillna(0.0)
+        - pd.to_numeric(df["基礎スピード点"], errors="coerce").fillna(0.0) * 1.05,
+    )
+    df["実戦裏付け不足補正"] = -np.clip(practical_overhang, 0.0, 5.0)
+
+    # 0m内枠は車番そのものではなく、位置活用率・試走信頼度・長期連対率が
+    # そろったときだけ「今回も実戦力を再現しやすい」と評価する。
+    handicap_v = pd.to_numeric(df["ハンデ"], errors="coerce").fillna(0.0)
+    position_v = pd.to_numeric(df["位置活用率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    trust_v = pd.to_numeric(df["試走信頼度"], errors="coerce").fillna(0.45).clip(0.0, 1.0)
+    quinella_support = pd.to_numeric(df["連対率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["内枠実戦再現補正"] = np.where(
+        handicap_v <= 0.0,
+        position_v * (0.45 + trust_v) * (0.70 + quinella_support) * 6.0,
+        0.0,
+    )
+
+    # 内枠でも試走信頼度が低い場合は、前残り期待を能力順位へ過剰転写しない。
+    df["内枠信頼不足補正"] = np.where(
+        handicap_v <= 0.0,
+        -np.maximum(0.0, 0.50 - trust_v) * 17.0,
+        0.0,
+    )
+
+    # 直近5走全体より直近4走が改善し、直近3走も上位を保つ選手を小幅加点。
+    # 単なる高水準ではなく「新しい方へ向けて良化」した場合のみ働く。
+    recent5_v = pd.to_numeric(df["直近5走生3着内率"], errors="coerce").fillna(0.0)
+    recent4_v = pd.to_numeric(df["直近4走生3着内率"], errors="coerce").fillna(0.0)
+    recent3_v = pd.to_numeric(df["直近3走生3着内率"], errors="coerce").fillna(0.0)
+    df["継続上昇補正"] = np.clip(
+        np.maximum(0.0, recent4_v - recent5_v) * 7.0
+        + np.maximum(0.0, recent3_v - 0.50) * 1.2,
+        0.0, 1.5,
+    ) * np.clip(0.70 + trust_v * 0.45, 0.70, 1.15)
+
+    # 最内車は、試走信頼度が十分高い場合に限り、前で自分のペースを作る再現性を加点。
+    # 信頼度が低い最内車には働かないため、単純な1番車優遇にはしない。
+    car_v = pd.to_numeric(df["車"], errors="coerce").fillna(99)
+    df["最内高信頼再現補正"] = np.where(
+        (car_v == 1) & (handicap_v <= 0.0),
+        np.clip(np.maximum(0.0, trust_v - 0.50) * 50.0, 0.0, 2.6),
+        0.0,
+    )
+
+    df["評価整合補正"] = (
+        df["実戦裏付け不足補正"]
+        + df["内枠実戦再現補正"]
+        + df["内枠信頼不足補正"]
+        + df["継続上昇補正"]
+        + df["最内高信頼再現補正"]
+    )
+    df["改善後総合点"] = df["改善後総合点"] + df["評価整合補正"]
+
+    # Ver10.2: 選手タイプを3方向で補足する。車番固定ではなく、
+    # レース内の相対値から「巻き返し余地」「再現力」「近況単独の過大評価」を判定する。
+    def _race_z(series):
+        v = pd.to_numeric(series, errors="coerce")
+        v = v.fillna(v.mean())
+        sd = float(v.std(ddof=0))
+        if not np.isfinite(sd) or sd < 1e-9:
+            return pd.Series(0.0, index=v.index)
+        return ((v - float(v.mean())) / sd).clip(-2.0, 2.0)
+
+    base_z = _race_z(df["基礎スピード点"])
+    avg_finish_z = _race_z(df["平均着順"])
+    trust_z = _race_z(df["試走信頼度"])
+    craft_z = _race_z(df["レース巧者指数"])
+    long_top3_z = _race_z(df["3着以内率"])
+    recent_top3_z = _race_z(df["直近5走生3着内率"])
+    practical_z = _race_z(df["実戦能力点"])
+    win_z = _race_z(df["勝ち切り指数"])
+
+    df["巻き返し余地補正"] = np.clip(
+        np.maximum(0.0, base_z) * np.maximum(0.0, avg_finish_z) * 2.0
+        + np.maximum(0.0, base_z) * 0.55,
+        0.0, 3.5,
+    )
+    df["実戦再現力補正"] = np.clip(
+        np.maximum(0.0, trust_z) * 0.75
+        + np.maximum(0.0, craft_z) * 1.05
+        + np.maximum(0.0, long_top3_z) * 0.45,
+        0.0, 2.4,
+    )
+    recent_top3_raw = pd.to_numeric(df["直近5走生3着内率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["勝負余力補正"] = np.clip(
+        np.maximum(0.0, win_z) * np.maximum(0.0, 0.75 - recent_top3_raw) * 2.8,
+        0.0, 1.8,
+    )
+    df["内側高信頼補正"] = np.where(
+        handicap_v <= 0.0,
+        np.clip(np.maximum(0.0, trust_v - 0.50) * position_v * 10.0, 0.0, 1.2),
+        0.0,
+    )
+    unsupported = (
+        np.maximum(0.0, practical_z) * np.maximum(0.0, -base_z) * 1.50
+        + np.maximum(0.0, recent_top3_z) * np.maximum(0.0, -craft_z) * 1.20
+        + np.maximum(0.0, recent_top3_z) * np.maximum(0.0, -trust_z) * 0.70
+    )
+    perfect_surge = np.maximum(0.0, recent_top3_z - 1.0) * (1.10 + np.maximum(0.0, -craft_z))
+    df["近況単独過大補正"] = -np.clip(unsupported + perfect_surge, 0.0, 4.5)
+    df["選手タイプ総合補正"] = (
+        df["巻き返し余地補正"]
+        + df["実戦再現力補正"]
+        + df["勝負余力補正"]
+        + df["内側高信頼補正"]
+        + df["近況単独過大補正"]
+    )
+    df["改善後総合点"] = df["改善後総合点"] + df["選手タイプ総合補正"]
+
+    # Ver10.5: 3着以内と凡走の間にある4～5着の内容を評価する。
+    # 3着以内率だけの段差で、競走内容をまとめている選手が沈みすぎるのを防ぐ。
+    # 車番は使用せず、直近5走の「6着以下ではないが3着以内でもない」割合から算出。
+    recent_mid_hold = np.clip(
+        1.0
+        - pd.to_numeric(df["直近5走生3着内率"], errors="coerce").fillna(0.0)
+        - pd.to_numeric(df["直近5走生凡走率"], errors="coerce").fillna(0.0),
+        0.0, 1.0,
+    )
+    trust_for_hold = pd.to_numeric(
+        df["試走信頼度"], errors="coerce"
+    ).fillna(0.45).clip(0.0, 1.0)
+    craft_for_hold = np.clip(
+        0.50 + pd.to_numeric(df["レース巧者指数"], errors="coerce").fillna(0.0) * 2.0,
+        0.0, 1.0,
+    )
+    df["中位粘り率"] = recent_mid_hold
+    df["中位粘り補正"] = np.clip(
+        recent_mid_hold
+        * (0.75 + trust_for_hold * 0.45 + craft_for_hold * 0.35)
+        * 2.6,
+        0.0, 2.8,
+    )
+
+    # 重いハンデから軽くなっただけで無条件加点せず、
+    # 試走信頼度と中位粘りが伴う場合に限り条件改善を追加評価する。
+    handicap_change_v = pd.to_numeric(
+        df["ハンデ変化点"], errors="coerce"
+    ).fillna(0.0).clip(lower=0.0)
+    df["条件改善再現補正"] = np.clip(
+        handicap_change_v
+        * (0.30 + trust_for_hold * 0.30 + recent_mid_hold * 0.35),
+        0.0, 1.6,
+    )
+
+    df["中位内容総合補正"] = (
+        df["中位粘り補正"] + df["条件改善再現補正"]
+    )
+    df["改善後総合点"] = df["改善後総合点"] + df["中位内容総合補正"]
+
+    # Ver10.6: 新しい3指標を能力評価へ追加。
+    # 全て車番非依存で、レース内相対値と履歴の流れから算出する。
+    curve_v = pd.to_numeric(df.get("上昇カーブ指数", 0.0), errors="coerce").fillna(0.0).clip(-1.0, 1.0)
+    kick_v = pd.to_numeric(df.get("終盤指数", 0.0), errors="coerce").fillna(0.0).clip(-1.0, 1.0)
+
+    df["上昇カーブ補正"] = np.clip(curve_v * 3.2, -2.0, 3.2)
+    df["終盤力補正"] = np.clip(kick_v * 3.0, -1.8, 3.0)
+
+    # 履歴に対戦相手ランクが無いため、現在の格に対して長期実戦成績が上回る選手を
+    # 「格以上に走れる＝相手耐性あり」と推定する。単純な低ランク救済にはしない。
+    rank_base_z = _race_z(df["審査Pランク点"])
+    durable_z = _race_z(
+        pd.to_numeric(df["3着以内率"], errors="coerce").fillna(0.0) * 0.55
+        + pd.to_numeric(df["着順安定度"], errors="coerce").fillna(0.0) * 0.25
+        + pd.to_numeric(df["レース巧者指数"], errors="coerce").fillna(0.0) * 0.20
+    )
+    recent_poor_gate = 1.0 - pd.to_numeric(
+        df["直近5走生凡走率"], errors="coerce"
+    ).fillna(0.0).clip(0.0, 1.0)
+    under_ranked = np.maximum(0.0, -rank_base_z)
+    df["相手レベル耐性補正"] = np.clip(
+        np.maximum(0.0, durable_z)
+        * (0.35 + under_ranked * 0.85)
+        * recent_poor_gate
+        * 1.45
+        + np.maximum(0.0, kick_v) * 0.45,
+        0.0, 2.2,
+    )
+
+    df["Ver10_6総合補正"] = (
+        df["上昇カーブ補正"]
+        + df["終盤力補正"]
+        + df["相手レベル耐性補正"]
+    )
+    df["改善後総合点"] = df["改善後総合点"] + df["Ver10_6総合補正"]
+
+
+    # Ver10.7: 能力順位とは別に「1着まで届く上振れ余地」を評価する。
+    # ① 前線最内で逃げの形を作れるタイプ
+    # ② 格・ST・勝ち切り力があり、近況不振でも一発の天井が残るタイプ
+    # の2経路を車番非依存で算出する。
+    handicap_now = pd.to_numeric(df["ハンデ"], errors="coerce").fillna(0.0)
+    front_h = float(handicap_now.min())
+    front_gate = (handicap_now == front_h).astype(float)
+    inner_degree = pd.to_numeric(df.get("前線内側度", 0.0), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    escape_v = pd.to_numeric(df.get("逃げ成功率", 0.0), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    hold_v = pd.to_numeric(df.get("内枠残存率", 0.0), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    close_v = pd.to_numeric(df.get("勝ち切り指数", 0.0), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    st_point_z = _race_z(pd.to_numeric(df["ST点"], errors="coerce").fillna(0.0))
+    rank_point_z = _race_z(pd.to_numeric(df["審査Pランク点"], errors="coerce").fillna(0.0))
+    trial_point_z = _race_z(pd.to_numeric(df["試走点"], errors="coerce").fillna(0.0))
+    recent_poor_v = pd.to_numeric(df["直近5走生凡走率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+
+    df["逃げ切り上振れ指数"] = np.clip(
+        front_gate
+        * inner_degree
+        * (0.34 * escape_v + 0.28 * hold_v + 0.18 * close_v
+           + 0.10 * np.maximum(0.0, trial_point_z)
+           + 0.10 * np.maximum(0.0, -st_point_z)),
+        0.0, 1.0,
+    )
+
+    # 近況不振は通常評価では減点するが、格・ST・勝率が揃う場合の
+    # 「一発の天井」までゼロにはしない。連下安定とは分離する。
+    raw_chase_ceiling = (
+        0.30 * np.maximum(0.0, rank_point_z)
+        + 0.24 * np.maximum(0.0, st_point_z)
+        + 0.30 * close_v
+        + 0.16 * np.maximum(0.0, trial_point_z)
+    )
+    # 格やSTだけでなく、最低限の勝ち切り実績を必要条件にする。
+    # これにより「速いが勝ち筋が薄い」選手の過大評価を防ぐ。
+    df["追上げ勝負余地指数"] = np.clip(
+        raw_chase_ceiling
+        * (0.48 + close_v * 1.55)
+        * (0.82 + recent_poor_v * 0.18),
+        0.0, 1.0,
+    )
+
+    df["勝ち上振れ余地指数"] = np.maximum(
+        df["逃げ切り上振れ指数"],
+        df["追上げ勝負余地指数"],
+    )
+    # 能力点への反映は小さく留め、主効果はシミュレーションの1着分岐に置く。
+    df["勝ち上振れ能力補正"] = np.clip(
+        df["勝ち上振れ余地指数"] * 1.55,
+        0.0, 1.55,
+    )
+    df["改善後総合点"] = df["改善後総合点"] + df["勝ち上振れ能力補正"]
+
+    # 格・ST・勝ち切りの3要素が偏らず揃う選手を「一発勝負型」として小幅評価。
+    # どれか1項目だけ突出した選手は上がりすぎないよう、3要素の最小値寄りで判定する。
+    rank_pct = pd.to_numeric(df["審査Pランク点"], errors="coerce").rank(pct=True)
+    st_pct = pd.to_numeric(df["ST点"], errors="coerce").rank(pct=True)
+    close_pct = close_v.rank(pct=True)
+    balanced_ceiling = (
+        np.minimum(np.minimum(rank_pct, st_pct), close_pct) * 0.65
+        + (rank_pct * st_pct * close_pct) ** (1.0 / 3.0) * 0.35
+    )
+    df["一発勝負バランス補正"] = np.clip(
+        np.maximum(0.0, balanced_ceiling - 0.48) * 2.2,
+        0.0, 1.15,
+    )
+    df["改善後総合点"] = df["改善後総合点"] + df["一発勝負バランス補正"]
+
+
+    # Ver11.3: 当日状態指数。今回試走の相対順位を中心に、
+    # 直近状態・上昇カーブ・ST・試走信頼度が伴う場合だけ強く評価する。
+    trial_raw = pd.to_numeric(df["試走換算"], errors="coerce")
+    trial_pct = trial_raw.rank(pct=True, ascending=False, method="average").fillna(0.50)
+    st_pct_today = pd.to_numeric(df["平均ST"], errors="coerce").rank(
+        pct=True, ascending=False, method="average"
+    ).fillna(0.50)
+    trust_today = pd.to_numeric(df["試走信頼度"], errors="coerce").fillna(0.50).clip(0.20, 1.00)
+    recent3_today = pd.to_numeric(df["直近3走生3着内率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    recent5_today = pd.to_numeric(df["直近5走生3着内率"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    curve_today = pd.to_numeric(df.get("上昇カーブ指数", 0.0), errors="coerce").fillna(0.0).clip(-1.0, 1.0)
+    craft_today = pd.to_numeric(df.get("レース巧者指数", 0.0), errors="coerce").fillna(0.0)
+    craft_today = np.clip(0.50 + craft_today * 1.5, 0.0, 1.0)
+    recent_today = np.clip(recent3_today * 0.58 + recent5_today * 0.42, 0.0, 1.0)
+    trend_today = np.clip(0.50 + curve_today * 0.50, 0.0, 1.0)
+    support_gate = np.clip(
+        0.30 + trust_today * 0.28 + recent_today * 0.20
+        + trend_today * 0.12 + craft_today * 0.10, 0.35, 1.00
+    )
+    own_trial_change = pd.to_numeric(
+        df.get("自己試走変化秒", pd.Series(0.0, index=df.index)), errors="coerce"
+    ).fillna(0.0)
+    own_trial_sd = pd.to_numeric(
+        df.get("直近試走標準偏差", pd.Series(0.035, index=df.index)), errors="coerce"
+    ).fillna(0.035).clip(0.018, 0.080)
+    # 良化0.04秒前後で強評価、悪化0.04秒前後で弱評価。
+    # 標準偏差が大きい選手は、単発の変化を少し割り引く。
+    own_scale = np.maximum(0.040, own_trial_sd * 1.35)
+    df["自己比試走指数"] = np.clip(
+        0.50 + own_trial_change / (own_scale * 2.0), 0.0, 1.0
+    )
+    df["当日状態指数"] = np.clip(
+        (trial_pct * 0.39 + df["自己比試走指数"] * 0.22
+         + st_pct_today * 0.12 + recent_today * 0.15
+         + trend_today * 0.08 + craft_today * 0.04) * support_gate, 0.0, 1.0
+    )
+    state_center = float(df["当日状態指数"].median())
+    df["当日状態補正"] = np.clip(
+        np.maximum(0.0, df["当日状態指数"] - state_center) * 8.5, 0.0, 3.4
+    )
+    df["改善後総合点"] = df["改善後総合点"] + df["当日状態補正"]
+
+    # Ver12.2: 爆発指数。
+    # 単なる試走1位ではなく、2位との差が大きい「突出試走」を今日だけの勝ち切り上振れとして扱う。
+    trial_values = trial_raw.to_numpy(float)
+    valid_trial = trial_values[np.isfinite(trial_values)]
+    if len(valid_trial) >= 2:
+        sorted_trial = np.sort(valid_trial)
+        best_trial = float(sorted_trial[0])
+        second_trial = float(sorted_trial[1])
+    elif len(valid_trial) == 1:
+        best_trial = second_trial = float(valid_trial[0])
+    else:
+        best_trial = second_trial = np.nan
+
+    # 0.05秒差でほぼ最大。トップ以外は突出度を持たない。
+    best_mask = np.isfinite(trial_values) & np.isclose(trial_values, best_trial, atol=1e-9)
+    top_margin = max(0.0, second_trial - best_trial) if np.isfinite(best_trial) else 0.0
+    margin_power = float(np.clip(top_margin / 0.05, 0.0, 1.0))
+    trial_dominance = np.zeros(len(df), dtype=float)
+    trial_dominance[best_mask] = margin_power
+    df["試走突出度"] = trial_dominance
+
+    # 今日の気配を主役にしつつ、信頼度・上昇傾向を補助条件にする。
+    # 履歴が弱くても突出試走そのものは残すが、無条件で能力トップにはしない。
+    explosion_support = np.clip(
+        0.58 + trust_today.to_numpy(float) * 0.20
+        + trend_today.to_numpy(float) * 0.12
+        + recent_today.to_numpy(float) * 0.10,
+        0.58, 1.00,
+    )
+    df["爆発指数"] = np.clip(
+        (trial_pct.to_numpy(float) * 0.24
+         + trial_dominance * 0.34
+         + df["自己比試走指数"].to_numpy(float) * 0.25
+         + df["当日状態指数"].to_numpy(float) * 0.17)
+        * explosion_support,
+        0.0, 1.0,
+    )
+    explosion_center = float(df["爆発指数"].median())
+    # 能力順位への加点は控えめ。主効果はシミュレーションの上振れ分岐。
+    df["爆発能力補正"] = np.clip(
+        np.maximum(0.0, df["爆発指数"] - explosion_center) * 2.2,
+        0.0, 1.10,
+    )
+    df["改善後総合点"] = df["改善後総合点"] + df["爆発能力補正"]
+
+    # Ver12.2: 当日レース評価。
+    # 過去能力の絶対点差が大きすぎると、突出試走を何点足しても届かないため、
+    # レース内百分位で「基礎力・当日試走・格・ST・ハンデ位置・上昇度」を再合成する。
+    # これにより過去能力を捨てず、その日の番組内での相対的な主役候補を評価する。
+    base_today_pct = pd.to_numeric(df["改善後総合点"], errors="coerce").rank(
+        pct=True, ascending=True, method="average"
+    ).fillna(0.50)
+    rank_today_pct = pd.to_numeric(df["審査Pランク点"], errors="coerce").rank(
+        pct=True, ascending=True, method="average"
+    ).fillna(0.50)
+    handicap_today_pct = pd.to_numeric(df["ハンデ"], errors="coerce").rank(
+        pct=True, ascending=True, method="average"
+    ).fillna(0.50)
+    trend_rank_pct = pd.to_numeric(df.get("上昇カーブ指数", 0.0), errors="coerce").rank(
+        pct=True, ascending=True, method="average"
+    ).fillna(0.50)
+
+    # Ver12.2: 前団主導指数。
+    # 0m逃げを無条件に上げず、最前線から10m後ろの選手が、今回試走・当日状態・ST・
+    # 試走信頼度を伴っている場合に「前団を先に攻略できる主役候補」として評価する。
+    handicap_num = pd.to_numeric(df["ハンデ"], errors="coerce").fillna(0.0)
+    min_handicap_value = float(handicap_num.min())
+    handicap_gap = handicap_num - min_handicap_value
+    front_band_gate = ((handicap_gap > 0.0) & (handicap_gap <= 10.0)).astype(float)
+    df["前団主導指数"] = np.clip(
+        (trial_pct * 0.36
+         + df["自己比試走指数"] * 0.18
+         + df["当日状態指数"] * 0.22
+         + st_pct_today * 0.12
+         + trust_today * 0.08
+         + trend_rank_pct * 0.04) * front_band_gate,
+        0.0, 1.0,
+    )
+
+    # 後方追走不成立リスク。
+    # 20m以上後方で、前団の最速試走より0.02秒を超えて劣る場合だけ発生。
+    # ランクそのものは下げず、今回の追走が成立しにくい条件として扱う。
+    front_trial_mask = handicap_gap <= 10.0
+    front_trials = trial_raw[front_trial_mask & trial_raw.notna()]
+    best_front_trial = float(front_trials.min()) if len(front_trials) else float(trial_raw.min())
+    trial_deficit = np.clip((trial_raw - best_front_trial - 0.02) / 0.04, 0.0, 1.0).fillna(0.0)
+    backline_gate = (handicap_gap >= 20.0).astype(float)
+    df["後方追走不成立リスク"] = np.clip(
+        trial_deficit
+        * backline_gate
+        * (0.78 - df["当日状態指数"] * 0.28)
+        * (1.00 - df["爆発指数"] * 0.45),
+        0.0, 0.85,
+    )
+
+    df["当日レース指数"] = np.clip(
+        trial_pct * 0.25
+        + df["自己比試走指数"] * 0.11
+        + rank_today_pct * 0.17
+        + base_today_pct * 0.11
+        + st_pct_today * 0.05
+        + handicap_today_pct * 0.15
+        + trend_rank_pct * 0.06
+        + df["前団主導指数"] * 0.14
+        - df["後方追走不成立リスク"] * 0.08,
+        0.0, 1.0,
+    )
+    # 爆発指数が高い選手は僅差の順位比較で優先する。過大な固定加点にはしない。
+    df["当日レース指数"] = np.clip(
+        df["当日レース指数"] + df["試走突出度"] * 0.08 + df["爆発指数"] * 0.04,
+        0.0, 1.0,
+    )
+    df["当日勝ち切り指数"] = np.clip(
+        df["自己比試走指数"] * 0.36
+        + df["前団主導指数"] * 0.30
+        + df["爆発指数"] * 0.18
+        + pd.to_numeric(df.get("勝ち切り指数", 0.0), errors="coerce").fillna(0.0).rank(pct=True) * 0.16,
+        0.0, 1.0,
+    )
+
+    # Ver12.2: 当日試走が横並びのレースでは、格・突破力だけの順位独占を抑え、
+    # 安定して2～4着へ残れる選手を評価へ戻す。
+    stable_top_pct = pd.to_numeric(df["安定上位指数"], errors="coerce").fillna(0.5).rank(pct=True)
+    recent_poor_gate_v = 1.0 - pd.to_numeric(
+        df.get("直近5走生凡走率", 0.0), errors="coerce"
+    ).fillna(0.0).clip(0.0, 1.0)
+    trial_spread = float(pd.to_numeric(df["試走換算"], errors="coerce").max() - pd.to_numeric(df["試走換算"], errors="coerce").min())
+    trial_tie_gate = float(np.clip((0.08 - trial_spread) / 0.06, 0.0, 1.0))
+    df["安定上位評価補正"] = np.clip(
+        (stable_top_pct - 0.50) * (0.10 + 0.10 * trial_tie_gate)
+        + (recent_poor_gate_v - 0.55) * 0.035,
+        -0.055, 0.125,
+    )
+    df["当日レース指数"] = np.clip(
+        df["当日レース指数"] + df["安定上位評価補正"], 0.0, 1.0
+    )
+
+    df["基礎履歴総合点"] = df["改善後総合点"]
+    df["改善後総合点"] = df["当日レース指数"] * 30.0
+
+    # 選手タイプVer2。既存タイプを残しつつ、強い特徴がある場合だけ上書きする。
+    df["選手タイプVer2"] = df["選手タイプ"].astype(str)
+    df.loc[(curve_v >= 0.35) & (kick_v >= 0.05), "選手タイプVer2"] = "上昇型"
+    df.loc[(kick_v >= 0.35) & (curve_v < 0.35), "選手タイプVer2"] = "終盤型"
+    df.loc[(kick_v >= 0.22) & (pd.to_numeric(df["連下安定指数"], errors="coerce").fillna(0.0) >= 0.52), "選手タイプVer2"] = "追走終盤型"
+    df.loc[(pd.to_numeric(df["内枠残存率"], errors="coerce").fillna(0.0) >= 0.58) & (kick_v < 0.20), "選手タイプVer2"] = "前残り型"
+
+    # Excel COUNTIF(">") + 1 と同じ競技順位
+    df["改良順位"] = [
+        1 + sum(other > value for other in df["改良総合点"])
+        for value in df["改良総合点"]
+    ]
+    df["改善後順位"] = [
+        1 + sum(other > value for other in df["改善後総合点"])
+        for value in df["改善後総合点"]
+    ]
+
+    return df
+
+
+
+
+def prepare_simulation_arrays(df):
+    """Ver7.2: 近況好調を実戦展開へ強く反映する配列。"""
+    cars = df["車"].astype(int).to_numpy()
+    handicap = pd.to_numeric(df["ハンデ"], errors="coerce").fillna(0.0).to_numpy(float)
+    st = pd.to_numeric(df["平均ST"], errors="coerce").fillna(0.20).clip(0.06, 0.40).to_numpy(float)
+    st_std = pd.to_numeric(df.get("ST標準偏差", pd.Series(0.045, index=df.index)), errors="coerce").fillna(0.045).clip(0.015, 0.12).to_numpy(float)
+    outer_penalty = pd.to_numeric(df["外枠不利補正"], errors="coerce").fillna(0.0).abs().to_numpy(float)
+    line_count = pd.to_numeric(df["同ハンデ人数"], errors="coerce").fillna(1.0).to_numpy(float)
+    scores = df["改善後総合点"].to_numpy(float)
+    finish_sd = pd.to_numeric(df["着順標準偏差"], errors="coerce").fillna(1.5).clip(0.8, 3.0).to_numpy(float)
+
+    # Ver11.1: 走路状況が変わっても崩れにくい度合い。
+    # 着順の散らばり、ST安定性、試走再現性を組み合わせる。
+    finish_consistency = np.clip(1.0 - (finish_sd - 0.8) / 2.2, 0.0, 1.0)
+
+    trial_outlier_confidence = pd.to_numeric(df.get("試走単発外れ信頼度", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0).clip(0.0, 1.0).to_numpy(float)
+    trial_relief_points = pd.to_numeric(df.get("試走単発救済点", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0).to_numpy(float)
+    # Ver7.2: 試走が単発で悪かった好調選手は、本走で戻す分岐を強める。
+    form_upside_prob = np.clip(
+        trial_outlier_confidence
+        * np.clip(trial_relief_points / 2.6, 0.0, 1.0)
+        * 1.02,
+        0.0, 0.58,
+    )
+    form_upside_power = 0.34 + trial_outlier_confidence * 0.76
+
+    # 直近の好調度を、能力点とは別の「展開発現力」として作る。
+    recent3_bonus = pd.to_numeric(df.get("直近3走好調補正", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0).clip(-3.0, 4.0).to_numpy(float)
+    recent5_bonus = pd.to_numeric(df.get("直近5走補正", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0).clip(-3.0, 4.0).to_numpy(float)
+    top3_rate_flow = pd.to_numeric(df.get("3着以内率", pd.Series(0.35, index=df.index)), errors="coerce").fillna(0.35).clip(0.0, 1.0).to_numpy(float)
+    quinella_rate_flow = pd.to_numeric(df.get("連対率", pd.Series(0.20, index=df.index)), errors="coerce").fillna(0.20).clip(0.0, 1.0).to_numpy(float)
+    craft_flow = pd.to_numeric(df.get("レース巧者指数", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0).to_numpy(float)
+    craft_scale = np.tanh(craft_flow / 0.30)
+
+    # Ver7.4: 試走だけ速く、実戦で着順へ変換しにくい選手を抑える。
+    # 車番固定ではなく、試走信頼度・レース巧者・ST安定性・外位置で判定する。
+    trial_trust_flow = pd.to_numeric(
+        df.get("試走信頼度", pd.Series(0.50, index=df.index)),
+        errors="coerce",
+    ).fillna(0.50).clip(0.20, 1.00).to_numpy(float)
+    st_stability_flow = pd.to_numeric(
+        df.get("ST安定性", pd.Series(0.50, index=df.index)),
+        errors="coerce",
+    ).fillna(0.50).clip(0.0, 1.0).to_numpy(float)
+    execution_quality = np.clip(
+        0.34 * trial_trust_flow
+        + 0.27 * ((craft_scale + 1.0) / 2.0)
+        + 0.22 * st_stability_flow
+        + 0.17 * top3_rate_flow,
+        0.0, 1.0,
+    )
+
+    road_stability = np.clip(
+        0.42 * finish_consistency
+        + 0.31 * st_stability_flow
+        + 0.17 * trial_trust_flow
+        + 0.10 * execution_quality,
+        0.0, 1.0,
+    )
+    volatility_profile = np.clip(1.0 - road_stability, 0.0, 1.0)
+
+    recent_form_strength = np.clip(
+        0.34 * top3_rate_flow
+        + 0.24 * quinella_rate_flow
+        + 0.18 * np.clip((recent3_bonus + 1.5) / 5.5, 0.0, 1.0)
+        + 0.14 * np.clip((recent5_bonus + 1.5) / 5.5, 0.0, 1.0)
+        + 0.10 * ((craft_scale + 1.0) / 2.0),
+        0.0, 1.0,
+    )
+
+    current_day_strength = pd.to_numeric(
+        df.get("当日状態指数", pd.Series(0.50, index=df.index)), errors="coerce"
+    ).fillna(0.50).clip(0.0, 1.0).to_numpy(float)
+    explosion_strength = pd.to_numeric(
+        df.get("爆発指数", pd.Series(0.0, index=df.index)), errors="coerce"
+    ).fillna(0.0).clip(0.0, 1.0).to_numpy(float)
+    trial_dominance_flow = pd.to_numeric(
+        df.get("試走突出度", pd.Series(0.0, index=df.index)), errors="coerce"
+    ).fillna(0.0).clip(0.0, 1.0).to_numpy(float)
+    front_command_flow = pd.to_numeric(
+        df.get("前団主導指数", pd.Series(0.0, index=df.index)), errors="coerce"
+    ).fillna(0.0).clip(0.0, 1.0).to_numpy(float)
+    pursuit_failure_risk = pd.to_numeric(
+        df.get("後方追走不成立リスク", pd.Series(0.0, index=df.index)), errors="coerce"
+    ).fillna(0.0).clip(0.0, 0.85).to_numpy(float)
+    own_trial_form = pd.to_numeric(
+        df.get("自己比試走指数", pd.Series(0.5, index=df.index)), errors="coerce"
+    ).fillna(0.5).clip(0.0, 1.0).to_numpy(float)
+    today_win_conversion = pd.to_numeric(
+        df.get("当日勝ち切り指数", pd.Series(0.5, index=df.index)), errors="coerce"
+    ).fillna(0.5).clip(0.0, 1.0).to_numpy(float)
+
+    score_std = np.std(scores, ddof=1)
+    ability_z = (scores - np.mean(scores)) / (score_std if score_std > 0 else 1.0)
+    form_std = np.std(recent_form_strength, ddof=1)
+    form_z = (recent_form_strength - np.mean(recent_form_strength)) / (form_std if form_std > 0 else 1.0)
+    # Ver7.4: 能力75%・近況展開25%。
+    # 通常スタート時は基礎能力をしっかり出し、展開失敗時だけ大きく落ちる二山型。
+    state_std = np.std(current_day_strength, ddof=1)
+    state_z = (current_day_strength - np.mean(current_day_strength)) / (state_std if state_std > 0 else 1.0)
+    z_scores = ability_z * 0.68 + form_z * 0.20 + state_z * 0.12
+
+    same_line_outer_ratio = np.zeros(len(df), dtype=float)
+    same_line_inner_ratio = np.zeros(len(df), dtype=float)
+    for _, group in df.groupby("ハンデ", dropna=False):
+        ordered = group.sort_values("車")
+        count = len(ordered)
+        if count <= 1:
+            continue
+        for order, idx in enumerate(ordered.index, 1):
+            pos = df.index.get_loc(idx)
+            ratio = (order - 1) / (count - 1)
+            same_line_outer_ratio[pos] = ratio
+            same_line_inner_ratio[pos] = 1.0 - ratio
+
+    # 外側で実戦変換力が低いほど、混戦で位置を失いやすい。
+    traffic_conversion = np.clip(
+        execution_quality
+        - same_line_outer_ratio * 0.20
+        + np.clip(craft_scale, -1.0, 1.0) * 0.10,
+        0.05, 0.95,
+    )
+
+
+    # Ver9.0: 能力とは別の勝ち切り・連下指標。
+    closing_base = pd.to_numeric(
+        df.get("勝ち切り指数", pd.Series(0.35, index=df.index)),
+        errors="coerce",
+    ).fillna(0.35).clip(0.0, 1.0)
+    final_kick_flow = pd.to_numeric(
+        df.get("終盤指数", pd.Series(0.0, index=df.index)),
+        errors="coerce",
+    ).fillna(0.0).clip(-1.0, 1.0)
+    win_upside_flow = pd.to_numeric(
+        df.get("勝ち上振れ余地指数", pd.Series(0.0, index=df.index)),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 1.0).to_numpy(float)
+    closing_strength = np.clip(
+        closing_base.to_numpy(float)
+        + np.maximum(0.0, final_kick_flow.to_numpy(float)) * 0.13
+        + win_upside_flow * 0.20,
+        0.0, 1.0,
+    )
+    position_hold_flow = pd.to_numeric(
+        df.get("好位置維持指数", pd.Series(0.50, index=df.index)), errors="coerce"
+    ).fillna(0.50).clip(0.0, 1.0).to_numpy(float)
+    rear_chase_flow = pd.to_numeric(
+        df.get("後方追上げ指数", pd.Series(0.35, index=df.index)), errors="coerce"
+    ).fillna(0.35).clip(0.0, 1.0).to_numpy(float)
+    position_dependency_flow = pd.to_numeric(
+        df.get("位置依存指数", pd.Series(0.50, index=df.index)), errors="coerce"
+    ).fillna(0.50).clip(0.0, 1.0).to_numpy(float)
+    bipolar_flow = pd.to_numeric(
+        df.get("二極化指数", pd.Series(0.30, index=df.index)), errors="coerce"
+    ).fillna(0.30).clip(0.0, 1.0).to_numpy(float)
+
+    place_strength = pd.to_numeric(
+        df.get("連下安定指数", pd.Series(0.45, index=df.index)),
+        errors="coerce",
+    ).fillna(0.45).clip(0.0, 1.0).to_numpy(float)
+
+    zero_line_outer = (handicap == 0).astype(float) * same_line_outer_ratio * np.clip((line_count - 1.0) / 2.0, 0.0, 1.0)
+    outer_start_delay = outer_penalty * 0.060 + zero_line_outer * 0.065
+
+    st_speed_risk = np.clip((st - 0.14) / 0.16, 0.0, 1.0)
+    st_variation_risk = np.clip((st_std - 0.025) / 0.065, 0.0, 1.0)
+    outer_risk = np.clip(outer_penalty / 4.5 + zero_line_outer * 0.75, 0.0, 1.0)
+    crowd_risk = np.clip((line_count - 2.0) / 4.0, 0.0, 1.0)
+    conversion_risk = np.clip(1.0 - traffic_conversion, 0.0, 1.0)
+    normal_late_prob = np.clip(
+        0.040 + st_speed_risk * 0.066 + st_variation_risk * 0.098
+        + outer_risk * 0.076 + crowd_risk * 0.032
+        + conversion_risk * same_line_outer_ratio * 0.090,
+        0.030, 0.29,
+    )
+    severe_late_prob = np.clip(
+        0.009 + st_speed_risk * 0.021 + st_variation_risk * 0.042
+        + outer_risk * 0.032
+        + conversion_risk * same_line_outer_ratio * 0.045,
+        0.006, 0.12,
+    )
+
+    zero_inner_escape = (handicap == 0).astype(float) * same_line_inner_ratio * np.clip((line_count - 1.0) / 2.0, 0.0, 1.0)
+    escape_success_prob = pd.to_numeric(df.get("逃げ成功率", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0).clip(0.0, 0.90).to_numpy(float)
+
+    top3_rate = pd.to_numeric(df.get("3着以内率", pd.Series(0.35, index=df.index)), errors="coerce").fillna(0.35).clip(0.0, 1.0).to_numpy(float)
+    quinella_rate = pd.to_numeric(df.get("連対率", pd.Series(0.20, index=df.index)), errors="coerce").fillna(0.20).clip(0.0, 1.0).to_numpy(float)
+    st_stability = pd.to_numeric(df.get("ST安定性", pd.Series(0.50, index=df.index)), errors="coerce").fillna(0.50).clip(0.0, 1.0).to_numpy(float)
+
+    # Ver7.4: 点数モデルで算出した内枠残存率をシミュレーションにも使用。
+    # 当日の混雑度とST安定性を少しだけ再加味する。
+    stored_inner_hold = pd.to_numeric(
+        df.get("内枠残存率", pd.Series(0.0, index=df.index)),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 0.90).to_numpy(float)
+    inner_hold_prob = np.clip(
+        stored_inner_hold * 0.82
+        + zero_inner_escape * 0.08
+        + st_stability * 0.06
+        + top3_rate * 0.04,
+        0.08, 0.88,
+    )
+    front_handicap = float(np.min(handicap))
+    front_line = handicap == front_handicap
+    inner_hold_prob *= front_line.astype(float)
+
+    # Ver8.3: 勝ち切り確率は「最内だから」ではなく能力の裏付けを必須にする。
+    # z_scores・実戦変換力が低い車は、内を守れても1着への強制昇格を抑える。
+    ability_gate = 1.0 / (1.0 + np.exp(-np.clip(z_scores, -3.0, 3.0)))
+    front_win_prob = np.clip(
+        escape_success_prob * 0.30
+        + inner_hold_prob * 0.10
+        + quinella_rate * 0.17
+        + recent_form_strength * 0.13
+        + st_stability * 0.11
+        + execution_quality * 0.10
+        + ability_gate * 0.07
+        + win_upside_flow * 0.14,
+        0.03, 0.74,
+    ) * front_line.astype(float)
+    base_start_key = handicap * 0.10 + cars.astype(float) * 0.002 + st * 0.88 + outer_start_delay - zero_inner_escape * 0.010 - escape_success_prob * 0.010
+
+    return {
+        "cars": cars, "handicap": handicap, "st": st, "st_std": st_std,
+        "z_scores": z_scores, "finish_sd": finish_sd,
+        "outer_start_delay": outer_start_delay,
+        "same_line_outer_ratio": same_line_outer_ratio,
+        "same_line_inner_ratio": same_line_inner_ratio,
+        "zero_inner_escape": zero_inner_escape,
+        "normal_late_prob": normal_late_prob,
+        "severe_late_prob": severe_late_prob,
+        "base_start_key": base_start_key,
+        "trial_outlier_confidence": trial_outlier_confidence,
+        "form_upside_prob": form_upside_prob,
+        "form_upside_power": form_upside_power,
+        "recent_form_strength": recent_form_strength,
+        "execution_quality": execution_quality,
+        "trial_trust_flow": trial_trust_flow,
+        "st_stability_flow": st_stability_flow,
+        "traffic_conversion": traffic_conversion,
+        "road_stability": road_stability,
+        "current_day_strength": current_day_strength,
+        "explosion_strength": explosion_strength,
+        "trial_dominance_flow": trial_dominance_flow,
+        "front_command_flow": front_command_flow,
+        "pursuit_failure_risk": pursuit_failure_risk,
+        "own_trial_form": own_trial_form,
+        "today_win_conversion": today_win_conversion,
+        "volatility_profile": volatility_profile,
+        "form_leader_strength": np.clip(
+            form_upside_prob * 0.38
+            + recent_form_strength * 0.24
+            + execution_quality * 0.14
+            + closing_strength * 0.20
+            + front_command_flow * 0.12,
+            0.0, 1.0,
+        ),
+        "closing_strength": closing_strength,
+        "win_upside_flow": win_upside_flow,
+        "final_kick_flow": final_kick_flow.to_numpy(float),
+        "place_strength": place_strength,
+        "position_hold_flow": position_hold_flow,
+        "rear_chase_flow": rear_chase_flow,
+        "position_dependency_flow": position_dependency_flow,
+        "bipolar_flow": bipolar_flow,
+        "escape_success_prob": escape_success_prob,
+        "inner_hold_prob": inner_hold_prob,
+        "front_win_prob": front_win_prob,
+        "front_handicap": front_handicap,
+        "front_line": front_line,
+    }
+
+
+def simulate_detailed(df, trials, seed, track_temp=30.0):
+    """Ver12.2: 大人数同ハンデ線を含む6周モデルに、安定上位と突破機会を追加する。"""
+    rng = np.random.default_rng(seed)
+    arr = prepare_simulation_arrays(df)
+    cars = arr["cars"]; n = len(cars)
+    handicap = arr["handicap"]; st = arr["st"]
+    z_scores = arr["z_scores"]; finish_sd = arr["finish_sd"]
+    explosion_strength = arr["explosion_strength"]
+    trial_dominance_flow = arr["trial_dominance_flow"]
+    front_command_flow = arr.get("front_command_flow", np.zeros(n, dtype=float))
+    pursuit_failure_risk = arr.get("pursuit_failure_risk", np.zeros(n, dtype=float))
+    own_trial_form = arr.get("own_trial_form", np.full(n, 0.5, dtype=float))
+    today_win_conversion = arr.get("today_win_conversion", np.full(n, 0.5, dtype=float))
+    outer_start_delay = arr["outer_start_delay"]
+    same_line_outer_ratio = arr["same_line_outer_ratio"]
+    same_line_inner_ratio = arr["same_line_inner_ratio"]
+    normal_late_prob = arr["normal_late_prob"]; severe_late_prob = arr["severe_late_prob"]
+    base_start_key = arr["base_start_key"]
+    form_upside_prob = arr["form_upside_prob"]; form_upside_power = arr["form_upside_power"]
+    recent_form_strength = arr["recent_form_strength"]
+    execution_quality = arr["execution_quality"]
+    trial_trust_flow = arr["trial_trust_flow"]
+    st_stability_flow = arr["st_stability_flow"]
+    traffic_conversion = arr["traffic_conversion"]
+    road_stability = arr["road_stability"]
+    current_day_strength = arr.get("current_day_strength", np.full(n, 0.50, dtype=float))
+    volatility_profile = arr["volatility_profile"]
+    form_leader_strength = arr["form_leader_strength"]
+    closing_strength = arr["closing_strength"]
+    win_upside_flow = arr.get("win_upside_flow", np.zeros(n, dtype=float))
+    final_kick_flow = arr.get("final_kick_flow", np.zeros(n, dtype=float))
+    place_strength = arr["place_strength"]
+    position_hold_flow = arr.get("position_hold_flow", np.full(n, 0.50))
+    rear_chase_flow = arr.get("rear_chase_flow", np.full(n, 0.35))
+    position_dependency_flow = arr.get("position_dependency_flow", np.full(n, 0.50))
+    bipolar_flow = arr.get("bipolar_flow", np.full(n, 0.30))
+    escape_success_prob = arr["escape_success_prob"]
+    inner_hold_prob = arr["inner_hold_prob"]
+    front_win_prob = arr["front_win_prob"]
+    front_line = arr["front_line"]
+    min_handicap = arr["front_handicap"]
+
+    # Ver11.1: 全車同ハンデは横一列スタートとして明示的に評価する。
+    # 車番固定ではなく、平均ST・ST安定性・今回試走・実戦変換力から
+    # 「スタート一気指数」を作り、外枠でも本当に切れる選手は先頭争いへ出せる。
+    all_same_handicap = bool(n >= 3 and np.nanmax(handicap) - np.nanmin(handicap) < 1e-9)
+    # Ver12.2: 全車横一列だけでなく、0m単騎＋10mに多数など「大人数の同ハンデ線」も混戦モデル対象。
+    unique_h, h_counts = np.unique(handicap, return_counts=True)
+    dense_idx = int(np.argmax(h_counts)) if len(h_counts) else 0
+    dense_handicap = float(unique_h[dense_idx]) if len(unique_h) else float(np.nanmin(handicap))
+    dense_line_size = int(h_counts[dense_idx]) if len(h_counts) else n
+    dense_line_race = bool(dense_line_size >= 4)
+    dense_line_mask = np.isclose(handicap, dense_handicap)
+    trial_values = pd.to_numeric(
+        df.get("試走換算", pd.Series(np.nan, index=df.index)),
+        errors="coerce",
+    ).to_numpy(float)
+    valid_trial = trial_values[np.isfinite(trial_values)]
+    trial_fill = float(np.nanmedian(valid_trial)) if len(valid_trial) else 3.50
+    trial_values = np.where(np.isfinite(trial_values), trial_values, trial_fill)
+
+    def _lower_rank_strength(values):
+        values = np.asarray(values, dtype=float)
+        order_idx = np.argsort(values, kind="stable")
+        strength = np.zeros(len(values), dtype=float)
+        if len(values) <= 1:
+            strength[:] = 0.5
+        else:
+            strength[order_idx] = 1.0 - np.arange(len(values), dtype=float) / (len(values) - 1.0)
+        return strength
+
+    st_launch_strength = _lower_rank_strength(st)
+    trial_launch_strength = _lower_rank_strength(trial_values)
+    same_line_launch_strength = np.clip(
+        st_launch_strength * 0.46
+        + st_stability_flow * 0.19
+        + trial_launch_strength * 0.22
+        + execution_quality * 0.13,
+        0.0, 1.0,
+    )
+
+    # Ver11.3: 好スタートを「実際の先行位置」に変換し、その位置を短時間維持する力。
+    # STだけではなく、本走への変換力・試走信頼度・走路安定性を組み合わせる。
+    # 能力点を直接持ち上げず、スタート成功時だけ展開へ作用させる。
+    trial_trust_flow = pd.to_numeric(
+        df.get("試走信頼度", pd.Series(0.50, index=df.index)),
+        errors="coerce",
+    ).fillna(0.50).clip(0.0, 1.0).to_numpy(float)
+    lead_conversion_strength = np.clip(
+        same_line_launch_strength * 0.43
+        + st_stability_flow * 0.13
+        + execution_quality * 0.18
+        + traffic_conversion * 0.14
+        + road_stability * 0.08
+        + trial_trust_flow * 0.04,
+        0.0, 1.0,
+    )
+
+    finish_matrix = np.zeros((n, n), dtype=np.int64)
+    trifecta = Counter()
+    trio = Counter()
+    exacta = Counter()
+    quinella = Counter()
+    scenario_counts = Counter()
+    phases = 3
+
+    # Ver12.2: 熱による前残りと、スタート後の隊列形成による残りを分離する。
+    # 41℃前後でも横一列スタートで内枠が先に隊列を作れば残れる一方、
+    # 温度だけで全ての前残りを強化しない。
+    track_temp = float(track_temp if track_temp is not None else 30.0)
+    if track_temp < 44.0:
+        heat_index = 0.0
+    elif track_temp < 48.0:
+        heat_index = 0.05 + (track_temp - 44.0) / 4.0 * 0.20
+    elif track_temp < 50.0:
+        heat_index = 0.25 + (track_temp - 48.0) / 2.0 * 0.25
+    else:
+        heat_index = 0.50 + np.clip((track_temp - 50.0) / 10.0, 0.0, 1.0) * 0.50
+    heat_index = float(np.clip(heat_index, 0.0, 1.0))
+    chaos_index = float(np.clip((track_temp - 48.0) / 16.0, 0.0, 1.0))
+    front_temp_gate = 0.20 + heat_index * 0.80
+    escape_success_prob = escape_success_prob * (0.34 + heat_index * 0.66)
+    inner_hold_prob = inner_hold_prob * front_temp_gate
+    front_win_prob = front_win_prob * (0.24 + heat_index * 0.76)
+    normal_pass_margin = 0.19 + heat_index * 0.15
+    incumbent_bonus = 0.060 + heat_index * 0.070
+
+    # 50℃未満でも温度由来の前残りは弱いが、横一列の隊列残存は別処理で発生する。
+    scenario_names = np.array(["先行縦長", "前残り", "混戦", "追い込み"], dtype=object)
+    scenario_prob = np.array([0.36, 0.12, 0.28, 0.24], dtype=float)
+    scenario_prob += heat_index * np.array([-0.055, 0.185, -0.040, -0.090])
+    scenario_prob = np.clip(scenario_prob, 0.03, None)
+    scenario_prob /= scenario_prob.sum()
+    scenario_ids = rng.choice(4, size=int(trials), p=scenario_prob)
+    scenario_noise_map = np.array([0.88, 0.82, 1.28, 1.06])
+    leader_factor_map = np.array([0.90, 1.24, 1.12, 0.70])
+    escape_factor_map = np.array([1.08, 1.22, 0.82, 0.72]) * (1.0 + heat_index * 0.07)
+    hold_factor_map = np.array([1.08, 1.20, 0.90, 0.78]) * (1.0 + heat_index * 0.12)
+    win_factor_map = np.array([1.04, 1.16, 0.82, 0.64]) * (1.0 + heat_index * 0.06)
+
+    for scenario_id in scenario_ids:
+        scenario = scenario_names[int(scenario_id)]
+        scenario_counts[str(scenario)] += 1
+        draw = rng.random(n)
+        severe = draw < severe_late_prob
+        normal = (~severe) & (draw < severe_late_prob + normal_late_prob)
+        late_delay = np.zeros(n, dtype=float)
+        if severe.any():
+            late_delay[severe] = rng.uniform(0.30, 0.62, int(severe.sum()))
+            mask = severe & (handicap == 0)
+            late_delay[mask] += same_line_outer_ratio[mask] * 0.34
+        if normal.any():
+            late_delay[normal] = rng.uniform(0.12, 0.28, int(normal.sum()))
+            mask = normal & (handicap == 0)
+            late_delay[mask] += same_line_outer_ratio[mask] * 0.20
+
+        start_noise_sd = 0.034 * (1.0 + chaos_index * (0.35 + volatility_profile * 0.65))
+        start_key = base_start_key + rng.normal(0, start_noise_sd, n) + late_delay
+
+        if all_same_handicap:
+            # 横一列では内外の距離差より、切った直後の加速とST再現性を優先する。
+            # 55℃付近ではグリップ低下により全体のブレは増える一方、
+            # 好スタートを決めた選手が先にコースを選べる価値も少し高まる。
+            launch_value = 0.040 + heat_index * 0.022
+            start_key -= same_line_launch_strength * launch_value
+            # 横一列では最内側ほど最初の進路を確保しやすい。
+            # ただしST・再現性が低い選手を車番だけで救済しない。
+            inner_lane_ratio = 1.0 - same_line_outer_ratio
+            lane_launch_gate = np.clip(
+                same_line_launch_strength * 0.58 + st_stability_flow * 0.22
+                + execution_quality * 0.20, 0.0, 1.0
+            )
+            start_key -= inner_lane_ratio * lane_launch_gate * 0.024
+
+            # 上位2名程度にだけ「スタート一気」の分岐を持たせる。
+            # 毎回固定せず、指数・安定性・熱走路の組合せで発生させる。
+            launch_rank = np.argsort(-same_line_launch_strength)
+            for launch_order, idx in enumerate(launch_rank[:min(3, n)]):
+                burst_prob = np.clip(
+                    0.07
+                    + same_line_launch_strength[idx] * 0.24
+                    + st_stability_flow[idx] * 0.08
+                    + heat_index * 0.05
+                    - launch_order * 0.035,
+                    0.04, 0.38,
+                )
+                if not severe[idx] and rng.random() < burst_prob:
+                    start_key[idx] -= rng.uniform(0.025, 0.065) * (
+                        0.75 + same_line_launch_strength[idx] * 0.50
+                    )
+
+            # 外枠一律減点を少し緩和。ただしSTが悪い外枠は救済しない。
+            start_key -= same_line_outer_ratio * same_line_launch_strength * (
+                0.010 + heat_index * 0.008
+            )
+
+        order = np.argsort(start_key)
+
+        # Ver11.3: 横一列でスタート上位に入った選手だけ、先行転換を成立させる。
+        # 「指数が高いだけ」では発動せず、実際のスタート順が前方であることを条件にする。
+        launch_retention = np.zeros(n, dtype=float)
+        launch_pair = None
+        if all_same_handicap:
+            front_window = [int(i) for i in order[:min(3, n)]]
+            for start_pos, idx in enumerate(front_window):
+                inner_lane_ratio = 1.0 - same_line_outer_ratio[idx]
+                formation_value = inner_lane_ratio * (
+                    0.55 * lead_conversion_strength[idx]
+                    + 0.45 * same_line_launch_strength[idx]
+                )
+                conversion_prob = np.clip(
+                    0.05
+                    + lead_conversion_strength[idx] * 0.42
+                    + same_line_launch_strength[idx] * 0.15
+                    + formation_value * 0.16
+                    + heat_index * 0.06
+                    - start_pos * 0.055
+                    - (0.10 if normal[idx] else 0.0),
+                    0.03, 0.70,
+                )
+                if not severe[idx] and rng.random() < conversion_prob:
+                    launch_retention[idx] = np.clip(
+                        0.16
+                        + lead_conversion_strength[idx] * 0.34
+                        + formation_value * 0.16
+                        + position_hold_flow[idx] * 0.27
+                        + position_dependency_flow[idx] * 0.09
+                        + heat_index * 0.06
+                        - start_pos * 0.045,
+                        0.16, 0.93,
+                    )
+
+            # 先頭と番手がともに高い先行転換力を持つ場合、短い隊列を形成。
+            # これにより「先頭が行き、もう1車が追走して残る」を自然に再現する。
+            if n >= 2:
+                lead_idx, second_idx = int(order[0]), int(order[1])
+                pair_quality = min(lead_conversion_strength[lead_idx], lead_conversion_strength[second_idx])
+                leader_inner = 1.0 - same_line_outer_ratio[lead_idx]
+                pair_prob = np.clip(
+                    0.04 + pair_quality * 0.27 + leader_inner * 0.08
+                    + heat_index * 0.05,
+                    0.03, 0.43,
+                )
+                if (launch_retention[lead_idx] > 0
+                        and launch_retention[second_idx] > 0
+                        and rng.random() < pair_prob):
+                    launch_pair = (lead_idx, second_idx)
+
+        # 能力の直接支配をさらに弱め、近況・スタート・位置取りを相対的に強化。
+        scenario_noise = scenario_noise_map[int(scenario_id)]
+        # 熱走路では滑りやライン乱れによる上下振れを増やす。
+        # 安定型は増幅を小さく、ムラ型は大きくする。
+        race_noise_sd = (0.16 + finish_sd * 0.075) * scenario_noise
+        race_noise_sd *= 1.0 + chaos_index * (0.22 + volatility_profile * 0.72)
+        race_noise = rng.normal(0, race_noise_sd)
+        base_pace = (
+            z_scores * 0.78
+            + race_noise
+            - (st - 0.20) * 0.58
+            + (execution_quality - 0.50) * 0.20
+            + chaos_index * (road_stability - 0.50) * 0.12
+            + (current_day_strength - 0.50) * (0.10 + heat_index * 0.12)
+            + front_command_flow * (0.13 + heat_index * 0.10)
+            + (own_trial_form - 0.50) * 0.10
+            - pursuit_failure_risk * (0.12 + heat_index * 0.10)
+        )
+
+        # 後方追走不成立は毎回固定減点せず、条件が悪い試行で大敗側へ分岐する。
+        pursuit_fail = rng.random(n) < np.clip(
+            pursuit_failure_risk * (0.24 + chaos_index * 0.18), 0.0, 0.42
+        )
+        if pursuit_fail.any():
+            base_pace[pursuit_fail] -= rng.uniform(0.20, 0.48, int(pursuit_fail.sum()))
+
+        # Ver12.2: 突出試走は毎回固定加点せず、当日の動きが本走で発現する試行だけ強く出す。
+        # 高温時は機力差が展開へ出やすくなる一方、不発試行も残す。
+        explosion_hit_prob = np.clip(
+            0.03 + explosion_strength * (0.30 + heat_index * 0.12)
+            + trial_dominance_flow * (0.12 + heat_index * 0.08),
+            0.03, 0.62,
+        )
+        explosion_hit = rng.random(n) < explosion_hit_prob
+        if explosion_hit.any():
+            explosion_power = (
+                0.10
+                + explosion_strength[explosion_hit] * (0.26 + heat_index * 0.10)
+                + trial_dominance_flow[explosion_hit] * (0.12 + heat_index * 0.06)
+            )
+            base_pace[explosion_hit] += explosion_power
+
+        # 突出気配が発現した車は終盤の勝ち切り分岐にも乗りやすくする。
+        explosion_finish_boost = np.zeros(n, dtype=float)
+        explosion_finish_boost[explosion_hit] = np.clip(
+            explosion_strength[explosion_hit] * 0.16
+            + trial_dominance_flow[explosion_hit] * 0.10,
+            0.0, 0.25,
+        )
+        # 先行転換成立時は序盤の巡航へ小幅加点。後半まで能力差を無効化しない。
+        retained_mask = launch_retention > 0
+        if retained_mask.any():
+            base_pace[retained_mask] += (
+                launch_retention[retained_mask] * (0.10 + heat_index * 0.045)
+            )
+        # Ver12.2: 実際に前方スタートを取れた時だけ、過去の位置維持型を反映する。
+        start_rank = np.empty(n, dtype=int)
+        start_rank[order] = np.arange(n)
+        good_position_now = start_rank <= min(2, n - 1)
+        if good_position_now.any():
+            base_pace[good_position_now] += (
+                position_hold_flow[good_position_now] * 0.10
+                + position_dependency_flow[good_position_now] * 0.045
+            )
+        # 二極化型がスタート後方になった場合は、後方追上げ力が低いほど大敗側へ振れる。
+        poor_position_now = start_rank >= max(4, n - 3)
+        poor_branch_prob = np.clip(
+            0.05 + bipolar_flow * 0.25 + position_dependency_flow * 0.18
+            - rear_chase_flow * 0.18, 0.02, 0.48
+        )
+        poor_collapse = poor_position_now & (rng.random(n) < poor_branch_prob)
+        if poor_collapse.any():
+            base_pace[poor_collapse] -= (
+                0.10 + bipolar_flow[poor_collapse] * 0.18
+                + position_dependency_flow[poor_collapse] * 0.10
+            )
+
+        if launch_pair is not None:
+            pair_leader, pair_follower = launch_pair
+            base_pace[pair_leader] += 0.035 + heat_index * 0.018
+            base_pace[pair_follower] += 0.055 + heat_index * 0.025
+
+        if scenario == "先行縦長":
+            base_pace[front_line] += 0.08 + execution_quality[front_line] * 0.05
+            chase_mask = handicap > min_handicap
+            base_pace[chase_mask] += 0.05 + traffic_conversion[chase_mask] * 0.07
+        elif scenario == "前残り":
+            base_pace[front_line] += 0.14 + recent_form_strength[front_line] * 0.08
+            base_pace[~front_line] -= 0.05
+        elif scenario == "混戦":
+            base_pace += rng.normal(0, 0.10, n)
+        elif scenario == "追い込み":
+            chase_mask = handicap > min_handicap
+            base_pace[chase_mask] += 0.15 + traffic_conversion[chase_mask] * 0.12
+            base_pace[front_line] -= 0.07
+
+        # 好調選手は毎回固定加点せず、その日の展開で動きが出る確率を上げる。
+        flow_hit_prob = np.clip(0.07 + recent_form_strength * 0.38 + form_upside_prob * 0.12, 0.07, 0.50)
+        flow_hit = rng.random(n) < flow_hit_prob
+        if flow_hit.any():
+            base_pace[flow_hit] += rng.uniform(0.04, 0.13, int(flow_hit.sum())) * (0.65 + recent_form_strength[flow_hit])
+
+        form_upside = rng.random(n) < form_upside_prob
+        if form_upside.any():
+            base_pace[form_upside] += rng.uniform(form_upside_power[form_upside] * 0.82, form_upside_power[form_upside] * 1.30)
+
+        # Ver8.1: 近況主役候補。前残り・混戦では、試走外れから本走で戻して
+        # 1着まで押し上がる独立分岐を持たせる。車番固定ではない。
+        leader_candidate = int(np.argmax(form_leader_strength))
+        scenario_leader_factor = leader_factor_map[int(scenario_id)]
+        leader_breakout = (
+            not severe[leader_candidate]
+            and rng.random() < np.clip(
+                0.04
+                + form_leader_strength[leader_candidate] * 0.38 * scenario_leader_factor
+                + closing_strength[leader_candidate] * 0.14,
+                0.04, 0.54,
+            )
+        )
+        if leader_breakout:
+            base_pace[leader_candidate] += (
+                rng.uniform(0.24, 0.48)
+                + form_upside_prob[leader_candidate] * 0.48
+                + recent_form_strength[leader_candidate] * 0.10
+                + closing_strength[leader_candidate] * 0.12
+            )
+
+        recovery = np.ones(n, dtype=float)
+        if severe.any():
+            recovery[severe] = rng.uniform(0.40, 0.64, int(severe.sum()))
+            base_pace[severe] -= rng.uniform(0.28, 0.56, int(severe.sum()))
+        if normal.any():
+            recovery[normal] = rng.uniform(0.64, 0.84, int(normal.sum()))
+            base_pace[normal] -= rng.uniform(0.10, 0.27, int(normal.sum()))
+
+        passed = np.zeros((n, n), dtype=bool)
+        # Ver8.4: 一度抜かれた後の隊列崩壊を記録する。
+        # collapse_level が高いほど、その後の巡航力と抵抗力が落ちる。
+        overtaken_count = np.zeros(n, dtype=np.int8)
+        collapse_level = np.zeros(n, dtype=float)
+        first_overtaken_phase = np.full(n, phases, dtype=np.int8)
+        delay_total = late_delay + outer_start_delay
+        initial_leader = int(order[0])
+        clean_escape = front_line[initial_leader] and not severe[initial_leader] and not normal[initial_leader] and rng.random() < np.clip(escape_success_prob[initial_leader] * escape_factor_map[int(scenario_id)], 0.02, 0.96)
+
+        # 最内前線車は、逃げ失敗でも「内枠残り」へ分岐できる。
+        front_candidates = [int(i) for i in order if front_line[int(i)]]
+        inner_front = min(front_candidates, key=lambda i: cars[i]) if front_candidates else initial_leader
+        inner_hold = (not clean_escape and not severe[inner_front] and rng.random() < np.clip(inner_hold_prob[inner_front] * hold_factor_map[int(scenario_id)], 0.02, 0.97))
+
+        # Ver8.3: 展開成立時だけ勝ち切り抽選を行う。
+        # 内枠残存だけの場合は、クリーンな逃げより勝ち切り条件を厳しくする。
+        win_setup_factor = 1.0 if clean_escape else 0.66
+        front_win = (
+            not severe[inner_front]
+            and (clean_escape or inner_hold)
+            and rng.random() < np.clip(
+                front_win_prob[inner_front] * win_factor_map[int(scenario_id)] * win_setup_factor,
+                0.02, 0.76,
+            )
+        )
+        if front_win:
+            base_pace[inner_front] += rng.uniform(0.12, 0.25) + escape_success_prob[inner_front] * 0.11
+
+        boxed = (not clean_escape and not inner_hold and (normal[inner_front] or rng.random() < 0.18 + same_line_outer_ratio[inner_front] * 0.10))
+
+        if clean_escape:
+            base_pace[initial_leader] += 0.13 + escape_success_prob[initial_leader] * 0.32 + recent_form_strength[initial_leader] * 0.08
+        elif inner_hold:
+            base_pace[inner_front] += 0.15 + inner_hold_prob[inner_front] * 0.24 + recent_form_strength[inner_front] * 0.07
+            inner_pos = int(np.where(order == inner_front)[0][0])
+            if inner_pos <= 2 and rng.random() < 0.20 + inner_hold_prob[inner_front] * 0.22:
+                order = np.delete(order, inner_pos)
+                order = np.insert(order, 0, inner_front)
+        elif boxed:
+            base_pace[inner_front] -= rng.uniform(0.10, 0.24)
+
+        # Ver7.4: 前線の最内車が残る展開では、その後ろの「実戦変換力が高い車」が
+        # コースを拾って続く。一方、外側で変換力が低い車は包まれやすい。
+        front_indices = np.where(front_line)[0]
+        follower = None
+        if (clean_escape or inner_hold) and len(front_indices) >= 3:
+            follower_score = (
+                traffic_conversion[front_indices] * 0.25
+                + form_upside_prob[front_indices] * 0.65
+                + recent_form_strength[front_indices] * 0.15
+                - same_line_outer_ratio[front_indices] * 0.04
+            )
+            follower_score[front_indices == inner_front] = -999.0
+            follower = int(front_indices[int(np.argmax(follower_score))])
+            if rng.random() < np.clip(0.24 + traffic_conversion[follower] * 0.34 + form_upside_prob[follower] * 0.50, 0.20, 0.72):
+                base_pace[follower] += rng.uniform(0.12, 0.25) + form_upside_prob[follower] * 0.22
+
+        weak_outer = front_indices[
+            (same_line_outer_ratio[front_indices] >= 0.70)
+            & (traffic_conversion[front_indices] < 0.43)
+        ]
+        for idx in weak_outer:
+            if rng.random() < 0.24 + (0.43 - traffic_conversion[idx]) * 0.75:
+                base_pace[idx] -= rng.uniform(0.10, 0.23)
+
+        for phase in range(phases):
+            phase_recovery = (phase + 1) / phases
+            # 抜かれた後はライン・リズムを失い、残り周回ほど後退が連鎖しやすい。
+            # ただし実戦変換力が高い選手は崩れ幅を抑える。
+            collapse_drag = collapse_level * (0.72 + 0.12 * phase)
+            pace = (
+                base_pace
+                + rng.normal(0, (0.075 + finish_sd * 0.027) * (1.0 + chaos_index * (0.15 + volatility_profile * 0.48)))
+                + z_scores * (1.0 - recovery) * phase_recovery * 0.34
+                - collapse_drag
+            )
+            pos = n - 1
+            while pos > 0:
+                trailing = int(order[pos]); ahead = int(order[pos - 1])
+                margin = normal_pass_margin + incumbent_bonus
+                # 熱走路では路面を使って前へ出る余地が小さくなるため、
+                # 後方からの仕掛けほど追加の速度差を必要とする。
+                position_heat = heat_index * (0.018 + 0.012 * min(pos, 5))
+                margin += position_heat
+                # 実戦変換力が低い追走車は、速い試走があっても混戦で抜きづらい。
+                margin += max(0.0, 0.50 - traffic_conversion[trailing]) * 0.34
+                # 実戦変換力が高い車は前を捌く際の必要差を少し小さくする。
+                margin -= max(0.0, traffic_conversion[trailing] - 0.58) * 0.16
+                # 前団主導指数が高い10m勢は、同ハンデ集団を捌いて前線へ出る力として扱う。
+                margin -= max(0.0, front_command_flow[trailing] - 0.42) * 0.24
+                # すでに抜かれて崩れた車は、後続への抵抗力も低下する。
+                margin -= min(0.24, collapse_level[ahead] * 0.30)
+
+                if clean_escape and ahead == initial_leader and pos - 1 == 0:
+                    margin += max(0.11, 0.15 - phase * 0.022 + escape_success_prob[ahead] * 0.24)
+                    margin += heat_index * (0.055 - phase * 0.007)
+                if inner_hold and ahead == inner_front and pos - 1 <= 2:
+                    # 先頭でなくてもインを守る車を抜くには余分な差が必要。
+                    margin += max(0.09, 0.16 - phase * 0.017 + inner_hold_prob[ahead] * 0.19 + recent_form_strength[ahead] * 0.035)
+                if front_win and ahead == inner_front and pos - 1 == 0:
+                    margin += max(0.12, 0.20 - phase * 0.020 + front_win_prob[ahead] * 0.22)
+                if follower is not None and trailing == follower and pos <= 4:
+                    margin -= 0.07 + form_upside_prob[follower] * 0.12
+
+                # Ver11.3: 先行転換に成功した車は1〜2周目だけ抜かれにくくする。
+                # 熱走路ほど追抜側にも負荷がかかるが、後半には効果を減衰させる。
+                if launch_retention[ahead] > 0 and pos - 1 <= 2:
+                    early_retention = max(0.0, 1.0 - phase / max(1, phases - 1))
+                    margin += launch_retention[ahead] * early_retention * (
+                        0.095 + heat_index * 0.060
+                    )
+                # 前に出た時に抜かれにくい選手は、序盤限定ではなく中終盤まで抵抗する。
+                if start_rank[ahead] <= 2 and pos - 1 <= 3:
+                    phase_keep = 0.70 + 0.30 * max(0.0, 1.0 - phase / max(1, phases - 1))
+                    margin += position_hold_flow[ahead] * position_dependency_flow[ahead] * phase_keep * 0.105
+                if launch_pair is not None:
+                    pair_leader, pair_follower = launch_pair
+                    if ahead == pair_leader and trailing == pair_follower and pos - 1 == 0:
+                        # 番手車は先頭を無理に早仕掛けせず、隊列を保ちやすい。
+                        margin += 0.055 + heat_index * 0.025
+                    elif ahead == pair_follower and pos - 1 <= 1:
+                        # 先頭・番手が形成された時、後続が番手を抜く障壁を少し増やす。
+                        margin += 0.045 + heat_index * 0.040
+
+                close_count = sum(abs(pace[int(order[k])] - pace[trailing]) < 0.30 for k in range(pos + 1, min(n, pos + 4)))
+                delayed_nearby = sum(delay_total[int(order[k])] >= 0.16 for k in range(max(0, pos - 1), min(n, pos + 3)))
+                margin += min(0.23, close_count * 0.055 + delayed_nearby * 0.042)
+
+                if passed[ahead, trailing]:
+                    margin += same_or_stronger_repass_penalty(pace[trailing], pace[ahead])
+                if severe[trailing]: margin += 0.16 * (1.0 - phase_recovery)
+                elif normal[trailing]: margin += 0.08 * (1.0 - phase_recovery)
+                if handicap[trailing] == 0 and same_line_outer_ratio[trailing] > 0 and (severe[trailing] or normal[trailing]):
+                    margin += same_line_outer_ratio[trailing] * (0.78 - phase * 0.11)
+
+                if pace[trailing] > pace[ahead] + margin:
+                    # 抜かれた側の崩れ判定。能力差が大きい、早い周回、
+                    # 実戦変換力が低い、すでに一度抜かれているほど連鎖しやすい。
+                    ability_gap = max(0.0, pace[trailing] - pace[ahead] - margin)
+                    early_factor = (phases - phase) / phases
+                    stability_guard = (
+                        0.52 * execution_quality[ahead]
+                        + 0.30 * traffic_conversion[ahead]
+                        + 0.18 * recent_form_strength[ahead]
+                    )
+                    collapse_prob = np.clip(
+                        0.10
+                        + ability_gap * 0.34
+                        + early_factor * 0.13
+                        + overtaken_count[ahead] * 0.16
+                        + max(0.0, 0.55 - stability_guard) * 0.48,
+                        0.06, 0.82,
+                    )
+                    if rng.random() < collapse_prob:
+                        collapse_add = (
+                            0.10
+                            + min(0.32, ability_gap * 0.24)
+                            + early_factor * 0.07
+                            + max(0.0, 0.55 - stability_guard) * 0.16
+                        )
+                        collapse_level[ahead] = min(0.78, collapse_level[ahead] + collapse_add)
+                    overtaken_count[ahead] += 1
+                    if first_overtaken_phase[ahead] == phases:
+                        first_overtaken_phase[ahead] = phase
+
+                    order[pos - 1], order[pos] = trailing, ahead
+                    passed[trailing, ahead] = True
+                pos -= 1
+
+        # Ver7.4: 前線最内が残ったレースでは、隊列が崩れにくい展開も作る。
+        # 番手候補は車番固定ではなく、試走外れ復調・実戦変換力・近況から選ぶ。
+        if (clean_escape or inner_hold) and int(order[0]) == inner_front and follower is not None:
+            line_lock_prob = np.clip(
+                0.18 + inner_hold_prob[inner_front] * 0.16
+                + form_upside_prob[follower] * 0.48
+                + traffic_conversion[follower] * 0.10
+                + heat_index * 0.14,
+                0.18, 0.66,
+            )
+            if rng.random() < line_lock_prob:
+                cur_f = int(np.where(order == follower)[0][0])
+                if cur_f != 1:
+                    order = np.delete(order, cur_f)
+                    order = np.insert(order, 1, follower)
+
+                remaining_front = [
+                    int(i) for i in np.where(front_line)[0]
+                    if int(i) not in (inner_front, follower)
+                ]
+                if remaining_front:
+                    third_score = np.array([
+                        recent_form_strength[i] * 0.44
+                        + traffic_conversion[i] * 0.36
+                        + execution_quality[i] * 0.20
+                        for i in remaining_front
+                    ])
+                    third_candidate = remaining_front[int(np.argmax(third_score))]
+                    cur_t = int(np.where(order == third_candidate)[0][0])
+                    if cur_t != 2 and rng.random() < 0.62:
+                        order = np.delete(order, cur_t)
+                        order = np.insert(order, 2, third_candidate)
+
+        # Ver8.1: シナリオごとの最終隊列調整。
+        if scenario == "先行縦長":
+            front_now = [int(i) for i in order if front_line[int(i)]]
+            if len(front_now) >= 2:
+                selected_front = sorted(front_now, key=lambda i: (-base_pace[i], int(cars[i])))[:2]
+                for target_pos, idx in enumerate(selected_front):
+                    cur = int(np.where(order == idx)[0][0])
+                    order = np.delete(order, cur); order = np.insert(order, target_pos, idx)
+            chase_candidates = [int(i) for i in order if handicap[int(i)] > min_handicap and not severe[int(i)]]
+            if chase_candidates:
+                chase_score = np.array([base_pace[i] + traffic_conversion[i] * 0.20 for i in chase_candidates])
+                chaser = chase_candidates[int(np.argmax(chase_score))]
+                cur = int(np.where(order == chaser)[0][0])
+                if cur > 2 and rng.random() < (0.48 + traffic_conversion[chaser] * 0.24) * (1.0 - heat_index * 0.38):
+                    order = np.delete(order, cur); order = np.insert(order, 2, chaser)
+        elif scenario == "追い込み":
+            chase_candidates = [int(i) for i in order if handicap[int(i)] > min_handicap and not severe[int(i)]]
+            if chase_candidates:
+                chase_score = np.array([base_pace[i] + traffic_conversion[i] * 0.26 for i in chase_candidates])
+                chaser = chase_candidates[int(np.argmax(chase_score))]
+                cur = int(np.where(order == chaser)[0][0])
+                target = 1 if rng.random() < 0.35 * (1.0 - heat_index * 0.42) else 2
+                if cur > target:
+                    order = np.delete(order, cur); order = np.insert(order, target, chaser)
+        elif scenario == "混戦":
+            front_top = sum(front_line[int(i)] for i in order[:4])
+            if front_top >= 3 and rng.random() < 0.24 * (1.0 - heat_index * 0.30):
+                chase_candidates = [int(i) for i in order if handicap[int(i)] > min_handicap and traffic_conversion[int(i)] >= 0.45]
+                if chase_candidates:
+                    chaser = max(chase_candidates, key=lambda i: base_pace[i] + traffic_conversion[i] * 0.18)
+                    cur = int(np.where(order == chaser)[0][0])
+                    target = int(rng.integers(1, 4))
+                    if cur > target:
+                        order = np.delete(order, cur); order = np.insert(order, target, chaser)
+
+        # Ver8.4: 隊列崩壊の最終連鎖。
+        # 早い段階で能力上位に抜かれ、後方にも強い車が複数いる場合は、
+        # 2～3着で踏みとどまらず着外まで飲み込まれる展開を作る。
+        for idx in range(n):
+            if overtaken_count[idx] <= 0 or collapse_level[idx] < 0.16:
+                continue
+            cur = int(np.where(order == idx)[0][0])
+            if cur >= n - 1:
+                continue
+            behind = [int(j) for j in order[cur + 1:]]
+            stronger_behind = [
+                j for j in behind
+                if (z_scores[j] - z_scores[idx] > 0.28)
+                and traffic_conversion[j] >= 0.42
+                and not severe[j]
+            ]
+            if not stronger_behind:
+                continue
+            early = 1.0 - first_overtaken_phase[idx] / max(1, phases)
+            cascade_prob = np.clip(
+                0.08
+                + collapse_level[idx] * 0.62
+                + min(3, len(stronger_behind)) * 0.10
+                + early * 0.14
+                - execution_quality[idx] * 0.16
+                - heat_index * 0.10,
+                0.04, 0.78,
+            )
+            if rng.random() < cascade_prob:
+                max_drop = min(len(stronger_behind), 3)
+                drop = 1 + int(rng.integers(0, max_drop))
+                target = min(n - 1, cur + drop)
+                order = np.delete(order, cur)
+                order = np.insert(order, target, idx)
+
+        # Ver8.3: 勝ち切り抽選成立でも無条件に先頭へ固定しない。
+        # クリーン逃げ、能力、現在位置が揃った場合に限って先頭へ戻す。
+        if front_win:
+            cur_w = int(np.where(order == inner_front)[0][0])
+            finish_win_prob = np.clip(
+                (0.46 if clean_escape else 0.24)
+                + front_win_prob[inner_front] * 0.34
+                + execution_quality[inner_front] * 0.12
+                - max(0, cur_w - 2) * 0.10
+                - collapse_level[inner_front] * 0.44
+                - overtaken_count[inner_front] * 0.08,
+                0.08, 0.88,
+            )
+            if cur_w <= 3 and rng.random() < finish_win_prob:
+                order = np.delete(order, cur_w)
+                order = np.insert(order, 0, inner_front)
+
+        # Ver8.1: 近況主役候補が展開をつかんだ場合は、最終的に1～2着へ進出。
+        # 前残りでは先頭まで、先行縦長・混戦では1～2番手を抽選する。
+        if leader_breakout and not severe[leader_candidate]:
+            cur_l = int(np.where(order == leader_candidate)[0][0])
+            # 能力が高くても勝ち切り指数が低い選手は、1着固定ではなく2～3着へ。
+            # ただし最前線の逃げ車は front_win 側で別評価するため、ここでは後方主役候補を調整。
+            close = float(closing_strength[leader_candidate])
+            if scenario == "前残り":
+                first_prob = 0.30 + close * 0.48
+                target_l = 0 if rng.random() < first_prob else 1
+            elif scenario == "混戦":
+                first_prob = 0.18 + close * 0.42
+                target_l = 0 if rng.random() < first_prob else 1
+            elif scenario == "先行縦長":
+                first_prob = 0.12 + close * 0.34
+                target_l = 0 if rng.random() < first_prob else 1
+            else:
+                target_l = 1 if rng.random() < (0.48 + place_strength[leader_candidate] * 0.30) else 2
+            if front_win and leader_candidate != inner_front:
+                target_l = max(1, target_l)
+            if cur_l > target_l:
+                order = np.delete(order, cur_l)
+                order = np.insert(order, target_l, leader_candidate)
+
+        # Ver9.0: 最終勝ち切り判定。
+        # 後方から能力で先頭へ来たものの勝ち切り実績が弱い選手は、
+        # 勝負強い2～3番手候補に差される場合を作る。
+        # 1番など最前線車の clean_escape / front_win は保護して、逃げ残りを消さない。
+        current_leader = int(order[0])
+        protected_escape = (
+            current_leader == inner_front
+            and (clean_escape or front_win)
+            and collapse_level[current_leader] < 0.22
+        )
+        if not protected_escape and closing_strength[current_leader] < 0.48:
+            challengers = [
+                int(i) for i in order[1:4]
+                if not severe[int(i)]
+                and closing_strength[int(i)] > closing_strength[current_leader] + 0.10
+                and base_pace[int(i)] > base_pace[current_leader] - 0.18
+            ]
+            if challengers:
+                finisher = max(
+                    challengers,
+                    key=lambda i: closing_strength[i] * 0.58 + base_pace[i] * 0.24 + place_strength[i] * 0.18,
+                )
+                conversion_prob = np.clip(
+                    0.06
+                    + (closing_strength[finisher] - closing_strength[current_leader]) * 0.42
+                    + max(0.0, base_pace[finisher] - base_pace[current_leader]) * 0.18
+                    - heat_index * (0.09 - np.maximum(0.0, final_kick_flow[finisher]) * 0.035),
+                    0.02, 0.34,
+                )
+                if rng.random() < conversion_prob:
+                    cur_f = int(np.where(order == finisher)[0][0])
+                    order = np.delete(order, cur_f)
+                    order = np.insert(order, 0, finisher)
+
+        # Ver10.7: 能力順位が中位でも、格・ST・勝ち切り力が揃う選手には
+        # 展開がほどけた際の一発逆転を残す。現在2～5番手にいることを条件とし、
+        # 後方から無条件に先頭へ飛ばす処理にはしない。
+        upset_pool = [
+            int(i) for i in order[1:5]
+            if not severe[int(i)]
+            and win_upside_flow[int(i)] >= 0.34
+            and closing_strength[int(i)] >= 0.24
+            and base_pace[int(i)] > base_pace[int(order[0])] - 0.38
+        ]
+        if upset_pool and not protected_escape:
+            upsetter = max(
+                upset_pool,
+                key=lambda i: (
+                    win_upside_flow[i] * 0.30
+                    + today_win_conversion[i] * 0.32
+                    + closing_strength[i] * 0.22
+                    + execution_quality[i] * 0.10
+                    + st_stability_flow[i] * 0.06
+                ),
+            )
+            upset_prob = np.clip(
+                0.015
+                + win_upside_flow[upsetter] * 0.070
+                + today_win_conversion[upsetter] * 0.085
+                + closing_strength[upsetter] * 0.055
+                + max(0.0, base_pace[upsetter] - base_pace[current_leader]) * 0.06
+                - heat_index * 0.035,
+                0.015, 0.145,
+            )
+            if rng.random() < upset_prob:
+                cur_u = int(np.where(order == upsetter)[0][0])
+                order = np.delete(order, cur_u)
+                order = np.insert(order, 0, upsetter)
+
+        # 包まれた内枠車は1着候補から落ちやすいが、完全着外固定にはしない。
+        if boxed:
+            cur = int(np.where(order == inner_front)[0][0])
+            target = min(n - 1, cur + int(rng.integers(1, 4)))
+            if target > cur:
+                order = np.delete(order, cur); order = np.insert(order, target, inner_front)
+
+        for idx in range(n):
+            if handicap[idx] == 0 and same_line_outer_ratio[idx] > 0 and (severe[idx] or normal[idx]):
+                cur = int(np.where(order == idx)[0][0])
+                drop = int(rng.integers(4, 7)) if severe[idx] else int(rng.integers(3, 6))
+                drop = max(1, int(round(drop * (0.70 + same_line_outer_ratio[idx]))))
+                target = min(n - 1, cur + drop)
+                if target > cur:
+                    order = np.delete(order, cur); order = np.insert(order, target, idx)
+
+        # Ver10.3: 能力順位とは別に、スタート後の「隊列連鎖」を再現する。
+        # 車番固定ではなく、ハンデ構成・内外位置・逃げ力・追走力・レール残存力から選ぶ。
+        unique_lines = np.unique(handicap)
+        front_members = [int(i) for i in np.where(front_line)[0]]
+        back_members = [int(i) for i in np.where(handicap > min_handicap)[0]]
+
+        # A) 複数ハンデ線: 前線の外寄りで逃げ力が高い車が主導権を取ると、
+        # 後方線の追走上位が2番手、前線の総合力上位が3番手に収まる隊列。
+        if len(unique_lines) >= 2 and len(front_members) >= 3 and back_members:
+            launch_pool = [
+                i for i in front_members
+                if same_line_outer_ratio[i] >= 0.45 and not severe[i]
+            ]
+            if launch_pool:
+                launch_scores = {
+                    i: (
+                        escape_success_prob[i] * 0.34
+                        + execution_quality[i] * 0.18
+                        + recent_form_strength[i] * 0.14
+                        + closing_strength[i] * 0.12
+                        + place_strength[i] * 0.10
+                        + (1.0 / (1.0 + np.exp(-z_scores[i]))) * 0.12
+                    )
+                    for i in launch_pool
+                }
+                flow_leader = max(launch_pool, key=lambda i: launch_scores[i])
+                flow_pos = int(np.where(order == flow_leader)[0][0])
+                chase_pool = [i for i in back_members if not severe[i]]
+                if (
+                    chase_pool
+                    and flow_pos <= 3
+                    and escape_success_prob[flow_leader] >= 0.76
+                    and max(place_strength[i] for i in chase_pool) >= 0.50
+                ):
+                    chase_scores = {
+                        i: (
+                            place_strength[i] * 0.34
+                            + traffic_conversion[i] * 0.28
+                            + execution_quality[i] * 0.18
+                            + closing_strength[i] * 0.12
+                            + recent_form_strength[i] * 0.08
+                            - same_line_outer_ratio[i] * 0.04
+                        )
+                        for i in chase_pool
+                    }
+                    chaser = max(chase_pool, key=lambda i: chase_scores[i])
+                    hold_pool = [i for i in front_members if i != flow_leader and not severe[i]]
+                    if hold_pool:
+                        hold_scores = {
+                            i: (
+                                (1.0 / (1.0 + np.exp(-z_scores[i]))) * 0.34
+                                + place_strength[i] * 0.22
+                                + execution_quality[i] * 0.18
+                                + recent_form_strength[i] * 0.14
+                                + inner_hold_prob[i] * 0.08
+                                + same_line_inner_ratio[i] * 0.04
+                            )
+                            for i in hold_pool
+                        }
+                        holder = max(hold_pool, key=lambda i: hold_scores[i])
+                        chain_prob = np.clip(
+                            0.18 + launch_scores[flow_leader] * 0.18
+                            + chase_scores[chaser] * 0.12
+                            + (0.05 if scenario in ("先行縦長", "前残り") else 0.0)
+                            - flow_pos * 0.025,
+                            0.16, 0.42,
+                        )
+                        if rng.random() < chain_prob:
+                            selected = [flow_leader, chaser, holder]
+                            rest = [int(i) for i in order if int(i) not in selected]
+                            order = np.array(selected + rest, dtype=int)
+
+        # B) 全車同一ハンデ線: 外寄りの先行車が切り込み、
+        # その内側の勝負強い車が追走し、最内寄りの安定車が3着へ残る隊列。
+        if len(unique_lines) == 1 and n >= 6:
+            outer_candidates = [
+                i for i in range(n)
+                if 0.55 <= same_line_outer_ratio[i] < 0.99 and not severe[i]
+            ]
+            if outer_candidates:
+                launch_scores = {
+                    i: (
+                        escape_success_prob[i] * 0.28
+                        + closing_strength[i] * 0.20
+                        + place_strength[i] * 0.16
+                        + execution_quality[i] * 0.16
+                        + recent_form_strength[i] * 0.12
+                        + traffic_conversion[i] * 0.08
+                    )
+                    for i in outer_candidates
+                }
+                launch_leader = max(outer_candidates, key=lambda i: launch_scores[i])
+                follower_pool = [
+                    i for i in range(n)
+                    if i != launch_leader
+                    and cars[i] < cars[launch_leader]
+                    and same_line_outer_ratio[i] >= 0.30
+                    and not severe[i]
+                ]
+                rail_pool = [
+                    i for i in range(n)
+                    if i != launch_leader
+                    and same_line_inner_ratio[i] >= 0.70
+                    and not severe[i]
+                ]
+                if follower_pool and rail_pool:
+                    follower_scores = {
+                        i: (
+                            closing_strength[i] * 0.38
+                            + place_strength[i] * 0.22
+                            + execution_quality[i] * 0.17
+                            + traffic_conversion[i] * 0.13
+                            + recent_form_strength[i] * 0.10
+                            - abs(float(cars[launch_leader] - cars[i]) - 2.0) * 0.025
+                        )
+                        for i in follower_pool
+                    }
+                    follower2 = max(follower_pool, key=lambda i: follower_scores[i])
+                    rail_pool = [i for i in rail_pool if i != follower2]
+                    if rail_pool:
+                        rail_scores = {
+                            i: (
+                                same_line_inner_ratio[i] * 0.42
+                                + trial_trust_flow[i] * 0.20
+                                + recent_form_strength[i] * 0.16
+                                + place_strength[i] * 0.12
+                                + st_stability_flow[i] * 0.10
+                            )
+                            for i in rail_pool
+                        }
+                        rail3 = max(rail_pool, key=lambda i: rail_scores[i])
+                        formation_prob = np.clip(
+                            0.11 + launch_scores[launch_leader] * 0.16
+                            + follower_scores[follower2] * 0.11
+                            + (0.04 if scenario in ("先行縦長", "混戦") else 0.0),
+                            0.11, 0.30,
+                        )
+                        # 現在の先頭が選定先行車、または先頭争い圏内のときだけ成立。
+                        launch_pos = int(np.where(order == launch_leader)[0][0])
+                        if launch_pos <= 2 and rng.random() < formation_prob:
+                            selected = [launch_leader, follower2, rail3]
+                            rest = [int(i) for i in order if int(i) not in selected]
+                            order = np.array(selected + rest, dtype=int)
+
+        # Ver12.2: 全車同ハンデ限定の6周簡易モデル。
+        # 現在の順位を1周目隊列として、隣接する相手だけを抜く現実寄りの処理を重ねる。
+        # 前団が密集すると後方ほど突破障壁が増えるが、集団突破力の高い選手は越えられる。
+        if dense_line_race and n >= 5:
+            group_breakthrough = pd.to_numeric(
+                df.get("集団突破力", pd.Series(0.50, index=df.index)), errors="coerce"
+            ).fillna(0.50).clip(0, 1).to_numpy(float)
+
+            # 大人数同ハンデ線では、能力順位より先にスタートで線内隊列を作る。
+            # 内側は進路を取りやすいが、スタート一気・先行転換力が高い外側は前へ出られる。
+            if not all_same_handicap:
+                dense_members = [int(i) for i in order if dense_line_mask[int(i)]]
+                other_members = [int(i) for i in order if not dense_line_mask[int(i)]]
+                if len(dense_members) >= 4:
+                    launch_metric = {}
+                    for ii in dense_members:
+                        launch_metric[ii] = (
+                            same_line_launch_strength[ii] * 0.34
+                            + lead_conversion_strength[ii] * 0.26
+                            + st_stability_flow[ii] * 0.14
+                            + trial_launch_strength[ii] * 0.10
+                            + same_line_inner_ratio[ii] * 0.16
+                            + rng.normal(0.0, 0.075)
+                        )
+                    dense_members = sorted(dense_members, key=lambda ii: launch_metric[ii], reverse=True)
+                    # 最前ハンデ車は序盤の前、密集線はその直後へ置く。
+                    front_others = sorted(other_members, key=lambda ii: (handicap[ii], list(order).index(ii)))
+                    order = np.array(front_others + dense_members, dtype=int)
+
+            # 1周目の隊列を強く残す。好スタート内枠だけ小さな進路確保を持つ。
+            first_lap_pos = np.empty(n, dtype=int)
+            for p0, i0 in enumerate(order):
+                first_lap_pos[int(i0)] = p0
+            front_pack_size = int(min(n - 1, max(3, min(5, dense_line_size // 2 + 1))))
+
+            for lap in range(2, 7):
+                # 2〜4周目は前団内の攻防中心、5〜6周目は突破力と終盤力を強める。
+                late_phase = max(0.0, (lap - 4) / 2.0)
+                new_order = order.copy()
+                # 前からではなく後ろから判定し、1周に何人も瞬間移動するのを防ぐ。
+                moved = set()
+                for pos in range(n - 1, 0, -1):
+                    chaser = int(new_order[pos])
+                    leader = int(new_order[pos - 1])
+                    if chaser in moved or leader in moved:
+                        continue
+
+                    # 先頭3台付近が固まるほど壁が厚くなる。後方から前団入口へ来た選手に強く作用。
+                    front_density = min(1.0, front_pack_size / 4.0)
+                    entering_front = pos <= front_pack_size + 1
+                    congestion = (0.13 + 0.24 * front_density) if entering_front else (0.04 + 0.08 * front_density)
+                    if dense_line_mask[chaser] and lap <= 4:
+                        congestion += same_line_outer_ratio[chaser] * 0.10
+
+                    # 内側の恩恵は「好スタートで前団に入れた」場合のみ。固定の能力加点ではない。
+                    leader_early_front = first_lap_pos[leader] <= 2
+                    inner_route_hold = (same_line_inner_ratio[leader] ** 1.4) * (0.10 if leader_early_front else 0.025)
+
+                    chase_power = (
+                        group_breakthrough[chaser] * (0.32 + 0.20 * late_phase)
+                        + closing_strength[chaser] * (0.15 + 0.17 * late_phase)
+                        + traffic_conversion[chaser] * 0.18
+                        + execution_quality[chaser] * 0.12
+                        + rear_chase_flow[chaser] * 0.10
+                        + current_day_strength[chaser] * 0.08
+                    )
+                    stable_top_flow = pd.to_numeric(
+                        df.get("安定上位指数", pd.Series(0.50, index=df.index)), errors="coerce"
+                    ).fillna(0.50).clip(0, 1).to_numpy(float)
+                    hold_power = (
+                        position_hold_flow[leader] * 0.21
+                        + execution_quality[leader] * 0.16
+                        + place_strength[leader] * 0.15
+                        + traffic_conversion[leader] * 0.10
+                        + st_stability_flow[leader] * 0.08
+                        + stable_top_flow[leader] * 0.18
+                        + inner_route_hold
+                    )
+
+                    # Ver12.2: 能力だけでは抜けず、前団が崩れる「突破機会」が必要。
+                    # 前走者の位置維持が弱い、前団内に能力差がある、終盤になるほど隙間が生まれる。
+                    leader_instability = np.clip(
+                        0.55 - position_hold_flow[leader] * 0.26
+                        - execution_quality[leader] * 0.14
+                        + volatility_profile[leader] * 0.18,
+                        0.08, 0.72
+                    )
+                    pack_spread = np.clip(
+                        abs(execution_quality[chaser] - execution_quality[leader]) * 0.35
+                        + abs(current_day_strength[chaser] - current_day_strength[leader]) * 0.25,
+                        0.0, 0.35
+                    )
+                    breakthrough_opportunity = np.clip(
+                        0.12 + leader_instability * 0.34 + pack_spread
+                        + late_phase * 0.22 - congestion * 0.30,
+                        0.035, 0.72
+                    )
+                    congestion_after_skill = congestion * (1.0 - 0.42 * group_breakthrough[chaser])
+                    margin = chase_power - hold_power - congestion_after_skill
+                    pass_prob = 1.0 / (1.0 + np.exp(-(margin - 0.085) * 6.6))
+                    # 適性と機会を掛け合わせる。強い選手でも混戦が開かなければ待たされる。
+                    pass_prob *= breakthrough_opportunity * (0.72 + 0.38 * late_phase)
+                    if severe[chaser]:
+                        pass_prob *= 0.20
+                    elif normal[chaser]:
+                        pass_prob *= 0.62
+                    if bipolar_flow[chaser] > 0.65 and first_lap_pos[chaser] >= n - 2:
+                        pass_prob *= 0.78
+
+                    if rng.random() < np.clip(pass_prob, 0.01, 0.72):
+                        new_order[pos - 1], new_order[pos] = chaser, leader
+                        moved.add(chaser); moved.add(leader)
+
+                order = new_order
+
+                # 前団内では、好位置維持だけでなく実戦能力のある選手が少しずつ上がれる。
+                # これにより3番が2番、続いて1番を抜くような段階的変動を許す。
+                if lap <= 4 and front_pack_size >= 2:
+                    for pos in range(min(front_pack_size, n - 1), 0, -1):
+                        chaser = int(order[pos]); leader = int(order[pos - 1])
+                        internal_edge = (
+                            group_breakthrough[chaser] * 0.28 + execution_quality[chaser] * 0.24
+                            + current_day_strength[chaser] * 0.18 + closing_strength[chaser] * 0.12
+                            - position_hold_flow[leader] * 0.22 - execution_quality[leader] * 0.10
+                        )
+                        internal_prob = np.clip(0.07 + internal_edge * 0.30, 0.015, 0.30)
+                        if rng.random() < internal_prob:
+                            order[pos - 1], order[pos] = chaser, leader
+                            break
+
+        for rank, idx in enumerate(order):
+            finish_matrix[int(idx), rank] += 1
+        top3 = tuple(int(cars[int(order[i])]) for i in range(3))
+        top2 = tuple(int(cars[int(order[i])]) for i in range(2))
+        trifecta[top3] += 1
+        trio[tuple(sorted(top3))] += 1
+        exacta[top2] += 1
+        quinella[tuple(sorted(top2))] += 1
+
+    finish_counts = {int(car): Counter({rank + 1: int(finish_matrix[i, rank]) for rank in range(n) if finish_matrix[i, rank] > 0}) for i, car in enumerate(cars)}
+    bet_counts = {
+        "三連単": trifecta,
+        "三連複": trio,
+        "2車単": exacta,
+        "2車複": quinella,
+    }
+    return finish_counts, bet_counts
+
+
+
+def simulate(df, trials, seed, track_temp=30.0):
+    """Ver12.3: 高速ベクトル型の6周近似モデル。
+
+    1周目のST反応とスタート後の伸びを分離し、最終周には僅差の差し判定を追加する。
+    車番固定の結果合わせは行わず、全選手共通の指標から確率的に発生させる。
+    """
+    rng = np.random.default_rng(int(seed))
+    arr = prepare_simulation_arrays(df)
+    cars = np.asarray(arr["cars"], dtype=int)
+    n = len(cars); trials = int(trials)
+    handicap = np.asarray(arr["handicap"], dtype=float)
+    z = np.asarray(arr["z_scores"], dtype=float)
+    finish_sd = np.asarray(arr["finish_sd"], dtype=float)
+    st = np.asarray(arr["st"], dtype=float)
+    st_stability = np.asarray(arr["st_stability_flow"], dtype=float)
+    execution = np.asarray(arr["execution_quality"], dtype=float)
+    traffic = np.asarray(arr["traffic_conversion"], dtype=float)
+    closing = np.asarray(arr["closing_strength"], dtype=float)
+    current = np.asarray(arr.get("current_day_strength", np.full(n, .5)), dtype=float)
+    position_hold = np.asarray(arr.get("position_hold_flow", np.full(n, .5)), dtype=float)
+    rear_chase = np.asarray(arr.get("rear_chase_flow", np.full(n, .35)), dtype=float)
+    dependency = np.asarray(arr.get("position_dependency_flow", np.full(n, .5)), dtype=float)
+    bipolar = np.asarray(arr.get("bipolar_flow", np.full(n, .3)), dtype=float)
+    volatility = np.asarray(arr.get("volatility_profile", np.full(n, .5)), dtype=float)
+    final_kick = np.asarray(arr.get("final_kick_flow", closing), dtype=float)
+    recent_form = np.asarray(arr.get("recent_form_strength", current), dtype=float)
+
+    stable = pd.to_numeric(df.get("安定上位指数", pd.Series(.5,index=df.index)), errors="coerce").fillna(.5).clip(0,1).to_numpy(float)
+    breakthrough = pd.to_numeric(df.get("集団突破力", pd.Series(.5,index=df.index)), errors="coerce").fillna(.5).clip(0,1).to_numpy(float)
+    trial = pd.to_numeric(df.get("試走換算", pd.Series(np.nan,index=df.index)), errors="coerce").to_numpy(float)
+    fill=float(np.nanmedian(trial[np.isfinite(trial)])) if np.isfinite(trial).any() else 3.50
+    trial=np.where(np.isfinite(trial),trial,fill)
+    trial_strength=(trial.max()-trial)/(max(1e-6,trial.max()-trial.min())) if trial.max()>trial.min() else np.full(n,.5)
+    st_fill=float(np.nanmedian(st[np.isfinite(st)])) if np.isfinite(st).any() else .15
+    st2=np.where(np.isfinite(st),st,st_fill)
+    st_strength=(st2.max()-st2)/(max(1e-6,st2.max()-st2.min())) if st2.max()>st2.min() else np.full(n,.5)
+
+    temp=float(track_temp if track_temp is not None else 30.0)
+    heat=np.clip((temp-44.0)/12.0,0,1)
+    unique_h, counts=np.unique(handicap,return_counts=True)
+    dense_h=float(unique_h[np.argmax(counts)])
+    dense_mask=np.isclose(handicap,dense_h)
+    dense_size=int(counts.max()); same_line=dense_size>=4
+    line_indices=np.where(dense_mask)[0]
+    lane_ratio=np.zeros(n)
+    if len(line_indices)>1:
+        order_line=line_indices[np.argsort(cars[line_indices])]
+        lane_ratio[order_line]=np.linspace(1.0,0.0,len(order_line))
+
+    # 評価の中心。安定上位は残すが、格だけで外枠が自動突破しないよう抑える。
+    base=(z*.76 + stable*.30 + execution*.15 + current*.13 + trial_strength*.11)
+    noise_sd=np.clip(.68 + finish_sd*.50 + volatility*.30, .52, 1.45)
+    score=base[None,:] + rng.normal(0,noise_sd,size=(trials,n))
+
+    # ST反応と「その後の伸び」を分離。
+    reaction = st_strength*.54 + st_stability*.25 + execution*.13 + trial_strength*.08
+    start_draw = reaction[None,:] + rng.normal(0,.25,size=(trials,n))
+    stretch_index=np.clip(trial_strength*.30 + execution*.25 + st_stability*.16 + current*.14 + recent_form*.10 + traffic*.05,0,1)
+    # 上振れは全員に起こり得るが、指数が高いほど頻度と幅が増える。
+    stretch_event = rng.random((trials,n)) < np.clip(.06 + stretch_index[None,:]*.24, .05, .30)
+    stretch_power = stretch_event * rng.uniform(.12,.58,size=(trials,n)) * (.55 + stretch_index[None,:])
+    first_lap = start_draw + stretch_power
+
+    if same_line:
+        gate=1/(1+np.exp(-(first_lap-.48)*8.0))
+        score += gate * lane_ratio[None,:] * .32
+        front_idx=np.argpartition(-first_lap, min(2,n-1), axis=1)[:,:min(3,n)]
+        front_mask=np.zeros((trials,n),dtype=bool)
+        front_mask[np.arange(trials)[:,None],front_idx]=True
+        score += front_mask*(.20 + position_hold[None,:]*.35 + stable[None,:]*.15)
+        # スタート伸び上振れ車は、外枠でも前団へ入った価値を上乗せ。
+        score += front_mask * stretch_power * .42
+        gap=rng.beta(2.0,3.2,size=(trials,1))
+        opportunity=np.clip(gap-(dense_size-3)*.035,0,1)
+        chase=(~front_mask)*opportunity*(breakthrough[None,:]*.48 + rear_chase[None,:]*.27 + closing[None,:]*.20)
+        score += chase
+        bad=first_lap < .37
+        score -= bad*(dependency[None,:]*.32 + bipolar[None,:]*rng.uniform(.04,.31,size=(trials,n)))
+    else:
+        min_h=np.nanmin(handicap); front=np.isclose(handicap,min_h)
+        score[:,front] += (.12+heat*.22)*position_hold[None,front]
+        score[:,~front] += rear_chase[None,~front]*.18 + closing[None,~front]*.12
+        score += stretch_power*.20
+
+    # 中盤の突破機会。
+    finish_gap=rng.beta(2.2,2.8,size=(trials,1))
+    score += finish_gap*(closing[None,:]*.18 + breakthrough[None,:]*.16)
+
+    # 最終周のゴール前伸び。大逆転ではなく、近い相手だけを僅差で交わせるようにする。
+    goal_kick_index=np.clip(final_kick*.36 + closing*.25 + execution*.15 + current*.10 + trial_strength*.08 + rear_chase*.06,0,1)
+    goal_event=rng.random((trials,n)) < np.clip(.08 + goal_kick_index[None,:]*.22, .06, .29)
+    goal_power=goal_event*rng.uniform(.05,.26,size=(trials,n))*(.65+goal_kick_index[None,:])
+    score += goal_power
+    score += rng.normal(0,.055,size=(trials,n))
+
+    # いったん順位化し、僅差の隣接2台だけ最終周差しを追加。
+    order=np.argsort(-score,axis=1)
+    sorted_score=np.take_along_axis(score,order,axis=1)
+    for rank in range(n-1):
+        lead_idx=order[:,rank]; chase_idx=order[:,rank+1]
+        margin=sorted_score[:,rank]-sorted_score[:,rank+1]
+        chase_kick=goal_power[np.arange(trials),chase_idx]
+        lead_hold=position_hold[lead_idx]*.11 + stable[lead_idx]*.06
+        pass_mask=(margin < .22) & ((chase_kick-lead_hold) > margin*.55) & (rng.random(trials)<.52)
+        if np.any(pass_mask):
+            a=order[pass_mask,rank].copy(); b=order[pass_mask,rank+1].copy()
+            order[pass_mask,rank]=b; order[pass_mask,rank+1]=a
+
+    finish_matrix=np.zeros((n,n),dtype=np.int64)
+    for rank in range(n): finish_matrix[:,rank]=np.bincount(order[:,rank],minlength=n)
+    top3=cars[order[:,:3]]; top2=cars[order[:,:2]]
+    def make_counter(a):
+        vals,cnt=np.unique(a,axis=0,return_counts=True)
+        return Counter({tuple(map(int,v)):int(c) for v,c in zip(vals,cnt)})
+    finish_counts={int(car):Counter({rank+1:int(finish_matrix[i,rank]) for rank in range(n) if finish_matrix[i,rank]>0}) for i,car in enumerate(cars)}
+    return finish_counts,{"三連単":make_counter(top3),"三連複":make_counter(np.sort(top3,axis=1)),"2車単":make_counter(top2),"2車複":make_counter(np.sort(top2,axis=1))}
+
+def style_header(ws, row, last_col):
+    fill = PatternFill("solid", fgColor="4472C4")
+    font = Font(color="FFFFFF", bold=True)
+    for c in range(1, last_col + 1):
+        cell = ws.cell(row, c)
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = Alignment(horizontal="center")
+
+
+def auto_width(ws):
+    for col_idx in range(1, ws.max_column + 1):
+        max_len = 0
+        for row_idx in range(1, ws.max_row + 1):
+            cell = ws.cell(row_idx, col_idx)
+            if isinstance(cell, MergedCell):
+                continue
+            if cell.value is not None:
+                max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(
+            max(max_len + 2, 10), 24
+        )
+
+
+def create_result_excel(content, filename, df, finish_counts, bet_counts, trials, track_temp=30.0):
+    wb = load_workbook(io.BytesIO(content), data_only=False)
+
+    generated_sheets = [
+        "Colab計算結果", "着順分布",
+        "三連単確率", "三連単期待値", "三連複確率", "三連複期待値",
+        "2車単確率", "2車単期待値", "2車複確率", "2車複期待値",
+    ]
+    for sheet_name in generated_sheets:
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+
+    result = wb.create_sheet("Colab計算結果")
+    dist = wb.create_sheet("着順分布")
+
+    result.merge_cells("A1:AV1")
+    result["A1"] = f"AutoRaceAI Ver12.2 走路環境結果（走路温度 {track_temp:.0f}℃）"
+    result["A1"].fill = PatternFill("solid", fgColor="17365D")
+    result["A1"].font = Font(color="FFFFFF", bold=True, size=14)
+    result["A1"].alignment = Alignment(horizontal="center")
+
+    output_cols = [
+        "車", "選手名", "ハンデ", "試走換算", "直近5差", "平均ST",
+        "ST標準偏差", "ST安定性", "同ハンデ差", "開催場差", "走路差", "着順指数", "勝率",
+        "連対率", "3着以内率", "平均着順", "着順安定度",
+        "審査P", "現ランク", "上昇度", "再現性", "今回ハンデ勝率",
+        "試走点", "試走単発救済点", "近況主役点", "最近点", "ST点", "ハンデ点", "開催場点",
+        "走路点", "位置点", "内枠展開点", "最内勝ち切り点", "着順点", "勝率点", "連対点",
+        "上昇点", "再現性点", "ハンデ勝率点", "3着以内率点", "平均着順点", "着順安定度点",
+        "審査Pランク点", "試走信頼度", "レース巧者指数", "レース巧者点",
+        "逃げ成功率", "内枠残存率", "位置活用率", "同ハンデST優位度", "レースタイプ", "改良総合点",
+        "改良順位", "前走ハンデ", "直近5走平均ハンデ", "ハンデ改善量", "ハンデ変化点", "同ハンデ人数",
+        "同ハンデ外順", "外枠不利補正", "直近3走好調補正", "巻き返し余地補正", "実戦再現力補正",
+        "勝負余力補正", "内側高信頼補正", "近況単独過大補正", "選手タイプ総合補正",
+        "中位粘り率", "中位粘り補正", "条件改善再現補正", "中位内容総合補正",
+        "上昇カーブ指数", "上昇カーブ補正", "終盤指数", "終盤力補正", "相手レベル耐性補正",
+        "Ver10_6総合補正", "選手タイプVer2", "改善後総合点", "改善後順位",
+    ]
+    output_cols = [c for c in output_cols if c in df.columns]
+    # シミュレーションと同じ定義で安定指数を表示する。
+    finish_sd = pd.to_numeric(df.get("着順標準偏差", pd.Series(1.5, index=df.index)), errors="coerce").fillna(1.5).clip(0.8, 3.0)
+    finish_consistency = (1.0 - (finish_sd - 0.8) / 2.2).clip(0.0, 1.0)
+    df = df.copy()
+    df["走路安定指数"] = (
+        0.42 * finish_consistency
+        + 0.31 * pd.to_numeric(df.get("ST安定性", 0.5), errors="coerce").fillna(0.5).clip(0, 1)
+        + 0.17 * pd.to_numeric(df.get("試走信頼度", 0.5), errors="coerce").fillna(0.5).clip(0.2, 1)
+        + 0.10 * pd.to_numeric(df.get("近況信頼度", 0.5), errors="coerce").fillna(0.5).clip(0, 1)
+    ).clip(0, 1)
+    df["走路安定タイプ"] = pd.cut(df["走路安定指数"], [-0.01, 0.48, 0.66, 1.01], labels=["ムラ型", "標準型", "安定型"]).astype(str)
+    output_cols += ["走路安定指数", "走路安定タイプ"]
+
+    for c, name in enumerate(output_cols, 1): result.cell(3, c, name)
+    style_header(result, 3, len(output_cols))
+    for r, (_, row) in enumerate(df.iterrows(), 4):
+        for c, name in enumerate(output_cols, 1):
+            value = row.get(name)
+            result.cell(r, c, None if pd.isna(value) else value)
+    percent_names = {"勝率", "連対率", "3着以内率", "今回ハンデ勝率", "走路安定指数"}
+    for c, name in enumerate(output_cols, 1):
+        if name in percent_names:
+            for r in range(4, 4 + len(df)): result.cell(r, c).number_format = "0.0%"
+
+    dist.merge_cells("A1:J1")
+    dist["A1"] = "着順分布"
+    dist["A1"].fill = PatternFill("solid", fgColor="17365D")
+    dist["A1"].font = Font(color="FFFFFF", bold=True, size=14)
+    dist["A1"].alignment = Alignment(horizontal="center")
+    dist_headers = ["車", "選手名"] + [f"{rank}着率" for rank in range(1, 9)]
+    for c, name in enumerate(dist_headers, 1): dist.cell(3, c, name)
+    style_header(dist, 3, len(dist_headers))
+    for r, (_, row) in enumerate(df.iterrows(), 4):
+        car = int(row["車"])
+        values = [car, row["選手名"]] + [finish_counts[car][rank] / trials for rank in range(1, 9)]
+        for c, value in enumerate(values, 1):
+            dist.cell(r, c, value)
+            if c >= 3: dist.cell(r, c).number_format = "0.0%"
+
+    def make_probability_and_ev(ticket_name, counter):
+        prob = wb.create_sheet(f"{ticket_name}確率")
+        ev = wb.create_sheet(f"{ticket_name}期待値")
+        ordered = ticket_name in ("三連単", "2車単")
+        pick_count = 3 if ticket_name.startswith("三連") else 2
+        labels = (["1着", "2着", "3着"] if pick_count == 3 and ordered else
+                  ["車1", "車2", "車3"] if pick_count == 3 else
+                  ["1着", "2着"] if ordered else ["車1", "車2"])
+        prob.merge_cells(start_row=1, start_column=1, end_row=1, end_column=pick_count + 3)
+        prob["A1"] = f"{ticket_name}確率（Ver11.1走路環境補正）"
+        prob["A1"].fill = PatternFill("solid", fgColor="17365D")
+        prob["A1"].font = Font(color="FFFFFF", bold=True, size=14)
+        headers = ["順位"] + labels + ["組合せ", "確率"]
+        for c, name in enumerate(headers, 1): prob.cell(3, c, name)
+        style_header(prob, 3, len(headers))
+        sorted_items = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+        for rank, (combo, count) in enumerate(sorted_items, 1):
+            row = rank + 3
+            values = [rank] + list(combo) + ["-".join(map(str, combo)), count / trials]
+            for c, value in enumerate(values, 1): prob.cell(row, c, value)
+            prob.cell(row, len(headers)).number_format = "0.000%"
+
+        ev.merge_cells(start_row=1, start_column=1, end_row=1, end_column=pick_count + 7)
+        ev["A1"] = f"{ticket_name}期待値（確率 × 実オッズ）"
+        ev["A1"].fill = PatternFill("solid", fgColor="17365D")
+        ev["A1"].font = Font(color="FFFFFF", bold=True, size=14)
+        ev_headers = ["順位"] + labels + ["組合せ", "補正確率", "適正オッズ", "実オッズ入力", "期待値倍率", "期待値判定"]
+        for c, name in enumerate(ev_headers, 1): ev.cell(3, c, name)
+        style_header(ev, 3, len(ev_headers))
+        prob_col = 2 + pick_count + 1
+        fair_col = prob_col + 1; odds_col = fair_col + 1; value_col = odds_col + 1; judge_col = value_col + 1
+        from openpyxl.utils import get_column_letter
+        for rank, (combo, count) in enumerate(sorted_items, 1):
+            row = rank + 3; p = count / trials
+            values = [rank] + list(combo) + ["-".join(map(str, combo)), p, (1/p if p > 0 else None)]
+            for c, value in enumerate(values, 1): ev.cell(row, c, value)
+            ev.cell(row, prob_col).number_format = "0.000%"
+            ev.cell(row, fair_col).number_format = "0.00"
+            ev.cell(row, odds_col).number_format = "0.00"
+            ev.cell(row, value_col, f'=IF({get_column_letter(odds_col)}{row}="","",{get_column_letter(prob_col)}{row}*{get_column_letter(odds_col)}{row})')
+            ev.cell(row, value_col).number_format = "0.000"
+            ev.cell(row, judge_col, f'=IF({get_column_letter(value_col)}{row}="","",IF({get_column_letter(value_col)}{row}>=1,"期待値あり","期待値不足"))')
+        return prob, ev
+
+    sheets = [result, dist]
+    for ticket in ["三連単", "三連複", "2車単", "2車複"]:
+        sheets.extend(make_probability_and_ev(ticket, bet_counts[ticket]))
+    for ws in sheets:
+        ws.freeze_panes = "A4"
+        auto_width(ws)
+
+    path = f"/content/{Path(filename).stem}_AutoRaceAI_Ver12_0_位置依存_二極化タイプ.xlsx"
+    wb.save(path)
+    return path
+
+
+def run_model(content, filename, trials, seed, track_temp=30.0):
+    wb = load_workbook(io.BytesIO(content), data_only=True)
+
+    required = ["レース予測", "設定"] + [f"選手{i}" for i in range(1, 9)]
+    missing = [name for name in required if name not in wb.sheetnames]
+    if missing:
+        raise ValueError("不足シート: " + ", ".join(missing))
+
+    race = read_race(wb["レース予測"])
+    settings = read_settings(wb["設定"])
+
+    metrics = []
+    for car in range(1, 9):
+        ws = wb[f"選手{car}"]
+        current = current_player(ws)
+        history = read_history(ws)
+        metrics.append(
+            player_metrics(car, current, history, race, settings)
+        )
+
+    df = calculate_excel_model(metrics, settings)
+
+    # Ver12.2 診断列。シミュレーションと同じ考え方で、スタート一気と先行転換を表示する。
+    st_v = pd.to_numeric(df["平均ST"], errors="coerce").fillna(0.20).to_numpy(float)
+    trial_v = pd.to_numeric(df["試走換算"], errors="coerce").fillna(pd.to_numeric(df["試走換算"], errors="coerce").median()).to_numpy(float)
+    def _rank_lower(v):
+        v = np.asarray(v, dtype=float); idx = np.argsort(v, kind="stable")
+        out = np.zeros(len(v), dtype=float)
+        out[idx] = 0.5 if len(v) <= 1 else 1.0 - np.arange(len(v), dtype=float) / (len(v) - 1.0)
+        return out
+    st_stable_v = pd.to_numeric(df["ST安定性"], errors="coerce").fillna(0.50).clip(0, 1).to_numpy(float)
+    execution_v = pd.to_numeric(df["実戦変換力"], errors="coerce").fillna(0.50).clip(0, 1).to_numpy(float) if "実戦変換力" in df.columns else pd.to_numeric(df["レース巧者指数"], errors="coerce").fillna(0.50).clip(0, 1).to_numpy(float)
+    traffic_v = pd.to_numeric(df["レース巧者指数"], errors="coerce").fillna(0.50).clip(0, 1).to_numpy(float)
+    road_v = pd.to_numeric(df.get("走路安定指数", pd.Series(0.50, index=df.index)), errors="coerce").fillna(0.50).clip(0, 1).to_numpy(float)
+    trust_v = pd.to_numeric(df["試走信頼度"], errors="coerce").fillna(0.50).clip(0, 1).to_numpy(float)
+    df["スタート一気指数"] = np.clip(_rank_lower(st_v) * 0.46 + st_stable_v * 0.19 + _rank_lower(trial_v) * 0.22 + execution_v * 0.13, 0, 1)
+    df["先行転換力"] = np.clip(df["スタート一気指数"].to_numpy(float) * 0.43 + st_stable_v * 0.13 + execution_v * 0.18 + traffic_v * 0.14 + road_v * 0.08 + trust_v * 0.04, 0, 1)
+    same_line_diag = bool(len(df) >= 3 and pd.to_numeric(df["ハンデ"], errors="coerce").max() - pd.to_numeric(df["ハンデ"], errors="coerce").min() < 1e-9)
+    if same_line_diag:
+        inner_ratio_diag = 1.0 - (pd.to_numeric(df["車"], errors="coerce").fillna(1.0).to_numpy(float) - 1.0) / max(1.0, len(df) - 1.0)
+        df["隊列残存指数"] = np.clip(inner_ratio_diag * (df["スタート一気指数"].to_numpy(float) * 0.48 + df["先行転換力"].to_numpy(float) * 0.52), 0, 1)
+    else:
+        df["隊列残存指数"] = 0.0
+
+    # Ver12.2: 能力が高い選手は混戦の壁を越えられるよう、全選手共通の集団突破力を作る。
+    # 内枠・車番はここには入れず、実戦能力・終盤・交通処理・勝負強さ・後方追上げで構成する。
+    def _norm01_col(col, default=50.0):
+        v = pd.to_numeric(df.get(col, pd.Series(default, index=df.index)), errors="coerce").fillna(default).to_numpy(float)
+        if np.nanmax(v) <= 1.5:
+            return np.clip(v, 0, 1)
+        lo, hi = np.nanpercentile(v, 10), np.nanpercentile(v, 90)
+        if hi - lo < 1e-9:
+            return np.full(len(v), 0.5)
+        return np.clip((v - lo) / (hi - lo), 0, 1)
+
+    practical_v = _norm01_col("実戦能力点")
+    closing_v = _norm01_col("終盤指数")
+    traffic_v2 = _norm01_col("レース巧者指数")
+    clutch_v = _norm01_col("勝負強さ点")
+    rear_v = np.clip(pd.to_numeric(df.get("後方追上げ指数", pd.Series(0.35, index=df.index)), errors="coerce").fillna(0.35).to_numpy(float), 0, 1)
+    trial_v2 = _norm01_col("当日レース指数")
+    stable_v2 = np.clip(pd.to_numeric(df.get("安定上位指数", pd.Series(0.50, index=df.index)), errors="coerce").fillna(0.50).to_numpy(float), 0, 1)
+    recent_poor_v2 = np.clip(pd.to_numeric(df.get("直近5走生凡走率", pd.Series(0.25, index=df.index)), errors="coerce").fillna(0.25).to_numpy(float), 0, 1)
+
+    raw_breakthrough = (
+        practical_v * 0.23 + closing_v * 0.20 + traffic_v2 * 0.18
+        + clutch_v * 0.10 + rear_v * 0.13 + trial_v2 * 0.08
+        + stable_v2 * 0.08
+    )
+    # 能力差を0～1へ広げすぎず、強い選手でも「機会がなければ抜けない」範囲へ圧縮。
+    df["混戦突破適性"] = np.clip(
+        0.26 + raw_breakthrough * 0.50 - recent_poor_v2 * 0.08,
+        0.18, 0.78
+    )
+    df["集団突破力"] = df["混戦突破適性"]
+
+    # Ver12.3 診断列：ST反応とは別のスタート伸びと、最終周の伸びを表示。
+    _trial_s = _norm01_col("当日レース指数")
+    _exec_s = _norm01_col("実戦能力点")
+    _ststab_s = np.clip(pd.to_numeric(df.get("ST安定性", pd.Series(.5,index=df.index)), errors="coerce").fillna(.5).to_numpy(float),0,1)
+    _current_s = np.clip(pd.to_numeric(df.get("当日状態指数", pd.Series(.5,index=df.index)), errors="coerce").fillna(.5).to_numpy(float),0,1)
+    _recent_s = np.clip(pd.to_numeric(df.get("近況信頼度", pd.Series(.5,index=df.index)), errors="coerce").fillna(.5).to_numpy(float),0,1)
+    df["スタート伸び指数"] = np.clip(_trial_s*.30 + _exec_s*.25 + _ststab_s*.16 + _current_s*.14 + _recent_s*.10 + traffic_v2*.05,0,1)
+    _final_s = _norm01_col("終盤指数")
+    df["ゴール前伸び指数"] = np.clip(_final_s*.36 + closing_v*.25 + _exec_s*.15 + _current_s*.10 + _trial_s*.08 + rear_v*.06,0,1)
+
+    finish_counts, bet_counts = simulate(df, trials, seed, track_temp=track_temp)
+    output = create_result_excel(
+        content, filename, df, finish_counts, bet_counts, trials, track_temp=track_temp
+    )
+    return df, bet_counts, output
+
+
+upload = widgets.FileUpload(
+    accept=".xlsx",
+    multiple=False,
+    description="Excelを選択",
+    button_style="info",
+)
+
+trial_slider = widgets.IntSlider(
+    value=10000,
+    min=1000,
+    max=100000,
+    step=1000,
+    description="試行回数（超高速10000）",
+    continuous_update=False,
+    layout=widgets.Layout(width="600px"),
+    style={"description_width": "initial"},
+)
+
+seed_input = widgets.IntText(
+    value=20260719,
+    description="乱数シード",
+    style={"description_width": "initial"},
+)
+
+track_temp_slider = widgets.FloatSlider(
+    value=30.0,
+    min=15.0,
+    max=70.0,
+    step=1.0,
+    description="走路温度(℃)",
+    continuous_update=False,
+    layout=widgets.Layout(width="600px"),
+    style={"description_width": "initial"},
+)
+
+run_button = widgets.Button(
+    description="Ver12.3 高速計算",
+    button_style="success",
+    icon="calculator",
+    layout=widgets.Layout(width="280px", height="44px"),
+)
+
+output_area = widgets.Output()
+
+
+def clicked(_):
+    with output_area:
+        _hidden_clear_output()
+
+        try:
+            import time
+            _calc_started = time.perf_counter()
+            filename, content = uploaded_file(upload.value)
+            if not content:
+                print("先にExcelを選択してください。")
+                return
+
+            heat = float(np.clip((float(track_temp_slider.value) - 50.0) / 8.0, 0.0, 1.0))
+            chaos = float(np.clip((float(track_temp_slider.value) - 48.0) / 16.0, 0.0, 1.0))
+            heat_label = "通常" if heat <= 0 else ("やや前残り" if heat < 0.50 else "前残り強め")
+            if chaos >= 0.65:
+                heat_label += "・荒れ強め"
+            elif chaos > 0:
+                heat_label += "・荒れ注意"
+            print(f"AutoRaceAI Ver12.3 高速版を計算中（走路温度 {track_temp_slider.value:.0f}℃・{heat_label}）...")
+            df, bet_counts, output = run_model(
+                content,
+                filename,
+                min(int(trial_slider.value), 20000),
+                int(seed_input.value),
+                float(track_temp_slider.value),
+            )
+            globals()["LATEST_PREDICTION_DF"] = df.copy()
+            globals()["LATEST_BET_COUNTS"] = bet_counts
+            globals()["LATEST_TRACK_TEMP"] = float(track_temp_slider.value)
+            globals()["LATEST_PREDICTION_FILENAME"] = filename
+
+            requested_display_cols = [
+                "車", "選手名", "レースタイプ", "逃げ成功率", "内枠残存率", "位置活用率",
+                "同ハンデST優位度", "試走信頼度", "レース巧者指数",
+                "直近5走生3着内率", "直近5走生凡走率", "近況信頼度", "短期上振れ抑制",
+                "近況信頼度補正", "直近内容補正", "速度実戦変換補正",
+                "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
+                "選手タイプ", "選手タイプVer2", "上昇カーブ指数", "上昇カーブ補正",
+                "終盤指数", "終盤力補正", "相手レベル耐性補正",
+                "中位粘り率", "中位粘り補正", "条件改善再現補正",
+                "スタート一気指数", "スタート伸び指数", "先行転換力", "隊列残存指数", "ゴール前伸び指数", "安定上位指数", "安定上位評価補正", "混戦突破適性", "集団突破力", "好位置維持指数", "後方追上げ指数", "位置依存指数", "二極化指数", "自己比試走指数", "自己試走変化秒", "当日状態指数", "試走突出度", "爆発指数", "爆発能力補正", "前団主導指数", "当日勝ち切り指数", "後方追走不成立リスク", "当日レース指数", "基礎履歴総合点", "改良総合点", "改善後総合点", "改善後順位"
+            ]
+            # Ver10で廃止・変更された旧列があっても表示処理を止めない
+            display_cols = [col for col in requested_display_cols if col in df.columns]
+            missing_display_cols = [col for col in requested_display_cols if col not in df.columns]
+            if missing_display_cols:
+                print("表示対象から除外した未生成列:", ", ".join(missing_display_cols))
+
+            _hidden_display(
+                df.loc[:, display_cols]
+                .sort_values(["改善後順位", "車"])
+                .reset_index(drop=True)
+                .style.format({
+                    "逃げ成功率": "{:.1%}",
+                    "内枠残存率": "{:.1%}",
+                    "位置活用率": "{:.1%}",
+                    "同ハンデST優位度": "{:.3f}",
+                    "試走信頼度": "{:.3f}",
+                    "レース巧者指数": "{:.3f}",
+                    "スタート一気指数": "{:.3f}",
+                    "先行転換力": "{:.3f}",
+                    "当日状態指数": "{:.3f}",
+                    "試走突出度": "{:.3f}",
+                    "爆発指数": "{:.3f}",
+                    "爆発能力補正": "{:.3f}",
+                    "当日レース指数": "{:.3f}",
+                    "基礎履歴総合点": "{:.3f}",
+                    "直近5走生3着内率": "{:.1%}",
+                    "直近5走生凡走率": "{:.1%}",
+                    "近況信頼度": "{:.3f}",
+                    "短期上振れ抑制": "{:.3f}",
+                    "近況信頼度補正": "{:.3f}",
+                    "直近内容補正": "{:.3f}",
+                    "速度実戦変換補正": "{:.3f}",
+                    "改良総合点": "{:.3f}",
+                    "ハンデ変化点": "{:.3f}",
+                    "改善後総合点": "{:.3f}",
+                })
+            )
+
+            print("\n三連単確率 上位10通り")
+            for rank, (combo, count) in enumerate(
+                sorted(bet_counts["三連単"].items(), key=lambda x: x[1], reverse=True)[:10],
+                1,
+            ):
+                probability = count / int(trial_slider.value) * 100
+                print(
+                    f"{rank:>2}. {combo[0]}-{combo[1]}-{combo[2]} "
+                    f"{probability:.3f}%"
+                )
+
+            for ticket in ["三連複", "2車単", "2車複"]:
+                print(f"\n{ticket}確率 上位5通り")
+                for rank, (combo, count) in enumerate(
+                    sorted(bet_counts[ticket].items(), key=lambda x: x[1], reverse=True)[:5], 1
+                ):
+                    probability = count / int(trial_slider.value) * 100
+                    print(f"{rank:>2}. {'-'.join(map(str, combo))} {probability:.3f}%")
+
+            _elapsed = time.perf_counter() - _calc_started
+            print(f"\n計算時間: {_elapsed:.1f}秒")
+            print("結果Excelをダウンロードします。")
+            files.download(output)
+
+        except Exception as exc:
+            print("エラー:", exc)
+
+
+run_button.on_click(clicked)
+
+_hidden_display(
+    widgets.VBox([
+        upload,
+        trial_slider,
+        seed_input,
+        track_temp_slider,
+        run_button,
+        output_area,
+    ])
+)
+
+# ============================================================
+# Ver13.1 周回順位貼り付け・展開分析
+# ============================================================
+LAP_STATUS_GOAL = 'ゴール線通過'
+
+def init_lap_tables():
+    mount_and_init_db()
+    with sqlite3.connect(DB_PATH) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS races (
+            race_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_key TEXT NOT NULL UNIQUE,
+            race_date TEXT, venue TEXT, race_no TEXT, race_name TEXT,
+            distance_m INTEGER, total_laps INTEGER,
+            weather TEXT, surface_condition TEXT,
+            track_temp REAL, air_temp REAL, humidity REAL,
+            start_time_text TEXT, source TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS lap_history (
+            lap_history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_id INTEGER NOT NULL,
+            lap_index INTEGER NOT NULL,
+            lap_label TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            car_no INTEGER NOT NULL,
+            player_id INTEGER,
+            is_goal INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(race_id, lap_index, position),
+            UNIQUE(race_id, lap_index, car_no),
+            FOREIGN KEY(race_id) REFERENCES races(race_id),
+            FOREIGN KEY(player_id) REFERENCES players(player_id)
+        );
+        CREATE TABLE IF NOT EXISTS lap_features (
+            feature_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_id INTEGER NOT NULL,
+            car_no INTEGER NOT NULL,
+            player_id INTEGER,
+            first_lap_pos INTEGER, final_pos INTEGER, best_pos INTEGER, worst_pos INTEGER,
+            net_gain INTEGER, overtakes INTEGER, passed_by INTEGER,
+            front_pack_laps INTEGER, front_pack_rate REAL,
+            late_gain INTEGER, late_peak_gain INTEGER,
+            lead_laps INTEGER, position_variance REAL,
+            finish_vs_first INTEGER,
+            UNIQUE(race_id, car_no),
+            FOREIGN KEY(race_id) REFERENCES races(race_id),
+            FOREIGN KEY(player_id) REFERENCES players(player_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lap_player ON lap_history(player_id, race_id, lap_index);
+        CREATE INDEX IF NOT EXISTS idx_lap_race ON lap_history(race_id, lap_index, position);
+        """)
+
+def _normalize_paste(text):
+    return str(text or '').replace('\r\n','\n').replace('\r','\n').replace('\u3000',' ')
+
+def parse_lap_paste(text):
+    text=_normalize_paste(text)
+    lines=[x.strip() for x in text.split('\n') if x.strip()]
+    rows=[]
+    for line in lines:
+        parts=[p for p in re.split(r'[\t ,，]+',line) if p]
+        if len(parts)<9 or not (parts[0] in ['ゴール線通過','ゴール'] or re.fullmatch(r'\d+周目',parts[0])):
+            continue
+        label=parts[0]
+        cars=[int(x) for x in parts[1:9] if re.fullmatch(r'\d+',x)]
+        if len(cars)!=8 or sorted(cars)!=list(range(1,9)):
+            raise ValueError(f'「{line}」の車番が1～8の並びになっていません')
+        is_goal=label in ['ゴール線通過','ゴール']
+        lap_no=10**6 if is_goal else int(re.search(r'\d+',label).group())
+        rows.append({'label':LAP_STATUS_GOAL if is_goal else label,'lap_no':lap_no,'is_goal':is_goal,'cars':cars})
+    if not rows:
+        raise ValueError('周回順位表を読み取れませんでした。見出しを含めてそのまま貼り付けてください。')
+    unique={r['label']:r for r in rows}
+    normal=sorted([r for r in unique.values() if not r['is_goal']],key=lambda r:r['lap_no'])
+    goals=[r for r in unique.values() if r['is_goal']]
+    ordered=normal+goals
+    for i,r in enumerate(ordered,1): r['lap_index']=i
+    meta={}
+    m=re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日',text)
+    if m: meta['race_date']=f'{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}'
+    m=re.search(r'([^\n]*?(?:優勝戦|一般戦|選抜戦|準決勝戦|特別選抜戦|予選|最終予選|二次予選))\s*(\d+)m\s*\((\d+)周\)',text)
+    if m:
+        meta['race_name']=m.group(1).strip(); meta['distance_m']=int(m.group(2)); meta['total_laps']=int(m.group(3))
+    else:
+        m=re.search(r'(\d+)m\s*\((\d+)周\)',text)
+        if m: meta['distance_m']=int(m.group(1)); meta['total_laps']=int(m.group(2))
+    patterns={
+        'weather':r'天候[：:]\s*([^\s　]+)',
+        'surface_condition':r'走路状況[：:]\s*([^\s　]+)',
+        'track_temp':r'走路温度[：:]\s*([\d.]+)',
+        'air_temp':r'気温[：:]\s*([\d.]+)',
+        'humidity':r'湿度[：:]\s*([\d.]+)',
+        'start_time_text':r'発走時間\s*([0-2]?\d:[0-5]\d)'
+    }
+    for k,p in patterns.items():
+        m=re.search(p,text)
+        if m: meta[k]=float(m.group(1)) if k in ['track_temp','air_temp','humidity'] else m.group(1)
+    return ordered,meta
+
+def extract_result_mapping(content):
+    if not content: return {},{}
+    wb=load_workbook(io.BytesIO(content),data_only=True)
+    mapping={}; meta={}
+    if '結果入力' in wb.sheetnames:
+        ws=wb['結果入力']; h={_s(ws.cell(1,c).value):c for c in range(1,ws.max_column+1)}
+        for r in range(2,ws.max_row+1):
+            name=_s(ws.cell(r,h.get('選手名',1)).value)
+            if name: mapping[r-1]=name
+        if ws.max_row>=2:
+            for col,key in [('開催日','race_date'),('開催場','venue'),('レース','race_no')]:
+                if col in h:
+                    v=ws.cell(2,h[col]).value
+                    meta[key]=_date_text(v) if col=='開催日' else _s(v)
+    else:
+        players=[w for w in wb.worksheets if re.fullmatch(r'選手\d+',w.title)]
+        for i,w in enumerate(players,1): mapping[i]=_player_name(w)
+    return mapping,meta
+
+def _race_key(meta, rows):
+    core=[_s(meta.get('race_date')),_s(meta.get('venue')),_s(meta.get('race_no')),_s(meta.get('race_name')),
+          _s(meta.get('distance_m')),_s(meta.get('total_laps'))]
+    if not any(core[:4]): core.append('|'.join(','.join(map(str,r['cars'])) for r in rows))
+    return hashlib.sha256('|'.join(core).encode()).hexdigest()
+
+def calculate_lap_features(rows):
+    positions={c:[] for c in range(1,9)}
+    for r in rows:
+        for pos,c in enumerate(r['cars'],1): positions[c].append(pos)
+    n=len(rows); late_start=max(0,n-3); feats={}
+    for c,p in positions.items():
+        gains=[p[i-1]-p[i] for i in range(1,len(p))]
+        front=sum(x<=3 for x in p)
+        feats[c]={
+            'first_lap_pos':p[0],'final_pos':p[-1],'best_pos':min(p),'worst_pos':max(p),
+            'net_gain':p[0]-p[-1],'overtakes':sum(max(0,x) for x in gains),
+            'passed_by':sum(max(0,-x) for x in gains),'front_pack_laps':front,
+            'front_pack_rate':round(front/len(p),4),'late_gain':p[late_start]-p[-1],
+            'late_peak_gain':sum(max(0,p[i-1]-p[i]) for i in range(max(1,late_start+1),len(p))),
+            'lead_laps':sum(x==1 for x in p),'position_variance':round(float(np.var(p)),4),
+            'finish_vs_first':p[0]-p[-1]
+        }
+    return feats
+
+def save_lap_data(rows, meta, player_mapping=None, source='貼り付け'):
+    init_lap_tables(); player_mapping=player_mapping or {}; key=_race_key(meta,rows)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""INSERT INTO races(race_key,race_date,venue,race_no,race_name,distance_m,total_laps,
+          weather,surface_condition,track_temp,air_temp,humidity,start_time_text,source)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(race_key) DO UPDATE SET race_date=excluded.race_date,venue=excluded.venue,
+          race_no=excluded.race_no,race_name=excluded.race_name,distance_m=excluded.distance_m,
+          total_laps=excluded.total_laps,weather=excluded.weather,surface_condition=excluded.surface_condition,
+          track_temp=excluded.track_temp,air_temp=excluded.air_temp,humidity=excluded.humidity,
+          start_time_text=excluded.start_time_text,source=excluded.source,updated_at=CURRENT_TIMESTAMP""",
+          (key,meta.get('race_date'),meta.get('venue'),meta.get('race_no'),meta.get('race_name'),meta.get('distance_m'),
+           meta.get('total_laps'),meta.get('weather'),meta.get('surface_condition'),meta.get('track_temp'),
+           meta.get('air_temp'),meta.get('humidity'),meta.get('start_time_text'),source))
+        race_id=con.execute('SELECT race_id FROM races WHERE race_key=?',(key,)).fetchone()[0]
+        pids={int(car):_ensure_player(con,name) for car,name in player_mapping.items() if name}
+        con.execute('DELETE FROM lap_history WHERE race_id=?',(race_id,)); con.execute('DELETE FROM lap_features WHERE race_id=?',(race_id,))
+        for r in rows:
+            for pos,car in enumerate(r['cars'],1):
+                con.execute("INSERT INTO lap_history(race_id,lap_index,lap_label,position,car_no,player_id,is_goal) VALUES(?,?,?,?,?,?,?)",
+                            (race_id,r['lap_index'],r['label'],pos,car,pids.get(car),int(r['is_goal'])))
+        feats=calculate_lap_features(rows)
+        for car,f in feats.items():
+            con.execute("""INSERT INTO lap_features(race_id,car_no,player_id,first_lap_pos,final_pos,best_pos,worst_pos,
+                net_gain,overtakes,passed_by,front_pack_laps,front_pack_rate,late_gain,late_peak_gain,
+                lead_laps,position_variance,finish_vs_first) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (race_id,car,pids.get(car),f['first_lap_pos'],f['final_pos'],f['best_pos'],f['worst_pos'],f['net_gain'],
+                 f['overtakes'],f['passed_by'],f['front_pack_laps'],f['front_pack_rate'],f['late_gain'],f['late_peak_gain'],
+                 f['lead_laps'],f['position_variance'],f['finish_vs_first']))
+    return race_id,feats
+
+def lap_analysis_dataframe(feats, mapping=None):
+    mapping=mapping or {}; data=[]
+    for c,f in feats.items():
+        typ=[]
+        if f['first_lap_pos']<=3 and f['front_pack_rate']>=0.6: typ.append('前団維持')
+        if f['net_gain']>=3: typ.append('追上げ')
+        if f['late_gain']>=2: typ.append('終盤伸び')
+        if f['first_lap_pos']<=3 and f['final_pos']>=6: typ.append('先行失速')
+        if f['position_variance']>=3: typ.append('展開変動大')
+        data.append({'車番':c,'選手名':mapping.get(c,''),'1周目':f['first_lap_pos'],'最終':f['final_pos'],
+                     '最高順位':f['best_pos'],'最低順位':f['worst_pos'],'純上昇':f['net_gain'],
+                     '追抜き量':f['overtakes'],'被追抜き量':f['passed_by'],'前団率':f['front_pack_rate'],
+                     '終盤上昇':f['late_gain'],'先頭周回':f['lead_laps'],'展開タイプ':'・'.join(typ) or '中間型'})
+    return pd.DataFrame(data).sort_values('最終').reset_index(drop=True)
+
+def player_lap_profile(name):
+    init_lap_tables()
+    with sqlite3.connect(DB_PATH) as con:
+        return pd.read_sql_query("""SELECT COUNT(*) AS レース数,
+          ROUND(AVG(first_lap_pos),2) AS 一周目平均順位, ROUND(AVG(final_pos),2) AS ゴール平均順位,
+          ROUND(AVG(net_gain),2) AS 平均順位上昇, ROUND(AVG(front_pack_rate)*100,1) AS 前団滞在率,
+          ROUND(AVG(late_gain),2) AS 終盤平均上昇, ROUND(AVG(overtakes),2) AS 平均追抜き量,
+          ROUND(AVG(CASE WHEN first_lap_pos<=3 AND final_pos<=3 THEN 1.0 ELSE 0 END)*100,1) AS 好位置維持率,
+          ROUND(AVG(CASE WHEN first_lap_pos>=6 AND final_pos<=3 THEN 1.0 ELSE 0 END)*100,1) AS 後方三着内率
+          FROM lap_features f JOIN players p ON p.player_id=f.player_id WHERE p.player_name=?""",con,params=(name,))
+
+init_lap_tables()
+lap_excel_upload=widgets.FileUpload(accept='.xlsx',multiple=False,description='結果Excel（任意）')
+lap_paste=widgets.Textarea(value='',placeholder='公式ページの「周回・順位」からレース情報まで、そのまま貼り付け',
+    description='周回表:',layout=widgets.Layout(width='100%',height='330px'),style={'description_width':'70px'})
+venue_box=widgets.Text(description='開催場:',placeholder='Excelがない場合に入力')
+race_no_box=widgets.Text(description='レース:',placeholder='例：12R')
+save_lap_button=widgets.Button(description='周回データを解析・DB保存',button_style='success',icon='database')
+lap_out=widgets.Output()
+
+def on_save_laps(_):
+    with lap_out:
+        _hidden_clear_output()
+        try:
+            rows,meta=parse_lap_paste(lap_paste.value)
+            fname,xbytes=file_bytes(lap_excel_upload)
+            mapping,xmeta=extract_result_mapping(xbytes) if xbytes else ({},{})
+            for k,v in xmeta.items():
+                if v and not meta.get(k): meta[k]=v
+            if venue_box.value.strip(): meta['venue']=venue_box.value.strip()
+            if race_no_box.value.strip(): meta['race_no']=race_no_box.value.strip()
+            race_id,feats=save_lap_data(rows,meta,mapping,source=fname or '公式周回表貼付')
+            print(f'保存完了：race_id={race_id} / {len(rows)}地点 × 8選手')
+            print('抽出したレース情報:',meta)
+            _hidden_display(lap_analysis_dataframe(feats,mapping))
+            if not mapping: print('※結果入力Excelも指定すると、車番と選手名を結び付けて保存できます。')
+        except Exception as e: print('エラー:',e)
+
+save_lap_button.on_click(on_save_laps)
+_hidden_display(widgets.HTML('<h3>⑤ 周回順位表をそのまま貼り付け</h3><p>結果入力Excelを指定すると、1行目＝1号車として選手名を自動対応します。</p>'))
+_hidden_display(lap_excel_upload,widgets.HBox([venue_box,race_no_box]),lap_paste,save_lap_button,lap_out)
+
+# ============================================================
+# Ver13.2 公式結果全文貼り付け・一括登録
+# ============================================================
+
+def _split_result_line(line):
+    line = line.replace('\u3000', ' ').strip()
+    if '\t' in line:
+        return [x.strip() for x in line.split('\t')]
+    return [x.strip() for x in re.split(r'\s{2,}', line) if x.strip()]
+
+
+def _normalize_status(accident='', abnormal=''):
+    raw = (_s(accident) + ' ' + _s(abnormal)).strip()
+    if not raw:
+        return '通常'
+    aliases = [
+        ('反妨', '反妨'), ('妨害', '反妨'), ('落車', '落車'), ('他落', '他落'),
+        ('故障', '故障'), ('反則', '反則'), ('不成立', '不成立'), ('欠車', '欠車'),
+        ('停止', '停止'), ('再試走', '再試走')
+    ]
+    for key, val in aliases:
+        if key in raw:
+            return val
+    return raw
+
+
+def parse_full_official_result(text):
+    if not _s(text):
+        raise ValueError('貼り付け内容が空です')
+    clean = text.replace('\r\n', '\n').replace('\r', '\n')
+    lap_rows, meta = parse_lap_paste(clean)
+
+    m = re.search(r'1着賞金\s*[\u3000 ]*([\d,]+)円', clean)
+    if m:
+        meta['first_prize_yen'] = int(m.group(1).replace(',', ''))
+
+    lines = [x.rstrip() for x in clean.split('\n')]
+    header_idx = None
+    for i, line in enumerate(lines):
+        compact = line.replace('\u3000', ' ').replace(' ', '')
+        if all(x in compact for x in ['着', '車', '選手名', '試走タイム', '競走タイム']):
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError('着順結果表の見出しが見つかりません')
+
+    results = []
+    for line in lines[header_idx + 1:]:
+        if 'グランドノート' in line or '周回・順位' in line:
+            break
+        if not line.strip():
+            continue
+        if '\t' in line:
+            parts = [x.strip() for x in line.replace('\u3000', ' ').split('\t')]
+            parts += [''] * max(0, 12 - len(parts))
+            finish, accident, car, name, age_term, lg, handicap, trial, race_t, st, abnormal, popularity = parts[:12]
+        else:
+            parts = _split_result_line(line)
+            if len(parts) < 9 or not re.fullmatch(r'\d+', parts[0]) or not re.fullmatch(r'\d+', parts[1]):
+                continue
+            finish, car = parts[0], parts[1]
+            name = parts[2]
+            age_term = parts[3] if len(parts) > 3 else ''
+            lg = parts[4] if len(parts) > 4 else ''
+            handicap = parts[5] if len(parts) > 5 else ''
+            trial = parts[6] if len(parts) > 6 else ''
+            race_t = parts[7] if len(parts) > 7 else ''
+            st = parts[8] if len(parts) > 8 else ''
+            popularity = parts[-1] if len(parts) > 9 and re.fullmatch(r'\d+', parts[-1]) else ''
+            accident = ''
+            abnormal = ''
+        if not re.fullmatch(r'\d+', _s(finish)) or not re.fullmatch(r'\d+', _s(car)):
+            continue
+        results.append({
+            '着順': int(finish), '事故': _s(accident), '車番': int(car), '選手名': _s(name),
+            '年齢期': _s(age_term), 'LG': _s(lg), 'ハンデ': _s(handicap),
+            '試走T': _num(trial), '競走T': _num(race_t), 'ST': _num(st),
+            '異常': _s(abnormal), '人気': _num(popularity),
+            '結果区分': _normalize_status(accident, abnormal)
+        })
+    if not results:
+        raise ValueError('選手結果を読み取れませんでした')
+    cars = sorted(r['車番'] for r in results)
+    if cars != list(range(1, len(results) + 1)):
+        raise ValueError(f'車番の読取結果が不正です: {cars}')
+    return meta, results, lap_rows
+
+
+def init_full_result_tables():
+    init_lap_tables()
+    with sqlite3.connect(DB_PATH) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS race_entries (
+            entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_id INTEGER NOT NULL,
+            car_no INTEGER NOT NULL,
+            player_id INTEGER,
+            finish INTEGER,
+            accident TEXT,
+            age_term TEXT,
+            lg TEXT,
+            handicap TEXT,
+            trial_time REAL,
+            race_time REAL,
+            start_time REAL,
+            abnormal TEXT,
+            popularity INTEGER,
+            result_status TEXT,
+            UNIQUE(race_id, car_no),
+            FOREIGN KEY(race_id) REFERENCES races(race_id),
+            FOREIGN KEY(player_id) REFERENCES players(player_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_race_entries_player ON race_entries(player_id);
+        """)
+
+
+def save_full_official_result(text, venue='', race_no='', source='公式結果全文貼付'):
+    init_full_result_tables()
+    meta, results, lap_rows = parse_full_official_result(text)
+    if _s(venue):
+        meta['venue'] = _s(venue)
+    if _s(race_no):
+        meta['race_no'] = _s(race_no)
+    mapping = {r['車番']: r['選手名'] for r in results}
+    race_id, features = save_lap_data(lap_rows, meta, mapping, source=source)
+
+    added_history = 0
+    skipped_history = 0
+    with sqlite3.connect(DB_PATH) as con:
+        for r in results:
+            pid = _ensure_player(con, r['選手名'])
+            con.execute("""INSERT INTO race_entries(
+                race_id,car_no,player_id,finish,accident,age_term,lg,handicap,
+                trial_time,race_time,start_time,abnormal,popularity,result_status)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(race_id,car_no) DO UPDATE SET
+                player_id=excluded.player_id,finish=excluded.finish,accident=excluded.accident,
+                age_term=excluded.age_term,lg=excluded.lg,handicap=excluded.handicap,
+                trial_time=excluded.trial_time,race_time=excluded.race_time,
+                start_time=excluded.start_time,abnormal=excluded.abnormal,
+                popularity=excluded.popularity,result_status=excluded.result_status""",
+                (race_id, r['車番'], pid, r['着順'], r['事故'], r['年齢期'], r['LG'], r['ハンデ'],
+                 r['試走T'], r['競走T'], r['ST'], r['異常'], r['人気'], r['結果区分']))
+
+    starters = len(results)
+    surface = meta.get('surface_condition', '')
+    for r in results:
+        row = {
+            '開催日': meta.get('race_date', ''), '開催場': meta.get('venue', ''),
+            'レース': meta.get('race_no') or meta.get('race_name', ''),
+            '着順': r['着順'], '出走': starters, '走路': surface, 'ハンデ': r['ハンデ'],
+            '試走T': r['試走T'], '競走T': r['競走T'], 'ST': r['ST'], '結果区分': r['結果区分']
+        }
+        a, s = add_history_rows(r['選手名'], [row], source)
+        added_history += a
+        skipped_history += s
+    return race_id, meta, results, features, added_history, skipped_history
+
+
+def full_result_summary(results, features):
+    rows = []
+    for r in sorted(results, key=lambda x: x['着順']):
+        f = features.get(r['車番'], {})
+        rows.append({
+            '着': r['着順'], '車': r['車番'], '選手名': r['選手名'], '結果区分': r['結果区分'],
+            '試走T': r['試走T'], '競走T': r['競走T'], 'ST': r['ST'], '人気': r['人気'],
+            '1周目': f.get('first_lap_pos'), '最終': f.get('final_pos'),
+            '純上昇': f.get('net_gain'), '前団率': f.get('front_pack_rate'),
+            '終盤上昇': f.get('late_gain'), '追抜き量': f.get('overtakes')
+        })
+    return pd.DataFrame(rows)
+
+
+init_full_result_tables()
+full_paste = widgets.Textarea(
+    value='',
+    placeholder='公式結果ページの「レース情報～着順表～グランドノート～周回順位」をまとめて貼り付け',
+    description='結果全文:',
+    layout=widgets.Layout(width='100%', height='520px'),
+    style={'description_width': '80px'}
+)
+full_venue = widgets.Text(description='開催場:', placeholder='本文に無い場合のみ 例：川口')
+full_race_no = widgets.Text(description='レース:', placeholder='本文に無い場合のみ 例：12R')
+full_save_btn = widgets.Button(description='結果・周回を一括DB登録', button_style='success', icon='database')
+full_out = widgets.Output()
+
+
+def on_save_full_result(_):
+    with full_out:
+        _hidden_clear_output()
+        try:
+            race_id, meta, results, features, a, s = save_full_official_result(
+                full_paste.value, full_venue.value, full_race_no.value
+            )
+            print(f'保存完了：race_id={race_id}')
+            print(f'選手履歴 新規追加={a} / 重複スキップ={s}')
+            if not meta.get('venue'):
+                print('注意：開催場が本文から取得できませんでした。開催場欄へ入力してください。')
+            if not meta.get('race_no'):
+                print('注意：レース番号が本文から取得できませんでした。レース欄へ入力してください。')
+            print('抽出したレース情報:', meta)
+            _hidden_display(full_result_summary(results, features))
+        except Exception as e:
+            print('エラー:', e)
+
+
+full_save_btn.on_click(on_save_full_result)
+_hidden_display(widgets.HTML(
+    '<h3>⑥ 公式結果ページ全文をそのまま貼り付け</h3>'
+    '<p>着順表と周回順位を一度に保存します。開催場・レース番号が本文に無い場合だけ補助欄へ入力してください。</p>'
+))
+_hidden_display(widgets.HBox([full_venue, full_race_no]), full_paste, full_save_btn, full_out)
+
+
+# ============================================================
+# Ver14.0 全結果再学習・設定変化表示
+# ============================================================
+import json, sqlite3, hashlib, math
+from datetime import datetime
+
+LEARN_FEATURES = {
+    "基礎能力": ["基礎履歴総合点", "基礎スピード点", "実戦能力点", "勝負強さ点"],
+    "スタート": ["スタート一気指数", "スタート伸び指数", "先行転換力", "同ハンデST優位度"],
+    "前団維持": ["隊列残存指数", "好位置維持指数", "前団主導指数", "安定上位指数"],
+    "追い上げ": ["混戦突破適性", "集団突破力", "後方追上げ指数"],
+    "終盤": ["終盤指数", "ゴール前伸び指数"],
+    "当日気配": ["当日状態指数", "自己比試走指数", "試走突出度", "爆発指数"],
+    "安定性": ["近況信頼度", "試走信頼度", "レース巧者指数"],
+}
+INITIAL_WEIGHTS = {
+    "基礎能力": 1.00, "スタート": 0.72, "前団維持": 0.68,
+    "追い上げ": 0.62, "終盤": 0.58, "当日気配": 0.74, "安定性": 0.55,
+}
+
+def init_learning_tables():
+    mount_and_init_db()
+    with sqlite3.connect(DB_PATH) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS prediction_races (
+            prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_key TEXT NOT NULL UNIQUE,
+            race_date TEXT, venue TEXT, race_no TEXT,
+            track_temp REAL, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS prediction_features (
+            prediction_id INTEGER NOT NULL,
+            car_no INTEGER NOT NULL,
+            player_name TEXT,
+            features_json TEXT NOT NULL,
+            PRIMARY KEY(prediction_id, car_no)
+        );
+        CREATE TABLE IF NOT EXISTS learning_settings (
+            setting_name TEXT PRIMARY KEY,
+            initial_value REAL NOT NULL,
+            current_value REAL NOT NULL,
+            updated_at TEXT,
+            sample_races INTEGER DEFAULT 0,
+            reason TEXT
+        );
+        CREATE TABLE IF NOT EXISTS learning_history (
+            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            learned_at TEXT, sample_races INTEGER,
+            old_score REAL, new_score REAL,
+            settings_json TEXT, changes_json TEXT
+        );
+        """)
+        for k,v in INITIAL_WEIGHTS.items():
+            con.execute("""INSERT OR IGNORE INTO learning_settings
+                (setting_name,initial_value,current_value,updated_at,sample_races,reason)
+                VALUES(?,?,?,?,?,?)""",(k,v,v,datetime.now().isoformat(timespec='seconds'),0,'初期設定'))
+        con.commit()
+
+def _race_key(date_text, venue, race_no):
+    d=re.sub(r'[^0-9]','',str(date_text))[:8]
+    r=re.sub(r'[^0-9]','',str(race_no))
+    return f"{d}_{str(venue).strip()}_{r}R"
+
+def _layer_value(row, cols):
+    vals=[]
+    for c in cols:
+        if c in row.index:
+            try:
+                x=float(row[c])
+                if np.isfinite(x): vals.append(x)
+            except: pass
+    return float(np.mean(vals)) if vals else 0.0
+
+def save_latest_prediction(date_text, venue, race_no):
+    init_learning_tables()
+    if 'LATEST_PREDICTION_DF' not in globals():
+        raise RuntimeError('先に予測セルで計算してください。')
+    df=LATEST_PREDICTION_DF.copy()
+    key=_race_key(date_text,venue,race_no)
+    now=datetime.now().isoformat(timespec='seconds')
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""INSERT INTO prediction_races(race_key,race_date,venue,race_no,track_temp,created_at)
+          VALUES(?,?,?,?,?,?) ON CONFLICT(race_key) DO UPDATE SET
+          track_temp=excluded.track_temp,created_at=excluded.created_at""",
+          (key,str(date_text),str(venue),str(race_no),float(globals().get('LATEST_TRACK_TEMP',np.nan)),now))
+        pid=con.execute('SELECT prediction_id FROM prediction_races WHERE race_key=?',(key,)).fetchone()[0]
+        con.execute('DELETE FROM prediction_features WHERE prediction_id=?',(pid,))
+        for _,row in df.iterrows():
+            car=int(float(row.get('車',row.get('車番',0))))
+            feats={layer:_layer_value(row,cols) for layer,cols in LEARN_FEATURES.items()}
+            # race内標準化は学習時に実施
+            con.execute('INSERT INTO prediction_features VALUES(?,?,?,?)',
+                        (pid,car,str(row.get('選手名','')),json.dumps(feats,ensure_ascii=False)))
+        con.commit()
+    return key,len(df)
+
+def _load_training():
+    init_learning_tables()
+    with sqlite3.connect(DB_PATH) as con:
+        prs=pd.read_sql_query('SELECT * FROM prediction_races',con)
+        pfs=pd.read_sql_query('SELECT * FROM prediction_features',con)
+        # Ver13.2 races/results schemaに合わせ、存在列を確認
+        tables={x[0] for x in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'race_results' in tables:
+            res=pd.read_sql_query('SELECT * FROM race_results',con)
+        elif 'results' in tables:
+            res=pd.read_sql_query('SELECT * FROM results',con)
+        else:
+            return []
+        races=pd.read_sql_query('SELECT * FROM races',con) if 'races' in tables else pd.DataFrame()
+    datasets=[]
+    for _,pr in prs.iterrows():
+        sub=pfs[pfs.prediction_id==pr.prediction_id].copy()
+        if sub.empty: continue
+        # race_key直接または日付/場/Rで結果レースを照合
+        rid=None
+        if not races.empty and 'race_key' in races.columns:
+            m=races[races.race_key.astype(str)==str(pr.race_key)]
+            if not m.empty: rid=m.iloc[0].get('race_id')
+        if rid is None and not races.empty:
+            m=races[(races.get('race_date','').astype(str)==str(pr.race_date)) &
+                    (races.get('venue','').astype(str)==str(pr.venue))]
+            if 'race_no' in races.columns:
+                m=m[m.race_no.astype(str).str.replace('R','',regex=False)==str(pr.race_no).replace('R','')]
+            if not m.empty: rid=m.iloc[0].get('race_id')
+        if rid is None: continue
+        rr=res[res.race_id==rid].copy() if 'race_id' in res.columns else pd.DataFrame()
+        if rr.empty: continue
+        carcol='car_no' if 'car_no' in rr.columns else ('車' if '車' in rr.columns else None)
+        rankcol='finish_rank' if 'finish_rank' in rr.columns else ('着順' if '着順' in rr.columns else None)
+        statuscol='result_status' if 'result_status' in rr.columns else None
+        if not carcol or not rankcol: continue
+        merged=sub.merge(rr[[carcol,rankcol]+([statuscol] if statuscol else [])],left_on='car_no',right_on=carcol)
+        if statuscol:
+            bad='反妨|落車|故障|反則|他落|不成立'
+            merged=merged[~merged[statuscol].fillna('').astype(str).str.contains(bad,regex=True)]
+        merged[rankcol]=pd.to_numeric(merged[rankcol],errors='coerce')
+        merged=merged.dropna(subset=[rankcol])
+        if len(merged)>=5:
+            datasets.append((str(pr.race_key),merged,rankcol))
+    return datasets
+
+def _matrix_for_race(df):
+    raw=np.array([[json.loads(x).get(k,0.0) for k in INITIAL_WEIGHTS] for x in df.features_json],float)
+    mu=np.nanmean(raw,axis=0); sd=np.nanstd(raw,axis=0)
+    sd=np.where(sd<1e-8,1.0,sd)
+    return np.nan_to_num((raw-mu)/sd)
+
+def _loss(weights,datasets,reg_strength):
+    w=np.array([weights[k] for k in INITIAL_WEIGHTS],float)
+    losses=[]
+    for _,df,rankcol in datasets:
+        X=_matrix_for_race(df); score=X@w
+        ranks=df[rankcol].to_numpy(float)
+        # 全ペア順位logloss
+        for i in range(len(df)):
+            for j in range(i+1,len(df)):
+                if ranks[i]==ranks[j]: continue
+                y=1.0 if ranks[i]<ranks[j] else 0.0
+                z=np.clip(score[i]-score[j],-20,20)
+                p=1/(1+np.exp(-z))
+                losses.append(-(y*np.log(p+1e-12)+(1-y)*np.log(1-p+1e-12)))
+    base=np.mean(losses) if losses else 99.0
+    initial=np.array(list(INITIAL_WEIGHTS.values()))
+    return float(base + reg_strength*np.mean((w-initial)**2))
+
+def learn_best_weights(search_rounds=3500,seed=42):
+    datasets=_load_training()
+    n=len(datasets)
+    if n<3:
+        raise RuntimeError(f'学習可能な予測＋結果が{n}レースです。最低3レース蓄積してください。')
+    init_learning_tables()
+    with sqlite3.connect(DB_PATH) as con:
+        cur={r[0]:float(r[1]) for r in con.execute('SELECT setting_name,current_value FROM learning_settings')}
+    # 少数時は初期値へ強く寄せる
+    reg=max(0.015,0.30/(n**0.65))
+    rng=np.random.default_rng(seed)
+    best=dict(cur); best_loss=_loss(best,datasets,reg)
+    old_loss=best_loss
+    scales=np.array([0.42,0.35,0.38,0.38,0.34,0.40,0.30])
+    centers=np.array([cur[k] for k in INITIAL_WEIGHTS])
+    for t in range(int(search_rounds)):
+        shrink=0.25+0.75*(1-t/max(search_rounds,1))
+        cand_arr=centers+rng.normal(0,scales*shrink)
+        cand_arr=np.clip(cand_arr,0.05,1.80)
+        cand={k:float(v) for k,v in zip(INITIAL_WEIGHTS,cand_arr)}
+        loss=_loss(cand,datasets,reg)
+        if loss<best_loss:
+            best,best_loss=cand,loss
+            centers=cand_arr
+    now=datetime.now().isoformat(timespec='seconds')
+    changes={k:best[k]-cur[k] for k in best}
+    with sqlite3.connect(DB_PATH) as con:
+        for k,v in best.items():
+            con.execute('UPDATE learning_settings SET current_value=?,updated_at=?,sample_races=?,reason=? WHERE setting_name=?',
+                        (v,now,n,'全登録レースの順位ペア誤差を最小化',k))
+        con.execute('INSERT INTO learning_history(learned_at,sample_races,old_score,new_score,settings_json,changes_json) VALUES(?,?,?,?,?,?)',
+                    (now,n,old_loss,best_loss,json.dumps(best,ensure_ascii=False),json.dumps(changes,ensure_ascii=False)))
+        con.commit()
+    return settings_table(),old_loss,best_loss,n
+
+def settings_table():
+    init_learning_tables()
+    with sqlite3.connect(DB_PATH) as con:
+        df=pd.read_sql_query('SELECT setting_name AS 設定,initial_value AS 初期値,current_value AS 現在値,updated_at AS 最終更新,sample_races AS 採用レース数,reason AS 変更理由 FROM learning_settings ORDER BY rowid',con)
+    df['変化量']=df['現在値']-df['初期値']
+    df['変化率%']=np.where(df['初期値']!=0,df['変化量']/df['初期値']*100,0)
+    df['方向']=np.where(df['変化量']>0.005,'↑ 強化',np.where(df['変化量']<-0.005,'↓ 弱化','→ ほぼ同じ'))
+    return df[['設定','初期値','現在値','変化量','変化率%','方向','採用レース数','最終更新','変更理由']]
+
+def learning_history_table(limit=20):
+    init_learning_tables()
+    with sqlite3.connect(DB_PATH) as con:
+        return pd.read_sql_query('SELECT learned_at AS 学習日時,sample_races AS レース数,old_score AS 更新前誤差,new_score AS 更新後誤差,changes_json AS 変更内容 FROM learning_history ORDER BY history_id DESC LIMIT ?',con,params=(int(limit),))
+
+def reset_weights_to_initial():
+    init_learning_tables(); now=datetime.now().isoformat(timespec='seconds')
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute('UPDATE learning_settings SET current_value=initial_value,updated_at=?,sample_races=0,reason=?',(now,'初期設定へ手動復元'))
+        con.commit()
+    return settings_table()
+
+# UI
+v14_date=widgets.Text(description='開催日',placeholder='2026/07/20')
+v14_venue=widgets.Text(description='開催場',placeholder='川口')
+v14_race=widgets.Text(description='レース',placeholder='12')
+v14_save=widgets.Button(description='最新予測をDB保存',button_style='info')
+v14_learn=widgets.Button(description='全結果から重み再学習',button_style='success')
+v14_show=widgets.Button(description='初期値との差を表示')
+v14_history=widgets.Button(description='学習履歴を表示')
+v14_reset=widgets.Button(description='初期設定へ戻す',button_style='warning')
+v14_out=widgets.Output()
+
+def _v14_save(_):
+    with v14_out:
+        _hidden_clear_output()
+        try:
+            key,n=save_latest_prediction(v14_date.value,v14_venue.value,v14_race.value)
+            print(f'保存完了: {key} / {n}選手')
+            print('レース結果を全文登録した後、「全結果から重み再学習」を押してください。')
+        except Exception as e: print('エラー:',e)
+def _v14_learn(_):
+    with v14_out:
+        _hidden_clear_output()
+        try:
+            df,a,b,n=learn_best_weights()
+            print(f'{n}レースを使って再学習しました。誤差 {a:.4f} → {b:.4f}')
+            _hidden_display(df.style.format({'初期値':'{:.3f}','現在値':'{:.3f}','変化量':'{:+.3f}','変化率%':'{:+.1f}%'}))
+        except Exception as e: print('エラー:',e)
+def _v14_show(_):
+    with v14_out:
+        _hidden_clear_output(); _hidden_display(settings_table().style.format({'初期値':'{:.3f}','現在値':'{:.3f}','変化量':'{:+.3f}','変化率%':'{:+.1f}%'}))
+def _v14_hist(_):
+    with v14_out:
+        _hidden_clear_output(); _hidden_display(learning_history_table())
+def _v14_reset(_):
+    with v14_out:
+        _hidden_clear_output(); print('初期設定へ戻しました。'); _hidden_display(reset_weights_to_initial())
+v14_save.on_click(_v14_save); v14_learn.on_click(_v14_learn); v14_show.on_click(_v14_show); v14_history.on_click(_v14_hist); v14_reset.on_click(_v14_reset)
+_hidden_display(widgets.VBox([
+    widgets.HTML('<b>Ver14.0 全履歴再学習</b><br>予測直後に開催情報を入力して保存し、結果全文登録後に再学習します。'),
+    widgets.HBox([v14_date,v14_venue,v14_race]),
+    widgets.HBox([v14_save,v14_learn,v14_show,v14_history,v14_reset]),v14_out
+]))
+
+# ============================================================
+# Ver14.1 条件依存特徴・選手別適用
+# ============================================================
+import re, sqlite3, json, math
+from datetime import datetime
+
+CONDITION_DEFAULTS = {
+    'min_condition_races': 5,
+    'min_other_races': 8,
+    'min_total_races': 14,
+    'min_effect': 0.11,
+    'min_confidence': 0.72,
+    'max_adjustment': 0.38,
+    'shrink_k': 8.0,
+}
+
+
+def init_condition_tables():
+    mount_and_init_db()
+    with sqlite3.connect(DB_PATH) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS player_condition_profiles (
+            player_id INTEGER NOT NULL,
+            condition_type TEXT NOT NULL,
+            condition_value TEXT NOT NULL,
+            sample_condition INTEGER NOT NULL,
+            sample_other INTEGER NOT NULL,
+            score_condition REAL,
+            score_other REAL,
+            raw_effect REAL,
+            shrunk_effect REAL,
+            confidence REAL,
+            adjustment REAL,
+            is_active INTEGER NOT NULL DEFAULT 0,
+            calculated_at TEXT,
+            PRIMARY KEY(player_id, condition_type, condition_value)
+        );
+        CREATE TABLE IF NOT EXISTS condition_learning_history (
+            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            calculated_at TEXT,
+            player_count INTEGER,
+            active_profile_count INTEGER,
+            settings_json TEXT
+        );
+        """)
+        # 既存prediction_racesを条件保存対応へ拡張
+        cols={r[1] for r in con.execute('PRAGMA table_info(prediction_races)')}
+        additions={
+            'start_time_text':'TEXT','air_temp':'REAL','humidity':'REAL',
+            'weather':'TEXT','surface_condition':'TEXT','distance_m':'INTEGER',
+            'total_laps':'INTEGER','handicap_pattern':'TEXT'
+        }
+        for name,typ in additions.items():
+            if name not in cols:
+                con.execute(f'ALTER TABLE prediction_races ADD COLUMN {name} {typ}')
+        con.commit()
+
+
+def _num(x):
+    try:
+        v=float(x)
+        return v if np.isfinite(v) else np.nan
+    except Exception:
+        return np.nan
+
+
+def _time_band(text):
+    m=re.search(r'(\d{1,2}):(\d{2})',str(text or ''))
+    if not m: return '時間不明'
+    h=int(m.group(1))
+    if h < 15: return '昼'
+    if h < 18: return '夕方'
+    return '夜'
+
+
+def _temp_band(x, kind='走路'):
+    x=_num(x)
+    if not np.isfinite(x): return f'{kind}不明'
+    if kind=='走路':
+        if x < 20: return '低温(<20℃)'
+        if x < 35: return '中温(20-34℃)'
+        if x < 45: return '高温(35-44℃)'
+        return '酷熱(45℃以上)'
+    if x < 15: return '低温(<15℃)'
+    if x < 28: return '中温(15-27℃)'
+    return '高温(28℃以上)'
+
+
+def _humidity_band(x):
+    x=_num(x)
+    if not np.isfinite(x): return '湿度不明'
+    if x < 45: return '低湿度(<45%)'
+    if x < 70: return '中湿度(45-69%)'
+    return '高湿度(70%以上)'
+
+
+def _handicap_num(x):
+    m=re.search(r'-?\d+',str(x or ''))
+    return int(m.group()) if m else None
+
+
+def _handicap_band(x):
+    n=_handicap_num(x)
+    if n is None: return 'ハンデ不明'
+    if n <= 0: return '0m'
+    if n <= 10: return '10m以内'
+    if n <= 20: return '20m以内'
+    return '30m以上'
+
+
+def _surface_group(x):
+    s=str(x or '').strip()
+    if not s: return '走路不明'
+    if '良' in s: return '良走路'
+    if '湿' in s or '濡' in s: return '湿走路'
+    if '斑' in s: return '斑走路'
+    return s
+
+
+def _distance_band(x):
+    x=_num(x)
+    if not np.isfinite(x): return '距離不明'
+    if x <= 3100: return '通常距離(3100m以下)'
+    if x <= 4100: return '長距離(3101-4100m)'
+    return '超長距離(4100m超)'
+
+
+def _performance_score(rank, field_size):
+    rank=_num(rank); field_size=_num(field_size)
+    if not np.isfinite(rank) or not np.isfinite(field_size) or field_size <= 1: return np.nan
+    return float(np.clip((field_size-rank)/(field_size-1),0,1))
+
+
+def _load_condition_rows():
+    init_condition_tables()
+    with sqlite3.connect(DB_PATH) as con:
+        tables={r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {'races','race_entries','players'}.issubset(tables):
+            return pd.DataFrame()
+        q="""
+        SELECT e.race_id,e.player_id,p.player_name,e.car_no,e.finish,e.result_status,
+               e.handicap,e.trial_time,e.race_time,e.start_time,
+               r.race_date,r.venue,r.race_no,r.race_name,r.distance_m,r.total_laps,
+               r.weather,r.surface_condition,r.track_temp,r.air_temp,r.humidity,r.start_time_text
+        FROM race_entries e
+        JOIN races r ON r.race_id=e.race_id
+        LEFT JOIN players p ON p.player_id=e.player_id
+        """
+        df=pd.read_sql_query(q,con)
+    if df.empty: return df
+    bad='反妨|落車|故障|反則|他落|不成立'
+    df=df[~df['result_status'].fillna('').astype(str).str.contains(bad,regex=True)].copy()
+    df['finish']=pd.to_numeric(df['finish'],errors='coerce')
+    df=df.dropna(subset=['player_id','finish'])
+    sizes=df.groupby('race_id')['car_no'].transform('count')
+    df['field_size']=sizes
+    df['performance']=[_performance_score(a,b) for a,b in zip(df.finish,df.field_size)]
+    # 同レース内ハンデ構成
+    def dense_line(g):
+        hs=g['handicap'].map(_handicap_num)
+        counts=hs.value_counts(dropna=True)
+        return '同ハンデ多数' if (not counts.empty and counts.max()>=5) else '通常ハンデ構成'
+    patterns={rid:dense_line(g) for rid,g in df.groupby('race_id')}
+    df['handicap_pattern']=df['race_id'].map(patterns).fillna('通常ハンデ構成')
+    df['時間帯']=df['start_time_text'].map(_time_band)
+    df['走路温度帯']=df['track_temp'].map(lambda x:_temp_band(x,'走路'))
+    df['気温帯']=df['air_temp'].map(lambda x:_temp_band(x,'気温'))
+    df['湿度帯']=df['humidity'].map(_humidity_band)
+    df['走路状態']=df['surface_condition'].map(_surface_group)
+    df['天候条件']=df['weather'].fillna('天候不明').astype(str).str.strip().replace('','天候不明')
+    df['開催場条件']=df['venue'].fillna('開催場不明').astype(str)
+    df['ハンデ帯']=df['handicap'].map(_handicap_band)
+    df['ハンデ構成']=df['handicap_pattern']
+    df['距離帯']=df['distance_m'].map(_distance_band)
+    return df
+
+
+CONDITION_COLUMNS=['時間帯','走路温度帯','気温帯','湿度帯','走路状態','天候条件','開催場条件','ハンデ帯','ハンデ構成','距離帯']
+
+
+def _confidence_from_effect(a,b,effect):
+    # Welch型の標準誤差から、0.5～0.99の扱いやすい信頼度へ変換
+    na,nb=len(a),len(b)
+    if na<2 or nb<2: return 0.0
+    se=math.sqrt(float(np.var(a,ddof=1))/na + float(np.var(b,ddof=1))/nb + 1e-12)
+    z=abs(effect)/se if se>0 else 0.0
+    return float(np.clip(0.5 + 0.49*(1-math.exp(-0.55*z)),0,0.99))
+
+
+def rebuild_player_condition_profiles(settings=None):
+    cfg=dict(CONDITION_DEFAULTS)
+    if settings: cfg.update(settings)
+    df=_load_condition_rows()
+    if df.empty:
+        raise RuntimeError('公式結果データがまだありません。')
+    now=datetime.now().isoformat(timespec='seconds')
+    records=[]
+    for pid,g in df.groupby('player_id'):
+        if len(g)<cfg['min_total_races']: continue
+        for ctype in CONDITION_COLUMNS:
+            for cval,cg in g.groupby(ctype):
+                other=g[g[ctype]!=cval]
+                if len(cg)<cfg['min_condition_races'] or len(other)<cfg['min_other_races']: continue
+                a=cg.performance.dropna().to_numpy(float); b=other.performance.dropna().to_numpy(float)
+                if len(a)<cfg['min_condition_races'] or len(b)<cfg['min_other_races']: continue
+                ma=float(np.mean(a)); mb=float(np.mean(b)); raw=ma-mb
+                shrink=len(a)/(len(a)+cfg['shrink_k'])
+                shrunk=raw*shrink
+                conf=_confidence_from_effect(a,b,raw)
+                active=(abs(shrunk)>=cfg['min_effect'] and conf>=cfg['min_confidence'])
+                adj=float(np.clip(shrunk*1.8,-cfg['max_adjustment'],cfg['max_adjustment'])) if active else 0.0
+                records.append((int(pid),ctype,str(cval),len(a),len(b),ma,mb,raw,shrunk,conf,adj,int(active),now))
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute('DELETE FROM player_condition_profiles')
+        con.executemany("""INSERT INTO player_condition_profiles(
+            player_id,condition_type,condition_value,sample_condition,sample_other,
+            score_condition,score_other,raw_effect,shrunk_effect,confidence,
+            adjustment,is_active,calculated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",records)
+        active=sum(r[11] for r in records)
+        con.execute('INSERT INTO condition_learning_history(calculated_at,player_count,active_profile_count,settings_json) VALUES(?,?,?,?)',
+                    (now,int(df.player_id.nunique()),int(active),json.dumps(cfg,ensure_ascii=False)))
+        con.commit()
+    return condition_profile_table(active_only=True),len(records),sum(r[11] for r in records)
+
+
+def condition_profile_table(player_name='',active_only=True):
+    init_condition_tables()
+    where=[]; params=[]
+    if active_only: where.append('c.is_active=1')
+    if str(player_name).strip():
+        where.append('p.player_name LIKE ?'); params.append('%'+str(player_name).strip()+'%')
+    sql="""SELECT p.player_name AS 選手名,c.condition_type AS 条件種類,c.condition_value AS 条件,
+           c.sample_condition AS 条件内件数,c.sample_other AS 比較件数,
+           c.score_condition AS 条件内成績,c.score_other AS その他成績,
+           c.shrunk_effect AS 補正前効果,c.confidence AS 信頼度,
+           c.adjustment AS 予測補正,
+           CASE WHEN c.adjustment>0 THEN '得意' ELSE '不得意' END AS 判定,
+           c.calculated_at AS 算出日時
+           FROM player_condition_profiles c LEFT JOIN players p ON p.player_id=c.player_id"""
+    if where: sql+=' WHERE '+' AND '.join(where)
+    sql+=' ORDER BY ABS(c.adjustment) DESC,c.sample_condition DESC'
+    with sqlite3.connect(DB_PATH) as con:
+        return pd.read_sql_query(sql,con,params=params)
+
+
+def _current_condition_map(meta):
+    return {
+        '時間帯':_time_band(meta.get('start_time_text','')),
+        '走路温度帯':_temp_band(meta.get('track_temp'),'走路'),
+        '気温帯':_temp_band(meta.get('air_temp'),'気温'),
+        '湿度帯':_humidity_band(meta.get('humidity')),
+        '走路状態':_surface_group(meta.get('surface_condition')),
+        '天候条件':str(meta.get('weather') or '天候不明').strip(),
+        '開催場条件':str(meta.get('venue') or '開催場不明').strip(),
+        'ハンデ構成':str(meta.get('handicap_pattern') or '通常ハンデ構成'),
+        '距離帯':_distance_band(meta.get('distance_m')),
+    }
+
+
+def apply_condition_profiles(pred_df,meta):
+    init_condition_tables()
+    out=pred_df.copy()
+    name_col='選手名' if '選手名' in out.columns else None
+    if not name_col: raise ValueError('予測表に選手名列がありません。')
+    cmap=_current_condition_map(meta)
+    with sqlite3.connect(DB_PATH) as con:
+        prof=pd.read_sql_query("""SELECT p.player_name,c.* FROM player_condition_profiles c
+          JOIN players p ON p.player_id=c.player_id WHERE c.is_active=1""",con)
+    adjustments=[]; reasons=[]
+    for _,row in out.iterrows():
+        name=str(row[name_col]).strip(); ps=prof[prof.player_name.astype(str).str.strip()==name]
+        total=0.0; rs=[]
+        # 個人ハンデ帯も現在行から判定
+        local=dict(cmap); local['ハンデ帯']=_handicap_band(row.get('ハンデ',row.get('ハンデm','')))
+        for ctype,cval in local.items():
+            m=ps[(ps.condition_type==ctype)&(ps.condition_value.astype(str)==str(cval))]
+            if m.empty: continue
+            r=m.iloc[0]; a=float(r.adjustment)
+            total+=a
+            rs.append(f"{ctype}:{cval} {a:+.3f}(n={int(r.sample_condition)},信頼{float(r.confidence):.0%})")
+        total=float(np.clip(total,-0.55,0.55))
+        adjustments.append(total); reasons.append(' / '.join(rs) if rs else '適用なし')
+    out['条件依存補正']=adjustments
+    out['条件補正理由']=reasons
+    # 総合点系があれば表示用に反映。元列は残す
+    target=next((c for c in ['総合点','AI総合点','予測スコア'] if c in out.columns),None)
+    if target:
+        out['条件補正後'+target]=pd.to_numeric(out[target],errors='coerce').fillna(0)+out['条件依存補正']
+    return out
+
+
+def apply_conditions_to_latest_prediction(meta):
+    global LATEST_PREDICTION_DF
+    if 'LATEST_PREDICTION_DF' not in globals():
+        raise RuntimeError('先に予測を実行してください。')
+    LATEST_PREDICTION_DF=apply_condition_profiles(LATEST_PREDICTION_DF,meta)
+    return LATEST_PREDICTION_DF
+
+# UI
+v141_time=widgets.Text(description='発走時刻',placeholder='20:45')
+v141_track=widgets.FloatText(description='走路温度',value=0.0)
+v141_air=widgets.FloatText(description='気温',value=0.0)
+v141_hum=widgets.FloatText(description='湿度',value=0.0)
+v141_weather=widgets.Text(description='天候',placeholder='晴')
+v141_surface=widgets.Text(description='走路',placeholder='良走路')
+v141_venue=widgets.Text(description='開催場',placeholder='川口')
+v141_distance=widgets.IntText(description='距離m',value=3100)
+v141_pattern=widgets.Dropdown(description='ハンデ構成',options=['通常ハンデ構成','同ハンデ多数'])
+v141_rebuild=widgets.Button(description='全結果から条件特徴を再分析',button_style='success')
+v141_apply=widgets.Button(description='今回予測へ条件補正を適用',button_style='info')
+v141_show=widgets.Button(description='有効な条件特徴を表示')
+v141_player=widgets.Text(description='選手検索',placeholder='空欄なら全員')
+v141_out=widgets.Output()
+
+def _v141_meta():
+    return {'start_time_text':v141_time.value,'track_temp':v141_track.value or np.nan,
+            'air_temp':v141_air.value or np.nan,'humidity':v141_hum.value or np.nan,
+            'weather':v141_weather.value,'surface_condition':v141_surface.value,
+            'venue':v141_venue.value,'distance_m':v141_distance.value,
+            'handicap_pattern':v141_pattern.value}
+
+def _v141_rebuild(_):
+    with v141_out:
+        _hidden_clear_output()
+        try:
+            df,n,a=rebuild_player_condition_profiles()
+            print(f'条件候補 {n}件を検証し、信頼条件を満たす特徴 {a}件を有効化しました。')
+            if df.empty: print('まだ有効な条件特徴はありません。結果件数を蓄積してください。')
+            else: _hidden_display(df.style.format({'条件内成績':'{:.3f}','その他成績':'{:.3f}','補正前効果':'{:+.3f}','信頼度':'{:.1%}','予測補正':'{:+.3f}'}))
+        except Exception as e: print('エラー:',e)
+
+def _v141_apply(_):
+    with v141_out:
+        _hidden_clear_output()
+        try:
+            df=apply_conditions_to_latest_prediction(_v141_meta())
+            cols=[c for c in ['車','車番','選手名','条件依存補正','条件補正理由','条件補正後総合点','条件補正後AI総合点','条件補正後予測スコア'] if c in df.columns]
+            _hidden_display(df[cols] if cols else df)
+        except Exception as e: print('エラー:',e)
+
+def _v141_show(_):
+    with v141_out:
+        _hidden_clear_output()
+        df=condition_profile_table(v141_player.value,True)
+        if df.empty: print('該当する有効特徴はありません。')
+        else: _hidden_display(df.style.format({'条件内成績':'{:.3f}','その他成績':'{:.3f}','補正前効果':'{:+.3f}','信頼度':'{:.1%}','予測補正':'{:+.3f}'}))
+
+v141_rebuild.on_click(_v141_rebuild)
+v141_apply.on_click(_v141_apply)
+v141_show.on_click(_v141_show)
+_hidden_display(widgets.VBox([
+    widgets.HTML('<b>Ver14.1 選手別・条件依存特徴</b><br>特定条件で差が繰り返し確認できた選手だけ補正します。'),
+    widgets.HBox([v141_time,v141_venue,v141_distance]),
+    widgets.HBox([v141_track,v141_air,v141_hum]),
+    widgets.HBox([v141_weather,v141_surface,v141_pattern]),
+    widgets.HBox([v141_rebuild,v141_apply]),
+    widgets.HBox([v141_player,v141_show]),v141_out
+]))
+
+# ============================================================
+# AutoRaceAI Ver15.0
+# スマホ全文コピペ予測・選手履歴追加・結果登録
+# ============================================================
+
+import re
+import json
+import math
+import sqlite3
+import hashlib
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+class _WidgetDummy:
+    def __init__(self, *args, **kwargs):
+        self.value = kwargs.get("value", None)
+        self.children = kwargs.get("children", [])
+    def __getattr__(self, name):
+        return _WidgetDummy()
+    def __call__(self, *args, **kwargs):
+        return _WidgetDummy(*args, **kwargs)
+    def on_click(self, *args, **kwargs): return None
+    def observe(self, *args, **kwargs): return None
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+class _WidgetsDummy:
+    def __getattr__(self, name): return _WidgetDummy
+widgets = _WidgetsDummy()
+def display(*args, **kwargs): return None
+def clear_output(*args, **kwargs): return None
+
+HTML = lambda x=None, *args, **kwargs: x
+
+# Ver14.1までのDB_PATHを優先して利用します。
+if "DB_PATH" not in globals():
+    DB_DIR = Path(os.environ.get('AUTORACEAI_DATA_DIR', str(Path(__file__).resolve().parent / 'data')))
+DB_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = str(DB_DIR / "autorace_players.sqlite3")
+
+V15_STATE = {
+    "race_meta": {},
+    "entries": pd.DataFrame(),
+    "player_history": pd.DataFrame(),
+    "raw_prediction_text": "",
+    "raw_player_text": "",
+    "raw_result_text": "",
+}
+
+V15_ENTRY_COLUMNS = [
+    "車番", "選手名", "ハンデ", "試走T", "ST", "年齢", "級別", "期別"
+]
+
+V15_HISTORY_COLUMNS = [
+    "開催日", "開催場", "レース", "着順", "出走", "走路",
+    "ハンデ", "試走T", "競走T", "ST"
+]
+
+
+# ------------------------------
+# 共通ユーティリティ
+# ------------------------------
+def v15_clean_text(text):
+    text = str(text or "")
+    text = text.replace("\u3000", " ").replace("\xa0", " ")
+    text = text.replace("℃", "℃ ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\r\n?", "\n", text)
+    return text.strip()
+
+
+def v15_float(value):
+    if value is None:
+        return np.nan
+    m = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+    return float(m.group()) if m else np.nan
+
+
+def v15_int(value):
+    x = v15_float(value)
+    return int(x) if pd.notna(x) else None
+
+
+def v15_normalize_name(name):
+    name = str(name or "").strip()
+    name = re.sub(r"\s+", " ", name)
+    name = re.sub(r"^[0-9]+\s*", "", name)
+    return name
+
+
+def v15_hash(*parts):
+    joined = "|".join("" if p is None else str(p).strip() for p in parts)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:24]
+
+
+def v15_table_exists(con, table):
+    row = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table,)
+    ).fetchone()
+    return row is not None
+
+
+def v15_columns(con, table):
+    if not v15_table_exists(con, table):
+        return []
+    return [r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def v15_first_match(patterns, text, flags=0):
+    for pattern in patterns:
+        m = re.search(pattern, text, flags)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+# ------------------------------
+# レース情報解析
+# ------------------------------
+def v15_parse_race_meta(text):
+    text = v15_clean_text(text)
+    compact = re.sub(r"\s+", " ", text)
+
+    date_raw = v15_first_match([
+        r"((?:20)?\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日",
+    ], compact)
+
+    # 上のfirst_matchでは複数groupを扱えないため、日付のみ個別処理
+    date_iso = None
+    dm = re.search(r"((?:20)?\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", compact)
+    if dm:
+        y = int(dm.group(1))
+        if y < 100:
+            y += 2000
+        date_iso = f"{y:04d}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}"
+    else:
+        dm = re.search(r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})", compact)
+        if dm:
+            date_iso = f"{int(dm.group(1)):04d}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}"
+
+    distance = v15_int(v15_first_match([
+        r"(\d{4})\s*m",
+        r"距離[:：]?\s*(\d{4})",
+    ], compact, re.I))
+
+    laps = v15_int(v15_first_match([
+        r"\((\d+)\s*周\)",
+        r"(\d+)\s*周",
+    ], compact))
+
+    start_time = v15_first_match([
+        r"発走(?:予定)?時間\s*[:：]?\s*(\d{1,2}:\d{2})",
+        r"発走\s*[:：]?\s*(\d{1,2}:\d{2})",
+    ], compact)
+
+    weather = v15_first_match([
+        r"天候\s*[:：]\s*([^\s　]+)",
+    ], compact)
+
+    surface = v15_first_match([
+        r"走路状況\s*[:：]\s*([^\s　]+)",
+        r"走路状態\s*[:：]\s*([^\s　]+)",
+    ], compact)
+
+    track_temp = v15_float(v15_first_match([
+        r"走路温度\s*[:：]\s*(-?\d+(?:\.\d+)?)",
+    ], compact))
+
+    air_temp = v15_float(v15_first_match([
+        r"(?<!走路)気温\s*[:：]\s*(-?\d+(?:\.\d+)?)",
+    ], compact))
+
+    humidity = v15_float(v15_first_match([
+        r"湿度\s*[:：]\s*(\d+(?:\.\d+)?)",
+    ], compact))
+
+    race_no = v15_int(v15_first_match([
+        r"(?:第\s*)?(\d{1,2})\s*R",
+        r"レース番号\s*[:：]?\s*(\d{1,2})",
+    ], compact, re.I))
+
+    venue = v15_first_match([
+        r"(川口|伊勢崎|浜松|山陽|飯塚)\s*(?:オート|走路|開催)?",
+        r"開催場\s*[:：]?\s*([^\s　]+)",
+    ], compact)
+
+    race_type = None
+    race_type_candidates = [
+        "SG優勝戦", "G1優勝戦", "G2優勝戦", "優勝戦",
+        "準決勝戦", "準決勝", "選抜戦", "特別選抜戦",
+        "一般戦", "予選", "最終予選", "二次予選", "一次予選"
+    ]
+    for label in race_type_candidates:
+        if label in compact:
+            race_type = label
+            break
+
+    race_title = None
+    title_match = re.search(
+        r"((?:一般戦|準決勝戦?|優勝戦|選抜戦|特別選抜戦|予選)[^0-9\n]{0,20})\s*(\d{4})\s*m",
+        compact
+    )
+    if title_match:
+        race_title = title_match.group(1).strip()
+
+    prize = v15_int(v15_first_match([
+        r"1着賞金\s*([\d,]+)\s*円",
+    ], compact))
+
+    time_band = None
+    if start_time:
+        hour = int(start_time.split(":")[0])
+        if hour < 16:
+            time_band = "昼"
+        elif hour < 18:
+            time_band = "夕方"
+        else:
+            time_band = "夜"
+
+    meta = {
+        "開催日": date_iso,
+        "開催場": venue,
+        "レース": race_no,
+        "レース名": race_title or race_type,
+        "レース種別": race_type,
+        "距離": distance,
+        "周回数": laps,
+        "発走時刻": start_time,
+        "時間帯": time_band,
+        "天候": weather,
+        "走路状態": surface,
+        "走路温度": track_temp,
+        "気温": air_temp,
+        "湿度": humidity,
+        "1着賞金": prize,
+    }
+    return meta
+
+
+# ------------------------------
+# 出走表解析
+# ------------------------------
+def v15_parse_entry_line(line):
+    line = v15_clean_text(line)
+    if not line:
+        return None
+
+    # タブ区切りを優先
+    parts = [p.strip() for p in re.split(r"\t+| {2,}", line) if p.strip()]
+    first = re.match(r"^\s*([1-8])(?:\s+|[　\t])", line)
+    if not first:
+        # コピー時に車番と選手名が連結する場合
+        first = re.match(r"^\s*([1-8])\s*([^\d\s].+)", line)
+    if not first:
+        return None
+
+    car_no = int(first.group(1))
+
+    # よくある数値を拾う
+    handicap_match = re.search(r"(?<!\d)(0|10|20|30|40|50|60|70|80)\s*m?(?!\d)", line)
+    trial_match = re.search(r"(?<!\d)(3\.\d{2})(?!\d)", line)
+    st_match = re.search(r"(?:ST|スタート)\s*[:：]?\s*([+-]?\d?\.\d{2,3})", line, re.I)
+
+    # 名前候補。車番の後から、ハンデ・タイム等の前まで
+    body = re.sub(r"^\s*[1-8]\s*", "", line).strip()
+    stop_positions = []
+    for pat in [
+        r"\s(?:0|10|20|30|40|50|60|70|80)\s*m?(?:\s|$)",
+        r"\s3\.\d{2}(?:\s|$)",
+        r"\s[AB]\d(?:\s|$)",
+        r"\s\d{1,2}期(?:\s|$)",
+    ]:
+        m = re.search(pat, body)
+        if m:
+            stop_positions.append(m.start())
+    name_area = body[:min(stop_positions)] if stop_positions else body
+
+    # 級別・年齢・期別のような末尾情報を除外
+    name_area = re.sub(r"\s+[AB]\d.*$", "", name_area).strip()
+    name_area = re.sub(r"\s+\d{1,2}期.*$", "", name_area).strip()
+    name_area = re.sub(r"\s+\d{2}歳.*$", "", name_area).strip()
+
+    # 名前が取れないときは分割部品から探索
+    if len(name_area) < 2 and len(parts) >= 2:
+        name_area = parts[1]
+
+    name = v15_normalize_name(name_area)
+    if not name or name in {"車番", "選手名", "枠番"}:
+        return None
+
+    age = v15_int(v15_first_match([r"(\d{2})\s*歳"], line))
+    grade = v15_first_match([r"\b([AB][12])\b"], line)
+    term = v15_int(v15_first_match([r"(\d{1,2})\s*期"], line))
+
+    return {
+        "車番": car_no,
+        "選手名": name,
+        "ハンデ": v15_int(handicap_match.group(1)) if handicap_match else None,
+        "試走T": v15_float(trial_match.group(1)) if trial_match else np.nan,
+        "ST": v15_float(st_match.group(1)) if st_match else np.nan,
+        "年齢": age,
+        "級別": grade,
+        "期別": term,
+    }
+
+
+def v15_parse_entries(text):
+    rows = []
+    seen = set()
+
+    for raw in v15_clean_text(text).splitlines():
+        row = v15_parse_entry_line(raw)
+        if not row:
+            continue
+        key = row["車番"]
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=V15_ENTRY_COLUMNS)
+    if not df.empty:
+        df = df.sort_values("車番").reset_index(drop=True)
+    return df
+
+
+def v15_parse_prediction_page(text):
+    meta = v15_parse_race_meta(text)
+    entries = v15_parse_entries(text)
+    return meta, entries
+
+
+# ------------------------------
+# 選手履歴解析
+# ------------------------------
+def v15_guess_history_row(line):
+    original = line
+    line = v15_clean_text(line)
+
+    dm = re.search(r"(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})", line)
+    if not dm:
+        return None
+    date_iso = f"{int(dm.group(1)):04d}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}"
+
+    venue = None
+    for v in ["川口", "伊勢崎", "浜松", "山陽", "飯塚"]:
+        if v in line:
+            venue = v
+            break
+
+    race_no = v15_int(v15_first_match([r"(\d{1,2})\s*R"], line, re.I))
+
+    rank = None
+    rank_match = re.search(r"(?:^|\s)([1-8])\s*着(?:\s|$)", line)
+    if rank_match:
+        rank = int(rank_match.group(1))
+    else:
+        # 表形式では着順が単独数字のことがある
+        nums = re.findall(r"(?:^|\s)([1-8])(?:\s|$)", line)
+        if nums:
+            rank = int(nums[-1])
+
+    surface = None
+    for s in ["良走路", "湿走路", "斑走路", "風走路", "良", "湿", "斑"]:
+        if s in line:
+            surface = s
+            break
+
+    handicap = None
+    hm = re.search(r"(?<!\d)(0|10|20|30|40|50|60|70|80)\s*m?(?!\d)", line)
+    if hm:
+        handicap = int(hm.group(1))
+
+    times = [float(x) for x in re.findall(r"(?<!\d)(3\.\d{2}|4\.\d{2}|[12]\.\d{2})(?!\d)", line)]
+    trial = times[0] if times else np.nan
+    race_time = times[1] if len(times) >= 2 else np.nan
+
+    st = np.nan
+    stm = re.search(r"(?:ST|スタート)\s*[:：]?\s*([+-]?\d?\.\d{2,3})", line, re.I)
+    if stm:
+        st = float(stm.group(1))
+    elif len(times) >= 3:
+        st = times[-1]
+
+    starters = v15_int(v15_first_match([
+        r"(\d)\s*車",
+        r"出走\s*[:：]?\s*(\d)",
+    ], line))
+
+    return {
+        "開催日": date_iso,
+        "開催場": venue,
+        "レース": race_no,
+        "着順": rank,
+        "出走": starters,
+        "走路": surface,
+        "ハンデ": handicap,
+        "試走T": trial,
+        "競走T": race_time,
+        "ST": st,
+        "_raw": original,
+    }
+
+
+def v15_parse_player_history(text, player_name=None):
+    rows = []
+    for line in v15_clean_text(text).splitlines():
+        row = v15_guess_history_row(line)
+        if row:
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["選手名"] + V15_HISTORY_COLUMNS)
+
+    if player_name:
+        df.insert(0, "選手名", v15_normalize_name(player_name))
+    else:
+        # ページ先頭の氏名らしき文字列
+        guessed = v15_first_match([
+            r"選手名\s*[:：]\s*([^\n]+)",
+            r"プロフィール\s+([^\n]+)",
+        ], v15_clean_text(text))
+        df.insert(0, "選手名", v15_normalize_name(guessed) if guessed else "")
+
+    return df[["選手名"] + V15_HISTORY_COLUMNS + ["_raw"]]
+
+
+# ------------------------------
+# Ver15用DB
+# ------------------------------
+def v15_init_tables(db_path=DB_PATH):
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v15_race_inputs (
+                race_key TEXT PRIMARY KEY,
+                race_date TEXT,
+                venue TEXT,
+                race_no INTEGER,
+                race_name TEXT,
+                race_type TEXT,
+                distance INTEGER,
+                laps INTEGER,
+                start_time TEXT,
+                time_band TEXT,
+                weather TEXT,
+                surface TEXT,
+                track_temp REAL,
+                air_temp REAL,
+                humidity REAL,
+                first_prize INTEGER,
+                raw_text TEXT,
+                created_at TEXT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v15_race_entry_inputs (
+                race_key TEXT,
+                car_no INTEGER,
+                player_name TEXT,
+                handicap INTEGER,
+                trial_time REAL,
+                st REAL,
+                age INTEGER,
+                grade TEXT,
+                term INTEGER,
+                created_at TEXT,
+                PRIMARY KEY (race_key, car_no)
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v15_similarity_weights (
+                feature_name TEXT PRIMARY KEY,
+                initial_weight REAL,
+                current_weight REAL,
+                updated_at TEXT,
+                reason TEXT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v15_player_history_imports (
+                history_key TEXT PRIMARY KEY,
+                player_name TEXT,
+                race_date TEXT,
+                venue TEXT,
+                race_no INTEGER,
+                rank INTEGER,
+                starters INTEGER,
+                surface TEXT,
+                handicap INTEGER,
+                trial_time REAL,
+                race_time REAL,
+                st REAL,
+                raw_line TEXT,
+                created_at TEXT
+            )
+        """)
+
+        defaults = {
+            "走路状態": 0.22,
+            "走路温度": 0.18,
+            "ハンデ構成": 0.18,
+            "開催場": 0.12,
+            "距離": 0.10,
+            "湿度": 0.08,
+            "気温": 0.06,
+            "レース種別": 0.04,
+            "発走時間": 0.02,
+        }
+        now = datetime.now().isoformat(timespec="seconds")
+        for name, weight in defaults.items():
+            con.execute("""
+                INSERT OR IGNORE INTO v15_similarity_weights
+                (feature_name, initial_weight, current_weight, updated_at, reason)
+                VALUES (?, ?, ?, ?, ?)
+            """, (name, weight, weight, now, "Ver15.0初期値"))
+        con.commit()
+
+
+def v15_race_key(meta):
+    return v15_hash(
+        meta.get("開催日"), meta.get("開催場"), meta.get("レース"),
+        meta.get("距離"), meta.get("発走時刻")
+    )
+
+
+def v15_save_race_input(meta, entries, raw_text, db_path=DB_PATH):
+    v15_init_tables(db_path)
+    key = v15_race_key(meta)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            INSERT OR REPLACE INTO v15_race_inputs (
+                race_key, race_date, venue, race_no, race_name, race_type,
+                distance, laps, start_time, time_band, weather, surface,
+                track_temp, air_temp, humidity, first_prize, raw_text, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            key, meta.get("開催日"), meta.get("開催場"), meta.get("レース"),
+            meta.get("レース名"), meta.get("レース種別"), meta.get("距離"),
+            meta.get("周回数"), meta.get("発走時刻"), meta.get("時間帯"),
+            meta.get("天候"), meta.get("走路状態"), meta.get("走路温度"),
+            meta.get("気温"), meta.get("湿度"), meta.get("1着賞金"),
+            raw_text, now
+        ))
+
+        for _, row in entries.iterrows():
+            con.execute("""
+                INSERT OR REPLACE INTO v15_race_entry_inputs (
+                    race_key, car_no, player_name, handicap, trial_time,
+                    st, age, grade, term, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                key, int(row["車番"]), row["選手名"],
+                None if pd.isna(row["ハンデ"]) else int(row["ハンデ"]),
+                None if pd.isna(row["試走T"]) else float(row["試走T"]),
+                None if pd.isna(row["ST"]) else float(row["ST"]),
+                None if pd.isna(row["年齢"]) else int(row["年齢"]),
+                None if pd.isna(row["級別"]) else str(row["級別"]),
+                None if pd.isna(row["期別"]) else int(row["期別"]),
+                now
+            ))
+        con.commit()
+    return key
+
+
+def v15_save_player_history(df, db_path=DB_PATH):
+    if df is None or df.empty:
+        return 0, 0
+
+    v15_init_tables(db_path)
+    inserted = 0
+    skipped = 0
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with sqlite3.connect(db_path) as con:
+        for _, row in df.iterrows():
+            key = v15_hash(
+                row.get("選手名"), row.get("開催日"), row.get("開催場"),
+                row.get("レース"), row.get("着順"), row.get("試走T"),
+                row.get("競走T")
+            )
+            exists = con.execute(
+                "SELECT 1 FROM v15_player_history_imports WHERE history_key=?",
+                (key,)
+            ).fetchone()
+            if exists:
+                skipped += 1
+                continue
+
+            con.execute("""
+                INSERT INTO v15_player_history_imports (
+                    history_key, player_name, race_date, venue, race_no,
+                    rank, starters, surface, handicap, trial_time,
+                    race_time, st, raw_line, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                key, row.get("選手名"), row.get("開催日"),
+                row.get("開催場"),
+                None if pd.isna(row.get("レース")) else int(row.get("レース")),
+                None if pd.isna(row.get("着順")) else int(row.get("着順")),
+                None if pd.isna(row.get("出走")) else int(row.get("出走")),
+                row.get("走路"),
+                None if pd.isna(row.get("ハンデ")) else int(row.get("ハンデ")),
+                None if pd.isna(row.get("試走T")) else float(row.get("試走T")),
+                None if pd.isna(row.get("競走T")) else float(row.get("競走T")),
+                None if pd.isna(row.get("ST")) else float(row.get("ST")),
+                row.get("_raw"), now
+            ))
+            inserted += 1
+        con.commit()
+
+    return inserted, skipped
+
+
+# ------------------------------
+# 類似レース候補
+# ------------------------------
+def v15_similarity_weights(db_path=DB_PATH):
+    v15_init_tables(db_path)
+    with sqlite3.connect(db_path) as con:
+        df = pd.read_sql_query(
+            "SELECT feature_name, current_weight FROM v15_similarity_weights",
+            con
+        )
+    return dict(zip(df["feature_name"], df["current_weight"]))
+
+
+def v15_handicap_signature(entries):
+    if entries is None or entries.empty or "ハンデ" not in entries:
+        return {}
+    vals = pd.to_numeric(entries["ハンデ"], errors="coerce").dropna().astype(int)
+    return vals.value_counts().sort_index().to_dict()
+
+
+def v15_numeric_similarity(a, b, scale):
+    if a is None or b is None or pd.isna(a) or pd.isna(b):
+        return None
+    return max(0.0, 1.0 - abs(float(a) - float(b)) / float(scale))
+
+
+def v15_categorical_similarity(a, b):
+    if not a or not b:
+        return None
+    return 1.0 if str(a) == str(b) else 0.0
+
+
+def v15_handicap_similarity(sig_a, sig_b):
+    if not sig_a or not sig_b:
+        return None
+    keys = sorted(set(sig_a) | set(sig_b))
+    va = np.array([sig_a.get(k, 0) for k in keys], dtype=float)
+    vb = np.array([sig_b.get(k, 0) for k in keys], dtype=float)
+    denom = max(1.0, va.sum(), vb.sum())
+    return max(0.0, 1.0 - np.abs(va - vb).sum() / denom)
+
+
+def v15_find_similar_races(meta, entries, top_n=10, db_path=DB_PATH):
+    v15_init_tables(db_path)
+    weights = v15_similarity_weights(db_path)
+    current_key = v15_race_key(meta)
+    current_sig = v15_handicap_signature(entries)
+
+    with sqlite3.connect(db_path) as con:
+        races = pd.read_sql_query("SELECT * FROM v15_race_inputs", con)
+        all_entries = pd.read_sql_query(
+            "SELECT race_key, handicap FROM v15_race_entry_inputs", con
+        )
+
+    if races.empty:
+        return pd.DataFrame()
+
+    sig_map = {}
+    if not all_entries.empty:
+        for key, g in all_entries.groupby("race_key"):
+            vals = pd.to_numeric(g["handicap"], errors="coerce").dropna().astype(int)
+            sig_map[key] = vals.value_counts().sort_index().to_dict()
+
+    rows = []
+    for _, r in races.iterrows():
+        if r["race_key"] == current_key:
+            continue
+
+        feature_scores = {
+            "走路状態": v15_categorical_similarity(meta.get("走路状態"), r["surface"]),
+            "走路温度": v15_numeric_similarity(meta.get("走路温度"), r["track_temp"], 25),
+            "ハンデ構成": v15_handicap_similarity(current_sig, sig_map.get(r["race_key"], {})),
+            "開催場": v15_categorical_similarity(meta.get("開催場"), r["venue"]),
+            "距離": v15_numeric_similarity(meta.get("距離"), r["distance"], 1000),
+            "湿度": v15_numeric_similarity(meta.get("湿度"), r["humidity"], 50),
+            "気温": v15_numeric_similarity(meta.get("気温"), r["air_temp"], 20),
+            "レース種別": v15_categorical_similarity(meta.get("レース種別"), r["race_type"]),
+            "発走時間": None,
+        }
+
+        if meta.get("発走時刻") and r["start_time"]:
+            try:
+                h1, m1 = map(int, meta["発走時刻"].split(":"))
+                h2, m2 = map(int, str(r["start_time"]).split(":"))
+                feature_scores["発走時間"] = max(
+                    0.0, 1.0 - abs((h1 * 60 + m1) - (h2 * 60 + m2)) / 360
+                )
+            except Exception:
+                pass
+
+        usable = {
+            k: v for k, v in feature_scores.items()
+            if v is not None and k in weights
+        }
+        total_w = sum(weights[k] for k in usable)
+        if total_w <= 0:
+            continue
+
+        score = sum(weights[k] * usable[k] for k in usable) / total_w
+        strongest = sorted(
+            usable.items(),
+            key=lambda kv: weights[kv[0]] * kv[1],
+            reverse=True
+        )[:3]
+
+        rows.append({
+            "開催日": r["race_date"],
+            "開催場": r["venue"],
+            "レース": r["race_no"],
+            "レース種別": r["race_type"],
+            "距離": r["distance"],
+            "類似度": round(score * 100, 1),
+            "主な一致条件": "・".join(k for k, _ in strongest),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("類似度", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+
+
+# ------------------------------
+# 予測セルへの引き渡し
+# ------------------------------
+def v15_apply_to_prediction(meta, entries):
+    global V15_RACE_META, V15_ENTRY_DF
+    V15_RACE_META = dict(meta)
+    V15_ENTRY_DF = entries.copy()
+
+    # 既存の予測ロジックが参照しやすい別名も用意
+    globals()["CURRENT_RACE_META"] = V15_RACE_META
+    globals()["CURRENT_ENTRY_DF"] = V15_ENTRY_DF
+
+    # 既存LATEST_TRACK_TEMPへ反映
+    if pd.notna(meta.get("走路温度")):
+        globals()["LATEST_TRACK_TEMP"] = float(meta["走路温度"])
+
+    return V15_RACE_META, V15_ENTRY_DF
+
+
+# ------------------------------
+# 結果全文をVer13.2へ渡す
+# ------------------------------
+def v15_parse_result_preview(text):
+    if "parse_full_official_result" in globals():
+        return parse_full_official_result(text)
+    return {
+        "error": "Ver13.2のparse_full_official_result関数が見つかりません。",
+        "raw_text": text
+    }
+
+
+def v15_save_result_using_existing(text):
+    if "parse_full_official_result" not in globals():
+        raise RuntimeError("Ver13.2の結果解析関数が読み込まれていません。上から順にセルを実行してください。")
+    parsed = parse_full_official_result(text)
+
+    if "save_full_official_result" not in globals():
+        raise RuntimeError("Ver13.2の結果保存関数が読み込まれていません。")
+
+    # 既存関数の引数差に耐える
+    try:
+        return save_full_official_result(parsed)
+    except TypeError:
+        return save_full_official_result(parsed, DB_PATH)
+
+
+# ------------------------------
+# UI
+# ------------------------------
+v15_init_tables()
+
+style = {"description_width": "110px"}
+wide_layout = widgets.Layout(width="100%", min_height="220px")
+button_layout = widgets.Layout(width="180px", height="42px")
+
+prediction_text = widgets.Textarea(
+    description="予測ページ全文",
+    placeholder="公式サイトのレース情報・出走表をまとめて貼り付け",
+    layout=wide_layout,
+    style=style,
+)
+btn_prediction_preview = widgets.Button(
+    description="① 解析プレビュー",
+    button_style="info",
+    layout=button_layout,
+)
+btn_prediction_save = widgets.Button(
+    description="② DB保存",
+    button_style="success",
+    layout=button_layout,
+)
+btn_prediction_apply = widgets.Button(
+    description="③ 予測へ反映",
+    button_style="primary",
+    layout=button_layout,
+)
+btn_similar = widgets.Button(
+    description="類似レース表示",
+    layout=button_layout,
+)
+out_prediction = widgets.Output()
+
+player_name_input = widgets.Text(
+    description="選手名",
+    placeholder="ページから取れない場合だけ入力",
+    layout=widgets.Layout(width="100%"),
+    style=style,
+)
+player_text = widgets.Textarea(
+    description="選手履歴全文",
+    placeholder="選手ページの過去成績表を貼り付け",
+    layout=wide_layout,
+    style=style,
+)
+btn_player_preview = widgets.Button(
+    description="① 履歴プレビュー",
+    button_style="info",
+    layout=button_layout,
+)
+btn_player_save = widgets.Button(
+    description="② 履歴DB追加",
+    button_style="success",
+    layout=button_layout,
+)
+out_player = widgets.Output()
+
+result_text = widgets.Textarea(
+    description="結果ページ全文",
+    placeholder="公式結果ページを最初から周回順位までまとめて貼り付け",
+    layout=wide_layout,
+    style=style,
+)
+btn_result_preview = widgets.Button(
+    description="① 結果プレビュー",
+    button_style="info",
+    layout=button_layout,
+)
+btn_result_save = widgets.Button(
+    description="② 結果を登録",
+    button_style="success",
+    layout=button_layout,
+)
+out_result = widgets.Output()
+
+
+def _v15_prediction_preview(_):
+    with out_prediction:
+        _hidden_clear_output()
+        text = prediction_text.value
+        meta, entries = v15_parse_prediction_page(text)
+        V15_STATE["race_meta"] = meta
+        V15_STATE["entries"] = entries
+        V15_STATE["raw_prediction_text"] = text
+
+        print("【解析したレース情報】")
+        _hidden_display(pd.DataFrame([meta]).T.rename(columns={0: "値"}))
+
+        print("\n【解析した出走選手】")
+        if entries.empty:
+            print("出走選手を読み取れませんでした。車番から始まる行を含めて貼り付けてください。")
+        else:
+            _hidden_display(entries)
+
+        missing = [k for k in ["開催日", "開催場", "レース", "距離"] if not meta.get(k)]
+        if missing:
+            print("\n⚠ 未取得項目:", "、".join(missing))
+        print("\n内容を確認してから「DB保存」または「予測へ反映」を押してください。")
+
+
+def _v15_prediction_save(_):
+    with out_prediction:
+        if not V15_STATE["race_meta"]:
+            print("先に解析プレビューを実行してください。")
+            return
+        key = v15_save_race_input(
+            V15_STATE["race_meta"],
+            V15_STATE["entries"],
+            V15_STATE["raw_prediction_text"],
+        )
+        print(f"✅ レース入力をDBへ保存しました。登録キー: {key}")
+
+
+def _v15_prediction_apply(_):
+    with out_prediction:
+        if not V15_STATE["race_meta"]:
+            print("先に解析プレビューを実行してください。")
+            return
+        meta, entries = v15_apply_to_prediction(
+            V15_STATE["race_meta"],
+            V15_STATE["entries"],
+        )
+        print("✅ 解析内容を予測用変数へ反映しました。")
+        print("利用変数: CURRENT_RACE_META / CURRENT_ENTRY_DF")
+        if entries.empty:
+            print("⚠ 出走表が空です。既存Excel入力と組み合わせて利用してください。")
+
+
+def _v15_similar(_):
+    with out_prediction:
+        if not V15_STATE["race_meta"]:
+            print("先に解析プレビューを実行してください。")
+            return
+        df = v15_find_similar_races(
+            V15_STATE["race_meta"],
+            V15_STATE["entries"],
+            top_n=10,
+        )
+        print("【類似レース候補】")
+        if df.empty:
+            print("比較できる保存済みレースがまだありません。")
+        else:
+            _hidden_display(df)
+            print("※ 類似度は初期重みによる参考値です。結果蓄積後に重みを再学習します。")
+
+
+def _v15_player_preview(_):
+    with out_player:
+        _hidden_clear_output()
+        df = v15_parse_player_history(
+            player_text.value,
+            player_name=player_name_input.value.strip() or None,
+        )
+        V15_STATE["player_history"] = df
+        V15_STATE["raw_player_text"] = player_text.value
+        if df.empty:
+            print("履歴行を読み取れませんでした。開催日を含む成績表を貼り付けてください。")
+        else:
+            print(f"解析件数: {len(df)}件")
+            _hidden_display(df.drop(columns=["_raw"], errors="ignore"))
+            if (df["選手名"].fillna("").str.strip() == "").any():
+                print("⚠ 選手名が空です。上の選手名欄へ入力して、もう一度プレビューしてください。")
+
+
+def _v15_player_save(_):
+    with out_player:
+        df = V15_STATE.get("player_history")
+        if df is None or df.empty:
+            print("先に履歴プレビューを実行してください。")
+            return
+        if (df["選手名"].fillna("").str.strip() == "").any():
+            print("選手名が空のため保存できません。")
+            return
+        inserted, skipped = v15_save_player_history(df)
+        print(f"✅ 新規追加: {inserted}件 / 重複スキップ: {skipped}件")
+
+
+def _v15_result_preview(_):
+    with out_result:
+        _hidden_clear_output()
+        V15_STATE["raw_result_text"] = result_text.value
+        parsed = v15_parse_result_preview(result_text.value)
+        print("【結果解析プレビュー】")
+        if isinstance(parsed, dict):
+            summary = {}
+            for k, v in parsed.items():
+                if isinstance(v, pd.DataFrame):
+                    print(f"\n{k}")
+                    _hidden_display(v)
+                elif isinstance(v, (list, tuple)) and v and isinstance(v[0], dict):
+                    print(f"\n{k}")
+                    _hidden_display(pd.DataFrame(v))
+                elif k != "raw_text":
+                    summary[k] = v
+            if summary:
+                _hidden_display(pd.DataFrame([summary]).T.rename(columns={0: "値"}))
+        else:
+            _hidden_display(parsed)
+        print("\n内容を確認してから「結果を登録」を押してください。")
+
+
+def _v15_result_save(_):
+    with out_result:
+        if not result_text.value.strip():
+            print("結果ページ全文を貼り付けてください。")
+            return
+        try:
+            result = v15_save_result_using_existing(result_text.value)
+            print("✅ 公式結果をDBへ登録しました。")
+            if result is not None:
+                _hidden_display(result) if isinstance(result, pd.DataFrame) else print(result)
+        except Exception as exc:
+            print("❌ 登録できませんでした。")
+            print(type(exc).__name__, str(exc))
+
+
+btn_prediction_preview.on_click(_v15_prediction_preview)
+btn_prediction_save.on_click(_v15_prediction_save)
+btn_prediction_apply.on_click(_v15_prediction_apply)
+btn_similar.on_click(_v15_similar)
+btn_player_preview.on_click(_v15_player_preview)
+btn_player_save.on_click(_v15_player_save)
+btn_result_preview.on_click(_v15_result_preview)
+btn_result_save.on_click(_v15_result_save)
+
+prediction_box = widgets.VBox([
+    widgets.HTML("<h3>📋 予測前：公式ページ全文を貼り付け</h3>"),
+    prediction_text,
+    widgets.HBox([
+        btn_prediction_preview,
+        btn_prediction_save,
+        btn_prediction_apply,
+        btn_similar,
+    ]),
+    out_prediction,
+])
+
+player_box = widgets.VBox([
+    widgets.HTML("<h3>👤 選手履歴：選手ページを貼り付け</h3>"),
+    player_name_input,
+    player_text,
+    widgets.HBox([btn_player_preview, btn_player_save]),
+    out_player,
+])
+
+result_box = widgets.VBox([
+    widgets.HTML("<h3>🏁 レース後：公式結果ページ全文を貼り付け</h3>"),
+    result_text,
+    widgets.HBox([btn_result_preview, btn_result_save]),
+    out_result,
+])
+
+v15_tabs = widgets.Tab(children=[prediction_box, player_box, result_box])
+v15_tabs.set_title(0, "予測入力")
+v15_tabs.set_title(1, "選手履歴")
+v15_tabs.set_title(2, "結果登録")
+
+_hidden_display(HTML("""
+<div style="padding:12px;border:1px solid #bbb;border-radius:10px;margin-bottom:10px">
+<b>AutoRaceAI Ver15.0</b><br>
+スマホでは公式ページを長押しコピーし、各タブの欄へ貼り付けます。
+必ずプレビューで解析内容を確認してから保存してください。
+</div>
+"""))
+_hidden_display(v15_tabs)
+
+# ============================================================
+# Ver15.1 縦型選手履歴コピペ対応
+# 「前走」「前々走」「3走前」...ごとに改行された形式を解析
+# ============================================================
+
+def v151_parse_date(line):
+    m = re.search(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", line)
+    if not m:
+        return None
+    return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+
+def v151_is_history_header(line):
+    line = line.strip()
+    return bool(re.fullmatch(r"(?:前走|前々走|\d+走前)", line))
+
+
+def v151_split_history_blocks(text):
+    lines = [x.strip() for x in v15_clean_text(text).splitlines() if x.strip()]
+    blocks = []
+    current = None
+
+    for line in lines:
+        if v151_is_history_header(line):
+            if current:
+                blocks.append(current)
+            current = {"見出し": line, "lines": []}
+        elif current is not None:
+            current["lines"].append(line)
+
+    if current:
+        blocks.append(current)
+
+    return blocks
+
+
+def v151_parse_history_block(block, player_name=""):
+    lines = block.get("lines", [])
+    if not lines:
+        return None
+
+    row = {
+        "選手名": v15_normalize_name(player_name),
+        "開催日": None,
+        "開催場": None,
+        "レース": None,
+        "着順": None,
+        "出走": None,
+        "走路": None,
+        "ハンデ": None,
+        "試走T": np.nan,
+        "競走T": np.nan,
+        "ST": np.nan,
+        "天候": None,
+        "走路温度": np.nan,
+        "気温": np.nan,
+        "湿度": np.nan,
+        "レース種別": None,
+        "距離": None,
+        "周回数": None,
+        "人気": None,
+        "車番": None,
+        "_raw": "\n".join([block.get("見出し", "")] + lines),
+    }
+
+    # 先頭の単独数字は着順として扱う
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"[1-8]", line):
+            row["着順"] = int(line)
+            break
+
+    for line in lines:
+        # 開催日
+        if row["開催日"] is None:
+            d = v151_parse_date(line)
+            if d:
+                row["開催日"] = d
+                continue
+
+        # 開催場
+        if line in ["川口", "伊勢崎", "浜松", "山陽", "飯塚"]:
+            row["開催場"] = line
+            continue
+
+        # レース種別
+        if any(x in line for x in [
+            "一般戦", "予選", "準決勝", "準決勝戦", "優勝戦",
+            "選抜戦", "特別選抜戦", "最終予選", "二次予選", "一次予選"
+        ]):
+            row["レース種別"] = line
+            continue
+
+        # 天候
+        if line in ["晴", "曇", "雨", "雪", "小雨"]:
+            row["天候"] = line
+            continue
+
+        # 走路
+        if line in ["良", "湿", "斑", "良走路", "湿走路", "斑走路"]:
+            row["走路"] = line
+            continue
+
+        # 走路温度
+        m = re.fullmatch(r"走\s*(-?\d+(?:\.\d+)?)", line)
+        if m:
+            row["走路温度"] = float(m.group(1))
+            continue
+
+        # 気温
+        m = re.fullmatch(r"気\s*(-?\d+(?:\.\d+)?)", line)
+        if m:
+            row["気温"] = float(m.group(1))
+            continue
+
+        # 湿度
+        m = re.fullmatch(r"湿\s*(\d+(?:\.\d+)?)", line)
+        if m:
+            row["湿度"] = float(m.group(1))
+            continue
+
+        # 車番・ハンデ
+        # 例: 1番-m / 3番10m / 8番20m
+        m = re.fullmatch(r"([1-8])番\s*([+-]?\d+|-)?m?", line)
+        if m:
+            row["車番"] = int(m.group(1))
+            if m.group(2) in (None, "-"):
+                row["ハンデ"] = 0
+            else:
+                row["ハンデ"] = int(m.group(2))
+            continue
+
+        # 距離・周回
+        m = re.fullmatch(r"(\d{4})m\((\d+)周\)", line)
+        if m:
+            row["距離"] = int(m.group(1))
+            row["周回数"] = int(m.group(2))
+            continue
+
+        # 人気
+        m = re.fullmatch(r"(\d+)人気", line)
+        if m:
+            row["人気"] = int(m.group(1))
+            continue
+
+        # 競走タイム
+        m = re.fullmatch(r"([3-9]\.\d{3})", line)
+        if m:
+            row["競走T"] = float(m.group(1))
+            continue
+
+        # 試走
+        m = re.fullmatch(r"試\s*([3-9]\.\d{2,3})", line)
+        if m:
+            row["試走T"] = float(m.group(1))
+            continue
+
+        # ST
+        m = re.fullmatch(r"ST\s*([+-]?\d?\.\d{2,3})", line, re.I)
+        if m:
+            row["ST"] = float(m.group(1))
+            continue
+
+    # 出走数は貼り付け情報にないため、通常8車として補完しない
+    # 必要なら結果ページ登録時に上書き
+    return row
+
+
+def v151_parse_vertical_player_history(text, player_name=None):
+    blocks = v151_split_history_blocks(text)
+    if not blocks:
+        return pd.DataFrame()
+
+    rows = []
+    for block in blocks:
+        row = v151_parse_history_block(block, player_name=player_name or "")
+        if row:
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# 既存関数を上書きし、縦型と表形式の両方に対応
+def v15_parse_player_history(text, player_name=None):
+    vertical = v151_parse_vertical_player_history(text, player_name=player_name)
+
+    # 縦型が2件以上取れたらこちらを採用
+    if not vertical.empty and vertical["開催日"].notna().sum() >= 1:
+        expected = [
+            "選手名", "開催日", "開催場", "レース", "着順", "出走", "走路",
+            "ハンデ", "試走T", "競走T", "ST",
+            "天候", "走路温度", "気温", "湿度",
+            "レース種別", "距離", "周回数", "人気", "車番", "_raw"
+        ]
+        for col in expected:
+            if col not in vertical.columns:
+                vertical[col] = np.nan
+        return vertical[expected]
+
+    # 従来の1行1レース形式へフォールバック
+    rows = []
+    for line in v15_clean_text(text).splitlines():
+        row = v15_guess_history_row(line)
+        if row:
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["選手名"] + V15_HISTORY_COLUMNS)
+
+    if player_name:
+        df.insert(0, "選手名", v15_normalize_name(player_name))
+    else:
+        guessed = v15_first_match([
+            r"選手名\s*[:：]\s*([^\n]+)",
+            r"プロフィール\s+([^\n]+)",
+        ], v15_clean_text(text))
+        df.insert(0, "選手名", v15_normalize_name(guessed) if guessed else "")
+
+    return df[["選手名"] + V15_HISTORY_COLUMNS + ["_raw"]]
+
+
+# DBに追加列を安全に追加
+def v151_ensure_player_import_columns(db_path=DB_PATH):
+    v15_init_tables(db_path)
+    extra_columns = {
+        "weather": "TEXT",
+        "track_temp": "REAL",
+        "air_temp": "REAL",
+        "humidity": "REAL",
+        "race_type": "TEXT",
+        "distance": "INTEGER",
+        "laps": "INTEGER",
+        "popularity": "INTEGER",
+        "car_no": "INTEGER",
+    }
+
+    with sqlite3.connect(db_path) as con:
+        cols = set(v15_columns(con, "v15_player_history_imports"))
+        for name, sql_type in extra_columns.items():
+            if name not in cols:
+                con.execute(
+                    f"ALTER TABLE v15_player_history_imports ADD COLUMN {name} {sql_type}"
+                )
+        con.commit()
+
+
+def v15_save_player_history(df, db_path=DB_PATH):
+    if df is None or df.empty:
+        return 0, 0
+
+    v151_ensure_player_import_columns(db_path)
+    inserted = 0
+    skipped = 0
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with sqlite3.connect(db_path) as con:
+        for _, row in df.iterrows():
+            key = v15_hash(
+                row.get("選手名"), row.get("開催日"), row.get("開催場"),
+                row.get("レース"), row.get("着順"), row.get("試走T"),
+                row.get("競走T"), row.get("車番")
+            )
+
+            exists = con.execute(
+                "SELECT 1 FROM v15_player_history_imports WHERE history_key=?",
+                (key,)
+            ).fetchone()
+            if exists:
+                skipped += 1
+                continue
+
+            con.execute("""
+                INSERT INTO v15_player_history_imports (
+                    history_key, player_name, race_date, venue, race_no,
+                    rank, starters, surface, handicap, trial_time,
+                    race_time, st, raw_line, created_at,
+                    weather, track_temp, air_temp, humidity,
+                    race_type, distance, laps, popularity, car_no
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                key,
+                row.get("選手名"),
+                row.get("開催日"),
+                row.get("開催場"),
+                None if pd.isna(row.get("レース")) else int(row.get("レース")),
+                None if pd.isna(row.get("着順")) else int(row.get("着順")),
+                None if pd.isna(row.get("出走")) else int(row.get("出走")),
+                row.get("走路"),
+                None if pd.isna(row.get("ハンデ")) else int(row.get("ハンデ")),
+                None if pd.isna(row.get("試走T")) else float(row.get("試走T")),
+                None if pd.isna(row.get("競走T")) else float(row.get("競走T")),
+                None if pd.isna(row.get("ST")) else float(row.get("ST")),
+                row.get("_raw"),
+                now,
+                row.get("天候"),
+                None if pd.isna(row.get("走路温度")) else float(row.get("走路温度")),
+                None if pd.isna(row.get("気温")) else float(row.get("気温")),
+                None if pd.isna(row.get("湿度")) else float(row.get("湿度")),
+                row.get("レース種別"),
+                None if pd.isna(row.get("距離")) else int(row.get("距離")),
+                None if pd.isna(row.get("周回数")) else int(row.get("周回数")),
+                None if pd.isna(row.get("人気")) else int(row.get("人気")),
+                None if pd.isna(row.get("車番")) else int(row.get("車番")),
+            ))
+            inserted += 1
+
+        con.commit()
+
+    return inserted, skipped
+
+
+print("✅ Ver15.1 縦型選手履歴パーサーを読み込みました。")
+
+# ============================================================
+# Ver15.2 縦型出走表コピペ対応
+# 公式サイトの「車番→選手名→複数行データ」形式を解析
+# ============================================================
+
+def v152_split_entry_blocks(text):
+    lines = [x.strip() for x in v15_clean_text(text).splitlines() if x.strip()]
+    blocks = []
+    current = None
+
+    # 車番単独行、または「1 宍戸幸」のような行を開始点にする
+    for i, line in enumerate(lines):
+        m = re.fullmatch(r"([1-8])", line)
+        m_inline = re.fullmatch(r"([1-8])\s+(.+)", line)
+
+        if m:
+            # 次行が選手名らしい場合のみ開始
+            if i + 1 < len(lines):
+                nxt = lines[i + 1]
+                if not re.fullmatch(r"\d+(?:\.\d+)?%?", nxt):
+                    if current:
+                        blocks.append(current)
+                    current = {"車番": int(m.group(1)), "lines": []}
+            elif current:
+                current["lines"].append(line)
+
+        elif m_inline and not re.match(r"^\d+\.\d", line):
+            if current:
+                blocks.append(current)
+            current = {
+                "車番": int(m_inline.group(1)),
+                "lines": [m_inline.group(2).strip()]
+            }
+        elif current is not None:
+            current["lines"].append(line)
+
+    if current:
+        blocks.append(current)
+
+    # 同じ車番が紛れた場合は最初の有効ブロックのみ
+    unique = {}
+    for block in blocks:
+        no = block["車番"]
+        if no not in unique and block["lines"]:
+            unique[no] = block
+    return [unique[k] for k in sorted(unique)]
+
+
+def v152_parse_entry_block(block):
+    car_no = int(block["車番"])
+    lines = [x.strip() for x in block.get("lines", []) if x.strip()]
+    if not lines:
+        return None
+
+    # 先頭行を選手名として採用
+    player_name = v15_normalize_name(lines[0])
+
+    joined = "\n".join(lines)
+    compact = " ".join(lines)
+
+    handicap = None
+    st = np.nan
+    hm = re.search(r"([+-]?\d+|-)\s*m\s*/\s*ST\s*([+-]?\d?\.\d{2,3})", compact, re.I)
+    if hm:
+        handicap = 0 if hm.group(1) == "-" else int(hm.group(1))
+        st = float(hm.group(2))
+    else:
+        hm2 = re.search(r"([+-]?\d+|-)\s*m", compact)
+        if hm2:
+            handicap = 0 if hm2.group(1) == "-" else int(hm2.group(1))
+        stm = re.search(r"ST\s*([+-]?\d?\.\d{2,3})", compact, re.I)
+        if stm:
+            st = float(stm.group(1))
+
+    # 当日試走
+    trial = np.nan
+    tm = re.search(r"試\s*([3-9]\.\d{2,3}|-)", compact)
+    if tm and tm.group(1) != "-":
+        trial = float(tm.group(1))
+
+    # 試走偏差
+    trial_dev = np.nan
+    dm = re.search(r"(?:試\s*[3-9]\.\d{2,3}|試-)\s+(-|[0-9]\.\d{3})", compact)
+    if dm and dm.group(1) != "-":
+        trial_dev = float(dm.group(1))
+
+    # ランク
+    rank = v15_first_match([r"\b([SAB]-?\d+)\b"], compact)
+    prev_rank = v15_first_match([r"\(前\s*([SAB]-?\d+)\)"], compact)
+
+    # 審査ポイント
+    review_point = np.nan
+    rpm = re.search(r"\(前[SAB]-?\d+\)\s*([0-9]{2,3}\.\d{3})", compact)
+    if rpm:
+        review_point = float(rpm.group(1))
+    else:
+        # ランク直後の3桁小数
+        rpm = re.search(r"\b[SAB]-?\d+\b\s*([0-9]{2,3}\.\d{3})", compact)
+        if rpm:
+            review_point = float(rpm.group(1))
+
+    current_year_v = v15_int(v15_first_match([r"\bV(\d+)\b"], compact))
+    final_count = v15_int(v15_first_match([r"(\d+)回"], compact))
+
+    all_v = None
+    all_vm = re.findall(r"\bV(\d+)\b", compact)
+    if all_vm:
+        try:
+            all_v = int(all_vm[-1])
+        except:
+            pass
+
+    avg_trial = v15_float(v15_first_match([r"平均試走T\s*([3-9]\.\d{2,3})"], compact))
+    avg_race = v15_float(v15_first_match([r"平均競走T\s*([3-9]\.\d{3})"], compact))
+    best_race = v15_float(v15_first_match([r"最高競走T\s*([3-9]\.\d{3})"], compact))
+
+    recent_finish = v15_first_match([r"着順\s*(\d+-\d+-\d+-\d+)"], compact)
+    two_rate = v15_float(v15_first_match([r"2連\s*([0-9.]+)%"], compact))
+    three_rate = v15_float(v15_first_match([r"3連\s*([0-9.]+)%"], compact))
+
+    # 車名は「3連xx%」の後、単独行として現れることが多い
+    car_name = None
+    for idx, line in enumerate(lines):
+        if re.fullmatch(r"3連\s*[0-9.]+%", line) and idx + 1 < len(lines):
+            candidate = lines[idx + 1]
+            if not re.fullmatch(r"\d+", candidate):
+                car_name = candidate
+                break
+
+    # 近90/180日の末尾パーセント群
+    percent_values = [float(x) for x in re.findall(r"([0-9]+(?:\.[0-9]+)?)%", compact)]
+    # 最初の2つは近10走の2連・3連なので、その後を着別成績用に使う
+    tail = percent_values[2:] if len(percent_values) >= 2 else []
+    metrics = {
+        "2連対率": tail[0] if len(tail) > 0 else np.nan,
+        "3連対率": tail[1] if len(tail) > 1 else np.nan,
+        "良2連対率": tail[2] if len(tail) > 2 else np.nan,
+        "良3連対率": tail[3] if len(tail) > 3 else np.nan,
+        "湿2連対率": tail[4] if len(tail) > 4 else np.nan,
+        "湿3連対率": tail[5] if len(tail) > 5 else np.nan,
+    }
+
+    row = {
+        "車番": car_no,
+        "選手名": player_name,
+        "ハンデ": handicap,
+        "試走T": trial,
+        "ST": st,
+        "年齢": None,
+        "級別": rank.split("-")[0] if rank else None,
+        "期別": None,
+        "現ランク": rank,
+        "前ランク": prev_rank,
+        "審査P": review_point,
+        "試走偏差": trial_dev,
+        "今年V": current_year_v,
+        "優出回数": final_count,
+        "通算V": all_v,
+        "平均試走T": avg_trial,
+        "平均競走T": avg_race,
+        "最高競走T": best_race,
+        "近10走着順": recent_finish,
+        "近10走2連": two_rate,
+        "近10走3連": three_rate,
+        "車名": car_name,
+        **metrics,
+        "_raw": joined,
+    }
+    return row
+
+
+def v152_parse_vertical_entries(text):
+    blocks = v152_split_entry_blocks(text)
+    rows = []
+    for block in blocks:
+        row = v152_parse_entry_block(block)
+        if row:
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# 既存関数を上書きして縦型優先・従来形式フォールバック
+def v15_parse_entries(text):
+    vertical = v152_parse_vertical_entries(text)
+
+    if not vertical.empty and vertical["車番"].nunique() >= 2:
+        return vertical.sort_values("車番").reset_index(drop=True)
+
+    rows = []
+    seen = set()
+    for raw in v15_clean_text(text).splitlines():
+        row = v15_parse_entry_line(raw)
+        if not row:
+            continue
+        key = row["車番"]
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("車番").reset_index(drop=True)
+    return df
+
+
+# レース情報パーサーも今回の形式へ強化
+_old_v15_parse_race_meta = v15_parse_race_meta
+
+def v15_parse_race_meta(text):
+    meta = _old_v15_parse_race_meta(text)
+    compact = " ".join([x.strip() for x in v15_clean_text(text).splitlines() if x.strip()])
+
+    # 6R
+    m = re.search(r"(?:^|\s)(\d{1,2})R(?:\s|$)", compact, re.I)
+    if m:
+        meta["レース"] = int(m.group(1))
+
+    # 13:13発走
+    m = re.search(r"(\d{1,2}:\d{2})\s*発走", compact)
+    if m:
+        meta["発走時刻"] = m.group(1)
+
+    # 良走路 /60℃
+    m = re.search(r"(良走路|湿走路|斑走路|良|湿|斑)\s*/\s*(-?\d+(?:\.\d+)?)℃", compact)
+    if m:
+        meta["走路状態"] = m.group(1)
+        meta["走路温度"] = float(m.group(2))
+
+    # 3100m 8車 6周
+    m = re.search(r"(\d{4})m\s+(\d+)車\s+(\d+)周", compact)
+    if m:
+        meta["距離"] = int(m.group(1))
+        meta["出走数"] = int(m.group(2))
+        meta["周回数"] = int(m.group(3))
+
+    # 初日・最終日等
+    m = re.search(r"(初日|\d+日目|最終日)", compact)
+    if m:
+        meta["開催日程"] = m.group(1)
+
+    # 締切
+    m = re.search(r"(\d{1,2}:\d{2})\s*締切", compact)
+    if m:
+        meta["締切時刻"] = m.group(1)
+
+    return meta
+
+
+print("✅ Ver15.2 縦型出走表パーサーを読み込みました。")
+class _FilesShim:
+    @staticmethod
+    def download(path):
+        return path
+files = _FilesShim()
+
+
+# Ver17 outer compatibility functions
+def read_history(ws):
+    df = _original_read_history(ws)
+    required = [
+        "開催日","開催場","レース","着順","出走","走路","ハンデ",
+        "ハンデ数値","試走T","競走T","ST","タイム差","有効"
+    ]
+    for col in required:
+        if col not in df.columns:
+            df[col] = pd.Series(dtype="bool" if col == "有効" else "float64")
+    return df[required]
+
+def prepare_history(df, current, race, settings):
+    x = _original_prepare_history(df, current, race, settings)
+
+    required_columns = {
+        "開催日": "float64",
+        "開催場": "object",
+        "レース": "object",
+        "着順": "float64",
+        "出走": "float64",
+        "走路": "object",
+        "ハンデ": "object",
+        "ハンデ数値": "float64",
+        "試走T": "float64",
+        "競走T": "float64",
+        "ST": "float64",
+        "タイム差": "float64",
+        "有効": "bool",
+        "経過日数": "float64",
+        "最近重み": "float64",
+        "場重み": "float64",
+        "走路適合重み": "float64",
+        "走路重み": "float64",
+        "ハンデ重み": "float64",
+        "総合重み": "float64",
+    }
+
+    for column, dtype in required_columns.items():
+        if column not in x.columns:
+            x[column] = pd.Series(index=x.index, dtype=dtype)
+
+    return x
+
+def _has_value(v):
+    if v is None:
+        return False
+    if isinstance(v, float) and np.isnan(v):
+        return False
+    return str(v).strip() not in ("", "—", "-", "－", "nan", "None")
+
+def _normalized_race_no(v):
+    s = _s(v).upper().replace("Ｒ", "R").strip()
+    if not s:
+        return ""
+    m = re.search(r"(\d+)", s)
+    return f"{int(m.group(1))}R" if m else s
+
+def _find_existing_history(con, player_id, row):
+    race_date = _date_text(row.get("開催日"))
+    venue = _s(row.get("開催場"))
+    race_no = _normalized_race_no(row.get("レース"))
+
+    if not race_date or not venue:
+        return None
+
+    # Rあり: 完全一致を優先し、なければ同日同場のR空欄を統合対象にする
+    if race_no:
+        exact = con.execute("""
+            SELECT history_id FROM race_history
+            WHERE player_id=? AND race_date=? AND venue=?
+              AND UPPER(REPLACE(COALESCE(race_no,''),'Ｒ','R'))=?
+            ORDER BY history_id LIMIT 1
+        """, (player_id, race_date, venue, race_no)).fetchone()
+        if exact:
+            return exact[0]
+
+        blank = con.execute("""
+            SELECT history_id FROM race_history
+            WHERE player_id=? AND race_date=? AND venue=?
+              AND TRIM(COALESCE(race_no,''))=''
+            ORDER BY history_id
+        """, (player_id, race_date, venue)).fetchall()
+        return blank[0][0] if len(blank) == 1 else None
+
+    # Rなし: 同日同場の候補が1件だけなら統合。複数Rなら誤結合防止で新規扱い。
+    candidates = con.execute("""
+        SELECT history_id FROM race_history
+        WHERE player_id=? AND race_date=? AND venue=?
+        ORDER BY history_id
+    """, (player_id, race_date, venue)).fetchall()
+    return candidates[0][0] if len(candidates) == 1 else None
+
+def add_history_rows(player, rows, source="履歴登録"):
+    added = updated = 0
+    canonical = _canonical_player_name(player)
+
+    with sqlite3.connect(str(DB_PATH)) as con:
+        pid = _ensure_player(con, canonical)
+
+        for row in rows:
+            normalized = {
+                "開催日": _date_text(row.get("開催日")),
+                "開催場": _s(row.get("開催場")),
+                "レース": _normalized_race_no(row.get("レース")),
+                "着順": _num(row.get("着順")),
+                "出走": _num(row.get("出走")),
+                "走路": _s(row.get("走路")),
+                "ハンデ": _s(row.get("ハンデ")),
+                "試走T": _num(row.get("試走T")),
+                "競走T": _num(row.get("競走T")),
+                "ST": _num(row.get("ST")),
+                "結果区分": _s(row.get("結果区分", "通常")) or "通常",
+            }
+
+            if not normalized["開催日"] or not normalized["開催場"]:
+                continue
+
+            status = normalized["結果区分"]
+            use = 0 if status in ["反妨","落車","故障","他落","反則","不成立"] else 1
+            existing_id = _find_existing_history(con, pid, normalized)
+
+            if existing_id is None:
+                key_row = normalized.copy()
+                key_row["レース"] = normalized["レース"]
+                record_key = _record_key(canonical, key_row)
+                # 同じ内容由来のキー衝突を避けるため、必要時だけ連番化
+                suffix = 0
+                base_key = record_key
+                while con.execute(
+                    "SELECT 1 FROM race_history WHERE record_key=?", (record_key,)
+                ).fetchone():
+                    suffix += 1
+                    record_key = hashlib.sha256(
+                        f"{base_key}|{suffix}".encode()
+                    ).hexdigest()
+
+                con.execute("""
+                    INSERT INTO race_history(
+                        player_id,race_date,venue,race_no,finish,starters,surface,
+                        handicap,trial_time,race_time,start_time,result_status,
+                        use_for_model,source,record_key
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    pid, normalized["開催日"], normalized["開催場"],
+                    normalized["レース"], normalized["着順"], normalized["出走"],
+                    normalized["走路"], normalized["ハンデ"],
+                    normalized["試走T"], normalized["競走T"], normalized["ST"],
+                    status, use, source, record_key
+                ))
+                added += 1
+                continue
+
+            current = con.execute("""
+                SELECT race_no,finish,starters,surface,handicap,
+                       trial_time,race_time,start_time,result_status,source
+                FROM race_history WHERE history_id=?
+            """, (existing_id,)).fetchone()
+
+            columns = [
+                "race_no","finish","starters","surface","handicap",
+                "trial_time","race_time","start_time","result_status"
+            ]
+            incoming = [
+                normalized["レース"], normalized["着順"], normalized["出走"],
+                normalized["走路"], normalized["ハンデ"],
+                normalized["試走T"], normalized["競走T"], normalized["ST"], status
+            ]
+
+            updates = {}
+            for col, old_value, new_value in zip(columns, current[:9], incoming):
+                # 既存空欄を補完。結果系は新しい有効値があれば更新。
+                if _has_value(new_value) and (
+                    not _has_value(old_value)
+                    or col in {"finish","trial_time","race_time","start_time","result_status"}
+                ):
+                    updates[col] = new_value
+
+            updates["use_for_model"] = use
+            updates["source"] = source
+
+            if updates:
+                set_sql = ", ".join(f"{k}=?" for k in updates)
+                con.execute(
+                    f"UPDATE race_history SET {set_sql} WHERE history_id=?",
+                    (*updates.values(), existing_id)
+                )
+                updated += 1
+
+    return added, updated
+
+def _canonical_player_name(name):
+    return re.sub(r"[\s　]+", "", str(name or "")).strip()
+
+def _ensure_player(con, name):
+    canonical = _canonical_player_name(name)
+    if not canonical:
+        raise ValueError("選手名が空です")
+    con.execute(
+        "INSERT OR IGNORE INTO players(player_name) VALUES (?)",
+        (canonical,)
+    )
+    con.execute(
+        "UPDATE players SET updated_at=CURRENT_TIMESTAMP WHERE player_name=?",
+        (canonical,)
+    )
+    return con.execute(
+        "SELECT player_id FROM players WHERE player_name=?",
+        (canonical,)
+    ).fetchone()[0]
