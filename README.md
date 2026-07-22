@@ -1,33 +1,21 @@
-# AutoRaceAI Streamlit Personal v2
+# AutoRaceAI Ver18.0 α
 
-GitHubでフォルダを作る必要はありません。
-
-リポジトリの一番上に、次の5ファイルをそのままアップロードしてください。
+GitHubでフォルダを作る必要はありません。ZIP内の6ファイルをリポジトリの一番上へアップロードしてください。
 
 - app.py
-- engine.py
-- mobile_helpers.py
+- parser.py
+- database.py
+- predictor.py
 - requirements.txt
 - README.md
 
-## Streamlitでの設定
+Streamlit Community CloudのMain file pathは `app.py` です。
 
-- Repository: AutoRaceAI
-- Branch: main
-- Main file path: app.py
+現在の機能:
+- 出走表貼り付け
+- 開催情報と選手候補の解析
+- SQLite保存
+- DBダウンロード
+- 仮の簡易予測
 
-## 今回の修正
-
-- `Workbook is not defined` を修正
-- `.ipynb` を起動時に使用しない構成
-- GitHub上でフォルダ追加不要
-- SQLiteは実行時に自動作成
-- DB管理画面からバックアップ可能
-
-## 更新方法
-
-GitHubで既存の同名ファイルを開き、編集するのではなく、
-`Add file` → `Upload files` からこの5ファイルをまとめてアップロードしてください。
-同名ファイルは新しい内容へ置き換わります。
-
-アップロード後、Streamlitの Manage app から Reboot app を実行してください。
+まだ本予測、モンテカルロ、結果登録、再学習は未実装です。
