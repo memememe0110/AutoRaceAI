@@ -3806,7 +3806,9 @@ def v15_normalize_name(name):
     name = str(name or "").strip()
     name = re.sub(r"\s+", " ", name)
     name = re.sub(r"^[0-9]+\s*", "", name)
-    return name
+    # 公式サイトの予想印・お気に入り印を氏名から除去
+    name = re.sub(r"^[◎○◯▲△×注☆★◇◆□■・]+\s*", "", name)
+    return name.strip()
 
 
 def v15_hash(*parts):
@@ -4835,44 +4837,83 @@ def v15_save_player_history(df, db_path=DB_PATH):
 # ============================================================
 
 def v152_split_entry_blocks(text):
+    """公式出走表の縦型ブロックを安全に分割する。
+
+    車級の「1」「2」や成績中の数字を車番と誤認しないよう、
+    新しい選手ブロックは次のどちらかだけを開始点にする。
+    1) 「1 選手名」のような車番＋氏名の行
+    2) 車番単独行の直後が氏名、その次が「0m/ST0.15」形式
+    """
     lines = [x.strip() for x in v15_clean_text(text).splitlines() if x.strip()]
     blocks = []
     current = None
 
-    # 車番単独行、または「1 宍戸幸」のような行を開始点にする
-    for i, line in enumerate(lines):
-        m = re.fullmatch(r"([1-8])", line)
-        m_inline = re.fullmatch(r"([1-8])\s+(.+)", line)
+    def is_handicap_st_line(value):
+        return bool(re.search(r"(?:[+-]?\d+|-)\s*m\s*/\s*ST\s*[+-]?\d?\.\d{2,3}", value, re.I))
 
-        if m:
-            # 次行が選手名らしい場合のみ開始
-            if i + 1 < len(lines):
-                nxt = lines[i + 1]
-                if not re.fullmatch(r"\d+(?:\.\d+)?%?", nxt):
-                    if current:
-                        blocks.append(current)
-                    current = {"車番": int(m.group(1)), "lines": []}
-            elif current:
-                current["lines"].append(line)
+    def looks_like_player_name(value):
+        value = value.strip()
+        if not value or len(value) > 40:
+            return False
+        if re.match(r"^(着順|平均|最高|試|ST|V\d|\d+(?:\.\d+)?%?$)", value):
+            return False
+        return bool(re.search(r"[^0-9.%()\s]", value))
 
-        elif m_inline and not re.match(r"^\d+\.\d", line):
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # 公式ページの標準形: 「1 ▲廿樂歩」
+        m_inline = re.fullmatch(r"([1-8])[\t 　]+(.+)", line)
+        inline_start = False
+        if m_inline:
+            candidate_name = m_inline.group(2).strip()
+            # 次行がハンデ/STなら、確実に選手見出し
+            inline_start = (
+                looks_like_player_name(candidate_name)
+                and i + 1 < len(lines)
+                and is_handicap_st_line(lines[i + 1])
+            )
+
+        # 一部コピー形式: 車番、氏名、ハンデ/ST がそれぞれ別行
+        m_single = re.fullmatch(r"([1-8])", line)
+        single_start = bool(
+            m_single
+            and i + 2 < len(lines)
+            and looks_like_player_name(lines[i + 1])
+            and is_handicap_st_line(lines[i + 2])
+        )
+
+        if inline_start:
             if current:
                 blocks.append(current)
             current = {
                 "車番": int(m_inline.group(1)),
-                "lines": [m_inline.group(2).strip()]
+                "lines": [m_inline.group(2).strip()],
             }
+        elif single_start:
+            if current:
+                blocks.append(current)
+            current = {
+                "車番": int(m_single.group(1)),
+                "lines": [lines[i + 1]],
+            }
+            i += 1  # 氏名行は取り込み済み
         elif current is not None:
             current["lines"].append(line)
+
+        i += 1
 
     if current:
         blocks.append(current)
 
-    # 同じ車番が紛れた場合は最初の有効ブロックのみ
+    # 同じ車番が紛れた場合は、内容の長いブロックを優先
     unique = {}
     for block in blocks:
         no = block["車番"]
-        if no not in unique and block["lines"]:
+        if not block["lines"]:
+            continue
+        if no not in unique or len(block["lines"]) > len(unique[no]["lines"]):
             unique[no] = block
     return [unique[k] for k in sorted(unique)]
 
@@ -4921,12 +4962,12 @@ def v152_parse_entry_block(block):
 
     # 審査ポイント
     review_point = np.nan
-    rpm = re.search(r"\(前[SAB]-?\d+\)\s*([0-9]{2,3}\.\d{3})", compact)
+    rpm = re.search(r"\(前[SAB]-?\d+\)\s*([0-9]{1,3}\.\d{3})", compact)
     if rpm:
         review_point = float(rpm.group(1))
     else:
         # ランク直後の3桁小数
-        rpm = re.search(r"\b[SAB]-?\d+\b\s*([0-9]{2,3}\.\d{3})", compact)
+        rpm = re.search(r"\b[SAB]-?\d+\b\s*([0-9]{1,3}\.\d{3})", compact)
         if rpm:
             review_point = float(rpm.group(1))
 
@@ -5041,6 +5082,11 @@ _old_v15_parse_race_meta = v15_parse_race_meta
 def v15_parse_race_meta(text):
     meta = _old_v15_parse_race_meta(text)
     compact = " ".join([x.strip() for x in v15_clean_text(text).splitlines() if x.strip()])
+
+    # 天候が単独行で貼られる形式（晴・曇・雨など）
+    wm = re.search(r"(?:^|\s)(晴|曇|雨|小雨|雪)(?:\s|$)", compact)
+    if wm:
+        meta["天候"] = wm.group(1)
 
     # 6R
     m = re.search(r"(?:^|\s)(\d{1,2})R(?:\s|$)", compact, re.I)
