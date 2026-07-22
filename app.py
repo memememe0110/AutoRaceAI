@@ -98,6 +98,7 @@ with st.sidebar:
 prediction_tab, db_tab = st.tabs(["🏁 予測", "🗃️ 登録情報確認"])
 
 with prediction_tab:
+    st.info("予測方式：Ver15.2互換エンジン。完全一致は同じDB・設定・乱数条件での照合が必要です。")
     text = st.text_area(
         "公式出走表を全文貼り付け",
         height=430,
@@ -130,7 +131,7 @@ with prediction_tab:
             total = int(trials)
             top = sorted(bets["三連単"].items(), key=lambda x: x[1], reverse=True)[:20]
             tri = pd.DataFrame([
-                {"順位": i, "三連単": "-".join(map(str, combo)), "確率": count / total}
+                {"順位": i, "三連単": "-".join(map(str, combo)), "確率": f"{(count / total) * 100:.2f}%"}
                 for i, (combo, count) in enumerate(top, 1)
             ])
             st.subheader("三連単確率 上位20")
