@@ -1,31 +1,11 @@
-# AutoRaceAI スマホ本予測 v2.6
+# AutoRaceAI スマホ本予測 v2.7
 
-## 追加機能
-- 公式プロフィールの「前走〜10走前」形式を解析
-- 選手履歴をSQLiteへ重複なしで登録
-- 登録前プレビュー
-- 選手別の登録情報確認
-- 確率を `%` 表示
-- GitHubへDBを保存し、アプリ起動時に復元
-- DBの手動ダウンロード・インポート
+- Ver13系SQLite DB（players / race_history）の読込に対応
+- アップロード後に登録選手・履歴件数を正しく表示
+- 前走〜10走前形式をVer13系DBと詳細ミラー表へ登録
+- 登録履歴を予測本体がそのまま使用
+- 展開予想（先行縦長・前残り・混戦・追い込み）を%表示
+- 三連単確率を%表示
+- GitHubへのDB保存・復元
 
-## Streamlit Secrets
-Streamlit Community Cloudのアプリ設定から次を登録してください。
-
-```toml
-GITHUB_TOKEN = "github_pat_xxxxxxxxx"
-GITHUB_REPO = "ユーザー名/リポジトリ名"
-GITHUB_BRANCH = "main"
-GITHUB_DB_PATH = "autorace_players.sqlite3"
-```
-
-`GITHUB_TOKEN`には対象リポジトリのContentsを読み書きできる権限が必要です。
-トークンを `app.py` やGitHub上のファイルへ直接書かないでください。
-
-## DB保持の仕組み
-1. アプリ起動時にGitHub上のDBを取得
-2. 選手情報登録後にSQLiteを更新
-3. 更新したDBをGitHubへコミット
-4. 再起動・再デプロイ後もGitHubから復元
-
-GitHub保存に失敗した場合でも、サイドバーからDBを端末へ保存できます。
+Streamlit Secretsには GITHUB_TOKEN / GITHUB_REPO / GITHUB_BRANCH / GITHUB_DB_PATH を設定してください。

@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver15.2互換予測・選手履歴登録・GitHub DB保存対応版")
+st.caption("Ver15.2互換予測・展開予想・選手履歴登録・GitHub DB保存対応版")
 
 
 def qident(name: str) -> str:
@@ -223,8 +223,10 @@ with st.sidebar:
     try:
         summary = db_summary(engine.DB_PATH)
         c1, c2 = st.columns(2)
-        c1.metric("登録選手", summary.get("import_players", summary.get("players", 0)))
-        c2.metric("登録履歴", summary.get("import_history", summary.get("history", 0)))
+        display_players = summary.get("players", 0) or summary.get("import_players", 0)
+        display_history = summary.get("history", 0) or summary.get("import_history", 0)
+        c1.metric("登録選手", display_players)
+        c2.metric("登録履歴", display_history)
         st.caption(f"DB容量: {summary.get('size', 0) / 1024 / 1024:.2f} MB")
         db_path = Path(engine.DB_PATH)
         if db_path.exists():
@@ -269,6 +271,21 @@ with prediction_tab:
             result = df[cols].sort_values(["改善後順位", "車"]).reset_index(drop=True)
             st.subheader("予測順位")
             st.dataframe(result, use_container_width=True, hide_index=True)
+
+            scenario_probs = engine.v27_scenario_probabilities(meta.get("走路温度", 30.0))
+            scenario_df = pd.DataFrame([
+                {"展開": name, "確率": prob * 100}
+                for name, prob in sorted(scenario_probs.items(), key=lambda x: x[1], reverse=True)
+            ])
+            st.subheader("展開予想")
+            st.dataframe(
+                scenario_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={"確率": st.column_config.NumberColumn("確率", format="%.1f%%")},
+            )
+            top_scenario = scenario_df.iloc[0]["展開"] if not scenario_df.empty else "不明"
+            st.caption(f"中心展開：{top_scenario}。Ver15.2のシミュレーションで使う4展開の事前確率です。")
 
             total = int(trials)
             top = sorted(bets["三連単"].items(), key=lambda x: x[1], reverse=True)[:20]
@@ -351,28 +368,58 @@ with db_tab:
             st.warning("DBにテーブルがありません。")
         else:
             with sqlite3.connect(engine.DB_PATH) as con:
-                if "v15_player_history_imports" in info["tables"]:
+                canonical_count = int(con.execute("SELECT COUNT(*) FROM race_history").fetchone()[0]) if "race_history" in info["tables"] else 0
+                import_count = int(con.execute("SELECT COUNT(*) FROM v15_player_history_imports").fetchone()[0]) if "v15_player_history_imports" in info["tables"] else 0
+
+                if canonical_count > 0 and "players" in info["tables"]:
+                    players = pd.read_sql_query(
+                        """
+                        SELECT p.player_name AS 選手名, COUNT(h.history_id) AS 登録件数,
+                               MAX(h.race_date) AS 最新日
+                        FROM players p
+                        LEFT JOIN race_history h ON h.player_id=p.player_id
+                        GROUP BY p.player_id, p.player_name
+                        HAVING COUNT(h.history_id) > 0
+                        ORDER BY p.player_name
+                        """, con)
+                    source_mode = "players / race_history"
+                elif import_count > 0:
                     players = pd.read_sql_query(
                         """
                         SELECT player_name AS 選手名, COUNT(*) AS 登録件数,
                                MAX(race_date) AS 最新日
                         FROM v15_player_history_imports
                         WHERE player_name IS NOT NULL AND player_name <> ''
-                        GROUP BY player_name
-                        ORDER BY player_name
-                        """,
-                        con,
-                    )
-                    query = st.text_input("選手名検索", placeholder="例：横田翔", key="db_player_search")
-                    shown = players
-                    if query.strip():
-                        shown = players[players["選手名"].astype(str).str.contains(query.strip(), case=False, na=False)]
-                    st.write(f"選手一覧: {len(shown)}件")
-                    st.dataframe(shown, use_container_width=True, hide_index=True, height=300)
+                        GROUP BY player_name ORDER BY player_name
+                        """, con)
+                    source_mode = "v15_player_history_imports"
+                else:
+                    players = pd.DataFrame(columns=["選手名", "登録件数", "最新日"])
+                    source_mode = "データなし"
 
-                    names = shown["選手名"].astype(str).tolist()
-                    if names:
-                        selected = st.selectbox("履歴を確認する選手", names)
+                st.caption(f"表示元: {source_mode}")
+                query = st.text_input("選手名検索", placeholder="例：横田翔", key="db_player_search")
+                shown = players
+                if query.strip():
+                    compact = re.sub(r"[\s　]+", "", query.strip())
+                    shown = players[players["選手名"].astype(str).str.replace(r"[\s　]+", "", regex=True).str.contains(compact, case=False, na=False)]
+                st.write(f"選手一覧: {len(shown)}件")
+                st.dataframe(shown, use_container_width=True, hide_index=True, height=300)
+
+                names = shown["選手名"].astype(str).tolist()
+                if names:
+                    selected = st.selectbox("履歴を確認する選手", names)
+                    if canonical_count > 0:
+                        history = pd.read_sql_query(
+                            """
+                            SELECT h.race_date AS 日付, h.venue AS 開催場, h.race_no AS レース,
+                                   h.finish AS 着順, h.surface AS 走路, h.handicap AS ハンデ,
+                                   h.trial_time AS 試走T, h.race_time AS 競走T,
+                                   h.start_time AS ST, h.source AS 登録元, h.created_at AS 登録日時
+                            FROM race_history h JOIN players p ON p.player_id=h.player_id
+                            WHERE p.player_name=? ORDER BY h.race_date DESC, h.history_id DESC
+                            """, con, params=(selected,))
+                    else:
                         history = pd.read_sql_query(
                             """
                             SELECT race_date AS 日付, venue AS 開催場, race_type AS レース種別,
@@ -383,14 +430,10 @@ with db_tab:
                                    trial_time AS 試走T, race_time AS 競走T, st AS ST,
                                    created_at AS 登録日時
                             FROM v15_player_history_imports
-                            WHERE player_name = ?
-                            ORDER BY race_date DESC, created_at DESC
-                            """,
-                            con,
-                            params=(selected,),
-                        )
-                        st.write(f"{selected}：履歴 {len(history)}件")
-                        st.dataframe(history, use_container_width=True, hide_index=True, height=430)
+                            WHERE player_name=? ORDER BY race_date DESC, created_at DESC
+                            """, con, params=(selected,))
+                    st.write(f"{selected}：履歴 {len(history)}件")
+                    st.dataframe(history, use_container_width=True, hide_index=True, height=430)
 
                 st.divider()
                 table = st.selectbox("DBテーブルを直接確認", info["tables"])

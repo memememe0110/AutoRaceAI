@@ -5309,3 +5309,114 @@ def ver16_run_prediction(text, trials=10000, seed=20260719):
     )
     return df, bets, output, entries, meta
 
+
+
+# ============================================================
+# v2.7: Ver13系DB互換登録・展開確率表示
+# ============================================================
+def v27_scenario_probabilities(track_temp=30.0):
+    """simulate_detailed と同じ4展開の事前確率を返す。"""
+    track_temp = float(track_temp if track_temp is not None else 30.0)
+    if track_temp < 44.0:
+        heat_index = 0.0
+    elif track_temp < 48.0:
+        heat_index = 0.05 + (track_temp - 44.0) / 4.0 * 0.20
+    elif track_temp < 50.0:
+        heat_index = 0.25 + (track_temp - 48.0) / 2.0 * 0.25
+    else:
+        heat_index = 0.50 + np.clip((track_temp - 50.0) / 10.0, 0.0, 1.0) * 0.50
+    names = np.array(["先行縦長", "前残り", "混戦", "追い込み"], dtype=object)
+    prob = np.array([0.36, 0.12, 0.28, 0.24], dtype=float)
+    prob += heat_index * np.array([-0.055, 0.185, -0.040, -0.090])
+    prob = np.clip(prob, 0.03, None)
+    prob /= prob.sum()
+    return {str(n): float(p) for n, p in zip(names, prob)}
+
+
+def _v27_norm_player_name(name):
+    return re.sub(r"[\s　]+", " ", str(name or "").strip())
+
+
+def _v27_record_key(*values):
+    raw = "|".join("" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v) for v in values)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def v15_save_player_history(df, db_path=DB_PATH):
+    """貼付履歴をVer13系 players/race_history に保存し、v15表にもミラーする。"""
+    if df is None or df.empty:
+        return 0, 0
+    mount_and_init_db()
+    v151_ensure_player_import_columns(db_path)
+    inserted = 0
+    skipped = 0
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("PRAGMA foreign_keys=ON")
+        for _, row in df.iterrows():
+            name = _v27_norm_player_name(row.get("選手名"))
+            if not name:
+                skipped += 1
+                continue
+            con.execute(
+                "INSERT OR IGNORE INTO players(player_name, created_at, updated_at) VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                (name,),
+            )
+            player_id = con.execute(
+                "SELECT player_id FROM players WHERE REPLACE(REPLACE(player_name,' ',''),'　','')=?",
+                (re.sub(r"[\s　]+", "", name),),
+            ).fetchone()[0]
+
+            race_date = row.get("開催日")
+            venue = row.get("開催場")
+            race_type = row.get("レース種別")
+            finish = None if pd.isna(row.get("着順")) else float(row.get("着順"))
+            starters = None if pd.isna(row.get("出走")) else float(row.get("出走"))
+            surface = row.get("走路")
+            handicap_num = None if pd.isna(row.get("ハンデ")) else int(row.get("ハンデ"))
+            handicap_text = None if handicap_num is None else f"{handicap_num}m"
+            trial = None if pd.isna(row.get("試走T")) else float(row.get("試走T"))
+            race_time = None if pd.isna(row.get("競走T")) else float(row.get("競走T"))
+            st = None if pd.isna(row.get("ST")) else float(row.get("ST"))
+            car_no = None if pd.isna(row.get("車番")) else int(row.get("車番"))
+            record_key = _v27_record_key(name, race_date, venue, race_type, finish, trial, race_time, st, car_no)
+
+            exists = con.execute("SELECT 1 FROM race_history WHERE record_key=?", (record_key,)).fetchone()
+            if exists:
+                skipped += 1
+            else:
+                con.execute(
+                    """INSERT INTO race_history(
+                        player_id, race_date, venue, race_no, finish, starters, surface,
+                        handicap, trial_time, race_time, start_time, result_status,
+                        use_for_model, source, record_key, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '通常', 1, 'スマホ貼付登録', ?, CURRENT_TIMESTAMP)""",
+                    (player_id, race_date, venue, race_type, finish, starters, surface,
+                     handicap_text, trial, race_time, st, record_key),
+                )
+                inserted += 1
+
+            # 詳細条件を保持するミラー表。予測本体は上のrace_historyを参照。
+            history_key = v15_hash(name, race_date, venue, race_type, finish, trial, race_time, car_no)
+            con.execute("""
+                INSERT OR IGNORE INTO v15_player_history_imports (
+                    history_key, player_name, race_date, venue, race_no,
+                    rank, starters, surface, handicap, trial_time,
+                    race_time, st, raw_line, created_at,
+                    weather, track_temp, air_temp, humidity,
+                    race_type, distance, laps, popularity, car_no
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                history_key, name, race_date, venue, None,
+                None if finish is None else int(finish), None if starters is None else int(starters), surface,
+                handicap_num, trial, race_time, st, row.get("_raw"), now,
+                row.get("天候"), None if pd.isna(row.get("走路温度")) else float(row.get("走路温度")),
+                None if pd.isna(row.get("気温")) else float(row.get("気温")),
+                None if pd.isna(row.get("湿度")) else float(row.get("湿度")),
+                race_type, None if pd.isna(row.get("距離")) else int(row.get("距離")),
+                None if pd.isna(row.get("周回数")) else int(row.get("周回数")),
+                None if pd.isna(row.get("人気")) else int(row.get("人気")), car_no,
+            ))
+        con.commit()
+    return inserted, skipped
