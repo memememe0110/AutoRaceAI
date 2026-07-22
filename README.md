@@ -1,11 +1,14 @@
-# AutoRaceAI スマホ本予測 v2.7
+# AutoRaceAI スマホ本予測 v3.0
 
-- Ver13系SQLite DB（players / race_history）の読込に対応
-- アップロード後に登録選手・履歴件数を正しく表示
-- 前走〜10走前形式をVer13系DBと詳細ミラー表へ登録
-- 登録履歴を予測本体がそのまま使用
-- 展開予想（先行縦長・前残り・混戦・追い込み）を%表示
-- 三連単確率を%表示
-- GitHubへのDB保存・復元
+## 主な変更
+- 確率計算を高速近似 `simulate()` から、Ver15.2内の詳細6周モデル `simulate_detailed()` に変更
+- 各試行でスタート、隊列形成、追い抜き、前残り、混戦突破、終盤変化を計算
+- 1着・2着・3着・3着内率をすべて％表示
+- 6周の代表展開表を表示
+- 三連単確率を％表示
+- `players` / `race_history` 形式の既存DBに対応
+- 選手履歴登録、DB確認、GitHub保存を維持
 
-Streamlit Secretsには GITHUB_TOKEN / GITHUB_REPO / GITHUB_BRANCH / GITHUB_DB_PATH を設定してください。
+## 注意
+6周代表展開表は、多数のシミュレーション結果を1本の見やすい流れにした表示用の代表経路です。
+着順確率と三連単確率は `simulate_detailed()` の全試行結果から集計します。

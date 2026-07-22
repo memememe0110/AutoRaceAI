@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver15.2互換予測・展開予想・選手履歴登録・GitHub DB保存対応版")
+st.caption("Ver15.2詳細6周シミュレーション・選手履歴登録・GitHub DB保存対応版")
 
 
 def qident(name: str) -> str:
@@ -243,7 +243,7 @@ with st.sidebar:
 prediction_tab, register_tab, db_tab = st.tabs(["🏁 予測", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
-    st.info("予測方式：Ver15.2互換エンジン。完全一致は同じDB・設定・乱数条件での照合が必要です。")
+    st.info("予測方式：Ver15.2の詳細6周モデル（simulate_detailed）。各試行で隊列変化を計算し、確率を集計します。")
     text = st.text_area(
         "公式出走表を全文貼り付け",
         height=430,
@@ -256,7 +256,7 @@ with prediction_tab:
             st.warning("出走表を貼り付けてください。")
             st.stop()
         try:
-            with st.spinner("Ver15.2本体で予測中…"):
+            with st.spinner("6周詳細シミュレーションを実行中…"):
                 df, bets, output, entries, meta = engine.ver16_run_prediction(text, int(trials), int(seed))
             st.success("予測が完了しました")
             st.subheader("解析した出走表")
@@ -271,6 +271,25 @@ with prediction_tab:
             result = df[cols].sort_values(["改善後順位", "車"]).reset_index(drop=True)
             st.subheader("予測順位")
             st.dataframe(result, use_container_width=True, hide_index=True)
+
+            st.subheader("6周の代表展開")
+            lap_df = engine.v30_representative_lap_projection(df)
+            st.dataframe(lap_df, use_container_width=True, hide_index=True)
+            st.caption("確率計算は全試行で6周詳細モデルを実行しています。この表は、その指標から作った見やすい代表的な1展開です。")
+
+            finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
+            st.subheader("着順確率")
+            st.dataframe(
+                finish_prob,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "1着率": st.column_config.NumberColumn("1着率", format="%.2f%%"),
+                    "2着率": st.column_config.NumberColumn("2着率", format="%.2f%%"),
+                    "3着率": st.column_config.NumberColumn("3着率", format="%.2f%%"),
+                    "3着内率": st.column_config.NumberColumn("3着内率", format="%.2f%%"),
+                },
+            )
 
             scenario_probs = engine.v27_scenario_probabilities(meta.get("走路温度", 30.0))
             scenario_df = pd.DataFrame([

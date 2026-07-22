@@ -3727,7 +3727,7 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
     _final_s = _norm01_col("終盤指数")
     df["ゴール前伸び指数"] = np.clip(_final_s*.36 + closing_v*.25 + _exec_s*.15 + _current_s*.10 + _trial_s*.08 + rear_v*.06,0,1)
 
-    finish_counts, bet_counts = simulate(df, trials, seed, track_temp=track_temp)
+    finish_counts, bet_counts = simulate_detailed(df, trials, seed, track_temp=track_temp)
     output = create_result_excel(
         content, filename, df, finish_counts, bet_counts, trials, track_temp=track_temp
     )
@@ -5420,3 +5420,76 @@ def v15_save_player_history(df, db_path=DB_PATH):
             ))
         con.commit()
     return inserted, skipped
+
+
+# ============================================================
+# v3.0: 6周詳細シミュレーション表示補助
+# ============================================================
+def v30_representative_lap_projection(df):
+    """詳細シミュレーション用指標から、代表的な6周の隊列推移を作る。
+
+    確率計算そのものは simulate_detailed() が担当する。この関数は画面表示用で、
+    スタート隊列から最終予測順位へ、隣接追い抜きだけで移る代表経路を返す。
+    """
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    work = df.copy().reset_index(drop=True)
+    cars = pd.to_numeric(work.get("車"), errors="coerce").fillna(999).astype(int).to_numpy()
+    names = work.get("選手名", pd.Series([""] * len(work))).astype(str).to_numpy()
+    handicap = pd.to_numeric(work.get("ハンデ"), errors="coerce").fillna(0).to_numpy(float)
+    st = pd.to_numeric(work.get("ST予測", work.get("平均ST", pd.Series(0.15, index=work.index))), errors="coerce").fillna(0.15).to_numpy(float)
+    start_stretch = pd.to_numeric(work.get("スタート伸び指数", pd.Series(0.5, index=work.index)), errors="coerce").fillna(0.5).to_numpy(float)
+    final_rank = pd.to_numeric(work.get("改善後順位", pd.Series(range(1, len(work)+1))), errors="coerce").fillna(len(work)).to_numpy(float)
+    closing = pd.to_numeric(work.get("ゴール前伸び指数", work.get("終盤指数", pd.Series(0.5, index=work.index))), errors="coerce").fillna(0.5).to_numpy(float)
+    breakthrough = pd.to_numeric(work.get("混戦突破適性", pd.Series(0.5, index=work.index)), errors="coerce").fillna(0.5).to_numpy(float)
+
+    # ハンデ前方を基本に、STとスタート伸びで1周目隊列を作る。
+    start_key = handicap * 0.045 + st * 1.8 - start_stretch * 0.18 + cars * 0.002
+    order = list(np.argsort(start_key, kind="stable"))
+    target = list(np.argsort(final_rank, kind="stable"))
+    snapshots = [order.copy()]
+
+    # 2～6周目。1周に一度、隣接車だけを入れ替えて徐々に最終隊列へ近づける。
+    for lap in range(2, 7):
+        desired_pos = {idx: pos for pos, idx in enumerate(target)}
+        candidates = []
+        for pos in range(1, len(order)):
+            chaser, leader = order[pos], order[pos-1]
+            if desired_pos[chaser] < desired_pos[leader]:
+                late = max(0.0, (lap - 3) / 3.0)
+                strength = (breakthrough[chaser] * (1-late) + closing[chaser] * late)
+                resistance = 0.35 * breakthrough[leader] + 0.25 * closing[leader]
+                urgency = desired_pos[leader] - desired_pos[chaser]
+                candidates.append((strength - resistance + urgency * 0.08, pos))
+        # 周回後半ほど最大2組、序盤は最大1組。互いに重ならない隣接交換のみ。
+        candidates.sort(reverse=True)
+        max_swaps = 1 if lap <= 3 else 2
+        used = set(); swaps = 0
+        for _, pos in candidates:
+            if swaps >= max_swaps or pos in used or (pos-1) in used:
+                continue
+            order[pos-1], order[pos] = order[pos], order[pos-1]
+            used.update({pos-1, pos}); swaps += 1
+        snapshots.append(order.copy())
+
+    rows=[]
+    for lap, snap in enumerate(snapshots, 1):
+        row={"周回": f"{lap}周目"}
+        for pos, idx in enumerate(snap, 1):
+            row[f"{pos}位"] = f"{cars[idx]} {names[idx]}".strip()
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def v30_finish_probabilities(df, bet_counts, trials):
+    """三連単カウントから各車の1～3着確率を％値で集計する。"""
+    total=max(1, int(trials))
+    counts={int(c): [0,0,0] for c in pd.to_numeric(df.get("車"), errors="coerce").dropna().astype(int)}
+    for combo, n in bet_counts.get("三連単", {}).items():
+        for pos, car in enumerate(combo[:3]):
+            counts.setdefault(int(car), [0,0,0])[pos] += int(n)
+    name_map={int(r["車"]): str(r.get("選手名", "")) for _,r in df.iterrows() if pd.notna(r.get("車"))}
+    rows=[]
+    for car, vals in counts.items():
+        rows.append({"車":car,"選手名":name_map.get(car,""),"1着率":vals[0]/total*100,"2着率":vals[1]/total*100,"3着率":vals[2]/total*100,"3着内率":sum(vals)/total*100})
+    return pd.DataFrame(rows).sort_values(["1着率","3着内率"],ascending=False).reset_index(drop=True)
