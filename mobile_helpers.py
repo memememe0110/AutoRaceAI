@@ -14,6 +14,7 @@ import io, re, sqlite3
 from datetime import datetime
 import numpy as np
 import pandas as pd
+from openpyxl import Workbook
 
 def safe_float(v, default=None):
     try:
