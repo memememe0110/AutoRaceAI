@@ -1,21 +1,33 @@
-# AutoRaceAI Ver18.0 α
+# AutoRaceAI Ver18.1 公式出走表対応
 
-GitHubでフォルダを作る必要はありません。ZIP内の6ファイルをリポジトリの一番上へアップロードしてください。
+GitHubでフォルダを作る必要はありません。ZIP内のファイルをリポジトリの一番上へアップロードしてください。
 
-- app.py
-- parser.py
-- database.py
-- predictor.py
-- requirements.txt
-- README.md
+## 対応した貼り付け形式
 
-Streamlit Community CloudのMain file pathは `app.py` です。
+- `6R`
+- `2026年7月21日(火)`
+- `20:05発走 3100m 7車 6周`
+- `湿走路 /34℃`
+- `気温：30℃`
+- `湿度：88%`
+- 車番と選手名から始まる公式出走表の選手ブロック
 
-現在の機能:
-- 出走表貼り付け
-- 開催情報と選手候補の解析
-- SQLite保存
-- DBダウンロード
-- 仮の簡易予測
+選手ごとに次を読み取ります。
 
-まだ本予測、モンテカルロ、結果登録、再学習は未実装です。
+- 車番
+- 選手名
+- ハンデ
+- ST
+- 試走T
+- 現ランク
+- 車名
+- 平均試走T
+- 平均競走T
+- 最高競走T
+- 湿2連対率
+- 湿3連対率
+
+## Streamlit設定
+
+- Branch: main
+- Main file path: app.py
