@@ -1,12 +1,12 @@
-# AutoRaceAI スマホ本予測 v2
+# AutoRaceAI スマホ本予測 v2.2
 
-Ver15.2の設定値、player_metrics、calculate_excel_model、モンテカルロを移植したStreamlit版です。
+## 修正点
+- `KeyError: '有効'` を修正
+- iPhoneでSQLiteを選べるよう、アップロード拡張子制限を撤廃
+- SQLiteヘッダー・整合性を検査してから読み込み
+- 読み込みボタンと登録件数表示を追加
+- 旧DBに不足テーブルがある場合は、既存データを消さずに追加
 
-## 起動
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## 重要
-元版と同じ予測結果にするには、元版で使用した `autorace_players.sqlite3` を画面左から読み込んでください。履歴DBが異なると結果も異なります。
+## DBの読み込み
+サイドバーから `autorace_players.sqlite3` 本体を選択し、
+「この履歴DBを読み込む」を押してください。ZIPファイルは読み込めません。

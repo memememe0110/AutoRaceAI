@@ -314,10 +314,67 @@ def weighted_std_series(values, weights):
     return float(np.sqrt(max(variance, 0.0)))
 
 
+HISTORY_MODEL_COLUMNS = [
+    "開催日", "開催場", "レース", "着順", "出走", "走路",
+    "ハンデ", "ハンデ数値", "試走T", "競走T", "ST",
+    "タイム差", "有効",
+]
+
+
+def normalize_history_schema(df):
+    """DB版・Excel版どちらの履歴でも元版の予測列へ揃える。"""
+    x = pd.DataFrame() if df is None else df.copy()
+
+    # DB由来の履歴には、元Excelでread_history()が作っていた計算列がない。
+    for col in HISTORY_MODEL_COLUMNS:
+        if col not in x.columns:
+            x[col] = pd.Series(index=x.index, dtype="object")
+
+    # SQLiteの日付文字列とExcelシリアル値の両方に対応
+    x["開催日"] = x["開催日"].apply(excel_serial)
+
+    # 数値列を安全に統一
+    numeric_cols = ["着順", "出走", "ハンデ数値", "試走T", "競走T", "ST", "タイム差"]
+    for col in numeric_cols:
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+
+    # DBのハンデ列から数値ハンデを復元
+    missing_h = x["ハンデ数値"].isna()
+    if missing_h.any():
+        x.loc[missing_h, "ハンデ数値"] = x.loc[missing_h, "ハンデ"].apply(handicap_number)
+
+    # 元版と同じタイム差・有効判定を復元
+    computed_gap = x["競走T"] - x["試走T"]
+    missing_gap = x["タイム差"].isna()
+    x.loc[missing_gap, "タイム差"] = computed_gap[missing_gap]
+
+    valid_calc = (
+        x["試走T"].notna()
+        & x["競走T"].notna()
+        & x["タイム差"].notna()
+        & (x["タイム差"] > 0)
+    )
+    supplied = x["有効"]
+    if supplied.isna().all():
+        x["有効"] = valid_calc
+    else:
+        supplied_bool = supplied.map(
+            lambda v: v if isinstance(v, (bool, np.bool_))
+            else str(v).strip().lower() not in ("", "0", "false", "none", "nan")
+        )
+        x["有効"] = supplied_bool & valid_calc
+
+    x["開催場"] = x["開催場"].fillna("").astype(str)
+    x["走路"] = x["走路"].fillna("").astype(str)
+    return x[HISTORY_MODEL_COLUMNS].copy()
+
+
 def prepare_history(df, current, race, settings):
-    x = df.copy()
+    x = normalize_history_schema(df)
 
     if x.empty:
+        for col in ["経過日数", "最近重み", "場重み", "走路適合重み", "走路重み", "ハンデ重み", "総合重み"]:
+            x[col] = pd.Series(index=x.index, dtype="float64")
         return x
 
     # Ver10.6: 公式プロフィール取得時に、予測対象レースの確定結果が
@@ -327,6 +384,8 @@ def prepare_history(df, current, race, settings):
     ) & (x["開催場"].astype(str) == str(race["開催場"]))
     x = x.loc[~same_day_result].copy()
     if x.empty:
+        for col in ["経過日数", "最近重み", "場重み", "走路適合重み", "走路重み", "ハンデ重み", "総合重み"]:
+            x[col] = pd.Series(index=x.index, dtype="float64")
         return x
 
     x["経過日数"] = np.maximum(0, race["開催日"] - x["開催日"])
@@ -418,7 +477,16 @@ def smooth_points(values, maximum, lower_is_better=True, zero_is_zero=False):
 def player_metrics(car, current, hist, race, settings):
     x = prepare_history(hist, current, race, settings)
 
-    valid = x[x["有効"]].copy()
+    # Streamlit版では、旧DBや空履歴から作ったDataFrameに
+    # 「有効」列がない場合がある。元版の通常履歴は有効扱いにする。
+    if "有効" not in x.columns:
+        x = x.copy()
+        x["有効"] = True
+    else:
+        x = x.copy()
+        x["有効"] = x["有効"].fillna(True).astype(bool)
+
+    valid = x.loc[x["有効"]].copy()
     first5 = valid.head(5)
     first10 = valid.head(10)
     first30 = valid.head(30)
