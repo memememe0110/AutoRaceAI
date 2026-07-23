@@ -242,7 +242,7 @@ def current_player(ws):
 
 
 def normalize_surface(value):
-    """走路表記を 良・斑・湿 にそろえる。"""
+    """走路表記を 良・斑・湿・風 にそろえる。"""
     s = text(value)
     if "良" in s:
         return "良"
@@ -250,6 +250,8 @@ def normalize_surface(value):
         return "斑"
     if "湿" in s:
         return "湿"
+    if "風" in s:
+        return "風"
     return s
 
 
@@ -278,6 +280,14 @@ def surface_compatibility_weight(history_surface, current_surface):
         # 今回が斑走路（良と湿の中間として扱う）
         ("良", "斑"): 0.15,
         ("湿", "斑"): 0.20,
+
+        # 風走路は乾いた良走路に近いが、別条件として弱めに共有する
+        ("風", "良"): 0.65,
+        ("良", "風"): 0.65,
+        ("斑", "風"): 0.18,
+        ("風", "斑"): 0.22,
+        ("湿", "風"): 0.03,
+        ("風", "湿"): 0.03,
     }
     return weights.get((past, now), 0.05)
 
@@ -4093,7 +4103,7 @@ def v15_guess_history_row(line):
             rank = int(nums[-1])
 
     surface = None
-    for s in ["良走路", "湿走路", "斑走路", "風走路", "良", "湿", "斑"]:
+    for s in ["良走路", "湿走路", "斑走路", "風走路", "良", "湿", "斑", "風"]:
         if s in line:
             surface = s
             break
@@ -4624,7 +4634,7 @@ def v151_parse_history_block(block, player_name=""):
             continue
 
         # 走路
-        if line in ["良", "湿", "斑", "良走路", "湿走路", "斑走路"]:
+        if line in ["良", "湿", "斑", "風", "良走路", "湿走路", "斑走路", "風走路"]:
             row["走路"] = line
             continue
 
@@ -5107,7 +5117,7 @@ def v15_parse_race_meta(text):
         meta["発走時刻"] = m.group(1)
 
     # 良走路 /60℃
-    m = re.search(r"(良走路|湿走路|斑走路|良|湿|斑)\s*/\s*(-?\d+(?:\.\d+)?)℃", compact)
+    m = re.search(r"(良走路|湿走路|斑走路|風走路|良|湿|斑|風)\s*/\s*(-?\d+(?:\.\d+)?)℃", compact)
     if m:
         meta["走路状態"] = m.group(1)
         meta["走路温度"] = float(m.group(2))
@@ -5923,12 +5933,12 @@ def _v35_parse_meta(text, venue_override="", race_no_override=""):
     if found_venue:
         meta["開催場"] = found_venue
 
-    surface_match = re.search(r"(良走路|湿走路|斑走路|荒走路)\s*/\s*(-?\d+(?:\.\d+)?)℃", text)
+    surface_match = re.search(r"(良走路|湿走路|斑走路|風走路|荒走路)\s*/\s*(-?\d+(?:\.\d+)?)℃", text)
     if surface_match:
         meta["走路状態"] = surface_match.group(1)
         meta["走路温度"] = float(surface_match.group(2))
     else:
-        sm = re.search(r"(良走路|湿走路|斑走路|荒走路)", text)
+        sm = re.search(r"(良走路|湿走路|斑走路|風走路|荒走路)", text)
         if sm:
             meta["走路状態"] = sm.group(1)
 
@@ -6182,7 +6192,7 @@ def v36_init_history_tables(db_path=DB_PATH):
 
 def _v36_surface_short(value):
     v = str(value or "").strip()
-    return {"良走路":"良", "湿走路":"湿", "斑走路":"斑", "荒走路":"荒"}.get(v, v)
+    return {"良走路":"良", "湿走路":"湿", "斑走路":"斑", "風走路":"風", "荒走路":"荒"}.get(v, v)
 
 
 def v36_update_player_histories(meta, results, laps=None, db_path=DB_PATH):
@@ -6261,3 +6271,30 @@ def v36_save_result_and_analyze(meta, results, laps=None, payouts=None, db_path=
                         (json.dumps(analysis, ensure_ascii=False), key))
             con.commit()
     return key, comparison, analysis
+
+
+# ============================================================
+# v3.7 風走路・縦型履歴対応
+# ============================================================
+def v37_init_adjustment_log(db_path=DB_PATH):
+    v36_init_history_tables(db_path)
+    rows = [
+        ("v3.7", "走路解析", "縦型選手履歴の走路『風』『風走路』を独立条件として保存", 0),
+        ("v3.7", "ハンデ解析", "『1番-m』などの-m表記を0mとして登録", 0),
+        ("v3.7", "走路補正", "風走路は良走路に近い別条件として弱く共有し、湿走路とはほぼ分離", 1),
+    ]
+    with sqlite3.connect(str(db_path)) as con:
+        con.executemany("""INSERT OR IGNORE INTO adjustment_log
+            (version,category,description,coefficient_changed) VALUES(?,?,?,?)""", rows)
+        con.commit()
+
+
+# 調整履歴表示時にv3.7の記録も初期化する
+_v36_get_adjustment_log_original = v36_get_adjustment_log
+def v36_get_adjustment_log(db_path=DB_PATH):
+    v37_init_adjustment_log(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        return pd.read_sql_query("""SELECT version AS バージョン, category AS 分類,
+            description AS 調整内容,
+            CASE coefficient_changed WHEN 1 THEN '変更あり' ELSE '変更なし' END AS 係数変更
+            FROM adjustment_log ORDER BY adjustment_id DESC""", con)
