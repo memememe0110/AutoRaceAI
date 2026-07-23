@@ -6722,3 +6722,258 @@ def v40_current_weights(db_path=DB_PATH):
         {"項目": k, "現在の重み": v, "初期値": V40_DEFAULT_WEIGHTS[k], "初期値からの差": v - V40_DEFAULT_WEIGHTS[k]}
         for k, v in w.items()
     ])
+
+# ============================================================
+# v4.1 全結果・直近重視学習 / 重複防止 / 欠損着順除外 / Undo
+# ============================================================
+V41_RECENT_RACES = 20
+V41_DECAY = 0.90
+
+
+def v41_valid_results(results):
+    """有効着順だけを分析用に返す。欠車・中止・空欄等は保存可能だが分析対象外。"""
+    if results is None or results.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    work = results.copy()
+    work["_finish_num"] = pd.to_numeric(work.get("着順"), errors="coerce")
+    field_size = max(1, int(len(work)))
+    status = work.get("結果区分", pd.Series("通常", index=work.index)).fillna("").astype(str)
+    invalid_status = status.str.contains("欠車|競走中止|落車|反則|不成立|失格", regex=True)
+    valid_mask = work["_finish_num"].notna() & (work["_finish_num"] >= 1) & (work["_finish_num"] <= field_size) & ~invalid_status
+    valid = work.loc[valid_mask].copy()
+    valid["着順"] = valid["_finish_num"].astype(int)
+    excluded = work.loc[~valid_mask].copy()
+    if not excluded.empty:
+        excluded["除外理由"] = np.where(invalid_status.loc[excluded.index], status.loc[excluded.index], "着順なし・範囲外")
+    return valid.drop(columns=["_finish_num"], errors="ignore"), excluded.drop(columns=["_finish_num"], errors="ignore")
+
+
+def v41_init_tables(db_path=DB_PATH):
+    v40_init_learning_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS v41_registration_batches (
+            batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_key TEXT NOT NULL UNIQUE,
+            registered_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            before_weights_json TEXT,
+            valid_count INTEGER NOT NULL DEFAULT 0,
+            excluded_count INTEGER NOT NULL DEFAULT 0,
+            undone_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_v41_batches_status ON v41_registration_batches(status, batch_id);
+        """)
+        con.commit()
+
+
+def v41_race_exists(meta, db_path=DB_PATH):
+    v41_init_tables(db_path)
+    key = v34_race_key(meta)
+    with sqlite3.connect(str(db_path)) as con:
+        row = con.execute("SELECT registered_at FROM result_races WHERE race_key=?", (key,)).fetchone()
+    return (row is not None), key, (row[0] if row else None)
+
+
+def _v41_all_race_evidence(db_path=DB_PATH):
+    """全登録結果を使い、直近20件を指数減衰で強く、古い履歴を20%残して相関を集計。"""
+    v41_init_tables(db_path)
+    colmap = {
+        "試走": "trial_feature", "ST": "st_feature", "ハンデ": "handicap_feature",
+        "近況": "form_feature", "走路適性": "surface_feature", "前残り": "front_feature",
+        "追い込み": "chase_feature", "周回安定": "stability_feature",
+        "コース適性": "course_feature", "相手耐性": "opponent_feature",
+    }
+    with sqlite3.connect(str(db_path)) as con:
+        races = pd.read_sql_query("""
+            SELECT rr.race_key, rr.registered_at
+            FROM result_races rr
+            JOIN v40_prediction_feature_snapshots s ON s.race_key=rr.race_key
+            LEFT JOIN v41_registration_batches b ON b.race_key=rr.race_key
+            WHERE COALESCE(b.status,'active')='active'
+            GROUP BY rr.race_key, rr.registered_at
+            ORDER BY rr.registered_at DESC, rr.race_key DESC
+        """, con)
+        per_race = []
+        for _, rr in races.iterrows():
+            merged = pd.read_sql_query("""
+                SELECT s.*, e.finish, e.result_status
+                FROM v40_prediction_feature_snapshots s
+                JOIN result_entries e ON e.race_key=s.race_key AND e.car_no=s.car_no
+                WHERE s.race_key=?
+            """, con, params=(rr["race_key"],))
+            if merged.empty:
+                continue
+            finish = pd.to_numeric(merged["finish"], errors="coerce")
+            status = merged["result_status"].fillna("").astype(str)
+            n_all = len(merged)
+            mask = finish.notna() & (finish >= 1) & (finish <= n_all) & ~status.str.contains("欠車|競走中止|落車|反則|不成立|失格", regex=True)
+            merged = merged.loc[mask].copy()
+            if len(merged) < 3:
+                continue
+            performance = (len(merged) + 1) - pd.to_numeric(merged["finish"], errors="coerce")
+            row = {"race_key": rr["race_key"], "registered_at": rr["registered_at"]}
+            for k, c in colmap.items():
+                row[k] = _v39_spearman(merged[c], performance)
+            per_race.append(row)
+    if not per_race:
+        return {k: 0.0 for k in V40_DEFAULT_WEIGHTS}, {"race_count": 0, "latest_contribution": 0.0, "recent_contribution": 0.0}
+    ev = pd.DataFrame(per_race)
+    recent = ev.head(V41_RECENT_RACES).copy()
+    recent_weights = np.array([V41_DECAY ** i for i in range(len(recent))], dtype=float)
+    recent_weights /= recent_weights.sum()
+    old = ev.iloc[V41_RECENT_RACES:].copy()
+    evidence = {}
+    for k in V40_DEFAULT_WEIGHTS:
+        recent_value = float(np.average(pd.to_numeric(recent[k], errors="coerce").fillna(0.0), weights=recent_weights))
+        if old.empty:
+            evidence[k] = recent_value
+        else:
+            old_value = float(pd.to_numeric(old[k], errors="coerce").fillna(0.0).mean())
+            evidence[k] = 0.80 * recent_value + 0.20 * old_value
+    latest_contribution = float(recent_weights[0] * (0.80 if not old.empty else 1.0))
+    recent_contribution = 0.80 if not old.empty else 1.0
+    return evidence, {
+        "race_count": int(len(ev)),
+        "recent_count": int(len(recent)),
+        "old_count": int(len(old)),
+        "latest_contribution": latest_contribution,
+        "recent_contribution": recent_contribution,
+    }
+
+
+def v41_adjust_weights_after_result(meta, results, db_path=DB_PATH):
+    """同一レースは二重学習せず、全結果を直近重視で集計して10要素を微調整。"""
+    v41_init_tables(db_path)
+    key = v34_race_key(meta)
+    valid, excluded = v41_valid_results(results)
+    if len(valid) < 3:
+        return {"message": f"有効着順が{len(valid)}人のため、重みは変更していません。", "valid_count": len(valid), "excluded_count": len(excluded)}
+    with sqlite3.connect(str(db_path)) as con:
+        already = con.execute("SELECT 1 FROM weight_adjustment_history WHERE race_key=? LIMIT 1", (key,)).fetchone()
+    if already:
+        return {"message": "このレースはすでに学習済みのため、重みを二重更新していません。", "duplicate": True}
+
+    evidence, stats = _v41_all_race_evidence(db_path)
+    before = v40_get_weights(db_path)
+    strength = {k: max(0.05, (evidence[k] + 1.0) / 2.0) for k in evidence}
+    target_total = sum(strength.values())
+    target = {k: strength[k] / target_total for k in strength}
+    raw = {k: before[k] + max(-0.003, min(0.003, (target[k] - before[k]) * 0.08)) for k in before}
+    raw = {k: min(0.30, max(0.025, v)) for k, v in raw.items()}
+    total = sum(raw.values())
+    after = {k: v / total for k, v in raw.items()}
+
+    with sqlite3.connect(str(db_path)) as con:
+        snap = pd.read_sql_query("SELECT * FROM v40_prediction_feature_snapshots WHERE race_key=?", con, params=(key,))
+    merged = snap.merge(valid[["車番", "着順"]], left_on="car_no", right_on="車番", how="inner")
+    colmap = {"試走":"trial_feature","ST":"st_feature","ハンデ":"handicap_feature","近況":"form_feature","走路適性":"surface_feature","前残り":"front_feature","追い込み":"chase_feature","周回安定":"stability_feature","コース適性":"course_feature","相手耐性":"opponent_feature"}
+    before_top3 = "→".join(map(str, merged.sort_values("before_rank")["car_no"].head(3).astype(int))) if not merged.empty else ""
+    diagnostic = sum(after[k] * merged[colmap[k]] for k in after) if not merged.empty else pd.Series(dtype=float)
+    after_top3 = "→".join(map(str, merged.assign(diag_score=diagnostic).sort_values("diag_score", ascending=False)["car_no"].head(3).astype(int))) if not merged.empty else ""
+    actual_top3 = "→".join(map(str, valid.sort_values("着順")["車番"].head(3).astype(int)))
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(str(db_path)) as con:
+        for k in before:
+            delta = after[k] - before[k]
+            reason = f"全{stats['race_count']}レースを集計。直近{stats.get('recent_count',0)}件を指数減衰({V41_DECAY})で重視。"
+            con.execute("UPDATE adaptive_weights SET current_weight=?,updated_at=?,update_count=update_count+1 WHERE feature_name=?", (after[k], now, k))
+            con.execute("""INSERT INTO weight_adjustment_history
+                (race_key,adjusted_at,feature_name,before_weight,after_weight,delta,evidence_score,reason,before_top3,after_top3,actual_top3,diagnostic_exact_before,diagnostic_exact_after)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (key, now, k, before[k], after[k], delta, evidence[k], reason, before_top3, after_top3, actual_top3, int(before_top3==actual_top3), int(after_top3==actual_top3)))
+        con.commit()
+    return {"race_key":key,"before":before,"after":after,"evidence":evidence,"before_top3":before_top3,"after_top3":after_top3,"actual_top3":actual_top3,"diagnostic_exact_before":before_top3==actual_top3,"diagnostic_exact_after":after_top3==actual_top3,"valid_count":len(valid),"excluded_count":len(excluded),"learning_stats":stats,"note":"全登録結果を考慮し、最近ほど強く反映しました。三連単は順番まで完全一致のみ的中です。"}
+
+
+def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    """安全登録。レース名はキーに使わず、同一レースを拒否し、Undo情報を保存。"""
+    v41_init_tables(db_path)
+    exists, key, registered_at = v41_race_exists(meta, db_path)
+    if exists:
+        return key, pd.DataFrame(), {"message": f"同じ開催日・開催場・レース番号の結果は登録済みです（{registered_at}）。履歴追加・重み更新は行っていません。", "duplicate": True}, {"message":"重複のため学習なし", "duplicate":True}, {"duplicate":True}
+    valid, excluded = v41_valid_results(results)
+    before_weights = v40_get_weights(db_path)
+    # 既存の保存処理は着順を整数化するため、有効着順だけを渡す。
+    # 除外行は後段で着順NULLのまま保存し、試走/ST等の履歴だけ利用可能にする。
+    key, comparison, analysis = v36_save_result_and_analyze(meta, valid, laps, payouts, db_path)
+    if not excluded.empty:
+        now_ex = datetime.now().isoformat(timespec="seconds")
+        with sqlite3.connect(str(db_path)) as con:
+            for _, r in excluded.iterrows():
+                con.execute("""INSERT OR REPLACE INTO result_entries
+                    (race_key,car_no,player_name,finish,trial_time,race_time,start_time,handicap,result_status)
+                    VALUES(?,?,?,?,?,?,?,?,?)""", (
+                    key, int(r.get("車番")), str(r.get("選手名", "")), None,
+                    None if pd.isna(r.get("試走T")) else float(r.get("試走T")),
+                    None if pd.isna(r.get("競走T")) else float(r.get("競走T")),
+                    None if pd.isna(r.get("ST")) else float(r.get("ST")),
+                    str(r.get("ハンデ", "")), str(r.get("結果区分", "着順なし"))
+                ))
+            con.commit()
+        # 着順なしでも試走・ST・走路情報は履歴として保存する。
+        extra_summary = v36_update_player_histories(meta, excluded, None, db_path)
+        analysis["履歴追加"] = int(analysis.get("履歴追加", 0)) + int(extra_summary.get("履歴追加", 0))
+        analysis["履歴重複スキップ"] = int(analysis.get("履歴重複スキップ", 0)) + int(extra_summary.get("履歴重複スキップ", 0))
+    adjustment = v41_adjust_weights_after_result(meta, results, db_path)
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("""INSERT OR REPLACE INTO v41_registration_batches
+            (race_key,registered_at,status,before_weights_json,valid_count,excluded_count,undone_at)
+            VALUES(?,?,'active',?,?,?,NULL)""", (key, now, json.dumps(before_weights, ensure_ascii=False), len(valid), len(excluded)))
+        con.commit()
+    analysis = dict(analysis)
+    analysis.update({"分析対象":len(valid),"分析除外":len(excluded)})
+    return key, comparison, analysis, adjustment, {"duplicate":False,"valid":valid,"excluded":excluded}
+
+
+def v41_registration_history(db_path=DB_PATH, limit=50):
+    v41_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        return pd.read_sql_query("""SELECT batch_id AS ID, race_key AS レースID, registered_at AS 登録日時,
+            CASE status WHEN 'active' THEN '登録中' ELSE '取消済' END AS 状態,
+            valid_count AS 分析対象, excluded_count AS 除外
+            FROM v41_registration_batches ORDER BY batch_id DESC LIMIT ?""", con, params=(int(limit),))
+
+
+def v41_undo_last_registration(db_path=DB_PATH):
+    """最後の結果登録を、重み・結果・周回・払戻・自動追加履歴ごと取り消す。"""
+    v41_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        batch = con.execute("SELECT * FROM v41_registration_batches WHERE status='active' ORDER BY batch_id DESC LIMIT 1").fetchone()
+        if not batch:
+            return False, "取り消せる結果登録がありません。"
+        key = batch["race_key"]
+        rr = con.execute("SELECT * FROM result_races WHERE race_key=?", (key,)).fetchone()
+        entries = con.execute("SELECT * FROM result_entries WHERE race_key=?", (key,)).fetchall()
+        before = json.loads(batch["before_weights_json"] or "{}")
+        now = datetime.now().isoformat(timespec="seconds")
+        for name, weight in before.items():
+            con.execute("UPDATE adaptive_weights SET current_weight=?,updated_at=?,update_count=MAX(0,update_count-1) WHERE feature_name=?", (float(weight), now, name))
+        # 自動結果登録で追加した選手履歴だけを実値照合して削除。
+        if rr:
+            for e in entries:
+                found = _v32_find_player(con, e["player_name"])
+                if found:
+                    player_id = found[0]
+                    rows = con.execute("SELECT * FROM race_history WHERE player_id=? AND race_date=? AND venue=? AND source='スマホ貼付登録'", (player_id, rr["race_date"], rr["venue"])).fetchall()
+                    cols = [d[0] for d in con.execute("SELECT * FROM race_history LIMIT 0").description]
+                    for rh in rows:
+                        d = dict(zip(cols, rh))
+                        same = (_v33_norm_number(d.get("finish"),0)==_v33_norm_number(e["finish"],0) and _v33_norm_number(d.get("trial_time"),3)==_v33_norm_number(e["trial_time"],3) and _v33_norm_number(d.get("race_time"),3)==_v33_norm_number(e["race_time"],3) and _v33_norm_number(d.get("start_time"),3)==_v33_norm_number(e["start_time"],3))
+                        if same:
+                            con.execute("DELETE FROM race_history WHERE history_id=?", (d["history_id"],))
+                    # ミラー表も同じ実値で削除。
+                    con.execute("""DELETE FROM v15_player_history_imports WHERE player_name=? AND race_date=? AND venue=?
+                        AND COALESCE(rank,-999)=COALESCE(?,-999) AND COALESCE(trial_time,-999)=COALESCE(?,-999)
+                        AND COALESCE(race_time,-999)=COALESCE(?,-999) AND COALESCE(st,-999)=COALESCE(?,-999)""",
+                        (found[1], rr["race_date"], rr["venue"], e["finish"], e["trial_time"], e["race_time"], e["start_time"]))
+        for table in ["result_laps","result_payouts","prediction_feedback","result_entries","player_lap_history","weight_adjustment_history"]:
+            try:
+                con.execute(f"DELETE FROM {table} WHERE race_key=?", (key,))
+            except sqlite3.OperationalError:
+                pass
+        con.execute("DELETE FROM result_races WHERE race_key=?", (key,))
+        con.execute("UPDATE v41_registration_batches SET status='undone',undone_at=? WHERE batch_id=?", (now, batch["batch_id"]))
+        con.commit()
+    return True, f"{key} の結果登録と学習を取り消しました。予測スナップショットは再登録用に残しています。"

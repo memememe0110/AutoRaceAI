@@ -435,9 +435,12 @@ with result_tab:
 
         if st.button("DBへ登録して予測差・展開を解析", type="primary", use_container_width=True):
             try:
-                key, comparison, analysis = engine.v36_save_result_and_analyze(
+                key, comparison, analysis, adjustment, registration = engine.v41_register_result(
                     meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
                 )
+                if registration.get("duplicate"):
+                    st.warning(analysis.get("message", "このレースは登録済みです。"))
+                    st.stop()
                 st.success(f"結果を登録しました: {key}")
                 if "message" in analysis:
                     st.warning(analysis["message"])
@@ -469,7 +472,7 @@ with result_tab:
                     st.caption("1着だけ、TOP3の車が同じだけでは三連単的中にしません。順番まで完全一致のみ○です。")
 
                 st.subheader("結果による重みの微調整")
-                adjustment = engine.v40_adjust_weights_after_result(meta_r, rows_r, engine.DB_PATH)
+                # v4.1登録処理内で、全履歴・直近重視の重み更新まで完了済み。
                 if "before" in adjustment:
                     weight_rows=[]
                     for name in adjustment["before"]:
@@ -483,7 +486,10 @@ with result_tab:
                     q1.metric("調整前の上位3車",adjustment["before_top3"])
                     q2.metric("調整後の診断",adjustment["after_top3"])
                     q3.metric("実結果",adjustment["actual_top3"])
+                    stats = adjustment.get("learning_stats", {})
                     st.info(adjustment["note"])
+                    if stats:
+                        st.caption(f"学習対象: 全{stats.get('race_count',0)}レース / 直近{stats.get('recent_count',0)}レースを中心 / 最新レース寄与 約{stats.get('latest_contribution',0)*100:.1f}%")
                 else:
                     st.info(adjustment.get("message","重みは変更していません。"))
 
@@ -493,7 +499,8 @@ with result_tab:
                 h2.metric("重複スキップ", analysis.get("履歴重複スキップ", 0))
                 h3.metric("周回順位", analysis.get("周回履歴保存", 0))
                 st.caption("結果登録した競走T・試走T・ST・着順・ハンデ・走路条件は、次回以降の予測用選手履歴へ反映されます。")
-                st.caption("同じ開催日・開催場・レース番号は上書き保存されます。レース名称が『予選』『一般戦』『6R』など異なっても重複登録されません。")
+                st.caption("同一判定は開催日・開催場・レース番号で行います。レース名称は判定に使いません。同じレースは履歴追加も重み更新も行いません。")
+                st.caption(f"順位分析対象: {analysis.get('分析対象', 0)}名 / 除外: {analysis.get('分析除外', 0)}名。着順なし・欠車・中止・失格などは順位分析から除外します。")
                 ok, msg = push_db_to_github(f"AutoRaceAI: {key} 結果・周回・払戻登録")
                 (st.success if ok else st.warning)(msg)
             except Exception as exc:
@@ -509,9 +516,21 @@ with db_tab:
         st.caption("重み変更履歴はまだありません。")
     else:
         st.dataframe(history_df,use_container_width=True,hide_index=True)
-    if st.button("直前の重み調整を元に戻す",use_container_width=True):
-        ok,msg=engine.v39_rollback_last_adjustment(engine.DB_PATH)
-        (st.success if ok else st.warning)(msg)
+    st.subheader("結果登録履歴・取り消し")
+    reg_history = engine.v41_registration_history(engine.DB_PATH, 50)
+    if reg_history.empty:
+        st.caption("v4.1で登録した結果はまだありません。")
+    else:
+        st.dataframe(reg_history, use_container_width=True, hide_index=True)
+    confirm_undo = st.checkbox("最後の結果登録を取り消すことを確認しました", key="confirm_v41_undo")
+    if st.button("↩ 最後の結果登録を取り消す", use_container_width=True, disabled=not confirm_undo):
+        ok,msg=engine.v41_undo_last_registration(engine.DB_PATH)
+        if ok:
+            push_ok, push_msg = push_db_to_github("AutoRaceAI: 最後の結果登録を取り消し")
+            st.success(msg)
+            (st.success if push_ok else st.warning)(push_msg)
+        else:
+            st.warning(msg)
 
 with register_tab:
     st.subheader("選手情報を登録")
