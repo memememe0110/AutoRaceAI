@@ -3744,9 +3744,11 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
     _final_s = _norm01_col("終盤指数")
     df["ゴール前伸び指数"] = np.clip(_final_s*.36 + closing_v*.25 + _exec_s*.15 + _current_s*.10 + _trial_s*.08 + rear_v*.06,0,1)
 
+    # v3.9: 学習重みを透明に適用する。元のVer15.2系総合点は保持し、
+    # 小さな補正だけを加えるため、1レースで予測が暴れない。
+    df = v39_apply_adaptive_weights(df, DB_PATH)
+
     # v3.8: 逐次的な追抜き入替ループを使わず、高速ベクトル型の6周イベントモデルを使用。
-    # スタート反応、1周目の伸び、中盤の突破機会、最終周の差しを一括生成するため、
-    # 同ハンデ車が多いレースでも処理時間が発散しない。
     finish_counts, bet_counts = simulate(df, trials, seed, track_temp=track_temp)
     output = create_result_excel(
         content, filename, df, finish_counts, bet_counts, trials, track_temp=track_temp
@@ -6301,3 +6303,213 @@ def v36_get_adjustment_log(db_path=DB_PATH):
             description AS 調整内容,
             CASE coefficient_changed WHEN 1 THEN '変更あり' ELSE '変更なし' END AS 係数変更
             FROM adjustment_log ORDER BY adjustment_id DESC""", con)
+
+
+# ============================================================
+# v3.9 透明な重み調整・調整前後比較
+# ============================================================
+V39_FEATURES = {
+    "試走": "試走換算",
+    "ST": "平均ST",
+    "ハンデ": "ハンデ",
+    "近況": "近況信頼度",
+    "走路適性": "走路点",
+}
+V39_DEFAULT_WEIGHTS = {"試走": 0.28, "ST": 0.18, "ハンデ": 0.12, "近況": 0.22, "走路適性": 0.20}
+
+
+def v39_init_learning_tables(db_path=DB_PATH):
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS adaptive_weights (
+            feature_name TEXT PRIMARY KEY,
+            current_weight REAL NOT NULL,
+            initial_weight REAL NOT NULL,
+            updated_at TEXT,
+            update_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS prediction_feature_snapshots (
+            race_key TEXT NOT NULL,
+            car_no INTEGER NOT NULL,
+            player_name TEXT,
+            trial_feature REAL,
+            st_feature REAL,
+            handicap_feature REAL,
+            form_feature REAL,
+            surface_feature REAL,
+            before_score REAL,
+            after_score REAL,
+            before_rank INTEGER,
+            after_rank INTEGER,
+            PRIMARY KEY(race_key, car_no)
+        );
+        CREATE TABLE IF NOT EXISTS weight_adjustment_history (
+            adjustment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_key TEXT NOT NULL,
+            adjusted_at TEXT NOT NULL,
+            feature_name TEXT NOT NULL,
+            before_weight REAL NOT NULL,
+            after_weight REAL NOT NULL,
+            delta REAL NOT NULL,
+            evidence_score REAL,
+            reason TEXT,
+            before_top3 TEXT,
+            after_top3 TEXT,
+            actual_top3 TEXT,
+            diagnostic_exact_before INTEGER,
+            diagnostic_exact_after INTEGER
+        );
+        """)
+        now=datetime.now().isoformat(timespec="seconds")
+        for name, weight in V39_DEFAULT_WEIGHTS.items():
+            con.execute("""INSERT OR IGNORE INTO adaptive_weights
+                (feature_name,current_weight,initial_weight,updated_at,update_count)
+                VALUES(?,?,?,?,0)""", (name,weight,weight,now))
+        con.commit()
+
+
+def v39_get_weights(db_path=DB_PATH):
+    v39_init_learning_tables(db_path)
+    with sqlite3.connect(db_path) as con:
+        rows=con.execute("SELECT feature_name,current_weight FROM adaptive_weights").fetchall()
+    values={str(k):float(v) for k,v in rows}
+    total=sum(max(0.0, values.get(k,0.0)) for k in V39_DEFAULT_WEIGHTS)
+    if total <= 0: return dict(V39_DEFAULT_WEIGHTS)
+    return {k:max(0.0,values.get(k,V39_DEFAULT_WEIGHTS[k]))/total for k in V39_DEFAULT_WEIGHTS}
+
+
+def _v39_rank_feature(series, lower_better=False):
+    x=pd.to_numeric(series,errors="coerce")
+    fill=x.median() if x.notna().any() else 0.0
+    x=x.fillna(fill)
+    pct=x.rank(method="average",pct=True)
+    return (1.0-pct if lower_better else pct).clip(0,1)
+
+
+def v39_feature_frame(df):
+    out=pd.DataFrame(index=df.index)
+    out["試走"]=_v39_rank_feature(df.get("試走換算",pd.Series(index=df.index,dtype=float)),True)
+    out["ST"]=_v39_rank_feature(df.get("平均ST",pd.Series(index=df.index,dtype=float)),True)
+    # ハンデは数値が小さいほど前。能力評価とは別に展開上の有利さとして扱う。
+    out["ハンデ"]=_v39_rank_feature(df.get("ハンデ",pd.Series(index=df.index,dtype=float)),True)
+    out["近況"]=_v39_rank_feature(df.get("近況信頼度",pd.Series(.5,index=df.index)),False)
+    out["走路適性"]=_v39_rank_feature(df.get("走路点",pd.Series(.5,index=df.index)),False)
+    return out.fillna(.5)
+
+
+def v39_apply_adaptive_weights(df, db_path=DB_PATH):
+    df=df.copy()
+    weights=v39_get_weights(db_path)
+    features=v39_feature_frame(df)
+    base=pd.to_numeric(df.get("改善後総合点",pd.Series(0,index=df.index)),errors="coerce").fillna(0.0)
+    df["調整前総合点"]=base
+    df["調整前順位"]=base.rank(method="min",ascending=False).astype(int)
+    centered=sum(weights[k]*(features[k]-.5) for k in V39_DEFAULT_WEIGHTS)
+    # 最大でも概ね±2点。元モデルを壊さず、蓄積データで少しずつ方向修正する。
+    bonus=(centered*4.0).clip(-2.0,2.0)
+    df["学習重み補正"]=bonus
+    df["改善後総合点"]=base+bonus
+    df["改善後順位"]=df["改善後総合点"].rank(method="min",ascending=False).astype(int)
+    for k in V39_DEFAULT_WEIGHTS:
+        df[f"学習特徴_{k}"]=features[k]
+    return df
+
+
+def v39_save_prediction_features(meta, df, db_path=DB_PATH):
+    v39_init_learning_tables(db_path)
+    key=v34_race_key(meta)
+    with sqlite3.connect(db_path) as con:
+        con.execute("DELETE FROM prediction_feature_snapshots WHERE race_key=?",(key,))
+        for _,r in df.iterrows():
+            con.execute("""INSERT INTO prediction_feature_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",(
+                key,int(r.get("車",r.get("車番"))),str(r.get("選手名","")),
+                float(r.get("学習特徴_試走",.5)),float(r.get("学習特徴_ST",.5)),
+                float(r.get("学習特徴_ハンデ",.5)),float(r.get("学習特徴_近況",.5)),
+                float(r.get("学習特徴_走路適性",.5)),float(r.get("調整前総合点",0)),
+                float(r.get("改善後総合点",0)),int(r.get("調整前順位",0)),int(r.get("改善後順位",0))
+            ))
+        con.commit()
+    return key
+
+
+def _v39_spearman(a,b):
+    a=pd.Series(a,dtype=float); b=pd.Series(b,dtype=float)
+    if len(a)<3 or a.nunique()<2 or b.nunique()<2: return 0.0
+    val=a.rank().corr(b.rank())
+    return 0.0 if pd.isna(val) else float(val)
+
+
+def v39_adjust_weights_after_result(meta, results, db_path=DB_PATH):
+    """結果を使って重みを微調整する。変更幅は1項目最大0.005、同レース再評価は診断専用。"""
+    v39_init_learning_tables(db_path)
+    key=v34_race_key(meta)
+    with sqlite3.connect(db_path) as con:
+        snap=pd.read_sql_query("SELECT * FROM prediction_feature_snapshots WHERE race_key=?",con,params=(key,))
+    if snap.empty:
+        return {"message":"特徴スナップショットがないため、重みは変更していません。次回予測から記録されます。"}
+    merged=snap.merge(results[["車番","着順"]],left_on="car_no",right_on="車番",how="inner")
+    if len(merged)<3:
+        return {"message":"比較可能な選手が3人未満のため、重みは変更していません。"}
+    performance=(len(merged)+1)-pd.to_numeric(merged["着順"],errors="coerce")
+    colmap={"試走":"trial_feature","ST":"st_feature","ハンデ":"handicap_feature","近況":"form_feature","走路適性":"surface_feature"}
+    evidence={k:_v39_spearman(merged[c],performance) for k,c in colmap.items()}
+    before=v39_get_weights(db_path)
+    # 正の一致度を目標配分へ。負の相関でも即ゼロにはせず下限を残す。
+    strength={k:max(.05,(evidence[k]+1.0)/2.0) for k in evidence}
+    stotal=sum(strength.values()); target={k:strength[k]/stotal for k in strength}
+    raw={k:before[k]+max(-.005,min(.005,(target[k]-before[k])*.08)) for k in before}
+    # 0.05～0.45に制限して正規化。
+    raw={k:min(.45,max(.05,v)) for k,v in raw.items()}; total=sum(raw.values()); after={k:v/total for k,v in raw.items()}
+    before_top3="→".join(map(str,merged.sort_values("before_rank")["car_no"].head(3).astype(int)))
+    # 同じレースへ新重みを当てた診断順位。実績には含めない。
+    diagnostic=sum(after[k]*merged[colmap[k]] for k in after)
+    diag_df=merged.assign(diag_score=diagnostic)
+    after_top3="→".join(map(str,diag_df.sort_values("diag_score",ascending=False)["car_no"].head(3).astype(int)))
+    actual_top3="→".join(map(str,merged.sort_values("着順")["car_no"].head(3).astype(int)))
+    now=datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(db_path) as con:
+        for k in before:
+            delta=after[k]-before[k]
+            reason=f"今回結果との順位相関 {evidence[k]:+.3f}。1回の変更幅を±0.005以内に制限。"
+            con.execute("""UPDATE adaptive_weights SET current_weight=?,updated_at=?,update_count=update_count+1 WHERE feature_name=?""",(after[k],now,k))
+            con.execute("""INSERT INTO weight_adjustment_history
+                (race_key,adjusted_at,feature_name,before_weight,after_weight,delta,evidence_score,reason,
+                 before_top3,after_top3,actual_top3,diagnostic_exact_before,diagnostic_exact_after)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",(
+                key,now,k,before[k],after[k],delta,evidence[k],reason,before_top3,after_top3,actual_top3,
+                int(before_top3==actual_top3),int(after_top3==actual_top3)))
+        con.commit()
+    return {"race_key":key,"before":before,"after":after,"evidence":evidence,
+            "before_top3":before_top3,"after_top3":after_top3,"actual_top3":actual_top3,
+            "diagnostic_exact_before":before_top3==actual_top3,"diagnostic_exact_after":after_top3==actual_top3,
+            "note":"同じレースへの調整後比較は答えを見た後の診断で、正式な的中実績には加算しません。"}
+
+
+def v39_weight_history(db_path=DB_PATH, limit=100):
+    v39_init_learning_tables(db_path)
+    with sqlite3.connect(db_path) as con:
+        return pd.read_sql_query("""SELECT adjusted_at AS 調整日時,race_key AS レース,
+            feature_name AS 項目,before_weight AS 調整前,after_weight AS 調整後,
+            delta AS 変化,evidence_score AS 結果との相関,reason AS 理由,
+            before_top3 AS 調整前予測,after_top3 AS 調整後診断,actual_top3 AS 実結果
+            FROM weight_adjustment_history ORDER BY adjustment_id DESC LIMIT ?""",con,params=(int(limit),))
+
+
+def v39_current_weights(db_path=DB_PATH):
+    w=v39_get_weights(db_path)
+    return pd.DataFrame([{"項目":k,"現在の重み":v,"初期値":V39_DEFAULT_WEIGHTS[k],"初期値からの差":v-V39_DEFAULT_WEIGHTS[k]} for k,v in w.items()])
+
+
+def v39_rollback_last_adjustment(db_path=DB_PATH):
+    v39_init_learning_tables(db_path)
+    with sqlite3.connect(db_path) as con:
+        row=con.execute("SELECT race_key,adjusted_at FROM weight_adjustment_history ORDER BY adjustment_id DESC LIMIT 1").fetchone()
+        if not row: return False,"戻せる調整履歴がありません。"
+        race_key,adjusted_at=row
+        rows=con.execute("SELECT feature_name,before_weight FROM weight_adjustment_history WHERE race_key=? AND adjusted_at=?",(race_key,adjusted_at)).fetchall()
+        now=datetime.now().isoformat(timespec="seconds")
+        for name,weight in rows:
+            con.execute("UPDATE adaptive_weights SET current_weight=?,updated_at=? WHERE feature_name=?",(weight,now,name))
+        con.execute("DELETE FROM weight_adjustment_history WHERE race_key=? AND adjusted_at=?",(race_key,adjusted_at))
+        con.commit()
+    return True,f"{race_key} の直前調整を元に戻しました。"

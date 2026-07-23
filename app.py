@@ -282,7 +282,7 @@ with prediction_tab:
     st.info("予測方式：高速6周イベントモデル。スタート、1周目の伸び、中盤の突破、最終周の差しを試行ごとに生成します。")
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
-        st.caption("v3.8では逐次追抜きループを廃止し、高速ベクトル計算へ変更しました。基本能力点は維持し、展開部分のみ安全・高速化しています。")
+        st.caption("v3.9では、結果登録後の重み変更を保存し、調整前後の順位・三連単上位3車を確認できます。1レースの変更幅は各項目±0.005以内です。")
     text = st.text_area(
         "公式出走表を全文貼り付け",
         height=430,
@@ -318,7 +318,13 @@ with prediction_tab:
 
             finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
             race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
-            st.caption(f"予測保存キー: {race_key}（結果登録時の比較に使用）")
+            engine.v39_save_prediction_features(meta, df, engine.DB_PATH)
+            st.caption(f"予測保存キー: {race_key}（結果登録時の比較・重み調整に使用）")
+
+            with st.expander("🧪 学習重みによる順位変化"):
+                compare_cols = [c for c in ["車","選手名","調整前順位","改善後順位","調整前総合点","学習重み補正","改善後総合点"] if c in df.columns]
+                st.dataframe(df[compare_cols].sort_values("改善後順位"), use_container_width=True, hide_index=True)
+                st.caption("調整前は元モデル、改善後は保存済み学習重みを小さく加えた順位です。")
             st.subheader("着順確率")
             st.dataframe(
                 finish_prob,
@@ -450,6 +456,37 @@ with result_tab:
                 if lap_items:
                     st.info("展開解析｜" + " / ".join(lap_items))
 
+                # 三連単は上位3車の順番が完全一致した場合だけ的中。
+                if "message" not in analysis:
+                    pred_trifecta = "→".join(map(str, comparison.sort_values("predicted_rank")["車番"].head(3).astype(int)))
+                    actual_trifecta = "→".join(map(str, rows_r.sort_values("着順")["車番"].head(3).astype(int)))
+                    exact_hit = pred_trifecta == actual_trifecta
+                    st.subheader("三連単の完全一致判定")
+                    t1, t2, t3 = st.columns(3)
+                    t1.metric("予測", pred_trifecta)
+                    t2.metric("実結果", actual_trifecta)
+                    t3.metric("三連単的中", "○" if exact_hit else "×")
+                    st.caption("1着だけ、TOP3の車が同じだけでは三連単的中にしません。順番まで完全一致のみ○です。")
+
+                st.subheader("結果による重みの微調整")
+                adjustment = engine.v39_adjust_weights_after_result(meta_r, rows_r, engine.DB_PATH)
+                if "before" in adjustment:
+                    weight_rows=[]
+                    for name in adjustment["before"]:
+                        weight_rows.append({"項目":name,"調整前":adjustment["before"][name],"調整後":adjustment["after"][name],
+                                            "変化":adjustment["after"][name]-adjustment["before"][name],
+                                            "今回結果との相関":adjustment["evidence"][name]})
+                    st.dataframe(pd.DataFrame(weight_rows), use_container_width=True, hide_index=True,
+                        column_config={"調整前":st.column_config.NumberColumn(format="%.4f"),"調整後":st.column_config.NumberColumn(format="%.4f"),
+                                       "変化":st.column_config.NumberColumn(format="%+.4f"),"今回結果との相関":st.column_config.NumberColumn(format="%+.3f")})
+                    q1,q2,q3=st.columns(3)
+                    q1.metric("調整前の上位3車",adjustment["before_top3"])
+                    q2.metric("調整後の診断",adjustment["after_top3"])
+                    q3.metric("実結果",adjustment["actual_top3"])
+                    st.info(adjustment["note"])
+                else:
+                    st.info(adjustment.get("message","重みは変更していません。"))
+
                 st.subheader("選手履歴の更新結果")
                 h1, h2, h3 = st.columns(3)
                 h1.metric("新規履歴", analysis.get("履歴追加", 0))
@@ -462,6 +499,19 @@ with result_tab:
             except Exception as exc:
                 st.error(f"結果登録エラー: {type(exc).__name__}: {exc}")
                 st.exception(exc)
+
+with db_tab:
+    st.subheader("学習重み・変更履歴")
+    st.dataframe(engine.v39_current_weights(engine.DB_PATH), use_container_width=True, hide_index=True,
+        column_config={"現在の重み":st.column_config.NumberColumn(format="%.4f"),"初期値":st.column_config.NumberColumn(format="%.4f"),"初期値からの差":st.column_config.NumberColumn(format="%+.4f")})
+    history_df=engine.v39_weight_history(engine.DB_PATH,100)
+    if history_df.empty:
+        st.caption("重み変更履歴はまだありません。")
+    else:
+        st.dataframe(history_df,use_container_width=True,hide_index=True)
+    if st.button("直前の重み調整を元に戻す",use_container_width=True):
+        ok,msg=engine.v39_rollback_last_adjustment(engine.DB_PATH)
+        (st.success if ok else st.warning)(msg)
 
 with register_tab:
     st.subheader("選手情報を登録")
