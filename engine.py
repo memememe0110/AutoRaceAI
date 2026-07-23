@@ -5334,7 +5334,132 @@ def v27_scenario_probabilities(track_temp=30.0):
 
 
 def _v27_norm_player_name(name):
-    return re.sub(r"[\s　]+", " ", str(name or "").strip())
+    """表示用氏名。全角/半角をそろえ、氏名内の空白は1個に整える。"""
+    import unicodedata
+    value = unicodedata.normalize("NFKC", str(name or "")).strip()
+    return re.sub(r"\s+", " ", value)
+
+
+def v32_player_name_key(name):
+    """同一人物判定用キー。全角/半角・空白有無を無視する。"""
+    import unicodedata
+    value = unicodedata.normalize("NFKC", str(name or "")).strip()
+    return re.sub(r"\s+", "", value).casefold()
+
+
+def _v32_find_player(con, name):
+    key = v32_player_name_key(name)
+    if not key:
+        return None
+    for player_id, player_name in con.execute("SELECT player_id, player_name FROM players ORDER BY player_id"):
+        if v32_player_name_key(player_name) == key:
+            return int(player_id), str(player_name)
+    return None
+
+
+def _v32_history_signature(row):
+    """player_idとrecord_keyを除いた履歴の実質内容。"""
+    return tuple(row.get(k) for k in (
+        "race_date", "venue", "race_no", "finish", "starters", "surface",
+        "handicap", "trial_time", "race_time", "start_time", "result_status",
+        "use_for_model"
+    ))
+
+
+def v32_merge_duplicate_players(db_path=DB_PATH):
+    """空白表記だけ異なる選手を統合し、重複履歴も整理する。"""
+    mount_and_init_db()
+    merged_players = 0
+    moved_histories = 0
+    deleted_histories = 0
+    normalized_imports = 0
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+        players = con.execute(
+            "SELECT player_id, player_name, created_at FROM players ORDER BY player_id"
+        ).fetchall()
+        groups = {}
+        for p in players:
+            key = v32_player_name_key(p["player_name"])
+            if key:
+                groups.setdefault(key, []).append(p)
+
+        for key, members in groups.items():
+            if len(members) < 2:
+                continue
+            canonical = members[0]
+            canonical_id = int(canonical["player_id"])
+            canonical_name = _v27_norm_player_name(canonical["player_name"])
+
+            existing_rows = con.execute(
+                "SELECT * FROM race_history WHERE player_id=? ORDER BY history_id",
+                (canonical_id,),
+            ).fetchall()
+            existing_signatures = {_v32_history_signature(dict(r)) for r in existing_rows}
+
+            for duplicate in members[1:]:
+                duplicate_id = int(duplicate["player_id"])
+                rows = con.execute(
+                    "SELECT * FROM race_history WHERE player_id=? ORDER BY history_id",
+                    (duplicate_id,),
+                ).fetchall()
+                for row in rows:
+                    row_dict = dict(row)
+                    signature = _v32_history_signature(row_dict)
+                    if signature in existing_signatures:
+                        con.execute("DELETE FROM race_history WHERE history_id=?", (row["history_id"],))
+                        deleted_histories += 1
+                        continue
+                    new_key = _v27_record_key(key, *signature)
+                    suffix = 0
+                    candidate = new_key
+                    while con.execute("SELECT 1 FROM race_history WHERE record_key=?", (candidate,)).fetchone():
+                        suffix += 1
+                        candidate = _v27_record_key(new_key, suffix)
+                    con.execute(
+                        "UPDATE race_history SET player_id=?, record_key=? WHERE history_id=?",
+                        (canonical_id, candidate, row["history_id"]),
+                    )
+                    existing_signatures.add(signature)
+                    moved_histories += 1
+                con.execute("DELETE FROM players WHERE player_id=?", (duplicate_id,))
+                merged_players += 1
+
+        if v15_table_exists(con, "v15_player_history_imports"):
+            rows = con.execute("SELECT * FROM v15_player_history_imports ORDER BY created_at, history_key").fetchall()
+            seen = set()
+            for row in rows:
+                d = dict(row)
+                key = v32_player_name_key(d.get("player_name"))
+                if not key:
+                    continue
+                found = _v32_find_player(con, d.get("player_name"))
+                canonical_name = found[1] if found else _v27_norm_player_name(d.get("player_name"))
+                logical = (
+                    key, d.get("race_date"), d.get("venue"), d.get("race_no"), d.get("rank"),
+                    d.get("surface"), d.get("handicap"), d.get("trial_time"), d.get("race_time"),
+                    d.get("st"), d.get("car_no")
+                )
+                if logical in seen:
+                    con.execute("DELETE FROM v15_player_history_imports WHERE history_key=?", (d["history_key"],))
+                    continue
+                seen.add(logical)
+                if d.get("player_name") != canonical_name:
+                    con.execute(
+                        "UPDATE v15_player_history_imports SET player_name=? WHERE history_key=?",
+                        (canonical_name, d["history_key"]),
+                    )
+                    normalized_imports += 1
+        con.commit()
+
+    return {
+        "merged_players": merged_players,
+        "moved_histories": moved_histories,
+        "deleted_histories": deleted_histories,
+        "normalized_imports": normalized_imports,
+    }
 
 
 def _v27_record_key(*values):
@@ -5355,18 +5480,20 @@ def v15_save_player_history(df, db_path=DB_PATH):
     with sqlite3.connect(str(db_path)) as con:
         con.execute("PRAGMA foreign_keys=ON")
         for _, row in df.iterrows():
-            name = _v27_norm_player_name(row.get("選手名"))
-            if not name:
+            entered_name = _v27_norm_player_name(row.get("選手名"))
+            if not entered_name:
                 skipped += 1
                 continue
-            con.execute(
-                "INSERT OR IGNORE INTO players(player_name, created_at, updated_at) VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-                (name,),
-            )
-            player_id = con.execute(
-                "SELECT player_id FROM players WHERE REPLACE(REPLACE(player_name,' ',''),'　','')=?",
-                (re.sub(r"[\s　]+", "", name),),
-            ).fetchone()[0]
+            existing_player = _v32_find_player(con, entered_name)
+            if existing_player:
+                player_id, name = existing_player
+            else:
+                con.execute(
+                    "INSERT INTO players(player_name, created_at, updated_at) VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                    (entered_name,),
+                )
+                player_id = int(con.execute("SELECT last_insert_rowid()").fetchone()[0])
+                name = entered_name
 
             race_date = row.get("開催日")
             venue = row.get("開催場")
@@ -5380,7 +5507,7 @@ def v15_save_player_history(df, db_path=DB_PATH):
             race_time = None if pd.isna(row.get("競走T")) else float(row.get("競走T"))
             st = None if pd.isna(row.get("ST")) else float(row.get("ST"))
             car_no = None if pd.isna(row.get("車番")) else int(row.get("車番"))
-            record_key = _v27_record_key(name, race_date, venue, race_type, finish, trial, race_time, st, car_no)
+            record_key = _v27_record_key(v32_player_name_key(name), race_date, venue, race_type, finish, trial, race_time, st, car_no)
 
             exists = con.execute("SELECT 1 FROM race_history WHERE record_key=?", (record_key,)).fetchone()
             if exists:
@@ -5398,7 +5525,7 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 inserted += 1
 
             # 詳細条件を保持するミラー表。予測本体は上のrace_historyを参照。
-            history_key = v15_hash(name, race_date, venue, race_type, finish, trial, race_time, car_no)
+            history_key = v15_hash(v32_player_name_key(name), race_date, venue, race_type, finish, trial, race_time, car_no)
             con.execute("""
                 INSERT OR IGNORE INTO v15_player_history_imports (
                     history_key, player_name, race_date, venue, race_no,

@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver15.2系詳細6周シミュレーション・券種別確率・選手履歴登録・GitHub DB保存対応版")
+st.caption("v3.2｜Ver15.2系詳細6周シミュレーション・券種別確率・氏名正規化・GitHub DB保存対応版")
 
 
 def qident(name: str) -> str:
@@ -494,6 +494,22 @@ with db_tab:
                             """, con, params=(selected,))
                     st.write(f"{selected}：履歴 {len(history)}件")
                     st.dataframe(history, use_container_width=True, hide_index=True, height=430)
+
+                st.divider()
+                st.subheader("DBメンテナンス")
+                st.caption("姓名の全角・半角スペース、スペースなしを同一人物として統合します。重複履歴も整理します。")
+                if st.button("同一選手の重複を統合", use_container_width=True):
+                    result = engine.v32_merge_duplicate_players(engine.DB_PATH)
+                    ok, msg = push_db_to_github("AutoRaceAI: 氏名表記の重複選手を統合")
+                    summary = (
+                        f"選手 {result['merged_players']}件を統合、履歴 {result['moved_histories']}件を移動、"
+                        f"重複履歴 {result['deleted_histories']}件を削除、詳細履歴名 {result['normalized_imports']}件を統一しました。"
+                    )
+                    if ok:
+                        st.success(summary + " " + msg)
+                    else:
+                        st.warning(summary + " GitHub保存は未完了です。" + msg)
+                    st.rerun()
 
                 st.divider()
                 table = st.selectbox("DBテーブルを直接確認", info["tables"])
