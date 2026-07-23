@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("v3.5｜公式結果全文・6周グランドノート・払戻金・予測比較解析対応版")
+st.caption("v3.8｜高速6周イベントシミュレーション・結果学習・風走路対応版")
 
 
 def qident(name: str) -> str:
@@ -279,10 +279,10 @@ with st.sidebar:
 prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
-    st.info("予測方式：Ver15.2の詳細6周モデル（simulate_detailed）。各試行で隊列変化を計算し、確率を集計します。")
+    st.info("予測方式：高速6周イベントモデル。スタート、1周目の伸び、中盤の突破、最終周の差しを試行ごとに生成します。")
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
-        st.caption("v3.6では予測係数は変えず、未登録車の除外と結果から選手履歴を更新する経路を修正しています。")
+        st.caption("v3.8では逐次追抜きループを廃止し、高速ベクトル計算へ変更しました。基本能力点は維持し、展開部分のみ安全・高速化しています。")
     text = st.text_area(
         "公式出走表を全文貼り付け",
         height=430,
@@ -295,7 +295,7 @@ with prediction_tab:
             st.warning("出走表を貼り付けてください。")
             st.stop()
         try:
-            with st.spinner("6周詳細シミュレーションを実行中…"):
+            with st.spinner("高速6周イベントシミュレーションを実行中…"):
                 df, bets, output, entries, meta = engine.ver16_run_prediction(text, int(trials), int(seed))
             st.success("予測が完了しました")
             st.subheader("解析した出走表")
@@ -314,7 +314,7 @@ with prediction_tab:
             st.subheader("6周の代表展開")
             lap_df = engine.v30_representative_lap_projection(df)
             st.dataframe(lap_df, use_container_width=True, hide_index=True)
-            st.caption("確率計算は全試行で6周詳細モデルを実行しています。この表は、その指標から作った見やすい代表的な1展開です。")
+            st.caption("確率計算は全試行で、スタート・中盤・最終周のイベントを生成しています。この表は指標から作った代表的な1展開です。")
 
             finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
             race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)

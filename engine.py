@@ -3377,7 +3377,7 @@ def simulate_detailed(df, trials, seed, track_temp=30.0):
 
 
 def simulate(df, trials, seed, track_temp=30.0):
-    """Ver12.3: 高速ベクトル型の6周近似モデル。
+    """v3.8: 高速ベクトル型の6周イベントモデル。
 
     1周目のST反応とスタート後の伸びを分離し、最終周には僅差の差し判定を追加する。
     車番固定の結果合わせは行わず、全選手共通の指標から確率的に発生させる。
@@ -3744,7 +3744,10 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
     _final_s = _norm01_col("終盤指数")
     df["ゴール前伸び指数"] = np.clip(_final_s*.36 + closing_v*.25 + _exec_s*.15 + _current_s*.10 + _trial_s*.08 + rear_v*.06,0,1)
 
-    finish_counts, bet_counts = simulate_detailed(df, trials, seed, track_temp=track_temp)
+    # v3.8: 逐次的な追抜き入替ループを使わず、高速ベクトル型の6周イベントモデルを使用。
+    # スタート反応、1周目の伸び、中盤の突破機会、最終周の差しを一括生成するため、
+    # 同ハンデ車が多いレースでも処理時間が発散しない。
+    finish_counts, bet_counts = simulate(df, trials, seed, track_temp=track_temp)
     output = create_result_excel(
         content, filename, df, finish_counts, bet_counts, trials, track_temp=track_temp
     )
