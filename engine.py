@@ -3641,7 +3641,7 @@ def create_result_excel(content, filename, df, finish_counts, bet_counts, trials
     return path
 
 
-def run_model(content, filename, trials, seed, track_temp=30.0):
+def run_model(content, filename, trials, seed, track_temp=30.0, active_cars=None):
     wb = load_workbook(io.BytesIO(content), data_only=True)
 
     required = ["レース予測", "設定"] + [f"選手{i}" for i in range(1, 9)]
@@ -3652,10 +3652,22 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
     race = read_race(wb["レース予測"])
     settings = read_settings(wb["設定"])
 
+    # スマホ版では実際に出走する車だけでVer15.2の相対評価を計算する。
+    # 7車立てに「未登録8」を混ぜると、順位・百分位・正規化が歪むため、
+    # ダミー選手は計算前から完全に除外する。
+    if active_cars is None:
+        active_cars = list(range(1, 9))
+    active_cars = sorted({int(c) for c in active_cars if 1 <= int(c) <= 8})
+    if len(active_cars) < 2:
+        raise ValueError("予測対象の実在車が2台未満です。出走表の解析結果を確認してください。")
+
     metrics = []
-    for car in range(1, 9):
+    for car in active_cars:
         ws = wb[f"選手{car}"]
         current = current_player(ws)
+        name = str(current.get("選手名", "") if isinstance(current, dict) else "")
+        if name.startswith("未登録"):
+            continue
         history = read_history(ws)
         metrics.append(
             player_metrics(car, current, history, race, settings)
@@ -5300,12 +5312,14 @@ def ver16_run_prediction(text, trials=10000, seed=20260719):
     content, meta, entries = ver16_build_virtual_excel(text)
     track_temp = ver16_safe_float(meta.get("走路温度"), 30.0)
     filename = f"AutoRaceAI_Ver16_{meta.get('開催場') or 'race'}_{meta.get('レース') or ''}R.xlsx"
+    active_cars = sorted(pd.to_numeric(entries["車番"], errors="coerce").dropna().astype(int).unique().tolist())
     df, bets, output = run_model(
         content,
         filename,
         min(int(trials), 20000),
         int(seed),
-        float(track_temp)
+        float(track_temp),
+        active_cars=active_cars,
     )
     return df, bets, output, entries, meta
 
