@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("v3.3｜Ver15.2系詳細6周シミュレーション・券種別確率・氏名／同一レース重複整理対応版")
+st.caption("v3.4｜Ver15.2系詳細6周シミュレーション・券種別確率・氏名／同一レース重複整理対応版")
 
 
 def qident(name: str) -> str:
@@ -276,7 +276,7 @@ with st.sidebar:
     except Exception as exc:
         st.warning(f"DB情報を確認できません: {exc}")
 
-prediction_tab, register_tab, db_tab = st.tabs(["🏁 予測", "👤 選手情報登録", "🗃️ 登録情報確認"])
+prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
     st.info("予測方式：Ver15.2の詳細6周モデル（simulate_detailed）。各試行で隊列変化を計算し、確率を集計します。")
@@ -314,6 +314,8 @@ with prediction_tab:
             st.caption("確率計算は全試行で6周詳細モデルを実行しています。この表は、その指標から作った見やすい代表的な1展開です。")
 
             finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
+            race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
+            st.caption(f"予測保存キー: {race_key}（結果登録時の比較に使用）")
             st.subheader("着順確率")
             st.dataframe(
                 finish_prob,
@@ -372,6 +374,45 @@ with prediction_tab:
         except Exception as exc:
             st.error(f"予測エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
+
+with result_tab:
+    st.subheader("公式結果を登録して予測と比較")
+    st.info("公式結果ページを全文コピーして貼り付けます。同じ日付・開催場・レース番号は上書きされるため、レース名の違いでは重複しません。")
+    c1, c2 = st.columns(2)
+    venue_override = c1.text_input("開催場（本文から取れない場合のみ）", key="result_venue")
+    race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key="result_race_no")
+    result_text = st.text_area("公式結果ページを全文貼り付け", height=500, key="official_result_text")
+    if st.button("結果を解析", use_container_width=True):
+        try:
+            meta_r, rows_r = engine.v34_parse_result_text(result_text, venue_override, race_no_override)
+            st.session_state["v34_result_meta"] = meta_r
+            st.session_state["v34_result_rows"] = rows_r
+        except Exception as exc:
+            st.error(f"結果解析エラー: {exc}")
+    meta_r = st.session_state.get("v34_result_meta")
+    rows_r = st.session_state.get("v34_result_rows")
+    if isinstance(rows_r, pd.DataFrame) and not rows_r.empty:
+        st.write("解析したレース情報", meta_r)
+        st.dataframe(rows_r, use_container_width=True, hide_index=True)
+        if st.button("DBへ登録して予測差を解析", type="primary", use_container_width=True):
+            try:
+                key, comparison, analysis = engine.v34_save_result_and_analyze(meta_r, rows_r, engine.DB_PATH)
+                st.success(f"結果を登録しました: {key}")
+                if "message" in analysis:
+                    st.warning(analysis["message"])
+                else:
+                    a,b,c = st.columns(3)
+                    a.metric("平均順位誤差", analysis["平均順位誤差"])
+                    b.metric("1着的中", "○" if analysis["1着的中"] else "×")
+                    c.metric("予測TOP3一致", f"{analysis['3着内一致数']}/3")
+                    show_cols=[x for x in ["着順","車番","選手名_x","predicted_rank","順位誤差","win_prob","top3_prob"] if x in comparison.columns]
+                    st.dataframe(comparison[show_cols], use_container_width=True, hide_index=True)
+                    st.caption("少数レースでも解析できます。現段階では1レースの外れで予測ロジックを大きく変えず、誤差を蓄積して安全に補正判断する設計です。")
+                ok,msg=push_db_to_github(f"AutoRaceAI: {key} 結果登録・解析")
+                (st.success if ok else st.warning)(msg)
+            except Exception as exc:
+                st.error(f"結果登録エラー: {type(exc).__name__}: {exc}")
+                st.exception(exc)
 
 with register_tab:
     st.subheader("選手情報を登録")

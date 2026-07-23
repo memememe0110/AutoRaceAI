@@ -5728,3 +5728,130 @@ def v30_finish_probabilities(df, bet_counts, trials):
     for car, vals in counts.items():
         rows.append({"車":car,"選手名":name_map.get(car,""),"1着率":vals[0]/total*100,"2着率":vals[1]/total*100,"3着率":vals[2]/total*100,"3着内率":sum(vals)/total*100})
     return pd.DataFrame(rows).sort_values(["1着率","3着内率"],ascending=False).reset_index(drop=True)
+
+# ============================================================
+# v3.4 結果登録・予測比較解析
+# ============================================================
+def v34_race_key(meta):
+    date = re.sub(r"[^0-9]", "", str(meta.get("開催日") or meta.get("race_date") or ""))[:8]
+    venue = str(meta.get("開催場") or meta.get("venue") or "").strip()
+    race = re.sub(r"[^0-9]", "", str(meta.get("レース") or meta.get("race_no") or ""))
+    return f"{date}_{venue}_{race or '0'}R"
+
+
+def v34_init_feedback_tables(db_path=DB_PATH):
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS prediction_snapshots (
+            race_key TEXT NOT NULL, car_no INTEGER NOT NULL, player_name TEXT,
+            predicted_rank INTEGER, win_prob REAL, top3_prob REAL,
+            created_at TEXT, PRIMARY KEY(race_key, car_no)
+        );
+        CREATE TABLE IF NOT EXISTS result_races (
+            race_key TEXT PRIMARY KEY, race_date TEXT, venue TEXT, race_no TEXT,
+            surface TEXT, track_temp REAL, air_temp REAL, humidity REAL,
+            registered_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS result_entries (
+            race_key TEXT NOT NULL, car_no INTEGER NOT NULL, player_name TEXT,
+            finish INTEGER, trial_time REAL, race_time REAL, start_time REAL,
+            handicap TEXT, result_status TEXT,
+            PRIMARY KEY(race_key, car_no)
+        );
+        CREATE TABLE IF NOT EXISTS prediction_feedback (
+            race_key TEXT PRIMARY KEY, sample_size INTEGER, mean_rank_error REAL,
+            winner_hit INTEGER, top3_hit_count INTEGER, analysis_json TEXT,
+            analyzed_at TEXT
+        );
+        """)
+
+
+def v34_save_prediction_snapshot(meta, df, finish_prob=None, db_path=DB_PATH):
+    v34_init_feedback_tables(db_path)
+    key = v34_race_key(meta)
+    probs = {}
+    if isinstance(finish_prob, pd.DataFrame) and not finish_prob.empty:
+        for _, r in finish_prob.iterrows():
+            car = int(r.get("車", r.get("車番", 0)) or 0)
+            probs[car] = (float(r.get("1着率", 0) or 0), float(r.get("3着内率", 0) or 0))
+    now = datetime.now().isoformat(timespec="seconds")
+    rank_col = "改善後順位" if "改善後順位" in df.columns else ("順位" if "順位" in df.columns else None)
+    car_col = "車" if "車" in df.columns else "車番"
+    with sqlite3.connect(db_path) as con:
+        con.execute("DELETE FROM prediction_snapshots WHERE race_key=?", (key,))
+        for _, r in df.iterrows():
+            car = int(r[car_col]); win, top3 = probs.get(car, (None, None))
+            con.execute("""INSERT INTO prediction_snapshots
+                (race_key,car_no,player_name,predicted_rank,win_prob,top3_prob,created_at)
+                VALUES(?,?,?,?,?,?,?)""",
+                (key, car, str(r.get("選手名", "")), int(r[rank_col]) if rank_col else None, win, top3, now))
+        con.commit()
+    return key
+
+
+def v34_parse_result_text(text, venue_override="", race_no_override=""):
+    clean = v15_clean_text(text)
+    if not clean:
+        raise ValueError("結果ページを貼り付けてください。")
+    meta = v15_parse_race_meta(clean)
+    if venue_override.strip(): meta["開催場"] = venue_override.strip()
+    if str(race_no_override).strip(): meta["レース"] = v15_int(race_no_override)
+    rows = []
+    for raw in clean.splitlines():
+        line = raw.replace("　", " ").strip()
+        if not line: continue
+        parts = [p.strip() for p in re.split(r"\t+| {2,}", line) if p.strip()]
+        if len(parts) < 3: continue
+        if not re.fullmatch(r"[1-8]", parts[0]) or not re.fullmatch(r"[1-8]", parts[1]): continue
+        finish, car = int(parts[0]), int(parts[1])
+        name = v15_normalize_name(parts[2])
+        nums = []
+        for p in parts[3:]:
+            m = re.fullmatch(r"[+-]?\d+(?:\.\d+)?", p.replace("m", ""))
+            if m: nums.append(float(m.group()))
+        trial = next((x for x in nums if 3.2 <= x <= 3.9), np.nan)
+        race_t = next((x for x in nums if 3.3 <= x <= 4.2 and (pd.isna(trial) or x != trial)), np.nan)
+        st = next((x for x in nums if 0 <= x < 1), np.nan)
+        handicap = next((p for p in parts if re.fullmatch(r"-?\d+m?", p) and int(p.replace('m','')) % 10 == 0), "")
+        rows.append({"着順":finish,"車番":car,"選手名":name,"ハンデ":handicap,
+                     "試走T":trial,"競走T":race_t,"ST":st,"結果区分":"通常"})
+    if len(rows) < 3:
+        raise ValueError("着順表を解析できませんでした。公式結果ページの着・車・選手名・試走タイム・競走タイムを含めて貼り付けてください。")
+    rows = sorted({r["車番"]:r for r in rows}.values(), key=lambda x:x["着順"])
+    return meta, pd.DataFrame(rows)
+
+
+def v34_save_result_and_analyze(meta, results, db_path=DB_PATH):
+    v34_init_feedback_tables(db_path)
+    key = v34_race_key(meta)
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(db_path) as con:
+        con.execute("""INSERT INTO result_races VALUES(?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(race_key) DO UPDATE SET surface=excluded.surface,track_temp=excluded.track_temp,
+          air_temp=excluded.air_temp,humidity=excluded.humidity,registered_at=excluded.registered_at""",
+          (key,meta.get("開催日"),meta.get("開催場"),str(meta.get("レース") or ""),meta.get("走路状態"),
+           meta.get("走路温度"),meta.get("気温"),meta.get("湿度"),now))
+        con.execute("DELETE FROM result_entries WHERE race_key=?", (key,))
+        for _,r in results.iterrows():
+            con.execute("""INSERT INTO result_entries VALUES(?,?,?,?,?,?,?,?,?,?)""",
+              (key,int(r["車番"]),str(r["選手名"]),int(r["着順"]),r.get("試走T"),r.get("競走T"),r.get("ST"),str(r.get("ハンデ", "")),str(r.get("結果区分","通常"))))
+        pred = pd.read_sql_query("SELECT * FROM prediction_snapshots WHERE race_key=?", con, params=(key,))
+        con.commit()
+    merged = results.merge(pred, left_on="車番", right_on="car_no", how="left") if not pred.empty else results.copy()
+    if pred.empty:
+        return key, merged, {"message":"同じ日付・開催場・レース番号の保存済み予測がないため、結果登録のみ完了しました。"}
+    merged["順位誤差"] = merged["着順"] - merged["predicted_rank"]
+    mae = float(merged["順位誤差"].abs().mean())
+    pred_winner = int(pred.sort_values("predicted_rank").iloc[0]["car_no"])
+    actual_winner = int(results.sort_values("着順").iloc[0]["車番"])
+    predicted_top3 = set(pred.nsmallest(3,"predicted_rank")["car_no"].astype(int))
+    actual_top3 = set(results.nsmallest(3,"着順")["車番"].astype(int))
+    analysis = {"平均順位誤差":round(mae,2),"1着的中":pred_winner==actual_winner,
+                "3着内一致数":len(predicted_top3 & actual_top3),"予測1着":pred_winner,"実際1着":actual_winner}
+    with sqlite3.connect(db_path) as con:
+        con.execute("""INSERT INTO prediction_feedback VALUES(?,?,?,?,?,?,?)
+          ON CONFLICT(race_key) DO UPDATE SET sample_size=excluded.sample_size,mean_rank_error=excluded.mean_rank_error,
+          winner_hit=excluded.winner_hit,top3_hit_count=excluded.top3_hit_count,analysis_json=excluded.analysis_json,analyzed_at=excluded.analyzed_at""",
+          (key,len(merged),mae,int(pred_winner==actual_winner),len(predicted_top3&actual_top3),json.dumps(analysis,ensure_ascii=False),now))
+        con.commit()
+    return key, merged, analysis
