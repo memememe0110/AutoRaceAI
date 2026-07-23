@@ -279,7 +279,7 @@ with st.sidebar:
 prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
-    st.info("予測方式：高速6周イベントモデル。スタート、1周目の伸び、中盤の突破、最終周の差しを試行ごとに生成します。")
+    st.info("Ver17予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
         st.caption("v4.0では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
@@ -298,11 +298,16 @@ with prediction_tab:
             with st.spinner("高速6周イベントシミュレーションを実行中…"):
                 df, bets, output, entries, meta = engine.ver16_run_prediction(text, int(trials), int(seed))
             st.success("予測が完了しました")
+            excluded = engine.v17_detect_nonstarters(text)
+            if excluded:
+                detail = "、".join(f"{car}番（{status}）" for car, status in sorted(excluded.items()))
+                st.warning(f"解析対象外: {detail}。確率・順位・買い目の組み合わせから完全に除外しました。")
+            st.caption(f"実出走数: {len(entries)}車 / 三連単組み合わせ数: {len(entries)*(len(entries)-1)*(len(entries)-2)}通り")
             st.subheader("解析した出走表")
             st.dataframe(entries.drop(columns=["_raw"], errors="ignore"), use_container_width=True, hide_index=True)
 
             cols = [c for c in [
-                "改善後順位", "車", "選手名", "ハンデ", "試走換算",
+                "改善後順位", "車", "選手名", "ハンデ", "試走換算", "予測競走T", "レース信頼度",
                 "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
                 "スタート伸び指数", "ゴール前伸び指数", "安定上位指数",
                 "混戦突破適性", "改善後総合点",

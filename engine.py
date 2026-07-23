@@ -3425,9 +3425,25 @@ def simulate(df, trials, seed, track_temp=30.0):
         order_line=line_indices[np.argsort(cars[line_indices])]
         lane_ratio[order_line]=np.linspace(1.0,0.0,len(order_line))
 
-    # 評価の中心。安定上位は残すが、格だけで外枠が自動突破しないよう抑える。
-    base=(z*.76 + stable*.30 + execution*.15 + current*.13 + trial_strength*.11)
-    noise_sd=np.clip(.68 + finish_sd*.50 + volatility*.30, .52, 1.45)
+    # Ver17: 予測競走タイムを確率差の中心へ追加する。
+    predicted_time = pd.to_numeric(
+        df.get("予測競走T", pd.Series(np.nan, index=df.index)), errors="coerce"
+    ).to_numpy(float)
+    if np.isfinite(predicted_time).any():
+        pt_fill = float(np.nanmedian(predicted_time[np.isfinite(predicted_time)]))
+        predicted_time = np.where(np.isfinite(predicted_time), predicted_time, pt_fill)
+        pt_span = max(1e-6, float(predicted_time.max()-predicted_time.min()))
+        time_strength = (predicted_time.max()-predicted_time)/pt_span
+    else:
+        pt_span = 0.0
+        time_strength = trial_strength.copy()
+
+    # 評価の中心。点数だけでなく予測タイム差を明示的に反映する。
+    base=(z*.64 + stable*.24 + execution*.14 + current*.12 + trial_strength*.12 + time_strength*.68)
+    # 明確なタイム差がある時だけランダム幅を縮める。混戦時は無理に確率を尖らせない。
+    sharpness = np.clip((pt_span-.015)/.055, 0.0, 1.0)
+    noise_scale = 1.0 - sharpness*.30
+    noise_sd=np.clip((.62 + finish_sd*.44 + volatility*.25)*noise_scale, .40, 1.25)
     score=base[None,:] + rng.normal(0,noise_sd,size=(trials,n))
 
     # ST反応と「その後の伸び」を分離。
@@ -3747,6 +3763,8 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
     # v3.9: 学習重みを透明に適用する。元のVer15.2系総合点は保持し、
     # 小さな補正だけを加えるため、1レースで予測が暴れない。
     df = v39_apply_adaptive_weights(df, DB_PATH)
+    # Ver17: 当日試走を中心に予測競走タイムを作り、確率差の根拠として利用する。
+    df = v17_add_predicted_time(df, track_temp=track_temp)
 
     # v3.8: 逐次的な追抜き入替ループを使わず、高速ベクトル型の6周イベントモデルを使用。
     finish_counts, bet_counts = simulate(df, trials, seed, track_temp=track_temp)
@@ -4894,8 +4912,7 @@ def v152_split_entry_blocks(text):
             # 次行がハンデ/STなら、確実に選手見出し
             inline_start = (
                 looks_like_player_name(candidate_name)
-                and i + 1 < len(lines)
-                and is_handicap_st_line(lines[i + 1])
+                and any(is_handicap_st_line(lines[j]) for j in range(i + 1, min(len(lines), i + 5)))
             )
 
         # 一部コピー形式: 車番、氏名、ハンデ/ST がそれぞれ別行
@@ -4904,7 +4921,7 @@ def v152_split_entry_blocks(text):
             m_single
             and i + 2 < len(lines)
             and looks_like_player_name(lines[i + 1])
-            and is_handicap_st_line(lines[i + 2])
+            and any(is_handicap_st_line(lines[j]) for j in range(i + 2, min(len(lines), i + 6)))
         )
 
         if inline_start:
@@ -4972,6 +4989,11 @@ def v152_parse_entry_block(block):
     tm = re.search(r"試\s*([3-9]\.\d{2,3}|-)", compact)
     if tm and tm.group(1) != "-":
         trial = float(tm.group(1))
+    else:
+        # スマホ縦型では「ハンデ10m/ST0.17 3.48」のように試走Tの見出しが省略される。
+        tm2 = re.search(r"ST\s*[+-]?\d?\.\d{2,3}\s+([3-9]\.\d{2,3}|-)", compact, re.I)
+        if tm2 and tm2.group(1) != "-":
+            trial = float(tm2.group(1))
 
     # 試走偏差
     trial_dev = np.nan
@@ -5075,10 +5097,42 @@ def v152_parse_vertical_entries(text):
 
 
 # 既存関数を上書きして縦型優先・従来形式フォールバック
+def v17_detect_nonstarters(text):
+    """出走表本文から欠車・出走取消などの車番を検出する。
+
+    欠車は勝率0%の選手ではなく、レースに存在しない選手として扱う。
+    """
+    clean = v15_clean_text(text)
+    lines = [x.strip() for x in clean.splitlines() if x.strip()]
+    excluded = {}
+    status_pattern = re.compile(r"欠車|出走取消|出走取り消し|不出走|除外|参加解除")
+    for i, line in enumerate(lines):
+        m_car = re.match(r"^([1-8])(?:[\t 　]+)(.+)$", line)
+        if not m_car:
+            continue
+        car = int(m_car.group(1))
+        # 選手見出し直後の数行だけを見る。別の表中の数字を拾わない。
+        nearby = "\n".join(lines[i:min(len(lines), i+6)])
+        m = status_pattern.search(nearby)
+        if m:
+            excluded[car] = m.group(0)
+    return excluded
+
+
 def v15_parse_entries(text):
-    vertical = v152_parse_vertical_entries(text)
+    excluded = v17_detect_nonstarters(text)
+    # 公式表示の「ハンデ0m/ST...」も従来パーサーの「0m/ST...」形式へ正規化。
+    parse_text = re.sub(r"(?m)^\s*ハンデ\s*", "", v15_clean_text(text))
+    # 欠車表示が氏名とハンデの間に入っても、ブロック認識できるよう除去して解析する。
+    parse_text = re.sub(r"(?m)^\s*(欠車|出走取消|出走取り消し|不出走|除外|参加解除)\s*$", "", parse_text)
+    vertical = v152_parse_vertical_entries(parse_text)
 
     if not vertical.empty and vertical["車番"].nunique() >= 2:
+        vertical = vertical.copy()
+        vertical["出走状態"] = vertical["車番"].map(lambda x: excluded.get(int(x), "出走"))
+        vertical["解析対象"] = ~vertical["車番"].astype(int).isin(excluded)
+        # シミュレーションへは実際に出走する選手だけ渡す。
+        vertical = vertical[vertical["解析対象"]].copy()
         return vertical.sort_values("車番").reset_index(drop=True)
 
     rows = []
@@ -5088,9 +5142,11 @@ def v15_parse_entries(text):
         if not row:
             continue
         key = row["車番"]
-        if key in seen:
+        if key in seen or int(key) in excluded:
             continue
         seen.add(key)
+        row["出走状態"] = "出走"
+        row["解析対象"] = True
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -5317,6 +5373,52 @@ def ver16_build_virtual_excel(text):
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue(), meta, entries
+
+def v17_add_predicted_time(df, track_temp=30.0):
+    """点数を補助に使いながら、当日試走を中心に相対的な予測競走タイムを作る。"""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    n = len(out)
+    trial = pd.to_numeric(out.get("試走換算", pd.Series(np.nan, index=out.index)), errors="coerce")
+    if trial.notna().any():
+        trial = trial.fillna(float(trial.median()))
+    else:
+        trial = pd.Series(3.50, index=out.index, dtype=float)
+    st = pd.to_numeric(out.get("平均ST", pd.Series(.15, index=out.index)), errors="coerce").fillna(.15)
+    handicap = pd.to_numeric(out.get("ハンデ", pd.Series(0, index=out.index)), errors="coerce").fillna(0)
+    practical = pd.to_numeric(out.get("実戦能力点", pd.Series(50, index=out.index)), errors="coerce").fillna(50)
+    closing = pd.to_numeric(out.get("終盤指数", pd.Series(50, index=out.index)), errors="coerce").fillna(50)
+    current = pd.to_numeric(out.get("当日状態指数", pd.Series(.5, index=out.index)), errors="coerce").fillna(.5)
+    stable = pd.to_numeric(out.get("安定上位指数", pd.Series(.5, index=out.index)), errors="coerce").fillna(.5)
+
+    def norm(v):
+        a = np.asarray(v, dtype=float)
+        lo, hi = np.nanpercentile(a, 10), np.nanpercentile(a, 90)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi-lo < 1e-9:
+            return np.full(len(a), .5)
+        return np.clip((a-lo)/(hi-lo), 0, 1)
+
+    practical_n = norm(practical)
+    closing_n = norm(closing)
+    st_penalty = (st - float(st.min())) * 0.10
+    # ハンデはスタート地点の差として扱う。後方車を単純に弱者扱いせず、負担のみ小さく秒換算。
+    handicap_penalty = (handicap - float(handicap.min())) / 10.0 * 0.006
+    ability_bonus = practical_n * 0.010 + closing_n * 0.006 + np.asarray(current) * 0.005 + np.asarray(stable) * 0.004
+    heat_penalty = max(0.0, (float(track_temp or 30.0)-45.0)/15.0) * 0.004
+    predicted = np.asarray(trial, dtype=float) + 0.095 + st_penalty + handicap_penalty + heat_penalty - ability_bonus
+    out["予測競走T"] = np.round(predicted, 4)
+
+    spread = float(np.nanmax(predicted)-np.nanmin(predicted)) if len(predicted) else 0.0
+    if spread >= .060:
+        confidence = "本命明確"
+    elif spread >= .030:
+        confidence = "やや本命"
+    else:
+        confidence = "混戦"
+    out["レース信頼度"] = confidence
+    return out
+
 
 def ver16_run_prediction(text, trials=10000, seed=20260719):
     content, meta, entries = ver16_build_virtual_excel(text)
