@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("v3.4｜Ver15.2系詳細6周シミュレーション・券種別確率・氏名／同一レース重複整理対応版")
+st.caption("v3.5｜公式結果全文・6周グランドノート・払戻金・予測比較解析対応版")
 
 
 def qident(name: str) -> str:
@@ -377,38 +377,78 @@ with prediction_tab:
 
 with result_tab:
     st.subheader("公式結果を登録して予測と比較")
-    st.info("公式結果ページを全文コピーして貼り付けます。同じ日付・開催場・レース番号は上書きされるため、レース名の違いでは重複しません。")
+    st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     c1, c2 = st.columns(2)
     venue_override = c1.text_input("開催場（本文から取れない場合のみ）", key="result_venue")
     race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key="result_race_no")
-    result_text = st.text_area("公式結果ページを全文貼り付け", height=500, key="official_result_text")
+    result_text = st.text_area(
+        "公式結果ページを全文貼り付け",
+        height=620,
+        key="official_result_text",
+        placeholder="6R\n確定\n2026年7月21日(火)\n…\n着順 車番 選手名\n…\nグランドノート\n…\n払戻金\n…",
+    )
     if st.button("結果を解析", use_container_width=True):
         try:
-            meta_r, rows_r = engine.v34_parse_result_text(result_text, venue_override, race_no_override)
-            st.session_state["v34_result_meta"] = meta_r
-            st.session_state["v34_result_rows"] = rows_r
+            meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(
+                result_text, venue_override, race_no_override
+            )
+            st.session_state["v35_result_meta"] = meta_r
+            st.session_state["v35_result_rows"] = rows_r
+            st.session_state["v35_result_laps"] = laps_r
+            st.session_state["v35_result_payouts"] = payouts_r
         except Exception as exc:
             st.error(f"結果解析エラー: {exc}")
-    meta_r = st.session_state.get("v34_result_meta")
-    rows_r = st.session_state.get("v34_result_rows")
+
+    meta_r = st.session_state.get("v35_result_meta")
+    rows_r = st.session_state.get("v35_result_rows")
+    laps_r = st.session_state.get("v35_result_laps")
+    payouts_r = st.session_state.get("v35_result_payouts")
+
     if isinstance(rows_r, pd.DataFrame) and not rows_r.empty:
         st.write("解析したレース情報", meta_r)
+        st.subheader("着順・タイム")
         st.dataframe(rows_r, use_container_width=True, hide_index=True)
-        if st.button("DBへ登録して予測差を解析", type="primary", use_container_width=True):
+
+        if isinstance(laps_r, pd.DataFrame) and not laps_r.empty:
+            st.subheader("6周グランドノート")
+            lap_table = laps_r.pivot(index="周回", columns="順位", values="車番")
+            order = [f"{i}周目" for i in range(1, 7)] + ["ゴール線"]
+            lap_table = lap_table.reindex([x for x in order if x in lap_table.index])
+            st.dataframe(lap_table, use_container_width=True)
+        else:
+            st.caption("グランドノートは見つかりませんでした。着順結果だけでも登録できます。")
+
+        if isinstance(payouts_r, pd.DataFrame) and not payouts_r.empty:
+            st.subheader("払戻金")
+            st.dataframe(payouts_r, use_container_width=True, hide_index=True)
+        else:
+            st.caption("払戻金は見つかりませんでした。")
+
+        if st.button("DBへ登録して予測差・展開を解析", type="primary", use_container_width=True):
             try:
-                key, comparison, analysis = engine.v34_save_result_and_analyze(meta_r, rows_r, engine.DB_PATH)
+                key, comparison, analysis = engine.v35_save_result_and_analyze(
+                    meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
+                )
                 st.success(f"結果を登録しました: {key}")
                 if "message" in analysis:
                     st.warning(analysis["message"])
                 else:
-                    a,b,c = st.columns(3)
+                    a, b, c = st.columns(3)
                     a.metric("平均順位誤差", analysis["平均順位誤差"])
                     b.metric("1着的中", "○" if analysis["1着的中"] else "×")
                     c.metric("予測TOP3一致", f"{analysis['3着内一致数']}/3")
-                    show_cols=[x for x in ["着順","車番","選手名_x","predicted_rank","順位誤差","win_prob","top3_prob"] if x in comparison.columns]
+                    show_cols = [x for x in ["着順", "車番", "選手名_x", "predicted_rank", "順位誤差", "win_prob", "top3_prob"] if x in comparison.columns]
                     st.dataframe(comparison[show_cols], use_container_width=True, hide_index=True)
-                    st.caption("少数レースでも解析できます。現段階では1レースの外れで予測ロジックを大きく変えず、誤差を蓄積して安全に補正判断する設計です。")
-                ok,msg=push_db_to_github(f"AutoRaceAI: {key} 結果登録・解析")
+
+                lap_items = []
+                for label in ["1周目先頭", "ゴール先頭", "先頭交代回数", "最大順位上昇車", "最大順位上昇"]:
+                    if label in analysis:
+                        lap_items.append(f"{label}: {analysis[label]}")
+                if lap_items:
+                    st.info("展開解析｜" + " / ".join(lap_items))
+
+                st.caption("同じ開催日・開催場・レース番号は上書き保存されます。レース名称が『予選』『一般戦』『6R』など異なっても重複登録されません。")
+                ok, msg = push_db_to_github(f"AutoRaceAI: {key} 結果・周回・払戻登録")
                 (st.success if ok else st.warning)(msg)
             except Exception as exc:
                 st.error(f"結果登録エラー: {type(exc).__name__}: {exc}")

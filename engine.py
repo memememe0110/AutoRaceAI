@@ -5833,7 +5833,7 @@ def v34_save_result_and_analyze(meta, results, db_path=DB_PATH):
            meta.get("走路温度"),meta.get("気温"),meta.get("湿度"),now))
         con.execute("DELETE FROM result_entries WHERE race_key=?", (key,))
         for _,r in results.iterrows():
-            con.execute("""INSERT INTO result_entries VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            con.execute("""INSERT INTO result_entries VALUES(?,?,?,?,?,?,?,?,?)""",
               (key,int(r["車番"]),str(r["選手名"]),int(r["着順"]),r.get("試走T"),r.get("競走T"),r.get("ST"),str(r.get("ハンデ", "")),str(r.get("結果区分","通常"))))
         pred = pd.read_sql_query("SELECT * FROM prediction_snapshots WHERE race_key=?", con, params=(key,))
         con.commit()
@@ -5855,3 +5855,278 @@ def v34_save_result_and_analyze(meta, results, db_path=DB_PATH):
           (key,len(merged),mae,int(pred_winner==actual_winner),len(predicted_top3&actual_top3),json.dumps(analysis,ensure_ascii=False),now))
         con.commit()
     return key, merged, analysis
+
+# ============================================================
+# v3.5 公式結果全文（縦型）・グランドノート・払戻金対応
+# ============================================================
+def v35_init_result_tables(db_path=DB_PATH):
+    v34_init_feedback_tables(db_path)
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS result_laps (
+            race_key TEXT NOT NULL,
+            lap_label TEXT NOT NULL,
+            lap_no INTEGER,
+            position INTEGER NOT NULL,
+            car_no INTEGER NOT NULL,
+            PRIMARY KEY (race_key, lap_label, position)
+        );
+        CREATE TABLE IF NOT EXISTS result_payouts (
+            race_key TEXT NOT NULL,
+            bet_type TEXT NOT NULL,
+            combination TEXT NOT NULL,
+            payout_yen INTEGER,
+            popularity INTEGER,
+            PRIMARY KEY (race_key, bet_type, combination)
+        );
+        """)
+        con.commit()
+
+
+def _v35_japanese_date(text):
+    m = re.search(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", text)
+    if not m:
+        return ""
+    return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+
+def _v35_float(value):
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return np.nan
+
+
+def _v35_parse_meta(text, venue_override="", race_no_override=""):
+    meta = v15_parse_race_meta(v15_clean_text(text))
+    date = _v35_japanese_date(text)
+    if date:
+        meta["開催日"] = date
+
+    race_match = re.search(r"(?m)^\s*(\d{1,2})R\s*$", text)
+    if race_match:
+        meta["レース"] = int(race_match.group(1))
+    if str(race_no_override).strip():
+        meta["レース"] = v15_int(race_no_override)
+
+    venues = ["川口", "伊勢崎", "浜松", "山陽", "飯塚"]
+    found_venue = next((v for v in venues if v in text), "")
+    if venue_override.strip():
+        found_venue = venue_override.strip()
+    if found_venue:
+        meta["開催場"] = found_venue
+
+    surface_match = re.search(r"(良走路|湿走路|斑走路|荒走路)\s*/\s*(-?\d+(?:\.\d+)?)℃", text)
+    if surface_match:
+        meta["走路状態"] = surface_match.group(1)
+        meta["走路温度"] = float(surface_match.group(2))
+    else:
+        sm = re.search(r"(良走路|湿走路|斑走路|荒走路)", text)
+        if sm:
+            meta["走路状態"] = sm.group(1)
+
+    am = re.search(r"気温[：:]\s*(-?\d+(?:\.\d+)?)℃", text)
+    hm = re.search(r"湿度[：:]\s*(\d+(?:\.\d+)?)%", text)
+    if am:
+        meta["気温"] = float(am.group(1))
+    if hm:
+        meta["湿度"] = float(hm.group(1))
+
+    weather_match = re.search(r"(?m)^\s*(晴|曇|雨|小雨|雪)\s*$", text)
+    if weather_match:
+        meta["天候"] = weather_match.group(1)
+
+    race_type_match = re.search(r"(?m)^\s*(予選|一般戦|準決勝戦|準決勝|優勝戦|選抜戦|特別一般戦)\s+(\d+)m\((\d+)周\)", text)
+    if race_type_match:
+        meta["レース種別"] = race_type_match.group(1)
+        meta["距離"] = int(race_type_match.group(2))
+        meta["周回数"] = int(race_type_match.group(3))
+    return meta
+
+
+def _v35_parse_entries(text):
+    # 着順表だけを対象にする。払戻金や周回順位を誤認しないよう区間を限定。
+    start = text.find("着順")
+    if start < 0:
+        start = 0
+    ends = [p for p in [text.find("グランドノート", start), text.find("払戻金", start)] if p >= 0]
+    end = min(ends) if ends else len(text)
+    block = text[start:end]
+    lines = [re.sub(r"[\t\u3000]+", " ", x).strip() for x in block.splitlines()]
+    lines = [x for x in lines if x]
+
+    rows = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^([1-8])\s+([1-8])(?:\s+(.+))?$", lines[i])
+        if not m:
+            i += 1
+            continue
+        finish, car = int(m.group(1)), int(m.group(2))
+        inline_name = (m.group(3) or "").strip()
+        i += 1
+        name = inline_name
+        if not name and i < len(lines):
+            name = lines[i]
+            i += 1
+        # LG/ハンデ/試走T
+        if i >= len(lines):
+            break
+        profile = lines[i]
+        i += 1
+        pm = re.search(r"([^/]+)/\s*(-?\d+)m\s*/\s*(\d\.\d{2})", profile)
+        if not pm:
+            continue
+        lg = pm.group(1).strip()
+        handicap = int(pm.group(2))
+        trial = float(pm.group(3))
+
+        # 競走T（人気）
+        race_t = np.nan
+        popularity = np.nan
+        if i < len(lines):
+            rm = re.search(r"(\d\.\d{3})\s*\((\d+)\)", lines[i])
+            if rm:
+                race_t = float(rm.group(1))
+                popularity = int(rm.group(2))
+                i += 1
+
+        # ST/事故
+        st_time = np.nan
+        accident = ""
+        if i < len(lines):
+            sm = re.match(r"^(0\.\d{2})(?:\s+(.+))?$", lines[i])
+            if sm:
+                st_time = float(sm.group(1))
+                accident = (sm.group(2) or "").strip()
+                i += 1
+
+        rows.append({
+            "着順": finish,
+            "車番": car,
+            "選手名": v15_normalize_name(name),
+            "所属": lg,
+            "ハンデ": handicap,
+            "試走T": trial,
+            "競走T": race_t,
+            "ST": st_time,
+            "人気": popularity,
+            "事故": accident,
+            "結果区分": "通常" if not accident else accident,
+        })
+    if len(rows) < 3:
+        raise ValueError("着順表を解析できませんでした。『着順 車番 選手名』からグランドノート直前までを含めて貼り付けてください。")
+    return pd.DataFrame(sorted(rows, key=lambda r: r["着順"]))
+
+
+def _v35_parse_laps(text):
+    if "グランドノート" not in text:
+        return pd.DataFrame(columns=["周回", "周回番号", "順位", "車番"])
+    block = text.split("グランドノート", 1)[1]
+    if "払戻金" in block:
+        block = block.split("払戻金", 1)[0]
+    records = []
+    for raw in block.splitlines():
+        line = re.sub(r"[\t\u3000]+", " ", raw).strip()
+        m = re.match(r"^(ゴール線|([1-9])周目)\s+((?:[1-8]\s*){3,8})$", line)
+        if not m:
+            continue
+        label = m.group(1)
+        lap_no = 99 if label == "ゴール線" else int(m.group(2))
+        cars = [int(x) for x in re.findall(r"[1-8]", m.group(3))]
+        for pos, car in enumerate(cars, start=1):
+            records.append({"周回": label, "周回番号": lap_no, "順位": pos, "車番": car})
+    if not records:
+        return pd.DataFrame(columns=["周回", "周回番号", "順位", "車番"])
+    return pd.DataFrame(records).sort_values(["周回番号", "順位"]).reset_index(drop=True)
+
+
+def _v35_parse_payouts(text):
+    if "払戻金" not in text:
+        return pd.DataFrame(columns=["券種", "組合せ", "払戻金", "人気"])
+    block = text.split("払戻金", 1)[1]
+    lines = [re.sub(r"[\t\u3000]+", " ", x).strip() for x in block.splitlines()]
+    lines = [x for x in lines if x]
+    known = {"単勝", "複勝", "2連複", "2連単", "ワイド", "3連複", "3連単"}
+    current = ""
+    rows = []
+    pattern = re.compile(r"^(?:(単勝|複勝|2連複|2連単|ワイド|3連複|3連単)\s+)?(.+?)\s+([\d,]+)円\s+(\d+)人気$")
+    for line in lines:
+        m = pattern.match(line)
+        if not m:
+            continue
+        if m.group(1):
+            current = m.group(1)
+        if current not in known:
+            continue
+        combo = re.sub(r"\s+", "", m.group(2))
+        rows.append({"券種": current, "組合せ": combo, "払戻金": int(m.group(3).replace(",", "")), "人気": int(m.group(4))})
+    return pd.DataFrame(rows)
+
+
+def v35_parse_result_text(text, venue_override="", race_no_override=""):
+    if not str(text).strip():
+        raise ValueError("結果ページを貼り付けてください。")
+    meta = _v35_parse_meta(text, venue_override, race_no_override)
+    rows = _v35_parse_entries(text)
+    laps = _v35_parse_laps(text)
+    payouts = _v35_parse_payouts(text)
+    if not meta.get("開催日") or not meta.get("開催場") or not meta.get("レース"):
+        raise ValueError("開催日・開催場・レース番号のいずれかを取得できませんでした。必要な場合は画面の補助入力を使ってください。")
+    return meta, rows, laps, payouts
+
+
+def _v35_lap_analysis(results, laps):
+    if laps is None or laps.empty:
+        return {}
+    pivot = laps.pivot(index="周回", columns="順位", values="車番")
+    lap1 = laps[laps["周回"] == "1周目"].sort_values("順位")
+    goal = laps[laps["周回"] == "ゴール線"].sort_values("順位")
+    if goal.empty:
+        goal = laps[laps["周回番号"] == laps["周回番号"].max()].sort_values("順位")
+    leader_sequence = []
+    ordered_labels = [x for x in laps.sort_values("周回番号")["周回"].drop_duplicates().tolist()]
+    for label in ordered_labels:
+        part = laps[(laps["周回"] == label) & (laps["順位"] == 1)]
+        if not part.empty:
+            leader_sequence.append(int(part.iloc[0]["車番"]))
+    lead_changes = sum(a != b for a, b in zip(leader_sequence, leader_sequence[1:]))
+    analysis = {"先頭交代回数": int(lead_changes)}
+    if not lap1.empty:
+        analysis["1周目先頭"] = int(lap1.iloc[0]["車番"])
+    if not goal.empty:
+        analysis["ゴール先頭"] = int(goal.iloc[0]["車番"])
+    if not lap1.empty and not goal.empty:
+        start_pos = {int(r["車番"]): int(r["順位"]) for _, r in lap1.iterrows()}
+        goal_pos = {int(r["車番"]): int(r["順位"]) for _, r in goal.iterrows()}
+        gains = {car: start_pos[car] - goal_pos.get(car, start_pos[car]) for car in start_pos}
+        if gains:
+            best_car = max(gains, key=gains.get)
+            analysis["最大順位上昇車"] = int(best_car)
+            analysis["最大順位上昇"] = int(gains[best_car])
+    return analysis
+
+
+def v35_save_result_and_analyze(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    v35_init_result_tables(db_path)
+    key, comparison, analysis = v34_save_result_and_analyze(meta, results, db_path)
+    with sqlite3.connect(db_path) as con:
+        con.execute("DELETE FROM result_laps WHERE race_key=?", (key,))
+        if isinstance(laps, pd.DataFrame) and not laps.empty:
+            for _, r in laps.iterrows():
+                con.execute("INSERT INTO result_laps VALUES(?,?,?,?,?)",
+                            (key, str(r["周回"]), int(r["周回番号"]), int(r["順位"]), int(r["車番"])))
+        con.execute("DELETE FROM result_payouts WHERE race_key=?", (key,))
+        if isinstance(payouts, pd.DataFrame) and not payouts.empty:
+            for _, r in payouts.iterrows():
+                con.execute("INSERT INTO result_payouts VALUES(?,?,?,?,?)",
+                            (key, str(r["券種"]), str(r["組合せ"]), int(r["払戻金"]), int(r["人気"])))
+        lap_analysis = _v35_lap_analysis(results, laps)
+        if lap_analysis:
+            analysis = dict(analysis)
+            analysis.update(lap_analysis)
+            if "message" not in analysis:
+                con.execute("UPDATE prediction_feedback SET analysis_json=? WHERE race_key=?",
+                            (json.dumps(analysis, ensure_ascii=False), key))
+        con.commit()
+    return key, comparison, analysis
