@@ -5357,13 +5357,44 @@ def _v32_find_player(con, name):
     return None
 
 
+def _v33_norm_text(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return re.sub(r"\s+", "", str(value)).strip().lower()
+
+
+def _v33_norm_number(value, digits=4):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip().lower().replace("m", "")
+    if text in {"", "none", "nan", "-"}:
+        return None
+    try:
+        return round(float(text), digits)
+    except (TypeError, ValueError):
+        return _v33_norm_text(value)
+
+
+def _v33_history_signature(row):
+    """同一走行結果の判定キー。
+
+    レース名称と走路表記は登録元により「一般戦/7R」「湿/斑」のように揺れるため
+    判定から除外する。日付・場・着順・ハンデ・各タイムが一致した走行を同一とする。
+    """
+    return (
+        _v33_norm_text(row.get("race_date")),
+        _v33_norm_text(row.get("venue")),
+        _v33_norm_number(row.get("finish"), 0),
+        _v33_norm_number(row.get("handicap"), 0),
+        _v33_norm_number(row.get("trial_time"), 3),
+        _v33_norm_number(row.get("race_time"), 3),
+        _v33_norm_number(row.get("start_time"), 3),
+    )
+
+
 def _v32_history_signature(row):
-    """player_idとrecord_keyを除いた履歴の実質内容。"""
-    return tuple(row.get(k) for k in (
-        "race_date", "venue", "race_no", "finish", "starters", "surface",
-        "handicap", "trial_time", "race_time", "start_time", "result_status",
-        "use_for_model"
-    ))
+    """後方互換名。v3.3からレース名称に依存しない。"""
+    return _v33_history_signature(row)
 
 
 def v32_merge_duplicate_players(db_path=DB_PATH):
@@ -5462,6 +5493,67 @@ def v32_merge_duplicate_players(db_path=DB_PATH):
     }
 
 
+def v33_cleanup_duplicate_histories(db_path=DB_PATH):
+    """同一選手内の重複走行を、レース名称に依存せず一括整理する。"""
+    mount_and_init_db()
+    deleted_histories = 0
+    deleted_imports = 0
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+
+        player_ids = [r[0] for r in con.execute("SELECT player_id FROM players ORDER BY player_id")]
+        for player_id in player_ids:
+            rows = con.execute(
+                "SELECT * FROM race_history WHERE player_id=? ORDER BY created_at, history_id",
+                (player_id,),
+            ).fetchall()
+            seen = {}
+            for row in rows:
+                sig = _v33_history_signature(dict(row))
+                if sig not in seen:
+                    seen[sig] = row
+                    continue
+                keep = seen[sig]
+                # より具体的なレース番号（例: 7R）を表示名として優先する。
+                keep_name = str(keep["race_no"] or "")
+                current_name = str(row["race_no"] or "")
+                if re.fullmatch(r"\d+R", current_name, flags=re.I) and not re.fullmatch(r"\d+R", keep_name, flags=re.I):
+                    con.execute("UPDATE race_history SET race_no=? WHERE history_id=?", (current_name, keep["history_id"]))
+                con.execute("DELETE FROM race_history WHERE history_id=?", (row["history_id"],))
+                deleted_histories += 1
+
+        if v15_table_exists(con, "v15_player_history_imports"):
+            rows = con.execute(
+                "SELECT * FROM v15_player_history_imports ORDER BY created_at, history_key"
+            ).fetchall()
+            seen = set()
+            for row in rows:
+                d = dict(row)
+                sig = (
+                    v32_player_name_key(d.get("player_name")),
+                    _v33_norm_text(d.get("race_date")),
+                    _v33_norm_text(d.get("venue")),
+                    _v33_norm_number(d.get("rank"), 0),
+                    _v33_norm_number(d.get("handicap"), 0),
+                    _v33_norm_number(d.get("trial_time"), 3),
+                    _v33_norm_number(d.get("race_time"), 3),
+                    _v33_norm_number(d.get("st"), 3),
+                )
+                if sig in seen:
+                    con.execute(
+                        "DELETE FROM v15_player_history_imports WHERE history_key=?",
+                        (d["history_key"],),
+                    )
+                    deleted_imports += 1
+                else:
+                    seen.add(sig)
+        con.commit()
+
+    return {"deleted_histories": deleted_histories, "deleted_imports": deleted_imports}
+
+
 def _v27_record_key(*values):
     raw = "|".join("" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v) for v in values)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -5507,9 +5599,25 @@ def v15_save_player_history(df, db_path=DB_PATH):
             race_time = None if pd.isna(row.get("競走T")) else float(row.get("競走T"))
             st = None if pd.isna(row.get("ST")) else float(row.get("ST"))
             car_no = None if pd.isna(row.get("車番")) else int(row.get("車番"))
-            record_key = _v27_record_key(v32_player_name_key(name), race_date, venue, race_type, finish, trial, race_time, st, car_no)
+            candidate_row = {
+                "race_date": race_date, "venue": venue, "finish": finish,
+                "handicap": handicap_text, "trial_time": trial,
+                "race_time": race_time, "start_time": st,
+            }
+            signature = _v33_history_signature(candidate_row)
+            record_key = _v27_record_key(v32_player_name_key(name), *signature)
 
-            exists = con.execute("SELECT 1 FROM race_history WHERE record_key=?", (record_key,)).fetchone()
+            # record_keyだけでなく実データでも確認する。旧版で別名保存された履歴も止める。
+            existing_rows = con.execute(
+                "SELECT * FROM race_history WHERE player_id=? AND race_date=? AND venue=?",
+                (player_id, race_date, venue),
+            ).fetchall()
+            exists = False
+            col_names = [d[0] for d in con.execute("SELECT * FROM race_history LIMIT 0").description]
+            for existing_row in existing_rows:
+                if _v33_history_signature(dict(zip(col_names, existing_row))) == signature:
+                    exists = True
+                    break
             if exists:
                 skipped += 1
             else:
@@ -5525,7 +5633,7 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 inserted += 1
 
             # 詳細条件を保持するミラー表。予測本体は上のrace_historyを参照。
-            history_key = v15_hash(v32_player_name_key(name), race_date, venue, race_type, finish, trial, race_time, car_no)
+            history_key = v15_hash(v32_player_name_key(name), race_date, venue, finish, handicap_num, trial, race_time, st)
             con.execute("""
                 INSERT OR IGNORE INTO v15_player_history_imports (
                     history_key, player_name, race_date, venue, race_no,

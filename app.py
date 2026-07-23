@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("v3.2｜Ver15.2系詳細6周シミュレーション・券種別確率・氏名正規化・GitHub DB保存対応版")
+st.caption("v3.3｜Ver15.2系詳細6周シミュレーション・券種別確率・氏名／同一レース重複整理対応版")
 
 
 def qident(name: str) -> str:
@@ -497,13 +497,15 @@ with db_tab:
 
                 st.divider()
                 st.subheader("DBメンテナンス")
-                st.caption("姓名の全角・半角スペース、スペースなしを同一人物として統合します。重複履歴も整理します。")
-                if st.button("同一選手の重複を統合", use_container_width=True):
+                st.caption("姓名の空白違いを統合し、レース名が『一般戦』『7R』など違っていても、同じ走行結果なら重複を整理します。")
+                if st.button("氏名・同一レースの重複をまとめて整理", use_container_width=True):
                     result = engine.v32_merge_duplicate_players(engine.DB_PATH)
-                    ok, msg = push_db_to_github("AutoRaceAI: 氏名表記の重複選手を統合")
+                    race_result = engine.v33_cleanup_duplicate_histories(engine.DB_PATH)
+                    ok, msg = push_db_to_github("AutoRaceAI: 氏名と同一走行結果の重複を整理")
                     summary = (
                         f"選手 {result['merged_players']}件を統合、履歴 {result['moved_histories']}件を移動、"
-                        f"重複履歴 {result['deleted_histories']}件を削除、詳細履歴名 {result['normalized_imports']}件を統一しました。"
+                        f"氏名統合時の重複 {result['deleted_histories']}件、同一走行履歴 {race_result['deleted_histories']}件、"
+                        f"詳細履歴 {race_result['deleted_imports']}件を削除しました。"
                     )
                     if ok:
                         st.success(summary + " " + msg)
