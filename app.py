@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("v3.8｜高速6周イベントシミュレーション・結果学習・風走路対応版")
+st.caption("v4.0｜10要素評価・前残り/追い込み分析・完全一致学習版")
 
 
 def qident(name: str) -> str:
@@ -282,7 +282,7 @@ with prediction_tab:
     st.info("予測方式：高速6周イベントモデル。スタート、1周目の伸び、中盤の突破、最終周の差しを試行ごとに生成します。")
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
-        st.caption("v3.9では、結果登録後の重み変更を保存し、調整前後の順位・三連単上位3車を確認できます。1レースの変更幅は各項目±0.005以内です。")
+        st.caption("v4.0では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
     text = st.text_area(
         "公式出走表を全文貼り付け",
         height=430,
@@ -318,11 +318,11 @@ with prediction_tab:
 
             finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
             race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
-            engine.v39_save_prediction_features(meta, df, engine.DB_PATH)
+            engine.v40_save_prediction_features(meta, df, engine.DB_PATH)
             st.caption(f"予測保存キー: {race_key}（結果登録時の比較・重み調整に使用）")
 
             with st.expander("🧪 学習重みによる順位変化"):
-                compare_cols = [c for c in ["車","選手名","調整前順位","改善後順位","調整前総合点","学習重み補正","改善後総合点"] if c in df.columns]
+                compare_cols = [c for c in ["車","選手名","調整前順位","改善後順位","調整前総合点","学習重み補正","改善後総合点","主な評価理由"] if c in df.columns]
                 st.dataframe(df[compare_cols].sort_values("改善後順位"), use_container_width=True, hide_index=True)
                 st.caption("調整前は元モデル、改善後は保存済み学習重みを小さく加えた順位です。")
             st.subheader("着順確率")
@@ -469,7 +469,7 @@ with result_tab:
                     st.caption("1着だけ、TOP3の車が同じだけでは三連単的中にしません。順番まで完全一致のみ○です。")
 
                 st.subheader("結果による重みの微調整")
-                adjustment = engine.v39_adjust_weights_after_result(meta_r, rows_r, engine.DB_PATH)
+                adjustment = engine.v40_adjust_weights_after_result(meta_r, rows_r, engine.DB_PATH)
                 if "before" in adjustment:
                     weight_rows=[]
                     for name in adjustment["before"]:
@@ -502,7 +502,7 @@ with result_tab:
 
 with db_tab:
     st.subheader("学習重み・変更履歴")
-    st.dataframe(engine.v39_current_weights(engine.DB_PATH), use_container_width=True, hide_index=True,
+    st.dataframe(engine.v40_current_weights(engine.DB_PATH), use_container_width=True, hide_index=True,
         column_config={"現在の重み":st.column_config.NumberColumn(format="%.4f"),"初期値":st.column_config.NumberColumn(format="%.4f"),"初期値からの差":st.column_config.NumberColumn(format="%+.4f")})
     history_df=engine.v39_weight_history(engine.DB_PATH,100)
     if history_df.empty:
