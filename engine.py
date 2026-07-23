@@ -3641,7 +3641,7 @@ def create_result_excel(content, filename, df, finish_counts, bet_counts, trials
     return path
 
 
-def run_model(content, filename, trials, seed, track_temp=30.0, active_cars=None):
+def run_model(content, filename, trials, seed, track_temp=30.0):
     wb = load_workbook(io.BytesIO(content), data_only=True)
 
     required = ["レース予測", "設定"] + [f"選手{i}" for i in range(1, 9)]
@@ -3652,27 +3652,22 @@ def run_model(content, filename, trials, seed, track_temp=30.0, active_cars=None
     race = read_race(wb["レース予測"])
     settings = read_settings(wb["設定"])
 
-    # スマホ版では実際に出走する車だけでVer15.2の相対評価を計算する。
-    # 7車立てに「未登録8」を混ぜると、順位・百分位・正規化が歪むため、
-    # ダミー選手は計算前から完全に除外する。
-    if active_cars is None:
-        active_cars = list(range(1, 9))
-    active_cars = sorted({int(c) for c in active_cars if 1 <= int(c) <= 8})
-    if len(active_cars) < 2:
-        raise ValueError("予測対象の実在車が2台未満です。出走表の解析結果を確認してください。")
-
     metrics = []
-    for car in active_cars:
+    for car in range(1, 9):
         ws = wb[f"選手{car}"]
         current = current_player(ws)
-        name = str(current.get("選手名", "") if isinstance(current, dict) else "")
-        if name.startswith("未登録"):
+        # 7車立てなどで作成した補助シート「未登録8」は計算へ入れない。
+        # ダミーを入れてから結果だけ消すのではなく、点数の正規化前に除外する。
+        current_name = str(current.get("選手名", current.get("name", "")) or "").strip()
+        if re.match(r"^未登録\d+$", re.sub(r"\s+", "", current_name)):
             continue
         history = read_history(ws)
         metrics.append(
             player_metrics(car, current, history, race, settings)
         )
 
+    if len(metrics) < 3:
+        raise ValueError("実在選手を3人以上取得できませんでした。出走表の貼り付け内容を確認してください。")
     df = calculate_excel_model(metrics, settings)
 
     # Ver12.2 診断列。シミュレーションと同じ考え方で、スタート一気と先行転換を表示する。
@@ -5312,14 +5307,12 @@ def ver16_run_prediction(text, trials=10000, seed=20260719):
     content, meta, entries = ver16_build_virtual_excel(text)
     track_temp = ver16_safe_float(meta.get("走路温度"), 30.0)
     filename = f"AutoRaceAI_Ver16_{meta.get('開催場') or 'race'}_{meta.get('レース') or ''}R.xlsx"
-    active_cars = sorted(pd.to_numeric(entries["車番"], errors="coerce").dropna().astype(int).unique().tolist())
     df, bets, output = run_model(
         content,
         filename,
         min(int(trials), 20000),
         int(seed),
-        float(track_temp),
-        active_cars=active_cars,
+        float(track_temp)
     )
     return df, bets, output, entries, meta
 
@@ -6143,4 +6136,128 @@ def v35_save_result_and_analyze(meta, results, laps=None, payouts=None, db_path=
                 con.execute("UPDATE prediction_feedback SET analysis_json=? WHERE race_key=?",
                             (json.dumps(analysis, ensure_ascii=False), key))
         con.commit()
+    return key, comparison, analysis
+
+
+# ============================================================
+# v3.6 結果登録時の選手履歴自動更新・調整履歴
+# ============================================================
+def v36_init_history_tables(db_path=DB_PATH):
+    mount_and_init_db()
+    with sqlite3.connect(str(db_path)) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS player_lap_history (
+            race_key TEXT NOT NULL,
+            player_id INTEGER NOT NULL,
+            player_name TEXT NOT NULL,
+            car_no INTEGER NOT NULL,
+            lap_label TEXT NOT NULL,
+            lap_no INTEGER,
+            position INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (race_key, car_no, lap_label),
+            FOREIGN KEY(player_id) REFERENCES players(player_id)
+        );
+        CREATE TABLE IF NOT EXISTS adjustment_log (
+            adjustment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version TEXT NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT NOT NULL,
+            coefficient_changed INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(version, category, description)
+        );
+        """)
+        rows = [
+            ("v3.6", "予測対象", "未登録1～8などの補助選手を、点数の正規化と6周シミュレーションの前に除外", 0),
+            ("v3.6", "履歴更新", "公式結果登録時にrace_historyと詳細履歴へ各選手の結果を自動追加", 0),
+            ("v3.6", "周回履歴", "グランドノートを選手別の周回順位履歴として保存", 0),
+            ("v3.6", "透明性", "登録件数・重複スキップ件数と調整履歴を画面表示", 0),
+            ("v3.6", "予測係数", "Ver15.2の予測係数・重みは変更していない", 0),
+        ]
+        con.executemany("""INSERT OR IGNORE INTO adjustment_log
+            (version,category,description,coefficient_changed) VALUES(?,?,?,?)""", rows)
+        con.commit()
+
+
+def _v36_surface_short(value):
+    v = str(value or "").strip()
+    return {"良走路":"良", "湿走路":"湿", "斑走路":"斑", "荒走路":"荒"}.get(v, v)
+
+
+def v36_update_player_histories(meta, results, laps=None, db_path=DB_PATH):
+    """結果表を学習用履歴へ同期する。再登録は論理キーで重複させない。"""
+    v36_init_history_tables(db_path)
+    if results is None or results.empty:
+        return {"履歴追加": 0, "履歴重複スキップ": 0, "周回履歴保存": 0}
+    starters = int(len(results))
+    rows=[]
+    for _, r in results.iterrows():
+        rows.append({
+            "選手名": str(r.get("選手名", "")).strip(),
+            "開催日": meta.get("開催日"),
+            "開催場": meta.get("開催場"),
+            "レース種別": meta.get("レース種別") or f"{meta.get('レース','')}R",
+            "着順": r.get("着順"),
+            "出走": starters,
+            "天候": meta.get("天候", ""),
+            "走路": _v36_surface_short(meta.get("走路状態")),
+            "走路温度": meta.get("走路温度"),
+            "気温": meta.get("気温"),
+            "湿度": meta.get("湿度"),
+            "車番": r.get("車番"),
+            "ハンデ": r.get("ハンデ"),
+            "距離": meta.get("距離", 3100),
+            "周回数": meta.get("周回数", 6),
+            "人気": r.get("人気"),
+            "競走T": r.get("競走T"),
+            "試走T": r.get("試走T"),
+            "ST": r.get("ST"),
+        })
+    inserted, skipped = v15_save_player_history(pd.DataFrame(rows), db_path)
+
+    key = v34_race_key(meta)
+    lap_saved = 0
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("PRAGMA foreign_keys=ON")
+        # 同一レースの再登録は周回部分だけ置換する。
+        con.execute("DELETE FROM player_lap_history WHERE race_key=?", (key,))
+        if isinstance(laps, pd.DataFrame) and not laps.empty:
+            name_by_car = {int(r["車番"]): str(r["選手名"]).strip() for _,r in results.iterrows()}
+            for _, lr in laps.iterrows():
+                car = int(lr["車番"])
+                name = name_by_car.get(car, "")
+                found = _v32_find_player(con, name)
+                if not found:
+                    continue
+                player_id, canonical = found
+                con.execute("""INSERT OR REPLACE INTO player_lap_history
+                    (race_key,player_id,player_name,car_no,lap_label,lap_no,position,created_at)
+                    VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                    (key, player_id, canonical, car, str(lr["周回"]), int(lr["周回番号"]), int(lr["順位"])))
+                lap_saved += 1
+        con.commit()
+    return {"履歴追加": int(inserted), "履歴重複スキップ": int(skipped), "周回履歴保存": int(lap_saved)}
+
+
+def v36_get_adjustment_log(db_path=DB_PATH):
+    v36_init_history_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        return pd.read_sql_query("""SELECT version AS バージョン, category AS 分類,
+            description AS 調整内容,
+            CASE coefficient_changed WHEN 1 THEN '変更あり' ELSE '変更なし' END AS 係数変更
+            FROM adjustment_log ORDER BY adjustment_id DESC""", con)
+
+
+def v36_save_result_and_analyze(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    key, comparison, analysis = v35_save_result_and_analyze(meta, results, laps, payouts, db_path)
+    history_summary = v36_update_player_histories(meta, results, laps, db_path)
+    analysis = dict(analysis)
+    analysis.update(history_summary)
+    # 予測比較が存在する場合は拡張後の解析内容も保存する。
+    if "message" not in analysis:
+        with sqlite3.connect(str(db_path)) as con:
+            con.execute("UPDATE prediction_feedback SET analysis_json=? WHERE race_key=?",
+                        (json.dumps(analysis, ensure_ascii=False), key))
+            con.commit()
     return key, comparison, analysis

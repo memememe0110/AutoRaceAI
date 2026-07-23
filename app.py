@@ -280,6 +280,9 @@ prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 
 
 with prediction_tab:
     st.info("予測方式：Ver15.2の詳細6周モデル（simulate_detailed）。各試行で隊列変化を計算し、確率を集計します。")
+    with st.expander("🔧 今回どこを調整したか"):
+        st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
+        st.caption("v3.6では予測係数は変えず、未登録車の除外と結果から選手履歴を更新する経路を修正しています。")
     text = st.text_area(
         "公式出走表を全文貼り付け",
         height=430,
@@ -426,7 +429,7 @@ with result_tab:
 
         if st.button("DBへ登録して予測差・展開を解析", type="primary", use_container_width=True):
             try:
-                key, comparison, analysis = engine.v35_save_result_and_analyze(
+                key, comparison, analysis = engine.v36_save_result_and_analyze(
                     meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
                 )
                 st.success(f"結果を登録しました: {key}")
@@ -447,6 +450,12 @@ with result_tab:
                 if lap_items:
                     st.info("展開解析｜" + " / ".join(lap_items))
 
+                st.subheader("選手履歴の更新結果")
+                h1, h2, h3 = st.columns(3)
+                h1.metric("新規履歴", analysis.get("履歴追加", 0))
+                h2.metric("重複スキップ", analysis.get("履歴重複スキップ", 0))
+                h3.metric("周回順位", analysis.get("周回履歴保存", 0))
+                st.caption("結果登録した競走T・試走T・ST・着順・ハンデ・走路条件は、次回以降の予測用選手履歴へ反映されます。")
                 st.caption("同じ開催日・開催場・レース番号は上書き保存されます。レース名称が『予選』『一般戦』『6R』など異なっても重複登録されません。")
                 ok, msg = push_db_to_github(f"AutoRaceAI: {key} 結果・周回・払戻登録")
                 (st.success if ok else st.warning)(msg)
