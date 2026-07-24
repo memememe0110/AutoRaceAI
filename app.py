@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import sqlite3
 import urllib.error
 import urllib.parse
@@ -16,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver19｜ハンデ補正適正化・追い込み型の外枠評価改善")
+st.caption("Ver20｜欠車誤判定修正・出走状態の手動切替対応")
 
 
 def qident(name: str) -> str:
@@ -279,10 +280,10 @@ with st.sidebar:
 prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
-    st.info("Ver19予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
+    st.info("Ver20予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
-        st.caption("Ver19では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
+        st.caption("Ver20では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
     if st.button("🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input"):
         for key in ["race_card_text"]:
             st.session_state.pop(key, None)
@@ -294,15 +295,37 @@ with prediction_tab:
         key="race_card_text",
     )
 
+    manual_excluded = []
+    if text.strip():
+        auto_excluded = {int(car): "手動指定" for car in manual_excluded}
+        # 欠車表示を一度除去して全車番を取得し、ユーザーが状態を上書きできるようにする。
+        status_removed = re.sub(r"(?m)^\s*(欠車|出走取消|出走取り消し|不出走|除外|参加解除)\s*$", "", text)
+        normalized = re.sub(r"(?m)^\s*ハンデ\s*", "", status_removed)
+        all_entries = engine.v152_parse_vertical_entries(engine.v15_clean_text(normalized))
+        available_cars = sorted(all_entries["車番"].dropna().astype(int).unique().tolist()) if not all_entries.empty else list(range(1, 9))
+        defaults = [car for car in available_cars if car in auto_excluded]
+        manual_excluded = st.multiselect(
+            "欠車・出走取消として除外する車番（手動で変更できます）",
+            options=available_cars,
+            default=defaults,
+            format_func=lambda x: f"{x}番",
+            key="manual_excluded_cars",
+        )
+        if auto_excluded:
+            detected = "、".join(f"{car}番" for car in sorted(auto_excluded))
+            st.caption(f"自動検出: {detected}。誤っている場合は上の選択を外してください。")
+        else:
+            st.caption("自動検出された欠車はありません。必要な車番だけ選択してください。")
+
     if st.button("解析して元版設定で予測", type="primary", use_container_width=True):
         if not text.strip():
             st.warning("出走表を貼り付けてください。")
             st.stop()
         try:
             with st.spinner("高速6周イベントシミュレーションを実行中…"):
-                df, bets, output, entries, meta = engine.ver16_run_prediction(text, int(trials), int(seed))
+                df, bets, output, entries, meta = engine.ver16_run_prediction(text, int(trials), int(seed), manual_excluded=manual_excluded)
             st.success("予測が完了しました")
-            excluded = engine.v17_detect_nonstarters(text)
+            excluded = {int(car): "手動指定" for car in manual_excluded}
             if excluded:
                 detail = "、".join(f"{car}番（{status}）" for car, status in sorted(excluded.items()))
                 st.warning(f"解析対象外: {detail}。確率・順位・買い目の組み合わせから完全に除外しました。")

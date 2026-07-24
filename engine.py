@@ -5134,29 +5134,32 @@ def v152_parse_vertical_entries(text):
 
 # 既存関数を上書きして縦型優先・従来形式フォールバック
 def v17_detect_nonstarters(text):
-    """出走表本文から欠車・出走取消などの車番を検出する。
+    """出走表本文から欠車・出走取消などの車番を安全に検出する。
 
-    欠車は勝率0%の選手ではなく、レースに存在しない選手として扱う。
+    車番ごとの選手ブロック内だけを検査するため、次の選手にある「欠車」を
+    直前の選手へ誤って割り当てない。
     """
     clean = v15_clean_text(text)
-    lines = [x.strip() for x in clean.splitlines() if x.strip()]
-    excluded = {}
     status_pattern = re.compile(r"欠車|出走取消|出走取り消し|不出走|除外|参加解除")
-    for i, line in enumerate(lines):
-        m_car = re.match(r"^([1-8])(?:[\t 　]+)(.+)$", line)
-        if not m_car:
-            continue
-        car = int(m_car.group(1))
-        # 選手見出し直後の数行だけを見る。別の表中の数字を拾わない。
-        nearby = "\n".join(lines[i:min(len(lines), i+6)])
-        m = status_pattern.search(nearby)
-        if m:
-            excluded[car] = m.group(0)
+    excluded = {}
+
+    # 公式縦型表示を車番見出し単位で分割する。
+    starts = list(re.finditer(r"(?m)^\s*([1-8])(?:[\t 　]+)(?=\S)", clean))
+    for idx, match in enumerate(starts):
+        car = int(match.group(1))
+        end = starts[idx + 1].start() if idx + 1 < len(starts) else len(clean)
+        block = clean[match.start():end]
+        found = status_pattern.search(block)
+        if found:
+            excluded[car] = found.group(0)
     return excluded
 
 
-def v15_parse_entries(text):
-    excluded = v17_detect_nonstarters(text)
+def v15_parse_entries(text, manual_excluded=None):
+    excluded = dict(v17_detect_nonstarters(text))
+    if manual_excluded is not None:
+        # 画面で指定した状態を最優先。空集合なら全車出走として扱う。
+        excluded = {int(car): "手動欠車" for car in manual_excluded}
     # 公式表示の「ハンデ0m/ST...」も従来パーサーの「0m/ST...」形式へ正規化。
     parse_text = re.sub(r"(?m)^\s*ハンデ\s*", "", v15_clean_text(text))
     # 欠車表示が氏名とハンデの間に入っても、ブロック認識できるよう除去して解析する。
@@ -5334,9 +5337,9 @@ def ver16_make_settings_sheet(ws):
         ws.cell(r, 1, labels.get(r, f"設定{r}"))
         ws.cell(r, 2, value)
 
-def ver16_build_virtual_excel(text):
+def ver16_build_virtual_excel(text, manual_excluded=None):
     meta = v15_parse_race_meta(text)
-    entries = v15_parse_entries(text)
+    entries = v15_parse_entries(text, manual_excluded=manual_excluded)
 
     if entries.empty:
         raise ValueError("出走表を解析できませんでした。公式ページを全文コピーして貼り付けてください。")
@@ -5456,8 +5459,8 @@ def v17_add_predicted_time(df, track_temp=30.0):
     return out
 
 
-def ver16_run_prediction(text, trials=10000, seed=20260719):
-    content, meta, entries = ver16_build_virtual_excel(text)
+def ver16_run_prediction(text, trials=10000, seed=20260719, manual_excluded=None):
+    content, meta, entries = ver16_build_virtual_excel(text, manual_excluded=manual_excluded)
     track_temp = ver16_safe_float(meta.get("走路温度"), 30.0)
     filename = f"AutoRaceAI_Ver16_{meta.get('開催場') or 'race'}_{meta.get('レース') or ''}R.xlsx"
     df, bets, output = run_model(
