@@ -2383,7 +2383,7 @@ def prepare_simulation_arrays(df):
 
 
 def simulate_detailed(df, trials, seed, track_temp=30.0):
-    """Ver12.2: 大人数同ハンデ線を含む6周モデルに、安定上位と突破機会を追加する。"""
+    """Ver28: 表示順位を変えず、早期先頭候補を三連単の周回展開へ反映する。"""
     rng = np.random.default_rng(seed)
     arr = prepare_simulation_arrays(df)
     cars = arr["cars"]; n = len(cars)
@@ -2719,14 +2719,30 @@ def simulate_detailed(df, trials, seed, track_temp=30.0):
         if scenario == "先行縦長":
             base_pace[front_line] += 0.08 + execution_quality[front_line] * 0.05
             if secondary_front.any():
-                base_pace[secondary_front] += 0.025 + early_lead_strength[secondary_front] * 0.035
+                # Ver28: 表示順位は変えず、10m早期先頭候補を周回展開で強める。
+                # 最前車を早めに交わして逃げ役へ移る混合展開を三連単へ反映する。
+                base_pace[secondary_front] += (
+                    0.050
+                    + early_lead_strength[secondary_front] * 0.070
+                    + heat_index * 0.025
+                )
             chase_mask = handicap > min_handicap
             base_pace[chase_mask] += 0.05 + traffic_conversion[chase_mask] * 0.07
         elif scenario == "前残り":
             base_pace[front_line] += 0.14 + recent_form_strength[front_line] * 0.08
+            if secondary_front.any():
+                # 熱走路の前残りを0m固定にせず、条件を満たした10m車にも配分する。
+                base_pace[secondary_front] += (
+                    0.060
+                    + early_lead_strength[secondary_front] * 0.085
+                    + heat_index * 0.035
+                )
             base_pace[~front_line] -= 0.05
         elif scenario == "混戦":
             base_pace += rng.normal(0, 0.10, n)
+            if secondary_front.any():
+                # 混戦でも早期に前へ付けた候補は3着内へ残る余地を持たせる。
+                base_pace[secondary_front] += 0.025 + early_lead_strength[secondary_front] * 0.040
         elif scenario == "追い込み":
             chase_mask = handicap > min_handicap
             base_pace[chase_mask] += 0.15 + traffic_conversion[chase_mask] * 0.12
