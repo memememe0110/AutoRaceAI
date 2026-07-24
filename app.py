@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver20｜欠車誤判定修正・出走状態の手動切替対応")
+st.caption("Ver21｜リセット安定化・結果解析の保持表示対応")
 
 
 def qident(name: str) -> str:
@@ -277,6 +277,54 @@ with st.sidebar:
     except Exception as exc:
         st.warning(f"DB情報を確認できません: {exc}")
 
+def render_last_result_analysis(view: dict) -> None:
+    """登録後の解析結果を、再描画後もセッションから復元して表示する。"""
+    if not isinstance(view, dict) or not view:
+        return
+    comparison = view.get("comparison")
+    analysis = view.get("analysis") or {}
+    adjustment = view.get("adjustment") or {}
+    st.markdown("### 📌 直前に登録した結果解析")
+    st.caption(f"登録キー: {view.get('key', '不明')}｜別タブ操作や再描画後も保持されます。")
+    if "message" in analysis:
+        st.warning(analysis["message"])
+    else:
+        a, b, c = st.columns(3)
+        a.metric("平均順位誤差", analysis.get("平均順位誤差", "-"))
+        b.metric("1着的中", "○" if analysis.get("1着的中") else "×")
+        c.metric("予測TOP3一致", f"{analysis.get('3着内一致数', 0)}/3")
+        if isinstance(comparison, pd.DataFrame) and not comparison.empty:
+            show_cols = [x for x in ["着順", "車番", "選手名_x", "predicted_rank", "順位誤差", "win_prob", "top3_prob"] if x in comparison.columns]
+            st.dataframe(comparison[show_cols], use_container_width=True, hide_index=True)
+    pred = view.get("predicted_trifecta")
+    actual = view.get("actual_trifecta")
+    if pred and actual:
+        st.subheader("三連単の完全一致判定")
+        t1, t2, t3 = st.columns(3)
+        t1.metric("予測", pred)
+        t2.metric("実結果", actual)
+        t3.metric("三連単的中", "○" if pred == actual else "×")
+    if "before" in adjustment:
+        st.subheader("結果による重みの微調整")
+        rows = []
+        for name in adjustment["before"]:
+            rows.append({
+                "項目": name,
+                "調整前": adjustment["before"][name],
+                "調整後": adjustment["after"][name],
+                "変化": adjustment["after"][name] - adjustment["before"][name],
+                "今回結果との相関": adjustment["evidence"][name],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+            column_config={
+                "調整前": st.column_config.NumberColumn(format="%.4f"),
+                "調整後": st.column_config.NumberColumn(format="%.4f"),
+                "変化": st.column_config.NumberColumn(format="%+.4f"),
+                "今回結果との相関": st.column_config.NumberColumn(format="%+.3f"),
+            })
+        st.info(adjustment.get("note", "学習重みを更新しました。"))
+
+
 prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
@@ -284,15 +332,17 @@ with prediction_tab:
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
         st.caption("Ver20では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
+    st.session_state.setdefault("prediction_input_version", 0)
     if st.button("🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input"):
-        for key in ["race_card_text"]:
-            st.session_state.pop(key, None)
+        st.session_state["prediction_input_version"] += 1
+        st.session_state.pop("last_prediction_view", None)
         st.rerun()
+    prediction_version = st.session_state["prediction_input_version"]
     text = st.text_area(
         "公式出走表を全文貼り付け",
         height=430,
         placeholder="autorace.jpの出走表をコピーして貼り付け",
-        key="race_card_text",
+        key=f"race_card_text_{prediction_version}",
     )
 
     manual_excluded = []
@@ -309,7 +359,7 @@ with prediction_tab:
             options=available_cars,
             default=defaults,
             format_func=lambda x: f"{x}番",
-            key="manual_excluded_cars",
+            key=f"manual_excluded_cars_{prediction_version}",
         )
         if auto_excluded:
             detected = "、".join(f"{car}番" for car in sorted(auto_excluded))
@@ -419,17 +469,20 @@ with prediction_tab:
 with result_tab:
     st.subheader("公式結果を登録して予測と比較")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
+    st.session_state.setdefault("result_input_version", 0)
     if st.button("🗑️ 結果入力をリセット", use_container_width=True, key="reset_result_input"):
-        for key in ["result_venue", "result_race_no", "official_result_text", "v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts", "v41_last_result_view"]:
+        st.session_state["result_input_version"] += 1
+        for key in ["v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts", "v41_last_result_view"]:
             st.session_state.pop(key, None)
         st.rerun()
+    result_version = st.session_state["result_input_version"]
     c1, c2 = st.columns(2)
-    venue_override = c1.text_input("開催場（本文から取れない場合のみ）", key="result_venue")
-    race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key="result_race_no")
+    venue_override = c1.text_input("開催場（本文から取れない場合のみ）", key=f"result_venue_{result_version}")
+    race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key=f"result_race_no_{result_version}")
     result_text = st.text_area(
         "公式結果ページを全文貼り付け",
         height=620,
-        key="official_result_text",
+        key=f"official_result_text_{result_version}",
         placeholder="6R\n確定\n2026年7月21日(火)\n…\n着順 車番 選手名\n…\nグランドノート\n…\n払戻金\n…",
     )
     if st.button("結果を解析", use_container_width=True):
@@ -478,11 +531,18 @@ with result_tab:
                     st.warning(analysis.get("message", "このレースは登録済みです。"))
                     st.stop()
                 st.success(f"結果を登録しました: {key}")
+                predicted_trifecta_saved = ""
+                actual_trifecta_saved = ""
+                if "message" not in analysis:
+                    predicted_trifecta_saved = "→".join(map(str, comparison.sort_values("predicted_rank")["車番"].head(3).astype(int)))
+                    actual_trifecta_saved = "→".join(map(str, rows_r.sort_values("着順")["車番"].head(3).astype(int)))
                 st.session_state["v41_last_result_view"] = {
                     "key": key,
                     "comparison": comparison,
                     "analysis": analysis,
                     "adjustment": adjustment,
+                    "predicted_trifecta": predicted_trifecta_saved,
+                    "actual_trifecta": actual_trifecta_saved,
                 }
                 if "message" in analysis:
                     st.warning(analysis["message"])
@@ -549,6 +609,12 @@ with result_tab:
                 st.error(f"結果登録エラー: {type(exc).__name__}: {exc}")
                 st.exception(exc)
 
+    last_result_view = st.session_state.get("v41_last_result_view")
+    if last_result_view:
+        st.divider()
+        render_last_result_analysis(last_result_view)
+
+
 with db_tab:
     st.subheader("学習重み・変更履歴")
     st.dataframe(engine.v40_current_weights(engine.DB_PATH), use_container_width=True, hide_index=True,
@@ -599,16 +665,18 @@ with db_tab:
 
 with register_tab:
     st.subheader("選手情報を登録")
+    st.session_state.setdefault("player_input_version", 0)
     if st.button("🗑️ 選手入力をリセット", use_container_width=True, key="reset_player_input"):
-        for key in ["player_name_input", "player_history_text", "parsed_player_history"]:
-            st.session_state.pop(key, None)
+        st.session_state["player_input_version"] += 1
+        st.session_state.pop("parsed_player_history", None)
         st.rerun()
-    player_name = st.text_input("選手名", placeholder="例：横田翔", key="player_name_input")
+    player_version = st.session_state["player_input_version"]
+    player_name = st.text_input("選手名", placeholder="例：横田翔", key=f"player_name_input_{player_version}")
     history_text = st.text_area(
         "公式プロフィールの直近履歴を貼り付け",
         height=520,
         placeholder="前走\n4\n2026年7月21日\n伊勢崎\n予選\n…",
-        key="player_history_text",
+        key=f"player_history_text_{player_version}",
     )
 
     if st.button("貼り付け内容を解析", use_container_width=True):
