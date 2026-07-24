@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver27｜モデル確率と入力オッズの比較表示対応")
+st.caption("Ver30｜早期先頭の逃げ切り分岐・確率表ごとのオッズ入力対応")
 
 
 def qident(name: str) -> str:
@@ -55,8 +55,8 @@ def normalize_player_key(name: str) -> str:
 
 
 def player_data_coverage(entries: pd.DataFrame, db_path: str) -> pd.DataFrame:
-    """解析対象選手ごとのDB登録量を、正規履歴と詳細取込履歴に分けて集計する。"""
-    columns = ["車", "選手名", "正規履歴", "詳細取込", "登録合計", "予測利用可", "最新日", "データ量"]
+    """解析対象選手ごとのDB登録量を、重複加算せずに集計する。"""
+    columns = ["車", "選手名", "正規履歴", "条件詳細あり", "実質登録数", "予測利用可", "最新日", "データ量"]
     if entries is None or entries.empty or "選手名" not in entries.columns:
         return pd.DataFrame(columns=columns)
 
@@ -110,7 +110,8 @@ def player_data_coverage(entries: pd.DataFrame, db_path: str) -> pd.DataFrame:
     for item in targets:
         c_all, c_use, c_latest = canonical.get(item["key"], (0, 0, None))
         i_all, i_latest = imported.get(item["key"], (0, None))
-        total = c_all + i_all
+        # 詳細取込は正規履歴のミラーなので合算しない。正規履歴が実質ユニーク件数。
+        total = c_all
         latest_candidates = [d for d in (c_latest, i_latest) if d]
         latest = max(latest_candidates) if latest_candidates else "未登録"
         if total >= 20:
@@ -127,9 +128,9 @@ def player_data_coverage(entries: pd.DataFrame, db_path: str) -> pd.DataFrame:
             "車": item["車"],
             "選手名": item["選手名"],
             "正規履歴": c_all,
-            "詳細取込": i_all,
-            "登録合計": total,
-            "予測利用可": c_use + i_all,
+            "条件詳細あり": i_all,
+            "実質登録数": total,
+            "予測利用可": c_use,
             "最新日": latest,
             "データ量": level,
         })
@@ -148,15 +149,15 @@ def show_player_data_coverage(entries: pd.DataFrame) -> None:
         hide_index=True,
         column_config={
             "正規履歴": st.column_config.NumberColumn(format="%d件"),
-            "詳細取込": st.column_config.NumberColumn(format="%d件"),
-            "登録合計": st.column_config.NumberColumn(format="%d件"),
+            "条件詳細あり": st.column_config.NumberColumn(format="%d件"),
+            "実質登録数": st.column_config.NumberColumn(format="%d件"),
             "予測利用可": st.column_config.NumberColumn(format="%d件"),
         },
     )
-    zero_names = coverage.loc[coverage["登録合計"] == 0, "選手名"].tolist()
+    zero_names = coverage.loc[coverage["実質登録数"] == 0, "選手名"].tolist()
     if zero_names:
         st.warning("DB履歴0件: " + "、".join(zero_names) + "。名前の照合または履歴登録を確認してください。")
-    st.caption("正規履歴は結果登録などで蓄積した履歴、詳細取込は公式プロフィールから登録した履歴です。登録合計20件以上を『十分』の目安にしています。")
+    st.caption("正規履歴が実質的な登録件数です。『条件詳細あり』は、その正規履歴のうち走路温度・湿度・レース種別などの詳細条件も保存されている件数で、別レースとしては加算しません。実質登録数20件以上を『十分』の目安にしています。")
 
 def ticket_probability_table(bets: dict, key: str, trials: int, top_n: int = 20) -> pd.DataFrame:
     """シミュレーションの券種別カウントを、表示用の確率表へ変換する。"""
@@ -230,60 +231,54 @@ def parse_manual_odds(text: str, unordered: bool = False) -> tuple[pd.DataFrame,
 
 
 def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_key: str, unordered: bool = False) -> None:
-    """モデル確率から公平倍率を算出し、手入力オッズとのズレだけを表示する。"""
-    with st.expander(f"📊 {title}の混合展開修正"):
-        st.caption("1行につき『組み合わせ オッズ』を入力します。例: 4-7-3 228.4。矢印や全角記号でも読み取れます。")
-        odds_text = st.text_area(
-            "オッズを貼り付け",
-            height=150,
-            key=f"odds_input_{widget_key}",
-            placeholder="4-7-3 228.4\n7-4-3 45.6",
-        )
-        if not odds_text.strip():
-            st.info("オッズを入力すると、モデル上の公平倍率との差を表示します。")
-            return
+    """各確率表の直下で、組み合わせごとにオッズを直接入力して市場差を確認する。"""
+    st.markdown(f"#### {title} オッズ入力")
+    st.caption("確率上位の各行へオッズを直接入力できます。公平倍率との差のみを表示し、購入推奨は行いません。")
 
-        odds_df, errors = parse_manual_odds(odds_text, unordered=unordered)
-        if errors:
-            st.warning("読み取れなかった行: " + " / ".join(errors[:5]))
-        if odds_df.empty:
-            return
+    prob_df = ticket_probability_table(bets, key, trials, top_n=40).drop(columns=["的中回数"], errors="ignore")
+    if prob_df.empty:
+        st.info("確率データがありません。")
+        return
+    if unordered:
+        prob_df["組み合わせ"] = prob_df["組み合わせ"].map(lambda x: normalize_ticket_combo(x, unordered=True))
+        prob_df = prob_df.groupby("組み合わせ", as_index=False)["確率"].sum().sort_values("確率", ascending=False).head(40)
+        prob_df.insert(0, "順位", range(1, len(prob_df) + 1))
+    prob_df["公平倍率"] = prob_df["確率"].map(lambda p: (100.0 / p) if p > 0 else None)
+    prob_df["入力オッズ"] = None
 
-        # 上位だけでなく全組み合わせを対象に照合する。
-        prob_df = ticket_probability_table(bets, key, trials, top_n=10000).drop(columns=["順位", "的中回数"], errors="ignore")
-        if unordered and not prob_df.empty:
-            prob_df["組み合わせ"] = prob_df["組み合わせ"].map(lambda x: normalize_ticket_combo(x, unordered=True))
-            prob_df = prob_df.groupby("組み合わせ", as_index=False)["確率"].sum()
-        merged = odds_df.merge(prob_df, on="組み合わせ", how="left")
-        merged["確率"] = merged["確率"].fillna(0.0)
-        merged["公平倍率"] = merged["確率"].map(lambda p: (100.0 / p) if p > 0 else None)
-        merged["オッズ÷公平倍率"] = merged.apply(
-            lambda r: (r["入力オッズ"] / r["公平倍率"]) if pd.notna(r["公平倍率"]) and r["公平倍率"] > 0 else None,
-            axis=1,
-        )
-        def label(row):
-            ratio = row["オッズ÷公平倍率"]
-            if pd.isna(ratio):
-                return "モデル確率0%"
-            if ratio >= 1.15:
-                return "市場よりモデル評価が高い"
-            if ratio <= 0.85:
-                return "市場よりモデル評価が低い"
-            return "ほぼ同水準"
-        merged["比較"] = merged.apply(label, axis=1)
-        merged = merged.sort_values(["オッズ÷公平倍率", "確率"], ascending=[False, False], na_position="last")
-        st.dataframe(
-            merged[["組み合わせ", "確率", "公平倍率", "入力オッズ", "オッズ÷公平倍率", "比較"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "確率": st.column_config.NumberColumn("モデル確率", format="%.2f%%"),
-                "公平倍率": st.column_config.NumberColumn("モデル上の公平倍率", format="%.1f倍"),
-                "入力オッズ": st.column_config.NumberColumn("入力オッズ", format="%.1f倍"),
-                "オッズ÷公平倍率": st.column_config.NumberColumn("倍率差", format="%.2f倍"),
-            },
-        )
-        st.caption("倍率差は『入力オッズ ÷ モデル上の公平倍率』です。購入推奨ではなく、市場評価とモデル評価の差を確認するための参考表示です。")
+    edited = st.data_editor(
+        prob_df[["順位", "組み合わせ", "確率", "公平倍率", "入力オッズ"]],
+        key=f"odds_editor_{widget_key}",
+        use_container_width=True,
+        hide_index=True,
+        disabled=["順位", "組み合わせ", "確率", "公平倍率"],
+        column_config={
+            "確率": st.column_config.NumberColumn("モデル確率", format="%.2f%%"),
+            "公平倍率": st.column_config.NumberColumn("公平倍率", format="%.1f倍"),
+            "入力オッズ": st.column_config.NumberColumn("入力オッズ", min_value=0.0, step=0.1, format="%.1f倍"),
+        },
+    )
+    entered = edited[pd.to_numeric(edited["入力オッズ"], errors="coerce").notna()].copy()
+    if entered.empty:
+        st.caption("入力した行だけ、倍率差と市場比較が下に表示されます。")
+        return
+    entered["入力オッズ"] = pd.to_numeric(entered["入力オッズ"], errors="coerce")
+    entered["倍率差"] = entered["入力オッズ"] / entered["公平倍率"]
+    entered["比較"] = entered["倍率差"].map(
+        lambda r: "市場よりモデル評価が高い" if r >= 1.15 else ("市場よりモデル評価が低い" if r <= 0.85 else "ほぼ同水準")
+    )
+    st.dataframe(
+        entered[["組み合わせ", "確率", "公平倍率", "入力オッズ", "倍率差", "比較"]].sort_values("倍率差", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "確率": st.column_config.NumberColumn("モデル確率", format="%.2f%%"),
+            "公平倍率": st.column_config.NumberColumn("公平倍率", format="%.1f倍"),
+            "入力オッズ": st.column_config.NumberColumn("入力オッズ", format="%.1f倍"),
+            "倍率差": st.column_config.NumberColumn("オッズ÷公平倍率", format="%.2f倍"),
+        },
+    )
+    st.caption("倍率差は入力オッズ÷公平倍率です。市場とモデルの評価差を見るための参考値です。")
 
 
 def install_uploaded_db(uploaded) -> tuple[bool, str]:

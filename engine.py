@@ -2383,7 +2383,7 @@ def prepare_simulation_arrays(df):
 
 
 def simulate_detailed(df, trials, seed, track_temp=30.0):
-    """Ver28: 表示順位を変えず、早期先頭候補を三連単の周回展開へ反映する。"""
+    """Ver30: 10m早期先頭交代と逃げ切りを三連単の周回展開へ反映する。"""
     rng = np.random.default_rng(seed)
     arr = prepare_simulation_arrays(df)
     cars = arr["cars"]; n = len(cars)
@@ -2795,16 +2795,44 @@ def simulate_detailed(df, trials, seed, track_temp=30.0):
         first_overtaken_phase = np.full(n, phases, dtype=np.int8)
         delay_total = late_delay + outer_start_delay
         initial_leader = int(order[0])
+
+        # Ver30: 弱い最前車の直後にいる10m早期先頭候補が、序盤で先頭役を引き継ぐ分岐。
+        # これまでは候補へ加点しても勝ち切り抽選の中心が0m車のまま残ることがあった。
+        takeover_front = None
+        sec_candidates = [int(i) for i in order if secondary_front[int(i)] and not severe[int(i)]]
+        if sec_candidates and scenario in ("先行縦長", "前残り", "混戦"):
+            takeover_front = max(sec_candidates, key=lambda i: early_lead_strength[i])
+            primary_strength = float(np.max(early_lead_strength[primary_front])) if primary_front.any() else 0.45
+            takeover_prob = np.clip(
+                0.08
+                + heat_index * 0.16
+                + early_lead_strength[takeover_front] * 0.34
+                + max(0.0, 0.48 - primary_strength) * 0.75
+                + (0.09 if scenario == "前残り" else 0.04 if scenario == "先行縦長" else 0.0),
+                0.08, 0.68,
+            )
+            if rng.random() < takeover_prob:
+                cur_t = int(np.where(order == takeover_front)[0][0])
+                order = np.delete(order, cur_t)
+                order = np.insert(order, 0, takeover_front)
+                initial_leader = takeover_front
+                base_pace[takeover_front] += 0.10 + early_lead_strength[takeover_front] * 0.12 + heat_index * 0.04
+
         clean_escape = front_line[initial_leader] and not severe[initial_leader] and not normal[initial_leader] and rng.random() < np.clip(escape_success_prob[initial_leader] * escape_factor_map[int(scenario_id)], 0.02, 0.96)
 
-        # 最内前線車は、逃げ失敗でも「内枠残り」へ分岐できる。
+        # 早期先頭交代が成立した場合は、その10m車を勝ち切り抽選の中心にする。
         front_candidates = [int(i) for i in order if front_line[int(i)]]
-        inner_front = min(front_candidates, key=lambda i: cars[i]) if front_candidates else initial_leader
+        if takeover_front is not None and initial_leader == takeover_front:
+            inner_front = takeover_front
+        else:
+            inner_front = min(front_candidates, key=lambda i: cars[i]) if front_candidates else initial_leader
         inner_hold = (not clean_escape and not severe[inner_front] and rng.random() < np.clip(inner_hold_prob[inner_front] * hold_factor_map[int(scenario_id)], 0.02, 0.97))
 
         # Ver8.3: 展開成立時だけ勝ち切り抽選を行う。
         # 内枠残存だけの場合は、クリーンな逃げより勝ち切り条件を厳しくする。
         win_setup_factor = 1.0 if clean_escape else 0.66
+        if takeover_front is not None and inner_front == takeover_front:
+            win_setup_factor = max(win_setup_factor, 0.86 + heat_index * 0.08)
         front_win = (
             not severe[inner_front]
             and (clean_escape or inner_hold)
@@ -3110,7 +3138,7 @@ def simulate_detailed(df, trials, seed, track_temp=30.0):
         current_leader = int(order[0])
         protected_escape = (
             current_leader == inner_front
-            and (clean_escape or front_win)
+            and (clean_escape or front_win or (takeover_front is not None and inner_front == takeover_front))
             and collapse_level[current_leader] < 0.22
         )
         if not protected_escape and closing_strength[current_leader] < 0.48:
