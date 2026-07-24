@@ -204,7 +204,7 @@ def read_settings(ws):
         "近接ハンデ倍率": b(10, 1.1),
         "遠隔ハンデ倍率": b(11, 0.75),
         "ST補正係数": b(12, 0.04),
-        "10m換算秒": b(22, 0.018),
+        "10m換算秒": b(22, 0.012),
 
         "試走点": b(29, 24),
         "最近5走点": 10.0,
@@ -950,14 +950,18 @@ def player_metrics(car, current, hist, race, settings):
     }
 
 
-def outer_lane_penalty(df, max_penalty=4.5):
+def outer_lane_penalty(df, max_penalty=3.0):
     """
     10m以上の同ハンデ帯で横並びが3人以上の場合、外側ほど減点する。
+
+    Ver19では一律減点をやめ、格・審査P・追上げ実績・レース巧者度で緩和する。
+    強い追い込み選手は最外でも軽い減点に留め、裏付けが弱い選手には
+    外枠リスクを残す。
 
     - 0m線は対象外
     - 同ハンデ2人以下は対象外
     - 人数が多いほど補正を強くする
-    - 最外枠でも最大4.5点まで
+    - 緩和前の最外枠でも最大3.0点まで
     """
     penalty = pd.Series(0.0, index=df.index)
     same_line_count = pd.Series(1, index=df.index, dtype=int)
@@ -986,7 +990,38 @@ def outer_lane_penalty(df, max_penalty=4.5):
 
             # 内側半分は減点せず、外側半分から滑らかに減点
             outer_exposure = max(0.0, (outer_ratio - 0.5) / 0.5)
-            penalty.loc[idx] = -max_penalty * crowd_factor * outer_exposure
+
+            # 追い込み・捌きの裏付けがある選手は外枠不利を緩和する。
+            # 各指標が欠損していても安全に計算できるよう中立値を使う。
+            row = df.loc[idx]
+            rank_text = str(row.get("現ランク", "")).strip().upper()
+            grade_strength = 1.0 if rank_text.startswith("S") else (0.55 if rank_text.startswith("A") else 0.15)
+
+            judge_p = pd.to_numeric(pd.Series([row.get("審査P", np.nan)]), errors="coerce").iloc[0]
+            judge_strength = float(np.clip((judge_p - 55.0) / 45.0, 0.0, 1.0)) if not pd.isna(judge_p) else 0.45
+
+            rear_chase = pd.to_numeric(pd.Series([row.get("後方追上げ指数", np.nan)]), errors="coerce").iloc[0]
+            rear_strength = float(np.clip(rear_chase, 0.0, 1.0)) if not pd.isna(rear_chase) else 0.45
+
+            craft_raw = pd.to_numeric(pd.Series([row.get("レース巧者指数", np.nan)]), errors="coerce").iloc[0]
+            # レース巧者指数は概ね-0.25～+0.25なので0～1へ写像する。
+            craft_strength = float(np.clip(0.5 + craft_raw * 2.0, 0.0, 1.0)) if not pd.isna(craft_raw) else 0.45
+
+            win_raw = pd.to_numeric(pd.Series([row.get("勝ち切り指数", np.nan)]), errors="coerce").iloc[0]
+            win_strength = float(np.clip(win_raw, 0.0, 1.0)) if not pd.isna(win_raw) else 0.45
+
+            pursuit_strength = (
+                grade_strength * 0.30
+                + judge_strength * 0.25
+                + rear_strength * 0.20
+                + craft_strength * 0.15
+                + win_strength * 0.10
+            )
+
+            # 最上位クラスでも外枠リスクをゼロにはしない。
+            # 緩和率は最大72%、最低8%。
+            relief = float(np.clip(0.08 + pursuit_strength * 0.64, 0.08, 0.72))
+            penalty.loc[idx] = -max_penalty * crowd_factor * outer_exposure * (1.0 - relief)
 
     return penalty, same_line_count, outer_order
 
@@ -1551,7 +1586,7 @@ def calculate_excel_model(metrics, settings):
         df["同ハンデ外順"],
     ) = (np.nan, np.nan)
     outer_penalty, line_count, outer_order = outer_lane_penalty(
-        df, max_penalty=4.5
+        df, max_penalty=3.0
     )
     df["同ハンデ人数"] = line_count
     df["同ハンデ外順"] = outer_order
@@ -2193,7 +2228,7 @@ def prepare_simulation_arrays(df):
 
     st_speed_risk = np.clip((st - 0.14) / 0.16, 0.0, 1.0)
     st_variation_risk = np.clip((st_std - 0.025) / 0.065, 0.0, 1.0)
-    outer_risk = np.clip(outer_penalty / 4.5 + zero_line_outer * 0.75, 0.0, 1.0)
+    outer_risk = np.clip(outer_penalty / 3.0 + zero_line_outer * 0.75, 0.0, 1.0)
     crowd_risk = np.clip((line_count - 2.0) / 4.0, 0.0, 1.0)
     conversion_risk = np.clip(1.0 - traffic_conversion, 0.0, 1.0)
     normal_late_prob = np.clip(
@@ -5280,7 +5315,7 @@ def ver16_make_settings_sheet(ws):
     ws["B1"] = "値"
     defaults = {
         4:30, 5:1.35, 6:0.85, 7:1.5, 8:0.7, 9:1.4, 10:1.1, 11:0.75,
-        12:0.04, 22:0.018, 29:24, 31:8, 32:8, 33:5, 34:5, 35:6,
+        12:0.04, 22:0.012, 29:24, 31:8, 32:8, 33:5, 34:5, 35:6,
         36:8, 37:6, 38:4, 39:2, 40:1, 43:6, 44:20, 45:0.6,
         49:6, 50:6, 51:4, 52:6
     }
