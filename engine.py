@@ -2265,8 +2265,40 @@ def prepare_simulation_arrays(df):
         0.08, 0.88,
     )
     front_handicap = float(np.min(handicap))
-    front_line = handicap == front_handicap
-    inner_hold_prob *= front_line.astype(float)
+    primary_front = handicap == front_handicap
+
+    # Ver27: 「最前ハンデだけが逃げ役」という固定をやめる。
+    # 最前線の裏付けが弱く、10m後ろに明確に実戦力の高い選手がいる場合は、
+    # その選手を序盤で先頭へ立てる早期先頭候補として前線へ含める。
+    ability_gate_pre = 1.0 / (1.0 + np.exp(-np.clip(z_scores, -3.0, 3.0)))
+    early_lead_strength = np.clip(
+        execution_quality * 0.27
+        + traffic_conversion * 0.22
+        + recent_form_strength * 0.17
+        + st_stability * 0.12
+        + quinella_rate * 0.12
+        + top3_rate * 0.10,
+        0.0, 1.0,
+    )
+    primary_best = float(np.max(early_lead_strength[primary_front])) if primary_front.any() else 0.50
+    secondary_line = np.isclose(handicap, front_handicap + 10.0)
+    secondary_gate = (
+        secondary_line
+        & (early_lead_strength >= max(0.48, primary_best + 0.055))
+        & (traffic_conversion >= 0.43)
+    )
+    # 最前線がかなり弱いレースでは、差が小さくても10m線の上位1車だけを候補化。
+    if primary_best < 0.40 and secondary_line.any() and not secondary_gate.any():
+        sec_idx = np.where(secondary_line)[0]
+        best_sec = int(sec_idx[np.argmax(early_lead_strength[sec_idx])])
+        if early_lead_strength[best_sec] >= 0.43:
+            secondary_gate[best_sec] = True
+    front_line = primary_front | secondary_gate
+    # 10m早期先頭候補は、最前線と同じ強さで固定せず適性に応じて残存率を縮小。
+    front_weight = primary_front.astype(float) + secondary_gate.astype(float) * np.clip(
+        0.48 + early_lead_strength * 0.34, 0.48, 0.78
+    )
+    inner_hold_prob *= front_weight
 
     # Ver8.3: 勝ち切り確率は「最内だから」ではなく能力の裏付けを必須にする。
     # z_scores・実戦変換力が低い車は、内を守れても1着への強制昇格を抑える。
@@ -2281,7 +2313,18 @@ def prepare_simulation_arrays(df):
         + ability_gate * 0.07
         + win_upside_flow * 0.14,
         0.03, 0.74,
-    ) * front_line.astype(float)
+    ) * front_weight
+
+    # 熱走路でも、格だけでなく実戦変換・捌き・安定性の裏付けがある追込車は
+    # 一律に仕掛けを封じない。後段の追抜必要差を緩和する係数として使用する。
+    heat_pursuit_relief = np.clip(
+        ability_gate * 0.28
+        + execution_quality * 0.24
+        + traffic_conversion * 0.24
+        + st_stability * 0.10
+        + top3_rate * 0.14,
+        0.0, 1.0,
+    )
     base_start_key = handicap * 0.10 + cars.astype(float) * 0.002 + st * 0.88 + outer_start_delay - zero_inner_escape * 0.010 - escape_success_prob * 0.010
 
     return {
@@ -2332,6 +2375,10 @@ def prepare_simulation_arrays(df):
         "front_win_prob": front_win_prob,
         "front_handicap": front_handicap,
         "front_line": front_line,
+        "primary_front": primary_front,
+        "secondary_front": secondary_gate,
+        "early_lead_strength": early_lead_strength,
+        "heat_pursuit_relief": heat_pursuit_relief,
     }
 
 
@@ -2375,6 +2422,10 @@ def simulate_detailed(df, trials, seed, track_temp=30.0):
     inner_hold_prob = arr["inner_hold_prob"]
     front_win_prob = arr["front_win_prob"]
     front_line = arr["front_line"]
+    primary_front = arr.get("primary_front", front_line)
+    secondary_front = arr.get("secondary_front", np.zeros_like(front_line, dtype=bool))
+    early_lead_strength = arr.get("early_lead_strength", np.zeros(n, dtype=float))
+    heat_pursuit_relief = arr.get("heat_pursuit_relief", np.zeros(n, dtype=float))
     min_handicap = arr["front_handicap"]
 
     # Ver11.1: 全車同ハンデは横一列スタートとして明示的に評価する。
@@ -2667,6 +2718,8 @@ def simulate_detailed(df, trials, seed, track_temp=30.0):
 
         if scenario == "先行縦長":
             base_pace[front_line] += 0.08 + execution_quality[front_line] * 0.05
+            if secondary_front.any():
+                base_pace[secondary_front] += 0.025 + early_lead_strength[secondary_front] * 0.035
             chase_mask = handicap > min_handicap
             base_pace[chase_mask] += 0.05 + traffic_conversion[chase_mask] * 0.07
         elif scenario == "前残り":
@@ -2802,6 +2855,8 @@ def simulate_detailed(df, trials, seed, track_temp=30.0):
                 # 熱走路では路面を使って前へ出る余地が小さくなるため、
                 # 後方からの仕掛けほど追加の速度差を必要とする。
                 position_heat = heat_index * (0.018 + 0.012 * min(pos, 5))
+                # 捌き・実戦変換の裏付けがある車は、熱走路でも必要差の増加を最大55%緩和。
+                position_heat *= (1.0 - 0.55 * heat_pursuit_relief[trailing])
                 margin += position_heat
                 # 実戦変換力が低い追走車は、速い試走があっても混戦で抜きづらい。
                 margin += max(0.0, 0.50 - traffic_conversion[trailing]) * 0.34
@@ -5660,7 +5715,7 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
         hist["handicap_bucket"] = hist["handicap"].map(bucket_handicap)
         specs=[
             ("走路", "surface", current_conditions["surface"], 1.00),
-            ("熱走路", "temp_bucket", current_conditions["track_temp"], 1.20),
+            ("熱走路", "temp_bucket", current_conditions["track_temp"], 0.95),
             ("湿度", "humidity_bucket", current_conditions["humidity"], .70),
             ("開催場", "venue", current_conditions["venue"], .65),
             ("ハンデ帯", "handicap_bucket", h_now, .90),
@@ -5674,10 +5729,19 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
             if n < 4: continue
             cond=float(perf.loc[hist.index[mask]].mean())
             delta=cond-base
-            # 12件でほぼ本採用。4件ではかなり縮める。
-            conf=min(1.0, max(0.0, (n-3)/9.0))
+            # Ver27: 少数条件の偶然を強く学習しない。
+            # 4-7件±0.3、8-14件±0.7、15-24件±1.2、25件以上±1.8が上限。
+            conf=min(1.0, max(0.0, (n-3)/18.0))
+            if n <= 7:
+                sample_cap = 0.30
+            elif n <= 14:
+                sample_cap = 0.70
+            elif n <= 24:
+                sample_cap = 1.20
+            else:
+                sample_cap = 1.80
             # 直近偏重を避けながら、顕著な差だけ採用。
-            effect=float(np.clip(delta*5.2*strength*conf, -1.25, 1.25))
+            effect=float(np.clip(delta*4.4*strength*conf, -sample_cap, sample_cap))
             if abs(effect) >= .08:
                 parts.append((effect,label,n,delta,conf))
         if not parts:
@@ -5685,7 +5749,10 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
         # 同じレース結果を複数条件で数えすぎないよう、強い上位3要素だけ採用。
         parts=sorted(parts, key=lambda x: abs(x[0]), reverse=True)[:3]
         raw=sum(x[0] for x in parts)
-        total=float(np.clip(raw, -2.2, 2.2))
+        # 上位条件を合算しても、最大一致件数に対応した信頼上限を超えない。
+        max_n=max(x[2] for x in parts)
+        total_cap = 0.30 if max_n <= 7 else 0.70 if max_n <= 14 else 1.20 if max_n <= 24 else 1.80
+        total=float(np.clip(raw, -total_cap, total_cap))
         bonuses.append(total)
         labels.append(" / ".join(f"{x[1]}{'得意' if x[0]>0 else '苦手'}({x[2]}件)" for x in parts))
         match_counts.append(max(x[2] for x in parts))

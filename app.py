@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver24｜解析対象選手の登録データ件数・最新日表示対応")
+st.caption("Ver27｜モデル確率と入力オッズの比較表示対応")
 
 
 def qident(name: str) -> str:
@@ -192,6 +192,99 @@ def show_ticket_table(title: str, bets: dict, key: str, trials: int, top_n: int 
             "的中回数": st.column_config.NumberColumn("的中回数", format="%d回"),
         },
     )
+
+
+def normalize_ticket_combo(value: str, unordered: bool = False) -> str:
+    """入力された車番組み合わせを、確率表と照合できる形式へ正規化する。"""
+    nums = [int(x) for x in re.findall(r"\d+", str(value or ""))]
+    if unordered:
+        nums = sorted(nums)
+    return "-".join(map(str, nums))
+
+
+def parse_manual_odds(text: str, unordered: bool = False) -> tuple[pd.DataFrame, list[str]]:
+    """1行1組の『組み合わせ オッズ』を読み取る。"""
+    rows = []
+    errors = []
+    for line_no, raw in enumerate(str(text or "").splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        # 最後の数値をオッズ、その前を組み合わせとして扱う。
+        match = re.match(r"^(.*?)[\s,，:：]+([0-9]+(?:\.[0-9]+)?)\s*(?:倍)?$", line)
+        if not match:
+            errors.append(f"{line_no}行目: {line}")
+            continue
+        combo = normalize_ticket_combo(match.group(1), unordered=unordered)
+        try:
+            odds = float(match.group(2))
+        except ValueError:
+            odds = 0.0
+        if not combo or odds <= 0:
+            errors.append(f"{line_no}行目: {line}")
+            continue
+        rows.append({"組み合わせ": combo, "入力オッズ": odds})
+    if not rows:
+        return pd.DataFrame(columns=["組み合わせ", "入力オッズ"]), errors
+    return pd.DataFrame(rows).drop_duplicates("組み合わせ", keep="last"), errors
+
+
+def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_key: str, unordered: bool = False) -> None:
+    """モデル確率から公平倍率を算出し、手入力オッズとのズレだけを表示する。"""
+    with st.expander(f"📊 {title}の混合展開修正"):
+        st.caption("1行につき『組み合わせ オッズ』を入力します。例: 4-7-3 228.4。矢印や全角記号でも読み取れます。")
+        odds_text = st.text_area(
+            "オッズを貼り付け",
+            height=150,
+            key=f"odds_input_{widget_key}",
+            placeholder="4-7-3 228.4\n7-4-3 45.6",
+        )
+        if not odds_text.strip():
+            st.info("オッズを入力すると、モデル上の公平倍率との差を表示します。")
+            return
+
+        odds_df, errors = parse_manual_odds(odds_text, unordered=unordered)
+        if errors:
+            st.warning("読み取れなかった行: " + " / ".join(errors[:5]))
+        if odds_df.empty:
+            return
+
+        # 上位だけでなく全組み合わせを対象に照合する。
+        prob_df = ticket_probability_table(bets, key, trials, top_n=10000).drop(columns=["順位", "的中回数"], errors="ignore")
+        if unordered and not prob_df.empty:
+            prob_df["組み合わせ"] = prob_df["組み合わせ"].map(lambda x: normalize_ticket_combo(x, unordered=True))
+            prob_df = prob_df.groupby("組み合わせ", as_index=False)["確率"].sum()
+        merged = odds_df.merge(prob_df, on="組み合わせ", how="left")
+        merged["確率"] = merged["確率"].fillna(0.0)
+        merged["公平倍率"] = merged["確率"].map(lambda p: (100.0 / p) if p > 0 else None)
+        merged["オッズ÷公平倍率"] = merged.apply(
+            lambda r: (r["入力オッズ"] / r["公平倍率"]) if pd.notna(r["公平倍率"]) and r["公平倍率"] > 0 else None,
+            axis=1,
+        )
+        def label(row):
+            ratio = row["オッズ÷公平倍率"]
+            if pd.isna(ratio):
+                return "モデル確率0%"
+            if ratio >= 1.15:
+                return "市場よりモデル評価が高い"
+            if ratio <= 0.85:
+                return "市場よりモデル評価が低い"
+            return "ほぼ同水準"
+        merged["比較"] = merged.apply(label, axis=1)
+        merged = merged.sort_values(["オッズ÷公平倍率", "確率"], ascending=[False, False], na_position="last")
+        st.dataframe(
+            merged[["組み合わせ", "確率", "公平倍率", "入力オッズ", "オッズ÷公平倍率", "比較"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "確率": st.column_config.NumberColumn("モデル確率", format="%.2f%%"),
+                "公平倍率": st.column_config.NumberColumn("モデル上の公平倍率", format="%.1f倍"),
+                "入力オッズ": st.column_config.NumberColumn("入力オッズ", format="%.1f倍"),
+                "オッズ÷公平倍率": st.column_config.NumberColumn("倍率差", format="%.2f倍"),
+            },
+        )
+        st.caption("倍率差は『入力オッズ ÷ モデル上の公平倍率』です。購入推奨ではなく、市場評価とモデル評価の差を確認するための参考表示です。")
+
 
 def install_uploaded_db(uploaded) -> tuple[bool, str]:
     data = uploaded.getvalue()
@@ -560,12 +653,16 @@ with prediction_tab:
             ticket_tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
             with ticket_tabs[0]:
                 show_ticket_table("2連単（2車単）確率", bets, "2車単", int(trials), 20)
+                show_odds_comparison("2連単", bets, "2車単", int(trials), "2tansho", unordered=False)
             with ticket_tabs[1]:
                 show_ticket_table("2連複（2車複）確率", bets, "2車複", int(trials), 20)
+                show_odds_comparison("2連複", bets, "2車複", int(trials), "2fuku", unordered=True)
             with ticket_tabs[2]:
                 show_ticket_table("3連複確率", bets, "三連複", int(trials), 20)
+                show_odds_comparison("3連複", bets, "三連複", int(trials), "3fuku", unordered=True)
             with ticket_tabs[3]:
                 show_ticket_table("3連単確率", bets, "三連単", int(trials), 20)
+                show_odds_comparison("3連単", bets, "三連単", int(trials), "3tan", unordered=False)
 
             if Path(output).exists():
                 st.download_button(
