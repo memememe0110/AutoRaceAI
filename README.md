@@ -20,3 +20,9 @@
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## Ver17.1 追加修正
+- 古いSQLite DBの adjustment_log に不足列があっても、既存データを残したまま自動追加
+- 予測入力・結果入力・選手入力のリセットボタンを追加
+- 登録情報確認から、過去の登録結果・着順・周回・払戻・解析内容を再閲覧可能
+- リセット操作は入力欄だけを消し、DB登録データには触れません

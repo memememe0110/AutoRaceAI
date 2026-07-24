@@ -6259,6 +6259,14 @@ def v35_save_result_and_analyze(meta, results, laps=None, payouts=None, db_path=
 # ============================================================
 # v3.6 結果登録時の選手履歴自動更新・調整履歴
 # ============================================================
+def _ensure_sqlite_columns(con, table_name, columns):
+    """古いDBを壊さず、足りない列だけ追加する。"""
+    existing = {row[1] for row in con.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    for name, definition in columns.items():
+        if name not in existing:
+            con.execute(f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}")
+
+
 def v36_init_history_tables(db_path=DB_PATH):
     mount_and_init_db()
     with sqlite3.connect(str(db_path)) as con:
@@ -6285,6 +6293,14 @@ def v36_init_history_tables(db_path=DB_PATH):
             UNIQUE(version, category, description)
         );
         """)
+        # CREATE TABLE IF NOT EXISTS だけでは古いDBへ新列が増えないため、起動時に安全移行する。
+        _ensure_sqlite_columns(con, "adjustment_log", {
+            "version": "TEXT NOT NULL DEFAULT ''",
+            "category": "TEXT NOT NULL DEFAULT ''",
+            "description": "TEXT NOT NULL DEFAULT ''",
+            "coefficient_changed": "INTEGER NOT NULL DEFAULT 0",
+            "created_at": "TEXT"
+        })
         rows = [
             ("v3.6", "予測対象", "未登録1～8などの補助選手を、点数の正規化と6周シミュレーションの前に除外", 0),
             ("v3.6", "履歴更新", "公式結果登録時にrace_historyと詳細履歴へ各選手の結果を自動追加", 0),
@@ -7035,6 +7051,18 @@ def v41_registration_history(db_path=DB_PATH, limit=50):
             CASE status WHEN 'active' THEN '登録中' ELSE '取消済' END AS 状態,
             valid_count AS 分析対象, excluded_count AS 除外
             FROM v41_registration_batches ORDER BY batch_id DESC LIMIT ?""", con, params=(int(limit),))
+
+
+def v41_registration_detail(race_key, db_path=DB_PATH):
+    """登録済み結果を再表示するための詳細取得。"""
+    v41_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        race = pd.read_sql_query("SELECT * FROM result_races WHERE race_key=?", con, params=(race_key,))
+        entries = pd.read_sql_query("SELECT * FROM result_entries WHERE race_key=? ORDER BY CASE WHEN finish IS NULL THEN 999 ELSE finish END, car_no", con, params=(race_key,))
+        laps = pd.read_sql_query("SELECT * FROM result_laps WHERE race_key=? ORDER BY lap_no, position", con, params=(race_key,))
+        payouts = pd.read_sql_query("SELECT * FROM result_payouts WHERE race_key=?", con, params=(race_key,))
+        feedback = pd.read_sql_query("SELECT * FROM prediction_feedback WHERE race_key=?", con, params=(race_key,))
+    return {"race": race, "entries": entries, "laps": laps, "payouts": payouts, "feedback": feedback}
 
 
 def v41_undo_last_registration(db_path=DB_PATH):

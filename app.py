@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("v4.0｜10要素評価・前残り/追い込み分析・完全一致学習版")
+st.caption("Ver17.1｜予測タイム・欠車完全除外・DB自動移行・登録結果再閲覧")
 
 
 def qident(name: str) -> str:
@@ -282,7 +282,11 @@ with prediction_tab:
     st.info("Ver17予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
-        st.caption("v4.0では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
+        st.caption("Ver17.1では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
+    if st.button("🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input"):
+        for key in ["race_card_text"]:
+            st.session_state.pop(key, None)
+        st.rerun()
     text = st.text_area(
         "公式出走表を全文貼り付け",
         height=430,
@@ -392,6 +396,10 @@ with prediction_tab:
 with result_tab:
     st.subheader("公式結果を登録して予測と比較")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
+    if st.button("🗑️ 結果入力をリセット", use_container_width=True, key="reset_result_input"):
+        for key in ["result_venue", "result_race_no", "official_result_text", "v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts", "v41_last_result_view"]:
+            st.session_state.pop(key, None)
+        st.rerun()
     c1, c2 = st.columns(2)
     venue_override = c1.text_input("開催場（本文から取れない場合のみ）", key="result_venue")
     race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key="result_race_no")
@@ -447,6 +455,12 @@ with result_tab:
                     st.warning(analysis.get("message", "このレースは登録済みです。"))
                     st.stop()
                 st.success(f"結果を登録しました: {key}")
+                st.session_state["v41_last_result_view"] = {
+                    "key": key,
+                    "comparison": comparison,
+                    "analysis": analysis,
+                    "adjustment": adjustment,
+                }
                 if "message" in analysis:
                     st.warning(analysis["message"])
                 else:
@@ -527,6 +541,29 @@ with db_tab:
         st.caption("v4.1で登録した結果はまだありません。")
     else:
         st.dataframe(reg_history, use_container_width=True, hide_index=True)
+        active_rows = reg_history[reg_history["状態"] == "登録中"] if "状態" in reg_history.columns else reg_history
+        if not active_rows.empty:
+            labels = active_rows["レースID"].astype(str).tolist()
+            selected_key = st.selectbox("登録結果をもう一度見る", labels, key="registration_detail_key")
+            if st.button("📖 選択した登録結果を開く", use_container_width=True):
+                st.session_state["opened_registration_key"] = selected_key
+        opened_key = st.session_state.get("opened_registration_key")
+        if opened_key:
+            detail = engine.v41_registration_detail(opened_key, engine.DB_PATH)
+            st.markdown(f"### 登録結果詳細：{opened_key}")
+            if not detail["race"].empty:
+                st.dataframe(detail["race"], use_container_width=True, hide_index=True)
+            st.subheader("着順・タイム")
+            st.dataframe(detail["entries"], use_container_width=True, hide_index=True)
+            if not detail["laps"].empty:
+                st.subheader("周回順位")
+                st.dataframe(detail["laps"], use_container_width=True, hide_index=True)
+            if not detail["payouts"].empty:
+                st.subheader("払戻金")
+                st.dataframe(detail["payouts"], use_container_width=True, hide_index=True)
+            if not detail["feedback"].empty:
+                st.subheader("予測比較・解析保存内容")
+                st.dataframe(detail["feedback"], use_container_width=True, hide_index=True)
     confirm_undo = st.checkbox("最後の結果登録を取り消すことを確認しました", key="confirm_v41_undo")
     if st.button("↩ 最後の結果登録を取り消す", use_container_width=True, disabled=not confirm_undo):
         ok,msg=engine.v41_undo_last_registration(engine.DB_PATH)
@@ -539,7 +576,11 @@ with db_tab:
 
 with register_tab:
     st.subheader("選手情報を登録")
-    player_name = st.text_input("選手名", placeholder="例：横田翔")
+    if st.button("🗑️ 選手入力をリセット", use_container_width=True, key="reset_player_input"):
+        for key in ["player_name_input", "player_history_text", "parsed_player_history"]:
+            st.session_state.pop(key, None)
+        st.rerun()
+    player_name = st.text_input("選手名", placeholder="例：横田翔", key="player_name_input")
     history_text = st.text_area(
         "公式プロフィールの直近履歴を貼り付け",
         height=520,
