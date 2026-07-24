@@ -3809,6 +3809,11 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
         df = v24_apply_race_context_bonus(
             df, globals().get("LATEST_ENTRY_STATS"), track_temp=track_temp
         )
+    # Ver25: 選手本人の履歴から、今回条件で繰り返し現れる得意・不得意を反映。
+    if "v25_player_condition_affinity" in globals():
+        df = v25_player_condition_affinity(
+            df, globals().get("LATEST_ENTRY_STATS"), globals().get("LATEST_RACE_META"), DB_PATH
+        )
 
     # v3.8: 逐次的な追抜き入替ループを使わず、高速ベクトル型の6周イベントモデルを使用。
     finish_counts, bet_counts = simulate(df, trials, seed, track_temp=track_temp)
@@ -5562,10 +5567,150 @@ def v24_apply_race_context_bonus(df, entries=None, track_temp=30.0):
     return out
 
 
+
+def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
+    """選手ごとに、特定条件で繰り返し現れる得意・不得意を学習して補正する。
+
+    対象条件は走路、走路温度帯、湿度帯、開催場、ハンデ帯、レース種別。
+    本人の全履歴に対する条件内成績の差を使い、件数と再現性で縮小する。
+    少数データの偶然を避けるため、条件一致4件未満は原則採用せず、
+    最終補正も最大±2.2点に制限する。
+    """
+    if df is None or df.empty or entries is None or len(entries) == 0:
+        return df
+    out = df.copy()
+    meta = meta or globals().get("LATEST_RACE_META", {}) or {}
+    car_col = "車" if "車" in out.columns else "車番"
+    if car_col not in out.columns:
+        return out
+
+    def bucket_temp(v):
+        try: v=float(v)
+        except Exception: return None
+        if v >= 50: return "50℃以上"
+        if v >= 45: return "45-49℃"
+        if v >= 35: return "35-44℃"
+        if v >= 25: return "25-34℃"
+        return "24℃以下"
+
+    def bucket_humidity(v):
+        try: v=float(v)
+        except Exception: return None
+        if v >= 80: return "80%以上"
+        if v >= 60: return "60-79%"
+        if v >= 40: return "40-59%"
+        return "39%以下"
+
+    def bucket_handicap(v):
+        try: v=float(v)
+        except Exception: return None
+        if v <= 0: return "0m"
+        if v <= 10: return "10m"
+        if v <= 20: return "20m"
+        if v <= 30: return "30m"
+        return "40m以上"
+
+    current_conditions = {
+        "surface": str(meta.get("走路") or "").strip(),
+        "track_temp": bucket_temp(meta.get("走路温度")),
+        "humidity": bucket_humidity(meta.get("湿度")),
+        "venue": str(meta.get("開催場") or "").strip(),
+        "race_type": str(meta.get("レース種別") or meta.get("種別") or "").strip(),
+    }
+
+    ent = entries.copy()
+    ent["車番"] = pd.to_numeric(ent.get("車番"), errors="coerce")
+    names = ent.set_index("車番").get("選手名", pd.Series(dtype=object)).to_dict()
+    handicaps = pd.to_numeric(ent.set_index("車番").get("ハンデ", pd.Series(dtype=float)), errors="coerce").to_dict()
+
+    bonuses=[]; labels=[]; match_counts=[]; confidences=[]
+    try:
+        con = sqlite3.connect(db_path)
+    except Exception:
+        con = None
+    for _, row in out.iterrows():
+        car = pd.to_numeric(pd.Series([row.get(car_col)]), errors="coerce").iloc[0]
+        name = str(names.get(car, row.get("選手名", ""))).strip()
+        h_now = bucket_handicap(handicaps.get(car, row.get("ハンデ")))
+        if not name or con is None:
+            bonuses.append(0.0); labels.append("データなし"); match_counts.append(0); confidences.append(0.0); continue
+        key = v32_player_name_key(name) if "v32_player_name_key" in globals() else re.sub(r"[\s　]", "", name)
+        hist = pd.read_sql_query("""
+            SELECT player_name, race_date, venue, rank, starters, surface, handicap,
+                   track_temp, humidity, race_type
+            FROM v15_player_history_imports
+            WHERE replace(replace(player_name,' ',''),'　','')=?
+              AND rank IS NOT NULL AND rank > 0
+            ORDER BY race_date DESC
+            LIMIT 160
+        """, con, params=(key,))
+        if hist.empty:
+            bonuses.append(0.0); labels.append("履歴不足"); match_counts.append(0); confidences.append(0.0); continue
+        rank = pd.to_numeric(hist["rank"], errors="coerce")
+        starters = pd.to_numeric(hist["starters"], errors="coerce").fillna(8).clip(lower=2)
+        # 1着=1、最下位=0の相対成績。人数差を吸収する。
+        perf = ((starters-rank)/(starters-1)).clip(0,1)
+        valid = rank.notna() & perf.notna()
+        hist=hist.loc[valid].copy(); perf=perf.loc[valid]
+        if len(hist) < 8:
+            bonuses.append(0.0); labels.append("履歴不足"); match_counts.append(len(hist)); confidences.append(0.0); continue
+        base=float(perf.mean())
+        hist["temp_bucket"] = hist["track_temp"].map(bucket_temp)
+        hist["humidity_bucket"] = hist["humidity"].map(bucket_humidity)
+        hist["handicap_bucket"] = hist["handicap"].map(bucket_handicap)
+        specs=[
+            ("走路", "surface", current_conditions["surface"], 1.00),
+            ("熱走路", "temp_bucket", current_conditions["track_temp"], 1.20),
+            ("湿度", "humidity_bucket", current_conditions["humidity"], .70),
+            ("開催場", "venue", current_conditions["venue"], .65),
+            ("ハンデ帯", "handicap_bucket", h_now, .90),
+            ("レース種別", "race_type", current_conditions["race_type"], .55),
+        ]
+        parts=[]
+        for label,col,val,strength in specs:
+            if val in (None, "") or col not in hist.columns: continue
+            mask=hist[col].astype(str).eq(str(val))
+            n=int(mask.sum())
+            if n < 4: continue
+            cond=float(perf.loc[hist.index[mask]].mean())
+            delta=cond-base
+            # 12件でほぼ本採用。4件ではかなり縮める。
+            conf=min(1.0, max(0.0, (n-3)/9.0))
+            # 直近偏重を避けながら、顕著な差だけ採用。
+            effect=float(np.clip(delta*5.2*strength*conf, -1.25, 1.25))
+            if abs(effect) >= .08:
+                parts.append((effect,label,n,delta,conf))
+        if not parts:
+            bonuses.append(0.0); labels.append("顕著な適性なし"); match_counts.append(0); confidences.append(0.0); continue
+        # 同じレース結果を複数条件で数えすぎないよう、強い上位3要素だけ採用。
+        parts=sorted(parts, key=lambda x: abs(x[0]), reverse=True)[:3]
+        raw=sum(x[0] for x in parts)
+        total=float(np.clip(raw, -2.2, 2.2))
+        bonuses.append(total)
+        labels.append(" / ".join(f"{x[1]}{'得意' if x[0]>0 else '苦手'}({x[2]}件)" for x in parts))
+        match_counts.append(max(x[2] for x in parts))
+        confidences.append(round(max(x[4] for x in parts),3))
+    if con is not None: con.close()
+
+    bonus=np.asarray(bonuses,dtype=float)
+    out["選手別条件適性補正"] = np.round(bonus,3)
+    out["条件適性根拠"] = labels
+    out["条件一致最大件数"] = match_counts
+    out["条件適性信頼度"] = confidences
+    if "改善後総合点" in out.columns:
+        out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0)+bonus
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0)+bonus*.42
+    if "予測競走T" in out.columns:
+        out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"], errors="coerce")-bonus*.0013,4)
+    return out
+
 def ver16_run_prediction(text, trials=10000, seed=20260719, manual_excluded=None):
     content, meta, entries = ver16_build_virtual_excel(text, manual_excluded=manual_excluded)
     # run_model内でも当日出走表の補助指標を参照できるよう、一回の予測中だけ保持する。
     globals()["LATEST_ENTRY_STATS"] = entries.copy()
+    globals()["LATEST_RACE_META"] = dict(meta)
     track_temp = ver16_safe_float(meta.get("走路温度"), 30.0)
     filename = f"AutoRaceAI_Ver16_{meta.get('開催場') or 'race'}_{meta.get('レース') or ''}R.xlsx"
     df, bets, output = run_model(
