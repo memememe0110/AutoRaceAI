@@ -3760,9 +3760,10 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
     _final_s = _norm01_col("終盤指数")
     df["ゴール前伸び指数"] = np.clip(_final_s*.36 + closing_v*.25 + _exec_s*.15 + _current_s*.10 + _trial_s*.08 + rear_v*.06,0,1)
 
-    # v3.9: 学習重みを透明に適用する。元のVer15.2系総合点は保持し、
-    # 小さな補正だけを加えるため、1レースで予測が暴れない。
-    df = v39_apply_adaptive_weights(df, DB_PATH)
+    # Ver18: 結果登録で更新している10項目学習を本番予測へ適用する。
+    # 旧版はここだけ5項目版(v39)のままで、保存した10項目重みが予測へ
+    # 反映されない不整合があった。元モデルを保持しつつ最大±3点だけ補正する。
+    df = v40_apply_adaptive_weights(df, DB_PATH)
     # Ver17: 当日試走を中心に予測競走タイムを作り、確率差の根拠として利用する。
     df = v17_add_predicted_time(df, track_temp=track_temp)
 
@@ -6679,16 +6680,37 @@ def v40_init_learning_tables(db_path=DB_PATH):
 
 
 def v40_get_weights(db_path=DB_PATH):
+    """10項目学習重みを返す。
+
+    登録結果が少ない段階では、直近数レースの偶然へ過適合しやすい。
+    そのため有効な登録レース数に応じて初期値へ縮約し、30レースで
+    保存済み学習重みを100%採用する。
+    """
     v40_init_learning_tables(db_path)
     with sqlite3.connect(db_path) as con:
         rows = con.execute("SELECT feature_name,current_weight FROM adaptive_weights").fetchall()
+        try:
+            race_count = int(con.execute(
+                "SELECT COUNT(*) FROM v41_registration_batches WHERE status='active'"
+            ).fetchone()[0])
+        except sqlite3.Error:
+            race_count = 0
     values = {str(k): float(v) for k, v in rows if str(k) in V40_DEFAULT_WEIGHTS}
     for k, v in V40_DEFAULT_WEIGHTS.items():
         values.setdefault(k, v)
     total = sum(max(0.0, values[k]) for k in V40_DEFAULT_WEIGHTS)
     if total <= 0:
-        return dict(V40_DEFAULT_WEIGHTS)
-    return {k: max(0.0, values[k]) / total for k in V40_DEFAULT_WEIGHTS}
+        learned = dict(V40_DEFAULT_WEIGHTS)
+    else:
+        learned = {k: max(0.0, values[k]) / total for k in V40_DEFAULT_WEIGHTS}
+
+    reliability = float(np.clip(race_count / 30.0, 0.0, 1.0))
+    blended = {
+        k: V40_DEFAULT_WEIGHTS[k] * (1.0 - reliability) + learned[k] * reliability
+        for k in V40_DEFAULT_WEIGHTS
+    }
+    blended_total = sum(blended.values())
+    return {k: blended[k] / blended_total for k in V40_DEFAULT_WEIGHTS}
 
 
 def v40_feature_frame(df):

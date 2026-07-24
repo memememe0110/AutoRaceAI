@@ -16,7 +16,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver17.1｜予測タイム・欠車完全除外・DB自動移行・登録結果再閲覧")
+st.caption("Ver18｜10項目学習の本番反映・過学習抑制・予測タイム")
 
 
 def qident(name: str) -> str:
@@ -279,10 +279,10 @@ with st.sidebar:
 prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
-    st.info("Ver17予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
+    st.info("Ver18予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
-        st.caption("Ver17.1では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
+        st.caption("Ver18では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
     if st.button("🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input"):
         for key in ["race_card_text"]:
             st.session_state.pop(key, None)
