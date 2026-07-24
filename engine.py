@@ -3802,6 +3802,14 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
     # Ver17: 当日試走を中心に予測競走タイムを作り、確率差の根拠として利用する。
     df = v17_add_predicted_time(df, track_temp=track_temp)
 
+    # Ver24: 当日出走表に含まれる中期車成績・試走偏差・同ハンデ内枠・
+    # 高温走路の位置価値を、最大±2.5点の補助補正としてシミュレーション前に反映する。
+    # 結果に合わせて特定車を上げるのではなく、全車へ同じ規則を適用する。
+    if "v24_apply_race_context_bonus" in globals():
+        df = v24_apply_race_context_bonus(
+            df, globals().get("LATEST_ENTRY_STATS"), track_temp=track_temp
+        )
+
     # v3.8: 逐次的な追抜き入替ループを使わず、高速ベクトル型の6周イベントモデルを使用。
     finish_counts, bet_counts = simulate(df, trials, seed, track_temp=track_temp)
     output = create_result_excel(
@@ -5463,8 +5471,101 @@ def v17_add_predicted_time(df, track_temp=30.0):
     return out
 
 
+
+def v24_apply_race_context_bonus(df, entries=None, track_temp=30.0):
+    """Ver24: 穴候補を拾うための当日文脈補正。
+
+    補正材料:
+    1) 同ハンデ内枠の序盤位置価値
+    2) 近90日相当の車2連対率・3連対率
+    3) 試走偏差の再現性
+    4) 高温走路での前・中団の残りやすさ
+
+    最大±2.5点に制限し、元モデルの順位を丸ごと置き換えない。
+    """
+    if df is None or df.empty or entries is None or len(entries) == 0:
+        return df
+    out = df.copy()
+    ent = entries.copy()
+    car_col = "車" if "車" in out.columns else "車番"
+    if car_col not in out.columns or "車番" not in ent.columns:
+        return out
+
+    def nseries(frame, col, default=np.nan):
+        return pd.to_numeric(frame.get(col, pd.Series(default, index=frame.index)), errors="coerce")
+
+    # 車番で当日データを結合
+    keep = [c for c in ["車番", "ハンデ", "試走偏差", "2連対率", "3連対率", "良2連対率", "良3連対率"] if c in ent.columns]
+    current = ent[keep].drop_duplicates("車番").copy()
+    current["車番"] = pd.to_numeric(current["車番"], errors="coerce")
+    out[car_col] = pd.to_numeric(out[car_col], errors="coerce")
+    merged = out[[car_col]].merge(current, left_on=car_col, right_on="車番", how="left")
+
+    handicap = nseries(merged, "ハンデ", 0.0).fillna(nseries(out, "ハンデ", 0.0)).fillna(0.0)
+    car = nseries(out, car_col, 99).fillna(99)
+
+    # 1) 同ハンデ内枠。2車以上の線で、最内を最大+1.2点。
+    lane_bonus = np.zeros(len(out), dtype=float)
+    for h in sorted(handicap.dropna().unique()):
+        idx = np.flatnonzero(np.isclose(handicap.to_numpy(float), float(h)))
+        if len(idx) < 2:
+            continue
+        ordered = idx[np.argsort(car.iloc[idx].to_numpy(float), kind="stable")]
+        if len(ordered) == 2:
+            vals = np.array([1.00, -0.15])
+        else:
+            vals = np.linspace(1.20, -0.45, len(ordered))
+        lane_bonus[ordered] = vals
+
+    # 2) 車の中期成績。良走路では良成績を少し優先し、欠損時は全体成績を利用。
+    two = nseries(merged, "2連対率")
+    three = nseries(merged, "3連対率")
+    good_two = nseries(merged, "良2連対率")
+    good_three = nseries(merged, "良3連対率")
+    two_use = good_two.where(good_two.notna(), two).fillna(two.median() if two.notna().any() else 25.0)
+    three_use = good_three.where(good_three.notna(), three).fillna(three.median() if three.notna().any() else 40.0)
+    medium_raw = two_use * 0.42 + three_use * 0.58
+    center = float(medium_raw.median()) if medium_raw.notna().any() else 35.0
+    spread = float((medium_raw.quantile(.85) - medium_raw.quantile(.15))) if medium_raw.notna().sum() >= 3 else 20.0
+    spread = max(spread, 12.0)
+    medium_bonus = np.clip((medium_raw.to_numpy(float) - center) / spread * 1.8, -1.1, 1.4)
+
+    # 3) 試走偏差。小さいほど本走へ再現しやすい。絶対値とメンバー相対を併用。
+    dev = nseries(merged, "試走偏差")
+    dev_fill = dev.fillna(dev.median() if dev.notna().any() else 0.095)
+    dev_center = float(dev_fill.median())
+    deviation_bonus = np.clip((dev_center - dev_fill.to_numpy(float)) / 0.025 * 0.75, -0.65, 0.95)
+
+    # 4) 高温走路。45℃超から前・中団を緩やかに支援し、最後方線を少し抑える。
+    temp = float(track_temp or 30.0)
+    heat = np.clip((temp - 45.0) / 10.0, 0.0, 1.0)
+    hmin, hmax = float(handicap.min()), float(handicap.max())
+    hrange = max(hmax - hmin, 10.0)
+    frontness = 1.0 - (handicap.to_numpy(float) - hmin) / hrange
+    heat_bonus = heat * np.clip((frontness - 0.30) * 1.15, -0.40, 0.70)
+
+    total = np.clip(lane_bonus + medium_bonus + deviation_bonus + heat_bonus, -2.5, 2.5)
+    out["同ハンデ内枠補正"] = np.round(lane_bonus, 3)
+    out["車中期成績補正"] = np.round(medium_bonus, 3)
+    out["試走偏差補正"] = np.round(deviation_bonus, 3)
+    out["高温位置補正"] = np.round(heat_bonus, 3)
+    out["Ver24展開穴補正"] = np.round(total, 3)
+
+    if "改善後総合点" in out.columns:
+        out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + total
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+    # シミュレーションが参照する当日指数にも小さく反映。二重加点を避けて0.35倍。
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + total * 0.35
+    if "予測競走T" in out.columns:
+        out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"], errors="coerce") - total * 0.0012, 4)
+    return out
+
+
 def ver16_run_prediction(text, trials=10000, seed=20260719, manual_excluded=None):
     content, meta, entries = ver16_build_virtual_excel(text, manual_excluded=manual_excluded)
+    # run_model内でも当日出走表の補助指標を参照できるよう、一回の予測中だけ保持する。
+    globals()["LATEST_ENTRY_STATS"] = entries.copy()
     track_temp = ver16_safe_float(meta.get("走路温度"), 30.0)
     filename = f"AutoRaceAI_Ver16_{meta.get('開催場') or 'race'}_{meta.get('レース') or ''}R.xlsx"
     df, bets, output = run_model(
