@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver21｜リセット安定化・結果解析の保持表示対応")
+st.caption("Ver23｜解析対象選手の登録データ件数・最新日表示対応")
 
 
 def qident(name: str) -> str:
@@ -45,6 +45,118 @@ def db_summary(db_path: str) -> dict:
     return info
 
 
+
+
+def normalize_player_key(name: str) -> str:
+    """DB照合用に空白と所属表記を除去した選手名キーを返す。"""
+    value = str(name or "").strip()
+    value = re.sub(r"[（(](?:川口|伊勢崎|浜松|飯塚|山陽)[）)]\s*$", "", value)
+    return re.sub(r"[\s　]+", "", value)
+
+
+def player_data_coverage(entries: pd.DataFrame, db_path: str) -> pd.DataFrame:
+    """解析対象選手ごとのDB登録量を、正規履歴と詳細取込履歴に分けて集計する。"""
+    columns = ["車", "選手名", "正規履歴", "詳細取込", "登録合計", "予測利用可", "最新日", "データ量"]
+    if entries is None or entries.empty or "選手名" not in entries.columns:
+        return pd.DataFrame(columns=columns)
+
+    targets = []
+    for _, row in entries.iterrows():
+        targets.append({
+            "車": int(row.get("車番", row.get("車", 0)) or 0),
+            "選手名": str(row.get("選手名", "")).strip(),
+            "key": normalize_player_key(row.get("選手名", "")),
+        })
+
+    canonical = {}
+    imported = {}
+    path = Path(db_path)
+    if path.exists():
+        with sqlite3.connect(path) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if {"players", "race_history"}.issubset(tables):
+                rows = con.execute(
+                    """
+                    SELECT p.player_name,
+                           COUNT(h.history_id),
+                           SUM(CASE WHEN COALESCE(h.use_for_model, 1)=1 THEN 1 ELSE 0 END),
+                           MAX(NULLIF(h.race_date, ''))
+                    FROM players p
+                    LEFT JOIN race_history h ON h.player_id=p.player_id
+                    GROUP BY p.player_id, p.player_name
+                    """
+                ).fetchall()
+                for name, count_all, count_use, latest in rows:
+                    key = normalize_player_key(name)
+                    prev = canonical.get(key, (0, 0, None))
+                    dates = [d for d in (prev[2], latest) if d]
+                    canonical[key] = (prev[0] + int(count_all or 0), prev[1] + int(count_use or 0), max(dates) if dates else None)
+            if "v15_player_history_imports" in tables:
+                rows = con.execute(
+                    """
+                    SELECT player_name, COUNT(*), MAX(NULLIF(race_date, ''))
+                    FROM v15_player_history_imports
+                    WHERE player_name IS NOT NULL AND TRIM(player_name)<>''
+                    GROUP BY player_name
+                    """
+                ).fetchall()
+                for name, count_all, latest in rows:
+                    key = normalize_player_key(name)
+                    prev = imported.get(key, (0, None))
+                    dates = [d for d in (prev[1], latest) if d]
+                    imported[key] = (prev[0] + int(count_all or 0), max(dates) if dates else None)
+
+    out = []
+    for item in targets:
+        c_all, c_use, c_latest = canonical.get(item["key"], (0, 0, None))
+        i_all, i_latest = imported.get(item["key"], (0, None))
+        total = c_all + i_all
+        latest_candidates = [d for d in (c_latest, i_latest) if d]
+        latest = max(latest_candidates) if latest_candidates else "未登録"
+        if total >= 20:
+            level = "十分"
+        elif total >= 10:
+            level = "標準"
+        elif total >= 5:
+            level = "少なめ"
+        elif total >= 1:
+            level = "不足"
+        else:
+            level = "0件"
+        out.append({
+            "車": item["車"],
+            "選手名": item["選手名"],
+            "正規履歴": c_all,
+            "詳細取込": i_all,
+            "登録合計": total,
+            "予測利用可": c_use + i_all,
+            "最新日": latest,
+            "データ量": level,
+        })
+    return pd.DataFrame(out, columns=columns).sort_values("車").reset_index(drop=True)
+
+
+def show_player_data_coverage(entries: pd.DataFrame) -> None:
+    coverage = player_data_coverage(entries, engine.DB_PATH)
+    st.subheader("📚 解析対象選手の登録データ量")
+    if coverage.empty:
+        st.info("解析対象選手の登録状況を確認できませんでした。")
+        return
+    st.dataframe(
+        coverage,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "正規履歴": st.column_config.NumberColumn(format="%d件"),
+            "詳細取込": st.column_config.NumberColumn(format="%d件"),
+            "登録合計": st.column_config.NumberColumn(format="%d件"),
+            "予測利用可": st.column_config.NumberColumn(format="%d件"),
+        },
+    )
+    zero_names = coverage.loc[coverage["登録合計"] == 0, "選手名"].tolist()
+    if zero_names:
+        st.warning("DB履歴0件: " + "、".join(zero_names) + "。名前の照合または履歴登録を確認してください。")
+    st.caption("正規履歴は結果登録などで蓄積した履歴、詳細取込は公式プロフィールから登録した履歴です。登録合計20件以上を『十分』の目安にしています。")
 
 def ticket_probability_table(bets: dict, key: str, trials: int, top_n: int = 20) -> pd.DataFrame:
     """シミュレーションの券種別カウントを、表示用の確率表へ変換する。"""
@@ -382,6 +494,7 @@ with prediction_tab:
             st.caption(f"実出走数: {len(entries)}車 / 三連単組み合わせ数: {len(entries)*(len(entries)-1)*(len(entries)-2)}通り")
             st.subheader("解析した出走表")
             st.dataframe(entries.drop(columns=["_raw"], errors="ignore"), use_container_width=True, hide_index=True)
+            show_player_data_coverage(entries)
 
             cols = [c for c in [
                 "改善後順位", "車", "選手名", "ハンデ", "試走換算", "予測競走T", "レース信頼度",

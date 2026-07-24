@@ -3885,6 +3885,10 @@ def v15_normalize_name(name):
     name = re.sub(r"^[0-9]+\s*", "", name)
     # 公式サイトの予想印・お気に入り印を氏名から除去
     name = re.sub(r"^[◎○◯▲△×注☆★◇◆□■・]+\s*", "", name)
+    # 新しい出走表では「田中 竜二(浜松)」のように所属LGが氏名末尾へ付く。
+    # 所属場だけを除き、DB照合・履歴検索に使う選手名を純粋な氏名へ統一する。
+    tracks = "川口|伊勢崎|浜松|飯塚|山陽"
+    name = re.sub(rf"\s*[（(](?:{tracks})[）)]\s*$", "", name)
     return name.strip()
 
 
