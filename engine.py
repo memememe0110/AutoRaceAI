@@ -4892,8 +4892,124 @@ def v151_parse_vertical_player_history(text, player_name=None):
     return pd.DataFrame(rows)
 
 
-# 既存関数を上書きし、縦型と表形式の両方に対応
+# Ver35: ヘッダー付きタブ区切り履歴の貼り付け対応
+def v35_parse_tabular_player_history(text, player_name=None):
+    # タブは列区切りなので、通常のclean_textで空白へ潰さず保持する。
+    cleaned = str(text or "").replace("\u3000", " ").replace("\xa0", " ")
+    cleaned = re.sub(r"\r\n?", "\n", cleaned).strip()
+    lines = [line.rstrip("\r") for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return pd.DataFrame()
+
+    # Excel/サイト表コピーのタブ区切りを優先。連続空白は氏名等を壊しやすいため使わない。
+    header = [x.strip() for x in lines[0].split("\t")]
+    aliases = {
+        "日付": "開催日", "開催日": "開催日",
+        "場": "開催場", "開催場": "開催場",
+        "R": "レース", "レース": "レース",
+        "着": "着順", "着順": "着順",
+        "車番": "車番",
+        "走路": "走路",
+        "ハンデ": "ハンデ",
+        "試走T": "試走T", "試走": "試走T",
+        "競走T": "競走T", "競走": "競走T",
+        "ST": "ST",
+        "出走": "出走",
+        "天候": "天候",
+        "走路温度": "走路温度", "走温": "走路温度",
+        "気温": "気温",
+        "湿度": "湿度",
+        "種別": "レース種別", "レース種別": "レース種別",
+        "距離": "距離", "周回数": "周回数", "人気": "人気",
+    }
+    mapped = [aliases.get(h) for h in header]
+    required = {"開催日", "開催場", "着順", "試走T", "競走T", "ST"}
+    if "\t" not in lines[0] or len(required.intersection({x for x in mapped if x})) < 4:
+        return pd.DataFrame()
+
+    def missing(v):
+        return str(v).strip() in {"", "-", "—", "–", "―", "ー", "−", "null", "None", "nan"}
+
+    def num(v, integer=False):
+        if missing(v):
+            return np.nan
+        t = str(v).strip().replace(",", "")
+        t = re.sub(r"(?:m|R|人気|周)$", "", t, flags=re.I).strip()
+        try:
+            x = float(t)
+            return int(x) if integer else x
+        except Exception:
+            return np.nan
+
+    rows = []
+    for raw in lines[1:]:
+        parts = [x.strip() for x in raw.split("\t")]
+        if not any(parts):
+            continue
+        if len(parts) < len(header):
+            parts += [""] * (len(header) - len(parts))
+        elif len(parts) > len(header):
+            parts = parts[:len(header)-1] + [" ".join(parts[len(header)-1:])]
+        src = {mapped[i]: parts[i] for i in range(len(header)) if mapped[i]}
+
+        date_value = src.get("開催日", "")
+        date_iso = None
+        if not missing(date_value):
+            dm = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})", date_value)
+            if dm:
+                date_iso = f"{int(dm.group(1)):04d}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}"
+
+        surface = None if missing(src.get("走路", "")) else src.get("走路", "").replace("走路", "")
+        rank = num(src.get("着順", ""), integer=True)
+        race_no = num(src.get("レース", ""), integer=True)
+        handicap = num(src.get("ハンデ", ""), integer=True)
+        car_no = num(src.get("車番", ""), integer=True)
+
+        row = {
+            "選手名": v15_normalize_name(player_name or ""),
+            "開催日": date_iso,
+            "開催場": None if missing(src.get("開催場", "")) else src.get("開催場", ""),
+            "レース": race_no,
+            "着順": rank,
+            "出走": num(src.get("出走", ""), integer=True),
+            "走路": surface,
+            "ハンデ": handicap,
+            "試走T": num(src.get("試走T", "")),
+            "競走T": num(src.get("競走T", "")),
+            "ST": num(src.get("ST", "")),
+            "天候": None if missing(src.get("天候", "")) else src.get("天候", ""),
+            "走路温度": num(src.get("走路温度", "")),
+            "気温": num(src.get("気温", "")),
+            "湿度": num(src.get("湿度", "")),
+            "レース種別": None if missing(src.get("レース種別", "")) else src.get("レース種別", ""),
+            "距離": num(src.get("距離", ""), integer=True),
+            "周回数": num(src.get("周回数", ""), integer=True),
+            "人気": num(src.get("人気", ""), integer=True),
+            "車番": car_no,
+            "_raw": raw,
+        }
+        # 日付・場・Rのどれかが取れた行だけ履歴候補として残す。欠損行も確認用に保持。
+        if row["開催日"] or row["開催場"] or not pd.isna(row["レース"]):
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# 既存関数を上書きし、縦型・タブ表・1行形式のすべてに対応
 def v15_parse_player_history(text, player_name=None):
+    tabular = v35_parse_tabular_player_history(text, player_name=player_name)
+    if not tabular.empty:
+        expected = [
+            "選手名", "開催日", "開催場", "レース", "着順", "出走", "走路",
+            "ハンデ", "試走T", "競走T", "ST",
+            "天候", "走路温度", "気温", "湿度",
+            "レース種別", "距離", "周回数", "人気", "車番", "_raw"
+        ]
+        for col in expected:
+            if col not in tabular.columns:
+                tabular[col] = np.nan
+        return tabular[expected]
+
     vertical = v151_parse_vertical_player_history(text, player_name=player_name)
 
     # 縦型が2件以上取れたらこちらを採用
