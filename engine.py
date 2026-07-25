@@ -6109,17 +6109,42 @@ def _v27_record_key(*values):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _v34_has_value(value, *, positive=False):
+    """重複更新用。空欄・NaNは既存値を消さない。時刻系は0以下も空欄扱い。"""
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    if isinstance(value, str):
+        if not value.strip() or value.strip().lower() in {"nan", "none", "null", "-"}:
+            return False
+    if positive:
+        try:
+            return float(value) > 0
+        except Exception:
+            return False
+    return True
+
+
+def _v34_merge(old, new, *, positive=False):
+    return new if _v34_has_value(new, positive=positive) else old
+
+
 def v15_save_player_history(df, db_path=DB_PATH):
-    """貼付履歴をVer13系 players/race_history に保存し、v15表にもミラーする。"""
+    """貼付履歴を保存。同一レースは行を置換せず、値があるカラムだけ更新する。"""
     if df is None or df.empty:
         return 0, 0
     mount_and_init_db()
     v151_ensure_player_import_columns(db_path)
-    inserted = 0
+    changed = 0
     skipped = 0
     now = datetime.now().isoformat(timespec="seconds")
 
     with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
         for _, row in df.iterrows():
             entered_name = _v27_norm_player_name(row.get("選手名"))
@@ -6162,28 +6187,25 @@ def v15_save_player_history(df, db_path=DB_PATH):
             use_for_model = 0 if marker or numeric_invalid else 1
             result_status = marker or ("無効タイム" if numeric_invalid else "通常")
 
-            candidate_row = {
-                "race_date": race_date, "venue": venue, "finish": finish,
-                "handicap": handicap_text, "trial_time": trial,
-                "race_time": race_time, "start_time": st,
-            }
-            signature = _v33_history_signature(candidate_row)
-            record_key = _v27_record_key(v32_player_name_key(name), *signature)
-
-            # record_keyだけでなく実データでも確認する。旧版で別名保存された履歴も止める。
-            existing_rows = con.execute(
-                "SELECT * FROM race_history WHERE player_id=? AND race_date=? AND venue=?",
+            # 同一選手・開催日・開催場を論理重複とする。
+            # 同日に複数候補がある場合はレース種別一致を優先する。
+            candidates = con.execute(
+                "SELECT * FROM race_history WHERE player_id=? AND race_date=? AND venue=? ORDER BY history_id",
                 (player_id, race_date, venue),
             ).fetchall()
-            exists = False
-            col_names = [d[0] for d in con.execute("SELECT * FROM race_history LIMIT 0").description]
-            for existing_row in existing_rows:
-                if _v33_history_signature(dict(zip(col_names, existing_row))) == signature:
-                    exists = True
-                    break
-            if exists:
-                skipped += 1
-            else:
+            target = None
+            if candidates:
+                same_race = [r for r in candidates if _v33_norm_text(r["race_no"]) == _v33_norm_text(race_type)]
+                target = same_race[0] if same_race else (candidates[0] if len(candidates) == 1 else None)
+
+            if target is None:
+                candidate_row = {
+                    "race_date": race_date, "venue": venue, "finish": finish,
+                    "handicap": handicap_text, "trial_time": trial,
+                    "race_time": race_time, "start_time": st,
+                }
+                signature = _v33_history_signature(candidate_row)
+                record_key = _v27_record_key(v32_player_name_key(name), *signature)
                 con.execute(
                     """INSERT INTO race_history(
                         player_id, race_date, venue, race_no, finish, starters, surface,
@@ -6193,31 +6215,103 @@ def v15_save_player_history(df, db_path=DB_PATH):
                     (player_id, race_date, venue, race_type, finish, starters, surface,
                      handicap_text, trial, race_time, st, result_status, use_for_model, record_key),
                 )
-                inserted += 1
+                changed += 1
+            else:
+                merged = {
+                    "race_no": _v34_merge(target["race_no"], race_type),
+                    "finish": _v34_merge(target["finish"], finish, positive=True),
+                    "starters": _v34_merge(target["starters"], starters, positive=True),
+                    "surface": _v34_merge(target["surface"], surface),
+                    "handicap": _v34_merge(target["handicap"], handicap_text),
+                    "trial_time": _v34_merge(target["trial_time"], trial, positive=True),
+                    "race_time": _v34_merge(target["race_time"], race_time, positive=True),
+                    "start_time": _v34_merge(target["start_time"], st, positive=True),
+                }
+                # 事故区分が明示されたときは更新。通常入力の欠損だけでは既存の事故区分を消さない。
+                if marker:
+                    merged_status = marker
+                    merged_use = 0
+                elif result_status == "通常" and all(_v34_has_value(merged[k], positive=True) for k in ("finish", "trial_time", "race_time", "start_time")):
+                    merged_status = "通常"
+                    merged_use = 1 if float(merged["race_time"]) > float(merged["trial_time"]) else 0
+                else:
+                    merged_status = target["result_status"]
+                    merged_use = target["use_for_model"]
+                candidate_row = {
+                    "race_date": race_date, "venue": venue, "finish": merged["finish"],
+                    "handicap": merged["handicap"], "trial_time": merged["trial_time"],
+                    "race_time": merged["race_time"], "start_time": merged["start_time"],
+                }
+                signature = _v33_history_signature(candidate_row)
+                record_key = _v27_record_key(v32_player_name_key(name), *signature)
+                con.execute(
+                    """UPDATE race_history SET race_no=?, finish=?, starters=?, surface=?, handicap=?,
+                       trial_time=?, race_time=?, start_time=?, result_status=?, use_for_model=?,
+                       source='スマホ貼付登録', record_key=? WHERE history_id=?""",
+                    (merged["race_no"], merged["finish"], merged["starters"], merged["surface"],
+                     merged["handicap"], merged["trial_time"], merged["race_time"], merged["start_time"],
+                     merged_status, merged_use, record_key, target["history_id"]),
+                )
+                changed += 1
 
-            # 詳細条件を保持するミラー表。予測本体は上のrace_historyを参照。
-            history_key = v15_hash(v32_player_name_key(name), race_date, venue, finish, handicap_num, trial, race_time, st)
-            con.execute("""
-                INSERT OR IGNORE INTO v15_player_history_imports (
-                    history_key, player_name, race_date, venue, race_no,
-                    rank, starters, surface, handicap, trial_time,
-                    race_time, st, raw_line, created_at,
-                    weather, track_temp, air_temp, humidity,
-                    race_type, distance, laps, popularity, car_no
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                history_key, name, race_date, venue, None,
-                None if finish is None else int(finish), None if starters is None else int(starters), surface,
-                handicap_num, trial, race_time, st, row.get("_raw"), now,
-                row.get("天候"), None if pd.isna(row.get("走路温度")) else float(row.get("走路温度")),
-                None if pd.isna(row.get("気温")) else float(row.get("気温")),
-                None if pd.isna(row.get("湿度")) else float(row.get("湿度")),
-                race_type, None if pd.isna(row.get("距離")) else int(row.get("距離")),
-                None if pd.isna(row.get("周回数")) else int(row.get("周回数")),
-                None if pd.isna(row.get("人気")) else int(row.get("人気")), car_no,
-            ))
+            detail_values = {
+                "player_name": name, "race_date": race_date, "venue": venue,
+                "race_no": None, "rank": None if finish is None else int(finish),
+                "starters": None if starters is None else int(starters), "surface": surface,
+                "handicap": handicap_num, "trial_time": trial, "race_time": race_time, "st": st,
+                "raw_line": row.get("_raw"), "weather": row.get("天候"),
+                "track_temp": None if pd.isna(row.get("走路温度")) else float(row.get("走路温度")),
+                "air_temp": None if pd.isna(row.get("気温")) else float(row.get("気温")),
+                "humidity": None if pd.isna(row.get("湿度")) else float(row.get("湿度")),
+                "race_type": race_type,
+                "distance": None if pd.isna(row.get("距離")) else int(row.get("距離")),
+                "laps": None if pd.isna(row.get("周回数")) else int(row.get("周回数")),
+                "popularity": None if pd.isna(row.get("人気")) else int(row.get("人気")),
+                "car_no": car_no,
+            }
+            detail_candidates = con.execute(
+                "SELECT * FROM v15_player_history_imports WHERE race_date=? AND venue=?",
+                (race_date, venue),
+            ).fetchall()
+            detail_target = None
+            for d in detail_candidates:
+                if v32_player_name_key(d["player_name"]) != v32_player_name_key(name):
+                    continue
+                if car_no is not None and d["car_no"] is not None and int(d["car_no"]) != car_no:
+                    continue
+                detail_target = d
+                break
+
+            if detail_target is None:
+                history_key = v15_hash(v32_player_name_key(name), race_date, venue, finish, handicap_num, trial, race_time, st)
+                con.execute("""
+                    INSERT INTO v15_player_history_imports (
+                        history_key, player_name, race_date, venue, race_no, rank, starters, surface,
+                        handicap, trial_time, race_time, st, raw_line, created_at, weather, track_temp,
+                        air_temp, humidity, race_type, distance, laps, popularity, car_no
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (history_key, name, race_date, venue, None, detail_values["rank"], detail_values["starters"],
+                       surface, handicap_num, trial, race_time, st, detail_values["raw_line"], now,
+                       detail_values["weather"], detail_values["track_temp"], detail_values["air_temp"],
+                       detail_values["humidity"], race_type, detail_values["distance"], detail_values["laps"],
+                       detail_values["popularity"], car_no))
+            else:
+                fields = ["player_name","race_no","rank","starters","surface","handicap","trial_time",
+                          "race_time","st","raw_line","weather","track_temp","air_temp","humidity",
+                          "race_type","distance","laps","popularity","car_no"]
+                positive_fields = {"rank","starters","handicap","trial_time","race_time","st","track_temp",
+                                   "air_temp","humidity","distance","laps","popularity","car_no"}
+                merged_detail = {
+                    f: _v34_merge(detail_target[f], detail_values[f], positive=f in positive_fields)
+                    for f in fields
+                }
+                con.execute("""UPDATE v15_player_history_imports SET
+                    player_name=?, race_no=?, rank=?, starters=?, surface=?, handicap=?, trial_time=?,
+                    race_time=?, st=?, raw_line=?, weather=?, track_temp=?, air_temp=?, humidity=?,
+                    race_type=?, distance=?, laps=?, popularity=?, car_no=? WHERE history_key=?""",
+                    tuple(merged_detail[f] for f in fields) + (detail_target["history_key"],))
         con.commit()
-    return inserted, skipped
+    return changed, skipped
 
 
 # ============================================================
