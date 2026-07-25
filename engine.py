@@ -9021,3 +9021,164 @@ def v47_player_history_breakdown(player_name, db_path=DB_PATH):
     if dates:
         result["latest"]=max(dates); result["oldest"]=min(dates)
     return result
+
+# ============================================================
+# Ver50: 重み影響の見える化・レース名自動補完強化
+# ============================================================
+def v50_normalize_race_name(value):
+    """レース名の空白・全半角・よくある表記ゆれを整える。"""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", str(value or "")).strip()
+    s = re.sub(r"\s+", "", s)
+    if s in {"", "-", "—", "–", "―", "nan", "None"}:
+        return None
+    replacements = {
+        "一般": "一般戦", "準決": "準決勝戦", "準決勝": "準決勝戦",
+        "優勝": "優勝戦", "特一般": "特別一般戦",
+    }
+    return replacements.get(s, s)
+
+
+def v50_infer_race_name(raw, race_type=None):
+    """貼付行・縦型ブロックから大会名ではなくレース区分を推定する。"""
+    candidate = v50_normalize_race_name(race_type)
+    if candidate:
+        return candidate
+    text = str(raw or "")
+    patterns = [
+        r"(マイスター選抜|特別選抜戦?|選抜予選|選抜戦|特別一般戦)",
+        r"(準決勝戦[ABＡＢＣC]?|準決勝[ABＡＢＣC]?|準決[ABＡＢＣC]?)",
+        r"(一次予選|二次予選|予選[ABＡＢＣC]?|一般戦|優勝戦)",
+        r"(最終予選|予選選抜|特別予選|一般選抜)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return v50_normalize_race_name(m.group(1))
+    return None
+
+
+_v50_parse_player_history_original = v15_parse_player_history
+def v15_parse_player_history(text, player_name=None):
+    df = _v50_parse_player_history_original(text, player_name=player_name)
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "レース名" not in out.columns:
+        out["レース名"] = None
+    if "レース種別" not in out.columns:
+        out["レース種別"] = None
+    if "_raw" not in out.columns:
+        out["_raw"] = ""
+    for idx in out.index:
+        current = v50_normalize_race_name(out.at[idx, "レース名"])
+        inferred = v50_infer_race_name(out.at[idx, "_raw"], out.at[idx, "レース種別"])
+        out.at[idx, "レース名"] = current or inferred
+        # レース種別側しか無い貼付形式も、保存時にレース名へ反映する。
+        if not v50_normalize_race_name(out.at[idx, "レース種別"]) and out.at[idx, "レース名"]:
+            out.at[idx, "レース種別"] = out.at[idx, "レース名"]
+    return out
+
+
+_v50_apply_weights_original = v40_apply_adaptive_weights
+def v40_apply_adaptive_weights(df, db_path=DB_PATH):
+    out = _v50_apply_weights_original(df, db_path=db_path)
+    weights = v40_get_weights(db_path)
+    features = v40_feature_frame(out)
+    comments = []
+    for idx in out.index:
+        before_rank = int(out.at[idx, "調整前順位"])
+        after_rank = int(out.at[idx, "改善後順位"])
+        move = before_rank - after_rank
+        contributions = []
+        for name in V40_DEFAULT_WEIGHTS:
+            contribution = float(weights[name] * (features.loc[idx, name] - 0.5) * 6.0)
+            contributions.append((name, contribution, float(weights[name])))
+        contributions.sort(key=lambda x: abs(x[1]), reverse=True)
+        detail = "、".join(
+            f"{name}{value:+.2f}点(重み{weight:.3f})"
+            for name, value, weight in contributions[:3]
+        )
+        if move > 0:
+            head = f"重み補正で{move}位上昇"
+        elif move < 0:
+            head = f"重み補正で{abs(move)}位下降"
+        else:
+            head = "順位変化なし"
+        comments.append(f"{head}。主因: {detail}")
+    out["重み調整コメント"] = comments
+    return out
+
+
+def _v50_softmax(values, temperature=1.0):
+    x = np.asarray(values, dtype=float)
+    x = np.nan_to_num(x, nan=np.nanmedian(x) if np.isfinite(x).any() else 0.0)
+    scale = np.nanstd(x)
+    if not np.isfinite(scale) or scale < 1e-9:
+        scale = 1.0
+    z = (x - np.nanmax(x)) / (scale * max(0.2, float(temperature)))
+    e = np.exp(np.clip(z, -40, 0))
+    return e / max(e.sum(), 1e-12)
+
+
+def _v50_plackett_luce_trifecta(cars, strengths):
+    rows = []
+    cars = [int(c) for c in cars]
+    s = np.asarray(strengths, dtype=float)
+    for i, a in enumerate(cars):
+        p1 = s[i] / s.sum()
+        rem1 = s.sum() - s[i]
+        for j, b in enumerate(cars):
+            if j == i: continue
+            p2 = s[j] / rem1
+            rem2 = rem1 - s[j]
+            for k, c in enumerate(cars):
+                if k in (i, j): continue
+                p3 = s[k] / rem2
+                rows.append((f"{a}-{b}-{c}", p1*p2*p3*100.0))
+    return dict(rows)
+
+
+def v50_weight_impact_summary(df, top_n=20):
+    """重み適用前後の順位と、スコアから算出した診断用確率差を返す。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    before = pd.to_numeric(work.get("調整前総合点"), errors="coerce").fillna(0.0)
+    after = pd.to_numeric(work.get("改善後総合点"), errors="coerce").fillna(0.0)
+    pb = _v50_softmax(before, 1.15)
+    pa = _v50_softmax(after, 1.15)
+    # 3着内は独立確率ではなく、相対強度からの簡易近似。比較用途に限定。
+    top3_b = np.clip(pb * 3.0, 0, 1) * 100
+    top3_a = np.clip(pa * 3.0, 0, 1) * 100
+    rows=[]
+    for pos, (_, r) in enumerate(work.iterrows()):
+        br=int(r.get("調整前順位",0)); ar=int(r.get("改善後順位",0))
+        rows.append({
+            "車": int(r.get("車", r.get("車番", 0))), "選手名": str(r.get("選手名", "")),
+            "調整前順位": br, "調整後順位": ar, "順位変化": br-ar,
+            "推定1着率_調整前": pb[pos]*100, "推定1着率_調整後": pa[pos]*100,
+            "1着率変化": (pa[pos]-pb[pos])*100,
+            "推定3着内率_調整前": top3_b[pos], "推定3着内率_調整後": top3_a[pos],
+            "3着内率変化": top3_a[pos]-top3_b[pos],
+            "コメント": r.get("重み調整コメント", r.get("主な評価理由", "")),
+        })
+    return pd.DataFrame(rows).sort_values(["調整後順位","車"]).head(int(top_n)).reset_index(drop=True)
+
+
+def v50_trifecta_weight_impact(df, limit=20):
+    """重み前後の三連単確率差をPlackett-Luce近似で比較する診断表。"""
+    if df is None or len(df) < 3:
+        return pd.DataFrame()
+    cars = pd.to_numeric(df.get("車", df.get("車番")), errors="coerce").fillna(0).astype(int).tolist()
+    before = _v50_softmax(pd.to_numeric(df.get("調整前総合点"), errors="coerce").fillna(0.0), 1.15)
+    after = _v50_softmax(pd.to_numeric(df.get("改善後総合点"), errors="coerce").fillna(0.0), 1.15)
+    b = _v50_plackett_luce_trifecta(cars, before)
+    a = _v50_plackett_luce_trifecta(cars, after)
+    rows=[]
+    for combo in set(b)|set(a):
+        rows.append({"組み合わせ":combo,"調整前確率":b.get(combo,0.0),"調整後確率":a.get(combo,0.0),"確率変化":a.get(combo,0.0)-b.get(combo,0.0)})
+    frame=pd.DataFrame(rows)
+    frame["上昇幅順位"] = frame["確率変化"].rank(method="min", ascending=False).astype(int)
+    frame["調整後順位"] = frame["調整後確率"].rank(method="min", ascending=False).astype(int)
+    return frame.sort_values(["確率変化","調整後確率"], ascending=False).head(int(limit)).reset_index(drop=True)

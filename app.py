@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver48｜Rまたはレース名必須・R欠損時は数値一致で重複判定")
+st.caption("Ver50｜重み影響比較・レース名自動補完")
 
 
 def qident(name: str) -> str:
@@ -787,10 +787,32 @@ with prediction_tab:
             st.caption("確率計算は全試行で、スタート・中盤・最終周のイベントを生成しています。この表は指標から作った代表的な1展開です。")
             st.caption(f"予測保存キー: {race_key}（結果登録時の比較・重み調整に使用）")
 
-            with st.expander("🧪 学習重みによる順位変化"):
-                compare_cols = [c for c in ["車","選手名","調整前順位","改善後順位","調整前総合点","学習重み補正","改善後総合点","主な評価理由"] if c in df.columns]
-                st.dataframe(df[compare_cols].sort_values("改善後順位"), use_container_width=True, hide_index=True)
-                st.caption("調整前は元モデル、改善後は保存済み学習重みを小さく加えた順位です。")
+            with st.expander("🧪 学習重みによる順位・確率の変化", expanded=True):
+                impact_df = engine.v50_weight_impact_summary(df)
+                st.dataframe(
+                    impact_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "推定1着率_調整前": st.column_config.NumberColumn(format="%.2f%%"),
+                        "推定1着率_調整後": st.column_config.NumberColumn(format="%.2f%%"),
+                        "1着率変化": st.column_config.NumberColumn(format="%+.2f%%"),
+                        "推定3着内率_調整前": st.column_config.NumberColumn(format="%.2f%%"),
+                        "推定3着内率_調整後": st.column_config.NumberColumn(format="%.2f%%"),
+                        "3着内率変化": st.column_config.NumberColumn(format="%+.2f%%"),
+                    },
+                )
+                st.caption("コメントは現在の重み・各選手の特徴・順位変化から毎回作り直します。確率差は重みの影響だけを見る診断用近似で、下の本シミュレーション確率とは別です。")
+
+                st.markdown("#### 三連単で確率が上がった組み合わせ")
+                trifecta_impact = engine.v50_trifecta_weight_impact(df, limit=20)
+                st.dataframe(
+                    trifecta_impact, use_container_width=True, hide_index=True,
+                    column_config={
+                        "調整前確率": st.column_config.NumberColumn(format="%.3f%%"),
+                        "調整後確率": st.column_config.NumberColumn(format="%.3f%%"),
+                        "確率変化": st.column_config.NumberColumn(format="%+.3f%%"),
+                    },
+                )
+                st.caption("上昇幅順位は、保存済み学習重みを適用したことで三連単確率がどれだけ増えたかの順位です。")
             st.subheader("着順確率")
             st.dataframe(
                 finish_prob,
