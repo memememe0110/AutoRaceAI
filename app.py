@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver50｜重み影響比較・レース名自動補完")
+st.caption("Ver54｜重み影響比較・レース名自動補完・予測自信度")
 
 
 def qident(name: str) -> str:
@@ -288,6 +288,76 @@ def ticket_probability_table(bets: dict, key: str, trials: int, top_n: int = 20)
             "的中回数": int(count),
         })
     return pd.DataFrame(rows, columns=["順位", "組み合わせ", "確率", "的中回数"])
+
+
+def prediction_confidence_summary(finish_prob: pd.DataFrame, bets: dict, trials: int) -> dict:
+    """予測分布の集中度から、今回の予測自信度を診断する。"""
+    empty = {
+        "level": "判定不能", "score": 0, "icon": "⚪", "top_car": None,
+        "top1": 0.0, "gap": 0.0, "top3": 0.0, "top_trifecta": 0.0,
+        "comment": "着順確率を取得できないため、自信度を判定できません。",
+    }
+    if finish_prob is None or finish_prob.empty or "1着率" not in finish_prob.columns:
+        return empty
+
+    work = finish_prob.copy()
+    work["1着率"] = pd.to_numeric(work["1着率"], errors="coerce").fillna(0.0)
+    if "3着内率" in work.columns:
+        work["3着内率"] = pd.to_numeric(work["3着内率"], errors="coerce").fillna(0.0)
+    else:
+        cols = [c for c in ["1着率", "2着率", "3着率"] if c in work.columns]
+        work["3着内率"] = work[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1)
+    work = work.sort_values("1着率", ascending=False).reset_index(drop=True)
+    top1 = float(work.loc[0, "1着率"])
+    second = float(work.loc[1, "1着率"]) if len(work) > 1 else 0.0
+    gap = max(top1 - second, 0.0)
+    top3 = float(work.loc[0, "3着内率"])
+    top_car = work.loc[0, "車"] if "車" in work.columns else None
+
+    tri = ticket_probability_table(bets, "三連単", trials, 1)
+    top_trifecta = float(tri.iloc[0]["確率"]) if not tri.empty else 0.0
+
+    score = round(
+        min(top1 / 35.0, 1.0) * 30.0
+        + min(gap / 15.0, 1.0) * 35.0
+        + min(top3 / 75.0, 1.0) * 20.0
+        + min(top_trifecta / 8.0, 1.0) * 15.0
+    )
+    if score >= 70:
+        level, icon = "高", "🔥"
+        comment = "上位候補が比較的はっきりしています。今回の予測は普段よりまとまりがあります。"
+    elif score >= 48:
+        level, icon = "中", "🟡"
+        comment = "中心候補はありますが、相手や着順にはまだ揺れがあります。"
+    else:
+        level, icon = "低", "🌫️"
+        comment = "上位確率が接近しています。展開次第で順位が入れ替わりやすい予測です。"
+
+    return {
+        "level": level, "score": int(score), "icon": icon, "top_car": top_car,
+        "top1": top1, "gap": gap, "top3": top3, "top_trifecta": top_trifecta,
+        "comment": comment,
+    }
+
+
+def show_prediction_confidence(finish_prob: pd.DataFrame, bets: dict, trials: int) -> None:
+    info = prediction_confidence_summary(finish_prob, bets, trials)
+    st.subheader(f"{info['icon']} 今回の予測自信度：{info['level']}（{info['score']}/100）")
+    if info["level"] == "高":
+        st.success(info["comment"])
+    elif info["level"] == "中":
+        st.warning(info["comment"])
+    elif info["level"] == "低":
+        st.info(info["comment"])
+    else:
+        st.info(info["comment"])
+    c1, c2, c3, c4 = st.columns(4)
+    car_text = f"{int(info['top_car'])}番" if pd.notna(info.get("top_car")) else "不明"
+    c1.metric("1着中心", car_text, f"1着率 {info['top1']:.2f}%")
+    c2.metric("1位と2位の差", f"{info['gap']:.2f}pt")
+    c3.metric("中心車の3着内率", f"{info['top3']:.2f}%")
+    c4.metric("三連単1位の確率", f"{info['top_trifecta']:.2f}%")
+    st.caption("自信度は、1着率の高さ・次点との差・3着内率・三連単確率の集中度をまとめた診断です。的中を保証する数値ではありません。")
 
 
 def show_ticket_table(title: str, bets: dict, key: str, trials: int, top_n: int = 20) -> None:
@@ -813,6 +883,8 @@ with prediction_tab:
                     },
                 )
                 st.caption("上昇幅順位は、保存済み学習重みを適用したことで三連単確率がどれだけ増えたかの順位です。")
+            show_prediction_confidence(finish_prob, bets, view_trials)
+
             st.subheader("着順確率")
             st.dataframe(
                 finish_prob,

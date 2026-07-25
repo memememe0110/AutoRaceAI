@@ -4801,8 +4801,8 @@ def v151_parse_history_block(block, player_name=""):
         # レース番号の代わりになる正式なレース名として1行で記載される。
         # 大会名（例: Ｇ２川口記念）とは分離し、race_nameにも必ず反映する。
         race_name_keywords = [
-            "一般", "予選", "準決", "優勝", "選抜", "特選",
-            "マイスター", "グレードレース", "順位決定", "特別一般"
+            "一般", "予選", "準々決勝", "準決", "決勝", "優勝", "選抜", "特選",
+            "マイスター", "ランチアタック", "グレードレース", "順位決定", "特別一般"
         ]
         if any(x in line for x in race_name_keywords):
             row["レース名"] = line
@@ -6746,18 +6746,26 @@ def v15_save_player_history(df, db_path=DB_PATH):
 
             if detail_target is None:
                 history_key = v15_hash(v32_player_name_key(name), race_date, venue, race_no_value, finish, handicap_num, trial, race_time, st)
-                con.execute("""
-                    INSERT INTO v15_player_history_imports (
-                        history_key, player_name, race_date, venue, race_no, race_name, rank, starters, surface,
-                        handicap, trial_time, race_time, st, raw_line, created_at, weather, track_temp,
-                        air_temp, humidity, race_type, distance, laps, popularity, car_no
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (history_key, name, race_date, venue, race_no_value, race_name, detail_values["rank"], detail_values["starters"],
-                       surface, handicap_num, trial, race_time, st, detail_values["raw_line"], now,
-                       detail_values["weather"], detail_values["track_temp"], detail_values["air_temp"],
-                       detail_values["humidity"], race_type, detail_values["distance"], detail_values["laps"],
-                       detail_values["popularity"], car_no))
-            else:
+                # 数値同定で候補を見つけられなくても、同じhistory_keyが既に存在する場合がある。
+                # UNIQUE違反にせず、その既存行へカラム単位で追記・更新する。
+                detail_target = con.execute(
+                    "SELECT * FROM v15_player_history_imports WHERE history_key=? LIMIT 1",
+                    (history_key,),
+                ).fetchone()
+                if detail_target is None:
+                    con.execute("""
+                        INSERT INTO v15_player_history_imports (
+                            history_key, player_name, race_date, venue, race_no, race_name, rank, starters, surface,
+                            handicap, trial_time, race_time, st, raw_line, created_at, weather, track_temp,
+                            air_temp, humidity, race_type, distance, laps, popularity, car_no
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (history_key, name, race_date, venue, race_no_value, race_name, detail_values["rank"], detail_values["starters"],
+                           surface, handicap_num, trial, race_time, st, detail_values["raw_line"], now,
+                           detail_values["weather"], detail_values["track_temp"], detail_values["air_temp"],
+                           detail_values["humidity"], race_type, detail_values["distance"], detail_values["laps"],
+                           detail_values["popularity"], car_no))
+
+            if detail_target is not None:
                 fields = ["player_name","race_no","race_name","rank","starters","surface","handicap","trial_time",
                           "race_time","st","raw_line","weather","track_temp","air_temp","humidity",
                           "race_type","distance","laps","popularity","car_no"]
@@ -9033,7 +9041,8 @@ def v50_normalize_race_name(value):
     if s in {"", "-", "—", "–", "―", "nan", "None"}:
         return None
     replacements = {
-        "一般": "一般戦", "準決": "準決勝戦", "準決勝": "準決勝戦",
+        "一般": "一般戦", "準々決勝": "準々決勝戦",
+        "準決": "準決勝戦", "準決勝": "準決勝戦",
         "優勝": "優勝戦", "特一般": "特別一般戦",
     }
     return replacements.get(s, s)
@@ -9046,15 +9055,29 @@ def v50_infer_race_name(raw, race_type=None):
         return candidate
     text = str(raw or "")
     patterns = [
-        r"(マイスター選抜|特別選抜戦?|選抜予選|選抜戦|特別一般戦)",
-        r"(準決勝戦[ABＡＢＣC]?|準決勝[ABＡＢＣC]?|準決[ABＡＢＣC]?)",
+        # 接頭語を含む複合名称を先に拾う。例: ランチアタック準々決勝戦
+        r"([^\n\t]{0,24}準々決勝戦[ABＡＢＣC]?)",
+        r"([^\n\t]{0,24}準決勝戦[ABＡＢＣC]?)",
+        r"([^\n\t]{0,24}(?:マイスター選抜|特別選抜戦?|選抜予選|選抜戦|特別一般戦))",
+        r"(準々決勝[ABＡＢＣC]?|準決勝[ABＡＢＣC]?|準決[ABＡＢＣC]?)",
         r"(一次予選|二次予選|予選[ABＡＢＣC]?|一般戦|優勝戦)",
-        r"(最終予選|予選選抜|特別予選|一般選抜)",
+        r"(最終予選|予選選抜|特別予選|一般選抜|順位決定戦?)",
     ]
     for pat in patterns:
         m = re.search(pat, text)
         if m:
-            return v50_normalize_race_name(m.group(1))
+            value = re.sub(r"^[0-9０-９]+走前\s*", "", m.group(1)).strip()
+            value = re.sub(r"^(?:川口|伊勢崎|浜松|山陽|飯塚)\s*", "", value)
+            return v50_normalize_race_name(value)
+
+    # 1行全体がレース区分らしい場合は、未知の冠名付きでもそのまま採用する。
+    for raw_line in text.splitlines():
+        line = v50_normalize_race_name(raw_line)
+        if not line or len(line) > 40:
+            continue
+        if re.search(r"(?:予選|一般戦?|準々決勝戦?|準決勝戦?|優勝戦?|選抜|特選|順位決定|ランチアタック)", line):
+            if not re.fullmatch(r"(?:川口|伊勢崎|浜松|山陽|飯塚)", line):
+                return line
     return None
 
 
@@ -9204,7 +9227,7 @@ def v51_extract_tournament_name(raw):
     """
     text = str(raw or "")
     lines = [v51_normalize_tournament_name(x) for x in text.splitlines()]
-    race_words = ("一般戦", "一般", "予選", "準決", "優勝戦", "優勝", "選抜", "特選", "マイスター")
+    race_words = ("一般戦", "一般", "予選", "準々決勝", "準決", "決勝", "優勝戦", "優勝", "選抜", "特選", "マイスター", "ランチアタック")
     strong_patterns = (
         r"(?:特別)?SG.+", r"(?:特別)?G[ⅠⅡⅢI123].+",
         r".+(?:記念|選手権|オールスター|グランプリ|王座決定戦|王座|杯|カップ|フェスタ)$",
