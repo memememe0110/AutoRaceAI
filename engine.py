@@ -8305,7 +8305,7 @@ def _v41_parse_trial_block(text, result_race_no):
 
 def _v41_parse_compact_result_entries(text, meta):
     """「着 事故 車 選手名」から始まる新しい縦型結果表を解析。"""
-    hm = re.search(r"着\s*[\t ]+事故\s*[\t ]+車\s*[\t ]+選手名", text)
+    hm = re.search(r"着\s+(?:事故\s+)?車\s+選手名", text)
     if not hm:
         raise ValueError("新形式の結果表見出しを取得できませんでした。")
     start = hm.end()
@@ -8320,6 +8320,11 @@ def _v41_parse_compact_result_entries(text, meta):
         mm = re.match(r"^\s*([1-8])\s*\t\s*([^\t]*)\t\s*([1-8])\s*\t?\s*$", raw)
         if mm:
             starts.append((idx, int(mm.group(1)), mm.group(2).strip(), int(mm.group(3))))
+            continue
+        # コピー元によってタブが連続空白へ変換された場合。
+        mm2 = re.match(r"^\s*([1-8])\s{2,}(.*?)\s{2,}([1-8])\s*$", raw)
+        if mm2:
+            starts.append((idx, int(mm2.group(1)), mm2.group(2).strip(), int(mm2.group(3))))
     if not starts:
         raise ValueError("結果行を解析できませんでした。")
 
@@ -8338,7 +8343,12 @@ def _v41_parse_compact_result_entries(text, meta):
             if re.match(r"^-?\d+(?:\t|$)", val):
                 data_line = val
                 break
-        parts = [p.strip() for p in data_line.split("\t")] if data_line else []
+        if data_line:
+            parts = [p.strip() for p in data_line.split("\t")]
+            if len(parts) == 1:
+                parts = [p.strip() for p in re.split(r"\s{2,}", data_line.strip())]
+        else:
+            parts = []
         handicap = np.nan
         trial = np.nan
         race_t = np.nan
@@ -8443,7 +8453,7 @@ def v35_parse_result_text(text, venue_override="", race_no_override=""):
     """旧形式と新公式サイト形式を自動判定して結果を解析する。"""
     if not str(text).strip():
         raise ValueError("結果ページを貼り付けてください。")
-    is_compact = bool(re.search(r"着\s*[\t ]+事故\s*[\t ]+車\s*[\t ]+選手名", text)) and "通常-結果" in text
+    is_compact = bool(re.search(r"着\s+(?:事故\s+)?車\s+選手名", text)) and "通常-結果" in text
     if not is_compact:
         return _v41_legacy_parse_result_text(text, venue_override, race_no_override)
 
@@ -8582,3 +8592,6 @@ def _v41_result_layout_meta(text, venue_override="", race_no_override=""):
     if str(venue_override).strip():
         meta["開催場"] = str(venue_override).strip()
     return meta
+
+
+# Ver43: 結果完成形式（早見列を含む8車結果・払戻・周回順位）対応強化
