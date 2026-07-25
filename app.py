@@ -1189,13 +1189,13 @@ with register_tab:
 
     pending = st.session_state.get("pending_player_history")
     if isinstance(pending, pd.DataFrame) and not pending.empty:
-        st.markdown("### ⚠️ 必須項目不足の保留行")
-        st.caption("日付・開催場・『Rまたはレース名』を入力して、不足行だけ登録できます。Rが無い場合の重複判定は、試走T・競走T・ST・着順・ハンデなどの数値一致で行います。")
-        edit_cols = [c for c in ["選手名","開催日","開催場","レース","レース名","着順","車番","走路","ハンデ","試走T","競走T","ST","保留理由"] if c in pending.columns]
+        st.markdown("### ⚠️ R・必須項目の入力待ち")
+        st.caption("R候補は参考表示です。候補と同じRを入力すると既存履歴を更新し、候補にないRを入力すると新しいレースとして登録します。Rを空欄のままにすると保留されます。")
+        edit_cols = [c for c in ["選手名","開催日","開催場","レース","R候補","レース名","着順","車番","走路","ハンデ","試走T","競走T","ST","保留理由"] if c in pending.columns]
         edited = st.data_editor(
             pending[edit_cols], use_container_width=True, hide_index=True,
             key=f"pending_history_editor_{player_version}",
-            disabled=["保留理由"] if "保留理由" in edit_cols else None,
+            disabled=[c for c in ["R候補", "保留理由"] if c in edit_cols],
             column_config={
                 "開催場": st.column_config.SelectboxColumn("開催場", options=["川口","伊勢崎","浜松","飯塚","山陽"]),
                 "レース": st.column_config.NumberColumn("R", min_value=1, max_value=12, step=1),

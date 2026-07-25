@@ -6584,16 +6584,12 @@ def v15_save_player_history(df, db_path=DB_PATH):
             if race_no_value is not None:
                 # Rがある場合は従来どおり、選手＋日付＋場＋Rで確定。
                 same_race = [r for r in candidates if _v45_norm_race_no(r["race_no"]) == _v45_norm_race_no(race_no_value)]
-                # 旧データ側だけRが無い場合は、数値が十分一致すれば同じ走行としてRを追記する。
-                if not same_race:
-                    numeric_target = _v48_find_same_race_without_r(
-                        [r for r in candidates if _v45_norm_race_no(r["race_no"]) is None], incoming_identity
-                    )
-                    same_race = [numeric_target] if numeric_target is not None else []
+                # Ver56: Rが入力された場合は、そのRだけで既存履歴を特定する。
+                # 候補にないRなら新しいレースとして登録し、数値一致では上書きしない。
             else:
-                # Rが無い場合はレース名では決めず、試走T・競走T・ST・着順・ハンデ等の数値一致で判定。
-                numeric_target = _v48_find_same_race_without_r(candidates, incoming_identity)
-                same_race = [numeric_target] if numeric_target is not None else []
+                # Ver56: Rなし行は、保存前の候補判定で必要なら保留へ回す。
+                # 数値一致による自動統合は行わない。
+                same_race = []
             target = same_race[0] if same_race else None
 
             candidate_row = {
@@ -6726,18 +6722,12 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 if v32_player_name_key(d["player_name"]) != v32_player_name_key(name):
                     continue
                 if race_no_value is not None:
-                    if d["race_no"] is not None and int(d["race_no"]) != race_no_value:
-                        continue
-                    if d["race_no"] is None and not _v48_numeric_identity_match(d, {
-                        "finish": finish, "starters": starters, "handicap": handicap_num,
-                        "trial_time": trial, "race_time": race_time, "start_time": st,
-                    }):
+                    # Ver56: 詳細履歴もRが一致する行だけ更新する。
+                    if d["race_no"] is None or int(d["race_no"]) != race_no_value:
                         continue
                 else:
-                    if not _v48_numeric_identity_match(d, {
-                        "finish": finish, "starters": starters, "handicap": handicap_num,
-                        "trial_time": trial, "race_time": race_time, "start_time": st,
-                    }):
+                    # Rなしは、同じ正規化レース名の既存行が1件だけの場合に限る。
+                    if _v55_race_name_key(d["race_name"]) != _v55_race_name_key(race_name):
                         continue
                 if car_no is not None and d["car_no"] is not None and int(d["car_no"]) != car_no:
                     continue
@@ -9358,4 +9348,213 @@ def v15_save_player_history(df, db_path=DB_PATH):
             if detail_target is not None:
                 con.execute("UPDATE v15_player_history_imports SET tournament_name=? WHERE history_key=?", (tournament, detail_target["history_key"]))
         con.commit()
+    return result
+
+# ============================================================
+# Ver55: Rなしで同日・同開催場・同レース名が重なる場合は保留
+# ============================================================
+def _v55_clean_text(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    s = str(value).strip()
+    return "" if s in {"", "-", "—", "–", "―", "None", "nan", "NaT"} else s
+
+
+def _v55_race_name_key(value):
+    """比較専用。一般/一般戦など既存の正規化規則を利用する。"""
+    normalized = v50_normalize_race_name(value)
+    return _v55_clean_text(normalized)
+
+
+def _v55_player_key(value):
+    try:
+        return v32_player_name_key(_v27_norm_player_name(value))
+    except Exception:
+        return re.sub(r"\s+", "", _v55_clean_text(value))
+
+
+def _v55_ambiguous_no_r_indices(df, db_path=DB_PATH):
+    """Rなし行のうち、同日・同場・同レース名で候補が重なる行番号を返す。
+
+    ・貼り付け内に同じ識別情報の行が2件以上ある
+    ・DBに同じ選手・日付・場・レース名の履歴が既にある
+    のどちらかなら、自動更新せずR入力待ちにする。
+    """
+    if df is None or df.empty:
+        return set()
+
+    work = df.copy().reset_index(drop=True)
+    for col in ["選手名", "開催日", "開催場", "レース", "レース名"]:
+        if col not in work.columns:
+            work[col] = None
+
+    # 基本項目を保存処理と同じ形へ寄せる。
+    work["開催日"] = work["開催日"].map(_v47_normalize_date)
+    work["開催場"] = work["開催場"].map(_v47_normalize_venue)
+    work["レース"] = work["レース"].map(_v47_normalize_race_no)
+
+    keys = []
+    for _, row in work.iterrows():
+        race_no = row.get("レース")
+        no_r = race_no is None or (isinstance(race_no, float) and pd.isna(race_no))
+        name_key = _v55_player_key(row.get("選手名"))
+        date = _v55_clean_text(row.get("開催日"))
+        venue = _v55_clean_text(row.get("開催場"))
+        race_name = _v55_race_name_key(row.get("レース名"))
+        keys.append((no_r, name_key, date, venue, race_name))
+
+    ambiguous = set()
+
+    # 貼り付け内の重複候補。
+    counts = {}
+    for key in keys:
+        no_r, name_key, date, venue, race_name = key
+        if no_r and name_key and date and venue and race_name:
+            identity = (name_key, date, venue, race_name)
+            counts[identity] = counts.get(identity, 0) + 1
+    for idx, key in enumerate(keys):
+        no_r, name_key, date, venue, race_name = key
+        if no_r and counts.get((name_key, date, venue, race_name), 0) >= 2:
+            ambiguous.add(idx)
+
+    # DB内の既存候補。DBが無い場合は貼り付け内判定だけで終了。
+    if not Path(db_path).exists():
+        return ambiguous
+
+    try:
+        v15_init_tables(db_path)
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory = sqlite3.Row
+            for idx, key in enumerate(keys):
+                no_r, name_key, date, venue, race_name = key
+                if not (no_r and name_key and date and venue and race_name):
+                    continue
+                player = _v32_find_player(con, _v27_norm_player_name(work.at[idx, "選手名"]))
+                if not player:
+                    continue
+                rows = con.execute(
+                    "SELECT race_name FROM race_history WHERE player_id=? AND race_date=? AND venue=?",
+                    (player[0], date, venue),
+                ).fetchall()
+                if any(_v55_race_name_key(r["race_name"]) == race_name for r in rows):
+                    ambiguous.add(idx)
+    except Exception:
+        # 判定補助で登録全体を止めない。通常の保存処理側の整合性チェックは残る。
+        pass
+
+    return ambiguous
+
+
+_v55_v47_save_player_history_original = v47_save_player_history
+def v47_save_player_history(df, db_path=DB_PATH):
+    """同日・同場・同レース名が重なるRなし行を、上書きせず保留へ回す。"""
+    if df is None:
+        df = pd.DataFrame()
+    work = df.copy().reset_index(drop=True)
+    ambiguous = _v55_ambiguous_no_r_indices(work, db_path=db_path)
+
+    if not ambiguous:
+        return _v55_v47_save_player_history_original(work, db_path=db_path)
+
+    save_part = work.drop(index=sorted(ambiguous)).reset_index(drop=True)
+    hold_part = work.loc[sorted(ambiguous)].copy().reset_index(drop=True)
+    hold_part["保留理由"] = "同日・同開催場・同レース名の候補あり：Rを入力"
+
+    result = _v55_v47_save_player_history_original(save_part, db_path=db_path)
+    original_pending = result.get("pending")
+    if original_pending is None or not isinstance(original_pending, pd.DataFrame):
+        original_pending = pd.DataFrame()
+    combined = pd.concat([original_pending, hold_part], ignore_index=True, sort=False)
+
+    result["read"] = int(len(work))
+    result["pending"] = combined
+    result["pending_count"] = int(len(combined))
+    return result
+
+
+# ============================================================
+# Ver56: R候補表示・結果開催場の市営見出し優先取得
+# ============================================================
+def _v56_result_venue_from_header(text):
+    """結果ページの開催見出しから開催場を取得する。選手所属LGより優先。"""
+    s = str(text or "")
+    patterns = [
+        (r"(?:令和[^\n]*?)?川口市営", "川口"),
+        (r"(?:令和[^\n]*?)?伊勢崎市営", "伊勢崎"),
+        (r"(?:令和[^\n]*?)?浜松市営", "浜松"),
+        (r"(?:令和[^\n]*?)?(?:山陽小野田|山陽)市営", "山陽"),
+        (r"(?:令和[^\n]*?)?飯塚市営", "飯塚"),
+    ]
+    for pat, venue in patterns:
+        if re.search(pat, s):
+            return venue
+    # 市営表記がない大会見出しの補助。着順表以降は選手所属なので見ない。
+    head = s.split("着順", 1)[0]
+    for venue in ["川口", "伊勢崎", "浜松", "山陽", "飯塚"]:
+        if re.search(rf"(?:開催|{venue}記念|{venue}オート|\b){venue}", head):
+            return venue
+    return None
+
+
+_v56_parse_meta_original = _v35_parse_meta
+def _v35_parse_meta(text, venue_override="", race_no_override=""):
+    meta = _v56_parse_meta_original(text, venue_override, race_no_override)
+    # 手動指定が最優先。未指定なら市営見出しから再確定する。
+    if str(venue_override or "").strip():
+        meta["開催場"] = str(venue_override).strip()
+    else:
+        header_venue = _v56_result_venue_from_header(text)
+        if header_venue:
+            meta["開催場"] = header_venue
+    return meta
+
+
+def _v56_candidate_races_for_row(row, db_path=DB_PATH):
+    """Rなし保留行に表示する既存R候補を返す。自由入力用の補助情報。"""
+    name = _v27_norm_player_name(row.get("選手名"))
+    date = _v47_normalize_date(row.get("開催日"))
+    venue = _v47_normalize_venue(row.get("開催場"))
+    race_name_key = _v55_race_name_key(row.get("レース名"))
+    if not (name and date and venue and race_name_key and Path(db_path).exists()):
+        return []
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory = sqlite3.Row
+            player = _v32_find_player(con, name)
+            if not player:
+                return []
+            rows = con.execute(
+                "SELECT race_no, race_name FROM race_history WHERE player_id=? AND race_date=? AND venue=? ORDER BY race_no, history_id",
+                (player[0], date, venue),
+            ).fetchall()
+        candidates=[]
+        for r in rows:
+            if _v55_race_name_key(r["race_name"]) != race_name_key:
+                continue
+            rn = _v47_normalize_race_no(r["race_no"])
+            label = f"{rn}R" if rn is not None else "R未設定"
+            if label not in candidates:
+                candidates.append(label)
+        return candidates
+    except Exception:
+        return []
+
+
+def v56_add_r_candidates(pending, db_path=DB_PATH):
+    if pending is None or not isinstance(pending, pd.DataFrame) or pending.empty:
+        return pending
+    out = pending.copy()
+    labels=[]
+    for _, row in out.iterrows():
+        cands = _v56_candidate_races_for_row(row, db_path=db_path)
+        labels.append(" / ".join(cands) if cands else "候補なし（新規Rを入力）")
+    out["R候補"] = labels
+    return out
+
+
+_v56_v47_save_original = v47_save_player_history
+def v47_save_player_history(df, db_path=DB_PATH):
+    result = _v56_v47_save_original(df, db_path=db_path)
+    result["pending"] = v56_add_r_candidates(result.get("pending"), db_path=db_path)
+    result["pending_count"] = int(len(result["pending"])) if isinstance(result.get("pending"), pd.DataFrame) else 0
     return result
