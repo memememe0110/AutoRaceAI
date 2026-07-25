@@ -4796,11 +4796,16 @@ def v151_parse_history_block(block, player_name=""):
             row["開催場"] = line
             continue
 
-        # レース種別
-        if any(x in line for x in [
-            "一般戦", "予選", "準決勝", "準決勝戦", "優勝戦",
-            "選抜戦", "特別選抜戦", "最終予選", "二次予選", "一次予選"
-        ]):
+        # レース名・レース種別
+        # 縦型履歴では「予選」「一般戦」「準決勝戦Ａ」「マイスター選抜」などが
+        # レース番号の代わりになる正式なレース名として1行で記載される。
+        # 大会名（例: Ｇ２川口記念）とは分離し、race_nameにも必ず反映する。
+        race_name_keywords = [
+            "一般", "予選", "準決", "優勝", "選抜", "特選",
+            "マイスター", "グレードレース", "順位決定", "特別一般"
+        ]
+        if any(x in line for x in race_name_keywords):
+            row["レース名"] = line
             row["レース種別"] = line
             continue
 
