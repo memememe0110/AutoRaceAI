@@ -6364,7 +6364,7 @@ def _v34_merge(old, new, *, positive=False):
 
 
 def v15_save_player_history(df, db_path=DB_PATH):
-    """貼付履歴を保存。同一レースは行を置換せず、値があるカラムだけ更新する。"""
+    """貼付履歴を保存。同一レース／同一record_keyは、値があるカラムだけ更新する。"""
     if df is None or df.empty:
         return 0, 0
     mount_and_init_db()
@@ -6462,14 +6462,23 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 elif len(candidates) == 1:
                     target = candidates[0]
 
+            # record_key はDB全体でUNIQUE。日付・場・Rの検索で見つからなくても、
+            # 同じ走行内容のキーが既に存在する場合はINSERTせずカラム単位更新へ回す。
+            candidate_row = {
+                "race_date": race_date, "venue": venue, "finish": finish,
+                "handicap": handicap_text, "trial_time": trial,
+                "race_time": race_time, "start_time": st,
+            }
+            signature = _v33_history_signature(candidate_row)
+            incoming_record_key = _v27_record_key(v32_player_name_key(name), *signature)
             if target is None:
-                candidate_row = {
-                    "race_date": race_date, "venue": venue, "finish": finish,
-                    "handicap": handicap_text, "trial_time": trial,
-                    "race_time": race_time, "start_time": st,
-                }
-                signature = _v33_history_signature(candidate_row)
-                record_key = _v27_record_key(v32_player_name_key(name), *signature)
+                target = con.execute(
+                    "SELECT * FROM race_history WHERE record_key=? LIMIT 1",
+                    (incoming_record_key,),
+                ).fetchone()
+
+            if target is None:
+                record_key = incoming_record_key
                 con.execute(
                     """INSERT INTO race_history(
                         player_id, race_date, venue, race_no, race_name, finish, starters, surface,
@@ -6509,6 +6518,32 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 }
                 signature = _v33_history_signature(candidate_row)
                 record_key = _v27_record_key(v32_player_name_key(name), *signature)
+
+                # カラム更新によって別行と同じrecord_keyになる場合も、完全置換せず
+                # 既存の同一走行行へ統合する。古い重複行だけ削除する。
+                conflict = con.execute(
+                    "SELECT * FROM race_history WHERE record_key=? AND history_id<>? LIMIT 1",
+                    (record_key, target["history_id"]),
+                ).fetchone()
+                delete_after_update = None
+                if conflict is not None:
+                    merged = {
+                        "race_no": _v34_merge(conflict["race_no"], merged["race_no"], positive=True),
+                        "race_name": _v34_merge(conflict["race_name"], merged["race_name"]),
+                        "finish": _v34_merge(conflict["finish"], merged["finish"], positive=True),
+                        "starters": _v34_merge(conflict["starters"], merged["starters"], positive=True),
+                        "surface": _v34_merge(conflict["surface"], merged["surface"]),
+                        "handicap": _v34_merge(conflict["handicap"], merged["handicap"]),
+                        "trial_time": _v34_merge(conflict["trial_time"], merged["trial_time"], positive=True),
+                        "race_time": _v34_merge(conflict["race_time"], merged["race_time"], positive=True),
+                        "start_time": _v34_merge(conflict["start_time"], merged["start_time"], positive=True),
+                    }
+                    if not marker:
+                        merged_status = conflict["result_status"] if conflict["result_status"] else merged_status
+                        merged_use = conflict["use_for_model"] if conflict["use_for_model"] is not None else merged_use
+                    delete_after_update = target["history_id"]
+                    target = conflict
+
                 con.execute(
                     """UPDATE race_history SET race_no=?, race_name=?, finish=?, starters=?, surface=?, handicap=?,
                        trial_time=?, race_time=?, start_time=?, result_status=?, use_for_model=?,
@@ -6517,6 +6552,8 @@ def v15_save_player_history(df, db_path=DB_PATH):
                      merged["handicap"], merged["trial_time"], merged["race_time"], merged["start_time"],
                      merged_status, merged_use, record_key, target["history_id"]),
                 )
+                if delete_after_update is not None:
+                    con.execute("DELETE FROM race_history WHERE history_id=?", (delete_after_update,))
                 changed += 1
 
             detail_values = {
