@@ -9182,3 +9182,157 @@ def v50_trifecta_weight_impact(df, limit=20):
     frame["上昇幅順位"] = frame["確率変化"].rank(method="min", ascending=False).astype(int)
     frame["調整後順位"] = frame["調整後確率"].rank(method="min", ascending=False).astype(int)
     return frame.sort_values(["確率変化","調整後確率"], ascending=False).head(int(limit)).reset_index(drop=True)
+
+
+# ============================================================
+# Ver51: 大会名を別保存し、正式レース名が無い場合だけ補完
+# ============================================================
+def v51_normalize_tournament_name(value):
+    """大会名の空白と全半角を整える。"""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", str(value or "")).strip()
+    s = re.sub(r"\s+", "", s)
+    if s in {"", "-", "—", "–", "―", "nan", "None"}:
+        return None
+    return s
+
+
+def v51_extract_tournament_name(raw):
+    """縦型・表形式の元テキストから大会名を抽出する。
+
+    予選、一般戦、準決勝戦などのレース区分は除外する。
+    """
+    text = str(raw or "")
+    lines = [v51_normalize_tournament_name(x) for x in text.splitlines()]
+    race_words = ("一般戦", "一般", "予選", "準決", "優勝戦", "優勝", "選抜", "特選", "マイスター")
+    strong_patterns = (
+        r"(?:特別)?SG.+", r"(?:特別)?G[ⅠⅡⅢI123].+",
+        r".+(?:記念|選手権|オールスター|グランプリ|王座決定戦|王座|杯|カップ|フェスタ)$",
+        r"(?:オーバー)?ミッドナイト(?:オートレース)?",
+    )
+    for line in lines:
+        if not line or any(w in line for w in race_words):
+            continue
+        if re.fullmatch(r"(?:川口|伊勢崎|浜松|山陽|飯塚)", line):
+            continue
+        if any(re.fullmatch(p, line, flags=re.IGNORECASE) for p in strong_patterns):
+            return line
+    return None
+
+
+def v51_ensure_tournament_columns(db_path=DB_PATH):
+    """既存DBを壊さず大会名列を追加する。"""
+    mount_and_init_db()
+    v15_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        for table in ("race_history", "v15_player_history_imports"):
+            cols = set(v15_columns(con, table))
+            if "tournament_name" not in cols:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN tournament_name TEXT")
+        con.commit()
+
+
+_v51_parse_player_history_original = v15_parse_player_history
+def v15_parse_player_history(text, player_name=None):
+    """大会名を別列へ保存し、レース名欠損時だけ大会名で補完する。"""
+    df = _v51_parse_player_history_original(text, player_name=player_name)
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "大会名" not in out.columns:
+        out["大会名"] = None
+    if "レース名" not in out.columns:
+        out["レース名"] = None
+    if "_raw" not in out.columns:
+        out["_raw"] = ""
+    for idx in out.index:
+        tournament = v51_extract_tournament_name(out.at[idx, "_raw"])
+        out.at[idx, "大会名"] = tournament
+        # 予選・一般戦・準決勝戦などが取れている場合は必ずそちらを優先。
+        race_name = v50_normalize_race_name(out.at[idx, "レース名"])
+        if not race_name and tournament:
+            out.at[idx, "レース名"] = tournament
+    return out
+
+
+_v51_save_player_history_original = v15_save_player_history
+def v15_save_player_history(df, db_path=DB_PATH):
+    """従来保存後に大会名を対応する履歴へ追記する。"""
+    v51_ensure_tournament_columns(db_path)
+    if df is None or df.empty:
+        return _v51_save_player_history_original(df, db_path=db_path)
+
+    work = df.copy()
+    if "大会名" not in work.columns:
+        work["大会名"] = None
+    if "レース名" not in work.columns:
+        work["レース名"] = None
+    if "_raw" not in work.columns:
+        work["_raw"] = ""
+    for idx in work.index:
+        tournament = v51_normalize_tournament_name(work.at[idx, "大会名"]) or v51_extract_tournament_name(work.at[idx, "_raw"])
+        work.at[idx, "大会名"] = tournament
+        if not v50_normalize_race_name(work.at[idx, "レース名"]) and tournament:
+            work.at[idx, "レース名"] = tournament
+
+    result = _v51_save_player_history_original(work, db_path=db_path)
+
+    # 大会名は重複判定には使わず、同定済みの正規履歴・詳細履歴へ別列で保存する。
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        for _, row in work.iterrows():
+            tournament = v51_normalize_tournament_name(row.get("大会名"))
+            if not tournament:
+                continue
+            name = _v27_norm_player_name(row.get("選手名"))
+            race_date = row.get("開催日")
+            venue = row.get("開催場")
+            race_no = None if pd.isna(row.get("レース")) else int(row.get("レース"))
+            player = _v32_find_player(con, name)
+            if not player:
+                continue
+            player_id = player[0]
+            candidates = con.execute(
+                "SELECT * FROM race_history WHERE player_id=? AND race_date=? AND venue=? ORDER BY history_id DESC",
+                (player_id, race_date, venue),
+            ).fetchall()
+            target = None
+            if race_no is not None:
+                target = next((r for r in candidates if _v45_norm_race_no(r["race_no"]) == race_no), None)
+            if target is None:
+                incoming = {
+                    "finish": None if pd.isna(row.get("着順")) else row.get("着順"),
+                    "starters": None if pd.isna(row.get("出走")) else row.get("出走"),
+                    "handicap": None if pd.isna(row.get("ハンデ")) else row.get("ハンデ"),
+                    "trial_time": None if pd.isna(row.get("試走T")) else row.get("試走T"),
+                    "race_time": None if pd.isna(row.get("競走T")) else row.get("競走T"),
+                    "start_time": None if pd.isna(row.get("ST")) else row.get("ST"),
+                }
+                target = _v48_find_same_race_without_r(candidates, incoming)
+            if target is not None:
+                con.execute("UPDATE race_history SET tournament_name=? WHERE history_id=?", (tournament, target["history_id"]))
+
+            details = con.execute(
+                "SELECT * FROM v15_player_history_imports WHERE race_date=? AND venue=? ORDER BY created_at DESC",
+                (race_date, venue),
+            ).fetchall()
+            detail_target = None
+            for d in details:
+                if v32_player_name_key(d["player_name"]) != v32_player_name_key(name):
+                    continue
+                if race_no is not None and d["race_no"] is not None and int(d["race_no"]) == race_no:
+                    detail_target = d; break
+                incoming_d = {
+                    "finish": None if pd.isna(row.get("着順")) else row.get("着順"),
+                    "starters": None if pd.isna(row.get("出走")) else row.get("出走"),
+                    "handicap": None if pd.isna(row.get("ハンデ")) else row.get("ハンデ"),
+                    "trial_time": None if pd.isna(row.get("試走T")) else row.get("試走T"),
+                    "race_time": None if pd.isna(row.get("競走T")) else row.get("競走T"),
+                    "start_time": None if pd.isna(row.get("ST")) else row.get("ST"),
+                }
+                if _v48_numeric_identity_match(d, incoming_d):
+                    detail_target = d; break
+            if detail_target is not None:
+                con.execute("UPDATE v15_player_history_imports SET tournament_name=? WHERE history_key=?", (tournament, detail_target["history_key"]))
+        con.commit()
+    return result
