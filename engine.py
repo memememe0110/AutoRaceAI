@@ -8223,3 +8223,362 @@ def v15_parse_race_meta(text):
                 meta["レース名"] = canonical
             break
     return meta
+
+# ============================================================
+# v4.1 新公式結果レイアウト対応
+# 通常-結果 / 重勝式-経過結果 / 周回順位タブ形式
+# ============================================================
+_v41_legacy_parse_result_text = v35_parse_result_text
+
+
+def _v41_result_layout_meta(text, venue_override="", race_no_override=""):
+    """新レイアウトの開催情報を解析する。結果側の日付・Rを優先する。"""
+    meta = _v35_parse_meta(text, venue_override, race_no_override)
+
+    # 開催期間の年と、結果欄の日付を組み合わせる。
+    ym = re.search(r"開催期間[：:]\s*(20\d{2})年", text)
+    year = int(ym.group(1)) if ym else None
+    dm = re.search(r"(?m)^\s*(\d{1,2})月(\d{1,2})日\([^\n]*\)\s*[\t ]+[^\n]*?(\d{1,2})R\s*[\t ]+(\d+)m", text)
+    if dm:
+        if year:
+            meta["開催日"] = f"{year:04d}-{int(dm.group(1)):02d}-{int(dm.group(2)):02d}"
+        meta["レース"] = int(dm.group(3))
+        meta["距離"] = int(dm.group(4))
+    else:
+        # 日付・レースが改行されていても拾う。
+        dm2 = re.search(r"(\d{1,2})月(\d{1,2})日\([^\n]*\)\s*[\t ]+([^\n]*?)(\d{1,2})R", text)
+        if dm2:
+            if year:
+                meta["開催日"] = f"{year:04d}-{int(dm2.group(1)):02d}-{int(dm2.group(2)):02d}"
+            meta["レース"] = int(dm2.group(4))
+            race_label = dm2.group(3).strip()
+            if race_label:
+                meta["レース種別"] = race_label
+
+    # 補助入力は常に最優先。
+    if str(race_no_override).strip():
+        meta["レース"] = v15_int(race_no_override)
+    if str(venue_override).strip():
+        meta["開催場"] = str(venue_override).strip()
+
+    # 横並び気象表。
+    wm = re.search(
+        r"気温\s*[\t ]+湿度\s*[\t ]+走路温度\s*[\t ]+走路状況\s*\n"
+        r"\s*(-?\d+(?:\.\d+)?)℃\s*[\t ]+([\d.]+)%\s*[\t ]+(-?\d+(?:\.\d+)?)℃\s*[\t ]+(良走路|湿走路|斑走路|風走路|荒走路)",
+        text,
+    )
+    if wm:
+        meta["気温"] = float(wm.group(1))
+        meta["湿度"] = float(wm.group(2))
+        meta["走路温度"] = float(wm.group(3))
+        meta["走路状態"] = wm.group(4)
+
+    # 天候は日付表の値を優先。
+    weather = re.search(r"\d{1,2}月\d{1,2}日\([^\n]*\)\s*[\t ]+[^\n]*?R\s*[\t ]+\d+m\s*[\t ]+(晴|曇|雨|小雨|雪)", text)
+    if weather:
+        meta["天候"] = weather.group(1)
+
+    # 発走予定。
+    tm = re.search(r"発走予定\s*(\d{1,2}:\d{2})", text)
+    if tm:
+        meta["発走時刻"] = tm.group(1)
+    return meta
+
+
+def _v41_parse_trial_block(text, result_race_no):
+    """上段試走表を解析。ただし結果レースと番号が一致するときだけ使う。"""
+    m = re.search(r"(?m)^\s*(\d{1,2})R試走タイム\s*$", text)
+    if not m or int(m.group(1)) != int(result_race_no or -1):
+        return {}
+    start = m.end()
+    tail = text[start:]
+    # 次の「初日」などで打ち切る。
+    stop = re.search(r"(?m)^\s*(?:初日|2日目|3日目|最終日)\s*$", tail)
+    if stop:
+        tail = tail[:stop.start()]
+    found = {}
+    # 1 3.50 H0 5 3.44 H30 のように一行2車でも対応。
+    for car, trial, hd in re.findall(r"(?:^|[\t ]+)([1-8])[\t ]+(?:再)?(\d\.\d{2})[\t ]+H(-?\d+)", tail, flags=re.M):
+        found[int(car)] = {"試走T": float(trial), "ハンデ": int(hd)}
+    return found
+
+
+def _v41_parse_compact_result_entries(text, meta):
+    """「着 事故 車 選手名」から始まる新しい縦型結果表を解析。"""
+    hm = re.search(r"着\s*[\t ]+事故\s*[\t ]+車\s*[\t ]+選手名", text)
+    if not hm:
+        raise ValueError("新形式の結果表見出しを取得できませんでした。")
+    start = hm.end()
+    end_candidates = [p for p in (text.find("払戻金", start), text.find("グランドノート", start)) if p >= 0]
+    end = min(end_candidates) if end_candidates else len(text)
+    block = text[start:end]
+    raw_lines = block.splitlines()
+
+    # エントリ開始行: 1\t\t6 のような「着・事故・車」。
+    starts = []
+    for idx, raw in enumerate(raw_lines):
+        mm = re.match(r"^\s*([1-8])\s*\t\s*([^\t]*)\t\s*([1-8])\s*\t?\s*$", raw)
+        if mm:
+            starts.append((idx, int(mm.group(1)), mm.group(2).strip(), int(mm.group(3))))
+    if not starts:
+        raise ValueError("結果行を解析できませんでした。")
+
+    trial_map = _v41_parse_trial_block(text, meta.get("レース"))
+    rows = []
+    for pos, (idx, finish, accident, car) in enumerate(starts):
+        next_idx = starts[pos + 1][0] if pos + 1 < len(starts) else len(raw_lines)
+        chunk = raw_lines[idx + 1:next_idx]
+        nonempty = [(j, x.strip()) for j, x in enumerate(chunk) if x.strip()]
+        if not nonempty:
+            continue
+        name = v15_normalize_name(nonempty[0][1])
+        # 2行目は通常車名。以後、数値で始まる行をハンデ等の行として扱う。
+        data_line = ""
+        for _, val in nonempty[1:]:
+            if re.match(r"^-?\d+(?:\t|$)", val):
+                data_line = val
+                break
+        parts = [p.strip() for p in data_line.split("\t")] if data_line else []
+        handicap = np.nan
+        trial = np.nan
+        race_t = np.nan
+        st_time = np.nan
+        abnormal = accident
+        if parts:
+            try:
+                handicap = int(float(parts[0]))
+            except Exception:
+                pass
+            vals = parts[1:]
+            # 列順: 試走T, 競走T, ST, 異。空欄を保持する。
+            if len(vals) > 0 and re.search(r"\d", vals[0]):
+                trial = _v35_float(re.sub(r"^再", "", vals[0]))
+            if len(vals) > 1 and re.search(r"\d", vals[1]):
+                race_t = _v35_float(vals[1])
+            if len(vals) > 2 and re.search(r"\d", vals[2]):
+                st_time = _v35_float(vals[2])
+            if len(vals) > 3 and vals[3]:
+                abnormal = vals[3]
+        # 同一Rの上段試走表だけ補完に使用。
+        if car in trial_map:
+            if pd.isna(trial):
+                trial = trial_map[car]["試走T"]
+            if pd.isna(handicap):
+                handicap = trial_map[car]["ハンデ"]
+
+        rows.append({
+            "着順": finish,
+            "車番": car,
+            "選手名": name,
+            "所属": "",
+            "ハンデ": handicap,
+            "試走T": trial,
+            "競走T": race_t,
+            "ST": st_time,
+            "人気": np.nan,
+            "事故": abnormal,
+            "結果区分": "通常" if not abnormal else abnormal,
+        })
+    if len(rows) < 3:
+        raise ValueError("結果上位3選手を解析できませんでした。")
+    return pd.DataFrame(rows).sort_values("着順").reset_index(drop=True)
+
+
+def _v41_parse_compact_laps(text):
+    if "グランドノート" not in text:
+        return pd.DataFrame(columns=["周回", "周回番号", "順位", "車番"])
+    block = text.split("グランドノート", 1)[1]
+    records = []
+    for raw in block.splitlines():
+        line = raw.strip()
+        mm = re.match(r"^(ゴール線通過|([1-9])周回)\s*[\t ]+((?:[1-8](?:\s*[\t ]+|\s+)){2,7}[1-8])\s*$", line)
+        if not mm:
+            continue
+        label_raw = mm.group(1)
+        if label_raw == "ゴール線通過":
+            label, lap_no = "ゴール線", 99
+        else:
+            lap_no = int(mm.group(2))
+            label = f"{lap_no}周目"
+        cars = [int(x) for x in re.findall(r"[1-8]", mm.group(3))]
+        for rank, car in enumerate(cars, 1):
+            records.append({"周回": label, "周回番号": lap_no, "順位": rank, "車番": car})
+    return pd.DataFrame(records, columns=["周回", "周回番号", "順位", "車番"])
+
+
+def _v41_parse_compact_payouts(text):
+    if "払戻金" not in text:
+        return pd.DataFrame(columns=["券種", "組合せ", "払戻金", "人気"])
+    block = text.split("払戻金", 1)[1]
+    if "グランドノート" in block:
+        block = block.split("グランドノート", 1)[0]
+    known = {"単勝", "複勝", "2連複", "2連単", "ワイド", "3連複", "3連単"}
+    current = ""
+    rows = []
+    for raw in block.splitlines():
+        line = re.sub(r"[\u3000]+", " ", raw).strip()
+        if not line or line in {"賭式\t払戻金\t人気", "返還"}:
+            continue
+        parts = [p.strip() for p in re.split(r"\t+| {2,}", line) if p.strip()]
+        if not parts:
+            continue
+        if parts[0] in known:
+            current = parts.pop(0)
+        if current not in known or len(parts) < 2:
+            continue
+        # 複勝・ワイドの継続行にも対応。
+        combo = parts[0].replace("→", "-")
+        payout_idx = next((i for i, p in enumerate(parts[1:], 1) if re.fullmatch(r"[\d,]+円", p)), None)
+        if payout_idx is None:
+            continue
+        payout = int(parts[payout_idx].replace(",", "").replace("円", ""))
+        popularity = np.nan
+        if payout_idx + 1 < len(parts) and re.fullmatch(r"\d+", parts[payout_idx + 1]):
+            popularity = int(parts[payout_idx + 1])
+        rows.append({"券種": current, "組合せ": combo, "払戻金": payout, "人気": popularity})
+    return pd.DataFrame(rows, columns=["券種", "組合せ", "払戻金", "人気"])
+
+
+def v35_parse_result_text(text, venue_override="", race_no_override=""):
+    """旧形式と新公式サイト形式を自動判定して結果を解析する。"""
+    if not str(text).strip():
+        raise ValueError("結果ページを貼り付けてください。")
+    is_compact = bool(re.search(r"着\s*[\t ]+事故\s*[\t ]+車\s*[\t ]+選手名", text)) and "通常-結果" in text
+    if not is_compact:
+        return _v41_legacy_parse_result_text(text, venue_override, race_no_override)
+
+    meta = _v41_result_layout_meta(text, venue_override, race_no_override)
+    rows = _v41_parse_compact_result_entries(text, meta)
+    laps = _v41_parse_compact_laps(text)
+    payouts = _v41_parse_compact_payouts(text)
+    if not meta.get("開催日") or not meta.get("開催場") or not meta.get("レース"):
+        raise ValueError("開催日・開催場・レース番号を取得できませんでした。開催場が本文にない場合は補助入力で指定してください。")
+    return meta, rows, laps, payouts
+
+# 新形式で上位3選手しか氏名が掲載されない場合、保存済み予測と
+# ゴール線順位を使って4～8着も補完する。
+_v41_legacy_register_result = v41_register_result
+
+
+def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    work = results.copy() if isinstance(results, pd.DataFrame) else pd.DataFrame(results)
+    try:
+        key = v34_race_key(meta)
+        with sqlite3.connect(str(db_path)) as con:
+            pred = pd.read_sql_query(
+                "SELECT car_no, player_name FROM prediction_snapshots WHERE race_key=?",
+                con,
+                params=(key,),
+            )
+        if not pred.empty:
+            name_map = {int(r.car_no): str(r.player_name or "").strip() for r in pred.itertuples()}
+            if not work.empty:
+                for idx, row in work.iterrows():
+                    car = int(row.get("車番"))
+                    if not str(row.get("選手名", "")).strip() and car in name_map:
+                        work.at[idx, "選手名"] = name_map[car]
+            if isinstance(laps, pd.DataFrame) and not laps.empty:
+                goal = laps[laps["周回"] == "ゴール線"].sort_values("順位")
+                existing = set(work["車番"].astype(int).tolist()) if not work.empty else set()
+                extra = []
+                for _, lr in goal.iterrows():
+                    car = int(lr["車番"])
+                    if car in existing or car not in name_map:
+                        continue
+                    extra.append({
+                        "着順": int(lr["順位"]),
+                        "車番": car,
+                        "選手名": name_map[car],
+                        "所属": "",
+                        "ハンデ": "",
+                        "試走T": np.nan,
+                        "競走T": np.nan,
+                        "ST": np.nan,
+                        "人気": np.nan,
+                        "事故": "",
+                        "結果区分": "通常",
+                    })
+                if extra:
+                    work = pd.concat([work, pd.DataFrame(extra)], ignore_index=True)
+                    work = work.sort_values("着順").reset_index(drop=True)
+    except Exception:
+        # 補完に失敗しても、元の上位結果登録は続行する。
+        work = results
+    return _v41_legacy_register_result(meta, work, laps, payouts, db_path)
+
+# ============================================================
+# v4.2 結果ページ冒頭ヘッダー形式の厳密対応
+# 例: 予選 開催期間... / 日付 レース 距離 天候 / 予選5R ...
+# ============================================================
+_v42_base_result_layout_meta = _v41_result_layout_meta
+
+
+def _v41_result_layout_meta(text, venue_override="", race_no_override=""):
+    """結果ページ冒頭の開催情報表を優先して解析する。"""
+    meta = _v42_base_result_layout_meta(text, venue_override, race_no_override)
+    src = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    # 冒頭のレース種別と開催期間。
+    first = re.search(
+        r"(?m)^\s*([^\t\n]+?)\s+開催期間[：:]\s*(20\d{2})年(\d{1,2})月(\d{1,2})日",
+        src,
+    )
+    if first:
+        race_type = first.group(1).strip()
+        if race_type:
+            meta["レース種別"] = race_type
+            meta["レース名"] = race_type
+        year = int(first.group(2))
+    else:
+        ym = re.search(r"開催期間[：:]\s*(20\d{2})年", src)
+        year = int(ym.group(1)) if ym else None
+
+    # 開催日目。
+    day_m = re.search(r"開催\s*第\s*(\d+)\s*日目", src)
+    if day_m:
+        meta["開催日目"] = int(day_m.group(1))
+
+    # 日付・レース・距離・天候の値行。
+    row = re.search(
+        r"日付\s*[\t ]+レース\s*[\t ]+距離\s*[\t ]+天候\s*\n"
+        r"\s*(\d{1,2})月(\d{1,2})日\([^\n]*\)\s*[\t ]+([^\t\n]*?)(\d{1,2})R\s*[\t ]+(\d+)m\s*[\t ]+(晴|曇|雨|小雨|雪)",
+        src,
+    )
+    if row:
+        if year:
+            meta["開催日"] = f"{year:04d}-{int(row.group(1)):02d}-{int(row.group(2)):02d}"
+        label = row.group(3).strip()
+        meta["レース"] = int(row.group(4))
+        meta["距離"] = int(row.group(5))
+        meta["天候"] = row.group(6)
+        if label:
+            meta["レース種別"] = label
+            meta["レース名"] = label
+
+    # 気象・走路表。タブ、連続空白の両方に対応。
+    weather_row = re.search(
+        r"気温\s*[\t ]+湿度\s*[\t ]+走路温度\s*[\t ]+走路状況\s*\n"
+        r"\s*(-?\d+(?:\.\d+)?)℃\s*[\t ]+(-?\d+(?:\.\d+)?)%\s*[\t ]+"
+        r"(-?\d+(?:\.\d+)?)℃\s*[\t ]+(良走路|湿走路|斑走路|風走路|荒走路)",
+        src,
+    )
+    if weather_row:
+        meta["気温"] = float(weather_row.group(1))
+        meta["湿度"] = float(weather_row.group(2))
+        meta["走路温度"] = float(weather_row.group(3))
+        meta["走路状態"] = weather_row.group(4)
+
+    # 締切・発走予定。変更表記は無視して時刻だけ保存。
+    close_m = re.search(r"投票締切\s*(\d{1,2}:\d{2})", src)
+    if close_m:
+        meta["投票締切"] = close_m.group(1)
+    start_m = re.search(r"発走予定\s*(\d{1,2}:\d{2})", src)
+    if start_m:
+        meta["発走時刻"] = start_m.group(1)
+
+    # 補助入力を最後に再適用。
+    if str(race_no_override).strip():
+        meta["レース"] = v15_int(race_no_override)
+    if str(venue_override).strip():
+        meta["開催場"] = str(venue_override).strip()
+    return meta
