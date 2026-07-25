@@ -8817,3 +8817,111 @@ def v46_delete_player_all(player_name, db_path=DB_PATH, delete_result_rows=False
         con.commit()
     total = sum(v for k, v in counts.items() if isinstance(v, int) and not k.endswith("_unlinked"))
     return {"deleted": total > 0, "message": f"{name} の選手情報を一括削除しました。", "counts": counts}
+
+
+# ============================================================
+# Ver47: 選手履歴の必須項目検証・不足行保留
+# ============================================================
+def _v47_normalize_date(value):
+    """日付を YYYY-MM-DD に統一。不正・空欄は None。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    s = str(value).strip()
+    if s in {"", "-", "—", "–", "―", "None", "nan", "NaT"}:
+        return None
+    s = s.replace("年", "/").replace("月", "/").replace("日", "")
+    s = s.replace(".", "/").replace("-", "/")
+    try:
+        parts = [p for p in s.split("/") if p != ""]
+        if len(parts) == 3 and len(parts[0]) == 2:
+            parts[0] = "20" + parts[0]
+            s = "/".join(parts)
+        dt = pd.to_datetime(s, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _v47_normalize_venue(value):
+    s = "" if value is None else str(value).strip()
+    if s in {"", "-", "—", "–", "―", "None", "nan"}:
+        return None
+    aliases = {"川口":"川口", "伊勢崎":"伊勢崎", "浜松":"浜松", "飯塚":"飯塚", "山陽":"山陽"}
+    return aliases.get(s, s)
+
+
+def _v47_normalize_race_no(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    m = re.search(r"(\d{1,2})", str(value))
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 1 <= n <= 12 else None
+
+
+def v47_validate_player_history(df):
+    """必須項目を正規化し、有効行・保留行へ分ける。"""
+    if df is None:
+        df = pd.DataFrame()
+    work = df.copy().reset_index(drop=True)
+    for col in ["選手名", "開催日", "開催場", "レース"]:
+        if col not in work.columns:
+            work[col] = None
+    work["開催日"] = work["開催日"].map(_v47_normalize_date)
+    work["開催場"] = work["開催場"].map(_v47_normalize_venue)
+    work["レース"] = work["レース"].map(_v47_normalize_race_no)
+    reasons=[]
+    for i,row in work.iterrows():
+        miss=[]
+        if not str(row.get("選手名") or "").strip(): miss.append("選手名")
+        if not row.get("開催日"): miss.append("日付")
+        if not row.get("開催場"): miss.append("開催場")
+        if row.get("レース") is None or pd.isna(row.get("レース")): miss.append("R")
+        reasons.append("・".join(miss))
+    work["保留理由"] = reasons
+    valid = work[work["保留理由"] == ""].drop(columns=["保留理由"]).copy()
+    pending = work[work["保留理由"] != ""].copy()
+    return valid.reset_index(drop=True), pending.reset_index(drop=True)
+
+
+def v47_save_player_history(df, db_path=DB_PATH):
+    """有効行だけ保存し、不足行は保留として返す。"""
+    valid, pending = v47_validate_player_history(df)
+    changed=skipped=0
+    if not valid.empty:
+        changed, skipped = v15_save_player_history(valid, db_path=db_path)
+    return {
+        "read": int(len(df) if df is not None else 0),
+        "changed": int(changed),
+        "skipped": int(skipped),
+        "pending_count": int(len(pending)),
+        "pending": pending,
+        "valid": valid,
+    }
+
+
+def v47_player_history_breakdown(player_name, db_path=DB_PATH):
+    """選手履歴の利用可・除外理由・期間を返す。"""
+    result={"total":0,"usable":0,"excluded":0,"latest":None,"oldest":None,"reasons":{}}
+    if not player_name or not Path(db_path).exists():
+        return result
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory=sqlite3.Row
+        p=_v32_find_player(con, _v27_norm_player_name(player_name))
+        if not p: return result
+        rows=con.execute("SELECT race_date,use_for_model,result_status FROM race_history WHERE player_id=?",(p[0],)).fetchall()
+    result["total"]=len(rows)
+    dates=[]
+    for r in rows:
+        if r["race_date"]: dates.append(str(r["race_date"]))
+        if int(r["use_for_model"] or 0)==1: result["usable"]+=1
+        else:
+            result["excluded"]+=1
+            reason=str(r["result_status"] or "その他")
+            result["reasons"][reason]=result["reasons"].get(reason,0)+1
+    if dates:
+        result["latest"]=max(dates); result["oldest"]=min(dates)
+    return result

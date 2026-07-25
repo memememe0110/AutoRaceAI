@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver44｜予測時の開催場補助入力対応")
+st.caption("Ver47｜履歴必須項目・不足行追記対応")
 
 
 def qident(name: str) -> str:
@@ -1080,20 +1080,52 @@ with register_tab:
 
         if st.button("DBへ登録してGitHubに保存", type="primary", use_container_width=True):
             try:
-                inserted, skipped = engine.v15_save_player_history(parsed, db_path=engine.DB_PATH)
-                if inserted:
-                    ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の履歴を{inserted}件登録")
-                    if ok:
-                        st.success(f"{inserted}件登録、{skipped}件は重複のためスキップしました。{msg}")
-                    else:
-                        st.warning(
-                            f"DBには{inserted}件登録しましたが、GitHub保存は未完了です。{msg}\n"
-                            "消失防止のため、サイドバーの『DBを端末へ保存』も使ってください。"
-                        )
+                report = engine.v47_save_player_history(parsed, db_path=engine.DB_PATH)
+                st.session_state["pending_player_history"] = report["pending"]
+                changed, skipped, pending_count = report["changed"], report["skipped"], report["pending_count"]
+                if changed:
+                    ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新")
+                    text = f"読込 {report['read']}件｜追加・更新 {changed}件｜重複処理 {skipped}件｜保留 {pending_count}件"
+                    (st.success if ok else st.warning)(text + (f"｜{msg}" if msg else ""))
                 else:
-                    st.info(f"新規登録は0件です。{skipped}件すべて登録済みでした。")
+                    st.info(f"読込 {report['read']}件｜追加・更新 0件｜保留 {pending_count}件")
             except Exception as exc:
                 st.error(f"登録エラー: {type(exc).__name__}: {exc}")
+                st.exception(exc)
+
+    pending = st.session_state.get("pending_player_history")
+    if isinstance(pending, pd.DataFrame) and not pending.empty:
+        st.markdown("### ⚠️ 必須項目不足の保留行")
+        st.caption("日付・開催場・Rを入力して、不足行だけ登録できます。日付は 2026-07-25 / 26/07/25 などに対応します。")
+        edit_cols = [c for c in ["選手名","開催日","開催場","レース","レース名","着順","車番","走路","ハンデ","試走T","競走T","ST","保留理由"] if c in pending.columns]
+        edited = st.data_editor(
+            pending[edit_cols], use_container_width=True, hide_index=True,
+            key=f"pending_history_editor_{player_version}",
+            disabled=["保留理由"] if "保留理由" in edit_cols else None,
+            column_config={
+                "開催場": st.column_config.SelectboxColumn("開催場", options=["川口","伊勢崎","浜松","飯塚","山陽"]),
+                "レース": st.column_config.NumberColumn("R", min_value=1, max_value=12, step=1),
+            },
+        )
+        if st.button("不足行だけ登録", type="primary", use_container_width=True, key=f"save_pending_{player_version}"):
+            try:
+                # 編集対象以外の元カラムも保持して戻す
+                repaired = pending.copy()
+                for c in edited.columns:
+                    if c != "保留理由": repaired[c] = edited[c].values
+                repaired = repaired.drop(columns=["保留理由"], errors="ignore")
+                report2 = engine.v47_save_player_history(repaired, db_path=engine.DB_PATH)
+                st.session_state["pending_player_history"] = report2["pending"]
+                if report2["changed"]:
+                    ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の保留履歴を{report2['changed']}件登録")
+                    (st.success if ok else st.warning)(f"不足行を{report2['changed']}件登録しました。残り保留 {report2['pending_count']}件。{msg}")
+                elif report2["pending_count"]:
+                    st.warning(f"まだ必須項目が不足しています。残り保留 {report2['pending_count']}件。")
+                else:
+                    st.info("登録対象の変更はありませんでした。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"不足行登録エラー: {type(exc).__name__}: {exc}")
                 st.exception(exc)
 
 with db_tab:
