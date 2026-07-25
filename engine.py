@@ -6433,6 +6433,8 @@ def v15_save_player_history(df, db_path=DB_PATH):
         if "race_name" not in _cols:
             _con.execute("ALTER TABLE race_history ADD COLUMN race_name TEXT")
         _con.commit()
+    # Ver46: 旧版でレース名違いにより分かれた同一レースを先に統合。
+    v46_cleanup_player_identity_duplicates(db_path)
     changed = 0
     skipped = 0
     now = datetime.now().isoformat(timespec="seconds")
@@ -8660,3 +8662,158 @@ def _v41_result_layout_meta(text, venue_override="", race_no_override=""):
 
 
 # Ver43: 結果完成形式（早見列を含む8車結果・払戻・周回順位）対応強化
+
+
+# ============================================================
+# Ver46: 選手単位の一括削除 / レース名差による重複統合
+# ============================================================
+def v46_cleanup_player_identity_duplicates(db_path=DB_PATH, player_name=None):
+    """選手名＋日付＋場＋Rが同じ履歴を、レース名に関係なく1件へ統合する。
+
+    race_history と v15_player_history_imports の両方を整理する。
+    """
+    mount_and_init_db()
+    merged_histories = 0
+    merged_imports = 0
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+
+        params = []
+        where = ""
+        if player_name:
+            key = v32_player_name_key(player_name)
+            rows = con.execute("SELECT player_id, player_name FROM players").fetchall()
+            ids = [int(r["player_id"]) for r in rows if v32_player_name_key(r["player_name"]) == key]
+            if not ids:
+                return {"merged_histories": 0, "merged_imports": 0}
+            where = "WHERE player_id IN (%s)" % ",".join("?" for _ in ids)
+            params = ids
+
+        rows = con.execute(f"SELECT * FROM race_history {where} ORDER BY history_id", params).fetchall()
+        groups = {}
+        for r in rows:
+            rn = _v45_norm_race_no(r["race_no"])
+            if rn is None:
+                continue
+            pname = con.execute("SELECT player_name FROM players WHERE player_id=?", (r["player_id"],)).fetchone()
+            pkey = v32_player_name_key(pname[0] if pname else "")
+            gk = (pkey, str(r["race_date"] or "").strip(), str(r["venue"] or "").strip(), rn)
+            groups.setdefault(gk, []).append(r)
+        for g in groups.values():
+            if len(g) < 2:
+                continue
+            keep, merged = _v45_merge_history_rows(con, g)
+            pname = con.execute("SELECT player_name FROM players WHERE player_id=?", (keep["player_id"],)).fetchone()
+            new_key = _v45_identity_record_key(pname[0] if pname else "", keep["race_date"], keep["venue"], merged.get("race_no"))
+            con.execute("""UPDATE race_history SET race_no=?, race_name=?, finish=?, starters=?, surface=?, handicap=?,
+                         trial_time=?, race_time=?, start_time=?, result_status=?, use_for_model=?, record_key=?
+                         WHERE history_id=?""",
+                        (merged.get("race_no"), merged.get("race_name"), merged.get("finish"), merged.get("starters"),
+                         merged.get("surface"), merged.get("handicap"), merged.get("trial_time"), merged.get("race_time"),
+                         merged.get("start_time"), merged.get("result_status") or "通常", int(merged.get("use_for_model") or 0),
+                         new_key, keep["history_id"]))
+            merged_histories += len(g) - 1
+
+        # 詳細履歴も、レース名・種別・車番に関係なく同一レースへ統合。
+        info = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='v15_player_history_imports'").fetchone()
+        if info:
+            drows = con.execute("SELECT * FROM v15_player_history_imports ORDER BY created_at, history_key").fetchall()
+            dgroups = {}
+            requested = v32_player_name_key(player_name) if player_name else None
+            for r in drows:
+                pkey = v32_player_name_key(r["player_name"])
+                if requested and pkey != requested:
+                    continue
+                rn = _v45_norm_race_no(r["race_no"])
+                if rn is None:
+                    continue
+                gk = (pkey, str(r["race_date"] or "").strip(), str(r["venue"] or "").strip(), rn)
+                dgroups.setdefault(gk, []).append(r)
+            fields = ["player_name","race_no","race_name","rank","starters","surface","handicap","trial_time",
+                      "race_time","st","raw_line","weather","track_temp","air_temp","humidity",
+                      "race_type","distance","laps","popularity","car_no"]
+            positive = {"race_no","rank","starters","handicap","trial_time","race_time","st","track_temp",
+                        "air_temp","humidity","distance","laps","popularity","car_no"}
+            for g in dgroups.values():
+                if len(g) < 2:
+                    continue
+                keep = max(g, key=lambda r: sum(_v34_has_value(r[f], positive=f in positive) for f in fields))
+                merged = {f: keep[f] for f in fields}
+                for r in g:
+                    if r["history_key"] == keep["history_key"]:
+                        continue
+                    for f in fields:
+                        merged[f] = _v34_merge(merged[f], r[f], positive=f in positive)
+                    con.execute("DELETE FROM v15_player_history_imports WHERE history_key=?", (r["history_key"],))
+                    merged_imports += 1
+                con.execute("""UPDATE v15_player_history_imports SET player_name=?, race_no=?, race_name=?, rank=?, starters=?,
+                             surface=?, handicap=?, trial_time=?, race_time=?, st=?, raw_line=?, weather=?, track_temp=?,
+                             air_temp=?, humidity=?, race_type=?, distance=?, laps=?, popularity=?, car_no=? WHERE history_key=?""",
+                            tuple(merged[f] for f in fields) + (keep["history_key"],))
+        con.commit()
+    return {"merged_histories": merged_histories, "merged_imports": merged_imports}
+
+
+def v46_delete_player_all(player_name, db_path=DB_PATH, delete_result_rows=False):
+    """指定選手の登録情報を一括削除する。
+
+    他選手やレース本体は保持し、外部キー参照はNULLへ戻す。
+    delete_result_rows=True の場合だけ、結果スナップショット内の選手行も削除する。
+    """
+    name = _v27_norm_player_name(player_name)
+    if not name:
+        return {"deleted": False, "message": "選手名が空です。"}
+    mount_and_init_db()
+    counts = {}
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+        players = con.execute("SELECT player_id, player_name FROM players").fetchall()
+        matched = [r for r in players if v32_player_name_key(r["player_name"]) == v32_player_name_key(name)]
+        player_ids = [int(r["player_id"]) for r in matched]
+        stored_names = [str(r["player_name"]) for r in matched] or [name]
+
+        def delete_by_name(table, column="player_name"):
+            if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                return 0
+            total = 0
+            rows = con.execute(f"SELECT rowid, {column} FROM {table}").fetchall()
+            ids = [int(r[0]) for r in rows if v32_player_name_key(r[1]) == v32_player_name_key(name)]
+            for rid in ids:
+                con.execute(f"DELETE FROM {table} WHERE rowid=?", (rid,))
+            return len(ids)
+
+        # 名前ベースの履歴・入力・予測特徴。
+        for table in ("v15_player_history_imports", "v15_race_entry_inputs", "prediction_features",
+                      "prediction_feature_snapshots", "prediction_snapshots", "v40_prediction_feature_snapshots"):
+            try:
+                counts[table] = delete_by_name(table)
+            except sqlite3.OperationalError:
+                counts[table] = 0
+
+        if player_ids:
+            q = ",".join("?" for _ in player_ids)
+            for table in ("player_lap_history",):
+                if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    cur = con.execute(f"DELETE FROM {table} WHERE player_id IN ({q})", player_ids)
+                    counts[table] = cur.rowcount
+            for table in ("lap_features", "lap_history", "race_entries"):
+                if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    cur = con.execute(f"UPDATE {table} SET player_id=NULL WHERE player_id IN ({q})", player_ids)
+                    counts[table + "_unlinked"] = cur.rowcount
+            cur = con.execute(f"DELETE FROM race_history WHERE player_id IN ({q})", player_ids)
+            counts["race_history"] = cur.rowcount
+            cur = con.execute(f"DELETE FROM players WHERE player_id IN ({q})", player_ids)
+            counts["players"] = cur.rowcount
+
+        if delete_result_rows:
+            for table in ("result_entries",):
+                try:
+                    counts[table] = delete_by_name(table)
+                except sqlite3.OperationalError:
+                    counts[table] = 0
+
+        con.commit()
+    total = sum(v for k, v in counts.items() if isinstance(v, int) and not k.endswith("_unlinked"))
+    return {"deleted": total > 0, "message": f"{name} の選手情報を一括削除しました。", "counts": counts}

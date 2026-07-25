@@ -1219,17 +1219,55 @@ with db_tab:
                             else:
                                 st.warning(result.get("message", "削除できませんでした。"))
 
+                    st.markdown("#### 🧹 選手情報を一括削除")
+                    st.caption("選択中の選手について、正規履歴・条件詳細・周回特徴・選手別予測スナップショットをまとめて削除します。他選手とレース本体は残ります。")
+                    delete_all_result_rows = st.checkbox(
+                        "結果登録内のこの選手の行も削除する",
+                        value=False,
+                        key=f"delete_all_result_rows_{selected}",
+                    )
+                    confirm_player_name = st.text_input(
+                        "確認のため選手名を入力",
+                        placeholder=selected,
+                        key=f"confirm_delete_player_name_{selected}",
+                    )
+                    normalized_confirm = re.sub(r"[\s　]+", "", confirm_player_name or "")
+                    normalized_selected = re.sub(r"[\s　]+", "", selected or "")
+                    can_delete_all = normalized_confirm == normalized_selected and bool(normalized_selected)
+                    if st.button(
+                        f"{selected} の選手情報を一括削除",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not can_delete_all,
+                        key=f"delete_all_player_button_{selected}",
+                    ):
+                        result = engine.v46_delete_player_all(
+                            selected, engine.DB_PATH, delete_result_rows=delete_all_result_rows
+                        )
+                        if result.get("deleted"):
+                            ok, msg = push_db_to_github(f"AutoRaceAI: {selected} の選手情報を一括削除")
+                            detail = " / ".join(f"{k}:{v}" for k, v in result.get("counts", {}).items() if v)
+                            if ok:
+                                st.success(result.get("message", "削除しました。") + (f" ({detail})" if detail else "") + " " + msg)
+                            else:
+                                st.warning(result.get("message", "削除しました。") + (f" ({detail})" if detail else "") + " GitHub保存は未完了です。" + msg)
+                            st.rerun()
+                        else:
+                            st.warning(result.get("message", "削除対象がありませんでした。"))
+
                 st.divider()
                 st.subheader("DBメンテナンス")
                 st.caption("姓名の空白違いを統合し、レース名が『一般戦』『7R』など違っていても、同じ走行結果なら重複を整理します。")
                 if st.button("氏名・同一レースの重複をまとめて整理", use_container_width=True):
                     result = engine.v32_merge_duplicate_players(engine.DB_PATH)
                     race_result = engine.v33_cleanup_duplicate_histories(engine.DB_PATH)
+                    identity_result = engine.v46_cleanup_player_identity_duplicates(engine.DB_PATH)
                     ok, msg = push_db_to_github("AutoRaceAI: 氏名と同一走行結果の重複を整理")
                     summary = (
                         f"選手 {result['merged_players']}件を統合、履歴 {result['moved_histories']}件を移動、"
                         f"氏名統合時の重複 {result['deleted_histories']}件、同一走行履歴 {race_result['deleted_histories']}件、"
-                        f"詳細履歴 {race_result['deleted_imports']}件を削除しました。"
+                        f"詳細履歴 {race_result['deleted_imports']}件を削除、"
+                        f"レース名差の正規履歴 {identity_result['merged_histories']}件・詳細履歴 {identity_result['merged_imports']}件を統合しました。"
                     )
                     if ok:
                         st.success(summary + " " + msg)
