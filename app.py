@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver37｜履歴の個別削除・誤登録修正対応")
+st.caption("Ver44｜予測時の開催場補助入力対応")
 
 
 def qident(name: str) -> str:
@@ -674,6 +674,27 @@ with prediction_tab:
         key=f"race_card_text_{prediction_version}",
     )
 
+    # 本文から開催場を取得できない場合だけ、予測用の補助入力を表示する。
+    prediction_venue_override = ""
+    detected_prediction_venue = ""
+    if text.strip():
+        try:
+            detected_meta = engine.v15_parse_race_meta(text) or {}
+            detected_prediction_venue = str(detected_meta.get("開催場") or "").strip()
+        except Exception:
+            detected_prediction_venue = ""
+
+        if detected_prediction_venue:
+            st.caption(f"開催場を自動取得: {detected_prediction_venue}")
+        else:
+            prediction_venue_override = st.selectbox(
+                "開催場（出走表から取得できないため選択してください）",
+                options=["", "川口", "伊勢崎", "浜松", "山陽", "飯塚"],
+                format_func=lambda value: "選択してください" if value == "" else value,
+                key=f"prediction_venue_override_{prediction_version}",
+            )
+            st.caption("選手の所属場は開催場として使いません。実際の開催場を選択してください。")
+
     manual_excluded = []
     if text.strip():
         auto_excluded = {int(car): "手動指定" for car in manual_excluded}
@@ -701,9 +722,15 @@ with prediction_tab:
         if not text.strip():
             st.warning("出走表を貼り付けてください。")
             st.stop()
+        if not detected_prediction_venue and not prediction_venue_override:
+            st.warning("開催場を選択してください。")
+            st.stop()
         try:
+            prediction_text = text
+            if prediction_venue_override:
+                prediction_text = f"開催場: {prediction_venue_override}\n" + text
             with st.spinner("高速6周イベントシミュレーションを実行中…"):
-                df, bets, output, entries, meta = engine.ver16_run_prediction(text, int(trials), int(seed), manual_excluded=manual_excluded)
+                df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
                 finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
                 race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
                 engine.v40_save_prediction_features(meta, df, engine.DB_PATH)
