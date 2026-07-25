@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver31｜早期先頭の逃げ切り分岐・確率別オッズ入力・選手登録状況確認")
+st.caption("Ver37｜履歴の個別削除・誤登録修正対応")
 
 
 def qident(name: str) -> str:
@@ -1123,7 +1123,7 @@ with db_tab:
                     if canonical_count > 0:
                         history = pd.read_sql_query(
                             """
-                            SELECT h.race_date AS 日付, h.venue AS 開催場, h.race_no AS レース,
+                            SELECT h.history_id AS 履歴ID, h.race_date AS 日付, h.venue AS 開催場, h.race_no AS レース,
                                    h.finish AS 着順, h.surface AS 走路, h.handicap AS ハンデ,
                                    h.trial_time AS 試走T, h.race_time AS 競走T,
                                    h.start_time AS ST, h.source AS 登録元, h.created_at AS 登録日時
@@ -1133,7 +1133,7 @@ with db_tab:
                     else:
                         history = pd.read_sql_query(
                             """
-                            SELECT race_date AS 日付, venue AS 開催場, race_type AS レース種別,
+                            SELECT history_key AS 履歴キー, race_date AS 日付, venue AS 開催場, race_type AS レース種別,
                                    rank AS 着順, weather AS 天候, surface AS 走路,
                                    track_temp AS 走路温度, air_temp AS 気温, humidity AS 湿度,
                                    car_no AS 車番, handicap AS ハンデ, distance AS 距離,
@@ -1144,7 +1144,53 @@ with db_tab:
                             WHERE player_name=? ORDER BY race_date DESC, created_at DESC
                             """, con, params=(selected,))
                     st.write(f"{selected}：履歴 {len(history)}件")
-                    st.dataframe(history, use_container_width=True, hide_index=True, height=430)
+                    display_history = history.drop(columns=[c for c in ["履歴ID", "履歴キー"] if c in history.columns], errors="ignore")
+                    st.dataframe(display_history, use_container_width=True, hide_index=True, height=430)
+
+                    if not history.empty:
+                        st.markdown("#### 🗑️ 誤登録した履歴を削除")
+                        st.caption("削除対象を選び、内容を確認してから実行してください。正規履歴を削除した場合、同じ走行の条件詳細データも同時に削除します。")
+                        delete_options = []
+                        for idx, r in history.reset_index(drop=True).iterrows():
+                            race_label = r.get("レース", r.get("レース種別", ""))
+                            finish_label = r.get("着順", "-")
+                            trial_label = r.get("試走T", "-")
+                            race_time_label = r.get("競走T", "-")
+                            delete_options.append(
+                                f"{idx + 1}. {r.get('日付', '')} {r.get('開催場', '')} {race_label or ''} "
+                                f"着{finish_label} 試{trial_label} 競{race_time_label}"
+                            )
+                        selected_delete_label = st.selectbox(
+                            "削除する履歴", delete_options, key=f"delete_history_select_{selected}"
+                        )
+                        selected_delete_idx = delete_options.index(selected_delete_label)
+                        delete_row = history.reset_index(drop=True).iloc[selected_delete_idx]
+                        preview_delete = delete_row.drop(labels=[c for c in ["履歴ID", "履歴キー"] if c in delete_row.index])
+                        st.dataframe(pd.DataFrame([preview_delete]), use_container_width=True, hide_index=True)
+                        confirm_delete = st.checkbox(
+                            "この履歴を削除することを確認しました",
+                            key=f"confirm_delete_history_{selected}_{selected_delete_idx}",
+                        )
+                        if st.button(
+                            "選択した履歴を削除",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not confirm_delete,
+                            key=f"delete_history_button_{selected}",
+                        ):
+                            if "履歴ID" in history.columns:
+                                result = engine.v37_delete_race_history(int(delete_row["履歴ID"]), engine.DB_PATH)
+                            else:
+                                result = engine.v37_delete_import_history(str(delete_row["履歴キー"]), engine.DB_PATH)
+                            if result.get("deleted"):
+                                ok, msg = push_db_to_github(f"AutoRaceAI: {selected} の誤登録履歴を削除")
+                                if ok:
+                                    st.success(result["message"] + " " + msg)
+                                else:
+                                    st.warning(result["message"] + " GitHub保存は未完了です。" + msg)
+                                st.rerun()
+                            else:
+                                st.warning(result.get("message", "削除できませんでした。"))
 
                 st.divider()
                 st.subheader("DBメンテナンス")

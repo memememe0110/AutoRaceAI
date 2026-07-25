@@ -6159,6 +6159,114 @@ def v32_merge_duplicate_players(db_path=DB_PATH):
     }
 
 
+
+
+# Ver37: 誤登録履歴の個別削除
+def _v37_same_num(a, b, digits=3):
+    try:
+        if a is None or b is None:
+            return a is None and b is None
+        return round(float(a), digits) == round(float(b), digits)
+    except Exception:
+        return str(a or "").strip() == str(b or "").strip()
+
+
+def _v37_import_matches_canonical(import_row, canonical_row, player_name):
+    """正規履歴と詳細取込の同一走行を、空白表記差を吸収して照合する。"""
+    d = dict(import_row)
+    c = dict(canonical_row)
+    if v32_player_name_key(d.get("player_name")) != v32_player_name_key(player_name):
+        return False
+    if _v33_norm_text(d.get("race_date")) != _v33_norm_text(c.get("race_date")):
+        return False
+    if _v33_norm_text(d.get("venue")) != _v33_norm_text(c.get("venue")):
+        return False
+    # 日付・場だけで削除すると同日別レースを巻き込むため、走行値を複数照合する。
+    checks = [
+        _v37_same_num(d.get("rank"), c.get("finish"), 0),
+        _v37_same_num(d.get("trial_time"), c.get("trial_time"), 3),
+        _v37_same_num(d.get("race_time"), c.get("race_time"), 3),
+        _v37_same_num(d.get("st"), c.get("start_time"), 3),
+    ]
+    # 有効な値が3項目以上一致したものだけ連動削除する。
+    available = 0
+    matched = 0
+    pairs = [
+        (d.get("rank"), c.get("finish"), 0),
+        (d.get("trial_time"), c.get("trial_time"), 3),
+        (d.get("race_time"), c.get("race_time"), 3),
+        (d.get("st"), c.get("start_time"), 3),
+        (d.get("handicap"), str(c.get("handicap") or "").replace("m", ""), 0),
+    ]
+    for a, b, digits in pairs:
+        if a is None or b is None or str(a).strip() in {"", "-"} or str(b).strip() in {"", "-"}:
+            continue
+        available += 1
+        if _v37_same_num(a, b, digits):
+            matched += 1
+    return available >= 3 and matched == available
+
+
+def v37_delete_race_history(history_id, db_path=DB_PATH):
+    """正規履歴を1件削除し、同じ走行の詳細取込も連動削除する。"""
+    mount_and_init_db()
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            """
+            SELECT h.*, p.player_name
+            FROM race_history h JOIN players p ON p.player_id=h.player_id
+            WHERE h.history_id=?
+            """,
+            (int(history_id),),
+        ).fetchone()
+        if row is None:
+            return {"deleted": 0, "deleted_imports": 0, "message": "対象履歴が見つかりません。"}
+
+        deleted_imports = 0
+        if v15_table_exists(con, "v15_player_history_imports"):
+            candidates = con.execute(
+                "SELECT * FROM v15_player_history_imports WHERE race_date=? AND venue=?",
+                (row["race_date"], row["venue"]),
+            ).fetchall()
+            for imp in candidates:
+                if _v37_import_matches_canonical(imp, row, row["player_name"]):
+                    con.execute(
+                        "DELETE FROM v15_player_history_imports WHERE history_key=?",
+                        (imp["history_key"],),
+                    )
+                    deleted_imports += 1
+
+        con.execute("DELETE FROM race_history WHERE history_id=?", (int(history_id),))
+        con.commit()
+        label = f"{row['player_name']} {row['race_date']} {row['venue']} {row['race_no'] or ''}".strip()
+        return {
+            "deleted": 1,
+            "deleted_imports": deleted_imports,
+            "message": f"{label} を削除しました。条件詳細の対応データ {deleted_imports}件も削除しました。",
+        }
+
+
+def v37_delete_import_history(history_key, db_path=DB_PATH):
+    """詳細取込だけに存在する履歴を1件削除する。"""
+    mount_and_init_db()
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT * FROM v15_player_history_imports WHERE history_key=?",
+            (str(history_key),),
+        ).fetchone()
+        if row is None:
+            return {"deleted": 0, "message": "対象履歴が見つかりません。"}
+        con.execute(
+            "DELETE FROM v15_player_history_imports WHERE history_key=?",
+            (str(history_key),),
+        )
+        con.commit()
+        label = f"{row['player_name']} {row['race_date']} {row['venue']} {row['race_no'] or ''}R"
+        return {"deleted": 1, "message": f"{label} の条件詳細データを削除しました。"}
+
+
 def v33_cleanup_duplicate_histories(db_path=DB_PATH):
     """同一選手内の重複走行を、レース名称に依存せず一括整理する。"""
     mount_and_init_db()
@@ -7777,3 +7885,261 @@ def v41_undo_last_registration(db_path=DB_PATH):
         con.execute("UPDATE v41_registration_batches SET status='undone',undone_at=? WHERE batch_id=?", (now, batch["batch_id"]))
         con.commit()
     return True, f"{key} の結果登録と学習を取り消しました。予測スナップショットは再登録用に残しています。"
+
+# ============================================================
+# Ver36 公式出走表（車・選手・ハンデ・近走が縦に並ぶ形式）対応
+# ============================================================
+
+_V36_TRACKS = ("川口", "伊勢崎", "浜松", "山陽", "飯塚")
+
+
+def _v36_lines(text):
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    raw = raw.replace("\u3000", " ").replace("\xa0", " ")
+    return [re.sub(r"[ \t]+", " ", line).strip() for line in raw.split("\n")]
+
+
+def _v36_is_name(value):
+    s = str(value or "").strip()
+    if not s or len(s) > 40:
+        return False
+    bad = {
+        "出走表", "出場選手", "近10走", "良5走", "湿5走", "斑5走",
+        "近90日", "近180日", "今年/通算", "車", "選手", "ハンデ",
+    }
+    if s in bad or re.fullmatch(r"\d+(?:\.\d+)?(?:%|R|m)?", s):
+        return False
+    if any(track in s and re.search(r"\d+期", s) for track in _V36_TRACKS):
+        return False
+    return bool(re.search(r"[一-龠々〆ヵヶぁ-んァ-ヶー]", s))
+
+
+def v36_split_mobile_entry_blocks(text):
+    """新しい公式出走表の車番単独行から、各選手ブロックを切り出す。"""
+    lines = _v36_lines(text)
+    starts = []
+    for i, line in enumerate(lines):
+        if not re.fullmatch(r"[1-8]", line):
+            continue
+        # 車番の次にある最初の非空行が氏名で、その数行後に所属＋期がある場合だけ採用。
+        following = [x for x in lines[i + 1:i + 8] if x]
+        if not following or not _v36_is_name(following[0]):
+            continue
+        if not any(any(t in x for t in _V36_TRACKS) and re.search(r"\d+期", x) for x in following[1:]):
+            continue
+        starts.append(i)
+
+    blocks = []
+    for pos, start in enumerate(starts):
+        end = starts[pos + 1] if pos + 1 < len(starts) else len(lines)
+        block_lines = [x for x in lines[start + 1:end] if x]
+        if block_lines:
+            blocks.append({"車番": int(lines[start]), "lines": block_lines})
+    return blocks
+
+
+def _v36_float_token(value):
+    s = str(value or "").strip()
+    s = re.sub(r"^(?:再|再試|試)", "", s)
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    return float(m.group(0)) if m else np.nan
+
+
+def v36_parse_mobile_entry_block(block):
+    car_no = int(block["車番"])
+    lines = [x for x in block.get("lines", []) if x]
+    if not lines:
+        return None
+
+    name = v15_normalize_name(lines[0])
+    car_name = lines[1] if len(lines) > 1 else None
+    compact = " ".join(lines)
+
+    lg = None
+    term = None
+    lg_idx = None
+    for i, line in enumerate(lines[:10]):
+        m = re.search(r"(川口|伊勢崎|浜松|山陽|飯塚)\s*(\d{1,2})期", line)
+        if m:
+            lg, term, lg_idx = m.group(1), int(m.group(2)), i
+            break
+
+    age = v15_int(v15_first_match([r"(\d{1,3})歳"], compact))
+    grade_num = v15_int(v15_first_match([r"(\d)級"], compact))
+    rank = v15_first_match([r"\b([SAB]-\d+)\b"], compact)
+
+    handicap = None
+    trial = np.nan
+    trial_dev = np.nan
+    # ランク行の直後は ハンデ → 試走T → 偏差 の並び。
+    rank_idx = None
+    for i, line in enumerate(lines):
+        if re.search(r"\b[SAB]-\d+\b", line):
+            rank_idx = i
+            break
+    if rank_idx is not None:
+        tail = " ".join(lines[rank_idx + 1:rank_idx + 8])
+        # タブ貼付では「0 再3.50 107」が同じ行になるため、並びをまとめて読む。
+        seq = re.search(
+            r"(?:^|\s)(0|10|20|30|40|50|60|70|80)\s+(?:再)?([3-9]\.\d{2,3}|-)\s+(\d{2,3})(?:\s|$)",
+            tail,
+        )
+        if seq:
+            handicap = int(seq.group(1))
+            if seq.group(2) != "-":
+                trial = float(seq.group(2))
+            trial_dev = int(seq.group(3)) / 1000.0
+        else:
+            numeric = []
+            for line in lines[rank_idx + 1:rank_idx + 8]:
+                for token in line.split():
+                    if re.fullmatch(r"-?\d+", token):
+                        numeric.append(("int", token))
+                    elif re.fullmatch(r"(?:再)?\d\.\d{2,3}|-", token):
+                        numeric.append(("time", token))
+            if numeric:
+                first_kind, first_val = numeric[0]
+                if first_kind == "int" and int(first_val) in range(0, 81, 10):
+                    handicap = int(first_val)
+                for kind, val in numeric[1:]:
+                    if pd.isna(trial) and kind == "time" and val != "-":
+                        trial = _v36_float_token(val)
+                        continue
+                    if pd.isna(trial_dev) and kind == "int" and 0 <= int(val) <= 999:
+                        trial_dev = int(val) / 1000.0
+                        break
+
+    # フォールバック
+    if handicap is None:
+        hm = re.search(r"(?:^|\s)(0|10|20|30|40|50|60|70|80)(?:\s|$)", compact)
+        if hm:
+            handicap = int(hm.group(1))
+    if pd.isna(trial):
+        tm = re.search(r"(?:再)?([3-9]\.\d{2,3})", compact)
+        if tm:
+            trial = float(tm.group(1))
+
+    two_rate = v15_float(v15_first_match([r"2連率\s*([0-9.]+)"], compact))
+    three_rate = v15_float(v15_first_match([r"3連率\s*([0-9.]+)"], compact))
+
+    # この形式には当日STがないためNaN。近走STを当日STとして誤用しない。
+    row = {
+        "車番": car_no,
+        "選手名": name,
+        "ハンデ": handicap,
+        "試走T": trial,
+        "ST": np.nan,
+        "年齢": age,
+        "級別": rank.split("-")[0] if rank else (str(grade_num) if grade_num else None),
+        "期別": term,
+        "所属": lg,
+        "現ランク": rank,
+        "試走偏差": trial_dev,
+        "近10走2連": two_rate,
+        "近10走3連": three_rate,
+        "2連対率": two_rate,
+        "3連対率": three_rate,
+        "車名": car_name,
+        "_raw": "\n".join(lines),
+    }
+    return row
+
+
+def v36_parse_mobile_entries(text):
+    rows = []
+    for block in v36_split_mobile_entry_blocks(text):
+        row = v36_parse_mobile_entry_block(block)
+        if row:
+            rows.append(row)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates("車番").sort_values("車番").reset_index(drop=True)
+    return df
+
+
+# 既存Ver35パーサーを保持し、新形式を最優先にする。
+_v36_previous_parse_entries = v15_parse_entries
+
+
+def v15_parse_entries(text, manual_excluded=None):
+    excluded = dict(v17_detect_nonstarters(text))
+    if manual_excluded is not None:
+        excluded = {int(car): "手動欠車" for car in manual_excluded}
+
+    mobile = v36_parse_mobile_entries(text)
+    if not mobile.empty and mobile["車番"].nunique() >= 2:
+        mobile = mobile.copy()
+        mobile["出走状態"] = mobile["車番"].map(lambda x: excluded.get(int(x), "出走"))
+        mobile["解析対象"] = ~mobile["車番"].astype(int).isin(excluded)
+        return mobile[mobile["解析対象"]].sort_values("車番").reset_index(drop=True)
+
+    return _v36_previous_parse_entries(text, manual_excluded=manual_excluded)
+
+
+_v36_previous_parse_meta = v15_parse_race_meta
+
+
+def v15_parse_race_meta(text):
+    meta = _v36_previous_parse_meta(text)
+    lines = _v36_lines(text)
+    compact = " ".join(x for x in lines if x)
+
+    # 「7月25日(土) 予選4R 3100m 晴」の表形式。
+    m = re.search(r"(?:予選|一般|準決|優勝|選抜)?\s*(\d{1,2})R", compact)
+    if m:
+        meta["レース"] = int(m.group(1))
+    m = re.search(r"発走予定\s*(\d{1,2}:\d{2})", compact)
+    if m:
+        meta["発走時刻"] = m.group(1)
+    if meta.get("発走時刻"):
+        hour = int(str(meta["発走時刻"]).split(":")[0])
+        meta["時間帯"] = "昼" if hour < 16 else ("夕方" if hour < 18 else "夜")
+
+    # 項目名の次行に値が並ぶ気象表を解析。
+    for i, line in enumerate(lines):
+        if line == "気温 湿度 走路温度 走路状況" and i + 1 < len(lines):
+            vals = lines[i + 1].split()
+            if len(vals) >= 4:
+                meta["気温"] = _v36_float_token(vals[0])
+                meta["湿度"] = _v36_float_token(vals[1])
+                meta["走路温度"] = _v36_float_token(vals[2])
+                meta["走路状態"] = vals[3].replace("走路", "")
+        if line == "日付 レース 距離 天候" and i + 1 < len(lines):
+            vals = lines[i + 1].split()
+            if len(vals) >= 4:
+                meta["天候"] = vals[-1]
+                dm = re.search(r"(\d{1,2})月(\d{1,2})日", vals[0])
+                # 年は開催期間から既に取れている。取れていなければ現在年を利用。
+                if dm and not meta.get("開催日"):
+                    year_m = re.search(r"(20\d{2})年", compact)
+                    year = int(year_m.group(1)) if year_m else datetime.now().year
+                    meta["開催日"] = f"{year:04d}-{int(dm.group(1)):02d}-{int(dm.group(2)):02d}"
+
+    # 開催場は選手所属ではなく開催文脈から優先取得。
+    vm = re.search(r"開催期間.*?(川口|伊勢崎|浜松|山陽|飯塚)", compact)
+    if vm:
+        meta["開催場"] = vm.group(1)
+    # 上記形式は開催場名がタイトルにない場合があるため、レースページ中の開催名を補助。
+    if not meta.get("開催場"):
+        vm = re.search(r"令和\S*年度(川口|伊勢崎|浜松|山陽|飯塚)市営", compact)
+        if vm:
+            meta["開催場"] = vm.group(1)
+
+    # 開催場が本文に明示されず、選手所属だけから拾われた場合は誤判定を避けて空欄にする。
+    explicit_venue = re.search(
+        r"(?:令和\S*年度)?(川口|伊勢崎|浜松|山陽|飯塚)市営|(?:開催場|会場)\s*[:：]?\s*(川口|伊勢崎|浜松|山陽|飯塚)",
+        compact,
+    )
+    if explicit_venue:
+        meta["開催場"] = next((g for g in explicit_venue.groups() if g), meta.get("開催場"))
+    elif "出場選手" in compact and "車 選手 ハンデ" in compact:
+        meta["開催場"] = None
+
+    # レース種別。
+    for label, canonical in [("準決勝", "準決勝"), ("準決", "準決勝"), ("優勝", "優勝戦"), ("一般", "一般戦"), ("予選", "予選")]:
+        if label in compact:
+            meta["レース種別"] = canonical
+            if not meta.get("レース名"):
+                meta["レース名"] = canonical
+            break
+    return meta
