@@ -4757,6 +4757,7 @@ def v151_parse_history_block(block, player_name=""):
         "開催日": None,
         "開催場": None,
         "レース": None,
+        "レース名": None,
         "着順": None,
         "出走": None,
         "走路": None,
@@ -4907,6 +4908,7 @@ def v35_parse_tabular_player_history(text, player_name=None):
         "日付": "開催日", "開催日": "開催日",
         "場": "開催場", "開催場": "開催場",
         "R": "レース", "レース": "レース",
+        "レース名": "レース名", "競走名": "レース名", "競走名称": "レース名",
         "着": "着順", "着順": "着順",
         "車番": "車番",
         "走路": "走路",
@@ -4921,6 +4923,7 @@ def v35_parse_tabular_player_history(text, player_name=None):
         "湿度": "湿度",
         "種別": "レース種別", "レース種別": "レース種別",
         "距離": "距離", "周回数": "周回数", "人気": "人気",
+        "異": "異常", "異常": "異常", "事故": "異常", "事故内容": "異常",
     }
     mapped = [aliases.get(h) for h in header]
     required = {"開催日", "開催場", "着順", "試走T", "競走T", "ST"}
@@ -4970,6 +4973,7 @@ def v35_parse_tabular_player_history(text, player_name=None):
             "開催日": date_iso,
             "開催場": None if missing(src.get("開催場", "")) else src.get("開催場", ""),
             "レース": race_no,
+            "レース名": None if missing(src.get("レース名", "")) else src.get("レース名", ""),
             "着順": rank,
             "出走": num(src.get("出走", ""), integer=True),
             "走路": surface,
@@ -4985,6 +4989,7 @@ def v35_parse_tabular_player_history(text, player_name=None):
             "距離": num(src.get("距離", ""), integer=True),
             "周回数": num(src.get("周回数", ""), integer=True),
             "人気": num(src.get("人気", ""), integer=True),
+            "異常": None if missing(src.get("異常", "")) else src.get("異常", ""),
             "車番": car_no,
             "_raw": raw,
         }
@@ -5000,10 +5005,10 @@ def v15_parse_player_history(text, player_name=None):
     tabular = v35_parse_tabular_player_history(text, player_name=player_name)
     if not tabular.empty:
         expected = [
-            "選手名", "開催日", "開催場", "レース", "着順", "出走", "走路",
+            "選手名", "開催日", "開催場", "レース", "レース名", "着順", "出走", "走路",
             "ハンデ", "試走T", "競走T", "ST",
             "天候", "走路温度", "気温", "湿度",
-            "レース種別", "距離", "周回数", "人気", "車番", "_raw"
+            "レース種別", "距離", "周回数", "人気", "異常", "車番", "_raw"
         ]
         for col in expected:
             if col not in tabular.columns:
@@ -5015,10 +5020,10 @@ def v15_parse_player_history(text, player_name=None):
     # 縦型が2件以上取れたらこちらを採用
     if not vertical.empty and vertical["開催日"].notna().sum() >= 1:
         expected = [
-            "選手名", "開催日", "開催場", "レース", "着順", "出走", "走路",
+            "選手名", "開催日", "開催場", "レース", "レース名", "着順", "出走", "走路",
             "ハンデ", "試走T", "競走T", "ST",
             "天候", "走路温度", "気温", "湿度",
-            "レース種別", "距離", "周回数", "人気", "車番", "_raw"
+            "レース種別", "距離", "周回数", "人気", "異常", "車番", "_raw"
         ]
         for col in expected:
             if col not in vertical.columns:
@@ -5052,6 +5057,7 @@ def v15_parse_player_history(text, player_name=None):
 def v151_ensure_player_import_columns(db_path=DB_PATH):
     v15_init_tables(db_path)
     extra_columns = {
+        "race_name": "TEXT",
         "weather": "TEXT",
         "track_temp": "REAL",
         "air_temp": "REAL",
@@ -6363,6 +6369,12 @@ def v15_save_player_history(df, db_path=DB_PATH):
         return 0, 0
     mount_and_init_db()
     v151_ensure_player_import_columns(db_path)
+    # Ver38: 正規履歴にもレース名を独立保存する。既存DBは自動移行。
+    with sqlite3.connect(str(db_path)) as _con:
+        _cols = set(v15_columns(_con, "race_history"))
+        if "race_name" not in _cols:
+            _con.execute("ALTER TABLE race_history ADD COLUMN race_name TEXT")
+        _con.commit()
     changed = 0
     skipped = 0
     now = datetime.now().isoformat(timespec="seconds")
@@ -6388,6 +6400,8 @@ def v15_save_player_history(df, db_path=DB_PATH):
 
             race_date = row.get("開催日")
             venue = row.get("開催場")
+            race_no_value = None if pd.isna(row.get("レース")) else int(row.get("レース"))
+            race_name = row.get("レース名")
             race_type = row.get("レース種別")
             finish = None if pd.isna(row.get("着順")) else float(row.get("着順"))
             starters = None if pd.isna(row.get("出走")) else float(row.get("出走"))
@@ -6399,8 +6413,24 @@ def v15_save_player_history(df, db_path=DB_PATH):
             st = None if pd.isna(row.get("ST")) else float(row.get("ST"))
             car_no = None if pd.isna(row.get("車番")) else int(row.get("車番"))
             raw_history_text = str(row.get("_raw") or "")
-            invalid_markers = ("欠責", "周誤", "欠車", "出走取消", "競走中止", "落車", "反則", "不成立", "失格")
-            marker = next((m for m in invalid_markers if m in raw_history_text), "")
+            explicit_status = str(row.get("異常") or "")
+            status_source = f"{raw_history_text} {explicit_status}"
+            invalid_markers = (
+                "欠責", "周誤", "欠車", "出走取消", "出走取り消し", "不出走",
+                "競走中止", "落車", "反則", "不成立", "失格", "除外", "参加解除"
+            )
+            marker = next((m for m in invalid_markers if m in status_source), "")
+
+            # サイトの簡易表では、取消・欠車が「— / — / — / —」だけで表されることがある。
+            # 着順・走路・試走・競走・STがすべて無い行は、通常の欠損ではなく
+            # 「出走取消等」として保持し、予測・条件適性・平均計算から除外する。
+            surface_missing = surface is None or str(surface).strip() in {"", "-", "—", "–", "―"}
+            cancel_like_missing = (
+                finish is None and surface_missing
+                and (trial is None or trial <= 0)
+                and (race_time is None or race_time <= 0)
+                and (st is None or st <= 0)
+            )
             numeric_invalid = (
                 finish is None or finish < 1
                 or trial is None or trial <= 0
@@ -6408,19 +6438,29 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 or race_time <= trial
                 or st is None or st <= 0
             )
-            use_for_model = 0 if marker or numeric_invalid else 1
-            result_status = marker or ("無効タイム" if numeric_invalid else "通常")
+            use_for_model = 0 if marker or cancel_like_missing or numeric_invalid else 1
+            if marker:
+                result_status = marker
+            elif cancel_like_missing:
+                result_status = "出走取消等"
+            elif numeric_invalid:
+                result_status = "無効タイム"
+            else:
+                result_status = "通常"
 
-            # 同一選手・開催日・開催場を論理重複とする。
-            # 同日に複数候補がある場合はレース種別一致を優先する。
+            # Ver38: 同一選手・日付・場に加え、Rがある場合はR一致を最優先。
+            # レース名は重複キーではなく、空欄を埋める更新カラムとして扱う。
             candidates = con.execute(
                 "SELECT * FROM race_history WHERE player_id=? AND race_date=? AND venue=? ORDER BY history_id",
                 (player_id, race_date, venue),
             ).fetchall()
             target = None
             if candidates:
-                same_race = [r for r in candidates if _v33_norm_text(r["race_no"]) == _v33_norm_text(race_type)]
-                target = same_race[0] if same_race else (candidates[0] if len(candidates) == 1 else None)
+                if race_no_value is not None:
+                    same_race = [r for r in candidates if _v33_norm_number(r["race_no"], 0) == _v33_norm_number(race_no_value, 0)]
+                    target = same_race[0] if same_race else None
+                elif len(candidates) == 1:
+                    target = candidates[0]
 
             if target is None:
                 candidate_row = {
@@ -6432,17 +6472,18 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 record_key = _v27_record_key(v32_player_name_key(name), *signature)
                 con.execute(
                     """INSERT INTO race_history(
-                        player_id, race_date, venue, race_no, finish, starters, surface,
+                        player_id, race_date, venue, race_no, race_name, finish, starters, surface,
                         handicap, trial_time, race_time, start_time, result_status,
                         use_for_model, source, record_key, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'スマホ貼付登録', ?, CURRENT_TIMESTAMP)""",
-                    (player_id, race_date, venue, race_type, finish, starters, surface,
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'スマホ貼付登録', ?, CURRENT_TIMESTAMP)""",
+                    (player_id, race_date, venue, race_no_value, race_name, finish, starters, surface,
                      handicap_text, trial, race_time, st, result_status, use_for_model, record_key),
                 )
                 changed += 1
             else:
                 merged = {
-                    "race_no": _v34_merge(target["race_no"], race_type),
+                    "race_no": _v34_merge(target["race_no"], race_no_value, positive=True),
+                    "race_name": _v34_merge(target["race_name"], race_name),
                     "finish": _v34_merge(target["finish"], finish, positive=True),
                     "starters": _v34_merge(target["starters"], starters, positive=True),
                     "surface": _v34_merge(target["surface"], surface),
@@ -6469,10 +6510,10 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 signature = _v33_history_signature(candidate_row)
                 record_key = _v27_record_key(v32_player_name_key(name), *signature)
                 con.execute(
-                    """UPDATE race_history SET race_no=?, finish=?, starters=?, surface=?, handicap=?,
+                    """UPDATE race_history SET race_no=?, race_name=?, finish=?, starters=?, surface=?, handicap=?,
                        trial_time=?, race_time=?, start_time=?, result_status=?, use_for_model=?,
                        source='スマホ貼付登録', record_key=? WHERE history_id=?""",
-                    (merged["race_no"], merged["finish"], merged["starters"], merged["surface"],
+                    (merged["race_no"], merged["race_name"], merged["finish"], merged["starters"], merged["surface"],
                      merged["handicap"], merged["trial_time"], merged["race_time"], merged["start_time"],
                      merged_status, merged_use, record_key, target["history_id"]),
                 )
@@ -6480,7 +6521,7 @@ def v15_save_player_history(df, db_path=DB_PATH):
 
             detail_values = {
                 "player_name": name, "race_date": race_date, "venue": venue,
-                "race_no": None, "rank": None if finish is None else int(finish),
+                "race_no": race_no_value, "race_name": race_name, "rank": None if finish is None else int(finish),
                 "starters": None if starters is None else int(starters), "surface": surface,
                 "handicap": handicap_num, "trial_time": trial, "race_time": race_time, "st": st,
                 "raw_line": row.get("_raw"), "weather": row.get("天候"),
@@ -6501,26 +6542,28 @@ def v15_save_player_history(df, db_path=DB_PATH):
             for d in detail_candidates:
                 if v32_player_name_key(d["player_name"]) != v32_player_name_key(name):
                     continue
+                if race_no_value is not None and d["race_no"] is not None and int(d["race_no"]) != race_no_value:
+                    continue
                 if car_no is not None and d["car_no"] is not None and int(d["car_no"]) != car_no:
                     continue
                 detail_target = d
                 break
 
             if detail_target is None:
-                history_key = v15_hash(v32_player_name_key(name), race_date, venue, finish, handicap_num, trial, race_time, st)
+                history_key = v15_hash(v32_player_name_key(name), race_date, venue, race_no_value, finish, handicap_num, trial, race_time, st)
                 con.execute("""
                     INSERT INTO v15_player_history_imports (
-                        history_key, player_name, race_date, venue, race_no, rank, starters, surface,
+                        history_key, player_name, race_date, venue, race_no, race_name, rank, starters, surface,
                         handicap, trial_time, race_time, st, raw_line, created_at, weather, track_temp,
                         air_temp, humidity, race_type, distance, laps, popularity, car_no
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (history_key, name, race_date, venue, None, detail_values["rank"], detail_values["starters"],
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (history_key, name, race_date, venue, race_no_value, race_name, detail_values["rank"], detail_values["starters"],
                        surface, handicap_num, trial, race_time, st, detail_values["raw_line"], now,
                        detail_values["weather"], detail_values["track_temp"], detail_values["air_temp"],
                        detail_values["humidity"], race_type, detail_values["distance"], detail_values["laps"],
                        detail_values["popularity"], car_no))
             else:
-                fields = ["player_name","race_no","rank","starters","surface","handicap","trial_time",
+                fields = ["player_name","race_no","race_name","rank","starters","surface","handicap","trial_time",
                           "race_time","st","raw_line","weather","track_temp","air_temp","humidity",
                           "race_type","distance","laps","popularity","car_no"]
                 positive_fields = {"rank","starters","handicap","trial_time","race_time","st","track_temp",
@@ -6530,7 +6573,7 @@ def v15_save_player_history(df, db_path=DB_PATH):
                     for f in fields
                 }
                 con.execute("""UPDATE v15_player_history_imports SET
-                    player_name=?, race_no=?, rank=?, starters=?, surface=?, handicap=?, trial_time=?,
+                    player_name=?, race_no=?, race_name=?, rank=?, starters=?, surface=?, handicap=?, trial_time=?,
                     race_time=?, st=?, raw_line=?, weather=?, track_temp=?, air_temp=?, humidity=?,
                     race_type=?, distance=?, laps=?, popularity=?, car_no=? WHERE history_key=?""",
                     tuple(merged_detail[f] for f in fields) + (detail_target["history_key"],))
