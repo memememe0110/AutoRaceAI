@@ -9558,3 +9558,367 @@ def v47_save_player_history(df, db_path=DB_PATH):
     result["pending"] = v56_add_r_candidates(result.get("pending"), db_path=db_path)
     result["pending_count"] = int(len(result["pending"])) if isinstance(result.get("pending"), pd.DataFrame) else 0
     return result
+
+# ============================================================
+# Ver57: 数値完全一致の重複登録防止・既存データ一括統合
+# ============================================================
+def _v57_exact_numeric_signature_from_values(player_name, race_date, venue, finish, handicap, trial, race_time, st):
+    """レース名・Rに依存しない、完全一致走行の比較キー。"""
+    values = (
+        _v33_norm_number(finish, 0),
+        _v33_norm_number(handicap, 0),
+        _v33_norm_number(trial, 3),
+        _v33_norm_number(race_time, 3),
+        _v33_norm_number(st, 3),
+    )
+    # 試走・競走の両方と、合計4項目以上がない行は誤統合防止のため対象外。
+    if values[2] is None or values[3] is None or sum(v is not None for v in values) < 4:
+        return None
+    return (
+        _v55_player_key(player_name),
+        _v55_clean_text(_v47_normalize_date(race_date)),
+        _v55_clean_text(_v47_normalize_venue(venue)),
+        *values,
+    )
+
+
+def _v57_exact_signature_from_input_row(row):
+    return _v57_exact_numeric_signature_from_values(
+        row.get("選手名"), row.get("開催日"), row.get("開催場"),
+        row.get("着順"), row.get("ハンデ"), row.get("試走T"),
+        row.get("競走T"), row.get("ST"),
+    )
+
+
+def _v57_existing_exact_signatures(db_path=DB_PATH):
+    signatures = set()
+    if not Path(db_path).exists():
+        return signatures
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        if v15_table_exists(con, "race_history") and v15_table_exists(con, "players"):
+            rows = con.execute("""
+                SELECT p.player_name, h.race_date, h.venue, h.finish, h.handicap,
+                       h.trial_time, h.race_time, h.start_time
+                FROM race_history h JOIN players p ON p.player_id=h.player_id
+            """).fetchall()
+            for r in rows:
+                sig = _v57_exact_numeric_signature_from_values(
+                    r["player_name"], r["race_date"], r["venue"], r["finish"],
+                    r["handicap"], r["trial_time"], r["race_time"], r["start_time"]
+                )
+                if sig is not None:
+                    signatures.add(sig)
+        if v15_table_exists(con, "v15_player_history_imports"):
+            rows = con.execute("""
+                SELECT player_name, race_date, venue, rank, handicap,
+                       trial_time, race_time, st
+                FROM v15_player_history_imports
+            """).fetchall()
+            for r in rows:
+                sig = _v57_exact_numeric_signature_from_values(
+                    r["player_name"], r["race_date"], r["venue"], r["rank"],
+                    r["handicap"], r["trial_time"], r["race_time"], r["st"]
+                )
+                if sig is not None:
+                    signatures.add(sig)
+    return signatures
+
+
+def _v57_merge_row_values(rows, fields, positive_fields=None):
+    positive_fields = set(positive_fields or [])
+    # 情報量が多い行を土台にする。
+    def score(row):
+        return sum(_v34_has_value(row[f], positive=f in positive_fields) for f in fields if f in row.keys())
+    keep = max(rows, key=score)
+    merged = dict(keep)
+    for row in rows:
+        for f in fields:
+            if f in row.keys():
+                merged[f] = _v34_merge(merged.get(f), row[f], positive=f in positive_fields)
+    return keep, merged
+
+
+def v57_cleanup_exact_numeric_duplicates(db_path=DB_PATH):
+    """DB内の数値完全一致履歴を一括統合し、情報がある列を残す。"""
+    mount_and_init_db()
+    merged_histories = 0
+    merged_imports = 0
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+
+        if v15_table_exists(con, "race_history") and v15_table_exists(con, "players"):
+            rows = con.execute("""
+                SELECT h.*, p.player_name FROM race_history h
+                JOIN players p ON p.player_id=h.player_id
+                ORDER BY h.created_at, h.history_id
+            """).fetchall()
+            groups = {}
+            for r in rows:
+                sig = _v57_exact_numeric_signature_from_values(
+                    r["player_name"], r["race_date"], r["venue"], r["finish"],
+                    r["handicap"], r["trial_time"], r["race_time"], r["start_time"]
+                )
+                if sig is not None:
+                    groups.setdefault(sig, []).append(r)
+            fields = ["race_no", "race_name", "finish", "starters", "surface", "handicap",
+                      "trial_time", "race_time", "start_time", "result_status", "use_for_model", "source"]
+            positives = {"race_no", "finish", "starters", "trial_time", "race_time", "start_time"}
+            for group in groups.values():
+                if len(group) < 2:
+                    continue
+                keep, merged = _v57_merge_row_values(group, fields, positives)
+                # UNIQUE制約との衝突を避けるため、先に余分な行を削除。
+                for r in group:
+                    if r["history_id"] != keep["history_id"]:
+                        con.execute("DELETE FROM race_history WHERE history_id=?", (r["history_id"],))
+                        merged_histories += 1
+                fallback = _v33_history_signature({
+                    "race_date": keep["race_date"], "venue": keep["venue"],
+                    "finish": merged.get("finish"), "handicap": merged.get("handicap"),
+                    "trial_time": merged.get("trial_time"), "race_time": merged.get("race_time"),
+                    "start_time": merged.get("start_time"),
+                })
+                record_key = _v45_identity_record_key(
+                    keep["player_name"], keep["race_date"], keep["venue"], merged.get("race_no"), fallback=fallback
+                )
+                con.execute("""
+                    UPDATE race_history SET race_no=?, race_name=?, finish=?, starters=?, surface=?, handicap=?,
+                        trial_time=?, race_time=?, start_time=?, result_status=?, use_for_model=?, source=?, record_key=?
+                    WHERE history_id=?
+                """, tuple(merged.get(f) for f in fields) + (record_key, keep["history_id"]))
+
+        if v15_table_exists(con, "v15_player_history_imports"):
+            rows = con.execute("SELECT * FROM v15_player_history_imports ORDER BY created_at, history_key").fetchall()
+            groups = {}
+            for r in rows:
+                sig = _v57_exact_numeric_signature_from_values(
+                    r["player_name"], r["race_date"], r["venue"], r["rank"],
+                    r["handicap"], r["trial_time"], r["race_time"], r["st"]
+                )
+                if sig is not None:
+                    groups.setdefault(sig, []).append(r)
+            all_cols = [r[1] for r in con.execute("PRAGMA table_info(v15_player_history_imports)").fetchall()]
+            fields = [c for c in all_cols if c not in {"history_key", "created_at"}]
+            positives = {"race_no", "rank", "starters", "handicap", "trial_time", "race_time", "st",
+                         "track_temp", "air_temp", "humidity", "distance", "laps", "popularity", "car_no"}
+            for group in groups.values():
+                if len(group) < 2:
+                    continue
+                keep, merged = _v57_merge_row_values(group, fields, positives)
+                for r in group:
+                    if r["history_key"] != keep["history_key"]:
+                        con.execute("DELETE FROM v15_player_history_imports WHERE history_key=?", (r["history_key"],))
+                        merged_imports += 1
+                assignments = ", ".join(f'"{f}"=?' for f in fields)
+                con.execute(
+                    f'UPDATE v15_player_history_imports SET {assignments} WHERE history_key=?',
+                    tuple(merged.get(f) for f in fields) + (keep["history_key"],)
+                )
+        con.commit()
+    return {"merged_histories": merged_histories, "merged_imports": merged_imports}
+
+
+_v57_v47_save_original = v47_save_player_history
+def v47_save_player_history(df, db_path=DB_PATH):
+    """数値完全一致行は新規登録せず、既存行への補完または重複スキップにする。"""
+    if df is None:
+        df = pd.DataFrame()
+    work = df.copy().reset_index(drop=True)
+    if work.empty:
+        return _v57_v47_save_original(work, db_path=db_path)
+
+    existing = _v57_existing_exact_signatures(db_path)
+    seen_in_batch = set()
+    keep_indices = []
+    exact_skipped = 0
+    for idx, row in work.iterrows():
+        sig = _v57_exact_signature_from_input_row(row)
+        if sig is not None and (sig in existing or sig in seen_in_batch):
+            exact_skipped += 1
+            continue
+        keep_indices.append(idx)
+        if sig is not None:
+            seen_in_batch.add(sig)
+
+    save_part = work.loc[keep_indices].reset_index(drop=True)
+    result = _v57_v47_save_original(save_part, db_path=db_path)
+    result["read"] = int(len(work))
+    result["exact_duplicate_skipped"] = int(exact_skipped)
+    result["skipped"] = int(result.get("skipped", 0)) + int(exact_skipped)
+    return result
+
+
+# ============================================================
+# Ver58: 数値完全一致でもRが違う場合は確認待ち
+# ============================================================
+def _v58_existing_exact_races(db_path=DB_PATH):
+    """数値完全一致キーごとに、既存のR候補を返す。"""
+    mapping = {}
+    if not Path(db_path).exists():
+        return mapping
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        if v15_table_exists(con, "race_history") and v15_table_exists(con, "players"):
+            rows = con.execute("""
+                SELECT p.player_name, h.race_date, h.venue, h.race_no, h.finish,
+                       h.handicap, h.trial_time, h.race_time, h.start_time
+                FROM race_history h JOIN players p ON p.player_id=h.player_id
+            """).fetchall()
+            for r in rows:
+                sig = _v57_exact_numeric_signature_from_values(
+                    r["player_name"], r["race_date"], r["venue"], r["finish"],
+                    r["handicap"], r["trial_time"], r["race_time"], r["start_time"]
+                )
+                if sig is None:
+                    continue
+                rn = _v47_normalize_race_no(r["race_no"])
+                mapping.setdefault(sig, set()).add(rn)
+    return mapping
+
+
+def _v58_confirmed(row):
+    value = row.get("_v58_duplicate_confirmed", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "confirmed", "確認済み"}
+    return bool(value)
+
+
+_v58_v47_save_original = v47_save_player_history
+def v47_save_player_history(df, db_path=DB_PATH):
+    """数値一致かつR相違は、自動スキップ・統合せず確認待ちへ回す。"""
+    if df is None:
+        df = pd.DataFrame()
+    work = df.copy().reset_index(drop=True)
+    if work.empty:
+        return _v58_v47_save_original(work, db_path=db_path)
+
+    existing_map = _v58_existing_exact_races(db_path)
+    hold_indices = []
+    hold_candidates = {}
+
+    for idx, row in work.iterrows():
+        if _v58_confirmed(row):
+            continue
+        sig = _v57_exact_signature_from_input_row(row)
+        if sig is None or sig not in existing_map:
+            continue
+        incoming_r = _v47_normalize_race_no(row.get("レース"))
+        existing_r = {r for r in existing_map[sig] if r is not None}
+        # 同じRなら通常の完全一致スキップでよい。Rが異なる時だけ確認する。
+        if incoming_r is not None and existing_r and incoming_r not in existing_r:
+            hold_indices.append(idx)
+            hold_candidates[idx] = sorted(existing_r)
+
+    if not hold_indices:
+        return _v58_v47_save_original(work, db_path=db_path)
+
+    save_part = work.drop(index=hold_indices).reset_index(drop=True)
+    hold_part = work.loc[hold_indices].copy().reset_index(drop=False).rename(columns={"index": "_v58_original_index"})
+    hold_part["保留理由"] = "数値完全一致の既存履歴とRが異なります：登録方法を選択"
+    hold_part["重複処理"] = "選択してください"
+    hold_part["R候補"] = hold_part["_v58_original_index"].map(
+        lambda i: " / ".join(f"{r}R" for r in hold_candidates.get(int(i), [])) or "候補なし"
+    )
+    hold_part = hold_part.drop(columns=["_v58_original_index"], errors="ignore")
+
+    result = _v58_v47_save_original(save_part, db_path=db_path)
+    pending = result.get("pending")
+    if pending is None or not isinstance(pending, pd.DataFrame):
+        pending = pd.DataFrame()
+    combined = pd.concat([pending, hold_part], ignore_index=True, sort=False)
+    result["read"] = int(len(work))
+    result["pending"] = combined
+    result["pending_count"] = int(len(combined))
+    result["r_conflict_pending"] = int(len(hold_part))
+    return result
+
+
+def v58_cleanup_exact_numeric_duplicates(db_path=DB_PATH):
+    """Rが異なる完全一致行は統合せず、同一RまたはR欠損同士だけを統合する。"""
+    mount_and_init_db()
+    merged_histories = 0
+    merged_imports = 0
+    r_conflicts = 0
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+
+        if v15_table_exists(con, "race_history") and v15_table_exists(con, "players"):
+            rows = con.execute("""
+                SELECT h.*, p.player_name FROM race_history h
+                JOIN players p ON p.player_id=h.player_id
+                ORDER BY h.created_at, h.history_id
+            """).fetchall()
+            groups = {}
+            for r in rows:
+                sig = _v57_exact_numeric_signature_from_values(
+                    r["player_name"], r["race_date"], r["venue"], r["finish"],
+                    r["handicap"], r["trial_time"], r["race_time"], r["start_time"]
+                )
+                if sig is not None:
+                    groups.setdefault(sig, []).append(r)
+            fields = ["race_no", "race_name", "finish", "starters", "surface", "handicap",
+                      "trial_time", "race_time", "start_time", "result_status", "use_for_model", "source"]
+            positives = {"race_no", "finish", "starters", "trial_time", "race_time", "start_time"}
+            for group in groups.values():
+                if len(group) < 2:
+                    continue
+                distinct_r = {_v47_normalize_race_no(r["race_no"]) for r in group if _v47_normalize_race_no(r["race_no"]) is not None}
+                if len(distinct_r) > 1:
+                    r_conflicts += 1
+                    continue
+                keep, merged = _v57_merge_row_values(group, fields, positives)
+                for r in group:
+                    if r["history_id"] != keep["history_id"]:
+                        con.execute("DELETE FROM race_history WHERE history_id=?", (r["history_id"],))
+                        merged_histories += 1
+                fallback = _v33_history_signature({
+                    "race_date": keep["race_date"], "venue": keep["venue"],
+                    "finish": merged.get("finish"), "handicap": merged.get("handicap"),
+                    "trial_time": merged.get("trial_time"), "race_time": merged.get("race_time"),
+                    "start_time": merged.get("start_time"),
+                })
+                record_key = _v45_identity_record_key(
+                    keep["player_name"], keep["race_date"], keep["venue"], merged.get("race_no"), fallback=fallback
+                )
+                con.execute("""
+                    UPDATE race_history SET race_no=?, race_name=?, finish=?, starters=?, surface=?, handicap=?,
+                        trial_time=?, race_time=?, start_time=?, result_status=?, use_for_model=?, source=?, record_key=?
+                    WHERE history_id=?
+                """, tuple(merged.get(f) for f in fields) + (record_key, keep["history_id"]))
+
+        if v15_table_exists(con, "v15_player_history_imports"):
+            rows = con.execute("SELECT * FROM v15_player_history_imports ORDER BY created_at, history_key").fetchall()
+            groups = {}
+            for r in rows:
+                sig = _v57_exact_numeric_signature_from_values(
+                    r["player_name"], r["race_date"], r["venue"], r["rank"],
+                    r["handicap"], r["trial_time"], r["race_time"], r["st"]
+                )
+                if sig is not None:
+                    groups.setdefault(sig, []).append(r)
+            all_cols = [r[1] for r in con.execute("PRAGMA table_info(v15_player_history_imports)").fetchall()]
+            fields = [c for c in all_cols if c not in {"history_key", "created_at"}]
+            positives = {"race_no", "rank", "starters", "handicap", "trial_time", "race_time", "st",
+                         "track_temp", "air_temp", "humidity", "distance", "laps", "popularity", "car_no"}
+            for group in groups.values():
+                if len(group) < 2:
+                    continue
+                distinct_r = {_v47_normalize_race_no(r["race_no"]) for r in group if _v47_normalize_race_no(r["race_no"]) is not None}
+                if len(distinct_r) > 1:
+                    r_conflicts += 1
+                    continue
+                keep, merged = _v57_merge_row_values(group, fields, positives)
+                for r in group:
+                    if r["history_key"] != keep["history_key"]:
+                        con.execute("DELETE FROM v15_player_history_imports WHERE history_key=?", (r["history_key"],))
+                        merged_imports += 1
+                assignments = ", ".join(f'"{f}"=?' for f in fields)
+                con.execute(
+                    f'UPDATE v15_player_history_imports SET {assignments} WHERE history_key=?',
+                    tuple(merged.get(f) for f in fields) + (keep["history_key"],)
+                )
+        con.commit()
+    return {"merged_histories": merged_histories, "merged_imports": merged_imports, "r_conflicts": r_conflicts}

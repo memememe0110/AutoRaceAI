@@ -1179,7 +1179,7 @@ with register_tab:
                 changed, skipped, pending_count = report["changed"], report["skipped"], report["pending_count"]
                 if changed:
                     ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新")
-                    text = f"読込 {report['read']}件｜追加・更新 {changed}件｜重複処理 {skipped}件｜保留 {pending_count}件"
+                    text = f"読込 {report['read']}件｜追加・更新 {changed}件｜重複処理 {skipped}件（数値完全一致 {report.get('exact_duplicate_skipped', 0)}件）｜保留 {pending_count}件"
                     (st.success if ok else st.warning)(text + (f"｜{msg}" if msg else ""))
                 else:
                     st.info(f"読込 {report['read']}件｜追加・更新 0件｜保留 {pending_count}件")
@@ -1190,8 +1190,8 @@ with register_tab:
     pending = st.session_state.get("pending_player_history")
     if isinstance(pending, pd.DataFrame) and not pending.empty:
         st.markdown("### ⚠️ R・必須項目の入力待ち")
-        st.caption("R候補は参考表示です。候補と同じRを入力すると既存履歴を更新し、候補にないRを入力すると新しいレースとして登録します。Rを空欄のままにすると保留されます。")
-        edit_cols = [c for c in ["選手名","開催日","開催場","レース","R候補","レース名","着順","車番","走路","ハンデ","試走T","競走T","ST","保留理由"] if c in pending.columns]
+        st.caption("R候補は参考表示です。数値が完全一致していてRだけ違う場合は、「既存Rへ統合」または「入力したRで新規登録」を選択してください。Rを空欄のままにすると保留されます。")
+        edit_cols = [c for c in ["選手名","開催日","開催場","レース","R候補","重複処理","レース名","着順","車番","走路","ハンデ","試走T","競走T","ST","保留理由"] if c in pending.columns]
         edited = st.data_editor(
             pending[edit_cols], use_container_width=True, hide_index=True,
             key=f"pending_history_editor_{player_version}",
@@ -1199,6 +1199,10 @@ with register_tab:
             column_config={
                 "開催場": st.column_config.SelectboxColumn("開催場", options=["川口","伊勢崎","浜松","飯塚","山陽"]),
                 "レース": st.column_config.NumberColumn("R", min_value=1, max_value=12, step=1),
+                "重複処理": st.column_config.SelectboxColumn(
+                    "重複処理",
+                    options=["選択してください", "既存Rへ統合", "入力したRで新規登録"],
+                ),
             },
         )
         if st.button("不足行だけ登録", type="primary", use_container_width=True, key=f"save_pending_{player_version}"):
@@ -1208,6 +1212,17 @@ with register_tab:
                 for c in edited.columns:
                     if c != "保留理由": repaired[c] = edited[c].values
                 repaired = repaired.drop(columns=["保留理由"], errors="ignore")
+
+                # 数値完全一致なのにRが異なる行は、利用者の選択後だけ保存する。
+                unresolved = pd.Series(False, index=repaired.index)
+                if "重複処理" in repaired.columns:
+                    conflict_mask = pending.get("保留理由", pd.Series("", index=pending.index)).astype(str).str.contains("Rが異なります", na=False)
+                    unresolved = conflict_mask & repaired["重複処理"].fillna("選択してください").eq("選択してください")
+                    repaired["_v58_duplicate_confirmed"] = ~unresolved
+                if unresolved.any():
+                    st.warning(f"Rが異なる重複候補 {int(unresolved.sum())}件の登録方法を選択してください。")
+                    st.stop()
+
                 report2 = engine.v47_save_player_history(repaired, db_path=engine.DB_PATH)
                 st.session_state["pending_player_history"] = report2["pending"]
                 if report2["changed"]:
@@ -1383,17 +1398,18 @@ with db_tab:
 
                 st.divider()
                 st.subheader("DBメンテナンス")
-                st.caption("姓名の空白違いを統合し、レース名が『一般戦』『7R』など違っていても、同じ走行結果なら重複を整理します。")
-                if st.button("氏名・同一レースの重複をまとめて整理", use_container_width=True):
+                st.caption("姓名の空白違いと数値完全一致の同一走行を整理します。ただしRが異なる組み合わせは勝手に統合せず、確認対象として残します。")
+                if st.button("完全一致を含む重複データを一括統合", use_container_width=True):
                     result = engine.v32_merge_duplicate_players(engine.DB_PATH)
+                    exact_result = engine.v58_cleanup_exact_numeric_duplicates(engine.DB_PATH)
                     race_result = engine.v33_cleanup_duplicate_histories(engine.DB_PATH)
                     identity_result = engine.v46_cleanup_player_identity_duplicates(engine.DB_PATH)
-                    ok, msg = push_db_to_github("AutoRaceAI: 氏名と同一走行結果の重複を整理")
+                    ok, msg = push_db_to_github("AutoRaceAI: 数値完全一致を含む重複履歴を一括統合")
                     summary = (
                         f"選手 {result['merged_players']}件を統合、履歴 {result['moved_histories']}件を移動、"
-                        f"氏名統合時の重複 {result['deleted_histories']}件、同一走行履歴 {race_result['deleted_histories']}件、"
-                        f"詳細履歴 {race_result['deleted_imports']}件を削除、"
-                        f"レース名差の正規履歴 {identity_result['merged_histories']}件・詳細履歴 {identity_result['merged_imports']}件を統合しました。"
+                        f"数値完全一致の正規履歴 {exact_result['merged_histories']}件・詳細履歴 {exact_result['merged_imports']}件、R相違の確認対象 {exact_result.get('r_conflicts', 0)}組、"
+                        f"その他の同一走行履歴 {race_result['deleted_histories']}件・詳細履歴 {race_result['deleted_imports']}件、"
+                        f"レース識別違いの正規履歴 {identity_result['merged_histories']}件・詳細履歴 {identity_result['merged_imports']}件を統合しました。"
                     )
                     if ok:
                         st.success(summary + " " + msg)
