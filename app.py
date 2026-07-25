@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver47｜履歴必須項目・不足行追記対応")
+st.caption("Ver48｜Rまたはレース名必須・R欠損時は数値一致で重複判定")
 
 
 def qident(name: str) -> str:
@@ -1072,7 +1072,7 @@ with register_tab:
     if isinstance(parsed, pd.DataFrame) and not parsed.empty:
         st.success(f"{len(parsed)}件を解析しました。登録前に内容を確認してください。")
         preview_cols = [c for c in [
-            "選手名", "開催日", "開催場", "レース種別", "着順", "天候", "走路",
+            "選手名", "開催日", "開催場", "レース", "レース名", "レース種別", "着順", "天候", "走路",
             "走路温度", "気温", "湿度", "車番", "ハンデ", "距離", "周回数",
             "人気", "競走T", "試走T", "ST"
         ] if c in parsed.columns]
@@ -1096,7 +1096,7 @@ with register_tab:
     pending = st.session_state.get("pending_player_history")
     if isinstance(pending, pd.DataFrame) and not pending.empty:
         st.markdown("### ⚠️ 必須項目不足の保留行")
-        st.caption("日付・開催場・Rを入力して、不足行だけ登録できます。日付は 2026-07-25 / 26/07/25 などに対応します。")
+        st.caption("日付・開催場・『Rまたはレース名』を入力して、不足行だけ登録できます。Rが無い場合の重複判定は、試走T・競走T・ST・着順・ハンデなどの数値一致で行います。")
         edit_cols = [c for c in ["選手名","開催日","開催場","レース","レース名","着順","車番","走路","ハンデ","試走T","競走T","ST","保留理由"] if c in pending.columns]
         edited = st.data_editor(
             pending[edit_cols], use_container_width=True, hide_index=True,

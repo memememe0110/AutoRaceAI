@@ -6366,6 +6366,64 @@ def _v45_identity_record_key(player_name, race_date, venue, race_no, fallback=No
     return _v27_record_key(*base)
 
 
+
+
+def _v48_num(value):
+    """重複判定用の数値化。空欄・0以下は比較対象外。"""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, str):
+        s = value.strip().replace("m", "")
+        if s in {"", "-", "—", "–", "―", "None", "nan"}:
+            return None
+        value = s
+    try:
+        n = float(value)
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _v48_numeric_identity_match(existing, incoming):
+    """Rが無い履歴を、同日・同場の数値一致で同一走行か判定する。
+
+    2項目以上が一致し、比較できた項目に明確な不一致がない場合のみ同一扱い。
+    タイム類は小数丸め差を吸収する。
+    """
+    specs = (
+        ("finish", "finish", 0.0),
+        ("starters", "starters", 0.0),
+        ("handicap", "handicap", 0.0),
+        ("trial_time", "trial_time", 0.0015),
+        ("race_time", "race_time", 0.0015),
+        ("start_time", "start_time", 0.0015),
+    )
+    matched = 0
+    compared = 0
+    conflicts = 0
+    for old_key, new_key, tol in specs:
+        old = _v48_num(existing[old_key] if old_key in existing.keys() else None)
+        new = _v48_num(incoming.get(new_key))
+        if old is None or new is None:
+            continue
+        compared += 1
+        if abs(old - new) <= tol:
+            matched += 1
+        else:
+            conflicts += 1
+    return compared >= 2 and matched >= 2 and conflicts == 0
+
+
+def _v48_find_same_race_without_r(candidates, incoming):
+    """R欠損時に数値一致する既存履歴を1件だけ返す。曖昧なら統合しない。"""
+    matches = [r for r in candidates if _v48_numeric_identity_match(r, incoming)]
+    return matches[0] if len(matches) == 1 else None
+
 def _v45_merge_history_rows(con, rows, preferred_id=None):
     """同一レースの複数行を、情報があるカラム単位で1行へ統合する。"""
     rows = list(rows or [])
@@ -6514,7 +6572,23 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 "SELECT * FROM race_history WHERE player_id=? AND race_date=? AND venue=? ORDER BY history_id",
                 (player_id, race_date, venue),
             ).fetchall()
-            same_race = [r for r in candidates if _v45_norm_race_no(r["race_no"]) == _v45_norm_race_no(race_no_value)] if race_no_value is not None else []
+            incoming_identity = {
+                "finish": finish, "starters": starters, "handicap": handicap_num,
+                "trial_time": trial, "race_time": race_time, "start_time": st,
+            }
+            if race_no_value is not None:
+                # Rがある場合は従来どおり、選手＋日付＋場＋Rで確定。
+                same_race = [r for r in candidates if _v45_norm_race_no(r["race_no"]) == _v45_norm_race_no(race_no_value)]
+                # 旧データ側だけRが無い場合は、数値が十分一致すれば同じ走行としてRを追記する。
+                if not same_race:
+                    numeric_target = _v48_find_same_race_without_r(
+                        [r for r in candidates if _v45_norm_race_no(r["race_no"]) is None], incoming_identity
+                    )
+                    same_race = [numeric_target] if numeric_target is not None else []
+            else:
+                # Rが無い場合はレース名では決めず、試走T・競走T・ST・着順・ハンデ等の数値一致で判定。
+                numeric_target = _v48_find_same_race_without_r(candidates, incoming_identity)
+                same_race = [numeric_target] if numeric_target is not None else []
             target = same_race[0] if same_race else None
 
             candidate_row = {
@@ -6646,8 +6720,20 @@ def v15_save_player_history(df, db_path=DB_PATH):
             for d in detail_candidates:
                 if v32_player_name_key(d["player_name"]) != v32_player_name_key(name):
                     continue
-                if race_no_value is not None and d["race_no"] is not None and int(d["race_no"]) != race_no_value:
-                    continue
+                if race_no_value is not None:
+                    if d["race_no"] is not None and int(d["race_no"]) != race_no_value:
+                        continue
+                    if d["race_no"] is None and not _v48_numeric_identity_match(d, {
+                        "finish": finish, "starters": starters, "handicap": handicap_num,
+                        "trial_time": trial, "race_time": race_time, "start_time": st,
+                    }):
+                        continue
+                else:
+                    if not _v48_numeric_identity_match(d, {
+                        "finish": finish, "starters": starters, "handicap": handicap_num,
+                        "trial_time": trial, "race_time": race_time, "start_time": st,
+                    }):
+                        continue
                 if car_no is not None and d["car_no"] is not None and int(d["car_no"]) != car_no:
                     continue
                 detail_target = d
@@ -8867,7 +8953,7 @@ def v47_validate_player_history(df):
     if df is None:
         df = pd.DataFrame()
     work = df.copy().reset_index(drop=True)
-    for col in ["選手名", "開催日", "開催場", "レース"]:
+    for col in ["選手名", "開催日", "開催場", "レース", "レース名"]:
         if col not in work.columns:
             work[col] = None
     work["開催日"] = work["開催日"].map(_v47_normalize_date)
@@ -8879,7 +8965,12 @@ def v47_validate_player_history(df):
         if not str(row.get("選手名") or "").strip(): miss.append("選手名")
         if not row.get("開催日"): miss.append("日付")
         if not row.get("開催場"): miss.append("開催場")
-        if row.get("レース") is None or pd.isna(row.get("レース")): miss.append("R")
+        race_missing = row.get("レース") is None or pd.isna(row.get("レース"))
+        race_name = str(row.get("レース名") or "").strip()
+        if race_name in {"", "-", "—", "–", "―", "None", "nan"}:
+            race_name = ""
+        if race_missing and not race_name:
+            miss.append("Rまたはレース名")
         reasons.append("・".join(miss))
     work["保留理由"] = reasons
     valid = work[work["保留理由"] == ""].drop(columns=["保留理由"]).copy()
