@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver30｜早期先頭の逃げ切り分岐・確率表ごとのオッズ入力対応")
+st.caption("Ver31｜早期先頭の逃げ切り分岐・確率別オッズ入力・選手登録状況確認")
 
 
 def qident(name: str) -> str:
@@ -158,6 +158,118 @@ def show_player_data_coverage(entries: pd.DataFrame) -> None:
     if zero_names:
         st.warning("DB履歴0件: " + "、".join(zero_names) + "。名前の照合または履歴登録を確認してください。")
     st.caption("正規履歴が実質的な登録件数です。『条件詳細あり』は、その正規履歴のうち走路温度・湿度・レース種別などの詳細条件も保存されている件数で、別レースとしては加算しません。実質登録数20件以上を『十分』の目安にしています。")
+
+
+
+def lookup_player_registration(name: str, db_path: str) -> dict:
+    """入力した選手名がDBに登録済みか、重複加算せずに確認する。"""
+    key = normalize_player_key(name)
+    result = {
+        "found": False,
+        "matched_name": "",
+        "canonical_count": 0,
+        "model_count": 0,
+        "detail_count": 0,
+        "latest": None,
+        "candidates": [],
+    }
+    if not key or not Path(db_path).exists():
+        return result
+
+    with sqlite3.connect(db_path) as con:
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        names = {}
+
+        if {"players", "race_history"}.issubset(tables):
+            rows = con.execute(
+                """
+                SELECT p.player_name, COUNT(h.history_id),
+                       SUM(CASE WHEN COALESCE(h.use_for_model, 1)=1 THEN 1 ELSE 0 END),
+                       MAX(NULLIF(h.race_date, ''))
+                FROM players p
+                LEFT JOIN race_history h ON h.player_id=p.player_id
+                GROUP BY p.player_id, p.player_name
+                """
+            ).fetchall()
+            for player_name, count_all, count_use, latest in rows:
+                pkey = normalize_player_key(player_name)
+                item = names.setdefault(pkey, {
+                    "names": [], "canonical": 0, "model": 0, "detail": 0, "dates": []
+                })
+                item["names"].append(str(player_name))
+                item["canonical"] += int(count_all or 0)
+                item["model"] += int(count_use or 0)
+                if latest:
+                    item["dates"].append(str(latest))
+
+        if "v15_player_history_imports" in tables:
+            rows = con.execute(
+                """
+                SELECT player_name, COUNT(*), MAX(NULLIF(race_date, ''))
+                FROM v15_player_history_imports
+                WHERE player_name IS NOT NULL AND TRIM(player_name)<>''
+                GROUP BY player_name
+                """
+            ).fetchall()
+            for player_name, count_all, latest in rows:
+                pkey = normalize_player_key(player_name)
+                item = names.setdefault(pkey, {
+                    "names": [], "canonical": 0, "model": 0, "detail": 0, "dates": []
+                })
+                item["names"].append(str(player_name))
+                item["detail"] += int(count_all or 0)
+                if latest:
+                    item["dates"].append(str(latest))
+
+        if key in names:
+            item = names[key]
+            display_names = sorted(set(item["names"]), key=lambda x: (len(x), x))
+            result.update({
+                "found": True,
+                "matched_name": display_names[0] if display_names else str(name).strip(),
+                "canonical_count": item["canonical"],
+                "model_count": item["model"],
+                "detail_count": item["detail"],
+                "latest": max(item["dates"]) if item["dates"] else None,
+            })
+            return result
+
+        # 完全一致しない場合は、入力文字を含む近い候補だけ表示する。
+        candidates = []
+        for pkey, item in names.items():
+            if key in pkey or pkey in key:
+                display_names = sorted(set(item["names"]), key=lambda x: (len(x), x))
+                if display_names:
+                    candidates.append(display_names[0])
+        result["candidates"] = sorted(set(candidates))[:8]
+    return result
+
+
+def show_player_registration_status(name: str) -> None:
+    """選手名入力直後にDB登録状況を表示する。"""
+    if not str(name or "").strip():
+        st.caption("選手名を入力すると、DB登録状況をここで確認できます。")
+        return
+    try:
+        status = lookup_player_registration(name, engine.DB_PATH)
+    except Exception as exc:
+        st.warning(f"登録状況を確認できませんでした: {type(exc).__name__}: {exc}")
+        return
+
+    if status["found"]:
+        latest = status["latest"] or "日付なし"
+        st.success(
+            f"✅ 登録済み: {status['matched_name']}｜正規履歴 {status['canonical_count']}件"
+            f"（予測利用可 {status['model_count']}件）｜条件詳細 {status['detail_count']}件｜最新 {latest}"
+        )
+        if status["canonical_count"] == 0 and status["detail_count"] > 0:
+            st.warning("条件詳細データはありますが、正規履歴が0件です。予測用データへの反映状態を確認してください。")
+    else:
+        st.warning("⚠️ この選手名はDBに未登録です。履歴を貼り付けて登録してください。")
+        if status["candidates"]:
+            st.caption("近い登録名: " + "、".join(status["candidates"]))
 
 def ticket_probability_table(bets: dict, key: str, trials: int, top_n: int = 20) -> pd.DataFrame:
     """シミュレーションの券種別カウントを、表示用の確率表へ変換する。"""
@@ -877,6 +989,7 @@ with register_tab:
         st.rerun()
     player_version = st.session_state["player_input_version"]
     player_name = st.text_input("選手名", placeholder="例：横田翔", key=f"player_name_input_{player_version}")
+    show_player_registration_status(player_name)
     history_text = st.text_area(
         "公式プロフィールの直近履歴を貼り付け",
         height=520,
