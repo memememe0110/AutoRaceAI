@@ -6339,6 +6339,64 @@ def _v27_record_key(*values):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+
+
+def _v45_norm_race_no(value):
+    """レース番号を比較用整数へ正規化。5R / 予選5R / 5 を同じ5として扱う。"""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    m = re.search(r"(\d{1,2})", str(value))
+    return int(m.group(1)) if m else None
+
+
+def _v45_identity_record_key(player_name, race_date, venue, race_no, fallback=None):
+    """Ver45: 同一レースキー = 選手名 + 開催日 + 開催場 + R。
+
+    Rが取得できない古いデータだけは、誤統合を避けるためfallbackを追加する。
+    """
+    rn = _v45_norm_race_no(race_no)
+    base = ["v45", v32_player_name_key(player_name), str(race_date or "").strip(), str(venue or "").strip(), rn]
+    if rn is None:
+        base.append(fallback or "race_no_missing")
+    return _v27_record_key(*base)
+
+
+def _v45_merge_history_rows(con, rows, preferred_id=None):
+    """同一レースの複数行を、情報があるカラム単位で1行へ統合する。"""
+    rows = list(rows or [])
+    if not rows:
+        return None
+    # 情報量が多い行、または指定行を残す。
+    def score(r):
+        fields = ("race_no", "race_name", "finish", "starters", "surface", "handicap", "trial_time", "race_time", "start_time")
+        return sum(_v34_has_value(r[f], positive=f in {"race_no","finish","starters","trial_time","race_time","start_time"}) for f in fields)
+    keep = next((r for r in rows if preferred_id is not None and r["history_id"] == preferred_id), None)
+    if keep is None:
+        keep = max(rows, key=score)
+    merged = dict(keep)
+    for r in rows:
+        if r["history_id"] == keep["history_id"]:
+            continue
+        for f in ("race_no", "race_name", "finish", "starters", "surface", "handicap", "trial_time", "race_time", "start_time"):
+            positive = f in {"race_no", "finish", "starters", "trial_time", "race_time", "start_time"}
+            merged[f] = _v34_merge(merged.get(f), r[f], positive=positive)
+        # 異常情報は通常より優先して保持する。
+        if r["result_status"] and r["result_status"] != "通常":
+            merged["result_status"] = r["result_status"]
+            merged["use_for_model"] = 0
+        elif merged.get("use_for_model") is None:
+            merged["use_for_model"] = r["use_for_model"]
+    for r in rows:
+        if r["history_id"] != keep["history_id"]:
+            con.execute("DELETE FROM race_history WHERE history_id=?", (r["history_id"],))
+    return keep, merged
+
+
 def _v34_has_value(value, *, positive=False):
     """重複更新用。空欄・NaNは既存値を消さない。時刻系は0以下も空欄扱い。"""
     if value is None:
@@ -6448,29 +6506,36 @@ def v15_save_player_history(df, db_path=DB_PATH):
             else:
                 result_status = "通常"
 
-            # Ver38: 同一選手・日付・場に加え、Rがある場合はR一致を最優先。
-            # レース名は重複キーではなく、空欄を埋める更新カラムとして扱う。
+            # Ver45: 重複判定は「選手名＋開催日＋開催場＋R」だけに統一。
+            # グレード・種別・車番・ハンデ・タイム差は、別レース判定には使わない。
             candidates = con.execute(
                 "SELECT * FROM race_history WHERE player_id=? AND race_date=? AND venue=? ORDER BY history_id",
                 (player_id, race_date, venue),
             ).fetchall()
-            target = None
-            if candidates:
-                if race_no_value is not None:
-                    same_race = [r for r in candidates if _v33_norm_number(r["race_no"], 0) == _v33_norm_number(race_no_value, 0)]
-                    target = same_race[0] if same_race else None
-                elif len(candidates) == 1:
-                    target = candidates[0]
+            same_race = [r for r in candidates if _v45_norm_race_no(r["race_no"]) == _v45_norm_race_no(race_no_value)] if race_no_value is not None else []
+            target = same_race[0] if same_race else None
 
-            # record_key はDB全体でUNIQUE。日付・場・Rの検索で見つからなくても、
-            # 同じ走行内容のキーが既に存在する場合はINSERTせずカラム単位更新へ回す。
             candidate_row = {
                 "race_date": race_date, "venue": venue, "finish": finish,
                 "handicap": handicap_text, "trial_time": trial,
                 "race_time": race_time, "start_time": st,
             }
             signature = _v33_history_signature(candidate_row)
-            incoming_record_key = _v27_record_key(v32_player_name_key(name), *signature)
+            incoming_record_key = _v45_identity_record_key(name, race_date, venue, race_no_value, fallback=signature)
+
+            # 旧record_keyで同一レースが複数行ある場合は、登録前に1行へ統合。
+            if len(same_race) > 1:
+                keep, merged_existing = _v45_merge_history_rows(con, same_race, preferred_id=target["history_id"])
+                con.execute(
+                    """UPDATE race_history SET race_no=?, race_name=?, finish=?, starters=?, surface=?, handicap=?,
+                       trial_time=?, race_time=?, start_time=?, result_status=?, use_for_model=? WHERE history_id=?""",
+                    (merged_existing.get("race_no"), merged_existing.get("race_name"), merged_existing.get("finish"),
+                     merged_existing.get("starters"), merged_existing.get("surface"), merged_existing.get("handicap"),
+                     merged_existing.get("trial_time"), merged_existing.get("race_time"), merged_existing.get("start_time"),
+                     merged_existing.get("result_status") or "通常", int(merged_existing.get("use_for_model") or 0), keep["history_id"]),
+                )
+                target = con.execute("SELECT * FROM race_history WHERE history_id=?", (keep["history_id"],)).fetchone()
+
             if target is None:
                 target = con.execute(
                     "SELECT * FROM race_history WHERE record_key=? LIMIT 1",
@@ -6517,7 +6582,7 @@ def v15_save_player_history(df, db_path=DB_PATH):
                     "race_time": merged["race_time"], "start_time": merged["start_time"],
                 }
                 signature = _v33_history_signature(candidate_row)
-                record_key = _v27_record_key(v32_player_name_key(name), *signature)
+                record_key = _v45_identity_record_key(name, race_date, venue, merged["race_no"], fallback=signature)
 
                 # カラム更新によって別行と同じrecord_keyになる場合も、完全置換せず
                 # 既存の同一走行行へ統合する。古い重複行だけ削除する。
