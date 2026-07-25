@@ -342,8 +342,8 @@ def parse_manual_odds(text: str, unordered: bool = False) -> tuple[pd.DataFrame,
     return pd.DataFrame(rows).drop_duplicates("組み合わせ", keep="last"), errors
 
 
-def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_key: str, unordered: bool = False) -> None:
-    """各確率表の直下で、組み合わせごとにオッズを直接入力して市場差を確認する。"""
+def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_key: str, unordered: bool = False, namespace: str = "current") -> None:
+    """各確率表の直下でオッズを入力し、再描画後も入力値を保持する。"""
     st.markdown(f"#### {title} オッズ入力")
     st.caption("確率上位の各行へオッズを直接入力できます。公平倍率との差のみを表示し、購入推奨は行いません。")
 
@@ -356,11 +356,15 @@ def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_k
         prob_df = prob_df.groupby("組み合わせ", as_index=False)["確率"].sum().sort_values("確率", ascending=False).head(40)
         prob_df.insert(0, "順位", range(1, len(prob_df) + 1))
     prob_df["公平倍率"] = prob_df["確率"].map(lambda p: (100.0 / p) if p > 0 else None)
-    prob_df["入力オッズ"] = None
 
+    store_key = f"saved_odds_{namespace}_{widget_key}"
+    saved = st.session_state.setdefault(store_key, {})
+    prob_df["入力オッズ"] = prob_df["組み合わせ"].map(lambda combo: saved.get(str(combo)))
+
+    editor_key = f"odds_editor_{namespace}_{widget_key}"
     edited = st.data_editor(
         prob_df[["順位", "組み合わせ", "確率", "公平倍率", "入力オッズ"]],
-        key=f"odds_editor_{widget_key}",
+        key=editor_key,
         use_container_width=True,
         hide_index=True,
         disabled=["順位", "組み合わせ", "確率", "公平倍率"],
@@ -370,11 +374,24 @@ def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_k
             "入力オッズ": st.column_config.NumberColumn("入力オッズ", min_value=0.0, step=0.1, format="%.1f倍"),
         },
     )
+
+    # data_editorは入力のたびに再実行されるため、組み合わせ単位で明示保存する。
+    updated = {}
+    for _, row in edited.iterrows():
+        val = pd.to_numeric(pd.Series([row.get("入力オッズ")]), errors="coerce").iloc[0]
+        if pd.notna(val) and float(val) > 0:
+            updated[str(row["組み合わせ"])] = float(val)
+    st.session_state[store_key] = updated
+
     entered = edited[pd.to_numeric(edited["入力オッズ"], errors="coerce").notna()].copy()
     if entered.empty:
         st.caption("入力した行だけ、倍率差と市場比較が下に表示されます。")
         return
     entered["入力オッズ"] = pd.to_numeric(entered["入力オッズ"], errors="coerce")
+    entered = entered[entered["入力オッズ"] > 0].copy()
+    if entered.empty:
+        st.caption("入力した行だけ、倍率差と市場比較が下に表示されます。")
+        return
     entered["倍率差"] = entered["入力オッズ"] / entered["公平倍率"]
     entered["比較"] = entered["倍率差"].map(
         lambda r: "市場よりモデル評価が高い" if r >= 1.15 else ("市場よりモデル評価が低い" if r <= 0.85 else "ほぼ同水準")
@@ -679,15 +696,46 @@ with prediction_tab:
         else:
             st.caption("自動検出された欠車はありません。必要な車番だけ選択してください。")
 
-    if st.button("解析して元版設定で予測", type="primary", use_container_width=True):
+    prediction_clicked = st.button("解析して元版設定で予測", type="primary", use_container_width=True)
+    if prediction_clicked:
         if not text.strip():
             st.warning("出走表を貼り付けてください。")
             st.stop()
         try:
             with st.spinner("高速6周イベントシミュレーションを実行中…"):
                 df, bets, output, entries, meta = engine.ver16_run_prediction(text, int(trials), int(seed), manual_excluded=manual_excluded)
+                finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
+                race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
+                engine.v40_save_prediction_features(meta, df, engine.DB_PATH)
+            # オッズ入力などによる再描画後も、直前の予測結果を保持する。
+            st.session_state["last_prediction_view"] = {
+                "df": df,
+                "bets": bets,
+                "output": output,
+                "entries": entries,
+                "meta": meta,
+                "finish_prob": finish_prob,
+                "race_key": race_key,
+                "trials": int(trials),
+                "excluded": [int(x) for x in manual_excluded],
+            }
             st.success("予測が完了しました")
-            excluded = {int(car): "手動指定" for car in manual_excluded}
+        except Exception as exc:
+            st.error(f"予測エラー: {type(exc).__name__}: {exc}")
+            st.exception(exc)
+
+    view = st.session_state.get("last_prediction_view")
+    if view:
+        try:
+            df = view["df"]
+            bets = view["bets"]
+            output = view["output"]
+            entries = view["entries"]
+            meta = view["meta"]
+            finish_prob = view["finish_prob"]
+            race_key = view.get("race_key", "current")
+            view_trials = int(view.get("trials", trials))
+            excluded = {int(car): "手動指定" for car in view.get("excluded", [])}
             if excluded:
                 detail = "、".join(f"{car}番（{status}）" for car, status in sorted(excluded.items()))
                 st.warning(f"解析対象外: {detail}。確率・順位・買い目の組み合わせから完全に除外しました。")
@@ -710,10 +758,6 @@ with prediction_tab:
             lap_df = engine.v30_representative_lap_projection(df)
             st.dataframe(lap_df, use_container_width=True, hide_index=True)
             st.caption("確率計算は全試行で、スタート・中盤・最終周のイベントを生成しています。この表は指標から作った代表的な1展開です。")
-
-            finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
-            race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
-            engine.v40_save_prediction_features(meta, df, engine.DB_PATH)
             st.caption(f"予測保存キー: {race_key}（結果登録時の比較・重み調整に使用）")
 
             with st.expander("🧪 学習重みによる順位変化"):
@@ -734,17 +778,9 @@ with prediction_tab:
             )
 
             scenario_probs = engine.v27_scenario_probabilities(meta.get("走路温度", 30.0))
-            scenario_df = pd.DataFrame([
-                {"展開": name, "確率": prob * 100}
-                for name, prob in sorted(scenario_probs.items(), key=lambda x: x[1], reverse=True)
-            ])
+            scenario_df = pd.DataFrame([{"展開": name, "確率": prob * 100} for name, prob in sorted(scenario_probs.items(), key=lambda x: x[1], reverse=True)])
             st.subheader("展開予想")
-            st.dataframe(
-                scenario_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={"確率": st.column_config.NumberColumn("確率", format="%.1f%%")},
-            )
+            st.dataframe(scenario_df, use_container_width=True, hide_index=True, column_config={"確率": st.column_config.NumberColumn("確率", format="%.1f%%")})
             top_scenario = scenario_df.iloc[0]["展開"] if not scenario_df.empty else "不明"
             st.caption(f"中心展開：{top_scenario}。Ver15.2のシミュレーションで使う4展開の事前確率です。")
 
@@ -757,19 +793,20 @@ with prediction_tab:
             ]
             st.dataframe(pd.DataFrame(condition_rows), use_container_width=True, hide_index=True)
 
+            odds_namespace = re.sub(r"[^0-9A-Za-z_-]+", "_", str(race_key))[-80:] or "current"
             ticket_tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
             with ticket_tabs[0]:
-                show_ticket_table("2連単（2車単）確率", bets, "2車単", int(trials), 20)
-                show_odds_comparison("2連単", bets, "2車単", int(trials), "2tansho", unordered=False)
+                show_ticket_table("2連単（2車単）確率", bets, "2車単", view_trials, 20)
+                show_odds_comparison("2連単", bets, "2車単", view_trials, "2tansho", unordered=False, namespace=odds_namespace)
             with ticket_tabs[1]:
-                show_ticket_table("2連複（2車複）確率", bets, "2車複", int(trials), 20)
-                show_odds_comparison("2連複", bets, "2車複", int(trials), "2fuku", unordered=True)
+                show_ticket_table("2連複（2車複）確率", bets, "2車複", view_trials, 20)
+                show_odds_comparison("2連複", bets, "2車複", view_trials, "2fuku", unordered=True, namespace=odds_namespace)
             with ticket_tabs[2]:
-                show_ticket_table("3連複確率", bets, "三連複", int(trials), 20)
-                show_odds_comparison("3連複", bets, "三連複", int(trials), "3fuku", unordered=True)
+                show_ticket_table("3連複確率", bets, "三連複", view_trials, 20)
+                show_odds_comparison("3連複", bets, "三連複", view_trials, "3fuku", unordered=True, namespace=odds_namespace)
             with ticket_tabs[3]:
-                show_ticket_table("3連単確率", bets, "三連単", int(trials), 20)
-                show_odds_comparison("3連単", bets, "三連単", int(trials), "3tan", unordered=False)
+                show_ticket_table("3連単確率", bets, "三連単", view_trials, 20)
+                show_odds_comparison("3連単", bets, "三連単", view_trials, "3tan", unordered=False, namespace=odds_namespace)
 
             if Path(output).exists():
                 st.download_button(
@@ -780,7 +817,7 @@ with prediction_tab:
                     use_container_width=True,
                 )
         except Exception as exc:
-            st.error(f"予測エラー: {type(exc).__name__}: {exc}")
+            st.error(f"保存済み予測の表示エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
 
 with result_tab:
