@@ -5424,6 +5424,19 @@ def ver16_get_history(name):
                 JOIN players p ON p.player_id=h.player_id
                 WHERE REPLACE(REPLACE(p.player_name,' ',''),'　','')=?
                   AND COALESCE(h.use_for_model,1)=1
+                  AND h.finish IS NOT NULL AND h.finish >= 1
+                  AND h.trial_time IS NOT NULL AND h.trial_time > 0
+                  AND h.race_time IS NOT NULL AND h.race_time > h.trial_time
+                  AND h.start_time IS NOT NULL AND h.start_time > 0
+                  AND COALESCE(h.result_status,'') NOT LIKE '%欠責%'
+                  AND COALESCE(h.result_status,'') NOT LIKE '%周誤%'
+                  AND COALESCE(h.result_status,'') NOT LIKE '%欠車%'
+                  AND COALESCE(h.result_status,'') NOT LIKE '%出走取消%'
+                  AND COALESCE(h.result_status,'') NOT LIKE '%競走中止%'
+                  AND COALESCE(h.result_status,'') NOT LIKE '%落車%'
+                  AND COALESCE(h.result_status,'') NOT LIKE '%反則%'
+                  AND COALESCE(h.result_status,'') NOT LIKE '%不成立%'
+                  AND COALESCE(h.result_status,'') NOT LIKE '%失格%'
                 ORDER BY h.race_date DESC, h.history_id DESC
             """, con, params=(target,))
     except Exception:
@@ -5740,6 +5753,19 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
             FROM v15_player_history_imports
             WHERE replace(replace(player_name,' ',''),'　','')=?
               AND rank IS NOT NULL AND rank > 0
+              AND (starters IS NULL OR rank <= starters)
+              AND trial_time IS NOT NULL AND trial_time > 0
+              AND race_time IS NOT NULL AND race_time > trial_time
+              AND st IS NOT NULL AND st > 0
+              AND COALESCE(raw_line,'') NOT LIKE '%欠責%'
+              AND COALESCE(raw_line,'') NOT LIKE '%周誤%'
+              AND COALESCE(raw_line,'') NOT LIKE '%欠車%'
+              AND COALESCE(raw_line,'') NOT LIKE '%出走取消%'
+              AND COALESCE(raw_line,'') NOT LIKE '%競走中止%'
+              AND COALESCE(raw_line,'') NOT LIKE '%落車%'
+              AND COALESCE(raw_line,'') NOT LIKE '%反則%'
+              AND COALESCE(raw_line,'') NOT LIKE '%不成立%'
+              AND COALESCE(raw_line,'') NOT LIKE '%失格%'
             ORDER BY race_date DESC
             LIMIT 160
         """, con, params=(key,))
@@ -6123,6 +6149,19 @@ def v15_save_player_history(df, db_path=DB_PATH):
             race_time = None if pd.isna(row.get("競走T")) else float(row.get("競走T"))
             st = None if pd.isna(row.get("ST")) else float(row.get("ST"))
             car_no = None if pd.isna(row.get("車番")) else int(row.get("車番"))
+            raw_history_text = str(row.get("_raw") or "")
+            invalid_markers = ("欠責", "周誤", "欠車", "出走取消", "競走中止", "落車", "反則", "不成立", "失格")
+            marker = next((m for m in invalid_markers if m in raw_history_text), "")
+            numeric_invalid = (
+                finish is None or finish < 1
+                or trial is None or trial <= 0
+                or race_time is None or race_time <= 0
+                or race_time <= trial
+                or st is None or st <= 0
+            )
+            use_for_model = 0 if marker or numeric_invalid else 1
+            result_status = marker or ("無効タイム" if numeric_invalid else "通常")
+
             candidate_row = {
                 "race_date": race_date, "venue": venue, "finish": finish,
                 "handicap": handicap_text, "trial_time": trial,
@@ -6150,9 +6189,9 @@ def v15_save_player_history(df, db_path=DB_PATH):
                         player_id, race_date, venue, race_no, finish, starters, surface,
                         handicap, trial_time, race_time, start_time, result_status,
                         use_for_model, source, record_key, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '通常', 1, 'スマホ貼付登録', ?, CURRENT_TIMESTAMP)""",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'スマホ貼付登録', ?, CURRENT_TIMESTAMP)""",
                     (player_id, race_date, venue, race_type, finish, starters, surface,
-                     handicap_text, trial, race_time, st, record_key),
+                     handicap_text, trial, race_time, st, result_status, use_for_model, record_key),
                 )
                 inserted += 1
 

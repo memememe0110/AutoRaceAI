@@ -545,7 +545,7 @@ if "github_pull_done" not in st.session_state:
 
 with st.sidebar:
     st.header("予測設定")
-    trials = st.selectbox("試行回数", [3000, 10000, 20000], index=1)
+    trials = st.selectbox("試行回数", [3000, 10000, 20000], index=2)
     seed = st.number_input("乱数シード", min_value=0, value=20260719, step=1)
     st.divider()
     st.subheader("履歴DB")
