@@ -11155,3 +11155,219 @@ def v65_apply_weather_condition_learning(df, entries=None, meta=None, db_path=No
     if "予測競走T" in out.columns:
         out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"], errors="coerce") - bonus * 0.0010, 4)
     return out
+
+# ============================================================
+# Ver67: 券種別の予測分布保存・結果照合・累積確率自己評価
+# ============================================================
+def v67_init_ticket_feedback_tables(db_path=DB_PATH):
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS v67_prediction_tickets (
+            race_key TEXT NOT NULL,
+            bet_type TEXT NOT NULL,
+            combination TEXT NOT NULL,
+            probability REAL NOT NULL,
+            predicted_rank INTEGER NOT NULL,
+            cumulative_probability REAL NOT NULL,
+            simulation_count INTEGER,
+            created_at TEXT,
+            PRIMARY KEY (race_key, bet_type, combination)
+        );
+        CREATE TABLE IF NOT EXISTS v67_ticket_feedback (
+            race_key TEXT NOT NULL,
+            bet_type TEXT NOT NULL,
+            actual_combination TEXT NOT NULL,
+            predicted_rank INTEGER,
+            individual_probability REAL,
+            cumulative_probability REAL,
+            total_combinations INTEGER,
+            analyzed_at TEXT,
+            PRIMARY KEY (race_key, bet_type)
+        );
+        """)
+        con.commit()
+
+
+def _v67_combo_text(combo, unordered=False):
+    if not isinstance(combo, (tuple, list)):
+        combo = (combo,)
+    vals = [int(x) for x in combo]
+    if unordered:
+        vals = sorted(vals)
+    return "-".join(map(str, vals))
+
+
+def v67_save_ticket_snapshot(meta, bets, trials, db_path=DB_PATH):
+    """予測時点の全組み合わせ確率を保存する。結果登録後の先読みを防ぐため予測時のみ呼ぶ。"""
+    v67_init_ticket_feedback_tables(db_path)
+    race_key = v34_race_key(meta)
+    total = max(int(trials or 0), 1)
+    mapping = {
+        "2連単": ("2車単", False),
+        "2連複": ("2車複", True),
+        "3連複": ("三連複", True),
+        "3連単": ("三連単", False),
+    }
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(db_path) as con:
+        con.execute("DELETE FROM v67_prediction_tickets WHERE race_key=?", (race_key,))
+        for bet_type, (source_key, unordered) in mapping.items():
+            counter = (bets or {}).get(source_key, {})
+            items = sorted(counter.items(), key=lambda x: (-int(x[1]), _v67_combo_text(x[0], unordered)))
+            cumulative = 0.0
+            seen = set()
+            rank = 0
+            for combo, count in items:
+                text = _v67_combo_text(combo, unordered)
+                if text in seen:
+                    continue
+                seen.add(text)
+                rank += 1
+                probability = float(count) / total * 100.0
+                cumulative += probability
+                con.execute("""
+                    INSERT INTO v67_prediction_tickets
+                    (race_key,bet_type,combination,probability,predicted_rank,cumulative_probability,simulation_count,created_at)
+                    VALUES(?,?,?,?,?,?,?,?)
+                """, (race_key, bet_type, text, probability, rank, cumulative, int(count), now))
+        con.commit()
+    return race_key
+
+
+def _v67_actual_combinations(results):
+    valid = results.copy()
+    valid["着順"] = pd.to_numeric(valid["着順"], errors="coerce")
+    valid["車番"] = pd.to_numeric(valid["車番"], errors="coerce")
+    valid = valid.dropna(subset=["着順", "車番"]).sort_values("着順")
+    cars = valid["車番"].astype(int).tolist()
+    if len(cars) < 3:
+        return {}
+    return {
+        "2連単": f"{cars[0]}-{cars[1]}",
+        "2連複": "-".join(map(str, sorted(cars[:2]))),
+        "3連複": "-".join(map(str, sorted(cars[:3]))),
+        "3連単": f"{cars[0]}-{cars[1]}-{cars[2]}",
+    }
+
+
+def v67_analyze_ticket_result(meta, results, db_path=DB_PATH):
+    """実結果が予測確率上位から累積何%地点にあったかを券種別に保存・返却する。"""
+    v67_init_ticket_feedback_tables(db_path)
+    race_key = v34_race_key(meta)
+    actuals = _v67_actual_combinations(results)
+    rows = []
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(db_path) as con:
+        for bet_type, actual in actuals.items():
+            hit = con.execute("""
+                SELECT predicted_rank, probability, cumulative_probability
+                FROM v67_prediction_tickets
+                WHERE race_key=? AND bet_type=? AND combination=?
+            """, (race_key, bet_type, actual)).fetchone()
+            total_combos = con.execute(
+                "SELECT COUNT(*) FROM v67_prediction_tickets WHERE race_key=? AND bet_type=?",
+                (race_key, bet_type),
+            ).fetchone()[0]
+            if hit:
+                rank, prob, cumulative = int(hit[0]), float(hit[1]), float(hit[2])
+                con.execute("""
+                    INSERT INTO v67_ticket_feedback
+                    (race_key,bet_type,actual_combination,predicted_rank,individual_probability,cumulative_probability,total_combinations,analyzed_at)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(race_key,bet_type) DO UPDATE SET
+                    actual_combination=excluded.actual_combination,
+                    predicted_rank=excluded.predicted_rank,
+                    individual_probability=excluded.individual_probability,
+                    cumulative_probability=excluded.cumulative_probability,
+                    total_combinations=excluded.total_combinations,
+                    analyzed_at=excluded.analyzed_at
+                """, (race_key, bet_type, actual, rank, prob, cumulative, total_combos, now))
+                rows.append({"券種": bet_type, "的中組み合わせ": actual, "予測順位": rank,
+                             "個別確率": prob, "上位累積確率": cumulative, "全組み合わせ数": total_combos})
+            else:
+                rows.append({"券種": bet_type, "的中組み合わせ": actual, "予測順位": None,
+                             "個別確率": None, "上位累積確率": None, "全組み合わせ数": total_combos})
+        con.commit()
+    return pd.DataFrame(rows)
+
+
+def v67_ticket_feedback_stats(db_path=DB_PATH):
+    """券種別の的中位置平均と累積分位点を返す。"""
+    v67_init_ticket_feedback_tables(db_path)
+    with sqlite3.connect(db_path) as con:
+        df = pd.read_sql_query("""
+            SELECT bet_type, cumulative_probability, predicted_rank
+            FROM v67_ticket_feedback
+            WHERE cumulative_probability IS NOT NULL
+        """, con)
+    if df.empty:
+        return pd.DataFrame(columns=["券種","レース数","平均","中央値","80%カバー","90%カバー","95%カバー"])
+    out = []
+    for bet_type, g in df.groupby("bet_type"):
+        vals = pd.to_numeric(g["cumulative_probability"], errors="coerce").dropna()
+        if vals.empty:
+            continue
+        out.append({
+            "券種": bet_type, "レース数": len(vals), "平均": float(vals.mean()),
+            "中央値": float(vals.median()), "80%カバー": float(vals.quantile(.80)),
+            "90%カバー": float(vals.quantile(.90)), "95%カバー": float(vals.quantile(.95)),
+        })
+    order = {"2連単":0,"2連複":1,"3連複":2,"3連単":3}
+    return pd.DataFrame(out).sort_values("券種", key=lambda s:s.map(order)).reset_index(drop=True)
+
+
+def v67_ticket_highlight_table(meta, bet_type, cutoff_pct, db_path=DB_PATH):
+    v67_init_ticket_feedback_tables(db_path)
+    race_key = v34_race_key(meta)
+    with sqlite3.connect(db_path) as con:
+        df = pd.read_sql_query("""
+            SELECT predicted_rank AS 順位, combination AS 組み合わせ,
+                   probability AS 確率, cumulative_probability AS 累積確率
+            FROM v67_prediction_tickets
+            WHERE race_key=? AND bet_type=? AND cumulative_probability<=?
+            ORDER BY predicted_rank
+        """, con, params=(race_key, bet_type, float(cutoff_pct)+1e-9))
+        # 境界を超える最初の1件も含め、指定カバー率に到達させる。
+        if df.empty or (not df.empty and float(df["累積確率"].max()) + 0.01 < float(cutoff_pct)):
+            extra = pd.read_sql_query("""
+                SELECT predicted_rank AS 順位, combination AS 組み合わせ,
+                       probability AS 確率, cumulative_probability AS 累積確率
+                FROM v67_prediction_tickets
+                WHERE race_key=? AND bet_type=? AND cumulative_probability>?
+                ORDER BY predicted_rank LIMIT 1
+            """, con, params=(race_key, bet_type, float(cutoff_pct)))
+            df = pd.concat([df, extra], ignore_index=True).drop_duplicates("組み合わせ")
+    return df
+
+
+def v67_compress_formations(combos, bet_type):
+    """強調対象を人が読みやすいフォーメーションへ圧縮する。"""
+    parsed = []
+    for text in combos:
+        try:
+            parsed.append(tuple(int(x) for x in str(text).split("-")))
+        except Exception:
+            continue
+    if not parsed:
+        return []
+    lines = []
+    if bet_type == "3連単":
+        by_first = {}
+        for a,b,c in parsed:
+            item = by_first.setdefault(a, {"second": set(), "third": set(), "count": 0})
+            item["second"].add(b); item["third"].add(c); item["count"] += 1
+        for a, item in sorted(by_first.items()):
+            s2 = "".join(map(str, sorted(item["second"])))
+            s3 = "".join(map(str, sorted(item["third"])))
+            lines.append(f"{a}-{s2}-{s3}（対象{item['count']}点）")
+    elif bet_type == "3連複":
+        lines = ["-".join(map(str, x)) for x in sorted(set(tuple(sorted(x)) for x in parsed))]
+    elif bet_type == "2連単":
+        by_first = {}
+        for a,b in parsed:
+            by_first.setdefault(a, set()).add(b)
+        for a, seconds in sorted(by_first.items()):
+            lines.append(f"{a}-{''.join(map(str, sorted(seconds)))}（{len(seconds)}点）")
+    elif bet_type == "2連複":
+        lines = ["-".join(map(str, x)) for x in sorted(set(tuple(sorted(x)) for x in parsed))]
+    return lines

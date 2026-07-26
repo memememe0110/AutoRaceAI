@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver63｜グランドノート未リンク診断・修復／全件再学習／未来データ完全除外")
+st.caption("Ver67｜券種別自己評価・上位累積確率・強調範囲の買い目圧縮")
 
 
 def qident(name: str) -> str:
@@ -375,6 +375,91 @@ def show_ticket_table(title: str, bets: dict, key: str, trials: int, top_n: int 
             "的中回数": st.column_config.NumberColumn("的中回数", format="%d回"),
         },
     )
+
+
+
+def show_v67_self_evaluation(meta: dict) -> None:
+    """過去結果から券種別カバー率を表示し、現在予測の該当範囲を強調・圧縮する。"""
+    stats = engine.v67_ticket_feedback_stats(engine.DB_PATH)
+    st.subheader("🎯 AI自己評価・上位累積確率ライン")
+    if stats.empty:
+        st.info("結果照合データがまだありません。今後、予測後に結果を登録すると券種別の平均と強調ラインが育ちます。")
+        return
+    st.dataframe(
+        stats,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "平均": st.column_config.NumberColumn(format="%.2f%%"),
+            "中央値": st.column_config.NumberColumn(format="%.2f%%"),
+            "80%カバー": st.column_config.NumberColumn(format="%.2f%%"),
+            "90%カバー": st.column_config.NumberColumn(format="%.2f%%"),
+            "95%カバー": st.column_config.NumberColumn(format="%.2f%%"),
+        },
+    )
+    coverage = st.selectbox("強調ライン", [80, 90, 95], index=1, format_func=lambda x: f"過去{x}%の結果を含む範囲")
+    stat_col = f"{coverage}%カバー"
+    tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
+    for tab, bet_type in zip(tabs, ["2連単", "2連複", "3連複", "3連単"]):
+        with tab:
+            row = stats[stats["券種"] == bet_type]
+            if row.empty:
+                st.info(f"{bet_type}は結果照合がまだありません。")
+                continue
+            cutoff = float(row.iloc[0][stat_col])
+            sample = int(row.iloc[0]["レース数"])
+            highlighted = engine.v67_ticket_highlight_table(meta, bet_type, cutoff, engine.DB_PATH)
+            st.success(f"過去{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで（{sample}レース集計）")
+            if highlighted.empty:
+                st.caption("現在の予測分布を取得できませんでした。予測をもう一度実行してください。")
+                continue
+            st.dataframe(
+                highlighted,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "確率": st.column_config.NumberColumn(format="%.3f%%"),
+                    "累積確率": st.column_config.NumberColumn(format="%.2f%%"),
+                },
+            )
+            formations = engine.v67_compress_formations(highlighted["組み合わせ"].tolist(), bet_type)
+            if formations:
+                st.markdown("#### 強調範囲のまとめ")
+                for line in formations:
+                    st.code(line, language=None)
+                st.caption("圧縮表記は候補を見やすくまとめたものです。表記から展開される全点が、上の強調対象と完全一致しない場合があるため、正確な対象は一覧表を優先してください。")
+
+
+def show_v67_result_analysis(ticket_analysis: pd.DataFrame) -> None:
+    st.subheader("🎯 実結果は予測の上位累積何%地点だったか")
+    if ticket_analysis is None or ticket_analysis.empty:
+        st.info("同じレースの券種別予測確率が保存されていないため、照合できませんでした。")
+        return
+    display = ticket_analysis.copy()
+    st.dataframe(
+        display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "個別確率": st.column_config.NumberColumn(format="%.3f%%"),
+            "上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
+        },
+    )
+    stats = engine.v67_ticket_feedback_stats(engine.DB_PATH)
+    if not stats.empty:
+        st.markdown("#### これまでの平均")
+        st.dataframe(
+            stats,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "平均": st.column_config.NumberColumn(format="%.2f%%"),
+                "中央値": st.column_config.NumberColumn(format="%.2f%%"),
+                "80%カバー": st.column_config.NumberColumn(format="%.2f%%"),
+                "90%カバー": st.column_config.NumberColumn(format="%.2f%%"),
+                "95%カバー": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
 
 
 def normalize_ticket_combo(value: str, unordered: bool = False) -> str:
@@ -822,6 +907,7 @@ with prediction_tab:
                 df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
                 finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
                 race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
+                engine.v67_save_ticket_snapshot(meta, bets, int(trials), engine.DB_PATH)
                 engine.v40_save_prediction_features(meta, df, engine.DB_PATH)
             # オッズ入力などによる再描画後も、直前の予測結果を保持する。
             st.session_state["last_prediction_view"] = {
@@ -1029,6 +1115,8 @@ with prediction_tab:
                 show_ticket_table("3連単確率", bets, "三連単", view_trials, 20)
                 show_odds_comparison("3連単", bets, "三連単", view_trials, "3tan", unordered=False, namespace=odds_namespace)
 
+            show_v67_self_evaluation(meta)
+
             if Path(output).exists():
                 st.download_button(
                     "予測結果Excelを保存",
@@ -1102,10 +1190,12 @@ with result_tab:
                 key, comparison, analysis, adjustment, registration = engine.v41_register_result(
                     meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
                 )
+                ticket_analysis = engine.v67_analyze_ticket_result(meta_r, rows_r, engine.DB_PATH)
                 if registration.get("duplicate"):
                     st.warning(analysis.get("message", "このレースは登録済みです。"))
                     st.stop()
                 st.success(f"結果を登録しました: {key}")
+                show_v67_result_analysis(ticket_analysis)
                 predicted_trifecta_saved = ""
                 actual_trifecta_saved = ""
                 if "message" not in analysis:
