@@ -765,6 +765,25 @@ with prediction_tab:
             )
             st.caption("選手の所属場は開催場として使いません。実際の開催場を選択してください。")
 
+    # Ver64: 予測実行前に出走表の読み取り結果を確認できるようにする。
+    if text.strip():
+        try:
+            preview_entries = engine.v15_parse_entries(text)
+            if isinstance(preview_entries, pd.DataFrame) and not preview_entries.empty:
+                preview_cols = [c for c in [
+                    "車番", "選手名", "所属", "ハンデ", "試走T", "ST",
+                    "試走偏差", "現ランク", "平均競走T", "最高競走T",
+                    "近10走着順", "近10走2連", "近10走3連", "車名"
+                ] if c in preview_entries.columns]
+                with st.expander(f"📋 出走表の読み取り確認（{len(preview_entries)}名）", expanded=False):
+                    st.dataframe(preview_entries[preview_cols], use_container_width=True, hide_index=True)
+                    if preview_entries["車番"].nunique() < 8:
+                        st.warning("8車すべてを取得できていません。貼り付け範囲を確認してください。")
+            else:
+                st.warning("出走表から選手を読み取れませんでした。ページ全体をコピーして貼り付けてください。")
+        except Exception as exc:
+            st.warning(f"出走表の事前確認に失敗しました: {exc}")
+
     manual_excluded = []
     if text.strip():
         auto_excluded = {int(car): "手動指定" for car in manual_excluded}

@@ -10776,3 +10776,157 @@ def v63_db_health_report(db_path=DB_PATH):
         "result_lap_rows": int(status.get("結果周回行", 0)),
         "learned_lap_rows": int(status.get("選手別周回行", 0)),
     }
+
+# ============================================================
+# Ver64 出走表読取強化
+# ・予想印付き氏名、氏名末尾の所属LGに対応
+# ・年齢/期、当日試走、試走偏差、近10走、車名、車級を確実に取得
+# ・近10走成績を小さな当日補正として予測へ反映
+# ============================================================
+
+_v64_old_parse_entry_block = v152_parse_entry_block
+
+
+def _v64_first_float(pattern, text, flags=0):
+    m = re.search(pattern, text, flags)
+    return float(m.group(1)) if m else np.nan
+
+
+def v152_parse_entry_block(block):
+    car_no = int(block["車番"])
+    lines = [str(x).strip() for x in block.get("lines", []) if str(x).strip()]
+    if not lines:
+        return None
+
+    # まず従来処理を通し、Ver64で不足項目を正確に補完する。
+    row = _v64_old_parse_entry_block(block) or {}
+    joined = "\n".join(lines)
+    compact = " ".join(lines)
+
+    # 氏名・所属。先頭の予想印は除き、末尾LGは所属へ分離する。
+    raw_name = lines[0]
+    lg_m = re.search(r"[（(](川口|伊勢崎|浜松|山陽|飯塚)[）)]\s*$", raw_name)
+    row["所属"] = lg_m.group(1) if lg_m else row.get("所属")
+    row["選手名"] = v15_normalize_name(raw_name)
+
+    # 年齢・期別。「18歳/39期」の同一行を確実に取得。
+    age_term = re.search(r"(\d{1,3})歳\s*/\s*(\d{1,2})期", compact)
+    if age_term:
+        row["年齢"] = int(age_term.group(1))
+        row["期別"] = int(age_term.group(2))
+
+    # ハンデ/ST/当日試走。「ハンデ0m/ST0.16 3.47」に対応。
+    hs = re.search(
+        r"ハンデ\s*([+-]?\d+|-)\s*m\s*/\s*ST\s*([+-]?\d?\.\d{2,3})\s+([3-9]\.\d{2,3}|-)",
+        compact, re.I,
+    )
+    if hs:
+        row["ハンデ"] = 0 if hs.group(1) == "-" else int(hs.group(1))
+        row["ST"] = float(hs.group(2))
+        row["試走T"] = np.nan if hs.group(3) == "-" else float(hs.group(3))
+
+    # 試走偏差と現ランクが同じ行に並ぶ形式。「0.087 B-135」
+    dev_rank = re.search(r"(?:^|\s)(0\.\d{3})\s+([SAB]-\d+)(?:\s|$)", compact)
+    if dev_rank:
+        row["試走偏差"] = float(dev_rank.group(1))
+        row["現ランク"] = dev_rank.group(2)
+        row["級別"] = dev_rank.group(2).split("-")[0]
+
+    prev = re.search(r"\(前\s*([SAB]-\d+)\)", compact)
+    if prev:
+        row["前ランク"] = prev.group(1)
+
+    # 平均・最高タイム。
+    for key, pattern in (
+        ("平均試走T", r"平均試走T\s*([3-9]\.\d{2,3})"),
+        ("平均競走T", r"平均競走T\s*([3-9]\.\d{3})"),
+        ("最高競走T", r"最高競走T\s*([3-9]\.\d{3})"),
+    ):
+        value = _v64_first_float(pattern, compact)
+        if pd.notna(value):
+            row[key] = value
+
+    # 近10走成績。最初に現れる「着順 a-b-c-d」と、その直後の2連/3連を採用。
+    recent = re.search(r"着順\s*(\d+-\d+-\d+-\d+)", compact)
+    if recent:
+        row["近10走着順"] = recent.group(1)
+    two = re.search(r"2連\s*([0-9.]+)%", compact)
+    three = re.search(r"3連\s*([0-9.]+)%", compact)
+    if two:
+        row["近10走2連"] = float(two.group(1))
+    if three:
+        row["近10走3連"] = float(three.group(1))
+
+    # 車名は「3連 xx%」の直後。タブが潰れて同じ行でも取得する。
+    car_m = re.search(
+        r"3連\s*[0-9.]+%\s+(.+?)(?=\s+[12]\s+着順\s*\d+-\d+-\d+-\d+|$)",
+        compact,
+    )
+    if car_m:
+        candidate = car_m.group(1).strip()
+        if candidate and not re.fullmatch(r"[12]", candidate):
+            row["車名"] = candidate
+
+    # 車級は車名直後にある単独1/2。車番とは別物。
+    vehicle_grade = None
+    grade_m = re.search(
+        r"3連\s*[0-9.]+%\s+.+?\s+([12])\s+着順\s*\d+-\d+-\d+-\d+",
+        compact,
+    )
+    if grade_m:
+        vehicle_grade = int(grade_m.group(1))
+    row["車級"] = vehicle_grade
+
+    # 競走車成績の6率。近10走2連/3連を除いた末尾6件を採用。
+    all_pct = [float(x) for x in re.findall(r"([0-9]+(?:\.[0-9]+)?)%", compact)]
+    if len(all_pct) >= 8:
+        tail = all_pct[-6:]
+        for key, value in zip(
+            ["2連対率", "3連対率", "良2連対率", "良3連対率", "湿2連対率", "湿3連対率"],
+            tail,
+        ):
+            row[key] = value
+
+    row["_raw"] = joined
+    return row
+
+
+# 近10走成績を予測へ小さく反映する。極端な上書きを避け最大±0.8点。
+_v64_old_context_bonus = v24_apply_race_context_bonus
+
+
+def v24_apply_race_context_bonus(df, entries=None, track_temp=30.0):
+    out = _v64_old_context_bonus(df, entries=entries, track_temp=track_temp)
+    if out is None or out.empty or entries is None or len(entries) == 0:
+        return out
+    car_col = "車" if "車" in out.columns else "車番"
+    if car_col not in out.columns or "車番" not in entries.columns:
+        return out
+
+    ent = entries.copy()
+    cols = [c for c in ["車番", "近10走2連", "近10走3連", "平均競走T", "最高競走T"] if c in ent.columns]
+    if len(cols) <= 1:
+        return out
+    current = ent[cols].drop_duplicates("車番")
+    merged = out[[car_col]].merge(current, left_on=car_col, right_on="車番", how="left")
+
+    two = pd.to_numeric(merged.get("近10走2連"), errors="coerce")
+    three = pd.to_numeric(merged.get("近10走3連"), errors="coerce")
+    if two.notna().any() or three.notna().any():
+        form = two.fillna(two.median() if two.notna().any() else 20.0) * 0.45
+        form += three.fillna(three.median() if three.notna().any() else 35.0) * 0.55
+        center = float(form.median())
+        spread = max(float(form.quantile(.85) - form.quantile(.15)), 15.0)
+        bonus = np.clip((form.to_numpy(float) - center) / spread * 0.65, -0.65, 0.80)
+    else:
+        bonus = np.zeros(len(out), dtype=float)
+
+    out["近10走勢い補正"] = np.round(bonus, 3)
+    if "改善後総合点" in out.columns:
+        out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.30
+    if "予測競走T" in out.columns:
+        out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"], errors="coerce") - bonus * 0.0008, 4)
+    return out
