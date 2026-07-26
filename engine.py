@@ -11500,3 +11500,97 @@ def ver16_run_prediction(text, trials=10000, seed=20260719, manual_excluded=None
 
 def v68_get_latest_future_audit():
     return globals().get("LATEST_FUTURE_AUDIT") or v68_future_audit_summary()
+
+# ============================================================
+# Ver70: 登録済み結果の再登録（置き換え）
+# ============================================================
+def _v70_delete_old_result_generated_history(con, race_key):
+    con.row_factory = sqlite3.Row
+    rr = con.execute("SELECT * FROM result_races WHERE race_key=?", (race_key,)).fetchone()
+    entries = con.execute("SELECT * FROM result_entries WHERE race_key=?", (race_key,)).fetchall()
+    if not rr:
+        return 0
+    deleted = 0
+    race_no = v61_race_no(rr["race_no"] if "race_no" in rr.keys() else None)
+    for e in entries:
+        player_name = str(e["player_name"] or "").strip()
+        if not player_name:
+            continue
+        found = _v32_find_player(con, player_name)
+        if found:
+            player_id = found[0]
+            rows = con.execute(
+                "SELECT * FROM race_history WHERE player_id=? AND race_date=? AND venue=?",
+                (player_id, rr["race_date"], rr["venue"]),
+            ).fetchall()
+            cols = [d[0] for d in con.execute("SELECT * FROM race_history LIMIT 0").description]
+            for rh in rows:
+                d = dict(zip(cols, rh))
+                same_r = race_no is None or v61_race_no(d.get("race_no")) == race_no
+                same_values = (
+                    _v33_norm_number(d.get("finish"), 0) == _v33_norm_number(e["finish"], 0)
+                    and _v33_norm_number(d.get("trial_time"), 3) == _v33_norm_number(e["trial_time"], 3)
+                    and _v33_norm_number(d.get("race_time"), 3) == _v33_norm_number(e["race_time"], 3)
+                    and _v33_norm_number(d.get("start_time"), 3) == _v33_norm_number(e["start_time"], 3)
+                )
+                if same_r and same_values:
+                    con.execute("DELETE FROM race_history WHERE history_id=?", (d["history_id"],))
+                    deleted += 1
+        # 詳細履歴側も、同一レース・同一実値だけ削除。
+        try:
+            con.execute(
+                """DELETE FROM v15_player_history_imports
+                   WHERE REPLACE(REPLACE(player_name,' ',''),'　','')=REPLACE(REPLACE(?,' ',''),'　','')
+                     AND race_date=? AND venue=?
+                     AND (? IS NULL OR CAST(REPLACE(COALESCE(race_no,''),'R','') AS INTEGER)=?)
+                     AND COALESCE(rank,-999)=COALESCE(?,-999)
+                     AND COALESCE(trial_time,-999)=COALESCE(?,-999)
+                     AND COALESCE(race_time,-999)=COALESCE(?,-999)
+                     AND COALESCE(st,-999)=COALESCE(?,-999)""",
+                (player_name, rr["race_date"], rr["venue"], race_no, race_no,
+                 e["finish"], e["trial_time"], e["race_time"], e["start_time"]),
+            )
+        except sqlite3.Error:
+            pass
+    return deleted
+
+
+def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    """同じ日・開催場・Rの登録済み結果を、払戻・周回・履歴ごと安全に置き換える。"""
+    v41_init_tables(db_path)
+    v67_init_ticket_feedback_tables(db_path)
+    key = v34_race_key(meta)
+    exists, _, _ = v41_race_exists(meta, db_path)
+    if not exists:
+        return v41_register_result(meta, results, laps, payouts, db_path)
+
+    with sqlite3.connect(str(db_path)) as con:
+        deleted_histories = _v70_delete_old_result_generated_history(con, key)
+        for table in [
+            "result_laps", "result_payouts", "prediction_feedback", "result_entries",
+            "player_lap_history", "weight_adjustment_history", "v67_ticket_feedback"
+        ]:
+            try:
+                con.execute(f"DELETE FROM {table} WHERE race_key=?", (key,))
+            except sqlite3.Error:
+                pass
+        con.execute("DELETE FROM result_races WHERE race_key=?", (key,))
+        con.execute("DELETE FROM v41_registration_batches WHERE race_key=?", (key,))
+        # 古い結果の学習影響を残さないため、全アクティブ結果を基準に再構築する。
+        try:
+            con.execute("UPDATE adaptive_weights SET current_weight=initial_weight, update_count=0, updated_at=?",
+                        (datetime.now().isoformat(timespec='seconds'),))
+            con.execute("DELETE FROM weight_adjustment_history")
+        except sqlite3.Error:
+            pass
+        con.commit()
+
+    key, comparison, analysis, adjustment, registration = v41_register_result(
+        meta, results, laps, payouts, db_path
+    )
+    analysis = dict(analysis)
+    analysis["再登録"] = True
+    analysis["旧履歴削除"] = int(deleted_histories)
+    registration = dict(registration)
+    registration["replaced"] = True
+    return key, comparison, analysis, adjustment, registration

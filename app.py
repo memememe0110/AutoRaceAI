@@ -1205,16 +1205,45 @@ with result_tab:
         else:
             st.caption("払戻金は見つかりませんでした。")
 
-        if st.button("DBへ登録して予測差・展開を解析", type="primary", use_container_width=True):
+        result_exists = False
+        existing_result_key = ""
+        existing_registered_at = None
+        try:
+            result_exists, existing_result_key, existing_registered_at = engine.v41_race_exists(meta_r, engine.DB_PATH)
+        except Exception:
+            pass
+
+        replace_registered = False
+        if result_exists:
+            st.warning(f"このレースは登録済みです：{existing_result_key}（{existing_registered_at or '登録日時不明'}）")
+            replace_registered = st.checkbox(
+                "登録済みの結果を、今回の内容で置き換える",
+                key=f"replace_result_{existing_result_key}",
+                help="着順・タイム・払戻金・グランドノート・自動追加された選手履歴を置き換えます。予測スナップショットは残します。",
+            )
+            if replace_registered:
+                st.info("再登録では、古い結果データを削除してから今回の内容を登録し直します。")
+
+        button_label = "登録済み結果を置き換えて再解析" if replace_registered else "DBへ登録して予測差・展開を解析"
+        button_disabled = bool(result_exists and not replace_registered)
+        if st.button(button_label, type="primary", use_container_width=True, disabled=button_disabled):
             try:
-                key, comparison, analysis, adjustment, registration = engine.v41_register_result(
-                    meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
-                )
+                if replace_registered:
+                    key, comparison, analysis, adjustment, registration = engine.v70_replace_registered_result(
+                        meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
+                    )
+                else:
+                    key, comparison, analysis, adjustment, registration = engine.v41_register_result(
+                        meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
+                    )
                 ticket_analysis = engine.v67_analyze_ticket_result(meta_r, rows_r, engine.DB_PATH)
                 if registration.get("duplicate"):
                     st.warning(analysis.get("message", "このレースは登録済みです。"))
                     st.stop()
-                st.success(f"結果を登録しました: {key}")
+                if registration.get("replaced"):
+                    st.success(f"登録済み結果を置き換えました: {key}")
+                else:
+                    st.success(f"結果を登録しました: {key}")
                 show_v67_result_analysis(ticket_analysis)
                 predicted_trifecta_saved = ""
                 actual_trifecta_saved = ""
@@ -1286,7 +1315,7 @@ with result_tab:
                 h2.metric("重複スキップ", analysis.get("履歴重複スキップ", 0))
                 h3.metric("周回順位", analysis.get("周回履歴保存", 0))
                 st.caption("結果登録した競走T・試走T・ST・着順・ハンデ・走路条件は、次回以降の予測用選手履歴へ反映されます。")
-                st.caption("同一判定は開催日・開催場・レース番号で行います。レース名称は判定に使いません。同じレースは履歴追加も重み更新も行いません。")
+                st.caption("同一判定は開催日・開催場・レース番号で行います。レース名称は判定に使いません。同じレースは通常登録では重複を防止します。再登録を選んだ場合だけ、古い結果を今回の内容へ置き換えます。")
                 st.caption(f"順位分析対象: {analysis.get('分析対象', 0)}名 / 除外: {analysis.get('分析除外', 0)}名。着順なし・欠車・中止・失格などは順位分析から除外します。")
                 ok, msg = push_db_to_github(f"AutoRaceAI: {key} 結果・周回・払戻登録")
                 (st.success if ok else st.warning)(msg)
