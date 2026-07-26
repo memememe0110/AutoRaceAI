@@ -470,8 +470,26 @@ def show_ticket_table(title: str, bets: dict, key: str, trials: int, top_n: int 
 def show_v67_self_evaluation(meta: dict) -> None:
     """全結果ラインと、大外しを分離した実用ラインを表示する。"""
     st.markdown('<div id="cover-line"></div>', unsafe_allow_html=True)
-    stats = engine.v72_ticket_feedback_stats(engine.DB_PATH)
     st.subheader("🎯 AI自己評価・上位累積確率ライン")
+
+    st.markdown("#### 実用ラインの大外し設定")
+    outlier_cutoff = st.slider(
+        "三連単の大外し判定（上位累積確率）",
+        min_value=50,
+        max_value=99,
+        value=85,
+        step=1,
+        key="v78_coverline_outlier_cutoff",
+        help="三連単の的中位置がこの値以上だったレースは、レース単位で全券種の実用カバーライン計算から除外します。全結果ラインと学習データには残ります。",
+    )
+    st.caption(
+        f"現在の設定：三連単が上位累積{int(outlier_cutoff)}%以上だったレースを、実用ラインだけから除外"
+    )
+
+    stats = engine.v72_ticket_feedback_stats(
+        engine.DB_PATH,
+        trifecta_outlier_cutoff=float(outlier_cutoff),
+    )
     if stats.empty:
         st.info("結果照合データがまだありません。今後、予測後に結果を登録すると券種別の平均と強調ラインが育ちます。")
         return
@@ -500,7 +518,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
     )
     line_mode = st.radio(
         "ライン計算", ["実用ライン", "全結果ライン"], horizontal=True,
-        help="実用ラインは、10レース以上ある券種で極端に悪い上側外れ値だけを最大10%まで分離します。全結果ラインはすべての結果を含みます。",
+        help=f"実用ラインは、三連単の的中位置が上位累積{int(outlier_cutoff)}%以上だったレースを、全券種の計算から除外します。全結果ラインはそのレースも含みます。",
     )
 
     st.markdown("#### 強調する最大点数")
@@ -539,21 +557,26 @@ def show_v67_self_evaluation(meta: dict) -> None:
                 used = int(r["実用レース数"])
                 st.success(
                     f"実用{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで "
-                    f"（全{sample}レース中 {used}レース使用・大外し{excluded}件を分離）"
+                    f"（全{sample}レース中 {used}レース使用・三連単{int(outlier_cutoff)}%以上のレース{excluded}件を除外）"
                 )
             else:
                 cutoff = float(r[f"{coverage}%カバー"])
                 st.info(f"全結果{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで（{sample}レースすべて使用）")
 
             if excluded > 0:
-                with st.expander(f"大外しとして分離した{excluded}件を確認"):
-                    details = engine.v72_ticket_outlier_details(bet_type, engine.DB_PATH)
+                with st.expander(f"三連単{int(outlier_cutoff)}%以上で除外した{excluded}レースを確認"):
+                    details = engine.v72_ticket_outlier_details(
+                        bet_type,
+                        engine.DB_PATH,
+                        trifecta_outlier_cutoff=float(outlier_cutoff),
+                    )
                     st.dataframe(
                         details,
                         use_container_width=True,
                         hide_index=True,
                         column_config={
                             "上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
+                            "三連単上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
                         },
                     )
 
@@ -646,6 +669,7 @@ def show_v67_result_analysis(ticket_analysis: pd.DataFrame) -> None:
         column_config={
             "個別確率": st.column_config.NumberColumn(format="%.3f%%"),
             "上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
+                            "三連単上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
         },
     )
     stats = engine.v67_ticket_feedback_stats(engine.DB_PATH)
@@ -1454,6 +1478,12 @@ with result_tab:
                     st.success(f"登録済み結果を置き換えました: {key}")
                 else:
                     st.success(f"結果を登録しました: {key}")
+                if registration.get("learning_excluded"):
+                    st.warning(
+                        "⚠️ 事故レースのためAI学習対象外です。"
+                        f" 理由: {registration.get('learning_exclusion_reason') or '事故・異常終了'}。"
+                        "結果・払戻金・グランドノートは保存しましたが、選手履歴学習・展開学習・重み更新には使いません。"
+                    )
                 show_v67_result_analysis(ticket_analysis)
                 predicted_trifecta_saved = ""
                 actual_trifecta_saved = ""
@@ -1905,6 +1935,37 @@ with db_tab:
                         f"数値完全一致の正規履歴 {exact_result['merged_histories']}件・詳細履歴 {exact_result['merged_imports']}件、R相違の確認対象 {exact_result.get('r_conflicts', 0)}組、"
                         f"その他の同一走行履歴 {race_result['deleted_histories']}件・詳細履歴 {race_result['deleted_imports']}件、"
                         f"レース識別違いの正規履歴 {identity_result['merged_histories']}件・詳細履歴 {identity_result['merged_imports']}件を統合しました。"
+                    )
+                    if ok:
+                        st.success(summary + " " + msg)
+                    else:
+                        st.warning(summary + " GitHub保存は未完了です。" + msg)
+                    st.rerun()
+
+                st.divider()
+                st.subheader("事故レースの学習除外")
+                st.caption("落車・反則・周回誤認・失格・競走中止などが1台でもあるレースは、結果を残したままレース全体をAI学習から除外します。")
+                try:
+                    accident_status = engine.v76_accident_learning_status(engine.DB_PATH)
+                    st.caption(
+                        f"登録結果 {accident_status.get('登録結果', 0)}レース / "
+                        f"学習対象外 {accident_status.get('事故レース除外', 0)}レース"
+                    )
+                    if accident_status.get("対象レース"):
+                        with st.expander("学習対象外の事故レースを確認", expanded=False):
+                            st.dataframe(pd.DataFrame(accident_status["対象レース"]), use_container_width=True, hide_index=True)
+                except Exception as exc:
+                    st.caption(f"事故レース状況を取得できませんでした: {exc}")
+                if st.button("登録済み結果を再点検して事故レースを学習対象外にする", use_container_width=True):
+                    with st.spinner("登録済み結果を再点検しています..."):
+                        accident_result = engine.v76_reclassify_existing_accident_races(engine.DB_PATH)
+                    ok, msg = push_db_to_github("AutoRaceAI: 事故レースを学習対象外へ再分類")
+                    summary = (
+                        f"{accident_result.get('結果レース確認', 0)}レースを確認し、"
+                        f"事故 {accident_result.get('事故レース', 0)}レースを学習対象外にしました。"
+                        f" 選手履歴 {accident_result.get('選手履歴除外', 0)}行を除外、"
+                        f"周回学習 {accident_result.get('周回学習削除', 0)}行・"
+                        f"事故レースの重み履歴 {accident_result.get('重み履歴削除', 0)}件を削除しました。"
                     )
                     if ok:
                         st.success(summary + " " + msg)

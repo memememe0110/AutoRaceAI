@@ -11937,3 +11937,461 @@ def v74_optimization_history(db_path=DB_PATH, limit=20):
             candidate_count AS 候補数, CASE applied WHEN 1 THEN '適用済み' ELSE '未適用' END AS 状態,
             applied_at AS 適用日時
             FROM v74_weight_optimization_history ORDER BY optimization_id DESC LIMIT ?""",con,params=(int(limit),))
+
+# ============================================================
+# Ver76: 事故レースは保存するが、AI学習からレース単位で除外
+# ============================================================
+V76_ACCIDENT_PATTERN = re.compile(
+    r"落車|他落|落妨|反則|反妨|妨害|周誤|周回誤認|競走中止|不成立|失格|欠責|欠車|出走取消|参加解除",
+    re.IGNORECASE,
+)
+
+
+def v76_init_accident_learning_columns(db_path=DB_PATH):
+    v41_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        _ensure_sqlite_columns(con, "result_races", {
+            "model_eligible": "INTEGER NOT NULL DEFAULT 1",
+            "model_exclusion_reason": "TEXT NOT NULL DEFAULT ''",
+        })
+        con.commit()
+
+
+def _v76_status_text(row):
+    values = []
+    if isinstance(row, pd.Series):
+        getter = row.get
+    elif isinstance(row, dict):
+        getter = row.get
+    else:
+        getter = lambda key, default="": getattr(row, key, default)
+    for key in ("結果区分", "事故", "result_status", "status", "異常"):
+        value = getter(key, "")
+        if value is not None and not (isinstance(value, float) and np.isnan(value)):
+            values.append(str(value))
+    return " ".join(values).strip()
+
+
+def v76_accident_reasons(results):
+    """事故・異常終了の理由一覧。1台でも該当すればレース全体を除外する。"""
+    if results is None:
+        return []
+    work = results if isinstance(results, pd.DataFrame) else pd.DataFrame(results)
+    reasons = []
+    for _, row in work.iterrows():
+        text = _v76_status_text(row)
+        for match in V76_ACCIDENT_PATTERN.findall(text):
+            if match and match not in reasons:
+                reasons.append(match)
+    return reasons
+
+
+def v76_is_accident_race(results):
+    return bool(v76_accident_reasons(results))
+
+
+def _v76_mark_race(meta, results, db_path=DB_PATH):
+    v76_init_accident_learning_columns(db_path)
+    key = v34_race_key(meta)
+    reasons = v76_accident_reasons(results)
+    eligible = 0 if reasons else 1
+    reason = "・".join(reasons)
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute(
+            "UPDATE result_races SET model_eligible=?, model_exclusion_reason=? WHERE race_key=?",
+            (eligible, reason, key),
+        )
+        con.commit()
+    return eligible, reason
+
+
+# 結果登録処理の中で呼ばれる学習同期を、事故レースだけ止める。
+_v76_original_v36_update_player_histories = v36_update_player_histories
+
+def v36_update_player_histories(meta, results, laps=None, db_path=DB_PATH):
+    if v76_is_accident_race(results):
+        key = v34_race_key(meta)
+        # 再登録時に旧学習行が残るケースも除去。
+        with sqlite3.connect(str(db_path)) as con:
+            try:
+                con.execute("DELETE FROM player_lap_history WHERE race_key=?", (key,))
+            except sqlite3.Error:
+                pass
+            con.commit()
+        return {
+            "履歴追加": 0,
+            "履歴重複スキップ": 0,
+            "周回履歴保存": 0,
+            "学習対象外": True,
+            "学習除外理由": "・".join(v76_accident_reasons(results)),
+        }
+    return _v76_original_v36_update_player_histories(meta, results, laps, db_path)
+
+
+# 事故が1台でもいれば、有効完走車だけを部分学習せず、レース全体を除外。
+_v76_original_v41_valid_results = v41_valid_results
+
+def v41_valid_results(results):
+    if v76_is_accident_race(results):
+        work = results.copy() if isinstance(results, pd.DataFrame) else pd.DataFrame(results)
+        reason = "事故レース全体を学習対象外: " + "・".join(v76_accident_reasons(work))
+        work["除外理由"] = reason
+        return work.iloc[0:0].copy(), work
+    return _v76_original_v41_valid_results(results)
+
+
+# 最新の結果登録関数を包み、保存後にレース単位の学習可否を記録。
+_v76_original_v41_register_result = v41_register_result
+
+def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    output = _v76_original_v41_register_result(meta, results, laps, payouts, db_path)
+    eligible, reason = _v76_mark_race(meta, results, db_path)
+    try:
+        key, comparison, analysis, adjustment, registration = output
+        analysis = dict(analysis or {})
+        adjustment = dict(adjustment or {})
+        registration = dict(registration or {})
+        registration["learning_excluded"] = not bool(eligible)
+        registration["learning_exclusion_reason"] = reason
+        if not eligible:
+            analysis["学習対象外"] = True
+            analysis["学習除外理由"] = reason
+            adjustment = {
+                "message": f"事故レース（{reason}）のため、重みは変更していません。",
+                "learning_excluded": True,
+                "reason": reason,
+            }
+        return key, comparison, analysis, adjustment, registration
+    except Exception:
+        return output
+
+
+# 全結果・直近重視の重み再集計でも、事故レースを丸ごと除外。
+def _v41_all_race_evidence(db_path=DB_PATH):
+    v76_init_accident_learning_columns(db_path)
+    colmap = {
+        "試走": "trial_feature", "ST": "st_feature", "ハンデ": "handicap_feature",
+        "近況": "form_feature", "走路適性": "surface_feature", "前残り": "front_feature",
+        "追い込み": "chase_feature", "周回安定": "stability_feature",
+        "コース適性": "course_feature", "相手耐性": "opponent_feature",
+    }
+    with sqlite3.connect(str(db_path)) as con:
+        races = pd.read_sql_query("""
+            SELECT rr.race_key, rr.registered_at
+              FROM result_races rr
+              JOIN v40_prediction_feature_snapshots s ON s.race_key=rr.race_key
+              LEFT JOIN v41_registration_batches b ON b.race_key=rr.race_key
+             WHERE COALESCE(b.status,'active')='active'
+               AND COALESCE(rr.model_eligible,1)=1
+             GROUP BY rr.race_key, rr.registered_at
+             ORDER BY rr.registered_at DESC, rr.race_key DESC
+        """, con)
+        per_race = []
+        for _, rr in races.iterrows():
+            merged = pd.read_sql_query("""
+                SELECT s.*, e.finish, e.result_status
+                  FROM v40_prediction_feature_snapshots s
+                  JOIN result_entries e ON e.race_key=s.race_key AND e.car_no=s.car_no
+                 WHERE s.race_key=?
+            """, con, params=(rr["race_key"],))
+            if len(merged) < 3:
+                continue
+            finish = pd.to_numeric(merged["finish"], errors="coerce")
+            if merged["result_status"].fillna("").astype(str).str.contains(V76_ACCIDENT_PATTERN).any():
+                continue
+            n_all = len(merged)
+            merged = merged.loc[finish.notna() & (finish >= 1) & (finish <= n_all)].copy()
+            if len(merged) < 3:
+                continue
+            performance = (len(merged) + 1) - pd.to_numeric(merged["finish"], errors="coerce")
+            row = {"race_key": rr["race_key"], "registered_at": rr["registered_at"]}
+            for k, c in colmap.items():
+                row[k] = _v39_spearman(merged[c], performance)
+            per_race.append(row)
+    if not per_race:
+        return {k: 0.0 for k in V40_DEFAULT_WEIGHTS}, {
+            "race_count": 0, "latest_contribution": 0.0, "recent_contribution": 0.0,
+            "accident_races_excluded": True,
+        }
+    ev = pd.DataFrame(per_race)
+    recent = ev.head(V41_RECENT_RACES).copy()
+    recent_weights = np.array([V41_DECAY ** i for i in range(len(recent))], dtype=float)
+    recent_weights /= recent_weights.sum()
+    old = ev.iloc[V41_RECENT_RACES:].copy()
+    evidence = {}
+    for k in V40_DEFAULT_WEIGHTS:
+        recent_value = float(np.average(pd.to_numeric(recent[k], errors="coerce").fillna(0.0), weights=recent_weights))
+        if old.empty:
+            evidence[k] = recent_value
+        else:
+            old_value = float(pd.to_numeric(old[k], errors="coerce").fillna(0.0).mean())
+            evidence[k] = 0.80 * recent_value + 0.20 * old_value
+    return evidence, {
+        "race_count": int(len(ev)), "recent_count": int(len(recent)), "old_count": int(len(old)),
+        "latest_contribution": float(recent_weights[0] * (0.80 if not old.empty else 1.0)),
+        "recent_contribution": 0.80 if not old.empty else 1.0,
+        "accident_races_excluded": True,
+    }
+
+
+# Python sqlite3にはREGEXPが標準でないため、v74はPandas側でレース単位除外する。
+def _v74_dataset(db_path=DB_PATH):
+    v76_init_accident_learning_columns(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        df = pd.read_sql_query("""
+            SELECT s.race_key, s.car_no, s.player_name,
+                   s.trial_feature, s.st_feature, s.handicap_feature,
+                   s.form_feature, s.surface_feature, s.front_feature,
+                   s.chase_feature, s.stability_feature, s.course_feature,
+                   s.opponent_feature, e.finish, e.result_status,
+                   COALESCE(rr.race_date, '') AS race_date,
+                   COALESCE(rr.race_no, 0) AS race_no,
+                   COALESCE(rr.registered_at, '') AS registered_at,
+                   COALESCE(rr.model_eligible,1) AS model_eligible
+              FROM v40_prediction_feature_snapshots s
+              JOIN result_entries e ON e.race_key=s.race_key AND e.car_no=s.car_no
+              JOIN result_races rr ON rr.race_key=s.race_key
+              LEFT JOIN v41_registration_batches b ON b.race_key=s.race_key
+             WHERE COALESCE(b.status,'active')='active'
+             ORDER BY race_date, race_no, registered_at, s.race_key, s.car_no
+        """, con)
+    if df.empty:
+        return df
+    status = df["result_status"].fillna("").astype(str)
+    accident_keys = set(df.loc[status.str.contains(V76_ACCIDENT_PATTERN), "race_key"].astype(str))
+    ineligible_keys = set(df.loc[pd.to_numeric(df["model_eligible"], errors="coerce").fillna(1).eq(0), "race_key"].astype(str))
+    df = df[~df["race_key"].astype(str).isin(accident_keys | ineligible_keys)].copy()
+    df["finish"] = pd.to_numeric(df["finish"], errors="coerce")
+    df = df[df["finish"].notna() & (df["finish"] >= 1)].copy()
+    counts = df.groupby("race_key")["car_no"].transform("count")
+    df = df[df["finish"] <= counts]
+    valid_races = df.groupby("race_key").size()
+    return df[df["race_key"].isin(valid_races[valid_races >= 3].index)].copy()
+
+
+_v76_original_v62_rebuild = v62_rebuild_grand_note_learning
+
+def v62_rebuild_grand_note_learning(db_path=DB_PATH):
+    result = _v76_original_v62_rebuild(db_path)
+    v76_init_accident_learning_columns(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        accident_keys = [r[0] for r in con.execute("""
+            SELECT DISTINCT rr.race_key
+              FROM result_races rr
+              LEFT JOIN result_entries e ON e.race_key=rr.race_key
+             WHERE COALESCE(rr.model_eligible,1)=0
+                OR COALESCE(e.result_status,'') LIKE '%落車%'
+                OR COALESCE(e.result_status,'') LIKE '%反則%'
+                OR COALESCE(e.result_status,'') LIKE '%周誤%'
+                OR COALESCE(e.result_status,'') LIKE '%失格%'
+                OR COALESCE(e.result_status,'') LIKE '%競走中止%'
+                OR COALESCE(e.result_status,'') LIKE '%不成立%'
+        """).fetchall()]
+        deleted = 0
+        for key in accident_keys:
+            cur = con.execute("DELETE FROM player_lap_history WHERE race_key=?", (key,))
+            deleted += max(0, cur.rowcount or 0)
+        con.commit()
+    result = dict(result or {})
+    result["事故レース除外"] = len(accident_keys)
+    result["事故周回削除"] = deleted
+    return result
+
+
+def v76_reclassify_existing_accident_races(db_path=DB_PATH):
+    """既存結果を再点検し、事故レースを学習対象外へ変更する。結果自体は削除しない。"""
+    v76_init_accident_learning_columns(db_path)
+    stats = {
+        "結果レース確認": 0, "事故レース": 0, "正常レース": 0,
+        "選手履歴除外": 0, "周回学習削除": 0, "重み履歴削除": 0,
+    }
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        races = con.execute("SELECT race_key,race_date,venue,race_no FROM result_races").fetchall()
+        stats["結果レース確認"] = len(races)
+        for rr in races:
+            entries = con.execute("SELECT result_status FROM result_entries WHERE race_key=?", (rr["race_key"],)).fetchall()
+            texts = [str(e[0] or "") for e in entries]
+            reasons = []
+            for text in texts:
+                for m in V76_ACCIDENT_PATTERN.findall(text):
+                    if m not in reasons:
+                        reasons.append(m)
+            if not reasons:
+                con.execute("UPDATE result_races SET model_eligible=1,model_exclusion_reason='' WHERE race_key=?", (rr["race_key"],))
+                stats["正常レース"] += 1
+                continue
+            stats["事故レース"] += 1
+            reason = "・".join(reasons)
+            con.execute("UPDATE result_races SET model_eligible=0,model_exclusion_reason=? WHERE race_key=?", (reason, rr["race_key"]))
+            # 正規履歴は日付・場・Rで対象行を学習対象外へ。
+            try:
+                rno = v61_race_no(rr["race_no"])
+                cur = con.execute("""
+                    UPDATE race_history
+                       SET use_for_model=0,
+                           result_status=CASE
+                               WHEN COALESCE(result_status,'')='' OR result_status='通常' THEN ?
+                               WHEN result_status NOT LIKE ? THEN result_status || '・' || ?
+                               ELSE result_status END
+                     WHERE race_date=? AND venue=?
+                       AND (? IS NULL OR CAST(REPLACE(COALESCE(race_no,''),'R','') AS INTEGER)=?)
+                """, (reason, f"%{reason}%", reason, rr["race_date"], rr["venue"], rno, rno))
+                stats["選手履歴除外"] += max(0, cur.rowcount or 0)
+            except sqlite3.Error:
+                pass
+            cur = con.execute("DELETE FROM player_lap_history WHERE race_key=?", (rr["race_key"],))
+            stats["周回学習削除"] += max(0, cur.rowcount or 0)
+            cur = con.execute("DELETE FROM weight_adjustment_history WHERE race_key=?", (rr["race_key"],))
+            stats["重み履歴削除"] += max(0, cur.rowcount or 0)
+        con.commit()
+    return stats
+
+
+def v76_accident_learning_status(db_path=DB_PATH):
+    v76_init_accident_learning_columns(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        total = con.execute("SELECT COUNT(*) FROM result_races").fetchone()[0]
+        excluded = con.execute("SELECT COUNT(*) FROM result_races WHERE COALESCE(model_eligible,1)=0").fetchone()[0]
+        rows = con.execute("""
+            SELECT race_date,venue,race_no,model_exclusion_reason
+              FROM result_races
+             WHERE COALESCE(model_eligible,1)=0
+             ORDER BY race_date DESC, CAST(REPLACE(COALESCE(race_no,''),'R','') AS INTEGER) DESC
+             LIMIT 50
+        """).fetchall()
+    return {
+        "登録結果": int(total), "事故レース除外": int(excluded),
+        "対象レース": [
+            {"日付": r[0], "開催場": r[1], "R": r[2], "理由": r[3]} for r in rows
+        ],
+    }
+
+# ============================================================
+# Ver78: 三連単の大外し閾値を変更可能にして、レース単位で実用ラインから除外
+# ============================================================
+V78_DEFAULT_RACE_OUTLIER_TRIFECTA_CUTOFF = 85.0
+
+
+def _v77_coverline_excluded_races(
+    db_path=DB_PATH,
+    trifecta_outlier_cutoff=V78_DEFAULT_RACE_OUTLIER_TRIFECTA_CUTOFF,
+):
+    """三連単の的中位置が指定閾値以上だったrace_key集合を返す。"""
+    v67_init_ticket_feedback_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        rows = con.execute("""
+            SELECT DISTINCT race_key
+              FROM v67_ticket_feedback
+             WHERE bet_type='3連単'
+               AND cumulative_probability IS NOT NULL
+               AND cumulative_probability>=?
+        """, (float(trifecta_outlier_cutoff),)).fetchall()
+    return {str(r[0]) for r in rows if r and r[0] is not None}
+
+
+def v72_ticket_feedback_stats(
+    db_path=DB_PATH,
+    trifecta_outlier_cutoff=V78_DEFAULT_RACE_OUTLIER_TRIFECTA_CUTOFF,
+):
+    """全結果と、三連単が指定閾値以上のレースを除いた実用ラインを返す。"""
+    v67_init_ticket_feedback_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        df = pd.read_sql_query("""
+            SELECT race_key, bet_type, cumulative_probability, predicted_rank
+              FROM v67_ticket_feedback
+             WHERE cumulative_probability IS NOT NULL
+        """, con)
+    columns = [
+        "券種", "レース数", "平均", "中央値",
+        "80%カバー", "90%カバー", "95%カバー",
+        "実用レース数", "大外し除外", "実用平均", "実用中央値",
+        "実用80%カバー", "実用90%カバー", "実用95%カバー",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    excluded_races = _v77_coverline_excluded_races(
+        db_path,
+        trifecta_outlier_cutoff=trifecta_outlier_cutoff,
+    )
+    out = []
+    for bet_type, g in df.groupby("bet_type"):
+        work = g.copy()
+        work["cumulative_probability"] = pd.to_numeric(
+            work["cumulative_probability"], errors="coerce"
+        )
+        work = work.dropna(subset=["cumulative_probability"])
+        work = work[
+            (work["cumulative_probability"] >= 0.0)
+            & (work["cumulative_probability"] <= 100.0)
+        ]
+        if work.empty:
+            continue
+
+        vals = work["cumulative_probability"].astype(float)
+        practical_rows = work[~work["race_key"].astype(str).isin(excluded_races)].copy()
+        practical = practical_rows["cumulative_probability"].astype(float)
+        removed_count = int(work["race_key"].astype(str).isin(excluded_races).sum())
+
+        # 全件が除外対象の場合は計算不能をNaNで明示する。
+        if practical.empty:
+            practical_mean = practical_median = np.nan
+            p80 = p90 = p95 = np.nan
+        else:
+            practical_mean = float(practical.mean())
+            practical_median = float(practical.median())
+            p80 = float(practical.quantile(.80))
+            p90 = float(practical.quantile(.90))
+            p95 = float(practical.quantile(.95))
+
+        out.append({
+            "券種": bet_type,
+            "レース数": int(len(vals)),
+            "平均": float(vals.mean()),
+            "中央値": float(vals.median()),
+            "80%カバー": float(vals.quantile(.80)),
+            "90%カバー": float(vals.quantile(.90)),
+            "95%カバー": float(vals.quantile(.95)),
+            "実用レース数": int(len(practical)),
+            "大外し除外": removed_count,
+            "実用平均": practical_mean,
+            "実用中央値": practical_median,
+            "実用80%カバー": p80,
+            "実用90%カバー": p90,
+            "実用95%カバー": p95,
+        })
+
+    order = {"2連単": 0, "2連複": 1, "3連複": 2, "3連単": 3}
+    return pd.DataFrame(out, columns=columns).sort_values(
+        "券種", key=lambda s: s.map(order)
+    ).reset_index(drop=True)
+
+
+def v72_ticket_outlier_details(
+    bet_type,
+    db_path=DB_PATH,
+    trifecta_outlier_cutoff=V78_DEFAULT_RACE_OUTLIER_TRIFECTA_CUTOFF,
+):
+    """三連単が指定閾値以上のため、実用ラインからレース単位で除外した一覧。"""
+    v67_init_ticket_feedback_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        df = pd.read_sql_query("""
+            SELECT tri.race_key AS レース,
+                   selected.actual_combination AS 的中組み合わせ,
+                   selected.predicted_rank AS 予測順位,
+                   selected.cumulative_probability AS 上位累積確率,
+                   tri.cumulative_probability AS 三連単上位累積確率
+              FROM v67_ticket_feedback tri
+              LEFT JOIN v67_ticket_feedback selected
+                ON selected.race_key=tri.race_key
+               AND selected.bet_type=?
+             WHERE tri.bet_type='3連単'
+               AND tri.cumulative_probability IS NOT NULL
+               AND tri.cumulative_probability>=?
+             ORDER BY tri.cumulative_probability DESC, tri.race_key
+        """, con, params=(str(bet_type), float(trifecta_outlier_cutoff)))
+    columns = ["レース", "的中組み合わせ", "予測順位", "上位累積確率", "三連単上位累積確率"]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    return df[columns].reset_index(drop=True)
