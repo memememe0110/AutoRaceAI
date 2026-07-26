@@ -933,6 +933,23 @@ with prediction_tab:
                 st.caption(f"今回の走路温度：{temp_now}℃。47℃以上を細分化し、50℃以降は前残り・位置維持・選手別高温実績の影響を非線形に強めています。")
                 st.caption("周回履歴が少ない選手は補正を自動で縮小します。予測対象日以降の結果は学習に使いません。")
 
+            with st.expander("🌤️ 天候・複合条件適性", expanded=True):
+                weather_cols = [c for c in [
+                    "車", "選手名", "今回天候", "天候条件キー", "天候一致最大件数",
+                    "天候適性信頼度", "天候適性補正", "天候適性根拠"
+                ] if c in df.columns]
+                if weather_cols:
+                    weather_view = df[weather_cols].sort_values(["天候適性補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                    if "天候適性信頼度" in weather_view.columns:
+                        weather_view["天候適性信頼度"] = pd.to_numeric(weather_view["天候適性信頼度"], errors="coerce") * 100.0
+                    st.dataframe(weather_view, use_container_width=True, hide_index=True, column_config={
+                        "天候適性信頼度": st.column_config.NumberColumn(format="%.1f%%"),
+                        "天候適性補正": st.column_config.NumberColumn(format="%+.3f"),
+                    })
+                else:
+                    st.info("天候データを取得できなかったため、今回は天候補正を行っていません。")
+                st.caption("天候単独に加え、天候×走路状態×走路温度帯×時間帯を選手別に学習します。複合条件は十分な履歴件数がある場合だけ反映します。")
+
             st.subheader("6周の代表展開")
             lap_df = engine.v30_representative_lap_projection(df)
             st.dataframe(lap_df, use_container_width=True, hide_index=True)
@@ -989,8 +1006,9 @@ with prediction_tab:
 
             st.subheader("今回条件の反映状況")
             condition_rows = [
+                {"条件": "天候", "入力値": meta.get("天候") or "未取得", "反映": "直接反映（選手別の天候・複合条件適性）"},
                 {"条件": "走路状態", "入力値": meta.get("走路状態") or "未取得", "反映": "直接反映（履歴の走路適合重み）"},
-                {"条件": "走路温度", "入力値": f"{meta.get('走路温度')}℃" if pd.notna(meta.get("走路温度")) else "未取得", "反映": "直接反映（6周展開・変動幅）"},
+                {"条件": "走路温度", "入力値": f"{meta.get('走路温度')}℃" if pd.notna(meta.get("走路温度")) else "未取得", "反映": "直接反映（6周展開・変動幅・天候との複合適性）"},
                 {"条件": "気温", "入力値": f"{meta.get('気温')}℃" if pd.notna(meta.get("気温")) else "未取得", "反映": "取得・保存・類似レース検索（直接補正は未実装）"},
                 {"条件": "湿度", "入力値": f"{meta.get('湿度')}%" if pd.notna(meta.get("湿度")) else "未取得", "反映": "取得・保存・類似レース検索（直接補正は未実装）"},
             ]

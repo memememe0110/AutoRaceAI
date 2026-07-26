@@ -3923,6 +3923,11 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
         df = v60_apply_lap_and_heat_learning(
             df, globals().get("LATEST_ENTRY_STATS"), globals().get("LATEST_RACE_META"), DB_PATH
         )
+    # Ver65: 天候を走路・温度帯・時間帯と組み合わせた選手別適性として反映。
+    if "v65_apply_weather_condition_learning" in globals():
+        df = v65_apply_weather_condition_learning(
+            df, globals().get("LATEST_ENTRY_STATS"), globals().get("LATEST_RACE_META"), DB_PATH
+        )
 
     # v3.8: 逐次的な追抜き入替ループを使わず、高速ベクトル型の6周イベントモデルを使用。
     finish_counts, bet_counts = simulate(df, trials, seed, track_temp=track_temp)
@@ -10929,4 +10934,224 @@ def v24_apply_race_context_bonus(df, entries=None, track_temp=30.0):
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.30
     if "予測競走T" in out.columns:
         out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"], errors="coerce") - bonus * 0.0008, 4)
+    return out
+
+
+# ============================================================
+# Ver65: 天候 × 走路 × 走路温度帯 × 時間帯の複合条件学習
+# ============================================================
+def v65_normalize_weather(value):
+    text = str(value or "").strip().replace("　", "")
+    if not text:
+        return None
+    if "雷" in text:
+        return "雷雨"
+    if "雪" in text:
+        return "雪"
+    if "小雨" in text or "霧雨" in text:
+        return "小雨"
+    if "雨" in text:
+        return "雨"
+    if "曇" in text:
+        return "曇"
+    if "晴" in text:
+        return "晴"
+    return text[:12]
+
+
+def v65_normalize_surface(value):
+    text = str(value or "").strip()
+    if "湿" in text:
+        return "湿"
+    if "斑" in text:
+        return "斑"
+    if "良" in text:
+        return "良"
+    return text or None
+
+
+def v65_time_band(value, race_no=None):
+    text = str(value or "").strip()
+    m = re.search(r"(\d{1,2}):(\d{2})", text)
+    if m:
+        hour = int(m.group(1))
+        if hour < 14:
+            return "昼"
+        if hour < 18:
+            return "夕方"
+        if hour < 22:
+            return "ナイター"
+        return "深夜"
+    text2 = text.lower()
+    if "オーバー" in text2 or "over" in text2:
+        return "深夜"
+    if "ミッド" in text2 or "mid" in text2:
+        return "深夜"
+    try:
+        r = int(float(race_no))
+        return "昼" if r <= 5 else "夕方" if r <= 8 else "ナイター"
+    except Exception:
+        return None
+
+
+def v65_temp_band(value):
+    try:
+        t = float(value)
+    except Exception:
+        return None
+    if t < 42: return "～41℃"
+    if t < 47: return "42～46℃"
+    if t < 50: return "47～49℃"
+    if t < 52: return "50～51℃"
+    if t < 54: return "52～53℃"
+    if t < 56: return "54～55℃"
+    return "56℃以上"
+
+
+def v65_apply_weather_condition_learning(df, entries=None, meta=None, db_path=None):
+    """天候単独と複合条件の再現性を選手別に学習して予測へ反映する。
+
+    同じ結果を複数条件で過剰に数えないよう、最も信頼できる上位2条件だけを採用する。
+    複合条件ほど最低件数を厳しくし、最大補正は±1.5点に制限する。
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    n = len(out)
+    defaults = {
+        "今回天候": [None] * n,
+        "天候適性補正": np.zeros(n),
+        "天候適性信頼度": np.zeros(n),
+        "天候一致最大件数": np.zeros(n, dtype=int),
+        "天候適性根拠": ["天候未取得"] * n,
+        "天候条件キー": [""] * n,
+    }
+    for col, val in defaults.items():
+        out[col] = val
+
+    meta = meta or globals().get("LATEST_RACE_META", {}) or {}
+    weather = v65_normalize_weather(meta.get("天候") or meta.get("weather"))
+    surface = v65_normalize_surface(meta.get("走路状態") or meta.get("走路") or meta.get("surface"))
+    temp_band = v65_temp_band(meta.get("走路温度") or meta.get("track_temp"))
+    time_band = v65_time_band(
+        meta.get("発走時刻") or meta.get("start_time") or meta.get("時間帯") or "",
+        meta.get("レース") or meta.get("R") or meta.get("race_no")
+    )
+    current_key = "×".join(x for x in [weather, surface, temp_band, time_band] if x)
+    out["今回天候"] = weather
+    out["天候条件キー"] = current_key
+    if not weather:
+        return out
+
+    car_col = "車" if "車" in out.columns else "車番" if "車番" in out.columns else None
+    if car_col is None:
+        return out
+    ent = entries.copy() if isinstance(entries, pd.DataFrame) else pd.DataFrame()
+    names = {}
+    if not ent.empty and "車番" in ent.columns and "選手名" in ent.columns:
+        e = ent.copy()
+        e["車番"] = pd.to_numeric(e["車番"], errors="coerce")
+        names = e.dropna(subset=["車番"]).set_index("車番")["選手名"].to_dict()
+
+    db_path = db_path or globals().get("DB_PATH")
+    try:
+        con = sqlite3.connect(db_path)
+    except Exception:
+        return out
+
+    bonuses=[]; confidences=[]; counts=[]; reasons=[]
+    for _, row in out.iterrows():
+        car = pd.to_numeric(pd.Series([row.get(car_col)]), errors="coerce").iloc[0]
+        name = str(names.get(car, row.get("選手名", ""))).strip()
+        if not name:
+            bonuses.append(0.0); confidences.append(0.0); counts.append(0); reasons.append("選手名なし"); continue
+        key = v32_player_name_key(name) if "v32_player_name_key" in globals() else re.sub(r"[\s　]", "", name)
+        try:
+            hist = pd.read_sql_query("""
+                SELECT race_date, race_no, rank, starters, weather, surface,
+                       track_temp, start_time, time_band, race_name, raw_line
+                FROM v15_player_history_imports
+                WHERE replace(replace(player_name,' ',''),'　','')=?
+                  AND rank IS NOT NULL AND rank > 0
+                  AND (starters IS NULL OR rank <= starters)
+                  AND COALESCE(raw_line,'') NOT LIKE '%欠責%'
+                  AND COALESCE(raw_line,'') NOT LIKE '%周誤%'
+                  AND COALESCE(raw_line,'') NOT LIKE '%欠車%'
+                  AND COALESCE(raw_line,'') NOT LIKE '%出走取消%'
+                  AND COALESCE(raw_line,'') NOT LIKE '%競走中止%'
+                  AND COALESCE(raw_line,'') NOT LIKE '%落車%'
+                  AND COALESCE(raw_line,'') NOT LIKE '%反則%'
+                  AND COALESCE(raw_line,'') NOT LIKE '%不成立%'
+                  AND COALESCE(raw_line,'') NOT LIKE '%失格%'
+                ORDER BY race_date DESC
+                LIMIT 240
+            """, con, params=(key,))
+        except Exception:
+            hist = pd.DataFrame()
+        if hist.empty:
+            bonuses.append(0.0); confidences.append(0.0); counts.append(0); reasons.append("天候履歴なし"); continue
+        if "v61_filter_history_df" in globals():
+            hist = v61_filter_history_df(hist, "race_date", "race_no", count_stats=False)
+        if hist.empty or len(hist) < 8:
+            bonuses.append(0.0); confidences.append(0.0); counts.append(len(hist)); reasons.append("履歴不足"); continue
+
+        hist["rank"] = pd.to_numeric(hist["rank"], errors="coerce")
+        hist["starters"] = pd.to_numeric(hist["starters"], errors="coerce").fillna(8).clip(lower=2)
+        hist = hist[hist["rank"].notna()].copy()
+        if hist.empty:
+            bonuses.append(0.0); confidences.append(0.0); counts.append(0); reasons.append("有効着順なし"); continue
+        hist["perf"] = ((hist["starters"] - hist["rank"]) / (hist["starters"] - 1)).clip(0, 1)
+        hist["weather_n"] = hist["weather"].map(v65_normalize_weather)
+        hist["surface_n"] = hist["surface"].map(v65_normalize_surface)
+        hist["temp_n"] = hist["track_temp"].map(v65_temp_band)
+        hist["time_n"] = [v65_time_band(tb or st, rn) for tb, st, rn in zip(hist.get("time_band", ""), hist.get("start_time", ""), hist.get("race_no", ""))]
+        base = float(hist["perf"].mean())
+
+        specs = [
+            ("天候", ["weather_n"], [weather], 4, 0.55),
+            ("天候×走路", ["weather_n", "surface_n"], [weather, surface], 5, 0.78),
+            ("天候×温度帯", ["weather_n", "temp_n"], [weather, temp_band], 5, 0.82),
+            ("天候×時間帯", ["weather_n", "time_n"], [weather, time_band], 5, 0.65),
+            ("天候×走路×温度帯", ["weather_n", "surface_n", "temp_n"], [weather, surface, temp_band], 6, 1.00),
+            ("天候×走路×温度帯×時間帯", ["weather_n", "surface_n", "temp_n", "time_n"], [weather, surface, temp_band, time_band], 7, 1.08),
+        ]
+        parts=[]
+        for label, cols, vals, min_n, strength in specs:
+            if any(v in (None, "") for v in vals):
+                continue
+            mask = pd.Series(True, index=hist.index)
+            for c, v in zip(cols, vals):
+                mask &= hist[c].astype(str).eq(str(v))
+            nn = int(mask.sum())
+            if nn < min_n:
+                continue
+            cond = float(hist.loc[mask, "perf"].mean())
+            delta = cond - base
+            conf = min(1.0, (nn - min_n + 1) / 16.0)
+            cap = 0.28 if nn < 8 else 0.55 if nn < 15 else 0.95 if nn < 25 else 1.30
+            effect = float(np.clip(delta * 4.1 * strength * conf, -cap, cap))
+            if abs(effect) >= 0.06:
+                parts.append((effect, label, nn, delta, conf))
+        if not parts:
+            bonuses.append(0.0); confidences.append(0.0); counts.append(0); reasons.append("顕著な天候適性なし"); continue
+        parts = sorted(parts, key=lambda x: (abs(x[0]), x[2]), reverse=True)[:2]
+        total = float(np.clip(sum(x[0] for x in parts), -1.5, 1.5))
+        bonuses.append(total)
+        confidences.append(max(x[4] for x in parts))
+        counts.append(max(x[2] for x in parts))
+        reasons.append(" / ".join(f"{x[1]}{'得意' if x[0] > 0 else '苦手'}({x[2]}件,{x[0]:+.2f})" for x in parts))
+    con.close()
+
+    bonus = np.asarray(bonuses, dtype=float)
+    out["天候適性補正"] = np.round(bonus, 3)
+    out["天候適性信頼度"] = np.round(confidences, 3)
+    out["天候一致最大件数"] = counts
+    out["天候適性根拠"] = reasons
+    if "改善後総合点" in out.columns:
+        out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.38
+    if "予測競走T" in out.columns:
+        out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"], errors="coerce") - bonus * 0.0010, 4)
     return out
