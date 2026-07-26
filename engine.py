@@ -11365,7 +11365,19 @@ def v67_compress_formations(combos, bet_type):
             s3 = "".join(map(str, sorted(item["third"])))
             lines.append(f"{a}-{s2}-{s3}（対象{item['count']}点）")
     elif bet_type == "3連複":
-        lines = ["-".join(map(str, x)) for x in sorted(set(tuple(sorted(x)) for x in parsed))]
+        # 先頭2車が共通する組み合わせだけをまとめるシンプル圧縮。
+        # 例: 2-3-5 / 2-3-7 / 2-3-8 -> 2-3-578
+        # 元の一覧に存在しない組み合わせは追加しない。
+        triples = sorted(set(tuple(sorted(x)) for x in parsed))
+        by_first_two = {}
+        for a, b, c in triples:
+            by_first_two.setdefault((a, b), []).append(c)
+        for (a, b), thirds in sorted(by_first_two.items()):
+            thirds = sorted(set(thirds))
+            if len(thirds) >= 2:
+                lines.append(f"{a}-{b}-{''.join(map(str, thirds))}")
+            else:
+                lines.append(f"{a}-{b}-{thirds[0]}")
     elif bet_type == "2連単":
         by_first = {}
         for a,b in parsed:
@@ -11594,3 +11606,96 @@ def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_pat
     registration = dict(registration)
     registration["replaced"] = True
     return key, comparison, analysis, adjustment, registration
+
+# ============================================================
+# Ver72: 大外しを分離した実用カバーライン
+# ============================================================
+def _v72_practical_values(values):
+    """極端に悪い上側外れ値だけを除外する。最低10件、最大10%まで。"""
+    vals = pd.to_numeric(pd.Series(values), errors="coerce").dropna().astype(float)
+    vals = vals[(vals >= 0.0) & (vals <= 100.0)].sort_values()
+    n = len(vals)
+    if n < 10:
+        return vals, pd.Series(dtype=float), None
+    q1 = float(vals.quantile(0.25))
+    q3 = float(vals.quantile(0.75))
+    iqr = max(q3 - q1, 0.0)
+    # IQRがほぼ無い場合も、上位1%程度の僅差を誤って外れ扱いしない。
+    threshold = q3 + max(1.5 * iqr, 5.0)
+    candidates = vals[vals > threshold].sort_values(ascending=False)
+    max_remove = max(1, int(np.floor(n * 0.10)))
+    removed = candidates.head(max_remove)
+    if removed.empty:
+        return vals, pd.Series(dtype=float), threshold
+    kept = vals.drop(index=removed.index)
+    return kept, removed, threshold
+
+
+def v72_ticket_feedback_stats(db_path=DB_PATH):
+    """全結果基準と、大外しを最大10%除いた実用基準を同時に返す。"""
+    v67_init_ticket_feedback_tables(db_path)
+    with sqlite3.connect(db_path) as con:
+        df = pd.read_sql_query("""
+            SELECT race_key, bet_type, cumulative_probability, predicted_rank
+            FROM v67_ticket_feedback
+            WHERE cumulative_probability IS NOT NULL
+        """, con)
+    columns = [
+        "券種", "レース数", "平均", "中央値",
+        "80%カバー", "90%カバー", "95%カバー",
+        "実用レース数", "大外し除外", "実用平均", "実用中央値",
+        "実用80%カバー", "実用90%カバー", "実用95%カバー",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    out = []
+    for bet_type, g in df.groupby("bet_type"):
+        vals = pd.to_numeric(g["cumulative_probability"], errors="coerce").dropna()
+        if vals.empty:
+            continue
+        practical, removed, _ = _v72_practical_values(vals)
+        if practical.empty:
+            practical = vals
+            removed = pd.Series(dtype=float)
+        out.append({
+            "券種": bet_type,
+            "レース数": int(len(vals)),
+            "平均": float(vals.mean()),
+            "中央値": float(vals.median()),
+            "80%カバー": float(vals.quantile(.80)),
+            "90%カバー": float(vals.quantile(.90)),
+            "95%カバー": float(vals.quantile(.95)),
+            "実用レース数": int(len(practical)),
+            "大外し除外": int(len(removed)),
+            "実用平均": float(practical.mean()),
+            "実用中央値": float(practical.median()),
+            "実用80%カバー": float(practical.quantile(.80)),
+            "実用90%カバー": float(practical.quantile(.90)),
+            "実用95%カバー": float(practical.quantile(.95)),
+        })
+    order = {"2連単":0, "2連複":1, "3連複":2, "3連単":3}
+    return pd.DataFrame(out, columns=columns).sort_values(
+        "券種", key=lambda s: s.map(order)
+    ).reset_index(drop=True)
+
+
+def v72_ticket_outlier_details(bet_type, db_path=DB_PATH):
+    """実用ラインから除外した大外しレースを確認用に返す。"""
+    v67_init_ticket_feedback_tables(db_path)
+    with sqlite3.connect(db_path) as con:
+        df = pd.read_sql_query("""
+            SELECT race_key AS レース, cumulative_probability AS 上位累積確率,
+                   predicted_rank AS 予測順位, actual_combination AS 的中組み合わせ
+            FROM v67_ticket_feedback
+            WHERE bet_type=? AND cumulative_probability IS NOT NULL
+            ORDER BY cumulative_probability DESC
+        """, con, params=(bet_type,))
+    if df.empty or len(df) < 10:
+        return pd.DataFrame(columns=["レース", "的中組み合わせ", "予測順位", "上位累積確率"])
+    practical, removed, threshold = _v72_practical_values(df["上位累積確率"])
+    if removed.empty:
+        return pd.DataFrame(columns=["レース", "的中組み合わせ", "予測順位", "上位累積確率"])
+    # 値が同じ場合も最大除外数を超えないよう、上から順に対応付ける。
+    max_remove = len(removed)
+    result = df[df["上位累積確率"] > float(threshold)].head(max_remove).copy()
+    return result[["レース", "的中組み合わせ", "予測順位", "上位累積確率"]].reset_index(drop=True)

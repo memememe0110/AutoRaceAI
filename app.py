@@ -12,12 +12,101 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver69｜上位累積確率・強調範囲のシンプル圧縮")
+st.caption("Ver73｜フォーメーション一括コピー・画面ナビ改善")
+
+st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
+st.markdown(
+    """
+    <style>
+    .v73-float-top {
+        position: fixed;
+        right: 16px;
+        bottom: 82px;
+        z-index: 999999;
+        background: rgba(31, 41, 55, 0.92);
+        color: white !important;
+        text-decoration: none !important;
+        padding: 10px 14px;
+        border-radius: 999px;
+        font-size: 14px;
+        box-shadow: 0 4px 14px rgba(0,0,0,.22);
+    }
+    .v73-nav {
+        display:flex;
+        gap:8px;
+        flex-wrap:wrap;
+        margin:8px 0 16px 0;
+    }
+    .v73-nav a {
+        display:inline-block;
+        padding:7px 11px;
+        border:1px solid #d1d5db;
+        border-radius:999px;
+        text-decoration:none !important;
+        font-size:13px;
+    }
+    </style>
+    <a class="v73-float-top" href="#page-top">↑ 上へ</a>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def v73_section_nav() -> None:
+    st.markdown(
+        """
+        <div class="v73-nav">
+          <a href="#prediction-summary">予測概要</a>
+          <a href="#finish-probability">着順確率</a>
+          <a href="#ticket-probability">券種別確率</a>
+          <a href="#cover-line">強調ライン</a>
+          <a href="#copy-all-formations">一括コピー</a>
+          <a href="#page-top">ページ上部</a>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def v73_copy_box(title: str, text: str, key: str, height: int = 145) -> None:
+    """スマホでも一括コピーしやすい読み取り専用欄を表示する。"""
+    safe_title = json.dumps(str(title), ensure_ascii=False)
+    safe_text = json.dumps(str(text), ensure_ascii=False)
+    element_id = "v73_copy_" + re.sub(r"[^0-9A-Za-z_-]+", "_", str(key))
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+      <div style="font-weight:700;margin:0 0 7px 0;">{title}</div>
+      <textarea id="{element_id}" readonly
+        style="width:100%;height:{height}px;box-sizing:border-box;border:1px solid #d1d5db;border-radius:10px;padding:10px;font-size:16px;line-height:1.55;background:#f8fafc;color:#111827;">{text}</textarea>
+      <button id="{element_id}_btn"
+        style="width:100%;margin-top:7px;padding:10px;border:0;border-radius:9px;background:#2563eb;color:white;font-weight:700;font-size:15px;">
+        まとめてコピー
+      </button>
+      <div id="{element_id}_msg" style="height:20px;margin-top:5px;font-size:13px;color:#15803d;"></div>
+    </div>
+    <script>
+      const area = document.getElementById({json.dumps(element_id)});
+      const btn = document.getElementById({json.dumps(element_id + '_btn')});
+      const msg = document.getElementById({json.dumps(element_id + '_msg')});
+      btn.addEventListener('click', async () => {{
+        try {{
+          await navigator.clipboard.writeText({safe_text});
+          msg.textContent = 'コピーしました';
+        }} catch (e) {{
+          area.focus(); area.select();
+          document.execCommand('copy');
+          msg.textContent = 'コピーしました';
+        }}
+      }});
+    </script>
+    """
+    components.html(html, height=height + 105, scrolling=False)
 
 
 def qident(name: str) -> str:
@@ -379,37 +468,75 @@ def show_ticket_table(title: str, bets: dict, key: str, trials: int, top_n: int 
 
 
 def show_v67_self_evaluation(meta: dict) -> None:
-    """過去結果から券種別カバー率を表示し、現在予測の該当範囲を強調・圧縮する。"""
-    stats = engine.v67_ticket_feedback_stats(engine.DB_PATH)
+    """全結果ラインと、大外しを分離した実用ラインを表示する。"""
+    st.markdown('<div id="cover-line"></div>', unsafe_allow_html=True)
+    stats = engine.v72_ticket_feedback_stats(engine.DB_PATH)
     st.subheader("🎯 AI自己評価・上位累積確率ライン")
     if stats.empty:
         st.info("結果照合データがまだありません。今後、予測後に結果を登録すると券種別の平均と強調ラインが育ちます。")
         return
-    st.dataframe(
-        stats,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "平均": st.column_config.NumberColumn(format="%.2f%%"),
-            "中央値": st.column_config.NumberColumn(format="%.2f%%"),
-            "80%カバー": st.column_config.NumberColumn(format="%.2f%%"),
-            "90%カバー": st.column_config.NumberColumn(format="%.2f%%"),
-            "95%カバー": st.column_config.NumberColumn(format="%.2f%%"),
-        },
+
+    summary = stats[[
+        "券種", "レース数", "大外し除外",
+        "90%カバー", "実用90%カバー",
+        "95%カバー", "実用95%カバー",
+    ]].copy()
+    with st.expander("過去成績とカバーライン一覧", expanded=False):
+        st.dataframe(
+            summary,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "90%カバー": st.column_config.NumberColumn("全結果90%", format="%.2f%%"),
+                "実用90%カバー": st.column_config.NumberColumn("実用90%", format="%.2f%%"),
+                "95%カバー": st.column_config.NumberColumn("全結果95%", format="%.2f%%"),
+                "実用95%カバー": st.column_config.NumberColumn("実用95%", format="%.2f%%"),
+            },
+        )
+
+    coverage = st.selectbox(
+        "強調ライン", [80, 90, 95], index=1,
+        format_func=lambda x: f"過去{x}%の結果を含む範囲",
     )
-    coverage = st.selectbox("強調ライン", [80, 90, 95], index=1, format_func=lambda x: f"過去{x}%の結果を含む範囲")
-    stat_col = f"{coverage}%カバー"
+    line_mode = st.radio(
+        "ライン計算", ["実用ライン", "全結果ライン"], horizontal=True,
+        help="実用ラインは、10レース以上ある券種で極端に悪い上側外れ値だけを最大10%まで分離します。全結果ラインはすべての結果を含みます。",
+    )
     tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
+    all_formation_text: dict[str, str] = {}
     for tab, bet_type in zip(tabs, ["2連単", "2連複", "3連複", "3連単"]):
         with tab:
             row = stats[stats["券種"] == bet_type]
             if row.empty:
                 st.info(f"{bet_type}は結果照合がまだありません。")
                 continue
-            cutoff = float(row.iloc[0][stat_col])
-            sample = int(row.iloc[0]["レース数"])
+            r = row.iloc[0]
+            sample = int(r["レース数"])
+            excluded = int(r["大外し除外"])
+            if line_mode == "実用ライン":
+                cutoff = float(r[f"実用{coverage}%カバー"])
+                used = int(r["実用レース数"])
+                st.success(
+                    f"実用{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで "
+                    f"（全{sample}レース中 {used}レース使用・大外し{excluded}件を分離）"
+                )
+            else:
+                cutoff = float(r[f"{coverage}%カバー"])
+                st.info(f"全結果{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで（{sample}レースすべて使用）")
+
+            if excluded > 0:
+                with st.expander(f"大外しとして分離した{excluded}件を確認"):
+                    details = engine.v72_ticket_outlier_details(bet_type, engine.DB_PATH)
+                    st.dataframe(
+                        details,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
+                        },
+                    )
+
             highlighted = engine.v67_ticket_highlight_table(meta, bet_type, cutoff, engine.DB_PATH)
-            st.success(f"過去{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで（{sample}レース集計）")
             if highlighted.empty:
                 st.caption("現在の予測分布を取得できませんでした。予測をもう一度実行してください。")
                 continue
@@ -424,11 +551,32 @@ def show_v67_self_evaluation(meta: dict) -> None:
             )
             formations = engine.v67_compress_formations(highlighted["組み合わせ"].tolist(), bet_type)
             if formations:
-                st.markdown("#### 強調範囲のまとめ")
-                for line in formations:
-                    st.code(line, language=None)
+                st.markdown("#### 強調範囲のまとめ・一括コピー")
+                formation_text = "\n".join(str(line) for line in formations)
+                all_formation_text[bet_type] = formation_text
+                v73_copy_box(
+                    f"{bet_type} フォーメーション",
+                    formation_text,
+                    f"{bet_type}_{coverage}_{line_mode}",
+                    height=max(105, min(260, 44 + 28 * len(formations))),
+                )
                 st.caption("共通部分だけをまとめた簡易表記です。正確な対象は上の一覧表でも確認できます。")
 
+    if all_formation_text:
+        st.markdown('<div id="copy-all-formations"></div>', unsafe_allow_html=True)
+        st.markdown("### 📋 全券種まとめてコピー")
+        all_text = "\n\n".join(
+            f"【{bet_type}】\n{all_formation_text[bet_type]}"
+            for bet_type in ["2連単", "2連複", "3連複", "3連単"]
+            if bet_type in all_formation_text
+        )
+        v73_copy_box(
+            "強調対象フォーメーション一式",
+            all_text,
+            f"all_{coverage}_{line_mode}",
+            height=max(180, min(420, 75 + 26 * all_text.count("\n"))),
+        )
+        st.markdown('<div class="v73-nav"><a href="#ticket-probability">券種別確率へ</a><a href="#prediction-summary">予測概要へ</a><a href="#page-top">ページ上部へ</a></div>', unsafe_allow_html=True)
 
 def show_v67_result_analysis(ticket_analysis: pd.DataFrame) -> None:
     st.subheader("🎯 実結果は予測の上位累積何%地点だったか")
@@ -1056,13 +1204,15 @@ with prediction_tab:
                     st.info("天候データを取得できなかったため、今回は天候補正を行っていません。")
                 st.caption("天候単独に加え、天候×走路状態×走路温度帯×時間帯を選手別に学習します。複合条件は十分な履歴件数がある場合だけ反映します。")
 
+            st.markdown('<div id="prediction-summary"></div>', unsafe_allow_html=True)
+            v73_section_nav()
             st.subheader("6周の代表展開")
             lap_df = engine.v30_representative_lap_projection(df)
             st.dataframe(lap_df, use_container_width=True, hide_index=True)
             st.caption("確率計算は全試行で、スタート・中盤・最終周のイベントを生成しています。この表は指標から作った代表的な1展開です。")
             st.caption(f"予測保存キー: {race_key}（結果登録時の比較・重み調整に使用）")
 
-            with st.expander("🧪 学習重みによる順位・確率の変化", expanded=True):
+            with st.expander("🧪 学習重みによる順位・確率の変化", expanded=False):
                 impact_df = engine.v50_weight_impact_summary(df)
                 st.dataframe(
                     impact_df, use_container_width=True, hide_index=True,
@@ -1090,6 +1240,7 @@ with prediction_tab:
                 st.caption("上昇幅順位は、保存済み学習重みを適用したことで三連単確率がどれだけ増えたかの順位です。")
             show_prediction_confidence(finish_prob, bets, view_trials)
 
+            st.markdown('<div id="finish-probability"></div>', unsafe_allow_html=True)
             st.subheader("着順確率")
             st.dataframe(
                 finish_prob,
@@ -1121,6 +1272,8 @@ with prediction_tab:
             st.dataframe(pd.DataFrame(condition_rows), use_container_width=True, hide_index=True)
 
             odds_namespace = re.sub(r"[^0-9A-Za-z_-]+", "_", str(race_key))[-80:] or "current"
+            st.markdown('<div id="ticket-probability"></div>', unsafe_allow_html=True)
+            st.subheader("券種別確率・オッズ比較")
             ticket_tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
             with ticket_tabs[0]:
                 show_ticket_table("2連単（2車単）確率", bets, "2車単", view_trials, 20)
@@ -1136,6 +1289,8 @@ with prediction_tab:
                 show_odds_comparison("3連単", bets, "三連単", view_trials, "3tan", unordered=False, namespace=odds_namespace)
 
             show_v67_self_evaluation(meta)
+
+            v73_section_nav()
 
             if Path(output).exists():
                 st.download_button(
