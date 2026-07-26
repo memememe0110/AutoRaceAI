@@ -921,6 +921,7 @@ with prediction_tab:
                 "trials": int(trials),
                 "excluded": [int(x) for x in manual_excluded],
                 "learning_boundary": engine.v61_learning_boundary_summary(),
+                "future_audit": engine.v68_get_latest_future_audit(),
             }
             st.success("予測が完了しました")
         except Exception as exc:
@@ -940,6 +941,25 @@ with prediction_tab:
             view_trials = int(view.get("trials", trials))
             excluded = {int(car): "手動指定" for car in view.get("excluded", [])}
             boundary = view.get("learning_boundary") or {}
+            audit = view.get("future_audit") or {}
+            if audit:
+                status = audit.get("status", "OK")
+                if status == "OK":
+                    st.success(
+                        f"🔒 未来データ監査：OK｜確認 {int(audit.get('total_checked',0))}件｜"
+                        f"使用 {int(audit.get('used',0))}件｜除外 {int(audit.get('excluded',0))}件｜混入 0件"
+                    )
+                else:
+                    st.error(f"未来データ監査：混入 {int(audit.get('violations',0))}件を検出し、使用を停止しました。")
+                with st.expander("未来データ監査の内訳", expanded=False):
+                    events = audit.get("events", [])
+                    if events:
+                        st.dataframe(pd.DataFrame(events).drop(columns=["details"], errors="ignore"), use_container_width=True, hide_index=True)
+                        for ev in events:
+                            if ev.get("details"):
+                                st.caption(f"{ev.get('source')}: " + " / ".join(ev.get("details", [])))
+                    else:
+                        st.caption("監査対象の履歴はありませんでした。")
             if boundary:
                 st.info(
                     f"🕒 学習境界：{boundary.get('label', '')}｜"

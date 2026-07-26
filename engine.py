@@ -6009,7 +6009,7 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
             bonuses.append(0.0); labels.append("データなし"); match_counts.append(0); confidences.append(0.0); continue
         key = v32_player_name_key(name) if "v32_player_name_key" in globals() else re.sub(r"[\s　]", "", name)
         hist = pd.read_sql_query("""
-            SELECT player_name, race_date, venue, rank, starters, surface, handicap,
+            SELECT player_name, race_date, race_no, venue, rank, starters, surface, handicap,
                    track_temp, humidity, race_type
             FROM v15_player_history_imports
             WHERE replace(replace(player_name,' ',''),'　','')=?
@@ -6030,6 +6030,8 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
             ORDER BY race_date DESC
             LIMIT 160
         """, con, params=(key,))
+        if "v61_filter_history_df" in globals():
+            hist = v61_filter_history_df(hist, "race_date", "race_no" if "race_no" in hist.columns else "__none__", count_stats=False)
         if hist.empty:
             bonuses.append(0.0); labels.append("履歴不足"); match_counts.append(0); confidences.append(0.0); continue
         rank = pd.to_numeric(hist["rank"], errors="coerce")
@@ -6171,7 +6173,7 @@ def v59_apply_escape_history(df, entries=None, meta=None, db_path=None):
             key = v32_player_name_key(name) if "v32_player_name_key" in globals() else re.sub(r"\s+", "", name)
             try:
                 hist = pd.read_sql_query(
-                    """SELECT race_date, venue, rank, handicap, st, car_no, surface, track_temp, player_name
+                    """SELECT race_date, race_no, venue, rank, handicap, st, car_no, surface, track_temp, player_name
                        FROM v15_player_history_imports""", con
                 )
                 hist = hist[hist["player_name"].map(v32_player_name_key).eq(key)] if "player_name" in hist.columns else hist.iloc[0:0]
@@ -6194,7 +6196,9 @@ def v59_apply_escape_history(df, entries=None, meta=None, db_path=None):
 
         if not hist.empty:
             hist["race_date"] = hist["race_date"].astype(str)
-            if current_date:
+            if "v61_filter_history_df" in globals():
+                hist = v61_filter_history_df(hist, "race_date", "race_no" if "race_no" in hist.columns else "__none__", count_stats=False)
+            elif current_date:
                 hist = hist[hist["race_date"] < current_date]
             hist["handicap"] = pd.to_numeric(hist["handicap"], errors="coerce")
             hist["rank"] = pd.to_numeric(hist["rank"], errors="coerce")
@@ -11371,3 +11375,117 @@ def v67_compress_formations(combos, bet_type):
     elif bet_type == "2連複":
         lines = ["-".join(map(str, x)) for x in sorted(set(tuple(sorted(x)) for x in parsed))]
     return lines
+
+
+# ============================================================
+# Ver68: 未来データ完全監査
+# ============================================================
+VER68_AUDIT_EVENTS = []
+_VER68_BASE_HISTORY_FILTER = v61_filter_history_df
+_VER68_BASE_LAP_FILTER = v61_filter_lap_df
+
+
+def v68_reset_future_audit():
+    VER68_AUDIT_EVENTS.clear()
+
+
+def _v68_is_future_row(date_value, race_value=None):
+    target_date = VER61_LEARNING_BOUNDARY.get("date") or ""
+    target_r = VER61_LEARNING_BOUNDARY.get("race_no")
+    d = v61_normalize_date(date_value)
+    r = v61_race_no(race_value)
+    if not target_date or not d:
+        return False
+    if d > target_date:
+        return True
+    if d < target_date:
+        return False
+    if target_r is None:
+        return True
+    if r is None:
+        return True
+    return r >= target_r
+
+
+def _v68_record_event(source, total, used, excluded, violations=0, details=None):
+    VER68_AUDIT_EVENTS.append({
+        "source": str(source), "total": int(total), "used": int(used),
+        "excluded": int(excluded), "violations": int(violations),
+        "details": details or [],
+    })
+
+
+def v61_filter_history_df(df, date_col="開催日", race_col="レース", count_stats=True, source="履歴"):
+    if df is None or df.empty:
+        _v68_record_event(source, 0, 0, 0, 0)
+        return df
+    total = len(df)
+    out = _VER68_BASE_HISTORY_FILTER(df, date_col, race_col, count_stats=count_stats)
+    violations = 0
+    details = []
+    if out is not None and not out.empty and date_col in out.columns:
+        for _, row in out.iterrows():
+            rv = row.get(race_col) if race_col in out.columns else None
+            if _v68_is_future_row(row.get(date_col), rv):
+                violations += 1
+                if len(details) < 20:
+                    details.append(f"{row.get(date_col)} {rv or 'R不明'}")
+        if violations:
+            mask = out.apply(lambda r: not _v68_is_future_row(r.get(date_col), r.get(race_col) if race_col in out.columns else None), axis=1)
+            out = out.loc[mask].copy()
+    _v68_record_event(source, total, len(out) if out is not None else 0, total-(len(out) if out is not None else 0), violations, details)
+    return out
+
+
+def v61_filter_lap_df(df, race_key_col="race_key", source="グランドノート"):
+    if df is None or df.empty:
+        _v68_record_event(source, 0, 0, 0, 0)
+        return df
+    total = len(df)
+    out = _VER68_BASE_LAP_FILTER(df, race_key_col)
+    violations = 0
+    details = []
+    if out is not None and not out.empty and race_key_col in out.columns:
+        bad_idx=[]
+        for idx, key in out[race_key_col].astype(str).items():
+            dm=re.search(r"^(\d{8})", key)
+            rm=re.search(r"_(\d{1,2})R(?:_|$)", key)
+            d=datetime.strptime(dm.group(1), "%Y%m%d").strftime("%Y-%m-%d") if dm else ""
+            r=int(rm.group(1)) if rm else None
+            if _v68_is_future_row(d,r):
+                bad_idx.append(idx); violations+=1
+                if len(details)<20: details.append(f"{d} {str(r)+'R' if r else 'R不明'}")
+        if bad_idx:
+            out=out.drop(index=bad_idx)
+    _v68_record_event(source,total,len(out),total-len(out),violations,details)
+    return out
+
+
+def v68_future_audit_summary():
+    b=v61_learning_boundary_summary()
+    events=list(VER68_AUDIT_EVENTS)
+    total=sum(e["total"] for e in events)
+    used=sum(e["used"] for e in events)
+    excluded=sum(e["excluded"] for e in events)
+    violations=sum(e["violations"] for e in events)
+    return {
+        "boundary": b, "events": events, "total_checked": total,
+        "used": used, "excluded": excluded, "violations": violations,
+        "status": "OK" if violations==0 else "BLOCKED",
+    }
+
+
+_VER68_ORIGINAL_RUN_PREDICTION = ver16_run_prediction
+
+def ver16_run_prediction(text, trials=10000, seed=20260719, manual_excluded=None):
+    v68_reset_future_audit()
+    result = _VER68_ORIGINAL_RUN_PREDICTION(text, trials, seed, manual_excluded)
+    audit = v68_future_audit_summary()
+    if audit.get("violations", 0):
+        raise RuntimeError(f"未来データ監査で{audit['violations']}件を検出し、予測を停止しました。")
+    globals()["LATEST_FUTURE_AUDIT"] = audit
+    return result
+
+
+def v68_get_latest_future_audit():
+    return globals().get("LATEST_FUTURE_AUDIT") or v68_future_audit_summary()
