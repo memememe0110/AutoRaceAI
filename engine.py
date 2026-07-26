@@ -3913,6 +3913,16 @@ def run_model(content, filename, trials, seed, track_temp=30.0):
         df = v25_player_condition_affinity(
             df, globals().get("LATEST_ENTRY_STATS"), globals().get("LATEST_RACE_META"), DB_PATH
         )
+    # Ver59: 初周先頭と逃げ残りを分離し、登録済み履歴から選手別に補正する。
+    if "v59_apply_escape_history" in globals():
+        df = v59_apply_escape_history(
+            df, globals().get("LATEST_ENTRY_STATS"), globals().get("LATEST_RACE_META"), DB_PATH
+        )
+    # Ver60: グランドノートの周回変化と50℃以上の非線形な熱走路適性を反映。
+    if "v60_apply_lap_and_heat_learning" in globals():
+        df = v60_apply_lap_and_heat_learning(
+            df, globals().get("LATEST_ENTRY_STATS"), globals().get("LATEST_RACE_META"), DB_PATH
+        )
 
     # v3.8: 逐次的な追抜き入替ループを使わず、高速ベクトル型の6周イベントモデルを使用。
     finish_counts, bet_counts = simulate(df, trials, seed, track_temp=track_temp)
@@ -5521,53 +5531,172 @@ def ver16_surface(v):
         return "良"
     return s or "良"
 
-def ver16_get_history(name):
-    # Ver13 DB管理関数を優先
+
+# ============================================================
+# Ver61: 予測対象レース以降のデータを完全除外
+# ============================================================
+VER61_LEARNING_BOUNDARY = {
+    "date": "", "race_no": None, "used_rows": 0, "excluded_rows": 0,
+    "players": 0, "same_day_before_rows": 0, "unknown_r_same_day_excluded": 0,
+}
+
+def v61_race_no(value):
+    """5R / 5 / 5.0 を整数レース番号へ統一。取得不能はNone。"""
+    if value is None:
+        return None
+    m = re.search(r"(\d{1,2})", str(value))
+    if not m:
+        return None
     try:
-        df = get_player_history(v15_normalize_name(name), model_only=True)
-        if not df.empty:
-            return df
+        n = int(m.group(1))
+        return n if 1 <= n <= 12 else None
+    except Exception:
+        return None
+
+
+def v61_normalize_date(value):
+    try:
+        if "v47_normalize_required_date" in globals():
+            return v47_normalize_required_date(value)
     except Exception:
         pass
+    s = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%y/%m/%d", "%Y.%m.%d"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    return s
 
-    # 名前空白差のフォールバック
+
+def v61_set_learning_boundary(meta=None):
+    meta = meta or {}
+    date = v61_normalize_date(meta.get("開催日") or meta.get("日付") or "")
+    race_no = v61_race_no(meta.get("レース") or meta.get("R") or meta.get("race_no"))
+    VER61_LEARNING_BOUNDARY.update({
+        "date": date, "race_no": race_no, "used_rows": 0, "excluded_rows": 0,
+        "players": 0, "same_day_before_rows": 0, "unknown_r_same_day_excluded": 0,
+    })
+    return dict(VER61_LEARNING_BOUNDARY)
+
+
+def v61_filter_history_df(df, date_col="開催日", race_col="レース", count_stats=True):
+    """
+    対象日より前、または対象日かつ対象Rより前だけを返す。
+    対象Rが不明なら同日データをすべて除外する。
+    同日で履歴側Rが不明な行も安全側で除外する。
+    """
+    if df is None or df.empty:
+        return df
+    target_date = VER61_LEARNING_BOUNDARY.get("date") or ""
+    target_r = VER61_LEARNING_BOUNDARY.get("race_no")
+    if not target_date or date_col not in df.columns:
+        if count_stats:
+            VER61_LEARNING_BOUNDARY["used_rows"] += len(df)
+            VER61_LEARNING_BOUNDARY["players"] += 1
+        return df.copy()
+    x = df.copy()
+    dates = x[date_col].map(v61_normalize_date)
+    before = dates < target_date
+    same = dates == target_date
+    after = dates > target_date
+    same_before = pd.Series(False, index=x.index)
+    unknown_same = pd.Series(False, index=x.index)
+    if target_r is not None and race_col in x.columns:
+        rr = x[race_col].map(v61_race_no)
+        same_before = same & rr.notna() & rr.lt(target_r)
+        unknown_same = same & rr.isna()
+    else:
+        unknown_same = same
+    keep = before | same_before
+    out = x.loc[keep].copy()
+    if count_stats:
+        VER61_LEARNING_BOUNDARY["used_rows"] += int(keep.sum())
+        VER61_LEARNING_BOUNDARY["excluded_rows"] += int((~keep).sum())
+        VER61_LEARNING_BOUNDARY["same_day_before_rows"] += int(same_before.sum())
+        VER61_LEARNING_BOUNDARY["unknown_r_same_day_excluded"] += int(unknown_same.sum())
+        VER61_LEARNING_BOUNDARY["players"] += 1
+    return out
+
+
+def v61_filter_lap_df(df, race_key_col="race_key"):
+    """race_key(YYYYMMDD_開催場_6R)を対象日・対象R境界で除外。"""
+    if df is None or df.empty or race_key_col not in df.columns:
+        return df
+    target_date = (VER61_LEARNING_BOUNDARY.get("date") or "").replace("-", "")
+    target_r = VER61_LEARNING_BOUNDARY.get("race_no")
+    if not target_date:
+        return df.copy()
+    x = df.copy()
+    keys = x[race_key_col].astype(str)
+    dates = keys.str.extract(r"^(\d{8})", expand=False)
+    rr = keys.str.extract(r"_(\d{1,2})R(?:_|$)", expand=False)
+    rr = pd.to_numeric(rr, errors="coerce")
+    before = dates < target_date
+    same = dates == target_date
+    if target_r is None:
+        keep = before
+    else:
+        keep = before | (same & rr.notna() & rr.lt(target_r))
+    return x.loc[keep].copy()
+
+
+def v61_learning_boundary_summary():
+    b = dict(VER61_LEARNING_BOUNDARY)
+    r = b.get("race_no")
+    if b.get("date"):
+        b["label"] = f"{b['date']} {str(r)+'R' if r is not None else '同日全除外'} より前"
+    else:
+        b["label"] = "境界日を取得できず（全履歴）"
+    return b
+
+def ver16_get_history(name):
+    """選手履歴を取得し、Ver61の時点境界を必ず適用する。"""
+    df = pd.DataFrame()
     try:
-        target = re.sub(r"[\s　]+", "", str(name))
-        with sqlite3.connect(str(DB_PATH)) as con:
-            return pd.read_sql_query("""
-                SELECT
-                    h.race_date AS 開催日,
-                    h.venue AS 開催場,
-                    h.race_no AS レース,
-                    h.finish AS 着順,
-                    h.starters AS 出走,
-                    h.surface AS 走路,
-                    h.handicap AS ハンデ,
-                    h.trial_time AS 試走T,
-                    h.race_time AS 競走T,
-                    h.start_time AS ST,
-                    h.result_status AS 結果区分
-                FROM race_history h
-                JOIN players p ON p.player_id=h.player_id
-                WHERE REPLACE(REPLACE(p.player_name,' ',''),'　','')=?
-                  AND COALESCE(h.use_for_model,1)=1
-                  AND h.finish IS NOT NULL AND h.finish >= 1
-                  AND h.trial_time IS NOT NULL AND h.trial_time > 0
-                  AND h.race_time IS NOT NULL AND h.race_time > h.trial_time
-                  AND h.start_time IS NOT NULL AND h.start_time > 0
-                  AND COALESCE(h.result_status,'') NOT LIKE '%欠責%'
-                  AND COALESCE(h.result_status,'') NOT LIKE '%周誤%'
-                  AND COALESCE(h.result_status,'') NOT LIKE '%欠車%'
-                  AND COALESCE(h.result_status,'') NOT LIKE '%出走取消%'
-                  AND COALESCE(h.result_status,'') NOT LIKE '%競走中止%'
-                  AND COALESCE(h.result_status,'') NOT LIKE '%落車%'
-                  AND COALESCE(h.result_status,'') NOT LIKE '%反則%'
-                  AND COALESCE(h.result_status,'') NOT LIKE '%不成立%'
-                  AND COALESCE(h.result_status,'') NOT LIKE '%失格%'
-                ORDER BY h.race_date DESC, h.history_id DESC
-            """, con, params=(target,))
+        df = get_player_history(v15_normalize_name(name), model_only=True)
     except Exception:
-        return pd.DataFrame()
+        df = pd.DataFrame()
+
+    if df is None or df.empty:
+        try:
+            target = re.sub(r"[\s　]+", "", str(name))
+            with sqlite3.connect(str(DB_PATH)) as con:
+                df = pd.read_sql_query("""
+                    SELECT
+                        h.race_date AS 開催日,
+                        h.venue AS 開催場,
+                        h.race_no AS レース,
+                        h.finish AS 着順,
+                        h.starters AS 出走,
+                        h.surface AS 走路,
+                        h.handicap AS ハンデ,
+                        h.trial_time AS 試走T,
+                        h.race_time AS 競走T,
+                        h.start_time AS ST,
+                        h.result_status AS 結果区分
+                    FROM race_history h
+                    JOIN players p ON p.player_id=h.player_id
+                    WHERE REPLACE(REPLACE(p.player_name,' ',''),'　','')=?
+                      AND COALESCE(h.use_for_model,1)=1
+                      AND h.finish IS NOT NULL AND h.finish >= 1
+                      AND h.trial_time IS NOT NULL AND h.trial_time > 0
+                      AND h.race_time IS NOT NULL AND h.race_time > h.trial_time
+                      AND h.start_time IS NOT NULL AND h.start_time > 0
+                      AND COALESCE(h.result_status,'') NOT LIKE '%欠責%'
+                      AND COALESCE(h.result_status,'') NOT LIKE '%周誤%'
+                      AND COALESCE(h.result_status,'') NOT LIKE '%欠車%'
+                      AND COALESCE(h.result_status,'') NOT LIKE '%出走取消%'
+                      AND COALESCE(h.result_status,'') NOT LIKE '%競走中止%'
+                      AND COALESCE(h.result_status,'') NOT LIKE '%落車%'
+                      AND COALESCE(h.result_status,'') NOT LIKE '%反則%'
+                      AND COALESCE(h.result_status,'') NOT LIKE '%不成立%'
+                      AND COALESCE(h.result_status,'') NOT LIKE '%失格%'
+                    ORDER BY h.race_date DESC, h.history_id DESC
+                """, con, params=(target,))
+        except Exception:
+            df = pd.DataFrame()
+    return v61_filter_history_df(df, "開催日", "レース", count_stats=True)
 
 def ver16_make_settings_sheet(ws):
     ws["A1"] = "設定項目"
@@ -5970,8 +6099,373 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
         out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"], errors="coerce")-bonus*.0013,4)
     return out
 
+
+
+# ============================================================
+# Ver59: 選手別の逃げ役・逃げ残り学習
+# ============================================================
+def v59_apply_escape_history(df, entries=None, meta=None, db_path=None):
+    """
+    登録済み履歴から、最前線選手の「初周先頭」と「残り」を別々に推定する。
+
+    周回順位が少ない間は、0m実績・着順・ST・今回の位置関係を中心に使い、
+    周回データが増えるほど実測の初周先頭率を優先する。
+    現在レースの日付以降は学習対象から除外し、結果の先読みを防ぐ。
+    """
+    out = df.copy()
+    n = len(out)
+    defaults = {
+        "初周先頭推定": np.zeros(n),
+        "逃げ残り推定": np.zeros(n),
+        "逃切り推定": np.zeros(n),
+        "逃げ履歴件数": np.zeros(n, dtype=int),
+        "初周先頭実測件数": np.zeros(n, dtype=int),
+        "逃げ履歴補正": np.zeros(n),
+        "逃げ判定": ["対象外"] * n,
+        "逃げ根拠": ["最前線ではありません"] * n,
+    }
+    for c, v in defaults.items():
+        out[c] = v
+
+    if out.empty:
+        return out
+
+    handicaps = pd.to_numeric(out.get("ハンデ"), errors="coerce").fillna(0.0)
+    front_h = float(handicaps.min())
+    front_idx = list(out.index[handicaps.eq(front_h)])
+    if not front_idx:
+        return out
+
+    db_path = db_path or globals().get("DB_PATH")
+    current_date = str((meta or {}).get("開催日") or (meta or {}).get("日付") or "").strip()
+    current_date = v47_normalize_required_date(current_date) if "v47_normalize_required_date" in globals() else current_date
+
+    con = None
+    try:
+        if db_path and Path(str(db_path)).exists():
+            con = sqlite3.connect(str(db_path))
+    except Exception:
+        con = None
+
+    front_sorted = out.loc[front_idx].sort_values("車")
+    front_count = len(front_sorted)
+    st_now = pd.to_numeric(front_sorted.get("平均ST"), errors="coerce").fillna(0.20)
+    st_rank = st_now.rank(method="average", ascending=True)
+
+    for order, idx in enumerate(front_sorted.index):
+        row = out.loc[idx]
+        name = str(row.get("選手名") or "").strip()
+        car = int(pd.to_numeric(pd.Series([row.get("車")]), errors="coerce").fillna(99).iloc[0])
+        inner = 1.0 if front_count <= 1 else 1.0 - order / max(1, front_count - 1)
+        st_adv = 0.60 if front_count <= 1 else 1.0 - (float(st_rank.loc[idx]) - 1.0) / max(1.0, front_count - 1.0)
+        lone_front = 1.0 if front_count == 1 else 0.0
+
+        hist = pd.DataFrame()
+        lap = pd.DataFrame()
+        if con is not None and name:
+            key = v32_player_name_key(name) if "v32_player_name_key" in globals() else re.sub(r"\s+", "", name)
+            try:
+                hist = pd.read_sql_query(
+                    """SELECT race_date, venue, rank, handicap, st, car_no, surface, track_temp, player_name
+                       FROM v15_player_history_imports""", con
+                )
+                hist = hist[hist["player_name"].map(v32_player_name_key).eq(key)] if "player_name" in hist.columns else hist.iloc[0:0]
+            except Exception:
+                try:
+                    hist = pd.read_sql_query(
+                        """SELECT race_date, venue, rank, handicap, st, car_no, surface, track_temp, player_name
+                           FROM v15_player_history_imports""", con
+                    )
+                    hist = hist[hist["player_name"].map(v32_player_name_key).eq(key)]
+                except Exception:
+                    hist = pd.DataFrame()
+            try:
+                lap = pd.read_sql_query(
+                    "SELECT race_key, lap_label, position, player_name FROM player_lap_history", con
+                )
+                lap = lap[lap["player_name"].map(v32_player_name_key).eq(key)]
+            except Exception:
+                lap = pd.DataFrame()
+
+        if not hist.empty:
+            hist["race_date"] = hist["race_date"].astype(str)
+            if current_date:
+                hist = hist[hist["race_date"] < current_date]
+            hist["handicap"] = pd.to_numeric(hist["handicap"], errors="coerce")
+            hist["rank"] = pd.to_numeric(hist["rank"], errors="coerce")
+            hist["st"] = pd.to_numeric(hist["st"], errors="coerce")
+            same_front = hist[hist["handicap"].eq(front_h) & hist["rank"].notna()].copy()
+        else:
+            same_front = pd.DataFrame()
+
+        hcount = len(same_front)
+        # ベイズ平滑化。少数履歴で0%/100%に振り切れないようにする。
+        wins = int((same_front.get("rank", pd.Series(dtype=float)) == 1).sum()) if hcount else 0
+        top2 = int((same_front.get("rank", pd.Series(dtype=float)) <= 2).sum()) if hcount else 0
+        top3 = int((same_front.get("rank", pd.Series(dtype=float)) <= 3).sum()) if hcount else 0
+        win_rate = (wins + 1.0) / (hcount + 8.0)
+        top2_rate = (top2 + 2.0) / (hcount + 8.0)
+        top3_rate = (top3 + 3.0) / (hcount + 8.0)
+
+        recent = same_front.sort_values("race_date", ascending=False).head(8) if hcount else same_front
+        recent_top3 = ((recent["rank"] <= 3).sum() + 2.0) / (len(recent) + 5.0) if len(recent) else 0.40
+        hist_st = same_front["st"].dropna() if hcount else pd.Series(dtype=float)
+        st_quality = float(np.clip((0.23 - hist_st.mean()) / 0.16, 0.0, 1.0)) if len(hist_st) else 0.50
+
+        lap_count = 0
+        lap_lead_rate = 0.50
+        if not lap.empty:
+            if current_date:
+                lap = v61_filter_lap_df(lap, "race_key")
+            first_laps = lap[lap["lap_label"].astype(str).eq("1周目")]
+            lap_count = len(first_laps)
+            if lap_count:
+                lap_lead_rate = (int((pd.to_numeric(first_laps["position"], errors="coerce") == 1).sum()) + 1.0) / (lap_count + 2.0)
+
+        position_lead = 0.23 + inner * 0.24 + st_adv * 0.20 + lone_front * 0.20 + st_quality * 0.13
+        lap_weight = min(0.55, lap_count / 10.0)
+        first_lead = float(np.clip(position_lead * (1.0 - lap_weight) + lap_lead_rate * lap_weight, 0.08, 0.94))
+        hold = float(np.clip(first_lead * 0.34 + top3_rate * 0.34 + top2_rate * 0.18 + recent_top3 * 0.14, 0.08, 0.88))
+        win = float(np.clip(first_lead * 0.30 + win_rate * 0.52 + top2_rate * 0.18, 0.03, 0.72))
+
+        old_escape = float(pd.to_numeric(pd.Series([row.get("逃げ成功率")]), errors="coerce").fillna(0.35).iloc[0])
+        old_hold = float(pd.to_numeric(pd.Series([row.get("内枠残存率")]), errors="coerce").fillna(0.40).iloc[0])
+        out.at[idx, "逃げ成功率"] = float(np.clip(old_escape * 0.52 + win * 0.48, 0.03, 0.86))
+        out.at[idx, "内枠残存率"] = float(np.clip(old_hold * 0.42 + hold * 0.58, 0.08, 0.90))
+        out.at[idx, "初周先頭推定"] = round(first_lead, 3)
+        out.at[idx, "逃げ残り推定"] = round(hold, 3)
+        out.at[idx, "逃切り推定"] = round(win, 3)
+        out.at[idx, "逃げ履歴件数"] = int(hcount)
+        out.at[idx, "初周先頭実測件数"] = int(lap_count)
+
+        # 1着固定ではなく、主に2～3着残りへ効かせる小さな補正。
+        bonus = float(np.clip((hold - 0.42) * 2.2 + (first_lead - 0.55) * 0.7, -0.65, 1.05))
+        out.at[idx, "逃げ履歴補正"] = round(bonus, 3)
+        if first_lead >= 0.70 and hold >= 0.55:
+            label = "逃げ役濃厚・残り期待"
+        elif first_lead >= 0.68:
+            label = "逃げ役濃厚"
+        elif first_lead >= 0.55:
+            label = "逃げ候補"
+        else:
+            label = "逃げ不確実"
+        out.at[idx, "逃げ判定"] = label
+        out.at[idx, "逃げ根拠"] = (
+            f"最前{int(front_h)}m・内側度{inner:.2f}・ST優位{st_adv:.2f} / "
+            f"同ハンデ{hcount}走: 1着{wins}、2着内{top2}、3着内{top3} / "
+            f"初周順位実測{lap_count}走"
+        )
+
+    if con is not None:
+        con.close()
+
+    bonus_s = pd.to_numeric(out["逃げ履歴補正"], errors="coerce").fillna(0.0)
+    if "改善後総合点" in out.columns:
+        out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus_s
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus_s * 0.34
+    if "予測競走T" in out.columns:
+        out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"], errors="coerce") - bonus_s * 0.0008, 4)
+    return out
+
+
+
+# ============================================================
+# Ver60: グランドノート展開学習・50℃以上の熱走路細分化
+# ============================================================
+def v60_heat_band(track_temp):
+    """50℃付近の非線形な変化を細かく分ける。"""
+    try:
+        t = float(track_temp)
+    except Exception:
+        t = 30.0
+    if t < 42: return "～41℃", 0.00
+    if t < 47: return "42～46℃", 0.12
+    if t < 50: return "47～49℃", 0.30
+    if t < 52: return "50～51℃", 0.58
+    if t < 54: return "52～53℃", 0.76
+    if t < 56: return "54～55℃", 0.90
+    return "56℃以上", 1.00
+
+
+def _v60_name_key(value):
+    try:
+        return v32_player_name_key(value)
+    except Exception:
+        return re.sub(r"\s+", "", str(value or ""))
+
+
+def _v60_safe_rate(num, den, a=1.0, b=2.0):
+    return float((float(num) + a) / (float(den) + b)) if den >= 0 else 0.5
+
+
+def v60_apply_lap_and_heat_learning(df, entries=None, meta=None, db_path=None):
+    """
+    グランドノートから序盤主導・位置維持・捌き・追込み・終盤失速を集計し、
+    走路温度50℃以上は細分化した選手別高温適性と組み合わせて予測へ反映する。
+    """
+    out = df.copy()
+    n = len(out)
+    defaults = {
+        "展開履歴件数": np.zeros(n, dtype=int),
+        "初周主導指数": np.full(n, 0.5),
+        "位置維持指数": np.full(n, 0.5),
+        "捌き指数": np.full(n, 0.5),
+        "追込み指数": np.full(n, 0.5),
+        "終盤指数_実測": np.full(n, 0.5),
+        "失速リスク": np.full(n, 0.5),
+        "展開学習補正": np.zeros(n),
+        "展開タイプ_実測": ["データ不足"] * n,
+        "熱走路帯": [v60_heat_band((meta or {}).get("走路温度"))[0]] * n,
+        "高温履歴件数": np.zeros(n, dtype=int),
+        "50℃以上3着内率": np.full(n, np.nan),
+        "熱走路適性": np.full(n, 0.5),
+        "熱走路学習補正": np.zeros(n),
+        "Ver60総合補正": np.zeros(n),
+        "Ver60根拠": ["周回・高温履歴を確認中"] * n,
+    }
+    for c, v in defaults.items():
+        out[c] = v
+    if out.empty:
+        return out
+
+    db_path = db_path or globals().get("DB_PATH")
+    current_date = str((meta or {}).get("開催日") or (meta or {}).get("日付") or "").strip()
+    try:
+        current_date = v47_normalize_required_date(current_date)
+    except Exception:
+        pass
+    try:
+        track_temp = float((meta or {}).get("走路温度") or 30.0)
+    except Exception:
+        track_temp = 30.0
+    band, heat_level = v60_heat_band(track_temp)
+
+    lap_all = pd.DataFrame()
+    hist_all = pd.DataFrame()
+    con = None
+    try:
+        if db_path and Path(str(db_path)).exists():
+            con = sqlite3.connect(str(db_path))
+            lap_all = pd.read_sql_query(
+                "SELECT race_key, player_name, car_no, lap_label, lap_no, position FROM player_lap_history", con
+            )
+            hist_all = pd.read_sql_query(
+                "SELECT player_name, race_date, race_no, rank, handicap, track_temp, car_no, st FROM v15_player_history_imports", con
+            )
+    except Exception:
+        lap_all = pd.DataFrame(); hist_all = pd.DataFrame()
+    finally:
+        if con is not None:
+            con.close()
+
+    if not lap_all.empty:
+        lap_all["name_key"] = lap_all["player_name"].map(_v60_name_key)
+        lap_all["position"] = pd.to_numeric(lap_all["position"], errors="coerce")
+        lap_all["lap_no"] = pd.to_numeric(lap_all.get("lap_no"), errors="coerce")
+        if current_date:
+            lap_all = v61_filter_lap_df(lap_all, "race_key")
+    if not hist_all.empty:
+        hist_all["name_key"] = hist_all["player_name"].map(_v60_name_key)
+        hist_all["track_temp"] = pd.to_numeric(hist_all["track_temp"], errors="coerce")
+        hist_all["rank"] = pd.to_numeric(hist_all["rank"], errors="coerce")
+        if current_date:
+            hist_all = v61_filter_history_df(hist_all, "race_date", "race_no", count_stats=False)
+
+    for idx, row in out.iterrows():
+        key = _v60_name_key(row.get("選手名"))
+        p_laps = lap_all[lap_all["name_key"].eq(key)].copy() if not lap_all.empty else pd.DataFrame()
+        race_count = 0
+        lead_vals=[]; hold_vals=[]; pass_vals=[]; close_vals=[]; fade_vals=[]
+        if not p_laps.empty:
+            for race_key, g in p_laps.groupby("race_key"):
+                g = g.dropna(subset=["position"]).copy()
+                if g.empty: continue
+                def pos_for(label):
+                    z=g[g["lap_label"].astype(str).eq(label)]
+                    return float(z.iloc[0]["position"]) if not z.empty else None
+                first=pos_for("1周目")
+                goal=pos_for("ゴール線")
+                if goal is None:
+                    goal=pos_for("ゴール")
+                if first is None or goal is None: continue
+                race_count += 1
+                lead_vals.append(1.0 if first == 1 else max(0.0, 1.0-(first-1)/7.0))
+                hold_vals.append(float(np.clip(1.0-abs(goal-first)/7.0,0,1)))
+                pass_vals.append(float(np.clip((first-goal)/5.0+0.5,0,1)))
+                close_vals.append(float(np.clip((first-goal)/7.0+0.5,0,1)))
+                fade_vals.append(float(np.clip((goal-first)/5.0+0.5,0,1)))
+        if race_count:
+            lead=float(np.mean(lead_vals)); hold=float(np.mean(hold_vals)); passing=float(np.mean(pass_vals)); closing=float(np.mean(close_vals)); fade=float(np.mean(fade_vals))
+        else:
+            lead=hold=passing=closing=fade=0.5
+
+        p_hist = hist_all[hist_all["name_key"].eq(key)].copy() if not hist_all.empty else pd.DataFrame()
+        hot = p_hist[p_hist["track_temp"].ge(50) & p_hist["rank"].notna()] if not p_hist.empty else pd.DataFrame()
+        normal = p_hist[p_hist["track_temp"].lt(50) & p_hist["rank"].notna()] if not p_hist.empty else pd.DataFrame()
+        hot_n=len(hot)
+        hot_top3=_v60_safe_rate((hot["rank"]<=3).sum(), hot_n, 2, 5) if hot_n else np.nan
+        norm_top3=_v60_safe_rate((normal["rank"]<=3).sum(), len(normal), 2, 5) if len(normal) else 0.40
+        hot_skill=0.5 if hot_n==0 else float(np.clip(0.5+(hot_top3-norm_top3)*1.25,0.05,0.95))
+
+        # 展開補正は履歴数に応じて縮小。50℃以上では前残り・位置維持を強める。
+        lap_conf=min(1.0, race_count/8.0)
+        base_flow=((lead-0.5)*0.55 + (hold-0.5)*0.50 + (passing-0.5)*0.45 + (closing-0.5)*0.35 - (fade-0.5)*0.35) * lap_conf
+        front_role=float(pd.to_numeric(pd.Series([row.get("初周先頭推定")]), errors="coerce").fillna(0.35).iloc[0])
+        hot_flow=heat_level*((hot_skill-0.5)*1.10 + (hold-0.5)*0.45 + (front_role-0.5)*0.28)
+        flow_bonus=float(np.clip(base_flow*1.10,-0.85,0.85))
+        heat_bonus=float(np.clip(hot_flow,-0.75,0.90))
+        total=float(np.clip(flow_bonus+heat_bonus,-1.20,1.35))
+
+        if lead>=0.67 and hold>=0.62: typ="逃げ・粘り型"
+        elif passing>=0.66 and closing>=0.62: typ="捌き・追込み型"
+        elif fade>=0.64: typ="終盤失速注意"
+        elif hold>=0.65: typ="位置維持型"
+        elif race_count: typ="展開混合型"
+        else: typ="データ不足"
+
+        out.at[idx,"展開履歴件数"]=race_count
+        out.at[idx,"初周主導指数"]=round(lead,3)
+        out.at[idx,"位置維持指数"]=round(hold,3)
+        out.at[idx,"捌き指数"]=round(passing,3)
+        out.at[idx,"追込み指数"]=round(closing,3)
+        out.at[idx,"終盤指数_実測"]=round(1.0-fade,3)
+        out.at[idx,"失速リスク"]=round(fade,3)
+        out.at[idx,"展開学習補正"]=round(flow_bonus,3)
+        out.at[idx,"展開タイプ_実測"]=typ
+        out.at[idx,"熱走路帯"]=band
+        out.at[idx,"高温履歴件数"]=hot_n
+        out.at[idx,"50℃以上3着内率"]=round(hot_top3,3) if hot_n else np.nan
+        out.at[idx,"熱走路適性"]=round(hot_skill,3)
+        out.at[idx,"熱走路学習補正"]=round(heat_bonus,3)
+        out.at[idx,"Ver60総合補正"]=round(total,3)
+        out.at[idx,"Ver60根拠"]=(f"周回{race_count}走: 主導{lead:.2f} 維持{hold:.2f} 捌き{passing:.2f} 失速{fade:.2f} / " f"{band}・50℃以上{hot_n}走・熱適性{hot_skill:.2f}")
+
+    bonus=pd.to_numeric(out["Ver60総合補正"],errors="coerce").fillna(0.0)
+    if "改善後総合点" in out.columns:
+        out["改善後総合点"] = pd.to_numeric(out["改善後総合点"],errors="coerce").fillna(0.0)+bonus
+        out["改善後順位"] = out["改善後総合点"].rank(method="min",ascending=False).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"],errors="coerce").fillna(50.0)+bonus*0.42
+    if "予測競走T" in out.columns:
+        out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"],errors="coerce")-bonus*0.0009,4)
+    # 既存シミュレーションが参照する列にも穏やかに注入。
+    if "混戦突破適性" in out.columns:
+        out["混戦突破適性"] = np.clip(pd.to_numeric(out["混戦突破適性"],errors="coerce").fillna(.5)+(out["捌き指数"]-.5)*.16,0.05,.95)
+    if "ゴール前伸び指数" in out.columns:
+        out["ゴール前伸び指数"] = np.clip(pd.to_numeric(out["ゴール前伸び指数"],errors="coerce").fillna(.5)+(out["終盤指数_実測"]-.5)*.18,0.05,.95)
+    if "内枠残存率" in out.columns:
+        out["内枠残存率"] = np.clip(pd.to_numeric(out["内枠残存率"],errors="coerce").fillna(.4)+(out["位置維持指数"]-.5)*.16*heat_level,0.05,.95)
+    return out
+
 def ver16_run_prediction(text, trials=10000, seed=20260719, manual_excluded=None):
+    # 先にメタ情報を読み、履歴取得より前に学習境界を固定する。
+    _meta_for_cutoff = v15_parse_race_meta(text)
+    v61_set_learning_boundary(_meta_for_cutoff)
     content, meta, entries = ver16_build_virtual_excel(text, manual_excluded=manual_excluded)
+    # 解析結果側の正規化済みメタで境界を再確定。
+    v61_set_learning_boundary(meta)
     # run_model内でも当日出走表の補助指標を参照できるよう、一回の予測中だけ保持する。
     globals()["LATEST_ENTRY_STATS"] = entries.copy()
     globals()["LATEST_RACE_META"] = dict(meta)

@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver54｜重み影響比較・レース名自動補完・予測自信度")
+st.caption("Ver61｜対象日・対象R以降を完全除外／グランドノート展開AI／熱走路細分化")
 
 
 def qident(name: str) -> str:
@@ -815,6 +815,7 @@ with prediction_tab:
                 "race_key": race_key,
                 "trials": int(trials),
                 "excluded": [int(x) for x in manual_excluded],
+                "learning_boundary": engine.v61_learning_boundary_summary(),
             }
             st.success("予測が完了しました")
         except Exception as exc:
@@ -833,6 +834,18 @@ with prediction_tab:
             race_key = view.get("race_key", "current")
             view_trials = int(view.get("trials", trials))
             excluded = {int(car): "手動指定" for car in view.get("excluded", [])}
+            boundary = view.get("learning_boundary") or {}
+            if boundary:
+                st.info(
+                    f"🕒 学習境界：{boundary.get('label', '')}｜"
+                    f"使用 {int(boundary.get('used_rows', 0))}件｜"
+                    f"対象レース以降を除外 {int(boundary.get('excluded_rows', 0))}件"
+                )
+                if int(boundary.get('unknown_r_same_day_excluded', 0)):
+                    st.caption(
+                        f"同日でR不明の履歴 {int(boundary.get('unknown_r_same_day_excluded', 0))}件は、"
+                        "先読み防止のため安全側で除外しました。"
+                    )
             if excluded:
                 detail = "、".join(f"{car}番（{status}）" for car, status in sorted(excluded.items()))
                 st.warning(f"解析対象外: {detail}。確率・順位・買い目の組み合わせから完全に除外しました。")
@@ -845,11 +858,61 @@ with prediction_tab:
                 "改善後順位", "車", "選手名", "ハンデ", "試走換算", "予測競走T", "レース信頼度",
                 "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
                 "スタート伸び指数", "ゴール前伸び指数", "安定上位指数",
-                "混戦突破適性", "同ハンデ内枠補正", "車中期成績補正", "試走偏差補正", "高温位置補正", "Ver24展開穴補正", "選手別条件適性補正", "条件適性根拠", "条件一致最大件数", "条件適性信頼度", "改善後総合点",
+                "混戦突破適性", "逃げ判定", "初周先頭推定", "逃げ残り推定", "逃切り推定", "逃げ履歴件数", "逃げ履歴補正",
+                "展開タイプ_実測", "展開履歴件数", "展開学習補正", "熱走路帯", "高温履歴件数", "熱走路適性", "熱走路学習補正", "Ver60総合補正",
+                "同ハンデ内枠補正", "車中期成績補正", "試走偏差補正", "高温位置補正", "Ver24展開穴補正", "選手別条件適性補正", "条件適性根拠", "条件一致最大件数", "条件適性信頼度", "改善後総合点",
             ] if c in df.columns]
             result = df[cols].sort_values(["改善後順位", "車"]).reset_index(drop=True)
             st.subheader("予測順位")
             st.dataframe(result, use_container_width=True, hide_index=True)
+
+            with st.expander("🏍️ 逃げ役・逃げ残り診断", expanded=True):
+                escape_cols = [c for c in [
+                    "車", "選手名", "ハンデ", "逃げ判定", "初周先頭推定", "逃げ残り推定",
+                    "逃切り推定", "逃げ履歴件数", "初周先頭実測件数", "逃げ履歴補正", "逃げ根拠"
+                ] if c in df.columns]
+                escape_view = df[escape_cols].sort_values(["ハンデ", "車"]).reset_index(drop=True)
+                for pct_col in ["初周先頭推定", "逃げ残り推定", "逃切り推定"]:
+                    if pct_col in escape_view.columns:
+                        escape_view[pct_col] = pd.to_numeric(escape_view[pct_col], errors="coerce") * 100.0
+                st.dataframe(
+                    escape_view, use_container_width=True, hide_index=True,
+                    column_config={
+                        "初周先頭推定": st.column_config.NumberColumn(format="%.1f%%"),
+                        "逃げ残り推定": st.column_config.NumberColumn(format="%.1f%%"),
+                        "逃切り推定": st.column_config.NumberColumn(format="%.1f%%"),
+                        "逃げ履歴補正": st.column_config.NumberColumn(format="%+.3f"),
+                    },
+                )
+                st.caption("初周先頭は主導権、逃げ残りは2～3着を含む粘り、逃切りは1着まで残す見込みです。周回実測が少ない間は0m実績・ST・今回の位置関係を中心に推定します。")
+
+            with st.expander("🧭 グランドノート展開学習・熱走路診断", expanded=True):
+                v60_cols = [c for c in [
+                    "車", "選手名", "展開タイプ_実測", "展開履歴件数", "初周主導指数", "位置維持指数",
+                    "捌き指数", "追込み指数", "終盤指数_実測", "失速リスク", "展開学習補正",
+                    "熱走路帯", "高温履歴件数", "50℃以上3着内率", "熱走路適性", "熱走路学習補正",
+                    "Ver60総合補正", "Ver60根拠"
+                ] if c in df.columns]
+                v60_view = df[v60_cols].sort_values(["Ver60総合補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                for pc in ["初周主導指数", "位置維持指数", "捌き指数", "追込み指数", "終盤指数_実測", "失速リスク", "50℃以上3着内率", "熱走路適性"]:
+                    if pc in v60_view.columns:
+                        v60_view[pc] = pd.to_numeric(v60_view[pc], errors="coerce") * 100.0
+                st.dataframe(v60_view, use_container_width=True, hide_index=True, column_config={
+                    "初周主導指数": st.column_config.NumberColumn(format="%.1f%%"),
+                    "位置維持指数": st.column_config.NumberColumn(format="%.1f%%"),
+                    "捌き指数": st.column_config.NumberColumn(format="%.1f%%"),
+                    "追込み指数": st.column_config.NumberColumn(format="%.1f%%"),
+                    "終盤指数_実測": st.column_config.NumberColumn(format="%.1f%%"),
+                    "失速リスク": st.column_config.NumberColumn(format="%.1f%%"),
+                    "50℃以上3着内率": st.column_config.NumberColumn(format="%.1f%%"),
+                    "熱走路適性": st.column_config.NumberColumn(format="%.1f%%"),
+                    "展開学習補正": st.column_config.NumberColumn(format="%+.3f"),
+                    "熱走路学習補正": st.column_config.NumberColumn(format="%+.3f"),
+                    "Ver60総合補正": st.column_config.NumberColumn(format="%+.3f"),
+                })
+                temp_now = meta.get("走路温度") or "未取得"
+                st.caption(f"今回の走路温度：{temp_now}℃。47℃以上を細分化し、50℃以降は前残り・位置維持・選手別高温実績の影響を非線形に強めています。")
+                st.caption("周回履歴が少ない選手は補正を自動で縮小します。予測対象日以降の結果は学習に使いません。")
 
             st.subheader("6周の代表展開")
             lap_df = engine.v30_representative_lap_projection(df)
