@@ -11699,3 +11699,241 @@ def v72_ticket_outlier_details(bet_type, db_path=DB_PATH):
     max_remove = len(removed)
     result = df[df["上位累積確率"] > float(threshold)].head(max_remove).copy()
     return result[["レース", "的中組み合わせ", "予測順位", "上位累積確率"]].reset_index(drop=True)
+
+
+# ============================================================
+# Ver74: 全結果バックテストによる重み最適化
+# ============================================================
+def v74_init_tables(db_path=DB_PATH):
+    v41_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS v74_weight_optimization_history (
+            optimization_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            optimized_at TEXT NOT NULL,
+            race_count INTEGER NOT NULL,
+            train_count INTEGER NOT NULL,
+            validation_count INTEGER NOT NULL,
+            candidate_count INTEGER NOT NULL,
+            before_weights_json TEXT NOT NULL,
+            proposed_weights_json TEXT NOT NULL,
+            before_metrics_json TEXT,
+            proposed_metrics_json TEXT,
+            applied INTEGER NOT NULL DEFAULT 0,
+            applied_at TEXT
+        )""")
+        con.commit()
+
+
+def _v74_dataset(db_path=DB_PATH):
+    """予測時に保存した特徴と、その後登録された結果をレース単位で返す。"""
+    v74_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        df = pd.read_sql_query("""
+            SELECT s.race_key, s.car_no, s.player_name,
+                   s.trial_feature, s.st_feature, s.handicap_feature,
+                   s.form_feature, s.surface_feature, s.front_feature,
+                   s.chase_feature, s.stability_feature, s.course_feature,
+                   s.opponent_feature, e.finish, e.result_status,
+                   COALESCE(rr.race_date, '') AS race_date,
+                   COALESCE(rr.race_no, 0) AS race_no,
+                   COALESCE(rr.registered_at, '') AS registered_at
+            FROM v40_prediction_feature_snapshots s
+            JOIN result_entries e
+              ON e.race_key=s.race_key AND e.car_no=s.car_no
+            JOIN result_races rr ON rr.race_key=s.race_key
+            LEFT JOIN v41_registration_batches b ON b.race_key=s.race_key
+            WHERE COALESCE(b.status,'active')='active'
+            ORDER BY race_date, race_no, registered_at, s.race_key, s.car_no
+        """, con)
+    if df.empty:
+        return df
+    df['finish'] = pd.to_numeric(df['finish'], errors='coerce')
+    invalid = df['result_status'].fillna('').astype(str).str.contains(
+        '欠車|競走中止|落車|反則|不成立|失格', regex=True
+    )
+    df = df[df['finish'].notna() & (df['finish'] >= 1) & ~invalid].copy()
+    counts = df.groupby('race_key')['car_no'].transform('count')
+    df = df[df['finish'] <= counts]
+    valid_races = df.groupby('race_key').size()
+    return df[df['race_key'].isin(valid_races[valid_races >= 3].index)].copy()
+
+
+_V74_COLMAP = {
+    '試走':'trial_feature', 'ST':'st_feature', 'ハンデ':'handicap_feature',
+    '近況':'form_feature', '走路適性':'surface_feature', '前残り':'front_feature',
+    '追い込み':'chase_feature', '周回安定':'stability_feature',
+    'コース適性':'course_feature', '相手耐性':'opponent_feature',
+}
+
+
+def _v74_normalize_weights(weights):
+    raw = {k: float(max(0.015, min(0.35, weights.get(k, V40_DEFAULT_WEIGHTS[k]))))
+           for k in V40_DEFAULT_WEIGHTS}
+    total = sum(raw.values()) or 1.0
+    return {k: raw[k] / total for k in V40_DEFAULT_WEIGHTS}
+
+
+def _v74_metrics(df, weights):
+    """小さいほど良い損失と、人が読める指標を返す。"""
+    if df is None or df.empty:
+        return {'race_count':0, 'objective':None}
+    w = _v74_normalize_weights(weights)
+    rows=[]
+    for race_key, g in df.groupby('race_key', sort=False):
+        g=g.copy()
+        score=np.zeros(len(g), dtype=float)
+        for name,col in _V74_COLMAP.items():
+            score += w[name] * pd.to_numeric(g[col], errors='coerce').fillna(.5).to_numpy(float)
+        g['_score']=score
+        g['_pred_rank']=g['_score'].rank(method='min', ascending=False).astype(int)
+        g['_actual_rank']=pd.to_numeric(g['finish'], errors='coerce').astype(int)
+        n=max(1,len(g))
+        winner=g.sort_values('_actual_rank').iloc[0]
+        winner_pct=(int(winner['_pred_rank'])-1)/max(1,n-1)
+        pred_top3=set(g.nsmallest(min(3,n),'_pred_rank')['car_no'].astype(int))
+        actual_top3=set(g.nsmallest(min(3,n),'_actual_rank')['car_no'].astype(int))
+        top3_recall=len(pred_top3 & actual_top3)/max(1,len(actual_top3))
+        pred_order=g.nsmallest(min(3,n),'_pred_rank')['car_no'].astype(int).tolist()
+        actual_order=g.nsmallest(min(3,n),'_actual_rank')['car_no'].astype(int).tolist()
+        exact=float(pred_order==actual_order)
+        rho=_v39_spearman(-g['_pred_rank'], -g['_actual_rank'])
+        rows.append((winner_pct,top3_recall,exact,rho))
+    arr=np.asarray(rows,float)
+    winner_pct=float(arr[:,0].mean())
+    top3=float(arr[:,1].mean())
+    exact=float(arr[:,2].mean())
+    rho=float(arr[:,3].mean())
+    # 全着順を平均的に良くしつつ、1着と上位3台を少し重く評価。
+    objective=(1-winner_pct)*0.34 + top3*0.31 + ((rho+1)/2)*0.25 + exact*0.10
+    return {
+        'race_count':len(rows), 'objective':float(objective),
+        'winner_mean_percentile':winner_pct*100.0,
+        'top3_recall':top3*100.0,
+        'exact_trifecta_rate':exact*100.0,
+        'rank_correlation':rho,
+    }
+
+
+def _v74_metric_rows(before, after, label):
+    def val(d,k):
+        v=d.get(k)
+        return None if v is None else float(v)
+    specs=[
+        ('総合評価', 'objective', True, 100.0, '点'),
+        ('勝者の平均予測位置', 'winner_mean_percentile', False, 1.0, '%'),
+        ('上位3台の捕捉率', 'top3_recall', True, 1.0, '%'),
+        ('三連単1位完全一致率', 'exact_trifecta_rate', True, 1.0, '%'),
+        ('全着順相関', 'rank_correlation', True, 1.0, ''),
+    ]
+    rows=[]
+    for name,key,higher,scale,suffix in specs:
+        b=val(before,key); a=val(after,key)
+        if b is None or a is None: continue
+        b*=scale; a*=scale
+        change=(a-b) if higher else (b-a)
+        rows.append({'対象':label,'指標':name,'現在':b,'提案':a,'改善方向の差':change,'単位':suffix})
+    return rows
+
+
+def v74_optimize_weights(db_path=DB_PATH, candidate_count=800, seed=74):
+    """古い70%で探索し、新しい30%でも悪化しない重みだけを提案する。"""
+    df=_v74_dataset(db_path)
+    races=(df[['race_key','race_date','race_no','registered_at']]
+           .drop_duplicates('race_key')
+           .sort_values(['race_date','race_no','registered_at','race_key'])) if not df.empty else pd.DataFrame()
+    if len(races)<8:
+        return {'ok':False,'message':f'比較可能な予測＋結果が{len(races)}レースです。最低8レース必要です。'}
+    split=max(5,min(len(races)-2,int(round(len(races)*0.70))))
+    train_keys=set(races.iloc[:split]['race_key'])
+    valid_keys=set(races.iloc[split:]['race_key'])
+    train=df[df['race_key'].isin(train_keys)]
+    valid=df[df['race_key'].isin(valid_keys)]
+    current=v40_get_weights(db_path)
+    default=_v74_normalize_weights(V40_DEFAULT_WEIGHTS)
+    before_train=_v74_metrics(train,current)
+    before_valid=_v74_metrics(valid,current)
+    before_all=_v74_metrics(df,current)
+    rng=np.random.default_rng(int(seed))
+    candidates=[current,default]
+    current_vec=np.array([current[k] for k in V40_DEFAULT_WEIGHTS],float)
+    default_vec=np.array([default[k] for k in V40_DEFAULT_WEIGHTS],float)
+    # 現在値周辺、初期値周辺、広め探索を混ぜる。
+    n=max(50,int(candidate_count))
+    for i in range(n):
+        if i%3==0:
+            alpha=np.maximum(current_vec*140,1.2)
+        elif i%3==1:
+            alpha=np.maximum(default_vec*100,1.0)
+        else:
+            alpha=np.maximum((current_vec*.55+default_vec*.45)*35,.8)
+        vec=rng.dirichlet(alpha)
+        candidates.append({k:float(vec[j]) for j,k in enumerate(V40_DEFAULT_WEIGHTS)})
+    best=None
+    for cand in candidates:
+        cand=_v74_normalize_weights(cand)
+        mt=_v74_metrics(train,cand)
+        mv=_v74_metrics(valid,cand)
+        # 検証側の悪化を許さない。微差なら全体成績を優先。
+        if mv['objective'] + 1e-9 < before_valid['objective'] - 0.002:
+            continue
+        robust=0.52*mt['objective']+0.48*mv['objective']
+        item=(robust,mv['objective'],mt['objective'],cand,mt,mv)
+        if best is None or item[:3]>best[:3]: best=item
+    if best is None:
+        proposed=current; prop_train=before_train; prop_valid=before_valid
+    else:
+        _,_,_,proposed,prop_train,prop_valid=best
+    prop_all=_v74_metrics(df,proposed)
+    rows=[]
+    for k in V40_DEFAULT_WEIGHTS:
+        rows.append({'項目':k,'現在':current[k],'提案':proposed[k],'変化':proposed[k]-current[k]})
+    comparison=[]
+    comparison += _v74_metric_rows(before_train,prop_train,'探索用（古い70%）')
+    comparison += _v74_metric_rows(before_valid,prop_valid,'検証用（新しい30%）')
+    comparison += _v74_metric_rows(before_all,prop_all,'全結果')
+    result={
+        'ok':True,'race_count':len(races),'train_count':len(train_keys),'validation_count':len(valid_keys),
+        'candidate_count':len(candidates),'current':current,'proposed':proposed,
+        'weights':pd.DataFrame(rows),'comparison':pd.DataFrame(comparison),
+        'before_train':before_train,'proposed_train':prop_train,
+        'before_validation':before_valid,'proposed_validation':prop_valid,
+        'before_all':before_all,'proposed_all':prop_all,
+    }
+    v74_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        cur=con.execute("""INSERT INTO v74_weight_optimization_history
+            (optimized_at,race_count,train_count,validation_count,candidate_count,
+             before_weights_json,proposed_weights_json,before_metrics_json,proposed_metrics_json,applied)
+             VALUES(?,?,?,?,?,?,?,?,?,0)""",(
+            datetime.now().isoformat(timespec='seconds'),len(races),len(train_keys),len(valid_keys),len(candidates),
+            json.dumps(current,ensure_ascii=False),json.dumps(proposed,ensure_ascii=False),
+            json.dumps({'train':before_train,'validation':before_valid,'all':before_all},ensure_ascii=False),
+            json.dumps({'train':prop_train,'validation':prop_valid,'all':prop_all},ensure_ascii=False)))
+        result['optimization_id']=int(cur.lastrowid)
+        con.commit()
+    return result
+
+
+def v74_apply_optimized_weights(optimization_id, db_path=DB_PATH):
+    v74_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        row=con.execute("SELECT proposed_weights_json,applied FROM v74_weight_optimization_history WHERE optimization_id=?",(int(optimization_id),)).fetchone()
+        if not row: return False,'最適化結果が見つかりません。'
+        if int(row[1] or 0)==1: return False,'この提案はすでに適用済みです。'
+        proposed=_v74_normalize_weights(json.loads(row[0]))
+        now=datetime.now().isoformat(timespec='seconds')
+        for name,value in proposed.items():
+            con.execute("UPDATE adaptive_weights SET current_weight=?,updated_at=?,update_count=update_count+1 WHERE feature_name=?",(float(value),now,name))
+        con.execute("UPDATE v74_weight_optimization_history SET applied=1,applied_at=? WHERE optimization_id=?",(now,int(optimization_id)))
+        con.commit()
+    return True,'全結果バックテストの提案重みを適用しました。'
+
+
+def v74_optimization_history(db_path=DB_PATH, limit=20):
+    v74_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        return pd.read_sql_query("""SELECT optimization_id AS ID, optimized_at AS 実行日時,
+            race_count AS 全レース, train_count AS 探索用, validation_count AS 検証用,
+            candidate_count AS 候補数, CASE applied WHEN 1 THEN '適用済み' ELSE '未適用' END AS 状態,
+            applied_at AS 適用日時
+            FROM v74_weight_optimization_history ORDER BY optimization_id DESC LIMIT ?""",con,params=(int(limit),))

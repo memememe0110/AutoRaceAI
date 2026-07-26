@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver73｜フォーメーション一括コピー・画面ナビ改善")
+st.caption("Ver74｜全結果バックテスト・重み最適化")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -502,6 +502,27 @@ def show_v67_self_evaluation(meta: dict) -> None:
         "ライン計算", ["実用ライン", "全結果ライン"], horizontal=True,
         help="実用ラインは、10レース以上ある券種で極端に悪い上側外れ値だけを最大10%まで分離します。全結果ラインはすべての結果を含みます。",
     )
+
+    st.markdown("#### 強調する最大点数")
+    cap_enabled = st.checkbox(
+        "点数上限を使う",
+        value=True,
+        key="v75_highlight_cap_enabled",
+        help="有効にすると、カバーラインに必要な点数が多くても上位から指定点数までに絞ります。",
+    )
+    cap_points = st.select_slider(
+        "全券種共通の最大点数",
+        options=[5, 10, 15, 20, 30, 50, 100],
+        value=20,
+        disabled=not cap_enabled,
+        key="v75_highlight_cap_points",
+        help="フォーメーションと一括コピーも、この点数以内の組み合わせだけで作成します。",
+    )
+    if cap_enabled:
+        st.caption(f"現在の設定：各券種とも最大{int(cap_points)}点まで強調")
+    else:
+        st.caption("現在の設定：点数制限なし。選択したカバーラインまで強調")
+
     tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
     all_formation_text: dict[str, str] = {}
     for tab, bet_type in zip(tabs, ["2連単", "2連複", "3連複", "3連単"]):
@@ -536,12 +557,44 @@ def show_v67_self_evaluation(meta: dict) -> None:
                         },
                     )
 
-            highlighted = engine.v67_ticket_highlight_table(meta, bet_type, cutoff, engine.DB_PATH)
-            if highlighted.empty:
+            highlighted_full = engine.v67_ticket_highlight_table(meta, bet_type, cutoff, engine.DB_PATH)
+            if highlighted_full.empty:
                 st.caption("現在の予測分布を取得できませんでした。予測をもう一度実行してください。")
                 continue
+
+            highlighted = highlighted_full.copy()
+            if cap_enabled:
+                highlighted = highlighted.head(int(cap_points)).copy()
+
+            actual_points = len(highlighted)
+            original_points = len(highlighted_full)
+            actual_cover = float(pd.to_numeric(highlighted["累積確率"], errors="coerce").dropna().max()) if not highlighted.empty else 0.0
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("強調点数", f"{actual_points}点")
+            m2.metric("強調範囲の累積", f"{actual_cover:.2f}%")
+            m3.metric("ライン要求", f"{cutoff:.2f}%")
+            if cap_enabled and original_points > actual_points:
+                st.warning(
+                    f"{coverage}%カバーラインには{original_points}点必要ですが、最大{int(cap_points)}点に制限しました。"
+                    f" 現在の強調範囲は累積{actual_cover:.2f}%です。"
+                )
+            else:
+                st.success(f"選択したラインを{actual_points}点・累積{actual_cover:.2f}%でカバーしています。")
+
+            # 強調対象そのものが一目で分かるよう、行全体を色付けする。
+            def _v75_row_style(row):
+                is_last = row.name == highlighted.index[-1]
+                if is_last:
+                    return ["background-color: #b7e4c7; font-weight: 700; border-bottom: 3px solid #2d6a4f"] * len(row)
+                return ["background-color: #d8f3dc"] * len(row)
+
+            styled = highlighted.style.apply(_v75_row_style, axis=1).format({
+                "確率": "{:.3f}%",
+                "累積確率": "{:.2f}%",
+            })
             st.dataframe(
-                highlighted,
+                styled,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -549,6 +602,8 @@ def show_v67_self_evaluation(meta: dict) -> None:
                     "累積確率": st.column_config.NumberColumn(format="%.2f%%"),
                 },
             )
+            st.caption("緑色の行が強調対象です。濃い緑の最終行が現在の強調境界です。")
+
             formations = engine.v67_compress_formations(highlighted["組み合わせ"].tolist(), bet_type)
             if formations:
                 st.markdown("#### 強調範囲のまとめ・一括コピー")
@@ -557,7 +612,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
                 v73_copy_box(
                     f"{bet_type} フォーメーション",
                     formation_text,
-                    f"{bet_type}_{coverage}_{line_mode}",
+                    f"{bet_type}_{coverage}_{line_mode}_{cap_enabled}_{cap_points}",
                     height=max(105, min(260, 44 + 28 * len(formations))),
                 )
                 st.caption("共通部分だけをまとめた簡易表記です。正確な対象は上の一覧表でも確認できます。")
@@ -573,7 +628,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
         v73_copy_box(
             "強調対象フォーメーション一式",
             all_text,
-            f"all_{coverage}_{line_mode}",
+            f"all_{coverage}_{line_mode}_{cap_enabled}_{cap_points}",
             height=max(180, min(420, 75 + 26 * all_text.count("\n"))),
         )
         st.markdown('<div class="v73-nav"><a href="#ticket-probability">券種別確率へ</a><a href="#prediction-summary">予測概要へ</a><a href="#page-top">ページ上部へ</a></div>', unsafe_allow_html=True)
@@ -1485,6 +1540,52 @@ with result_tab:
 
 
 with db_tab:
+    st.subheader("全結果バックテスト・重み最適化")
+    st.caption("単発レースの結果だけでなく、予測時に保存した特徴と登録済み結果をまとめて比較します。古い約70%で候補を探し、新しい約30%でも悪化しない候補だけを提案します。")
+    candidate_count = st.slider("試す重み候補数", 200, 3000, 800, 100, key="v74_candidate_count")
+    if st.button("🧠 全結果から重みを最適化", use_container_width=True, key="v74_optimize"):
+        with st.spinner("登録済みレースをバックテスト中です…"):
+            st.session_state["v74_optimization"] = engine.v74_optimize_weights(engine.DB_PATH, candidate_count)
+    opt = st.session_state.get("v74_optimization")
+    if opt:
+        if not opt.get("ok"):
+            st.warning(opt.get("message", "最適化できませんでした。"))
+        else:
+            c1,c2,c3=st.columns(3)
+            c1.metric("全レース", opt["race_count"])
+            c2.metric("探索用", opt["train_count"])
+            c3.metric("検証用", opt["validation_count"])
+            st.markdown("#### 重みの提案")
+            st.dataframe(opt["weights"], use_container_width=True, hide_index=True, column_config={
+                "現在":st.column_config.NumberColumn(format="%.4f"),
+                "提案":st.column_config.NumberColumn(format="%.4f"),
+                "変化":st.column_config.NumberColumn(format="%+.4f"),
+            })
+            st.markdown("#### バックテスト比較")
+            st.dataframe(opt["comparison"], use_container_width=True, hide_index=True, column_config={
+                "現在":st.column_config.NumberColumn(format="%.3f"),
+                "提案":st.column_config.NumberColumn(format="%.3f"),
+                "改善方向の差":st.column_config.NumberColumn(format="%+.3f"),
+            })
+            valid_before=opt["before_validation"].get("objective",0) or 0
+            valid_after=opt["proposed_validation"].get("objective",0) or 0
+            if valid_after > valid_before + 1e-6:
+                st.success(f"新しい約30%の検証レースでも総合評価が {valid_before*100:.2f} → {valid_after*100:.2f} に改善しました。")
+            else:
+                st.info("検証レースで明確な改善候補が見つからなかったため、現在値に近い提案です。無理に重みを動かしません。")
+            confirm_apply=st.checkbox("提案重みを適用する", key=f"v74_apply_confirm_{opt.get('optimization_id')}")
+            if st.button("✅ 提案重みを適用", use_container_width=True, disabled=not confirm_apply, key=f"v74_apply_{opt.get('optimization_id')}"):
+                ok,msg=engine.v74_apply_optimized_weights(opt["optimization_id"],engine.DB_PATH)
+                (st.success if ok else st.warning)(msg)
+                if ok:
+                    st.session_state.pop("v74_optimization",None)
+                    st.rerun()
+    hist74=engine.v74_optimization_history(engine.DB_PATH,20)
+    if not hist74.empty:
+        with st.expander("過去の最適化履歴", expanded=False):
+            st.dataframe(hist74,use_container_width=True,hide_index=True)
+
+    st.divider()
     st.subheader("学習重み・変更履歴")
     st.dataframe(engine.v40_current_weights(engine.DB_PATH), use_container_width=True, hide_index=True,
         column_config={"現在の重み":st.column_config.NumberColumn(format="%.4f"),"初期値":st.column_config.NumberColumn(format="%.4f"),"初期値からの差":st.column_config.NumberColumn(format="%+.4f")})
