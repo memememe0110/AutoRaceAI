@@ -10416,3 +10416,363 @@ def v58_cleanup_exact_numeric_duplicates(db_path=DB_PATH):
                 )
         con.commit()
     return {"merged_histories": merged_histories, "merged_imports": merged_imports, "r_conflicts": r_conflicts}
+
+# ============================================================
+# Ver62: 登録済みグランドノートの全件再同期・再学習
+# ============================================================
+def v62_rebuild_grand_note_learning(db_path=DB_PATH):
+    """
+    旧版を含む result_laps の全周回データを player_lap_history へ再同期する。
+
+    Ver60の展開学習は player_lap_history を予測時に集計するため、ここを再構築すると
+    登録済みのグランドノート全件が、初周主導・位置維持・捌き・追込み・終盤・失速・
+    熱走路時の前残り補正へ反映される。
+
+    既存行は同一 (race_key, car_no, lap_label) で置換し、重複は作らない。
+    result_laps に存在しない選手別周回履歴は削除しない。
+    """
+    v35_init_result_tables(db_path)
+    v36_init_history_tables(db_path)
+
+    stats = {
+        "結果周回行": 0,
+        "同期成功": 0,
+        "更新": 0,
+        "新規": 0,
+        "選手不明": 0,
+        "結果選手不明": 0,
+        "対象レース": 0,
+        "対象選手": 0,
+    }
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("PRAGMA foreign_keys=ON")
+
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "result_laps" not in tables or "result_entries" not in tables:
+            return stats
+
+        lap_rows = con.execute("""
+            SELECT rl.race_key, rl.lap_label, rl.lap_no, rl.position, rl.car_no,
+                   re.player_name
+              FROM result_laps rl
+              LEFT JOIN result_entries re
+                ON re.race_key = rl.race_key AND re.car_no = rl.car_no
+             ORDER BY rl.race_key, rl.lap_no, rl.position
+        """).fetchall()
+        stats["結果周回行"] = len(lap_rows)
+        stats["対象レース"] = len({str(r[0]) for r in lap_rows})
+        stats["対象選手"] = len({(str(r[0]), int(r[4])) for r in lap_rows})
+
+        for race_key, lap_label, lap_no, position, car_no, player_name in lap_rows:
+            name = str(player_name or "").strip()
+            if not name:
+                stats["結果選手不明"] += 1
+                continue
+
+            found = _v32_find_player(con, name)
+            if not found:
+                # 結果登録済みなのに選手マスターが無い旧DBでは、安全に選手を補完する。
+                try:
+                    con.execute(
+                        "INSERT OR IGNORE INTO players(player_name) VALUES(?)",
+                        (name,),
+                    )
+                    found = _v32_find_player(con, name)
+                except Exception:
+                    found = None
+            if not found:
+                stats["選手不明"] += 1
+                continue
+
+            player_id, canonical = found
+            existed = con.execute("""
+                SELECT 1 FROM player_lap_history
+                 WHERE race_key=? AND car_no=? AND lap_label=?
+            """, (race_key, int(car_no), str(lap_label))).fetchone()
+
+            con.execute("""
+                INSERT INTO player_lap_history
+                    (race_key, player_id, player_name, car_no, lap_label,
+                     lap_no, position, created_at)
+                VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(race_key, car_no, lap_label) DO UPDATE SET
+                    player_id=excluded.player_id,
+                    player_name=excluded.player_name,
+                    lap_no=excluded.lap_no,
+                    position=excluded.position,
+                    created_at=CURRENT_TIMESTAMP
+            """, (
+                str(race_key), int(player_id), str(canonical), int(car_no),
+                str(lap_label), int(lap_no) if lap_no is not None else None,
+                int(position),
+            ))
+            stats["同期成功"] += 1
+            if existed:
+                stats["更新"] += 1
+            else:
+                stats["新規"] += 1
+
+        # 同じ選手名の空白表記を正規化し、今後の集計漏れを防ぐ。
+        try:
+            rows = con.execute("SELECT rowid, player_name FROM player_lap_history").fetchall()
+            for rowid, old_name in rows:
+                found = _v32_find_player(con, old_name)
+                if found and str(old_name) != str(found[1]):
+                    con.execute(
+                        "UPDATE player_lap_history SET player_id=?, player_name=? WHERE rowid=?",
+                        (int(found[0]), str(found[1]), int(rowid)),
+                    )
+        except Exception:
+            pass
+
+        con.commit()
+
+    return stats
+
+
+def v62_grand_note_learning_status(db_path=DB_PATH):
+    """現在のグランドノート保存・展開学習対象件数を返す。"""
+    v35_init_result_tables(db_path)
+    v36_init_history_tables(db_path)
+    out = {
+        "結果周回行": 0,
+        "選手別周回行": 0,
+        "結果レース数": 0,
+        "学習レース数": 0,
+        "学習選手数": 0,
+        "未同期行推定": 0,
+    }
+    with sqlite3.connect(str(db_path)) as con:
+        try:
+            out["結果周回行"] = int(con.execute("SELECT COUNT(*) FROM result_laps").fetchone()[0])
+            out["結果レース数"] = int(con.execute("SELECT COUNT(DISTINCT race_key) FROM result_laps").fetchone()[0])
+        except Exception:
+            pass
+        try:
+            out["選手別周回行"] = int(con.execute("SELECT COUNT(*) FROM player_lap_history").fetchone()[0])
+            out["学習レース数"] = int(con.execute("SELECT COUNT(DISTINCT race_key) FROM player_lap_history").fetchone()[0])
+            out["学習選手数"] = int(con.execute("SELECT COUNT(DISTINCT player_id) FROM player_lap_history").fetchone()[0])
+        except Exception:
+            pass
+        try:
+            out["未同期行推定"] = int(con.execute("""
+                SELECT COUNT(*)
+                  FROM result_laps rl
+                  JOIN result_entries re
+                    ON re.race_key=rl.race_key AND re.car_no=rl.car_no
+                  LEFT JOIN player_lap_history pl
+                    ON pl.race_key=rl.race_key
+                   AND pl.car_no=rl.car_no
+                   AND pl.lap_label=rl.lap_label
+                 WHERE pl.race_key IS NULL
+                   AND COALESCE(TRIM(re.player_name),'')<>''
+            """).fetchone()[0])
+        except Exception:
+            pass
+    return out
+
+# ============================================================
+# Ver63: グランドノート未リンク診断・修復
+# ============================================================
+def _v63_norm_race_no(value):
+    m = re.search(r"\d+", str(value or ""))
+    return int(m.group()) if m else None
+
+
+def v63_grand_note_unlinked_groups(db_path=DB_PATH):
+    """選手名と結び付いていないグランドノートを、レース・車番単位で返す。"""
+    v35_init_result_tables(db_path)
+    v36_init_history_tables(db_path)
+    groups = []
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT rl.race_key, rr.race_date, rr.venue, rr.race_no,
+                   rl.car_no, COUNT(*) AS lap_rows,
+                   MIN(rl.position) AS best_position,
+                   MAX(CASE WHEN rl.lap_label='ゴール線' THEN rl.position END) AS goal_position,
+                   MAX(CASE WHEN rl.lap_label='1周目' THEN rl.position END) AS first_lap_position,
+                   MAX(COALESCE(re.player_name,'')) AS player_name
+              FROM result_laps rl
+              LEFT JOIN result_races rr ON rr.race_key=rl.race_key
+              LEFT JOIN result_entries re
+                ON re.race_key=rl.race_key AND re.car_no=rl.car_no
+             WHERE COALESCE(TRIM(re.player_name),'')=''
+             GROUP BY rl.race_key, rr.race_date, rr.venue, rr.race_no, rl.car_no
+             ORDER BY rr.race_date DESC, CAST(rr.race_no AS INTEGER) DESC, rl.car_no
+        """).fetchall()
+
+        for row in rows:
+            race_no = _v63_norm_race_no(row["race_no"])
+            candidates = []
+
+            # 1) 正規履歴から同日・同場・同R・同車番を探す
+            try:
+                crows = con.execute("""
+                    SELECT DISTINCT p.player_name, '正規履歴' AS source
+                      FROM race_history rh
+                      JOIN players p ON p.player_id=rh.player_id
+                     WHERE rh.race_date=? AND rh.venue=?
+                       AND CAST(REPLACE(COALESCE(rh.race_no,''),'R','') AS INTEGER)=?
+                       AND EXISTS (
+                           SELECT 1 FROM v15_player_history_imports vi
+                            WHERE REPLACE(vi.player_name,' ','')=REPLACE(p.player_name,' ','')
+                              AND vi.race_date=rh.race_date AND vi.venue=rh.venue
+                              AND vi.race_no=? AND vi.car_no=?
+                       )
+                """, (row["race_date"], row["venue"], race_no or -1, race_no or -1, int(row["car_no"]))).fetchall()
+                candidates.extend({"player_name": r[0], "source": r[1]} for r in crows)
+            except Exception:
+                pass
+
+            # 2) 詳細履歴から同日・同場・同R・同車番を直接探す
+            try:
+                crows = con.execute("""
+                    SELECT DISTINCT player_name, '詳細履歴' AS source
+                      FROM v15_player_history_imports
+                     WHERE race_date=? AND venue=? AND race_no=? AND car_no=?
+                       AND COALESCE(TRIM(player_name),'')<>''
+                """, (row["race_date"], row["venue"], race_no or -1, int(row["car_no"]))).fetchall()
+                candidates.extend({"player_name": r[0], "source": r[1]} for r in crows)
+            except Exception:
+                pass
+
+            # 重複候補を正規化して除去
+            unique = []
+            seen = set()
+            for c in candidates:
+                key = re.sub(r"[\s　]+", "", str(c["player_name"] or ""))
+                if key and key not in seen:
+                    seen.add(key)
+                    unique.append(c)
+
+            groups.append({
+                "race_key": row["race_key"],
+                "race_date": row["race_date"],
+                "venue": row["venue"],
+                "race_no": row["race_no"],
+                "car_no": int(row["car_no"]),
+                "lap_rows": int(row["lap_rows"] or 0),
+                "first_lap_position": row["first_lap_position"],
+                "goal_position": row["goal_position"],
+                "candidates": unique,
+            })
+    return groups
+
+
+def v63_player_name_choices(db_path=DB_PATH):
+    """手動修復用の選手名一覧。"""
+    with sqlite3.connect(str(db_path)) as con:
+        return [r[0] for r in con.execute(
+            "SELECT player_name FROM players WHERE COALESCE(TRIM(player_name),'')<>'' ORDER BY player_name"
+        ).fetchall()]
+
+
+def v63_repair_grand_note_link(race_key, car_no, player_name, db_path=DB_PATH):
+    """結果の車番へ選手名を設定し、該当グランドノートを選手別履歴へ再同期する。"""
+    name = str(player_name or "").strip()
+    if not name:
+        return {"ok": False, "message": "選手名を選択してください。"}
+    v35_init_result_tables(db_path)
+    v36_init_history_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("PRAGMA foreign_keys=ON")
+        lap_count = int(con.execute(
+            "SELECT COUNT(*) FROM result_laps WHERE race_key=? AND car_no=?",
+            (str(race_key), int(car_no)),
+        ).fetchone()[0])
+        if lap_count == 0:
+            return {"ok": False, "message": "対象のグランドノートが見つかりません。"}
+
+        found = _v32_find_player(con, name)
+        if not found:
+            con.execute("INSERT OR IGNORE INTO players(player_name) VALUES(?)", (name,))
+            found = _v32_find_player(con, name)
+        if not found:
+            return {"ok": False, "message": "選手マスターを作成できませんでした。"}
+        player_id, canonical = found
+
+        exists = con.execute(
+            "SELECT 1 FROM result_entries WHERE race_key=? AND car_no=?",
+            (str(race_key), int(car_no)),
+        ).fetchone()
+        if exists:
+            con.execute(
+                "UPDATE result_entries SET player_name=? WHERE race_key=? AND car_no=?",
+                (str(canonical), str(race_key), int(car_no)),
+            )
+        else:
+            con.execute(
+                "INSERT INTO result_entries(race_key,car_no,player_name,result_status) VALUES(?,?,?,'通常')",
+                (str(race_key), int(car_no), str(canonical)),
+            )
+
+        laps = con.execute("""
+            SELECT lap_label, lap_no, position
+              FROM result_laps
+             WHERE race_key=? AND car_no=?
+        """, (str(race_key), int(car_no))).fetchall()
+        for lap_label, lap_no, position in laps:
+            con.execute("""
+                INSERT INTO player_lap_history
+                    (race_key, player_id, player_name, car_no, lap_label, lap_no, position, created_at)
+                VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(race_key, car_no, lap_label) DO UPDATE SET
+                    player_id=excluded.player_id,
+                    player_name=excluded.player_name,
+                    lap_no=excluded.lap_no,
+                    position=excluded.position,
+                    created_at=CURRENT_TIMESTAMP
+            """, (
+                str(race_key), int(player_id), str(canonical), int(car_no),
+                str(lap_label), int(lap_no) if lap_no is not None else None,
+                int(position),
+            ))
+        con.commit()
+    return {
+        "ok": True,
+        "message": f"{race_key}・{car_no}番を {canonical} にリンクしました。",
+        "synced_rows": lap_count,
+        "player_name": canonical,
+    }
+
+
+def v63_auto_repair_grand_note_links(db_path=DB_PATH):
+    """候補が一意に決まる未リンクだけを安全に自動修復する。"""
+    groups = v63_grand_note_unlinked_groups(db_path)
+    repaired = 0
+    rows = 0
+    manual = 0
+    details = []
+    for g in groups:
+        if len(g.get("candidates", [])) == 1:
+            candidate = g["candidates"][0]["player_name"]
+            result = v63_repair_grand_note_link(g["race_key"], g["car_no"], candidate, db_path)
+            if result.get("ok"):
+                repaired += 1
+                rows += int(result.get("synced_rows", 0))
+                details.append(result.get("message", ""))
+            else:
+                manual += 1
+        else:
+            manual += 1
+    return {"repaired_groups": repaired, "synced_rows": rows, "manual_groups": manual, "details": details}
+
+
+def v63_db_health_report(db_path=DB_PATH):
+    """グランドノート周辺を中心とした簡易DB健康診断。"""
+    status = v62_grand_note_learning_status(db_path)
+    groups = v63_grand_note_unlinked_groups(db_path)
+    unresolved_rows = sum(int(g.get("lap_rows", 0)) for g in groups)
+    total = max(int(status.get("結果周回行", 0)), 1)
+    score = max(0.0, 100.0 * (1.0 - unresolved_rows / total))
+    return {
+        "health_score": round(score, 1),
+        "unlinked_groups": len(groups),
+        "unlinked_rows": unresolved_rows,
+        "result_lap_rows": int(status.get("結果周回行", 0)),
+        "learned_lap_rows": int(status.get("選手別周回行", 0)),
+    }

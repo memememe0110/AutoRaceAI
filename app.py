@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver61｜対象日・対象R以降を完全除外／グランドノート展開AI／熱走路細分化")
+st.caption("Ver63｜グランドノート未リンク診断・修復／全件再学習／未来データ完全除外")
 
 
 def qident(name: str) -> str:
@@ -1479,6 +1479,111 @@ with db_tab:
                     else:
                         st.warning(summary + " GitHub保存は未完了です。" + msg)
                     st.rerun()
+
+                st.divider()
+                st.subheader("グランドノート再学習")
+                st.caption("旧バージョンを含む登録済み結果のグランドノートを、選手別の展開学習へ全件再同期します。再同期後は、初周主導・位置維持・捌き・追込み・終盤・失速・熱走路補正のすべてに反映されます。")
+                try:
+                    gn_status = engine.v62_grand_note_learning_status(engine.DB_PATH)
+                    st.caption(
+                        f"結果周回 {gn_status.get('結果周回行', 0)}行 / "
+                        f"学習済み {gn_status.get('選手別周回行', 0)}行 / "
+                        f"学習レース {gn_status.get('学習レース数', 0)}件 / "
+                        f"未同期推定 {gn_status.get('未同期行推定', 0)}行"
+                    )
+                except Exception as exc:
+                    st.caption(f"再学習状況を取得できませんでした: {exc}")
+
+                if st.button("登録済みグランドノートを全件再学習", use_container_width=True):
+                    with st.spinner("登録済みグランドノートを再同期しています..."):
+                        gn_result = engine.v62_rebuild_grand_note_learning(engine.DB_PATH)
+                    ok, msg = push_db_to_github("AutoRaceAI: 登録済みグランドノートを全件再学習")
+                    summary = (
+                        f"対象 {gn_result.get('対象レース', 0)}レース・{gn_result.get('対象選手', 0)}選手、"
+                        f"周回 {gn_result.get('同期成功', 0)}行を反映 "
+                        f"（新規 {gn_result.get('新規', 0)} / 更新 {gn_result.get('更新', 0)}）。"
+                    )
+                    if gn_result.get('結果選手不明', 0) or gn_result.get('選手不明', 0):
+                        summary += (
+                            f" 選手名不足 {gn_result.get('結果選手不明', 0)}行、"
+                            f"選手未解決 {gn_result.get('選手不明', 0)}行。"
+                        )
+                    if ok:
+                        st.success(summary + " " + msg)
+                    else:
+                        st.warning(summary + " GitHub保存は未完了です。" + msg)
+                    st.rerun()
+
+                st.divider()
+                st.subheader("グランドノート未リンク修復")
+                st.caption("結果の周回順位はあるのに選手名へ結び付いていないデータを、レース・車番単位で診断して修復します。候補が一意のものだけ自動修復し、曖昧なものは手動で選びます。")
+                try:
+                    health = engine.v63_db_health_report(engine.DB_PATH)
+                    score = health.get("health_score", 0)
+                    icon = "🟢" if score >= 99 else ("🟡" if score >= 95 else "🔴")
+                    st.metric("グランドノートDB健康度", f"{icon} {score:.1f}%")
+                    st.caption(
+                        f"未リンク {health.get('unlinked_groups', 0)}組・{health.get('unlinked_rows', 0)}行 / "
+                        f"結果周回 {health.get('result_lap_rows', 0)}行 / 学習済み {health.get('learned_lap_rows', 0)}行"
+                    )
+                    unresolved = engine.v63_grand_note_unlinked_groups(engine.DB_PATH)
+                except Exception as exc:
+                    unresolved = []
+                    st.error(f"未リンク診断に失敗しました: {exc}")
+
+                if unresolved:
+                    if st.button("一意に決まる未リンクだけ自動修復", use_container_width=True):
+                        repair_result = engine.v63_auto_repair_grand_note_links(engine.DB_PATH)
+                        ok, msg = push_db_to_github("AutoRaceAI: グランドノート未リンクを自動修復")
+                        summary = (
+                            f"{repair_result.get('repaired_groups', 0)}組・{repair_result.get('synced_rows', 0)}行を修復。"
+                            f"手動確認 {repair_result.get('manual_groups', 0)}組。"
+                        )
+                        st.success(summary + (" " + msg if ok else " GitHub保存は未完了です。" + msg))
+                        st.rerun()
+
+                    player_choices = engine.v63_player_name_choices(engine.DB_PATH)
+                    for idx, item in enumerate(unresolved):
+                        title = (
+                            f"{item.get('race_date', '')} {item.get('venue', '')} "
+                            f"{item.get('race_no', '')}R・{item.get('car_no')}番 "
+                            f"（未リンク {item.get('lap_rows', 0)}行）"
+                        )
+                        with st.expander(title, expanded=True):
+                            st.caption(
+                                f"1周目順位: {item.get('first_lap_position') or '-'} / "
+                                f"ゴール順位: {item.get('goal_position') or '-'} / "
+                                f"race_key: {item.get('race_key')}"
+                            )
+                            auto_candidates = [c.get('player_name') for c in item.get('candidates', [])]
+                            if auto_candidates:
+                                st.info("自動候補: " + " / ".join(auto_candidates))
+                            else:
+                                st.warning("自動候補を特定できません。結果ページを確認して選手名を選択してください。")
+
+                            options = ["選択してください"] + auto_candidates + [n for n in player_choices if n not in auto_candidates]
+                            selected_name = st.selectbox(
+                                "この車番の選手",
+                                options,
+                                key=f"v63_player_{item.get('race_key')}_{item.get('car_no')}_{idx}",
+                            )
+                            if st.button(
+                                "この未リンクを修復",
+                                key=f"v63_repair_{item.get('race_key')}_{item.get('car_no')}_{idx}",
+                                use_container_width=True,
+                                disabled=selected_name == "選択してください",
+                            ):
+                                result = engine.v63_repair_grand_note_link(
+                                    item.get('race_key'), item.get('car_no'), selected_name, engine.DB_PATH
+                                )
+                                if result.get('ok'):
+                                    ok, msg = push_db_to_github("AutoRaceAI: グランドノート未リンクを手動修復")
+                                    st.success(result.get('message', '修復しました。') + f" 周回{result.get('synced_rows', 0)}行を再学習しました。" + (" " + msg if ok else " GitHub保存は未完了です。" + msg))
+                                    st.rerun()
+                                else:
+                                    st.warning(result.get('message', '修復できませんでした。'))
+                else:
+                    st.success("未リンクのグランドノートはありません。すべて選手別学習へ反映されています。")
 
                 st.divider()
                 table = st.selectbox("DBテーブルを直接確認", info["tables"])
