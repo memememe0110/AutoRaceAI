@@ -11373,7 +11373,18 @@ def v67_compress_formations(combos, bet_type):
         for a, seconds in sorted(by_first.items()):
             lines.append(f"{a}-{''.join(map(str, sorted(seconds)))}（{len(seconds)}点）")
     elif bet_type == "2連複":
-        lines = ["-".join(map(str, x)) for x in sorted(set(tuple(sorted(x)) for x in parsed))]
+        # 共通する先頭車だけをまとめるシンプル圧縮。
+        # 例: 5-6 / 5-8 / 6-8 -> 5-68 / 6-8
+        pairs = sorted(set(tuple(sorted(x)) for x in parsed))
+        by_first = {}
+        for a, b in pairs:
+            by_first.setdefault(a, []).append(b)
+        for a, seconds in sorted(by_first.items()):
+            seconds = sorted(set(seconds))
+            if len(seconds) >= 2:
+                lines.append(f"{a}-{''.join(map(str, seconds))}")
+            else:
+                lines.append(f"{a}-{seconds[0]}")
     return lines
 
 

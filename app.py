@@ -17,7 +17,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver67｜券種別自己評価・上位累積確率・強調範囲の買い目圧縮")
+st.caption("Ver69｜上位累積確率・強調範囲のシンプル圧縮")
 
 
 def qident(name: str) -> str:
@@ -427,7 +427,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
                 st.markdown("#### 強調範囲のまとめ")
                 for line in formations:
                     st.code(line, language=None)
-                st.caption("圧縮表記は候補を見やすくまとめたものです。表記から展開される全点が、上の強調対象と完全一致しない場合があるため、正確な対象は一覧表を優先してください。")
+                st.caption("共通部分だけをまとめた簡易表記です。正確な対象は上の一覧表でも確認できます。")
 
 
 def show_v67_result_analysis(ticket_analysis: pd.DataFrame) -> None:
