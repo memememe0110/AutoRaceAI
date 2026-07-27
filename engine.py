@@ -12565,3 +12565,219 @@ def v72_ticket_outlier_details(
     if df.empty:
         return pd.DataFrame(columns=columns)
     return df[columns].reset_index(drop=True)
+
+# ============================================================
+# Ver84: 開催場そのものの特徴を学習
+# ============================================================
+# 選手×開催場の相性とは別に、開催場全体の
+# ・前残り / 追込み
+# ・試走の信頼度
+# ・STの影響
+# ・高温時の前残り変化
+# を登録済み結果から推定し、穏やかに予測へ反映する。
+
+_V84_ORIGINAL_LAP_AND_HEAT = v60_apply_lap_and_heat_learning
+
+
+def _v84_rank01(series, lower_better=True):
+    s = pd.to_numeric(series, errors="coerce")
+    if s.notna().sum() <= 1:
+        return pd.Series(0.5, index=s.index, dtype=float)
+    r = s.rank(method="average", ascending=lower_better, pct=True)
+    # 良い値を1、悪い値を0へ
+    return (1.0 - r + (1.0 / max(int(s.notna().sum()), 1))).clip(0.0, 1.0).fillna(0.5)
+
+
+def _v84_history_rows(db_path=DB_PATH):
+    """未来データと事故レースを除外した、開催場特徴学習用の結果明細。"""
+    try:
+        v76_init_accident_learning_columns(db_path)
+        with sqlite3.connect(str(db_path)) as con:
+            df = pd.read_sql_query("""
+                SELECT rr.race_key, rr.race_date AS 開催日, rr.race_no AS レース,
+                       rr.venue AS 開催場, rr.surface AS 走路,
+                       rr.track_temp AS 走路温度,
+                       re.car_no AS 車番, re.player_name AS 選手名,
+                       re.finish AS 着順, re.trial_time AS 試走T,
+                       re.start_time AS ST, re.handicap AS ハンデ
+                FROM result_races rr
+                JOIN result_entries re ON re.race_key=rr.race_key
+                WHERE COALESCE(rr.model_eligible,1)=1
+                  AND re.finish IS NOT NULL
+                  AND COALESCE(re.result_status,'通常') NOT REGEXP '落車|他落|落妨|反則|反妨|妨害|周誤|周回誤認|競走中止|不成立|失格|欠責|欠車|出走取消'
+            """, con)
+    except sqlite3.OperationalError:
+        # SQLite標準にはREGEXPが無いため、通常はこちらを使用する。
+        try:
+            with sqlite3.connect(str(db_path)) as con:
+                df = pd.read_sql_query("""
+                    SELECT rr.race_key, rr.race_date AS 開催日, rr.race_no AS レース,
+                           rr.venue AS 開催場, rr.surface AS 走路,
+                           rr.track_temp AS 走路温度,
+                           re.car_no AS 車番, re.player_name AS 選手名,
+                           re.finish AS 着順, re.trial_time AS 試走T,
+                           re.start_time AS ST, re.handicap AS ハンデ,
+                           re.result_status AS 結果区分
+                    FROM result_races rr
+                    JOIN result_entries re ON re.race_key=rr.race_key
+                    WHERE COALESCE(rr.model_eligible,1)=1
+                      AND re.finish IS NOT NULL
+                """, con)
+            if "結果区分" in df.columns:
+                bad = df["結果区分"].astype(str).str.contains(V76_ACCIDENT_PATTERN, na=False)
+                df = df.loc[~bad].copy()
+        except Exception:
+            return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    return v61_filter_history_df(df, "開催日", "レース", count_stats=False)
+
+
+def _v84_race_level_features(rows):
+    """各レースを同じ重さで扱うため、レース単位の特徴へ変換する。"""
+    if rows is None or rows.empty:
+        return pd.DataFrame()
+    work = rows.copy()
+    work["着順"] = pd.to_numeric(work["着順"], errors="coerce")
+    work["試走T"] = pd.to_numeric(work["試走T"], errors="coerce")
+    work["ST"] = pd.to_numeric(work["ST"], errors="coerce")
+    work["ハンデ数値"] = work["ハンデ"].map(handicap_number)
+    out = []
+    for race_key, g in work.groupby("race_key", sort=False):
+        g = g.dropna(subset=["着順"]).copy()
+        if len(g) < 4:
+            continue
+        front_h = pd.to_numeric(g["ハンデ数値"], errors="coerce").min()
+        max_h = pd.to_numeric(g["ハンデ数値"], errors="coerce").max()
+        front = g[pd.to_numeric(g["ハンデ数値"], errors="coerce") == front_h]
+        rear = g[pd.to_numeric(g["ハンデ数値"], errors="coerce") == max_h]
+        trial_ok = g.dropna(subset=["試走T"])
+        st_ok = g.dropna(subset=["ST"])
+        trial_corr = trial_ok["試走T"].corr(trial_ok["着順"], method="spearman") if len(trial_ok) >= 4 else np.nan
+        st_corr = st_ok["ST"].corr(st_ok["着順"], method="spearman") if len(st_ok) >= 4 else np.nan
+        out.append({
+            "race_key": race_key,
+            "開催場": str(g["開催場"].iloc[0] or "").strip(),
+            "走路": str(g["走路"].iloc[0] or "").strip(),
+            "走路温度": pd.to_numeric(g["走路温度"], errors="coerce").dropna().mean(),
+            "前線3着内率": float((front["着順"] <= 3).mean()) if len(front) else np.nan,
+            "最後方1着率": float((rear["着順"] == 1).mean()) if len(rear) else np.nan,
+            "最後方3着内率": float((rear["着順"] <= 3).mean()) if len(rear) else np.nan,
+            "試走着順相関": float(trial_corr) if not pd.isna(trial_corr) else np.nan,
+            "ST着順相関": float(st_corr) if not pd.isna(st_corr) else np.nan,
+        })
+    return pd.DataFrame(out)
+
+
+def v84_venue_profile(meta=None, db_path=DB_PATH):
+    """今回開催場の特徴を、全場平均との差として返す。"""
+    meta = meta or {}
+    venue = str(meta.get("開催場") or meta.get("venue") or "").strip()
+    if not venue:
+        return {"開催場": "", "レース数": 0, "信頼度": 0.0}
+    race_df = _v84_race_level_features(_v84_history_rows(db_path))
+    if race_df.empty:
+        return {"開催場": venue, "レース数": 0, "信頼度": 0.0}
+    vg = race_df[race_df["開催場"].astype(str).str.strip() == venue].copy()
+    n = len(vg)
+    if n == 0:
+        return {"開催場": venue, "レース数": 0, "信頼度": 0.0}
+    # 30レース未満は弱く、150レースで最大。開催場データは選手別より集まりやすい。
+    confidence = float(np.clip((n - 5) / 145.0, 0.0, 1.0))
+    def diff(col):
+        a = pd.to_numeric(vg[col], errors="coerce").dropna()
+        b = pd.to_numeric(race_df[col], errors="coerce").dropna()
+        if len(a) < 8 or len(b) < 20:
+            return 0.0
+        return float(a.mean() - b.mean())
+    hot = vg[pd.to_numeric(vg["走路温度"], errors="coerce") >= 50]
+    normal = vg[pd.to_numeric(vg["走路温度"], errors="coerce") < 50]
+    hot_front = 0.0
+    if len(hot) >= 8 and len(normal) >= 8:
+        hot_front = float(pd.to_numeric(hot["前線3着内率"], errors="coerce").mean() -
+                          pd.to_numeric(normal["前線3着内率"], errors="coerce").mean())
+    profile = {
+        "開催場": venue,
+        "レース数": int(n),
+        "信頼度": confidence,
+        "前残り差": float(np.clip(diff("前線3着内率"), -0.30, 0.30)),
+        "追込み1着差": float(np.clip(diff("最後方1着率"), -0.25, 0.25)),
+        "追込み3着内差": float(np.clip(diff("最後方3着内率"), -0.30, 0.30)),
+        # 正の相関ほど、タイムが速い車ほど着順も良いので信頼度が高い。
+        "試走信頼差": float(np.clip(diff("試走着順相関"), -0.40, 0.40)),
+        "ST影響差": float(np.clip(diff("ST着順相関"), -0.40, 0.40)),
+        "高温前残り差": float(np.clip(hot_front, -0.35, 0.35)),
+    }
+    return profile
+
+
+def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
+    out = df.copy()
+    profile = v84_venue_profile(meta, db_path)
+    n = len(out)
+    for col, default in {
+        "開催場特徴補正": 0.0,
+        "開催場特徴レース数": int(profile.get("レース数", 0)),
+        "開催場特徴信頼度": float(profile.get("信頼度", 0.0)),
+        "開催場前残り差": float(profile.get("前残り差", 0.0)),
+        "開催場追込み差": float(profile.get("追込み3着内差", 0.0)),
+        "開催場試走信頼差": float(profile.get("試走信頼差", 0.0)),
+        "開催場ST影響差": float(profile.get("ST影響差", 0.0)),
+        "開催場特徴根拠": "",
+    }.items():
+        out[col] = [default] * n
+    conf = float(profile.get("信頼度", 0.0))
+    if n == 0 or conf <= 0.0:
+        return out
+    handicap = pd.to_numeric(out.get("ハンデ", pd.Series(0.0, index=out.index)), errors="coerce").fillna(0.0)
+    hmin, hmax = float(handicap.min()), float(handicap.max())
+    span = max(hmax - hmin, 10.0)
+    front_role = (1.0 - (handicap - hmin) / span).clip(0.0, 1.0)
+    rear_role = ((handicap - hmin) / span).clip(0.0, 1.0)
+    trial_col = "試走T" if "試走T" in out.columns else "当日試走T"
+    st_col = "ST" if "ST" in out.columns else "平均ST"
+    trial_strength = _v84_rank01(out.get(trial_col, pd.Series(np.nan, index=out.index)), True)
+    st_strength = _v84_rank01(out.get(st_col, pd.Series(np.nan, index=out.index)), True)
+    track_temp = number((meta or {}).get("走路温度"), 30.0)
+    hot_level = float(np.clip((track_temp - 48.0) / 8.0, 0.0, 1.0))
+    front_diff = float(profile.get("前残り差", 0.0))
+    chase_diff = float(profile.get("追込み3着内差", 0.0)) * 0.65 + float(profile.get("追込み1着差", 0.0)) * 0.35
+    trial_diff = float(profile.get("試走信頼差", 0.0))
+    st_diff = float(profile.get("ST影響差", 0.0))
+    hot_front = float(profile.get("高温前残り差", 0.0))
+    # 最大でも約±0.9点。開催場だけで順位がひっくり返り過ぎないよう抑える。
+    bonus = conf * (
+        front_diff * (front_role - 0.35) * 2.2
+        + chase_diff * (rear_role - 0.35) * 1.8
+        + trial_diff * (trial_strength - 0.5) * 1.15
+        + st_diff * (st_strength - 0.5) * 0.90
+        + hot_front * hot_level * (front_role - 0.35) * 1.55
+    )
+    bonus = pd.Series(np.clip(bonus, -0.90, 0.90), index=out.index)
+    out["開催場特徴補正"] = bonus.round(3)
+    venue = str(profile.get("開催場") or "")
+    out["開催場特徴根拠"] = [
+        f"{venue}{profile['レース数']}R・信頼{conf:.2f} / 前残り差{front_diff:+.2f} / 追込み差{chase_diff:+.2f} / 試走差{trial_diff:+.2f}"
+    ] * n
+    if "改善後総合点" in out.columns:
+        out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.40
+    if "予測競走T" in out.columns:
+        out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"], errors="coerce") - bonus * 0.0008, 4)
+    # シミュレーション側の展開指標にも少量だけ伝える。
+    if "内枠残存率" in out.columns:
+        out["内枠残存率"] = np.clip(pd.to_numeric(out["内枠残存率"], errors="coerce").fillna(.4) + conf * front_diff * front_role * .10, .05, .95)
+    if "混戦突破適性" in out.columns:
+        out["混戦突破適性"] = np.clip(pd.to_numeric(out["混戦突破適性"], errors="coerce").fillna(.5) + conf * chase_diff * rear_role * .08, .05, .95)
+    return out
+
+
+def v60_apply_lap_and_heat_learning(df, entries=None, meta=None, db_path=None):
+    """Ver60処理後に、Ver84の開催場全体特徴を重ねる。"""
+    path = db_path or DB_PATH
+    out = _V84_ORIGINAL_LAP_AND_HEAT(df, entries, meta, path)
+    return v84_apply_venue_learning(out, entries, meta, path)
