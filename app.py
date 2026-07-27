@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver79｜DB列数エラー修正・ダークモード強調改善")
+st.caption("Ver80｜順位列重複エラー修正・上へボタンをメインタブへ移動")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -52,7 +52,7 @@ st.markdown(
         font-size:13px;
     }
     </style>
-    <a class="v73-float-top" href="#page-top">↑ 上へ</a>
+    <a class="v73-float-top" href="#main-tabs">↑ 上へ</a>
     """,
     unsafe_allow_html=True,
 )
@@ -67,7 +67,7 @@ def v73_section_nav() -> None:
           <a href="#ticket-probability">券種別確率</a>
           <a href="#cover-line">強調ライン</a>
           <a href="#copy-all-formations">一括コピー</a>
-          <a href="#page-top">ページ上部</a>
+          <a href="#main-tabs">メインタブへ</a>
         </div>
         """,
         unsafe_allow_html=True,
@@ -607,6 +607,12 @@ def show_v67_self_evaluation(meta: dict) -> None:
 
             # ダークモードでも埋もれないよう、色だけでなく記号・太字・境界線を併用する。
             display_highlighted = highlighted.copy().reset_index(drop=True)
+            # 保存済み予測の形式によっては、すでに「強調」「順位」列を持つことがある。
+            # insert() の重複エラーを避け、表示用の列を毎回安全に作り直す。
+            display_highlighted = display_highlighted.drop(
+                columns=[c for c in ["強調", "順位"] if c in display_highlighted.columns],
+                errors="ignore",
+            )
             display_highlighted.insert(0, "強調", ["★" if i < len(display_highlighted) - 1 else "★ ここまで" for i in range(len(display_highlighted))])
             display_highlighted.insert(1, "順位", [f"{i + 1}位" for i in range(len(display_highlighted))])
 
@@ -1048,6 +1054,8 @@ def render_last_result_analysis(view: dict) -> None:
         st.info(adjustment.get("note", "学習重みを更新しました。"))
 
 
+# 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
+st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
 prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
