@@ -4497,6 +4497,29 @@ def v15_save_race_input(meta, entries, raw_text, db_path=DB_PATH):
     return key
 
 
+def _v90_optional_number(value, *, integer=False):
+    """空欄・記号付き文字列を安全に数値化する。変換不能ならNone。"""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text in {"", "-", "—", "–", "―", "None", "nan", "NaN"}:
+        return None
+    # 例: 0m, 10m, 6R, 1着。最初の数値部分だけを使用する。
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text.replace(",", ""))
+    if not match:
+        return None
+    try:
+        number = float(match.group(0))
+        return int(number) if integer else number
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def v15_save_player_history(df, db_path=DB_PATH):
     if df is None or df.empty:
         return 0, 0
@@ -5279,15 +5302,25 @@ def v152_parse_entry_block(block):
             st = float(stm.group(1))
 
     # 当日試走
+    # 公式スマホ表示では「ST0.18 再3.45」のように再試走を示す「再」が付く。
+    # 平均試走T（後段）を誤取得しないよう、ハンデ/ST直後の値を最優先する。
     trial = np.nan
-    tm = re.search(r"試\s*([3-9]\.\d{2,3}|-)", compact)
-    if tm and tm.group(1) != "-":
-        trial = float(tm.group(1))
+    tm2 = re.search(
+        r"ST\s*(?:[+-]?\d?\.\d{2,3}|-)\s+(?:再|再試)?\s*([3-9]\.\d{2,3}|-)",
+        compact,
+        re.I,
+    )
+    if tm2 and tm2.group(1) != "-":
+        trial = float(tm2.group(1))
     else:
-        # スマホ縦型では「ハンデ10m/ST0.17 3.48」のように試走Tの見出しが省略される。
-        tm2 = re.search(r"ST\s*[+-]?\d?\.\d{2,3}\s+([3-9]\.\d{2,3}|-)", compact, re.I)
-        if tm2 and tm2.group(1) != "-":
-            trial = float(tm2.group(1))
+        # 「試3.45」「試走T 3.45」「試走T 再3.45」にも対応する。
+        tm = re.search(
+            r"(?:試走T|試)\s*(?:再|再試)?\s*([3-9]\.\d{2,3}|-)",
+            compact,
+            re.I,
+        )
+        if tm and tm.group(1) != "-":
+            trial = float(tm.group(1))
 
     # 試走偏差
     trial_dev = np.nan
@@ -7026,18 +7059,18 @@ def v15_save_player_history(df, db_path=DB_PATH):
 
             race_date = row.get("開催日")
             venue = row.get("開催場")
-            race_no_value = None if pd.isna(row.get("レース")) else int(row.get("レース"))
+            race_no_value = _v90_optional_number(row.get("レース"), integer=True)
             race_name = row.get("レース名")
             race_type = row.get("レース種別")
-            finish = None if pd.isna(row.get("着順")) else float(row.get("着順"))
-            starters = None if pd.isna(row.get("出走")) else float(row.get("出走"))
+            finish = _v90_optional_number(row.get("着順"))
+            starters = _v90_optional_number(row.get("出走"))
             surface = row.get("走路")
-            handicap_num = None if pd.isna(row.get("ハンデ")) else int(row.get("ハンデ"))
+            handicap_num = _v90_optional_number(row.get("ハンデ"), integer=True)
             handicap_text = None if handicap_num is None else f"{handicap_num}m"
-            trial = None if pd.isna(row.get("試走T")) else float(row.get("試走T"))
-            race_time = None if pd.isna(row.get("競走T")) else float(row.get("競走T"))
-            st = None if pd.isna(row.get("ST")) else float(row.get("ST"))
-            car_no = None if pd.isna(row.get("車番")) else int(row.get("車番"))
+            trial = _v90_optional_number(row.get("試走T"))
+            race_time = _v90_optional_number(row.get("競走T"))
+            st = _v90_optional_number(row.get("ST"))
+            car_no = _v90_optional_number(row.get("車番"), integer=True)
             raw_history_text = str(row.get("_raw") or "")
             explicit_status = str(row.get("異常") or "")
             status_source = f"{raw_history_text} {explicit_status}"
@@ -8760,8 +8793,13 @@ def v36_parse_mobile_entry_block(block):
         if hm:
             handicap = int(hm.group(1))
     if pd.isna(trial):
-        tm = re.search(r"(?:再)?([3-9]\.\d{2,3})", compact)
-        if tm:
+        # 当日試走はハンデ/ST直後を優先し、平均試走Tを拾わない。
+        tm = re.search(
+            r"ST\s*(?:[+-]?\d?\.\d{2,3}|-)\s+(?:再|再試)?\s*([3-9]\.\d{2,3}|-)",
+            compact,
+            re.I,
+        )
+        if tm and tm.group(1) != "-":
             trial = float(tm.group(1))
 
     two_rate = v15_float(v15_first_match([r"2連率\s*([0-9.]+)"], compact))
@@ -12791,20 +12829,49 @@ _v86_previous_compress_formations = v67_compress_formations
 
 
 def v67_compress_formations(combos, bet_type):
-    """既存の厳密圧縮に加え、三連単の完全3車BOXを ``136BOX`` 形式で表示する。"""
+    """厳密圧縮後、三連単の全 ``=`` 表記を完全BOXへ明示変換する。
+
+    ``2=45=46`` のような表記は、意味する完全BOXを列挙して
+    ``245BOX``, ``246BOX``, ``256BOX`` と表示する。
+    基礎圧縮側で展開結果が元買い目集合の部分集合であることを検証済みのため、
+    この変換で元にない買い目は増えない。
+    """
+    from itertools import product
+
     lines = _v86_previous_compress_formations(combos, bet_type)
     if bet_type != "3連単":
         return lines
 
     converted = []
     for line in lines:
-        # 1=3=6 は3車の全6通りが存在するときだけ既存ロジックが生成する。
-        m = re.fullmatch(r"([1-8])=([1-8])=([1-8])", str(line).strip())
-        if m and len(set(m.groups())) == 3:
-            converted.append("".join(sorted(m.groups(), key=int)) + "BOX")
-        else:
+        text = str(line).strip()
+        m = re.fullmatch(r"([1-8]+)=([1-8]+)=([1-8]+)", text)
+        if not m:
             converted.append(line)
-    return converted
+            continue
+
+        # 全て '=' で結ばれた三連単表記は、各グループから1車ずつ選んだ
+        # 3車の完全BOX集合を意味する。重複車を含む選択は買い目にならない。
+        boxes = {
+            tuple(sorted((int(a), int(b), int(c))))
+            for a, b, c in product(*m.groups())
+            if len({a, b, c}) == 3
+        }
+        if not boxes:
+            converted.append(line)
+            continue
+
+        converted.extend("".join(map(str, box)) + "BOX" for box in sorted(boxes))
+
+    # 複数の圧縮行から同じBOXが生成された場合も、表示は1回だけにする。
+    unique = []
+    seen = set()
+    for line in converted:
+        if line in seen:
+            continue
+        seen.add(line)
+        unique.append(line)
+    return unique
 
 
 _V86_TRACKS = "川口|伊勢崎|浜松|山陽|飯塚"
@@ -12857,7 +12924,7 @@ def _v86_parse_overmidnight_block(block):
     st_value = np.nan
     trial = np.nan
     hs = re.search(
-        r"ハンデ\s*([+-]?\d+|-)\s*m\s*/\s*ST\s*([+-]?\d?\.\d{2,3}|-)\s*(?:\t|\s)+([3-9]\.\d{2,3}|-)",
+        r"ハンデ\s*([+-]?\d+|-)\s*m\s*/\s*ST\s*([+-]?\d?\.\d{2,3}|-)\s*(?:\t|\s)+(?:再|再試)?\s*([3-9]\.\d{2,3}|-)",
         compact,
         re.I,
     )
@@ -12971,3 +13038,118 @@ def v15_parse_entries(text, manual_excluded=None):
         special["解析対象"] = ~special["車番"].astype(int).isin(excluded)
         return special[special["解析対象"]].sort_values("車番").reset_index(drop=True)
     return _v86_previous_parse_entries(text, manual_excluded=manual_excluded)
+
+
+# ============================================================
+# Ver91: 結果表の「LG/ハンデ/試走T」を安全に解析
+#         例: 飯塚/0m/再3.45, 飯塚/20m/-, 空欄にも対応
+# ============================================================
+def _v91_parse_result_profile(profile):
+    """結果表のプロフィール文字列を解析する。
+
+    戻り値: (所属, ハンデ数値, 試走T, 再試走フラグ)
+    文字列を単純splitしてintへ渡さず、各項目を独立に抽出する。
+    """
+    import unicodedata
+    raw = unicodedata.normalize("NFKC", str(profile or ""))
+    raw = re.sub(r"[\t\u3000]+", " ", raw).strip()
+
+    parts = [p.strip() for p in raw.split("/")]
+    affiliation = parts[0] if parts and parts[0] not in {"", "-", "—", "–", "―"} else None
+
+    handicap = None
+    hm = re.search(r"(?:^|/)\s*([+-]?\d+)\s*m(?:/|$)", raw, re.I)
+    if hm:
+        try:
+            handicap = int(hm.group(1))
+        except (TypeError, ValueError):
+            handicap = None
+
+    retrial = bool(re.search(r"(?:^|/)\s*(?:再試走|再試|再)\s*[3-9]\.\d{2,3}", raw))
+    trial = np.nan
+    tm = re.search(r"(?:^|/)\s*(?:再試走|再試|再)?\s*([3-9]\.\d{2,3})(?:\s|$)", raw)
+    if tm:
+        try:
+            trial = float(tm.group(1))
+        except (TypeError, ValueError):
+            trial = np.nan
+
+    return affiliation, handicap, trial, retrial
+
+
+def _v35_parse_entries(text):
+    """Ver91版の結果着順表解析。
+
+    「飯塚/0m/再3.45」の再試走表記、試走なし、空欄を安全に扱う。
+    """
+    start = text.find("着順")
+    if start < 0:
+        start = 0
+    ends = [p for p in [text.find("グランドノート", start), text.find("払戻金", start)] if p >= 0]
+    end = min(ends) if ends else len(text)
+    block = text[start:end]
+    lines = [re.sub(r"[\t\u3000]+", " ", x).strip() for x in block.splitlines()]
+    lines = [x for x in lines if x]
+
+    rows = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^([1-8])\s+([1-8])(?:\s+(.+))?$", lines[i])
+        if not m:
+            i += 1
+            continue
+        finish, car = int(m.group(1)), int(m.group(2))
+        inline_name = (m.group(3) or "").strip()
+        i += 1
+        name = inline_name
+        if not name and i < len(lines):
+            name = lines[i]
+            i += 1
+
+        if i >= len(lines):
+            break
+        profile = lines[i]
+        i += 1
+        lg, handicap, trial, retrial = _v91_parse_result_profile(profile)
+
+        # プロフィール行と判断できない場合は、その選手だけ飛ばさず欠損として保持。
+        # 車番・選手名・着順を失わないことを優先する。
+        race_t = np.nan
+        popularity = np.nan
+        if i < len(lines):
+            rm = re.search(r"([0-9]\.[0-9]{3})\s*\((\d+)\)", lines[i])
+            if rm:
+                race_t = float(rm.group(1))
+                popularity = int(rm.group(2))
+                i += 1
+
+        st_time = np.nan
+        accident = ""
+        if i < len(lines):
+            sm = re.match(r"^([+-]?0\.\d{2,3}|-)(?:\s+(.+))?$", lines[i])
+            if sm:
+                if sm.group(1) != "-":
+                    st_time = float(sm.group(1))
+                accident = (sm.group(2) or "").strip()
+                i += 1
+
+        rows.append({
+            "着順": finish,
+            "車番": car,
+            "選手名": v15_normalize_name(name),
+            "所属": lg,
+            "ハンデ": handicap,
+            "試走T": trial,
+            "試走種別": "再試走" if retrial else ("通常" if not pd.isna(trial) else "試走なし"),
+            "再試走": bool(retrial),
+            "競走T": race_t,
+            "ST": st_time,
+            "人気": popularity,
+            "事故": accident,
+            "結果区分": "通常" if not accident else accident,
+            "_raw_profile": profile,
+        })
+
+    if len(rows) < 3:
+        raise ValueError("着順表を解析できませんでした。『着順 車番 選手名』からグランドノート直前までを含めて貼り付けてください。")
+    return pd.DataFrame(sorted(rows, key=lambda r: r["着順"]))
