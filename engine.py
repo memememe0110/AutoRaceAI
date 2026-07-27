@@ -11351,59 +11351,173 @@ def v67_ticket_highlight_table(meta, bet_type, cutoff_pct, db_path=DB_PATH):
 
 
 def v67_compress_formations(combos, bet_type):
-    """強調対象を人が読みやすいフォーメーションへ圧縮する。"""
-    parsed = []
+    """買い目を、元にない組み合わせを増やさず最少行数へ圧縮する。
+
+    表記ルール:
+    - 2連複・3連複は順不同なので ``=`` を使用する。
+    - 2連単・3連単は着順固定部分を ``-``、裏表が全て存在する部分を ``=`` で表す。
+    - 例: 3-5 / 5-3 -> 3=5
+    - 例: 3-5-8 / 5-3-8 -> 3=5-8
+    - 展開結果が元の買い目集合に完全に含まれる候補だけを採用する。
+    """
+    from functools import lru_cache
+    from itertools import permutations, product
+
+    ordered = bet_type in {"2連単", "3連単"}
+    arity = 2 if bet_type in {"2連単", "2連複"} else 3
+
+    parsed = set()
     for text in combos:
-        try:
-            parsed.append(tuple(int(x) for x in str(text).split("-")))
-        except Exception:
+        nums = tuple(int(x) for x in re.findall(r"\d+", str(text)))
+        if len(nums) != arity or len(set(nums)) != arity:
             continue
+        parsed.add(nums if ordered else tuple(sorted(nums)))
     if not parsed:
         return []
-    lines = []
-    if bet_type == "3連単":
-        by_first = {}
-        for a,b,c in parsed:
-            item = by_first.setdefault(a, {"second": set(), "third": set(), "count": 0})
-            item["second"].add(b); item["third"].add(c); item["count"] += 1
-        for a, item in sorted(by_first.items()):
-            s2 = "".join(map(str, sorted(item["second"])))
-            s3 = "".join(map(str, sorted(item["third"])))
-            lines.append(f"{a}-{s2}-{s3}（対象{item['count']}点）")
-    elif bet_type == "3連複":
-        # 先頭2車が共通する組み合わせだけをまとめるシンプル圧縮。
-        # 例: 2-3-5 / 2-3-7 / 2-3-8 -> 2-3-578
-        # 元の一覧に存在しない組み合わせは追加しない。
-        triples = sorted(set(tuple(sorted(x)) for x in parsed))
-        by_first_two = {}
-        for a, b, c in triples:
-            by_first_two.setdefault((a, b), []).append(c)
-        for (a, b), thirds in sorted(by_first_two.items()):
-            thirds = sorted(set(thirds))
-            if len(thirds) >= 2:
-                lines.append(f"{a}-{b}-{''.join(map(str, thirds))}")
-            else:
-                lines.append(f"{a}-{b}-{thirds[0]}")
-    elif bet_type == "2連単":
-        by_first = {}
-        for a,b in parsed:
-            by_first.setdefault(a, set()).add(b)
-        for a, seconds in sorted(by_first.items()):
-            lines.append(f"{a}-{''.join(map(str, sorted(seconds)))}（{len(seconds)}点）")
-    elif bet_type == "2連複":
-        # 共通する先頭車だけをまとめるシンプル圧縮。
-        # 例: 5-6 / 5-8 / 6-8 -> 5-68 / 6-8
-        pairs = sorted(set(tuple(sorted(x)) for x in parsed))
-        by_first = {}
-        for a, b in pairs:
-            by_first.setdefault(a, []).append(b)
-        for a, seconds in sorted(by_first.items()):
-            seconds = sorted(set(seconds))
-            if len(seconds) >= 2:
-                lines.append(f"{a}-{''.join(map(str, seconds))}")
-            else:
-                lines.append(f"{a}-{seconds[0]}")
-    return lines
+
+    universe = sorted(parsed)
+    index = {combo: i for i, combo in enumerate(universe)}
+    full_mask = (1 << len(universe)) - 1
+    cars = sorted({car for combo in universe for car in combo})
+
+    if ordered and arity == 2:
+        patterns = [("-",), ("=",)]
+    elif ordered:
+        patterns = [("-", "-"), ("=", "-"), ("-", "="), ("=", "=")]
+    else:
+        patterns = [("=",) * (arity - 1)]
+
+    def _expand(groups, separators):
+        """グループ表記を実買い目へ展開する。"""
+        out = set()
+        for picked in product(*[sorted(g) for g in groups]):
+            if len(set(picked)) != arity:
+                continue
+            if not ordered:
+                out.add(tuple(sorted(picked)))
+                continue
+
+            # '=' でつながった位置は、そのブロック内の全順列を含む。
+            blocks = []
+            block_start = 0
+            for pos, sep in enumerate(separators):
+                if sep == "-":
+                    blocks.append(tuple(range(block_start, pos + 1)))
+                    block_start = pos + 1
+            blocks.append(tuple(range(block_start, arity)))
+
+            variants = [list(picked)]
+            for block in blocks:
+                if len(block) <= 1:
+                    continue
+                next_variants = []
+                values = [picked[i] for i in block]
+                for perm in permutations(values):
+                    for base in variants:
+                        row = list(base)
+                        for idx2, value in zip(block, perm):
+                            row[idx2] = value
+                        next_variants.append(row)
+                variants = next_variants
+            out.update(tuple(v) for v in variants)
+        return out
+
+    def _canonical(groups, separators):
+        groups = tuple(frozenset(g) for g in groups)
+        # 全て '=' の場合はグループ順も意味を持たないため整列する。
+        if all(sep == "=" for sep in separators):
+            groups = tuple(sorted(groups, key=lambda g: tuple(sorted(g))))
+        return groups, tuple(separators)
+
+    def _text(groups, separators):
+        parts = ["".join(str(x) for x in sorted(g)) for g in groups]
+        result = parts[0]
+        for sep, part in zip(separators, parts[1:]):
+            result += sep + part
+        return result
+
+    # maskごとに最短表記だけを保持する。
+    candidate_text = {}
+    seen_states = set()
+    queue = []
+    for combo in universe:
+        for separators in patterns:
+            groups = tuple(frozenset([x]) for x in combo)
+            state = _canonical(groups, separators)
+            if state not in seen_states:
+                seen_states.add(state)
+                queue.append(state)
+
+    # 有効な表記へ車番を1つずつ追加する。最終形が元集合内なら、途中形も必ず元集合内。
+    qpos = 0
+    universe_set = set(universe)
+    while qpos < len(queue):
+        groups, separators = queue[qpos]
+        qpos += 1
+        expanded = _expand(groups, separators)
+        if not expanded or not expanded.issubset(universe_set):
+            continue
+        mask = 0
+        for combo in expanded:
+            mask |= 1 << index[combo]
+        text = _text(groups, separators)
+        old = candidate_text.get(mask)
+        if old is None or (len(text), text) < (len(old), old):
+            candidate_text[mask] = text
+
+        for pos in range(arity):
+            for car in cars:
+                if car in groups[pos]:
+                    continue
+                grown = list(groups)
+                grown[pos] = frozenset(set(grown[pos]) | {car})
+                state = _canonical(tuple(grown), separators)
+                if state not in seen_states:
+                    seen_states.add(state)
+                    queue.append(state)
+
+    # 念のため単独買い目は必ず候補に含める。
+    plain_sep = ("-",) * (arity - 1) if ordered else ("=",) * (arity - 1)
+    for combo in universe:
+        mask = 1 << index[combo]
+        text = str(combo[0])
+        for sep, value in zip(plain_sep, combo[1:]):
+            text += sep + str(value)
+        old = candidate_text.get(mask)
+        if old is None or (len(text), text) < (len(old), old):
+            candidate_text[mask] = text
+
+    candidates = [(mask, text) for mask, text in candidate_text.items()]
+    by_bit = {i: [] for i in range(len(universe))}
+    for mask, text in candidates:
+        for i in range(len(universe)):
+            if mask & (1 << i):
+                by_bit[i].append((mask, text))
+    for i in by_bit:
+        by_bit[i].sort(key=lambda x: (-x[0].bit_count(), len(x[1]), x[1]))
+
+    @lru_cache(maxsize=None)
+    def _solve(remaining):
+        if remaining == 0:
+            return (0, 0, ())
+        first_bit = (remaining & -remaining).bit_length() - 1
+        best = None
+        for mask, text in by_bit[first_bit]:
+            if mask & remaining != mask:
+                continue
+            sub = _solve(remaining ^ mask)
+            if sub is None:
+                continue
+            lines = tuple(sorted((text,) + sub[2]))
+            score = (1 + sub[0], len(text) + sub[1], lines)
+            if best is None or score < best:
+                best = score
+        return best
+
+    solved = _solve(full_mask)
+    if solved is None:
+        return [candidate_text[1 << i] for i in range(len(universe))]
+    return list(solved[2])
 
 
 # ============================================================
