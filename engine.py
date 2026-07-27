@@ -12300,7 +12300,7 @@ def v72_ticket_feedback_stats(
     db_path=DB_PATH,
     trifecta_outlier_cutoff=V78_DEFAULT_RACE_OUTLIER_TRIFECTA_CUTOFF,
 ):
-    """全結果と、三連単が指定閾値以上のレースを除いた実用ラインを返す。"""
+    """全結果・実用ラインに加え、三連単の20点以内的中ラインを返す。"""
     v67_init_ticket_feedback_tables(db_path)
     with sqlite3.connect(str(db_path)) as con:
         df = pd.read_sql_query("""
@@ -12313,6 +12313,8 @@ def v72_ticket_feedback_stats(
         "80%カバー", "90%カバー", "95%カバー",
         "実用レース数", "大外し除外", "実用平均", "実用中央値",
         "実用80%カバー", "実用90%カバー", "実用95%カバー",
+        "20点以内レース数", "20点以内平均", "20点以内中央値",
+        "20点以内80%カバー", "20点以内90%カバー", "20点以内95%カバー",
     ]
     if df.empty:
         return pd.DataFrame(columns=columns)
@@ -12327,6 +12329,7 @@ def v72_ticket_feedback_stats(
         work["cumulative_probability"] = pd.to_numeric(
             work["cumulative_probability"], errors="coerce"
         )
+        work["predicted_rank"] = pd.to_numeric(work["predicted_rank"], errors="coerce")
         work = work.dropna(subset=["cumulative_probability"])
         work = work[
             (work["cumulative_probability"] >= 0.0)
@@ -12340,7 +12343,6 @@ def v72_ticket_feedback_stats(
         practical = practical_rows["cumulative_probability"].astype(float)
         removed_count = int(work["race_key"].astype(str).isin(excluded_races).sum())
 
-        # 全件が除外対象の場合は計算不能をNaNで明示する。
         if practical.empty:
             practical_mean = practical_median = np.nan
             p80 = p90 = p95 = np.nan
@@ -12350,6 +12352,26 @@ def v72_ticket_feedback_stats(
             p80 = float(practical.quantile(.80))
             p90 = float(practical.quantile(.90))
             p95 = float(practical.quantile(.95))
+
+        # 三連単だけ、的中順位が上位20点以内だった過去レースを別集計する。
+        # これは全レースのカバー率ではなく「20点以内で当たるレースの累積位置」の指標。
+        within20 = pd.Series(dtype=float)
+        if str(bet_type) == "3連単":
+            within20_rows = work[
+                work["predicted_rank"].notna()
+                & (work["predicted_rank"] >= 1)
+                & (work["predicted_rank"] <= 20)
+            ]
+            within20 = within20_rows["cumulative_probability"].astype(float)
+
+        if within20.empty:
+            w20_mean = w20_median = w20_p80 = w20_p90 = w20_p95 = np.nan
+        else:
+            w20_mean = float(within20.mean())
+            w20_median = float(within20.median())
+            w20_p80 = float(within20.quantile(.80))
+            w20_p90 = float(within20.quantile(.90))
+            w20_p95 = float(within20.quantile(.95))
 
         out.append({
             "券種": bet_type,
@@ -12366,12 +12388,40 @@ def v72_ticket_feedback_stats(
             "実用80%カバー": p80,
             "実用90%カバー": p90,
             "実用95%カバー": p95,
+            "20点以内レース数": int(len(within20)),
+            "20点以内平均": w20_mean,
+            "20点以内中央値": w20_median,
+            "20点以内80%カバー": w20_p80,
+            "20点以内90%カバー": w20_p90,
+            "20点以内95%カバー": w20_p95,
         })
 
     order = {"2連単": 0, "2連複": 1, "3連複": 2, "3連単": 3}
     return pd.DataFrame(out, columns=columns).sort_values(
         "券種", key=lambda s: s.map(order)
     ).reset_index(drop=True)
+
+
+def v81_trifecta_within20_details(db_path=DB_PATH):
+    """三連単が予測上位20点以内で的中した過去レースを返す。"""
+    v67_init_ticket_feedback_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        df = pd.read_sql_query("""
+            SELECT race_key AS レース,
+                   actual_combination AS 的中組み合わせ,
+                   predicted_rank AS 的中順位,
+                   individual_probability AS 個別確率,
+                   cumulative_probability AS 上位累積確率
+              FROM v67_ticket_feedback
+             WHERE bet_type='3連単'
+               AND predicted_rank BETWEEN 1 AND 20
+               AND cumulative_probability IS NOT NULL
+             ORDER BY analyzed_at DESC, race_key DESC
+        """, con)
+    columns = ["レース", "的中組み合わせ", "的中順位", "個別確率", "上位累積確率"]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    return df[columns].reset_index(drop=True)
 
 
 def v72_ticket_outlier_details(

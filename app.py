@@ -498,6 +498,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
         "券種", "レース数", "大外し除外",
         "90%カバー", "実用90%カバー",
         "95%カバー", "実用95%カバー",
+        "20点以内レース数", "20点以内90%カバー",
     ]].copy()
     with st.expander("過去成績とカバーライン一覧", expanded=False):
         st.dataframe(
@@ -509,6 +510,8 @@ def show_v67_self_evaluation(meta: dict) -> None:
                 "実用90%カバー": st.column_config.NumberColumn("実用90%", format="%.2f%%"),
                 "95%カバー": st.column_config.NumberColumn("全結果95%", format="%.2f%%"),
                 "実用95%カバー": st.column_config.NumberColumn("実用95%", format="%.2f%%"),
+                "20点以内レース数": st.column_config.NumberColumn("三連単20点内", format="%d件"),
+                "20点以内90%カバー": st.column_config.NumberColumn("20点内90%", format="%.2f%%"),
             },
         )
 
@@ -552,7 +555,54 @@ def show_v67_self_evaluation(meta: dict) -> None:
             r = row.iloc[0]
             sample = int(r["レース数"])
             excluded = int(r["大外し除外"])
-            if line_mode == "実用ライン":
+
+            # 三連単だけは、過去に上位20点以内で的中したレース群の
+            # 累積確率分布を強調基準として選べる。
+            trifecta_line_mode = "通常選択"
+            if bet_type == "3連単":
+                within20_count = int(r.get("20点以内レース数", 0) or 0)
+                st.markdown("#### 三連単の強調基準")
+                trifecta_line_mode = st.radio(
+                    "三連単ライン",
+                    ["通常選択", "過去20点以内的中ライン"],
+                    horizontal=True,
+                    key=f"v81_trifecta_line_mode_{coverage}_{line_mode}",
+                    help="『過去20点以内的中ライン』は、三連単が予測上位20点以内で当たった過去レースだけを集め、その累積確率の分位点を使います。全レースのカバー率ではありません。",
+                )
+                if within20_count > 0:
+                    w20_value = float(r[f"20点以内{coverage}%カバー"])
+                    st.caption(
+                        f"過去20点以内的中：{within20_count}レース ／ "
+                        f"{coverage}%地点の累積確率：{w20_value:.2f}%"
+                    )
+                    with st.expander(f"過去20点以内で的中した{within20_count}レースを確認"):
+                        w20_details = engine.v81_trifecta_within20_details(engine.DB_PATH)
+                        st.dataframe(
+                            w20_details,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "個別確率": st.column_config.NumberColumn(format="%.3f%%"),
+                                "上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
+                            },
+                        )
+                else:
+                    st.caption("三連単が上位20点以内で的中した過去データはまだありません。")
+
+            use_within20 = (
+                bet_type == "3連単"
+                and trifecta_line_mode == "過去20点以内的中ライン"
+                and int(r.get("20点以内レース数", 0) or 0) > 0
+            )
+            if use_within20:
+                cutoff = float(r[f"20点以内{coverage}%カバー"])
+                used = int(r["20点以内レース数"])
+                st.success(
+                    f"過去20点以内的中{coverage}%ライン：上位累積 {cutoff:.2f}%まで "
+                    f"（三連単が上位20点以内で的中した過去{used}レースから計算）"
+                )
+                st.caption("このラインは『20点以内で当たるレースの累積位置』を見る指標で、全レースの的中率を表すものではありません。")
+            elif line_mode == "実用ライン":
                 cutoff = float(r[f"実用{coverage}%カバー"])
                 used = int(r["実用レース数"])
                 st.success(
@@ -653,7 +703,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
                 v73_copy_box(
                     f"{bet_type} フォーメーション",
                     formation_text,
-                    f"{bet_type}_{coverage}_{line_mode}_{cap_enabled}_{cap_points}",
+                    f"{bet_type}_{coverage}_{line_mode}_{trifecta_line_mode}_{cap_enabled}_{cap_points}",
                     height=max(105, min(260, 44 + 28 * len(formations))),
                 )
                 st.caption("共通部分だけをまとめた簡易表記です。正確な対象は上の一覧表でも確認できます。")
