@@ -449,12 +449,17 @@ def show_prediction_confidence(finish_prob: pd.DataFrame, bets: dict, trials: in
     st.caption("自信度は、1着率の高さ・次点との差・3着内率・三連単確率の集中度をまとめた診断です。的中を保証する数値ではありません。")
 
 
-def show_ticket_table(title: str, bets: dict, key: str, trials: int, top_n: int = 20) -> None:
-    st.subheader(f"{title} 上位{top_n}")
+def ticket_point_heading(bet_type: str, points: int) -> str:
+    """券種と点数を全画面で同じ書式にそろえる。"""
+    return f"【{bet_type}】({int(points)}点)"
+
+
+def show_ticket_table(bet_type: str, bets: dict, key: str, trials: int, top_n: int = 20) -> None:
     table = ticket_probability_table(bets, key, trials, top_n)
     if table.empty:
-        st.info(f"{title}の集計結果がありません。")
+        st.info(f"【{bet_type}】の集計結果がありません。")
         return
+    st.subheader(ticket_point_heading(bet_type, len(table)))
     st.dataframe(
         table,
         use_container_width=True,
@@ -546,6 +551,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
 
     tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
     all_formation_text: dict[str, str] = {}
+    all_formation_points: dict[str, int] = {}
     for tab, bet_type in zip(tabs, ["2連単", "2連複", "3連複", "3連単"]):
         with tab:
             row = stats[stats["券種"] == bet_type]
@@ -643,17 +649,19 @@ def show_v67_self_evaluation(meta: dict) -> None:
             original_points = len(highlighted_full)
             actual_cover = float(pd.to_numeric(highlighted["累積確率"], errors="coerce").dropna().max()) if not highlighted.empty else 0.0
 
+            st.markdown(f"### {ticket_point_heading(bet_type, actual_points)}")
             m1, m2, m3 = st.columns(3)
             m1.metric("強調点数", f"{actual_points}点")
             m2.metric("強調範囲の累積", f"{actual_cover:.2f}%")
             m3.metric("ライン要求", f"{cutoff:.2f}%")
             if cap_enabled and original_points > actual_points:
                 st.warning(
-                    f"{coverage}%カバーラインには{original_points}点必要ですが、最大{int(cap_points)}点に制限しました。"
+                    f"{ticket_point_heading(bet_type, original_points)}が{coverage}%カバーラインに必要ですが、"
+                    f"{ticket_point_heading(bet_type, actual_points)}へ制限しました。"
                     f" 現在の強調範囲は累積{actual_cover:.2f}%です。"
                 )
             else:
-                st.success(f"選択したラインを{actual_points}点・累積{actual_cover:.2f}%でカバーしています。")
+                st.success(f"{ticket_point_heading(bet_type, actual_points)}・累積{actual_cover:.2f}%で選択ラインをカバーしています。")
 
             # ダークモードでも埋もれないよう、色だけでなく記号・太字・境界線を併用する。
             display_highlighted = highlighted.copy().reset_index(drop=True)
@@ -700,8 +708,9 @@ def show_v67_self_evaluation(meta: dict) -> None:
                 st.markdown("#### 強調範囲のまとめ・一括コピー")
                 formation_text = "\n".join(str(line) for line in formations)
                 all_formation_text[bet_type] = formation_text
+                all_formation_points[bet_type] = actual_points
                 v73_copy_box(
-                    f"{bet_type} フォーメーション",
+                    ticket_point_heading(bet_type, actual_points),
                     formation_text,
                     f"{bet_type}_{coverage}_{line_mode}_{trifecta_line_mode}_{cap_enabled}_{cap_points}",
                     height=max(105, min(260, 44 + 28 * len(formations))),
@@ -712,7 +721,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
         st.markdown('<div id="copy-all-formations"></div>', unsafe_allow_html=True)
         st.markdown("### 📋 全券種まとめてコピー")
         all_text = "\n\n".join(
-            f"【{bet_type}】\n{all_formation_text[bet_type]}"
+            f"{ticket_point_heading(bet_type, all_formation_points.get(bet_type, 0))}\n{all_formation_text[bet_type]}"
             for bet_type in ["2連単", "2連複", "3連複", "3連単"]
             if bet_type in all_formation_text
         )
@@ -1425,16 +1434,16 @@ with prediction_tab:
             st.subheader("券種別確率・オッズ比較")
             ticket_tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
             with ticket_tabs[0]:
-                show_ticket_table("2連単（2車単）確率", bets, "2車単", view_trials, 20)
+                show_ticket_table("2連単", bets, "2車単", view_trials, 20)
                 show_odds_comparison("2連単", bets, "2車単", view_trials, "2tansho", unordered=False, namespace=odds_namespace)
             with ticket_tabs[1]:
-                show_ticket_table("2連複（2車複）確率", bets, "2車複", view_trials, 20)
+                show_ticket_table("2連複", bets, "2車複", view_trials, 20)
                 show_odds_comparison("2連複", bets, "2車複", view_trials, "2fuku", unordered=True, namespace=odds_namespace)
             with ticket_tabs[2]:
-                show_ticket_table("3連複確率", bets, "三連複", view_trials, 20)
+                show_ticket_table("3連複", bets, "三連複", view_trials, 20)
                 show_odds_comparison("3連複", bets, "三連複", view_trials, "3fuku", unordered=True, namespace=odds_namespace)
             with ticket_tabs[3]:
-                show_ticket_table("3連単確率", bets, "三連単", view_trials, 20)
+                show_ticket_table("3連単", bets, "三連単", view_trials, 20)
                 show_odds_comparison("3連単", bets, "三連単", view_trials, "3tan", unordered=False, namespace=odds_namespace)
 
             show_v67_self_evaluation(meta)
