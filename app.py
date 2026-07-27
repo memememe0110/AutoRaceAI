@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver74｜全結果バックテスト・重み最適化")
+st.caption("Ver79｜DB列数エラー修正・ダークモード強調改善")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -605,14 +605,24 @@ def show_v67_self_evaluation(meta: dict) -> None:
             else:
                 st.success(f"選択したラインを{actual_points}点・累積{actual_cover:.2f}%でカバーしています。")
 
-            # 強調対象そのものが一目で分かるよう、行全体を色付けする。
-            def _v75_row_style(row):
-                is_last = row.name == highlighted.index[-1]
-                if is_last:
-                    return ["background-color: #b7e4c7; font-weight: 700; border-bottom: 3px solid #2d6a4f"] * len(row)
-                return ["background-color: #d8f3dc"] * len(row)
+            # ダークモードでも埋もれないよう、色だけでなく記号・太字・境界線を併用する。
+            display_highlighted = highlighted.copy().reset_index(drop=True)
+            display_highlighted.insert(0, "強調", ["★" if i < len(display_highlighted) - 1 else "★ ここまで" for i in range(len(display_highlighted))])
+            display_highlighted.insert(1, "順位", [f"{i + 1}位" for i in range(len(display_highlighted))])
 
-            styled = highlighted.style.apply(_v75_row_style, axis=1).format({
+            def _v79_row_style(row):
+                is_last = row.name == display_highlighted.index[-1]
+                base = (
+                    "background-color:#FFF3B0;color:#111827;font-weight:800;"
+                    "border-left:6px solid #F59E0B;"
+                )
+                if is_last:
+                    base += "border-top:3px solid #F59E0B;border-bottom:4px solid #F59E0B;"
+                else:
+                    base += "border-bottom:1px solid #D97706;"
+                return [base] * len(row)
+
+            styled = display_highlighted.style.apply(_v79_row_style, axis=1).format({
                 "確率": "{:.3f}%",
                 "累積確率": "{:.2f}%",
             })
@@ -621,11 +631,13 @@ def show_v67_self_evaluation(meta: dict) -> None:
                 use_container_width=True,
                 hide_index=True,
                 column_config={
+                    "強調": st.column_config.TextColumn(width="small"),
+                    "順位": st.column_config.TextColumn(width="small"),
                     "確率": st.column_config.NumberColumn(format="%.3f%%"),
                     "累積確率": st.column_config.NumberColumn(format="%.2f%%"),
                 },
             )
-            st.caption("緑色の行が強調対象です。濃い緑の最終行が現在の強調境界です。")
+            st.caption("★付きの黄色い行が強調対象です。『★ ここまで』が現在の強調境界です。")
 
             formations = engine.v67_compress_formations(highlighted["組み合わせ"].tolist(), bet_type)
             if formations:

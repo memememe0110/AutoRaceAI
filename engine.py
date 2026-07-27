@@ -7446,8 +7446,14 @@ def v34_save_result_and_analyze(meta, results, db_path=DB_PATH):
     key = v34_race_key(meta)
     now = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(db_path) as con:
-        con.execute("""INSERT INTO result_races VALUES(?,?,?,?,?,?,?,?,?)
-          ON CONFLICT(race_key) DO UPDATE SET surface=excluded.surface,track_temp=excluded.track_temp,
+        # 列名を明示する。Ver76以降で result_races に学習可否列が増えても、
+        # 既存の9項目登録が列数不一致で壊れないようにする。
+        con.execute("""INSERT INTO result_races
+          (race_key,race_date,venue,race_no,surface,track_temp,air_temp,humidity,registered_at)
+          VALUES(?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(race_key) DO UPDATE SET
+          race_date=excluded.race_date,venue=excluded.venue,race_no=excluded.race_no,
+          surface=excluded.surface,track_temp=excluded.track_temp,
           air_temp=excluded.air_temp,humidity=excluded.humidity,registered_at=excluded.registered_at""",
           (key,meta.get("開催日"),meta.get("開催場"),str(meta.get("レース") or ""),meta.get("走路状態"),
            meta.get("走路温度"),meta.get("気温"),meta.get("湿度"),now))
