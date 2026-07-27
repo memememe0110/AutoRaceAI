@@ -12781,3 +12781,193 @@ def v60_apply_lap_and_heat_learning(df, entries=None, meta=None, db_path=None):
     path = db_path or DB_PATH
     out = _V84_ORIGINAL_LAP_AND_HEAT(df, entries, meta, path)
     return v84_apply_venue_learning(out, entries, meta, path)
+
+# ============================================================
+# Ver85: 三連単の完全3車BOX表記
+# Ver86: オーバーミッドナイト出走表（ST/試走Tが「-」）読取強化
+# ============================================================
+
+_v86_previous_compress_formations = v67_compress_formations
+
+
+def v67_compress_formations(combos, bet_type):
+    """既存の厳密圧縮に加え、三連単の完全3車BOXを ``136BOX`` 形式で表示する。"""
+    lines = _v86_previous_compress_formations(combos, bet_type)
+    if bet_type != "3連単":
+        return lines
+
+    converted = []
+    for line in lines:
+        # 1=3=6 は3車の全6通りが存在するときだけ既存ロジックが生成する。
+        m = re.fullmatch(r"([1-8])=([1-8])=([1-8])", str(line).strip())
+        if m and len(set(m.groups())) == 3:
+            converted.append("".join(sorted(m.groups(), key=int)) + "BOX")
+        else:
+            converted.append(line)
+    return converted
+
+
+_V86_TRACKS = "川口|伊勢崎|浜松|山陽|飯塚"
+
+
+def _v86_num(value, zero_as_nan=False):
+    try:
+        number_value = float(str(value).strip())
+    except Exception:
+        return np.nan
+    if zero_as_nan and abs(number_value) < 1e-12:
+        return np.nan
+    return number_value
+
+
+def _v86_split_overmidnight_blocks(text):
+    """「1 選手名(飯塚)」で始まる縦型ブロックを安全に切り出す。"""
+    clean = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = clean.split("\n")
+    starts = []
+    start_re = re.compile(
+        rf"^\s*([1-8])(?:\t|\s)+(.+?[（(](?:{_V86_TRACKS})[）)])\s*$"
+    )
+    for idx, line in enumerate(lines):
+        m = start_re.match(line)
+        if m:
+            starts.append((idx, int(m.group(1)), m.group(2).strip()))
+    blocks = []
+    for pos, (idx, car_no, name_line) in enumerate(starts):
+        end = starts[pos + 1][0] if pos + 1 < len(starts) else len(lines)
+        blocks.append({"車番": car_no, "name_line": name_line, "lines": lines[idx + 1:end]})
+    return blocks
+
+
+def _v86_parse_overmidnight_block(block):
+    car_no = int(block["車番"])
+    name_line = str(block.get("name_line") or "").strip()
+    body_lines = [str(x).strip() for x in block.get("lines", []) if str(x).strip()]
+    compact = " ".join(body_lines)
+
+    lg_m = re.search(rf"[（(]({_V86_TRACKS})[）)]\s*$", name_line)
+    affiliation = lg_m.group(1) if lg_m else None
+    player_name = v15_normalize_name(name_line)
+
+    age_term = re.search(r"(\d{1,3})歳\s*/\s*(\d{1,2})期", compact)
+    age = int(age_term.group(1)) if age_term else None
+    term = int(age_term.group(2)) if age_term else None
+
+    handicap = None
+    st_value = np.nan
+    trial = np.nan
+    hs = re.search(
+        r"ハンデ\s*([+-]?\d+|-)\s*m\s*/\s*ST\s*([+-]?\d?\.\d{2,3}|-)\s*(?:\t|\s)+([3-9]\.\d{2,3}|-)",
+        compact,
+        re.I,
+    )
+    if hs:
+        handicap = 0 if hs.group(1) == "-" else int(hs.group(1))
+        if hs.group(2) != "-":
+            st_value = float(hs.group(2))
+        if hs.group(3) != "-":
+            trial = float(hs.group(3))
+    else:
+        hm = re.search(r"ハンデ\s*([+-]?\d+|-)\s*m", compact, re.I)
+        if hm:
+            handicap = 0 if hm.group(1) == "-" else int(hm.group(1))
+        sm = re.search(r"/\s*ST\s*([+-]?\d?\.\d{2,3}|-)", compact, re.I)
+        if sm and sm.group(1) != "-":
+            st_value = float(sm.group(1))
+
+    rank_m = re.search(r"\b([SAB]-\d+)\b", compact)
+    rank = rank_m.group(1) if rank_m else None
+    prev_m = re.search(r"\(前\s*([SAB]-\d+)\)", compact)
+
+    # 試走偏差は、ST/試走行の後から現ランクまでにある0.xxxを採用する。
+    trial_dev = np.nan
+    dev_rank_m = re.search(r"(?:^|\s)(0\.\d{3})\s+([SAB]-\d+)(?:\s|$)", compact)
+    if dev_rank_m:
+        trial_dev = float(dev_rank_m.group(1))
+
+    def time_value(label, digits=3):
+        m = re.search(rf"{label}\s*([3-9]\.\d{{{digits}}}|0\.000)?", compact)
+        if not m or not m.group(1):
+            return np.nan
+        return _v86_num(m.group(1), zero_as_nan=True)
+
+    avg_trial = time_value("平均試走T", 2)
+    avg_race = time_value("平均競走T", 3)
+    best_race = time_value("最高競走T", 3)
+
+    recent_m = re.search(r"着順\s*(\d+-\d+-\d+-\d+)", compact)
+    two_m = re.search(r"2連\s*([0-9.]+)%", compact)
+    three_m = re.search(r"3連\s*([0-9.]+)%", compact)
+
+    car_name = None
+    car_m = re.search(
+        r"3連\s*[0-9.]+%\s+(.+?)(?=\s+[12]\s+着順\s*\d+-\d+-\d+-\d+|$)",
+        compact,
+    )
+    if car_m:
+        car_name = car_m.group(1).strip()
+
+    grade_m = re.search(
+        r"3連\s*[0-9.]+%\s+.+?\s+([12])\s+着順\s*\d+-\d+-\d+-\d+",
+        compact,
+    )
+    vehicle_grade = int(grade_m.group(1)) if grade_m else None
+
+    all_pct = [float(x) for x in re.findall(r"([0-9]+(?:\.[0-9]+)?)%", compact)]
+    tail = all_pct[-6:] if len(all_pct) >= 8 else []
+    rate_values = dict(zip(
+        ["2連対率", "3連対率", "良2連対率", "良3連対率", "湿2連対率", "湿3連対率"],
+        tail,
+    ))
+
+    row = {
+        "車番": car_no,
+        "選手名": player_name,
+        "所属": affiliation,
+        "年齢": age,
+        "期別": term,
+        "ハンデ": handicap,
+        "ST": st_value,
+        "試走T": trial,
+        "試走偏差": trial_dev,
+        "現ランク": rank,
+        "前ランク": prev_m.group(1) if prev_m else None,
+        "級別": rank.split("-")[0] if rank else None,
+        "平均試走T": avg_trial,
+        "平均競走T": avg_race,
+        "最高競走T": best_race,
+        "近10走着順": recent_m.group(1) if recent_m else None,
+        "近10走2連": float(two_m.group(1)) if two_m else np.nan,
+        "近10走3連": float(three_m.group(1)) if three_m else np.nan,
+        "車名": car_name,
+        "車級": vehicle_grade,
+        "_raw": "\n".join([name_line] + body_lines),
+    }
+    row.update(rate_values)
+    return row
+
+
+def v86_parse_overmidnight_entries(text):
+    rows = [_v86_parse_overmidnight_block(block) for block in _v86_split_overmidnight_blocks(text)]
+    rows = [row for row in rows if row and row.get("車番")]
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates("車番", keep="first").sort_values("車番").reset_index(drop=True)
+    return df
+
+
+_v86_previous_parse_entries = v15_parse_entries
+
+
+def v15_parse_entries(text, manual_excluded=None):
+    """オーバーミッドナイト形式を先に判定し、欠損値を列ずれさせず読む。"""
+    special = v86_parse_overmidnight_entries(text)
+    if not special.empty and special["車番"].nunique() >= 2:
+        excluded = dict(v17_detect_nonstarters(text))
+        if manual_excluded is not None:
+            excluded = {int(car): "手動欠車" for car in manual_excluded}
+        special = special.copy()
+        special["出走状態"] = special["車番"].map(lambda x: excluded.get(int(x), "出走"))
+        special["解析対象"] = ~special["車番"].astype(int).isin(excluded)
+        return special[special["解析対象"]].sort_values("車番").reset_index(drop=True)
+    return _v86_previous_parse_entries(text, manual_excluded=manual_excluded)

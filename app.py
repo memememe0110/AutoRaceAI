@@ -1166,10 +1166,24 @@ with prediction_tab:
                     "試走偏差", "現ランク", "平均競走T", "最高競走T",
                     "近10走着順", "近10走2連", "近10走3連", "車名"
                 ] if c in preview_entries.columns]
-                with st.expander(f"📋 出走表の読み取り確認（{len(preview_entries)}名）", expanded=False):
+                expected_entries = None
+                try:
+                    preview_meta = engine.v15_parse_race_meta(text) or {}
+                    expected_entries = int(preview_meta.get("出走数")) if preview_meta.get("出走数") else None
+                except Exception:
+                    expected_entries = None
+                actual_entries = int(preview_entries["車番"].nunique())
+                with st.expander(f"📋 出走表の読み取り確認（{actual_entries}名）", expanded=False):
                     st.dataframe(preview_entries[preview_cols], use_container_width=True, hide_index=True)
-                    if preview_entries["車番"].nunique() < 8:
-                        st.warning("8車すべてを取得できていません。貼り付け範囲を確認してください。")
+                    if expected_entries and actual_entries < expected_entries:
+                        present = set(preview_entries["車番"].dropna().astype(int).tolist())
+                        missing = [car for car in range(1, expected_entries + 1) if car not in present]
+                        missing_text = "、".join(f"{car}番" for car in missing) if missing else "不明"
+                        st.warning(f"⚠ {actual_entries}/{expected_entries}車のみ読み取りました。未読込候補: {missing_text}")
+                    elif expected_entries:
+                        st.success(f"✅ {actual_entries}/{expected_entries}車を正常に読み取りました。")
+                    else:
+                        st.info(f"読取車数: {actual_entries}車")
             else:
                 st.warning("出走表から選手を読み取れませんでした。ページ全体をコピーして貼り付けてください。")
         except Exception as exc:
