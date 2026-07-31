@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver80｜順位列重複エラー修正・上へボタンをメインタブへ移動")
+st.caption("Ver92｜開催場別の学習重み・実際の補正値を確認可能")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1311,6 +1311,50 @@ with prediction_tab:
             st.subheader("予測順位")
             st.dataframe(result, use_container_width=True, hide_index=True)
 
+            with st.expander("🏟️ 今回の開催場重み・適用補正", expanded=True):
+                venue_name = str(meta.get("開催場") or "").strip()
+                try:
+                    profile = engine.v92_venue_weight_profile(venue_name, engine.DB_PATH)
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("開催場", profile.get("開催場") or "未取得")
+                    m2.metric("学習レース数", f"{int(profile.get('レース数', 0))}R")
+                    confidence = float(profile.get("信頼度", 0.0) or 0.0)
+                    m3.metric("開催場特徴の信頼度", f"{confidence * 100:.1f}%")
+                    st.caption("実効係数は『基礎係数 × 開催場データ信頼度』です。開催場差が0に近い項目は、係数があっても実際の補正はほぼ掛かりません。")
+                    weight_df = pd.DataFrame(profile.get("重み明細", []))
+                    if not weight_df.empty:
+                        st.dataframe(
+                            weight_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "基礎係数": st.column_config.NumberColumn(format="%.2f"),
+                                "開催場差": st.column_config.NumberColumn(format="%+.3f"),
+                                "信頼度": st.column_config.NumberColumn(format="%.1%%"),
+                                "実効係数": st.column_config.NumberColumn(format="%.3f"),
+                                "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
+                            },
+                        )
+                    applied = engine.v92_applied_venue_corrections(df)
+                    if not applied.empty:
+                        st.markdown("#### 各選手へ実際に掛かった補正")
+                        st.dataframe(
+                            applied,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "開催場特徴補正": st.column_config.NumberColumn(format="%+.3f"),
+                                "開催場特徴信頼度": st.column_config.NumberColumn(format="%.1%%"),
+                                "開催場前残り差": st.column_config.NumberColumn(format="%+.3f"),
+                                "開催場追込み差": st.column_config.NumberColumn(format="%+.3f"),
+                                "開催場試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
+                                "開催場ST影響差": st.column_config.NumberColumn(format="%+.3f"),
+                            },
+                        )
+                    st.caption("開催場特徴補正は最大約±0.9点に制限しています。プラスは順位を押し上げ、マイナスは押し下げる方向です。")
+                except Exception as exc:
+                    st.warning(f"開催場重みを表示できませんでした: {exc}")
+
             with st.expander("🏍️ 逃げ役・逃げ残り診断", expanded=True):
                 escape_cols = [c for c in [
                     "車", "選手名", "ハンデ", "逃げ判定", "初周先頭推定", "逃げ残り推定",
@@ -1856,6 +1900,45 @@ with register_tab:
                 st.exception(exc)
 
 with db_tab:
+    st.subheader("🏟️ 開催場別の学習重み")
+    st.caption("開催場そのものの前残り・追込み・試走・ST・高温傾向を、全場平均との差で確認できます。信頼度が低い開催場は予測への反映も自動で弱くなります。")
+    try:
+        venue_profiles = engine.v92_all_venue_weight_profiles(engine.DB_PATH)
+        st.dataframe(
+            venue_profiles,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "信頼度": st.column_config.ProgressColumn(format="%.1%%", min_value=0.0, max_value=1.0),
+                "前残り差": st.column_config.NumberColumn(format="%+.3f"),
+                "追込み1着差": st.column_config.NumberColumn(format="%+.3f"),
+                "追込み3着内差": st.column_config.NumberColumn(format="%+.3f"),
+                "試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
+                "ST影響差": st.column_config.NumberColumn(format="%+.3f"),
+                "高温前残り差": st.column_config.NumberColumn(format="%+.3f"),
+            },
+        )
+        selected_venue = st.selectbox("詳しく見る開催場", engine.V92_VENUES, key="v92_selected_venue")
+        selected_profile = engine.v92_venue_weight_profile(selected_venue, engine.DB_PATH)
+        detail = pd.DataFrame(selected_profile.get("重み明細", []))
+        if not detail.empty:
+            st.dataframe(
+                detail,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "基礎係数": st.column_config.NumberColumn(format="%.2f"),
+                    "開催場差": st.column_config.NumberColumn(format="%+.3f"),
+                    "信頼度": st.column_config.NumberColumn(format="%.1%%"),
+                    "実効係数": st.column_config.NumberColumn(format="%.3f"),
+                    "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
+                },
+            )
+        st.caption("現在は確認専用です。基礎係数は全開催場共通で、開催場ごとの差とデータ信頼度によって実際の効き方が変わります。")
+    except Exception as exc:
+        st.warning(f"開催場別重みを取得できませんでした: {exc}")
+
+    st.divider()
     st.subheader("登録されている情報")
     try:
         info = db_summary(engine.DB_PATH)

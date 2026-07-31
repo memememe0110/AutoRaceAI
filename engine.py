@@ -13153,3 +13153,93 @@ def _v35_parse_entries(text):
     if len(rows) < 3:
         raise ValueError("着順表を解析できませんでした。『着順 車番 選手名』からグランドノート直前までを含めて貼り付けてください。")
     return pd.DataFrame(sorted(rows, key=lambda r: r["着順"]))
+
+
+# ============================================================
+# Ver92: 開催場別学習重み・適用補正の確認
+# ============================================================
+V92_VENUES = ["川口", "伊勢崎", "浜松", "飯塚", "山陽"]
+V92_VENUE_BASE_COEFFICIENTS = {
+    "前残り": 2.20,
+    "追込み": 1.80,
+    "試走信頼度": 1.15,
+    "ST影響": 0.90,
+    "高温前残り": 1.55,
+}
+
+
+def v92_venue_weight_profile(venue, db_path=DB_PATH):
+    """開催場特徴と、現在の固定係数・信頼度反映後の実効係数を返す。"""
+    profile = v84_venue_profile({"開催場": str(venue or "").strip()}, db_path)
+    confidence = float(profile.get("信頼度", 0.0) or 0.0)
+    rows = []
+    diff_map = {
+        "前残り": float(profile.get("前残り差", 0.0) or 0.0),
+        "追込み": (
+            float(profile.get("追込み3着内差", 0.0) or 0.0) * 0.65
+            + float(profile.get("追込み1着差", 0.0) or 0.0) * 0.35
+        ),
+        "試走信頼度": float(profile.get("試走信頼差", 0.0) or 0.0),
+        "ST影響": float(profile.get("ST影響差", 0.0) or 0.0),
+        "高温前残り": float(profile.get("高温前残り差", 0.0) or 0.0),
+    }
+    for name, base in V92_VENUE_BASE_COEFFICIENTS.items():
+        diff = diff_map[name]
+        rows.append({
+            "項目": name,
+            "基礎係数": float(base),
+            "開催場差": float(diff),
+            "信頼度": confidence,
+            "実効係数": float(base * confidence),
+            "最大寄与目安": float(base * confidence * abs(diff)),
+        })
+    return {
+        "開催場": str(profile.get("開催場") or venue or ""),
+        "レース数": int(profile.get("レース数", 0) or 0),
+        "信頼度": confidence,
+        "前残り差": float(profile.get("前残り差", 0.0) or 0.0),
+        "追込み1着差": float(profile.get("追込み1着差", 0.0) or 0.0),
+        "追込み3着内差": float(profile.get("追込み3着内差", 0.0) or 0.0),
+        "試走信頼差": float(profile.get("試走信頼差", 0.0) or 0.0),
+        "ST影響差": float(profile.get("ST影響差", 0.0) or 0.0),
+        "高温前残り差": float(profile.get("高温前残り差", 0.0) or 0.0),
+        "重み明細": rows,
+    }
+
+
+def v92_all_venue_weight_profiles(db_path=DB_PATH):
+    """全開催場の学習状況を比較するDataFrameを返す。"""
+    rows = []
+    for venue in V92_VENUES:
+        p = v92_venue_weight_profile(venue, db_path)
+        rows.append({
+            "開催場": venue,
+            "学習レース数": p["レース数"],
+            "信頼度": p["信頼度"],
+            "前残り差": p["前残り差"],
+            "追込み1着差": p["追込み1着差"],
+            "追込み3着内差": p["追込み3着内差"],
+            "試走信頼差": p["試走信頼差"],
+            "ST影響差": p["ST影響差"],
+            "高温前残り差": p["高温前残り差"],
+        })
+    return pd.DataFrame(rows)
+
+
+def v92_applied_venue_corrections(prediction_df):
+    """今回予測で各選手へ実際に掛かった開催場補正を表示用に整える。"""
+    if prediction_df is None or len(prediction_df) == 0:
+        return pd.DataFrame(columns=["車", "選手名", "ハンデ", "開催場特徴補正", "順位への方向"])
+    df = prediction_df.copy()
+    cols = [c for c in [
+        "車", "選手名", "ハンデ", "開催場特徴補正", "開催場特徴レース数",
+        "開催場特徴信頼度", "開催場前残り差", "開催場追込み差",
+        "開催場試走信頼差", "開催場ST影響差", "開催場特徴根拠"
+    ] if c in df.columns]
+    out = df[cols].copy()
+    if "開催場特徴補正" in out.columns:
+        val = pd.to_numeric(out["開催場特徴補正"], errors="coerce").fillna(0.0)
+        out["順位への方向"] = val.map(lambda x: "上げる" if x > 0.005 else ("下げる" if x < -0.005 else "ほぼ影響なし"))
+        sort_cols = ["開催場特徴補正"]
+        out = out.sort_values(sort_cols, ascending=False)
+    return out.reset_index(drop=True)
