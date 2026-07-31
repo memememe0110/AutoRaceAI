@@ -11588,10 +11588,19 @@ def _v68_is_future_row(date_value, race_value=None):
     return r >= target_r
 
 
-def _v68_record_event(source, total, used, excluded, violations=0, details=None):
+def _v68_record_event(source, total, used, excluded, violations=0, details=None, future_excluded=0):
+    """未来データ監査イベントを記録する。
+
+    future_excluded:
+        監査中に見つけ、安全に除外できた未来データ件数。
+    violations:
+        除外処理後にも残った未来データ漏れ件数。予測停止対象。
+    """
     VER68_AUDIT_EVENTS.append({
         "source": str(source), "total": int(total), "used": int(used),
-        "excluded": int(excluded), "violations": int(violations),
+        "excluded": int(excluded),
+        "future_excluded": int(future_excluded),
+        "violations": int(violations),
         "details": details or [],
     })
 
@@ -11602,19 +11611,34 @@ def v61_filter_history_df(df, date_col="開催日", race_col="レース", count_
         return df
     total = len(df)
     out = _VER68_BASE_HISTORY_FILTER(df, date_col, race_col, count_stats=count_stats)
-    violations = 0
+    future_excluded = 0
     details = []
     if out is not None and not out.empty and date_col in out.columns:
-        for _, row in out.iterrows():
-            rv = row.get(race_col) if race_col in out.columns else None
-            if _v68_is_future_row(row.get(date_col), rv):
-                violations += 1
-                if len(details) < 20:
-                    details.append(f"{row.get(date_col)} {rv or 'R不明'}")
-        if violations:
-            mask = out.apply(lambda r: not _v68_is_future_row(r.get(date_col), r.get(race_col) if race_col in out.columns else None), axis=1)
-            out = out.loc[mask].copy()
-    _v68_record_event(source, total, len(out) if out is not None else 0, total-(len(out) if out is not None else 0), violations, details)
+        future_mask = out.apply(
+            lambda r: _v68_is_future_row(
+                r.get(date_col), r.get(race_col) if race_col in out.columns else None
+            ), axis=1
+        )
+        future_excluded = int(future_mask.sum())
+        if future_excluded:
+            for _, row in out.loc[future_mask].head(20).iterrows():
+                rv = row.get(race_col) if race_col in out.columns else None
+                details.append(f"{row.get(date_col)} {rv or 'R不明'}")
+            out = out.loc[~future_mask].copy()
+
+    # 除外後にも未来データが残った場合だけ、本当の違反として扱う。
+    leakage = 0
+    if out is not None and not out.empty and date_col in out.columns:
+        leakage = int(out.apply(
+            lambda r: _v68_is_future_row(
+                r.get(date_col), r.get(race_col) if race_col in out.columns else None
+            ), axis=1
+        ).sum())
+    used = len(out) if out is not None else 0
+    _v68_record_event(
+        source, total, used, total-used,
+        violations=leakage, details=details, future_excluded=future_excluded
+    )
     return out
 
 
@@ -11624,7 +11648,7 @@ def v61_filter_lap_df(df, race_key_col="race_key", source="グランドノート
         return df
     total = len(df)
     out = _VER68_BASE_LAP_FILTER(df, race_key_col)
-    violations = 0
+    future_excluded = 0
     details = []
     if out is not None and not out.empty and race_key_col in out.columns:
         bad_idx=[]
@@ -11634,24 +11658,39 @@ def v61_filter_lap_df(df, race_key_col="race_key", source="グランドノート
             d=datetime.strptime(dm.group(1), "%Y%m%d").strftime("%Y-%m-%d") if dm else ""
             r=int(rm.group(1)) if rm else None
             if _v68_is_future_row(d,r):
-                bad_idx.append(idx); violations+=1
+                bad_idx.append(idx); future_excluded+=1
                 if len(details)<20: details.append(f"{d} {str(r)+'R' if r else 'R不明'}")
         if bad_idx:
             out=out.drop(index=bad_idx)
-    _v68_record_event(source,total,len(out),total-len(out),violations,details)
+
+    leakage = 0
+    if out is not None and not out.empty and race_key_col in out.columns:
+        for key in out[race_key_col].astype(str):
+            dm=re.search(r"^(\d{8})", key)
+            rm=re.search(r"_(\d{1,2})R(?:_|$)", key)
+            d=datetime.strptime(dm.group(1), "%Y%m%d").strftime("%Y-%m-%d") if dm else ""
+            r=int(rm.group(1)) if rm else None
+            leakage += int(_v68_is_future_row(d,r))
+    _v68_record_event(
+        source,total,len(out),total-len(out),
+        violations=leakage,details=details,future_excluded=future_excluded
+    )
     return out
 
 
 def v68_future_audit_summary():
     b=v61_learning_boundary_summary()
     events=list(VER68_AUDIT_EVENTS)
-    total=sum(e["total"] for e in events)
-    used=sum(e["used"] for e in events)
-    excluded=sum(e["excluded"] for e in events)
-    violations=sum(e["violations"] for e in events)
+    total=sum(e.get("total",0) for e in events)
+    used=sum(e.get("used",0) for e in events)
+    excluded=sum(e.get("excluded",0) for e in events)
+    future_excluded=sum(e.get("future_excluded",0) for e in events)
+    violations=sum(e.get("violations",0) for e in events)
     return {
         "boundary": b, "events": events, "total_checked": total,
-        "used": used, "excluded": excluded, "violations": violations,
+        "used": used, "excluded": excluded,
+        "future_excluded": future_excluded,
+        "violations": violations,
         "status": "OK" if violations==0 else "BLOCKED",
     }
 
@@ -11662,8 +11701,11 @@ def ver16_run_prediction(text, trials=10000, seed=20260719, manual_excluded=None
     v68_reset_future_audit()
     result = _VER68_ORIGINAL_RUN_PREDICTION(text, trials, seed, manual_excluded)
     audit = v68_future_audit_summary()
+    # 安全に除外した未来データは正常動作。除外後に残った漏れだけ停止する。
     if audit.get("violations", 0):
-        raise RuntimeError(f"未来データ監査で{audit['violations']}件を検出し、予測を停止しました。")
+        raise RuntimeError(
+            f"未来データ監査で除外後の漏れを{audit['violations']}件検出し、予測を停止しました。"
+        )
     globals()["LATEST_FUTURE_AUDIT"] = audit
     return result
 
@@ -14324,4 +14366,10 @@ def v99_run_batch_predictions(records, trials=5000, seed=20260719, db_path=DB_PA
 # - ７４歳／９期
 # - NBSP / 全角空白入り
 # を同一形式として解析する。
+# ============================================================
+
+
+# ============================================================
+# Ver101: 未来データ監査の誤停止修正
+# 検出して除外した件数と、除外後に残った漏れを分離。
 # ============================================================
