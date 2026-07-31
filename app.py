@@ -1899,9 +1899,21 @@ with result_tab:
                 )
                 st.info("同じ日付・開催場・レース番号の出走表と結果を確認してください。不一致のままでは登録・分析・学習を実行しません。")
             else:
-                st.success(
-                    f"✅ 予測と結果の出走数を確認しました：{entry_count_check.get('result_count', 0)}車"
-                )
+                incident_cars = entry_count_check.get("incident_cars", {}) or {}
+                if incident_cars:
+                    incident_text = "、".join(
+                        f"{car}番 {status}" for car, status in sorted(incident_cars.items(), key=lambda x: int(x[0]))
+                    )
+                    st.success(
+                        f"✅ 予測と結果の出走数を確認しました：{entry_count_check.get('result_count', 0)}車"
+                    )
+                    st.info(
+                        f"発走後事故として出走数には含め、着順分析・学習から除外します：{incident_text}"
+                    )
+                else:
+                    st.success(
+                        f"✅ 予測と結果の出走数を確認しました：{entry_count_check.get('result_count', 0)}車"
+                    )
         else:
             st.caption("同じレースの保存済み予測がないため、出走数比較は行わず結果登録のみ可能です。")
 

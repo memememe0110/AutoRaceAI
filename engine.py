@@ -9193,20 +9193,72 @@ def _v41_parse_compact_payouts(text):
     return pd.DataFrame(rows, columns=["券種", "組合せ", "払戻金", "人気"])
 
 
+def _v121_extract_started_and_incident_cars(text, finished_rows=None):
+    """公式結果本文から、完走車に加えて発走後事故車も抽出する。
+
+    欠車・出走取消は発走していないため含めない。落車、落妨、反妨、競走中止、
+    周誤などは予測時の出走数照合には含めるが、着順学習からは除外する。
+    """
+    finished = set()
+    if isinstance(finished_rows, pd.DataFrame) and "車番" in finished_rows.columns:
+        finished = set(pd.to_numeric(finished_rows["車番"], errors="coerce").dropna().astype(int).tolist())
+
+    block = str(text or "")
+    if "着順" in block and "車番" in block:
+        block = block[block.find("着順"):]
+    if "グランドノート" in block:
+        block = block.split("グランドノート", 1)[0]
+    lines = [re.sub(r"[\t\u3000]+", " ", x).strip() for x in block.splitlines()]
+    lines = [x for x in lines if x]
+
+    incident_words = (
+        "競走中止", "落妨", "落車", "反妨", "反則", "周誤", "周回誤認",
+        "他落", "故障", "妨害", "失格", "再試走", "戒告"
+    )
+    nonstarters = ("欠車", "出走取消", "参加解除", "欠場")
+    incidents = {}
+
+    for i, line in enumerate(lines):
+        car = None
+        # 公式縦表示: 「-」の次の行が車番。横表示「- 1」にも対応。
+        m = re.match(r"^[-－—–]\s*([1-8])(?:\s|$)", line)
+        if m:
+            car = int(m.group(1))
+        elif re.fullmatch(r"[-－—–]", line) and i + 1 < len(lines) and re.fullmatch(r"[1-8]", lines[i + 1]):
+            car = int(lines[i + 1])
+        if car is None:
+            continue
+
+        nearby = " ".join(lines[i:min(len(lines), i + 8)])
+        if any(w in nearby for w in nonstarters):
+            continue
+        status = next((w for w in incident_words if w in nearby), "競走中止等")
+        incidents[car] = status
+
+    started = sorted(finished | set(incidents))
+    return started, incidents
+
+
 def v35_parse_result_text(text, venue_override="", race_no_override=""):
     """旧形式と新公式サイト形式を自動判定して結果を解析する。"""
     if not str(text).strip():
         raise ValueError("結果ページを貼り付けてください。")
     is_compact = bool(re.search(r"着\s+(?:事故\s+)?車\s+選手名", text)) and "通常-結果" in text
     if not is_compact:
-        return _v41_legacy_parse_result_text(text, venue_override, race_no_override)
+        meta, rows, laps, payouts = _v41_legacy_parse_result_text(text, venue_override, race_no_override)
+    else:
+        meta = _v41_result_layout_meta(text, venue_override, race_no_override)
+        rows = _v41_parse_compact_result_entries(text, meta)
+        laps = _v41_parse_compact_laps(text)
+        payouts = _v41_parse_compact_payouts(text)
+        if not meta.get("開催日") or not meta.get("開催場") or not meta.get("レース"):
+            raise ValueError("開催日・開催場・レース番号を取得できませんでした。開催場が本文にない場合は補助入力で指定してください。")
 
-    meta = _v41_result_layout_meta(text, venue_override, race_no_override)
-    rows = _v41_parse_compact_result_entries(text, meta)
-    laps = _v41_parse_compact_laps(text)
-    payouts = _v41_parse_compact_payouts(text)
-    if not meta.get("開催日") or not meta.get("開催場") or not meta.get("レース"):
-        raise ValueError("開催日・開催場・レース番号を取得できませんでした。開催場が本文にない場合は補助入力で指定してください。")
+    started_cars, incident_cars = _v121_extract_started_and_incident_cars(text, rows)
+    meta = dict(meta or {})
+    meta["発走車番"] = started_cars
+    meta["発走後事故車"] = incident_cars
+    meta["完走車数"] = int(rows["車番"].nunique()) if isinstance(rows, pd.DataFrame) and "車番" in rows.columns else len(rows)
     return meta, rows, laps, payouts
 
 # 新形式で上位3選手しか氏名が掲載されない場合、保存済み予測と
@@ -15048,6 +15100,14 @@ def v117_prediction_result_entry_count_check(meta, results, db_path=DB_PATH):
             pd.to_numeric(result_df["車番"], errors="coerce")
             .dropna().astype(int).tolist()
         )
+    # 着順が付かなかった発走後事故車も、出走数・車番照合には含める。
+    # 一方、欠車・出走取消は parser 側で「発走車番」へ含めない。
+    meta_started = (meta or {}).get("発走車番", []) if isinstance(meta, dict) else []
+    try:
+        result_cars |= {int(x) for x in meta_started if x is not None}
+    except Exception:
+        pass
+    incident_cars = (meta or {}).get("発走後事故車", {}) if isinstance(meta, dict) else {}
     with sqlite3.connect(str(db_path)) as con:
         pred_rows = con.execute(
             "SELECT car_no FROM prediction_snapshots WHERE race_key=? ORDER BY car_no",
@@ -15070,6 +15130,8 @@ def v117_prediction_result_entry_count_check(meta, results, db_path=DB_PATH):
         "result_cars": sorted(result_cars),
         "missing_in_result": missing_in_result,
         "extra_in_result": extra_in_result,
+        "incident_cars": incident_cars if isinstance(incident_cars, dict) else {},
+        "finished_count": int(result_df["車番"].nunique()) if not result_df.empty and "車番" in result_df.columns else len(result_df),
     }
 
 
