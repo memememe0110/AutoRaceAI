@@ -440,7 +440,7 @@ def show_prediction_confidence(finish_prob: pd.DataFrame, bets: dict, trials: in
         st.info(info["comment"])
     else:
         st.info(info["comment"])
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     car_text = f"{int(info['top_car'])}番" if pd.notna(info.get("top_car")) else "不明"
     c1.metric("1着中心", car_text, f"1着率 {info['top1']:.2f}%")
     c2.metric("1位と2位の差", f"{info['gap']:.2f}pt")
@@ -2144,7 +2144,7 @@ with db_tab:
 
                 st.divider()
                 st.subheader("予測・結果の登録漏れチェック")
-                st.caption("同じ開催日・開催場・Rに出走選手全員の履歴がそろっているレースを復元し、予測未保存や結果未登録を抽出します。")
+                st.caption("選手別履歴を直接照合します。Rがあるデータは日付・開催場・Rで、Rがないデータも同時登録された選手セットから完全レースを復元します。")
                 try:
                     v97_health = engine.v97_database_health(engine.DB_PATH)
                     v97_summary = v97_health.get("summary", {})
@@ -2153,11 +2153,36 @@ with db_tab:
                     c2.metric("予測可能・未予測", f"{v97_summary.get('未予測', 0)}R")
                     c3.metric("結果未登録", f"{v97_summary.get('結果未登録', 0)}R")
                     c4.metric("予測済・結果未登録", f"{v97_summary.get('予測済結果未登録', 0)}R")
+                    c5.metric("Rなし復元", f"{v97_summary.get('Rなし完全データ', 0)}R")
 
+                    complete_all = v97_health.get("complete_all", [])
+                    unidentified_complete = v97_health.get("unidentified_complete", [])
                     unpredicted = v97_health.get("predictable_unpredicted", [])
                     missing_result = v97_health.get("complete_missing_result", [])
                     predicted_missing = v97_health.get("predicted_missing_result", [])
                     incomplete = v97_health.get("incomplete", [])
+
+
+                    with st.expander(f"選手別データ照合・全員分が揃ったレース（{len(complete_all)}R）", expanded=True):
+                        if complete_all:
+                            df_complete = pd.DataFrame(complete_all)
+                            show_cols = [c for c in ["開催日", "開催場", "R", "登録状況", "予測", "結果", "抽出元", "照合状態", "選手"] if c in df_complete.columns]
+                            st.dataframe(df_complete[show_cols], use_container_width=True, hide_index=True)
+                            st.download_button(
+                                "完全データレース一覧をCSV保存",
+                                df_complete.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="complete_player_data_races.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.caption("全員分が揃ったレースは見つかりませんでした。")
+
+                    if unidentified_complete:
+                        with st.expander(f"Rは不明だが全員分が揃った登録セット（{len(unidentified_complete)}R）", expanded=False):
+                            df_unknown = pd.DataFrame(unidentified_complete)
+                            st.dataframe(df_unknown[[c for c in ["開催日", "開催場", "R", "登録状況", "抽出元", "選手"] if c in df_unknown.columns]], use_container_width=True, hide_index=True)
+                            st.caption("選手全員分は揃っていますが、Rを特定できないため予測・結果の保存状況は断定していません。")
 
                     with st.expander(f"全選手データあり・予測未保存（{len(unpredicted)}R）", expanded=bool(unpredicted)):
                         if unpredicted:
@@ -2171,6 +2196,61 @@ with db_tab:
                                 mime="text/csv",
                                 use_container_width=True,
                             )
+                            st.markdown("#### 一括予測")
+                            st.caption("全選手分が揃い、Rを特定できる未予測レースだけが対象です。各レースの予測時点より後の履歴は学習から遮断します。")
+                            selectable = [r for r in unpredicted if not str(r.get("R", "")).startswith("R不明")]
+                            label_map = {
+                                f"{r.get('開催日')}｜{r.get('開催場')}｜{r.get('R')}｜{r.get('登録状況')}": r
+                                for r in selectable
+                            }
+                            selected_labels = st.multiselect(
+                                "一括予測するレース",
+                                options=list(label_map.keys()),
+                                default=list(label_map.keys()),
+                                key="v99_batch_prediction_selection",
+                            )
+                            batch_trials = st.select_slider(
+                                "一括予測の試行回数",
+                                options=[2000, 5000, 10000, 20000],
+                                value=5000,
+                                help="大量レースでは5000回が軽めです。保存後に必要なレースだけ通常画面で20000回へ再予測できます。",
+                                key="v99_batch_trials",
+                            )
+                            if st.button("選択した未予測レースを一括予測", type="primary", use_container_width=True, disabled=not selected_labels):
+                                selected_records = [label_map[x] for x in selected_labels]
+                                with st.spinner(f"{len(selected_records)}レースを時系列順に予測しています…"):
+                                    batch_report = engine.v99_run_batch_predictions(
+                                        selected_records, int(batch_trials), 20260719, engine.DB_PATH
+                                    )
+                                st.session_state["v99_last_batch_report"] = batch_report
+                                if batch_report.get("成功", 0):
+                                    st.success(
+                                        f"一括予測完了：成功 {batch_report.get('成功', 0)}R｜"
+                                        f"スキップ {batch_report.get('スキップ', 0)}R｜エラー {batch_report.get('エラー', 0)}R"
+                                    )
+                                else:
+                                    st.warning(
+                                        f"保存できたレースはありませんでした。スキップ {batch_report.get('スキップ', 0)}R｜"
+                                        f"エラー {batch_report.get('エラー', 0)}R"
+                                    )
+                                st.rerun()
+                            last_batch = st.session_state.get("v99_last_batch_report")
+                            if last_batch:
+                                with st.expander("直前の一括予測レポート", expanded=bool(last_batch.get("エラー") or last_batch.get("スキップ"))):
+                                    st.write(
+                                        f"対象 {last_batch.get('対象', 0)}R｜成功 {last_batch.get('成功', 0)}R｜"
+                                        f"スキップ {last_batch.get('スキップ', 0)}R｜エラー {last_batch.get('エラー', 0)}R"
+                                    )
+                                    details = pd.DataFrame(last_batch.get("details", []))
+                                    if not details.empty:
+                                        st.dataframe(details, use_container_width=True, hide_index=True)
+                                        st.download_button(
+                                            "一括予測レポートをCSV保存",
+                                            details.to_csv(index=False).encode("utf-8-sig"),
+                                            file_name="batch_prediction_report.csv",
+                                            mime="text/csv",
+                                            use_container_width=True,
+                                        )
                         else:
                             st.success("全選手データがそろったレースは、すべて予測保存済みです。")
 
@@ -2204,7 +2284,7 @@ with db_tab:
                             st.caption("該当レースはありません。")
 
                     if v97_summary.get("識別不能", 0):
-                        st.caption(f"日付またはRを特定できず集計対象外となった履歴: {v97_summary.get('識別不能', 0)}行")
+                        st.caption(f"日付を特定できず集計対象外となった履歴: {v97_summary.get('識別不能', 0)}行")
                     st.info("『予測未保存』は、予測スナップショットがDBに残っていない状態です。過去に画面表示だけ行い、保存前の版で予測したレースも含まれる場合があります。")
                 except Exception as exc:
                     st.warning(f"登録漏れチェックを実行できませんでした: {exc}")

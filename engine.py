@@ -4200,7 +4200,7 @@ def v15_parse_entry_line(line):
         r"\s(?:0|10|20|30|40|50|60|70|80)\s*m?(?:\s|$)",
         r"\s3\.\d{2}(?:\s|$)",
         r"\s[AB]\d(?:\s|$)",
-        r"\s\d{1,2}期(?:\s|$)",
+        r"\s\d{1,2}\s*期(?:\s|$)",
     ]:
         m = re.search(pat, body)
         if m:
@@ -4209,7 +4209,7 @@ def v15_parse_entry_line(line):
 
     # 級別・年齢・期別のような末尾情報を除外
     name_area = re.sub(r"\s+[AB]\d.*$", "", name_area).strip()
-    name_area = re.sub(r"\s+\d{1,2}期.*$", "", name_area).strip()
+    name_area = re.sub(r"\s+\d{1,2}\s*期.*$", "", name_area).strip()
     name_area = re.sub(r"\s+\d{2}歳.*$", "", name_area).strip()
 
     # 名前が取れないときは分割部品から探索
@@ -4220,7 +4220,7 @@ def v15_parse_entry_line(line):
     if not name or name in {"車番", "選手名", "枠番"}:
         return None
 
-    age = v15_int(v15_first_match([r"(\d{2})\s*歳"], line))
+    age = v15_int(v15_first_match([r"(\d{1,3})\s*歳"], line))
     grade = v15_first_match([r"\b([AB][12])\b"], line)
     term = v15_int(v15_first_match([r"(\d{1,2})\s*期"], line))
 
@@ -10863,7 +10863,7 @@ def v152_parse_entry_block(block):
     row["選手名"] = v15_normalize_name(raw_name)
 
     # 年齢・期別。「18歳/39期」の同一行を確実に取得。
-    age_term = re.search(r"(\d{1,3})歳\s*/\s*(\d{1,2})期", compact)
+    age_term = re.search(r"(\d{1,3})\s*歳\s*/\s*(\d{1,2})\s*期", compact)
     if age_term:
         row["年齢"] = int(age_term.group(1))
         row["期別"] = int(age_term.group(2))
@@ -12910,16 +12910,26 @@ def _v86_split_overmidnight_blocks(text):
 
 
 def _v86_parse_overmidnight_block(block):
+    # Ver100: 公式ページ内の全角数字・NBSP・全角空白・不規則な空白を
+    # 解析前に統一する。例: 「74歳/9 期」「７４歳／９期」も同一扱い。
+    import unicodedata
+
+    def _v100_norm(value):
+        value = unicodedata.normalize("NFKC", str(value or ""))
+        value = value.replace("\xa0", " ").replace("\u3000", " ")
+        value = re.sub(r"[ \t]+", " ", value)
+        return value.strip()
+
     car_no = int(block["車番"])
-    name_line = str(block.get("name_line") or "").strip()
-    body_lines = [str(x).strip() for x in block.get("lines", []) if str(x).strip()]
+    name_line = _v100_norm(block.get("name_line"))
+    body_lines = [_v100_norm(x) for x in block.get("lines", []) if _v100_norm(x)]
     compact = " ".join(body_lines)
 
     lg_m = re.search(rf"[（(]({_V86_TRACKS})[）)]\s*$", name_line)
     affiliation = lg_m.group(1) if lg_m else None
     player_name = v15_normalize_name(name_line)
 
-    age_term = re.search(r"(\d{1,3})歳\s*/\s*(\d{1,2})期", compact)
+    age_term = re.search(r"(\d{1,3})\s*歳\s*/\s*(\d{1,2})\s*期", compact)
     age = int(age_term.group(1)) if age_term else None
     term = int(age_term.group(2)) if age_term else None
 
@@ -13872,17 +13882,103 @@ def _v97_key(race_date, venue, race_no):
     return f"{d}_{v}_{r}" if d and v and r else ""
 
 
+def _v98_name_key(value):
+    """照合専用の選手名正規化。空白や全角空白の差を吸収する。"""
+    return re.sub(r"[\s　]+", "", str(value or "")).strip()
+
+
+def _v98_known_race_sets(con):
+    """結果・予測に保存済みの選手集合を、日付/場ごとに索引化する。"""
+    index = {}
+
+    def add(race_key, names, source):
+        parts = str(race_key or "").split("_")
+        if len(parts) < 3:
+            return
+        d, venue, race_no = parts[0], parts[1], parts[2]
+        if len(d) != 8 or not venue:
+            return
+        key_names = frozenset(_v98_name_key(x) for x in names if _v98_name_key(x))
+        if len(key_names) < 4:
+            return
+        index.setdefault((d, venue), []).append({
+            "race_key": str(race_key), "R": _v97_norm_race_no(race_no) or race_no,
+            "names": key_names, "source": source,
+        })
+
+    try:
+        q = pd.read_sql_query("""
+            SELECT rr.race_key, re.player_name
+            FROM result_races rr
+            JOIN result_entries re ON re.race_key=rr.race_key
+            ORDER BY rr.race_key, re.car_no
+        """, con)
+        for race_key, g in q.groupby("race_key"):
+            add(race_key, g["player_name"].tolist(), "結果")
+    except Exception:
+        pass
+
+    try:
+        q = pd.read_sql_query("""
+            SELECT race_key, player_name
+            FROM prediction_snapshots
+            ORDER BY race_key, car_no
+        """, con)
+        for race_key, g in q.groupby("race_key"):
+            add(race_key, g["player_name"].tolist(), "予測")
+    except Exception:
+        pass
+    return index
+
+
+def _v98_split_registration_batches(g):
+    """
+    Rがない選手別履歴を登録時刻のまとまりで復元する。
+    同一レースの一括登録が秒をまたぐケースもあるため、5秒以内を同じ候補とする。
+    """
+    if g.empty:
+        return []
+    x = g.copy().sort_values(["created_dt", "history_id"])
+    batches, current = [], []
+    prev_dt = None
+    for _, row in x.iterrows():
+        dt = row.get("created_dt")
+        gap = None if prev_dt is None or pd.isna(dt) or pd.isna(prev_dt) else (dt - prev_dt).total_seconds()
+        if current and (gap is None or gap > 5):
+            batches.append(pd.DataFrame(current))
+            current = []
+        current.append(row.to_dict())
+        prev_dt = dt
+    if current:
+        batches.append(pd.DataFrame(current))
+
+    # 1回の登録に複数レースが入った場合は、出走数を目安に安全に分割する。
+    out = []
+    for b in batches:
+        starters = pd.to_numeric(b.get("starters"), errors="coerce").dropna()
+        expected = int(starters.mode().iloc[0]) if not starters.empty else 0
+        expected = expected if 4 <= expected <= 8 else 0
+        if expected and len(b) > expected and len(b) % expected == 0:
+            for i in range(0, len(b), expected):
+                out.append(b.iloc[i:i+expected].copy())
+        else:
+            out.append(b)
+    return out
+
+
 def v97_database_health(db_path=DB_PATH):
-    """全選手履歴がそろうレースを復元し、未予測・結果未登録を抽出する。"""
+    """
+    Ver98: 選手別の race_history を直接照合して完全レースを抽出する。
+    Rがある履歴は日付/場/Rで集約し、Rがない履歴も登録時刻の一括登録単位で復元する。
+    """
     v34_init_feedback_tables(db_path)
-    rows = []
-    ambiguous = 0
+    ambiguous_rows = 0
     with sqlite3.connect(db_path) as con:
         con.row_factory = sqlite3.Row
         hist = pd.read_sql_query("""
-            SELECT h.race_date, h.venue, h.race_no, h.starters,
-                   h.player_id, p.player_name, h.finish, h.trial_time,
-                   h.race_time, h.start_time, h.result_status
+            SELECT h.history_id, h.race_date, h.venue, h.race_no, h.race_name,
+                   h.starters, h.player_id, p.player_name, h.finish, h.trial_time,
+                   h.race_time, h.start_time, h.result_status, h.created_at
             FROM race_history h
             LEFT JOIN players p ON p.player_id=h.player_id
             WHERE COALESCE(TRIM(h.race_date),'')<>''
@@ -13891,83 +13987,341 @@ def v97_database_health(db_path=DB_PATH):
         pred_keys = set()
         for table in ("prediction_snapshots", "v40_prediction_feature_snapshots", "prediction_races"):
             try:
-                pred_keys.update(str(r[0]) for r in con.execute(f"SELECT DISTINCT race_key FROM {table} WHERE race_key IS NOT NULL"))
+                pred_keys.update(str(r[0]) for r in con.execute(
+                    f"SELECT DISTINCT race_key FROM {table} WHERE race_key IS NOT NULL"
+                ))
             except Exception:
                 pass
         result_keys = set()
         try:
-            result_keys.update(str(r[0]) for r in con.execute("SELECT DISTINCT race_key FROM result_races WHERE race_key IS NOT NULL"))
+            result_keys.update(str(r[0]) for r in con.execute(
+                "SELECT DISTINCT race_key FROM result_races WHERE race_key IS NOT NULL"
+            ))
         except Exception:
             pass
+        known_sets = _v98_known_race_sets(con)
 
+    empty = {
+        "summary": {"復元候補": 0, "完全データ": 0, "未予測": 0, "結果未登録": 0,
+                    "予測済結果未登録": 0, "Rなし完全データ": 0, "識別不能": 0},
+        "complete_all": [], "predictable_unpredicted": [], "complete_missing_result": [],
+        "predicted_missing_result": [], "incomplete": [], "unidentified_complete": []
+    }
     if hist.empty:
-        return {
-            "summary": {"復元候補": 0, "完全データ": 0, "未予測": 0, "結果未登録": 0, "予測済結果未登録": 0, "識別不能": 0},
-            "predictable_unpredicted": [], "complete_missing_result": [],
-            "predicted_missing_result": [], "incomplete": []
-        }
+        return empty
 
     hist["norm_date"] = hist["race_date"].map(_v97_norm_date)
     hist["norm_race"] = hist["race_no"].map(_v97_norm_race_no)
-    ambiguous = int(((hist["norm_date"] == "") | (hist["norm_race"] == "")).sum())
-    valid = hist[(hist["norm_date"] != "") & (hist["norm_race"] != "")].copy()
-    if valid.empty:
-        return {
-            "summary": {"復元候補": 0, "完全データ": 0, "未予測": 0, "結果未登録": 0, "予測済結果未登録": 0, "識別不能": ambiguous},
-            "predictable_unpredicted": [], "complete_missing_result": [],
-            "predicted_missing_result": [], "incomplete": []
-        }
+    hist["created_dt"] = pd.to_datetime(hist["created_at"], errors="coerce")
+    hist["name_key"] = hist["player_name"].map(_v98_name_key)
+    ambiguous_rows = int((hist["norm_date"] == "").sum())
+    hist = hist[hist["norm_date"] != ""].copy()
 
     complete, incomplete = [], []
-    group_cols = ["norm_date", "venue", "norm_race"]
-    for (d, venue, race_no), g in valid.groupby(group_cols, dropna=False):
-        # 同じ選手の重複履歴は1人として扱う
-        g = g.sort_values("player_id").drop_duplicates(subset=["player_id"], keep="last")
+    used_history_ids = set()
+
+    def make_record(g, d, venue, race_label, source_label, set_no=None):
+        nonlocal complete, incomplete
+        g = g.sort_values("history_id").drop_duplicates(subset=["player_id"], keep="last")
         registered = int(g["player_id"].nunique())
         starters_values = pd.to_numeric(g["starters"], errors="coerce").dropna()
-        expected = int(starters_values.max()) if not starters_values.empty else registered
+        expected = int(starters_values.mode().iloc[0]) if not starters_values.empty else 0
         if expected < 4 or expected > 8:
-            expected = registered
-        key = _v97_key(d, venue, race_no)
-        if not key:
-            continue
+            expected = 0
         names = [str(x).strip() for x in g["player_name"].fillna("").tolist() if str(x).strip()]
+        name_set = frozenset(_v98_name_key(x) for x in names if _v98_name_key(x))
+
+        inferred = None
+        for candidate in known_sets.get((d, str(venue)), []):
+            if candidate["names"] == name_set:
+                inferred = candidate
+                break
+
+        if inferred:
+            race_key = inferred["race_key"]
+            display_r = inferred["R"]
+            identify = f"選手一致で{inferred['source']}と照合"
+        elif _v97_norm_race_no(race_label):
+            display_r = _v97_norm_race_no(race_label)
+            race_key = _v97_key(d, venue, display_r)
+            identify = "日付・場・Rで照合"
+        else:
+            display_r = f"R不明セット{set_no or 1}"
+            stamp = ""
+            if not g["created_dt"].dropna().empty:
+                stamp = g["created_dt"].dropna().min().strftime("%H%M%S")
+            race_key = f"historyset_{d}_{venue}_{stamp}_{set_no or 1}"
+            identify = "選手別一括登録から復元（R未特定）"
+
+        pred = "済" if race_key in pred_keys else ("未" if not race_key.startswith("historyset_") else "照合不能")
+        result = "登録済" if race_key in result_keys else ("未登録" if not race_key.startswith("historyset_") else "照合不能")
+        # 1〜3人だけの断片は「レース候補」として表示しない。
+        if registered < 4:
+            return
+        if expected == 0:
+            expected = 8 if registered > 6 else 6
+
         base = {
-            "開催日": f"{d[:4]}-{d[4:6]}-{d[6:8]}",
-            "開催場": str(venue),
-            "R": race_no,
-            "登録選手": registered,
-            "想定出走": expected,
-            "登録状況": f"{registered}/{expected}",
-            "予測": "済" if key in pred_keys else "未",
-            "結果": "登録済" if key in result_keys else "未登録",
-            "選手": "、".join(names),
-            "race_key": key,
+            "開催日": f"{d[:4]}-{d[4:6]}-{d[6:8]}", "開催場": str(venue), "R": display_r,
+            "登録選手": registered, "想定出走": expected, "登録状況": f"{registered}/{expected}",
+            "予測": pred, "結果": result, "選手": "、".join(names), "race_key": race_key,
+            "抽出元": source_label, "照合状態": identify,
         }
-        if registered >= expected and expected >= 4:
+        if registered == expected and expected >= 4:
             complete.append(base)
         else:
             base["不足人数"] = max(0, expected - registered)
             incomplete.append(base)
 
+    # 1. Rが明示されている履歴を照合
+    explicit = hist[hist["norm_race"] != ""].copy()
+    for (d, venue, race_no), g in explicit.groupby(["norm_date", "venue", "norm_race"], dropna=False):
+        make_record(g, d, venue, race_no, "選手別データ（日付・場・R）")
+        used_history_ids.update(g["history_id"].tolist())
+
+    # 2. Rなし履歴を、一括登録の時刻まとまりから照合
+    missing = hist[(hist["norm_race"] == "") & (~hist["history_id"].isin(used_history_ids))].copy()
+    for (d, venue), day_group in missing.groupby(["norm_date", "venue"], dropna=False):
+        batches = _v98_split_registration_batches(day_group)
+        for i, batch in enumerate(batches, 1):
+            make_record(batch, d, venue, "", "選手別データ（一括登録セット）", i)
+
+    # 完全レースの重複を除く。結果/予測と照合できたものを優先。
+    def priority(r):
+        return (0 if str(r["race_key"]).startswith("historyset_") else 1, r["登録選手"])
+    dedup = {}
+    for r in sorted(complete, key=priority):
+        name_sig = tuple(sorted(_v98_name_key(x) for x in r["選手"].split("、") if x))
+        sig = (r["開催日"], r["開催場"], name_sig)
+        dedup[sig] = r
+    complete = list(dedup.values())
+
     predictable_unpredicted = [r for r in complete if r["予測"] == "未"]
     complete_missing_result = [r for r in complete if r["結果"] == "未登録"]
     predicted_missing_result = [r for r in complete if r["予測"] == "済" and r["結果"] == "未登録"]
+    unidentified_complete = [r for r in complete if str(r["R"]).startswith("R不明")]
 
     def _sort(items):
-        return sorted(items, key=lambda r: (r["開催日"], r["開催場"], int(re.sub(r"\D", "", r["R"]) or 0)), reverse=True)
+        return sorted(items, key=lambda r: (r["開催日"], r["開催場"], r["R"]), reverse=True)
 
     return {
         "summary": {
-            "復元候補": len(complete) + len(incomplete),
-            "完全データ": len(complete),
-            "未予測": len(predictable_unpredicted),
-            "結果未登録": len(complete_missing_result),
+            "復元候補": len(complete) + len(incomplete), "完全データ": len(complete),
+            "未予測": len(predictable_unpredicted), "結果未登録": len(complete_missing_result),
             "予測済結果未登録": len(predicted_missing_result),
-            "識別不能": ambiguous,
+            "Rなし完全データ": len(unidentified_complete), "識別不能": ambiguous_rows,
         },
+        "complete_all": _sort(complete),
         "predictable_unpredicted": _sort(predictable_unpredicted),
         "complete_missing_result": _sort(complete_missing_result),
         "predicted_missing_result": _sort(predicted_missing_result),
         "incomplete": _sort(incomplete),
+        "unidentified_complete": _sort(unidentified_complete),
     }
+
+
+# ============================================================
+# Ver99: 完全データレースの未来遮断付き一括予測
+# ============================================================
+
+def _v99_float(value):
+    try:
+        x = float(value)
+        return x if np.isfinite(x) else None
+    except Exception:
+        return None
+
+
+def _v99_norm_name(value):
+    return _v98_name_key(value)
+
+
+def _v99_load_conditions(con, race_key, date8, venue, race_no):
+    data = {
+        "surface": "良", "track_temp": 30.0, "air_temp": 25.0,
+        "humidity": 60.0, "weather": "", "start_time": "",
+        "distance": 3100, "laps": 6, "race_type": "一般戦",
+    }
+    for query, params in [
+        ("SELECT surface,track_temp,air_temp,humidity FROM result_races WHERE race_key=?", (race_key,)),
+        ("SELECT surface_condition,track_temp,air_temp,humidity,weather,start_time_text,distance_m,total_laps,race_name FROM races WHERE race_date=? AND venue=? AND CAST(REPLACE(race_no,'R','') AS INTEGER)=? ORDER BY race_id DESC LIMIT 1",
+         (f"{date8[:4]}-{date8[4:6]}-{date8[6:8]}", venue, int(re.sub(r'[^0-9]', '', str(race_no)) or 0))),
+    ]:
+        try:
+            row = con.execute(query, params).fetchone()
+        except Exception:
+            row = None
+        if not row:
+            continue
+        cols = [d[0] for d in con.execute(query, params).description] if False else []
+        # sqlite.Row / tuple の両方に対応
+        if isinstance(row, sqlite3.Row):
+            r = dict(row)
+        else:
+            names = [x.split()[0].split('.')[-1] for x in query.lower().split('select',1)[1].split('from',1)[0].split(',')]
+            r = dict(zip(names, row))
+        data["surface"] = r.get("surface") or r.get("surface_condition") or data["surface"]
+        for key in ("track_temp", "air_temp", "humidity"):
+            val = _v99_float(r.get(key))
+            if val is not None:
+                data[key] = val
+        data["weather"] = r.get("weather") or data["weather"]
+        data["start_time"] = r.get("start_time_text") or data["start_time"]
+        data["distance"] = int(_v99_float(r.get("distance_m")) or data["distance"])
+        data["laps"] = int(_v99_float(r.get("total_laps")) or data["laps"])
+        data["race_type"] = r.get("race_name") or data["race_type"]
+    return data
+
+
+def _v99_latest_rows(df, name_col="player_name"):
+    if df.empty:
+        return df
+    x = df.copy()
+    x["_name_key"] = x[name_col].map(_v99_norm_name)
+    if "created_at" in x.columns:
+        x["_created"] = pd.to_datetime(x["created_at"], errors="coerce")
+        x = x.sort_values(["_created"], na_position="first")
+    return x.drop_duplicates("_name_key", keep="last")
+
+
+def v99_build_prediction_text(record, db_path=DB_PATH):
+    """完全レース情報から、結果を特徴量に混ぜず当時の出走表相当テキストを復元する。"""
+    date8 = _v97_norm_date(record.get("開催日"))
+    venue = str(record.get("開催場") or "").strip()
+    race_label = _v97_norm_race_no(record.get("R"))
+    if not date8 or not venue or not race_label:
+        raise ValueError("開催日・開催場・Rを特定できません")
+    race_no = int(re.sub(r"[^0-9]", "", race_label))
+    race_key = _v97_key(date8, venue, race_label)
+    wanted = {_v99_norm_name(x) for x in str(record.get("選手") or "").split("、") if _v99_norm_name(x)}
+
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        date_iso = f"{date8[:4]}-{date8[4:6]}-{date8[6:8]}"
+        # 最優先: 詳細取込。車番を持っている。
+        try:
+            imp = pd.read_sql_query("""
+                SELECT player_name, car_no, handicap, trial_time, st, created_at
+                FROM v15_player_history_imports
+                WHERE REPLACE(REPLACE(REPLACE(race_date,'-',''),'/',''),'.','')=?
+                  AND venue=? AND CAST(race_no AS INTEGER)=?
+            """, con, params=(date8, venue, race_no))
+        except Exception:
+            imp = pd.DataFrame()
+        imp = _v99_latest_rows(imp)
+        if wanted and not imp.empty:
+            imp = imp[imp["player_name"].map(_v99_norm_name).isin(wanted)]
+
+        # 結果登録済みなら、結果表の「車番・ハンデ・試走T・ST」だけを利用。
+        # 着順・競走Tは予測入力へ絶対に渡さない。
+        if len(imp) < len(wanted):
+            try:
+                res = pd.read_sql_query("""
+                    SELECT player_name, car_no, handicap, trial_time, start_time AS st, '' AS created_at
+                    FROM result_entries WHERE race_key=?
+                """, con, params=(race_key,))
+            except Exception:
+                res = pd.DataFrame()
+            if wanted and not res.empty:
+                res = res[res["player_name"].map(_v99_norm_name).isin(wanted)]
+            if not res.empty:
+                existing = set(imp["player_name"].map(_v99_norm_name)) if not imp.empty else set()
+                res = res[~res["player_name"].map(_v99_norm_name).isin(existing)]
+                imp = pd.concat([imp, res], ignore_index=True)
+
+        # race_historyから当時値を補完。ただし車番は作り物にしない。
+        try:
+            hist = pd.read_sql_query("""
+                SELECT p.player_name, h.handicap, h.trial_time, h.start_time AS st, h.created_at
+                FROM race_history h JOIN players p ON p.player_id=h.player_id
+                WHERE REPLACE(REPLACE(REPLACE(h.race_date,'-',''),'/',''),'.','')=?
+                  AND h.venue=? AND CAST(REPLACE(h.race_no,'R','') AS INTEGER)=?
+            """, con, params=(date8, venue, race_no))
+        except Exception:
+            hist = pd.DataFrame()
+        hist = _v99_latest_rows(hist)
+        conditions = _v99_load_conditions(con, race_key, date8, venue, race_label)
+
+    if imp.empty or "car_no" not in imp.columns:
+        raise ValueError("当時の車番を復元できません")
+    imp["car_no"] = pd.to_numeric(imp["car_no"], errors="coerce")
+    imp = imp[imp["car_no"].between(1, 8)].copy()
+    imp = imp.drop_duplicates("car_no", keep="last")
+    if wanted and set(imp["player_name"].map(_v99_norm_name)) != wanted:
+        missing = wanted - set(imp["player_name"].map(_v99_norm_name))
+        raise ValueError("車番付きデータ不足: " + "、".join(sorted(missing)))
+
+    # 履歴値で空欄のみ補完
+    hmap = { _v99_norm_name(r["player_name"]): r for _, r in hist.iterrows() } if not hist.empty else {}
+    rows = []
+    for _, r in imp.sort_values("car_no").iterrows():
+        key = _v99_norm_name(r.get("player_name"))
+        hr = hmap.get(key, {})
+        handicap = _v99_float(r.get("handicap"))
+        if handicap is None:
+            handicap = _v99_float(hr.get("handicap"))
+        trial = _v99_float(r.get("trial_time"))
+        if trial is None:
+            trial = _v99_float(hr.get("trial_time"))
+        st_val = _v99_float(r.get("st"))
+        if st_val is None:
+            st_val = _v99_float(hr.get("st"))
+        if handicap is None:
+            raise ValueError(f"{r.get('player_name')} のハンデ不足")
+        trial_text = f"{trial:.2f}" if trial is not None else "-"
+        st_text = f"{st_val:.2f}" if st_val is not None else "-"
+        rows.append(f"{int(r['car_no'])}  {str(r['player_name']).strip()}  {int(handicap)}m  {trial_text}  ST{st_text}")
+
+    if len(rows) < 4:
+        raise ValueError("出走選手を4人以上復元できません")
+    surface = str(conditions["surface"] or "良")
+    if "走路" not in surface:
+        surface = surface + "走路"
+    header = [
+        f"{race_no}R",
+        f"{date8[:4]}年{int(date8[4:6])}月{int(date8[6:8])}日",
+        f"開催場: {venue}",
+        f"{conditions['race_type']} {conditions['distance']}m({conditions['laps']}周)",
+        f"{conditions['start_time']}発走" if conditions['start_time'] else "",
+        f"{conditions['distance']}m {len(rows)}車 {conditions['laps']}周",
+        f"{surface} /{conditions['track_temp']:.0f}℃",
+        str(conditions["weather"] or ""),
+        f"気温：{conditions['air_temp']:.0f}℃",
+        f"湿度：{conditions['humidity']:.0f}%",
+    ]
+    text = "\n".join([x for x in header if x] + rows)
+    return text, {"race_key": race_key, "entries": len(rows)}
+
+
+def v99_run_batch_predictions(records, trials=5000, seed=20260719, db_path=DB_PATH):
+    """選択された完全レースを時系列順に予測し、各レースを直ちに保存する。"""
+    report = {"対象": len(records or []), "成功": 0, "スキップ": 0, "エラー": 0, "details": []}
+    ordered = sorted(records or [], key=lambda r: (str(r.get("開催日")), str(r.get("開催場")), str(r.get("R"))))
+    for i, record in enumerate(ordered):
+        label = f"{record.get('開催日')} {record.get('開催場')} {record.get('R')}"
+        try:
+            text, source_info = v99_build_prediction_text(record, db_path)
+            df, bets, output, entries, meta = ver16_run_prediction(text, int(trials), int(seed) + i, manual_excluded=[])
+            finish_prob = v30_finish_probabilities(df, bets, int(trials))
+            saved_key = v34_save_prediction_snapshot(meta, df, finish_prob, db_path)
+            v67_save_ticket_snapshot(meta, bets, int(trials), db_path)
+            v40_save_prediction_features(meta, df, db_path)
+            report["成功"] += 1
+            report["details"].append({"レース": label, "状態": "成功", "race_key": saved_key, "出走数": len(entries), "理由": ""})
+        except ValueError as exc:
+            report["スキップ"] += 1
+            report["details"].append({"レース": label, "状態": "スキップ", "race_key": record.get("race_key", ""), "出走数": record.get("登録選手", ""), "理由": str(exc)})
+        except Exception as exc:
+            report["エラー"] += 1
+            report["details"].append({"レース": label, "状態": "エラー", "race_key": record.get("race_key", ""), "出走数": record.get("登録選手", ""), "理由": f"{type(exc).__name__}: {exc}"})
+    return report
+
+
+# ============================================================
+# Ver100: 年齢・期別表記ゆれの読み取り修正
+# - 74歳/9期
+# - 74歳/9 期
+# - ７４歳／９期
+# - NBSP / 全角空白入り
+# を同一形式として解析する。
+# ============================================================
