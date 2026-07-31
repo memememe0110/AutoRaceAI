@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver112｜予測タブ上部ショートカット追加・Ver111高速化維持")
+st.caption("Ver114｜解析ボタン直下ショートカット追加・Ver113修正対応")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1353,6 +1353,8 @@ with prediction_tab:
             st.caption("自動検出された欠車はありません。必要な車番だけ選択してください。")
 
     prediction_clicked = st.button("解析して元版設定で予測", type="primary", use_container_width=True)
+    # 長い入力欄を通過した直後にも、予測結果の各位置へ移動できるショートカットを表示。
+    v73_section_nav()
     if prediction_clicked:
         if not text.strip():
             st.warning("出走表を貼り付けてください。")
