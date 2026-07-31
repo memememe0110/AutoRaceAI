@@ -2024,7 +2024,7 @@ if main_page == "👤 選手情報登録":
                 st.error(f"不足行登録エラー: {type(exc).__name__}: {exc}")
                 st.exception(exc)
 
-with db_tab:
+if main_page == "🗃️ 登録情報確認":
     st.subheader("🏟️ 開催場別の学習重み")
     st.caption("第1層はレース番号なしでも全履歴を使用し、第2層だけ開催日・開催場・R単位で展開を学習します。")
 
