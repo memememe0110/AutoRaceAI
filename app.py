@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver107｜選択画面だけ実行・開催場重みキャッシュ・選手名照合高速化")
+st.caption("Ver109｜タブ表示維持・重い処理の遅延実行・開催場重みキャッシュ")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -354,12 +354,12 @@ def _cached_player_registration_index(db_path: str, cache_token: tuple) -> dict:
         if {"players", "race_history"}.issubset(tables):
             rows = con.execute(
                 """
-                SELECT p.player_name, COUNT(h.history_id),
-                       SUM(CASE WHEN COALESCE(h.use_for_model, 1)=1 THEN 1 ELSE 0 END),
-                       MAX(NULLIF(h.race_date, ''))
+                SELECT p.name, COUNT(r.id),
+                       SUM(CASE WHEN COALESCE(r.is_valid_for_model, 1) = 1 THEN 1 ELSE 0 END),
+                       MAX(r.race_date)
                 FROM players p
-                LEFT JOIN race_history h ON h.player_id=p.player_id
-                GROUP BY p.player_id, p.player_name
+                LEFT JOIN race_history r ON r.player_id = p.id
+                GROUP BY p.id, p.name
                 """
             ).fetchall()
             for player_name, count_all, count_use, latest in rows:
@@ -373,9 +373,8 @@ def _cached_player_registration_index(db_path: str, cache_token: tuple) -> dict:
         if "v15_player_history_imports" in tables:
             rows = con.execute(
                 """
-                SELECT player_name, COUNT(*), MAX(NULLIF(race_date, ''))
+                SELECT player_name, COUNT(*), MAX(race_date)
                 FROM v15_player_history_imports
-                WHERE player_name IS NOT NULL AND TRIM(player_name)<>''
                 GROUP BY player_name
                 """
             ).fetchall()
@@ -1216,15 +1215,9 @@ try:
 except Exception:
     pass
 
-main_page = st.radio(
-    "機能を選択",
-    ["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"],
-    horizontal=True,
-    label_visibility="collapsed",
-    key="main_page_selector",
-)
+prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
-if main_page == "🏁 予測":
+with prediction_tab:
     st.info("Ver20予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
@@ -1645,7 +1638,7 @@ if main_page == "🏁 予測":
             st.error(f"保存済み予測の表示エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
 
-if main_page == "✅ 結果登録・解析":
+with result_tab:
     st.subheader("公式結果を登録して予測と比較")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
@@ -1831,7 +1824,7 @@ if main_page == "✅ 結果登録・解析":
         render_last_result_analysis(last_result_view)
 
 
-if main_page == "🗃️ 登録情報確認":
+with db_tab:
     st.subheader("全結果バックテスト・重み最適化")
     st.caption("単発レースの結果だけでなく、予測時に保存した特徴と登録済み結果をまとめて比較します。古い約70%で候補を探し、新しい約30%でも悪化しない候補だけを提案します。")
     candidate_count = st.slider("試す重み候補数", 200, 3000, 800, 100, key="v74_candidate_count")
@@ -1925,7 +1918,7 @@ if main_page == "🗃️ 登録情報確認":
         else:
             st.warning(msg)
 
-if main_page == "👤 選手情報登録":
+with register_tab:
     st.subheader("選手情報を登録")
     st.session_state.setdefault("player_input_version", 0)
     if st.button("🗑️ 選手入力をリセット", use_container_width=True, key="reset_player_input"):
@@ -2024,7 +2017,7 @@ if main_page == "👤 選手情報登録":
                 st.error(f"不足行登録エラー: {type(exc).__name__}: {exc}")
                 st.exception(exc)
 
-if main_page == "🗃️ 登録情報確認":
+with db_tab:
     st.subheader("🏟️ 開催場別の学習重み")
     st.caption("第1層はレース番号なしでも全履歴を使用し、第2層だけ開催日・開催場・R単位で展開を学習します。")
 
