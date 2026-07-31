@@ -15165,3 +15165,166 @@ def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_pat
     # 置換処理は既存結果を削除する前に必ず照合する。
     _v117_raise_on_entry_count_mismatch(meta, results, db_path)
     return _v117_original_v70_replace_registered_result(meta, results, laps, payouts, db_path)
+
+# ============================================================
+# Ver122: DBメンテナンス重複統合の保持優先順位を改善
+# ============================================================
+def _v122_race_no_present(value):
+    """有効なレース番号があるか。1 / 1R / 予選1R などを有効扱い。"""
+    return _v45_norm_race_no(value) is not None
+
+
+def _v122_row_detail_score(row, fields, positive_fields=None):
+    """重複候補の情報量を数える。情報量同点ならRありを優先する。"""
+    positive_fields = set(positive_fields or [])
+    keys = set(row.keys()) if hasattr(row, "keys") else set(dict(row).keys())
+    detail = sum(
+        _v34_has_value(row[f], positive=f in positive_fields)
+        for f in fields if f in keys
+    )
+    # レース名・大会名・生行など、後から再現に役立つ詳細列を少し強めに評価。
+    rich_fields = ("race_name", "tournament_name", "raw_line", "weather", "race_type")
+    rich = sum(
+        _v34_has_value(row[f]) for f in rich_fields if f in keys
+    )
+    race_no = 1 if ("race_no" in keys and _v122_race_no_present(row["race_no"])) else 0
+    # created_atは完全同点時だけ新しい方を残すための最終タイブレーク。
+    created = str(row["created_at"] or "") if "created_at" in keys else ""
+    return (detail, rich, race_no, created)
+
+
+def _v57_merge_row_values(rows, fields, positive_fields=None):
+    """Ver122: 最も詳細な行を土台にし、欠損列だけ他行から補完する。
+
+    優先順位:
+      1. 値が入っている列が多い行
+      2. レース名・大会名・raw_line等の詳細列が多い行
+      3. 同点ならレース番号がある行
+      4. さらに同点なら新しい行
+    """
+    positive_fields = set(positive_fields or [])
+    keep = max(rows, key=lambda r: _v122_row_detail_score(r, fields, positive_fields))
+    merged = dict(keep)
+
+    # 詳細なkeep行の値を優先し、空欄だけを他候補から補完する。
+    # race_noだけはkeep側が空欄ならRあり候補から優先して補う。
+    ordered = sorted(
+        rows,
+        key=lambda r: _v122_row_detail_score(r, fields, positive_fields),
+        reverse=True,
+    )
+    for f in fields:
+        if _v34_has_value(merged.get(f), positive=f in positive_fields):
+            continue
+        for row in ordered:
+            keys = set(row.keys()) if hasattr(row, "keys") else set(dict(row).keys())
+            if f not in keys:
+                continue
+            value = row[f]
+            if _v34_has_value(value, positive=f in positive_fields):
+                merged[f] = value
+                break
+    return keep, merged
+
+
+def v33_cleanup_duplicate_histories(db_path=DB_PATH):
+    """Ver122: 重複走行は詳細データを残し、同点ならRありを残して統合する。"""
+    mount_and_init_db()
+    deleted_histories = 0
+    deleted_imports = 0
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+
+        # race_history: シグネチャごとにグループ化し、最詳細行へ欠損補完して統合。
+        if v15_table_exists(con, "race_history"):
+            all_cols = [r[1] for r in con.execute("PRAGMA table_info(race_history)").fetchall()]
+            fields = [c for c in all_cols if c not in {"history_id", "player_id", "record_key", "created_at"}]
+            positives = {"race_no", "finish", "starters", "trial_time", "race_time", "start_time"}
+            player_ids = [r[0] for r in con.execute("SELECT player_id FROM players ORDER BY player_id")]
+            for player_id in player_ids:
+                rows = con.execute(
+                    "SELECT * FROM race_history WHERE player_id=? ORDER BY created_at, history_id",
+                    (player_id,),
+                ).fetchall()
+                groups = {}
+                for row in rows:
+                    groups.setdefault(_v33_history_signature(dict(row)), []).append(row)
+
+                for group in groups.values():
+                    if len(group) < 2:
+                        continue
+                    keep, merged = _v57_merge_row_values(group, fields, positives)
+                    for row in group:
+                        if row["history_id"] != keep["history_id"]:
+                            con.execute("DELETE FROM race_history WHERE history_id=?", (row["history_id"],))
+                            deleted_histories += 1
+
+                    fallback = _v33_history_signature({
+                        "race_date": keep["race_date"], "venue": keep["venue"],
+                        "finish": merged.get("finish"), "handicap": merged.get("handicap"),
+                        "trial_time": merged.get("trial_time"), "race_time": merged.get("race_time"),
+                        "start_time": merged.get("start_time"),
+                    })
+                    # player_nameを取得してrecord_keyを安全に作り直す。
+                    player_name_row = con.execute(
+                        "SELECT player_name FROM players WHERE player_id=?", (player_id,)
+                    ).fetchone()
+                    player_name = player_name_row[0] if player_name_row else ""
+                    record_key = _v45_identity_record_key(
+                        player_name, keep["race_date"], keep["venue"], merged.get("race_no"), fallback=fallback
+                    )
+                    assignments = ", ".join(f'"{f}"=?' for f in fields)
+                    con.execute(
+                        f'UPDATE race_history SET {assignments}, record_key=? WHERE history_id=?',
+                        tuple(merged.get(f) for f in fields) + (record_key, keep["history_id"]),
+                    )
+
+        # 詳細取込側も同じルールで統合。
+        if v15_table_exists(con, "v15_player_history_imports"):
+            rows = con.execute(
+                "SELECT * FROM v15_player_history_imports ORDER BY created_at, history_key"
+            ).fetchall()
+            groups = {}
+            for row in rows:
+                d = dict(row)
+                sig = (
+                    v32_player_name_key(d.get("player_name")),
+                    _v33_norm_text(d.get("race_date")),
+                    _v33_norm_text(d.get("venue")),
+                    _v33_norm_number(d.get("rank"), 0),
+                    _v33_norm_number(d.get("handicap"), 0),
+                    _v33_norm_number(d.get("trial_time"), 3),
+                    _v33_norm_number(d.get("race_time"), 3),
+                    _v33_norm_number(d.get("st"), 3),
+                )
+                groups.setdefault(sig, []).append(row)
+
+            all_cols = [r[1] for r in con.execute("PRAGMA table_info(v15_player_history_imports)").fetchall()]
+            fields = [c for c in all_cols if c not in {"history_key", "created_at"}]
+            positives = {"race_no", "rank", "starters", "handicap", "trial_time", "race_time", "st",
+                         "track_temp", "air_temp", "humidity", "distance", "laps", "popularity", "car_no"}
+            for group in groups.values():
+                if len(group) < 2:
+                    continue
+                keep, merged = _v57_merge_row_values(group, fields, positives)
+                for row in group:
+                    if row["history_key"] != keep["history_key"]:
+                        con.execute(
+                            "DELETE FROM v15_player_history_imports WHERE history_key=?",
+                            (row["history_key"],),
+                        )
+                        deleted_imports += 1
+                assignments = ", ".join(f'"{f}"=?' for f in fields)
+                con.execute(
+                    f'UPDATE v15_player_history_imports SET {assignments} WHERE history_key=?',
+                    tuple(merged.get(f) for f in fields) + (keep["history_key"],),
+                )
+        con.commit()
+
+    return {
+        "deleted_histories": deleted_histories,
+        "deleted_imports": deleted_imports,
+        "keep_rule": "詳細データ優先・同点ならレース番号あり優先",
+    }
