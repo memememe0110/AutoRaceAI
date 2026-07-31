@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver109｜タブ表示維持・重い処理の遅延実行・開催場重みキャッシュ")
+st.caption("Ver110｜開催場重み完全遅延読込・選手登録照合エラー修正")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -354,12 +354,12 @@ def _cached_player_registration_index(db_path: str, cache_token: tuple) -> dict:
         if {"players", "race_history"}.issubset(tables):
             rows = con.execute(
                 """
-                SELECT p.name, COUNT(r.id),
-                       SUM(CASE WHEN COALESCE(r.is_valid_for_model, 1) = 1 THEN 1 ELSE 0 END),
+                SELECT p.player_name, COUNT(r.history_id),
+                       SUM(CASE WHEN COALESCE(r.use_for_model, 1) = 1 THEN 1 ELSE 0 END),
                        MAX(r.race_date)
                 FROM players p
-                LEFT JOIN race_history r ON r.player_id = p.id
-                GROUP BY p.id, p.name
+                LEFT JOIN race_history r ON r.player_id = p.player_id
+                GROUP BY p.player_id, p.player_name
                 """
             ).fetchall()
             for player_name, count_all, count_use, latest in rows:
@@ -2058,47 +2058,71 @@ with db_tab:
     except Exception as exc:
         st.warning(f"保存済み開催場分析を読み込めませんでした: {exc}")
 
-    try:
-        venue_profiles = _cached_all_venue_weight_profiles(engine.DB_PATH, _db_cache_token(engine.DB_PATH))
-        st.dataframe(
-            venue_profiles,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "全履歴反映率": st.column_config.ProgressColumn(format="%.1f%%", min_value=0.0, max_value=1.0),
-                "展開反映率": st.column_config.ProgressColumn(format="%.1f%%", min_value=0.0, max_value=1.0),
-                "試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
-                "ST影響差": st.column_config.NumberColumn(format="%+.3f"),
-                "ハンデ影響差": st.column_config.NumberColumn(format="%+.3f"),
-                "タイム基準差秒": st.column_config.NumberColumn(format="%+.4f"),
-                "試走本走差秒": st.column_config.NumberColumn(format="%+.4f"),
-                "前残り差": st.column_config.NumberColumn(format="%+.3f"),
-                "追込み1着差": st.column_config.NumberColumn(format="%+.3f"),
-                "追込み3着内差": st.column_config.NumberColumn(format="%+.3f"),
-                "試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
-                "ST影響差": st.column_config.NumberColumn(format="%+.3f"),
-                "高温前残り差": st.column_config.NumberColumn(format="%+.3f"),
-            },
-        )
-        selected_venue = st.selectbox("詳しく見る開催場", engine.V92_VENUES, key="v92_selected_venue")
-        selected_profile = _cached_venue_weight_profile(selected_venue, engine.DB_PATH, _db_cache_token(engine.DB_PATH))
-        detail = pd.DataFrame(selected_profile.get("重み明細", []))
-        if not detail.empty:
+    # 開催場別の重み詳細は、初期表示や他タブ操作では読み込まない。
+    # Streamlit の st.tabs は非表示タブも実行するため、明示ボタンでのみ取得する。
+    if "v110_show_venue_weights" not in st.session_state:
+        st.session_state["v110_show_venue_weights"] = False
+
+    load_col, close_col = st.columns(2)
+    with load_col:
+        if st.button("開催場別の重みを読み込む", use_container_width=True, key="v110_load_venue_weights"):
+            st.session_state["v110_show_venue_weights"] = True
+    with close_col:
+        if st.button("開催場別の重みを閉じる", use_container_width=True, key="v110_close_venue_weights"):
+            st.session_state["v110_show_venue_weights"] = False
+
+    if st.session_state.get("v110_show_venue_weights", False):
+        try:
+            with st.spinner("保存済みの開催場重みを読み込んでいます…"):
+                venue_profiles = _cached_all_venue_weight_profiles(
+                    engine.DB_PATH, _db_cache_token(engine.DB_PATH)
+                )
             st.dataframe(
-                detail,
+                venue_profiles,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "基礎係数": st.column_config.NumberColumn(format="%.2f"),
-                    "開催場差": st.column_config.NumberColumn(format="%+.3f"),
-                    "信頼度": st.column_config.NumberColumn(format="%.1f%%"),
-                    "実効係数": st.column_config.NumberColumn(format="%.3f"),
-                    "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
+                    "全履歴反映率": st.column_config.ProgressColumn(format="%.1f%%", min_value=0.0, max_value=1.0),
+                    "展開反映率": st.column_config.ProgressColumn(format="%.1f%%", min_value=0.0, max_value=1.0),
+                    "試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
+                    "ST影響差": st.column_config.NumberColumn(format="%+.3f"),
+                    "ハンデ影響差": st.column_config.NumberColumn(format="%+.3f"),
+                    "タイム基準差秒": st.column_config.NumberColumn(format="%+.4f"),
+                    "試走本走差秒": st.column_config.NumberColumn(format="%+.4f"),
+                    "前残り差": st.column_config.NumberColumn(format="%+.3f"),
+                    "追込み1着差": st.column_config.NumberColumn(format="%+.3f"),
+                    "追込み3着内差": st.column_config.NumberColumn(format="%+.3f"),
+                    "高温前残り差": st.column_config.NumberColumn(format="%+.3f"),
                 },
             )
-        st.caption("全履歴層はレース番号なしでも利用します。展開層だけレース復元数に依存し、選手相性は予測時の選手ごとに別計算します。")
-    except Exception as exc:
-        st.warning(f"開催場別重みを取得できませんでした: {exc}")
+            selected_venue = st.selectbox("詳しく見る開催場", engine.V92_VENUES, key="v110_selected_venue")
+            if st.button("選択した開催場の重み明細を表示", use_container_width=True, key="v110_load_venue_detail"):
+                st.session_state["v110_detail_venue"] = selected_venue
+            detail_venue = st.session_state.get("v110_detail_venue")
+            if detail_venue:
+                selected_profile = _cached_venue_weight_profile(
+                    detail_venue, engine.DB_PATH, _db_cache_token(engine.DB_PATH)
+                )
+                st.markdown(f"#### {detail_venue}の重み明細")
+                detail = pd.DataFrame(selected_profile.get("重み明細", []))
+                if not detail.empty:
+                    st.dataframe(
+                        detail,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "基礎係数": st.column_config.NumberColumn(format="%.2f"),
+                            "開催場差": st.column_config.NumberColumn(format="%+.3f"),
+                            "信頼度": st.column_config.NumberColumn(format="%.1f%%"),
+                            "実効係数": st.column_config.NumberColumn(format="%.3f"),
+                            "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
+                        },
+                    )
+            st.caption("全履歴層はレース番号なしでも利用します。詳細は必要なときだけ読み込みます。")
+        except Exception as exc:
+            st.warning(f"開催場別重みを取得できませんでした: {exc}")
+    else:
+        st.caption("初期表示と他タブ操作を軽くするため、開催場重みの一覧・明細は自動取得しません。")
 
     st.divider()
     st.subheader("登録されている情報")
