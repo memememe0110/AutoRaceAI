@@ -13243,3 +13243,303 @@ def v92_applied_venue_corrections(prediction_df):
         sort_cols = ["開催場特徴補正"]
         out = out.sort_values(sort_cols, ascending=False)
     return out.reset_index(drop=True)
+
+# ============================================================
+# Ver93: 開催場学習の実反映監査 + race_history全履歴利用
+# ============================================================
+# Ver84までは開催場特徴の学習元が result_races/result_entries に限られていた。
+# 選手履歴を大量登録していても結果登録済みレースが少ないと、開催場学習件数が
+# 増えない問題を修正する。race_history をレース単位へ復元し、結果登録データと
+# 重複しない範囲で学習へ追加する。
+
+_V93_LAST_VENUE_SOURCE_STATS = {}
+
+
+def _v93_clean_race_no(value):
+    s = str(value or "").strip()
+    m = re.search(r"(\d{1,2})", s)
+    return str(int(m.group(1))) if m else ""
+
+
+def _v93_result_history_rows(db_path=DB_PATH):
+    """結果登録テーブルから開催場学習用明細を取得する。"""
+    try:
+        v76_init_accident_learning_columns(db_path)
+        with sqlite3.connect(str(db_path)) as con:
+            df = pd.read_sql_query("""
+                SELECT rr.race_key, rr.race_date AS 開催日, rr.race_no AS レース,
+                       rr.venue AS 開催場, rr.surface AS 走路,
+                       rr.track_temp AS 走路温度,
+                       re.car_no AS 車番, re.player_name AS 選手名,
+                       re.finish AS 着順, re.trial_time AS 試走T,
+                       re.start_time AS ST, re.handicap AS ハンデ,
+                       re.result_status AS 結果区分
+                FROM result_races rr
+                JOIN result_entries re ON re.race_key=rr.race_key
+                WHERE COALESCE(rr.model_eligible,1)=1
+                  AND re.finish IS NOT NULL
+            """, con)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    bad = df["結果区分"].astype(str).str.contains(V76_ACCIDENT_PATTERN, na=False)
+    df = df.loc[~bad].copy()
+    return v61_filter_history_df(df, "開催日", "レース", count_stats=False)
+
+
+def _v93_player_history_rows(db_path=DB_PATH):
+    """race_historyを開催日・場・Rでまとめ、開催場学習用レースへ復元する。"""
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            df = pd.read_sql_query("""
+                SELECT h.history_id, h.race_date AS 開催日, h.race_no AS レース,
+                       h.venue AS 開催場, h.surface AS 走路,
+                       NULL AS 走路温度, NULL AS 車番, p.player_name AS 選手名,
+                       h.finish AS 着順, h.trial_time AS 試走T,
+                       h.start_time AS ST, h.handicap AS ハンデ,
+                       h.result_status AS 結果区分
+                FROM race_history h
+                JOIN players p ON p.player_id=h.player_id
+                WHERE COALESCE(h.use_for_model,1)=1
+                  AND h.finish IS NOT NULL
+                  AND TRIM(COALESCE(h.venue,''))<>''
+                  AND TRIM(COALESCE(h.race_no,''))<>''
+            """, con)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    bad = df["結果区分"].astype(str).str.contains(V76_ACCIDENT_PATTERN, na=False)
+    df = df.loc[~bad].copy()
+    df["レース"] = df["レース"].map(_v93_clean_race_no)
+    df = df[df["レース"] != ""].copy()
+    df["開催場"] = df["開催場"].astype(str).str.strip()
+    df["開催日"] = df["開催日"].astype(str).str.strip()
+    # 同じ選手・同じレースの重複履歴は新しい1件だけ採用。
+    df = df.sort_values("history_id").drop_duplicates(
+        subset=["開催日", "開催場", "レース", "選手名"], keep="last"
+    )
+    group_sizes = df.groupby(["開催日", "開催場", "レース"])["選手名"].transform("nunique")
+    df = df[group_sizes >= 4].copy()
+    if df.empty:
+        return df
+    df["race_key"] = (
+        "history:" + df["開催日"] + ":" + df["開催場"] + ":" + df["レース"]
+    )
+    return v61_filter_history_df(df, "開催日", "レース", count_stats=False)
+
+
+def _v84_history_rows(db_path=DB_PATH):
+    """結果登録と選手履歴の両方を使うVer93開催場学習データ。"""
+    global _V93_LAST_VENUE_SOURCE_STATS
+    result_df = _v93_result_history_rows(db_path)
+    history_df = _v93_player_history_rows(db_path)
+
+    result_races = set()
+    if result_df is not None and not result_df.empty:
+        for _, r in result_df[["開催日", "開催場", "レース"]].drop_duplicates().iterrows():
+            result_races.add((str(r["開催日"]).strip(), str(r["開催場"]).strip(), _v93_clean_race_no(r["レース"])))
+
+    if history_df is not None and not history_df.empty and result_races:
+        identity = history_df.apply(
+            lambda r: (str(r["開催日"]).strip(), str(r["開催場"]).strip(), _v93_clean_race_no(r["レース"])), axis=1
+        )
+        history_df = history_df.loc[~identity.isin(result_races)].copy()
+
+    frames = [x for x in [result_df, history_df] if x is not None and not x.empty]
+    combined = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    result_count = int(result_df["race_key"].nunique()) if result_df is not None and not result_df.empty else 0
+    history_count = int(history_df["race_key"].nunique()) if history_df is not None and not history_df.empty else 0
+    stats = {}
+    venues = set()
+    if result_df is not None and not result_df.empty:
+        venues.update(result_df["開催場"].astype(str).str.strip().tolist())
+    if history_df is not None and not history_df.empty:
+        venues.update(history_df["開催場"].astype(str).str.strip().tolist())
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            raw_rows = pd.read_sql_query("""
+                SELECT venue AS 開催場, COUNT(*) AS 履歴行数
+                FROM race_history
+                WHERE COALESCE(use_for_model,1)=1
+                GROUP BY venue
+            """, con)
+        raw_map = {str(r["開催場"] or "").strip(): int(r["履歴行数"] or 0) for _, r in raw_rows.iterrows()}
+        venues.update(raw_map.keys())
+    except Exception:
+        raw_map = {}
+    for venue in venues:
+        rr = 0
+        hr = 0
+        if result_df is not None and not result_df.empty:
+            rr = int(result_df.loc[result_df["開催場"].astype(str).str.strip() == venue, "race_key"].nunique())
+        if history_df is not None and not history_df.empty:
+            hr = int(history_df.loc[history_df["開催場"].astype(str).str.strip() == venue, "race_key"].nunique())
+        stats[venue] = {
+            "結果登録レース数": rr,
+            "履歴復元レース数": hr,
+            "合計学習レース数": rr + hr,
+            "登録履歴行数": int(raw_map.get(venue, 0)),
+        }
+    _V93_LAST_VENUE_SOURCE_STATS = stats
+    return combined
+
+
+_V93_OLD_VENUE_PROFILE = v84_venue_profile
+
+
+def v84_venue_profile(meta=None, db_path=DB_PATH):
+    profile = _V93_OLD_VENUE_PROFILE(meta, db_path)
+    venue = str((meta or {}).get("開催場") or (meta or {}).get("venue") or profile.get("開催場") or "").strip()
+    profile.update(_V93_LAST_VENUE_SOURCE_STATS.get(venue, {}))
+    n = int(profile.get("レース数", 0) or 0)
+    # 20R未満は弱く、200Rで100%。大量データが実効倍率へ明確に反映される。
+    profile["信頼度"] = float(np.clip(n / 200.0, 0.0, 1.0))
+    profile["学習反映率"] = profile["信頼度"]
+    return profile
+
+
+def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
+    """開催場補正を最終予測へ適用し、適用前後を明示する。"""
+    out = df.copy()
+    profile = v84_venue_profile(meta, db_path)
+    n = len(out)
+    defaults = {
+        "開催場特徴補正": 0.0,
+        "開催場特徴レース数": int(profile.get("レース数", 0)),
+        "開催場特徴信頼度": float(profile.get("信頼度", 0.0)),
+        "開催場学習反映率": float(profile.get("学習反映率", 0.0)),
+        "開催場前残り差": float(profile.get("前残り差", 0.0)),
+        "開催場追込み差": float(profile.get("追込み3着内差", 0.0)),
+        "開催場試走信頼差": float(profile.get("試走信頼差", 0.0)),
+        "開催場ST影響差": float(profile.get("ST影響差", 0.0)),
+        "開催場補正秒": 0.0,
+        "開催場順位変化": 0,
+        "開催場特徴根拠": "",
+    }
+    for col, default in defaults.items():
+        out[col] = [default] * n
+
+    if "改善後総合点" in out.columns:
+        out["開催場補正前総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0)
+        out["開催場補正前順位"] = out["開催場補正前総合点"].rank(method="min", ascending=False).astype(int)
+    if "予測競走T" in out.columns:
+        out["開催場補正前予測T"] = pd.to_numeric(out["予測競走T"], errors="coerce")
+
+    conf = float(profile.get("信頼度", 0.0))
+    if n == 0 or conf <= 0.0:
+        if "開催場補正前総合点" in out.columns:
+            out["開催場補正後総合点"] = out["開催場補正前総合点"]
+            out["開催場補正後順位"] = out["開催場補正前順位"]
+        if "開催場補正前予測T" in out.columns:
+            out["開催場補正後予測T"] = out["開催場補正前予測T"]
+        return out
+
+    handicap = pd.to_numeric(out.get("ハンデ", pd.Series(0.0, index=out.index)), errors="coerce").fillna(0.0)
+    hmin, hmax = float(handicap.min()), float(handicap.max())
+    span = max(hmax - hmin, 10.0)
+    front_role = (1.0 - (handicap - hmin) / span).clip(0.0, 1.0)
+    rear_role = ((handicap - hmin) / span).clip(0.0, 1.0)
+    trial_col = "試走T" if "試走T" in out.columns else "当日試走T"
+    st_col = "ST" if "ST" in out.columns else "平均ST"
+    trial_strength = _v84_rank01(out.get(trial_col, pd.Series(np.nan, index=out.index)), True)
+    st_strength = _v84_rank01(out.get(st_col, pd.Series(np.nan, index=out.index)), True)
+    track_temp = number((meta or {}).get("走路温度"), 30.0)
+    hot_level = float(np.clip((track_temp - 48.0) / 8.0, 0.0, 1.0))
+    front_diff = float(profile.get("前残り差", 0.0))
+    chase_diff = float(profile.get("追込み3着内差", 0.0)) * 0.65 + float(profile.get("追込み1着差", 0.0)) * 0.35
+    trial_diff = float(profile.get("試走信頼差", 0.0))
+    st_diff = float(profile.get("ST影響差", 0.0))
+    hot_front = float(profile.get("高温前残り差", 0.0))
+
+    raw_bonus = (
+        front_diff * (front_role - 0.35) * 2.20
+        + chase_diff * (rear_role - 0.35) * 1.80
+        + trial_diff * (trial_strength - 0.5) * 1.15
+        + st_diff * (st_strength - 0.5) * 0.90
+        + hot_front * hot_level * (front_role - 0.35) * 1.55
+    )
+    bonus = pd.Series(np.clip(conf * raw_bonus, -0.90, 0.90), index=out.index)
+    # 旧版の0.0008秒/点は表示上ほぼゼロだったため、最大約±0.0054秒へ修正。
+    seconds = pd.Series(np.clip(-bonus * 0.0060, -0.0054, 0.0054), index=out.index)
+    out["開催場特徴補正"] = bonus.round(3)
+    out["開催場補正秒"] = seconds.round(4)
+    venue = str(profile.get("開催場") or "")
+    source_text = f"結果{int(profile.get('結果登録レース数',0))}R+履歴復元{int(profile.get('履歴復元レース数',0))}R"
+    out["開催場特徴根拠"] = [
+        f"{venue}{profile.get('レース数',0)}R・反映{conf:.0%} ({source_text}) / 前残り差{front_diff:+.2f} / 追込み差{chase_diff:+.2f}"
+    ] * n
+
+    if "改善後総合点" in out.columns:
+        out["改善後総合点"] = out["開催場補正前総合点"] + bonus
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        out["開催場補正後総合点"] = out["改善後総合点"]
+        out["開催場補正後順位"] = out["改善後順位"]
+        out["開催場順位変化"] = out["開催場補正前順位"] - out["開催場補正後順位"]
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.40
+    if "予測競走T" in out.columns:
+        out["予測競走T"] = np.round(out["開催場補正前予測T"] + seconds, 4)
+        out["開催場補正後予測T"] = out["予測競走T"]
+    if "内枠残存率" in out.columns:
+        out["内枠残存率"] = np.clip(pd.to_numeric(out["内枠残存率"], errors="coerce").fillna(.4) + conf * front_diff * front_role * .10, .05, .95)
+    if "混戦突破適性" in out.columns:
+        out["混戦突破適性"] = np.clip(pd.to_numeric(out["混戦突破適性"], errors="coerce").fillna(.5) + conf * chase_diff * rear_role * .08, .05, .95)
+    return out
+
+
+_V93_OLD_V92_PROFILE = v92_venue_weight_profile
+
+
+def v92_venue_weight_profile(venue, db_path=DB_PATH):
+    p = _V93_OLD_V92_PROFILE(venue, db_path)
+    fresh = v84_venue_profile({"開催場": str(venue or "").strip()}, db_path)
+    p.update({k: fresh.get(k) for k in [
+        "結果登録レース数", "履歴復元レース数", "合計学習レース数", "登録履歴行数", "学習反映率"
+    ]})
+    # 旧関数内で取得した信頼度をVer93値へ統一。
+    p["信頼度"] = float(fresh.get("信頼度", 0.0) or 0.0)
+    for row in p.get("重み明細", []):
+        row["信頼度"] = p["信頼度"]
+        row["実効係数"] = float(row.get("基礎係数", 0.0)) * p["信頼度"]
+        row["実際寄与目安"] = row["実効係数"] * abs(float(row.get("開催場差", 0.0)))
+    return p
+
+
+def v92_all_venue_weight_profiles(db_path=DB_PATH):
+    rows = []
+    for venue in V92_VENUES:
+        p = v92_venue_weight_profile(venue, db_path)
+        rows.append({
+            "開催場": venue,
+            "学習レース数": p.get("レース数", 0),
+            "結果登録R": p.get("結果登録レース数", 0),
+            "履歴復元R": p.get("履歴復元レース数", 0),
+            "登録履歴行数": p.get("登録履歴行数", 0),
+            "反映率": p.get("学習反映率", 0.0),
+            "前残り差": p.get("前残り差", 0.0),
+            "追込み1着差": p.get("追込み1着差", 0.0),
+            "追込み3着内差": p.get("追込み3着内差", 0.0),
+            "試走信頼差": p.get("試走信頼差", 0.0),
+            "ST影響差": p.get("ST影響差", 0.0),
+            "高温前残り差": p.get("高温前残り差", 0.0),
+        })
+    return pd.DataFrame(rows)
+
+
+def v92_applied_venue_corrections(prediction_df):
+    if prediction_df is None or len(prediction_df) == 0:
+        return pd.DataFrame()
+    df = prediction_df.copy()
+    cols = [c for c in [
+        "車", "選手名", "ハンデ",
+        "開催場補正前順位", "開催場補正後順位", "開催場順位変化",
+        "開催場補正前総合点", "開催場特徴補正", "開催場補正後総合点",
+        "開催場補正前予測T", "開催場補正秒", "開催場補正後予測T",
+        "開催場特徴レース数", "開催場学習反映率", "開催場特徴根拠"
+    ] if c in df.columns]
+    out = df[cols].copy()
+    if "開催場特徴補正" in out.columns:
+        out = out.sort_values("開催場特徴補正", ascending=False)
+    return out.reset_index(drop=True)

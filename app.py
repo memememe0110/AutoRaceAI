@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver92｜開催場別の学習重み・実際の補正値を確認可能")
+st.caption("Ver93｜開催場学習を全選手履歴から復元・補正前後を完全表示")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -650,7 +650,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
             actual_cover = float(pd.to_numeric(highlighted["累積確率"], errors="coerce").dropna().max()) if not highlighted.empty else 0.0
 
             st.markdown(f"### {ticket_point_heading(bet_type, actual_points)}")
-            m1, m2, m3 = st.columns(3)
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("強調点数", f"{actual_points}点")
             m2.metric("強調範囲の累積", f"{actual_cover:.2f}%")
             m3.metric("ライン要求", f"{cutoff:.2f}%")
@@ -1319,8 +1319,10 @@ with prediction_tab:
                     m1.metric("開催場", profile.get("開催場") or "未取得")
                     m2.metric("学習レース数", f"{int(profile.get('レース数', 0))}R")
                     confidence = float(profile.get("信頼度", 0.0) or 0.0)
-                    m3.metric("開催場特徴の信頼度", f"{confidence * 100:.1f}%")
-                    st.caption("実効係数は『基礎係数 × 開催場データ信頼度』です。開催場差が0に近い項目は、係数があっても実際の補正はほぼ掛かりません。")
+                    m3.metric("学習反映率", f"{confidence * 100:.1f}%")
+                    m4.metric("履歴から復元", f"{int(profile.get('履歴復元レース数', 0) or 0)}R")
+                    st.caption(f"登録履歴 {int(profile.get('登録履歴行数', 0) or 0):,}行のうち、開催日・開催場・Rが揃い4選手以上を同一レースとして復元できた履歴だけを学習に使用します。")
+                    st.caption("Ver93は結果登録だけでなく、選手履歴を開催日・開催場・Rごとにレースへ復元して学習します。補正前後の順位・点数・予測Tも下表で確認できます。")
                     weight_df = pd.DataFrame(profile.get("重み明細", []))
                     if not weight_df.empty:
                         st.dataframe(
@@ -1333,6 +1335,7 @@ with prediction_tab:
                                 "信頼度": st.column_config.NumberColumn(format="%.1%%"),
                                 "実効係数": st.column_config.NumberColumn(format="%.3f"),
                                 "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
+                                "実際寄与目安": st.column_config.NumberColumn(format="%.3f"),
                             },
                         )
                     applied = engine.v92_applied_venue_corrections(df)
@@ -1344,6 +1347,12 @@ with prediction_tab:
                             hide_index=True,
                             column_config={
                                 "開催場特徴補正": st.column_config.NumberColumn(format="%+.3f"),
+                                "開催場補正前総合点": st.column_config.NumberColumn(format="%.3f"),
+                                "開催場補正後総合点": st.column_config.NumberColumn(format="%.3f"),
+                                "開催場補正前予測T": st.column_config.NumberColumn(format="%.4f"),
+                                "開催場補正秒": st.column_config.NumberColumn(format="%+.4f"),
+                                "開催場補正後予測T": st.column_config.NumberColumn(format="%.4f"),
+                                "開催場学習反映率": st.column_config.NumberColumn(format="%.1%%"),
                                 "開催場特徴信頼度": st.column_config.NumberColumn(format="%.1%%"),
                                 "開催場前残り差": st.column_config.NumberColumn(format="%+.3f"),
                                 "開催場追込み差": st.column_config.NumberColumn(format="%+.3f"),
@@ -1351,7 +1360,7 @@ with prediction_tab:
                                 "開催場ST影響差": st.column_config.NumberColumn(format="%+.3f"),
                             },
                         )
-                    st.caption("開催場特徴補正は最大約±0.9点に制限しています。プラスは順位を押し上げ、マイナスは押し下げる方向です。")
+                    st.caption("開催場補正は最大±0.9点・予測T最大約±0.0054秒です。順位変化が0でも、点数と予測Tへの反映値を確認できます。")
                 except Exception as exc:
                     st.warning(f"開催場重みを表示できませんでした: {exc}")
 
@@ -1901,7 +1910,7 @@ with register_tab:
 
 with db_tab:
     st.subheader("🏟️ 開催場別の学習重み")
-    st.caption("開催場そのものの前残り・追込み・試走・ST・高温傾向を、全場平均との差で確認できます。信頼度が低い開催場は予測への反映も自動で弱くなります。")
+    st.caption("結果登録レースに加えて、登録済み選手履歴を開催日・開催場・R単位で復元して学習します。反映率は200レースで100%です。")
     try:
         venue_profiles = engine.v92_all_venue_weight_profiles(engine.DB_PATH)
         st.dataframe(
@@ -1909,7 +1918,7 @@ with db_tab:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "信頼度": st.column_config.ProgressColumn(format="%.1%%", min_value=0.0, max_value=1.0),
+                "反映率": st.column_config.ProgressColumn(format="%.1%%", min_value=0.0, max_value=1.0),
                 "前残り差": st.column_config.NumberColumn(format="%+.3f"),
                 "追込み1着差": st.column_config.NumberColumn(format="%+.3f"),
                 "追込み3着内差": st.column_config.NumberColumn(format="%+.3f"),
@@ -1934,7 +1943,7 @@ with db_tab:
                     "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
                 },
             )
-        st.caption("現在は確認専用です。基礎係数は全開催場共通で、開催場ごとの差とデータ信頼度によって実際の効き方が変わります。")
+        st.caption("基礎係数は共通ですが、開催場差・学習レース数・反映率によって実効値は変わります。結果登録Rと履歴復元Rを分けて確認できます。")
     except Exception as exc:
         st.warning(f"開催場別重みを取得できませんでした: {exc}")
 
