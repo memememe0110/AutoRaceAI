@@ -1127,6 +1127,11 @@ def render_last_result_analysis(view: dict) -> None:
 
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
+try:
+    engine.v105_init_performance(engine.DB_PATH)
+except Exception:
+    pass
+
 prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
@@ -2063,6 +2068,8 @@ with db_tab:
                 names = shown["選手名"].astype(str).tolist()
                 if names:
                     selected = st.selectbox("履歴を確認する選手", names)
+                    show_all_history = st.checkbox("全履歴を表示", value=False, key=f"show_all_history_{selected}")
+                    history_limit = "" if show_all_history else " LIMIT 100"
                     if canonical_count > 0:
                         history = pd.read_sql_query(
                             """
@@ -2072,7 +2079,7 @@ with db_tab:
                                    h.start_time AS ST, h.source AS 登録元, h.created_at AS 登録日時
                             FROM race_history h JOIN players p ON p.player_id=h.player_id
                             WHERE p.player_name=? ORDER BY h.race_date DESC, h.history_id DESC
-                            """, con, params=(selected,))
+                            """ + history_limit, con, params=(selected,))
                     else:
                         history = pd.read_sql_query(
                             """
@@ -2085,7 +2092,7 @@ with db_tab:
                                    created_at AS 登録日時
                             FROM v15_player_history_imports
                             WHERE player_name=? ORDER BY race_date DESC, created_at DESC
-                            """, con, params=(selected,))
+                            """ + history_limit, con, params=(selected,))
                     st.write(f"{selected}：履歴 {len(history)}件")
                     display_history = history.drop(columns=[c for c in ["履歴ID", "履歴キー"] if c in history.columns], errors="ignore")
                     st.dataframe(display_history, use_container_width=True, hide_index=True, height=430)
@@ -2196,7 +2203,17 @@ with db_tab:
                 st.subheader("予測・結果の登録漏れチェック")
                 st.caption("選手別履歴を直接照合します。Rがあるデータは日付・開催場・Rで、Rがないデータも同時登録された選手セットから完全レースを復元します。")
                 try:
-                    v97_health = engine.v97_database_health(engine.DB_PATH)
+                    refresh_health = st.button("登録漏れチェックを更新", use_container_width=True, key="v105_refresh_registration_health")
+                    if refresh_health:
+                        with st.spinner("登録履歴を照合しています。結果はDBへ保存され、中断後も再利用されます…"):
+                            v97_health = engine.v105_refresh_registration_health_cache(engine.DB_PATH)
+                    else:
+                        v97_health = engine.v105_load_registration_health_cache(engine.DB_PATH)
+                    if not v97_health:
+                        st.info("初回は『登録漏れチェックを更新』を押してください。通常の画面再実行では重い全件照合を行いません。")
+                        v97_health = {"summary": {}, "complete_all": [], "unidentified_complete": [], "predictable_unpredicted": [], "complete_missing_result": [], "predicted_missing_result": [], "incomplete": []}
+                    elif v97_health.get("_calculated_at"):
+                        st.caption(f"保存済み照合結果: {v97_health.get('_calculated_at')}（更新ボタンを押すまで再計算しません）")
                     v97_summary = v97_health.get("summary", {})
                     c1, c2, c3, c4, c5 = st.columns(5)
                     c1.metric("完全データ", f"{v97_summary.get('完全データ', 0)}R")
@@ -2275,7 +2292,8 @@ with db_tab:
                                 st.session_state["v99_last_batch_report"] = batch_report
                                 if batch_report.get("成功", 0):
                                     st.success(
-                                        f"一括予測完了：成功 {batch_report.get('成功', 0)}R｜"
+                                        f"一括予測完了：新規成功 {batch_report.get('成功', 0)}R｜"
+                                        f"完了済み再利用 {batch_report.get('再開スキップ', 0)}R｜"
                                         f"スキップ {batch_report.get('スキップ', 0)}R｜エラー {batch_report.get('エラー', 0)}R"
                                     )
                                 else:
@@ -2288,7 +2306,8 @@ with db_tab:
                             if last_batch:
                                 with st.expander("直前の一括予測レポート", expanded=bool(last_batch.get("エラー") or last_batch.get("スキップ"))):
                                     st.write(
-                                        f"対象 {last_batch.get('対象', 0)}R｜成功 {last_batch.get('成功', 0)}R｜"
+                                        f"対象 {last_batch.get('対象', 0)}R｜新規成功 {last_batch.get('成功', 0)}R｜"
+                                        f"完了済み再利用 {last_batch.get('再開スキップ', 0)}R｜"
                                         f"スキップ {last_batch.get('スキップ', 0)}R｜エラー {last_batch.get('エラー', 0)}R"
                                     )
                                     details = pd.DataFrame(last_batch.get("details", []))

@@ -14362,11 +14362,38 @@ def v99_build_prediction_text(record, db_path=DB_PATH):
 
 
 def v99_run_batch_predictions(records, trials=5000, seed=20260719, db_path=DB_PATH):
-    """選択された完全レースを時系列順に予測し、各レースを直ちに保存する。"""
-    report = {"対象": len(records or []), "成功": 0, "スキップ": 0, "エラー": 0, "details": []}
+    """選択レースを時系列順に予測。1Rごとに保存し、中断後は完了済みを飛ばして再開する。"""
+    from datetime import datetime
+    v105_init_performance(db_path)
+    report = {"対象": len(records or []), "成功": 0, "再開スキップ": 0, "スキップ": 0, "エラー": 0, "details": []}
     ordered = sorted(records or [], key=lambda r: (str(r.get("開催日")), str(r.get("開催場")), str(r.get("R"))))
     for i, record in enumerate(ordered):
         label = f"{record.get('開催日')} {record.get('開催場')} {record.get('R')}"
+        race_key = str(record.get("race_key") or "")
+
+        # 前回までに保存済みなら再計算しない。
+        if race_key and v105_prediction_exists(race_key, db_path):
+            report["再開スキップ"] += 1
+            report["details"].append({"レース": label, "状態": "完了済み", "race_key": race_key, "出走数": record.get("登録選手", ""), "理由": "前回までの保存結果を再利用"})
+            with sqlite3.connect(str(db_path), timeout=30) as con:
+                con.execute("""
+                    INSERT INTO v105_batch_progress(race_key,label,status,trials,seed,finished_at,message)
+                    VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(race_key) DO UPDATE SET status='success',finished_at=excluded.finished_at,message=excluded.message
+                """, (race_key, label, "success", int(trials), int(seed)+i, datetime.now().isoformat(timespec="seconds"), "保存済みのため再利用"))
+                con.commit()
+            continue
+
+        progress_key = race_key or f"pending_{record.get('開催日')}_{record.get('開催場')}_{record.get('R')}"
+        with sqlite3.connect(str(db_path), timeout=30) as con:
+            con.execute("""
+                INSERT INTO v105_batch_progress(race_key,label,status,trials,seed,started_at,message)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(race_key) DO UPDATE SET
+                    label=excluded.label,status='running',trials=excluded.trials,seed=excluded.seed,
+                    started_at=excluded.started_at,finished_at=NULL,message=''
+            """, (progress_key, label, "running", int(trials), int(seed)+i, datetime.now().isoformat(timespec="seconds"), ""))
+            con.commit()
         try:
             text, source_info = v99_build_prediction_text(record, db_path)
             df, bets, output, entries, meta = ver16_run_prediction(text, int(trials), int(seed) + i, manual_excluded=[])
@@ -14376,12 +14403,24 @@ def v99_run_batch_predictions(records, trials=5000, seed=20260719, db_path=DB_PA
             v40_save_prediction_features(meta, df, db_path)
             report["成功"] += 1
             report["details"].append({"レース": label, "状態": "成功", "race_key": saved_key, "出走数": len(entries), "理由": ""})
+            with sqlite3.connect(str(db_path), timeout=30) as con:
+                con.execute("""
+                    UPDATE v105_batch_progress SET race_key=?,status='success',finished_at=?,message=? WHERE race_key=?
+                """, (saved_key, datetime.now().isoformat(timespec="seconds"), "完了", progress_key))
+                con.commit()
         except ValueError as exc:
             report["スキップ"] += 1
-            report["details"].append({"レース": label, "状態": "スキップ", "race_key": record.get("race_key", ""), "出走数": record.get("登録選手", ""), "理由": str(exc)})
+            report["details"].append({"レース": label, "状態": "スキップ", "race_key": race_key, "出走数": record.get("登録選手", ""), "理由": str(exc)})
+            with sqlite3.connect(str(db_path), timeout=30) as con:
+                con.execute("UPDATE v105_batch_progress SET status='skipped',finished_at=?,message=? WHERE race_key=?", (datetime.now().isoformat(timespec="seconds"), str(exc), progress_key))
+                con.commit()
         except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
             report["エラー"] += 1
-            report["details"].append({"レース": label, "状態": "エラー", "race_key": record.get("race_key", ""), "出走数": record.get("登録選手", ""), "理由": f"{type(exc).__name__}: {exc}"})
+            report["details"].append({"レース": label, "状態": "エラー", "race_key": race_key, "出走数": record.get("登録選手", ""), "理由": message})
+            with sqlite3.connect(str(db_path), timeout=30) as con:
+                con.execute("UPDATE v105_batch_progress SET status='error',finished_at=?,message=? WHERE race_key=?", (datetime.now().isoformat(timespec="seconds"), message, progress_key))
+                con.commit()
     return report
 
 
@@ -14711,3 +14750,109 @@ def v103_load_venue_analysis_cache(db_path=DB_PATH):
                  WHEN '飯塚' THEN 4 WHEN '山陽' THEN 5 ELSE 99 END
         """, con)
     return df
+
+
+# ============================================================
+# Ver105: 参照高速化・登録情報確認キャッシュ・中断再開
+# ============================================================
+
+def v105_init_performance(db_path=DB_PATH):
+    """参照頻度の高い列へインデックスとVer105管理テーブルを追加する。"""
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        index_sql = [
+            "CREATE INDEX IF NOT EXISTS idx_players_name ON players(player_name)",
+            "CREATE INDEX IF NOT EXISTS idx_race_history_player_date ON race_history(player_id, race_date DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_race_history_date_venue_race ON race_history(race_date, venue, race_no)",
+            "CREATE INDEX IF NOT EXISTS idx_race_history_created ON race_history(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_v15_import_player_date ON v15_player_history_imports(player_name, race_date DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_v15_import_date_venue ON v15_player_history_imports(race_date, venue)",
+            "CREATE INDEX IF NOT EXISTS idx_prediction_snapshots_race_key ON prediction_snapshots(race_key)",
+            "CREATE INDEX IF NOT EXISTS idx_result_races_race_key ON result_races(race_key)",
+        ]
+        for sql in index_sql:
+            try:
+                con.execute(sql)
+            except sqlite3.OperationalError:
+                pass
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v105_registration_health_cache (
+                cache_key TEXT PRIMARY KEY,
+                calculated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v105_batch_progress (
+                race_key TEXT PRIMARY KEY,
+                label TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                trials INTEGER,
+                seed INTEGER,
+                started_at TEXT,
+                finished_at TEXT,
+                message TEXT
+            )
+        """)
+        con.commit()
+
+
+def v105_load_registration_health_cache(db_path=DB_PATH):
+    import json
+    v105_init_performance(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        row = con.execute(
+            "SELECT calculated_at, payload_json FROM v105_registration_health_cache WHERE cache_key='v97_health'"
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row[1])
+        payload["_calculated_at"] = row[0]
+        return payload
+    except Exception:
+        return None
+
+
+def v105_refresh_registration_health_cache(db_path=DB_PATH):
+    import json
+    from datetime import datetime
+    v105_init_performance(db_path)
+    payload = v97_database_health(db_path)
+    calculated_at = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        con.execute("""
+            INSERT INTO v105_registration_health_cache(cache_key, calculated_at, payload_json)
+            VALUES('v97_health', ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                calculated_at=excluded.calculated_at,
+                payload_json=excluded.payload_json
+        """, (calculated_at, json.dumps(payload, ensure_ascii=False, default=str)))
+        con.commit()
+    payload["_calculated_at"] = calculated_at
+    return payload
+
+
+def v105_prediction_exists(race_key, db_path=DB_PATH):
+    if not race_key:
+        return False
+    with sqlite3.connect(str(db_path)) as con:
+        for table in ("prediction_snapshots", "v40_prediction_feature_snapshots", "prediction_races"):
+            try:
+                row = con.execute(f"SELECT 1 FROM {table} WHERE race_key=? LIMIT 1", (str(race_key),)).fetchone()
+                if row:
+                    return True
+            except sqlite3.OperationalError:
+                continue
+    return False
+
+
+def v105_batch_progress(db_path=DB_PATH):
+    v105_init_performance(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        try:
+            return pd.read_sql_query(
+                "SELECT race_key,label,status,trials,started_at,finished_at,message FROM v105_batch_progress ORDER BY COALESCE(finished_at,started_at) DESC",
+                con,
+            )
+        except Exception:
+            return pd.DataFrame()
