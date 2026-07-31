@@ -6181,11 +6181,43 @@ def v59_apply_escape_history(df, entries=None, meta=None, db_path=None):
     current_date = v47_normalize_required_date(current_date) if "v47_normalize_required_date" in globals() else current_date
 
     con = None
+    hist_all = pd.DataFrame()
+    lap_all = pd.DataFrame()
     try:
         if db_path and Path(str(db_path)).exists():
             con = sqlite3.connect(str(db_path))
+            # 今回出走する選手だけをDBから取得する。全選手履歴の読み込みを避ける。
+            race_names = [str(v).strip() for v in out.get("選手名", pd.Series(dtype=str)).tolist() if str(v).strip()]
+            name_keys = sorted({re.sub(r"[\s　]+", "", name) for name in race_names})
+            if name_keys:
+                placeholders = ",".join(["?"] * len(name_keys))
+                normalized_name = "REPLACE(REPLACE(REPLACE(COALESCE(player_name,''), ' ', ''), '　', ''), char(9), '')"
+                try:
+                    hist_all = pd.read_sql_query(
+                        f"""SELECT race_date, race_no, venue, rank, handicap, st, car_no, surface, track_temp, player_name
+                            FROM v15_player_history_imports
+                            WHERE {normalized_name} IN ({placeholders})""",
+                        con, params=name_keys,
+                    )
+                except Exception:
+                    hist_all = pd.DataFrame()
+                try:
+                    lap_all = pd.read_sql_query(
+                        f"""SELECT race_key, lap_label, position, player_name
+                            FROM player_lap_history
+                            WHERE {normalized_name} IN ({placeholders})""",
+                        con, params=name_keys,
+                    )
+                except Exception:
+                    lap_all = pd.DataFrame()
+            if not hist_all.empty:
+                hist_all["name_key"] = hist_all["player_name"].astype(str).map(lambda x: re.sub(r"[\s　]+", "", x))
+            if not lap_all.empty:
+                lap_all["name_key"] = lap_all["player_name"].astype(str).map(lambda x: re.sub(r"[\s　]+", "", x))
     except Exception:
         con = None
+        hist_all = pd.DataFrame()
+        lap_all = pd.DataFrame()
 
     front_sorted = out.loc[front_idx].sort_values("車")
     front_count = len(front_sorted)
@@ -6202,30 +6234,12 @@ def v59_apply_escape_history(df, entries=None, meta=None, db_path=None):
 
         hist = pd.DataFrame()
         lap = pd.DataFrame()
-        if con is not None and name:
-            key = v32_player_name_key(name) if "v32_player_name_key" in globals() else re.sub(r"\s+", "", name)
-            try:
-                hist = pd.read_sql_query(
-                    """SELECT race_date, race_no, venue, rank, handicap, st, car_no, surface, track_temp, player_name
-                       FROM v15_player_history_imports""", con
-                )
-                hist = hist[hist["player_name"].map(v32_player_name_key).eq(key)] if "player_name" in hist.columns else hist.iloc[0:0]
-            except Exception:
-                try:
-                    hist = pd.read_sql_query(
-                        """SELECT race_date, venue, rank, handicap, st, car_no, surface, track_temp, player_name
-                           FROM v15_player_history_imports""", con
-                    )
-                    hist = hist[hist["player_name"].map(v32_player_name_key).eq(key)]
-                except Exception:
-                    hist = pd.DataFrame()
-            try:
-                lap = pd.read_sql_query(
-                    "SELECT race_key, lap_label, position, player_name FROM player_lap_history", con
-                )
-                lap = lap[lap["player_name"].map(v32_player_name_key).eq(key)]
-            except Exception:
-                lap = pd.DataFrame()
+        if name:
+            key = v32_player_name_key(name) if "v32_player_name_key" in globals() else re.sub(r"[\s　]+", "", name)
+            if not hist_all.empty:
+                hist = hist_all[hist_all["name_key"].eq(key)].copy()
+            if not lap_all.empty:
+                lap = lap_all[lap_all["name_key"].eq(key)].copy()
 
         if not hist.empty:
             hist["race_date"] = hist["race_date"].astype(str)
@@ -6390,12 +6404,24 @@ def v60_apply_lap_and_heat_learning(df, entries=None, meta=None, db_path=None):
     try:
         if db_path and Path(str(db_path)).exists():
             con = sqlite3.connect(str(db_path))
-            lap_all = pd.read_sql_query(
-                "SELECT race_key, player_name, car_no, lap_label, lap_no, position FROM player_lap_history", con
-            )
-            hist_all = pd.read_sql_query(
-                "SELECT player_name, race_date, race_no, rank, handicap, track_temp, car_no, st FROM v15_player_history_imports", con
-            )
+            # 今回出走する6〜8人だけをSQLで取得し、全履歴のDataFrame化を避ける。
+            race_names = [str(v).strip() for v in out.get("選手名", pd.Series(dtype=str)).tolist() if str(v).strip()]
+            name_keys = sorted({_v60_name_key(name) for name in race_names})
+            if name_keys:
+                placeholders = ",".join(["?"] * len(name_keys))
+                normalized_name = "REPLACE(REPLACE(REPLACE(COALESCE(player_name,''), ' ', ''), '　', ''), char(9), '')"
+                lap_all = pd.read_sql_query(
+                    f"""SELECT race_key, player_name, car_no, lap_label, lap_no, position
+                        FROM player_lap_history
+                        WHERE {normalized_name} IN ({placeholders})""",
+                    con, params=name_keys,
+                )
+                hist_all = pd.read_sql_query(
+                    f"""SELECT player_name, race_date, race_no, rank, handicap, track_temp, car_no, st
+                        FROM v15_player_history_imports
+                        WHERE {normalized_name} IN ({placeholders})""",
+                    con, params=name_keys,
+                )
     except Exception:
         lap_all = pd.DataFrame(); hist_all = pd.DataFrame()
     finally:
