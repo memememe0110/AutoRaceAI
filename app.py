@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver96｜開催場学習2層化・選手×開催場相性を実反映")
+st.caption("Ver107｜選択画面だけ実行・開催場重みキャッシュ・選手名照合高速化")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -136,6 +136,96 @@ def db_summary(db_path: str) -> dict:
 
 
 
+
+def _db_cache_token(db_path: str) -> tuple:
+    """DB更新時だけキャッシュを自動更新するための軽量トークン。"""
+    path = Path(db_path)
+    if not path.exists():
+        return (str(path), 0, 0)
+    stat = path.stat()
+    return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _cached_registered_players(db_path: str, cache_token: tuple, canonical_count: int, import_count: int) -> tuple[pd.DataFrame, str]:
+    """登録選手一覧をDB更新時だけ再取得する。"""
+    del cache_token
+    with sqlite3.connect(db_path) as con:
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if canonical_count > 0 and "players" in tables:
+            frame = pd.read_sql_query(
+                """
+                SELECT p.player_name AS 選手名, COUNT(h.history_id) AS 登録件数,
+                       MAX(h.race_date) AS 最新日
+                FROM players p
+                LEFT JOIN race_history h ON h.player_id=p.player_id
+                GROUP BY p.player_id, p.player_name
+                HAVING COUNT(h.history_id) > 0
+                ORDER BY p.player_name
+                """, con)
+            return frame, "players / race_history"
+        if import_count > 0:
+            frame = pd.read_sql_query(
+                """
+                SELECT player_name AS 選手名, COUNT(*) AS 登録件数,
+                       MAX(race_date) AS 最新日
+                FROM v15_player_history_imports
+                WHERE player_name IS NOT NULL AND player_name <> ''
+                GROUP BY player_name ORDER BY player_name
+                """, con)
+            return frame, "v15_player_history_imports"
+    return pd.DataFrame(columns=["選手名", "登録件数", "最新日"]), "データなし"
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _cached_player_history(db_path: str, cache_token: tuple, player_name: str, canonical: bool, show_all: bool) -> pd.DataFrame:
+    """選択した選手の履歴だけを取得し、同じ操作中は再利用する。"""
+    del cache_token
+    limit_sql = "" if show_all else " LIMIT 100"
+    with sqlite3.connect(db_path) as con:
+        if canonical:
+            return pd.read_sql_query(
+                """
+                SELECT h.history_id AS 履歴ID, h.race_date AS 日付, h.venue AS 開催場, h.race_no AS レース,
+                       h.finish AS 着順, h.surface AS 走路, h.handicap AS ハンデ,
+                       h.trial_time AS 試走T, h.race_time AS 競走T,
+                       h.start_time AS ST, h.source AS 登録元, h.created_at AS 登録日時
+                FROM race_history h JOIN players p ON p.player_id=h.player_id
+                WHERE p.player_name=? ORDER BY h.race_date DESC, h.history_id DESC
+                """ + limit_sql, con, params=(player_name,))
+        return pd.read_sql_query(
+            """
+            SELECT history_key AS 履歴キー, race_date AS 日付, venue AS 開催場, race_type AS レース種別,
+                   rank AS 着順, weather AS 天候, surface AS 走路,
+                   track_temp AS 走路温度, air_temp AS 気温, humidity AS 湿度,
+                   car_no AS 車番, handicap AS ハンデ, distance AS 距離,
+                   laps AS 周回数, popularity AS 人気,
+                   trial_time AS 試走T, race_time AS 競走T, st AS ST,
+                   created_at AS 登録日時
+            FROM v15_player_history_imports
+            WHERE player_name=? ORDER BY race_date DESC, created_at DESC
+            """ + limit_sql, con, params=(player_name,))
+
+
+def _clear_registration_view_cache() -> None:
+    _cached_registered_players.clear()
+    _cached_player_history.clear()
+    _cached_player_registration_index.clear()
+    _cached_all_venue_weight_profiles.clear()
+    _cached_venue_weight_profile.clear()
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _cached_all_venue_weight_profiles(db_path: str, cache_token: tuple) -> pd.DataFrame:
+    del cache_token
+    return engine.v92_all_venue_weight_profiles(db_path)
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _cached_venue_weight_profile(venue: str, db_path: str, cache_token: tuple) -> dict:
+    del cache_token
+    return engine.v92_venue_weight_profile(venue, db_path)
+
 def normalize_player_key(name: str) -> str:
     """DB照合用に空白と所属表記を除去した選手名キーを返す。"""
     value = str(name or "").strip()
@@ -250,27 +340,17 @@ def show_player_data_coverage(entries: pd.DataFrame) -> None:
 
 
 
-def lookup_player_registration(name: str, db_path: str) -> dict:
-    """入力した選手名がDBに登録済みか、重複加算せずに確認する。"""
-    key = normalize_player_key(name)
-    result = {
-        "found": False,
-        "matched_name": "",
-        "canonical_count": 0,
-        "model_count": 0,
-        "detail_count": 0,
-        "latest": None,
-        "candidates": [],
-    }
-    if not key or not Path(db_path).exists():
-        return result
-
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cached_player_registration_index(db_path: str, cache_token: tuple) -> dict:
+    """DB更新時だけ作り直す選手登録状況の索引。文字入力ごとの全件集計を防ぐ。"""
+    del cache_token
+    names = {}
+    if not Path(db_path).exists():
+        return names
     with sqlite3.connect(db_path) as con:
         tables = {r[0] for r in con.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()}
-        names = {}
-
         if {"players", "race_history"}.issubset(tables):
             rows = con.execute(
                 """
@@ -284,15 +364,12 @@ def lookup_player_registration(name: str, db_path: str) -> dict:
             ).fetchall()
             for player_name, count_all, count_use, latest in rows:
                 pkey = normalize_player_key(player_name)
-                item = names.setdefault(pkey, {
-                    "names": [], "canonical": 0, "model": 0, "detail": 0, "dates": []
-                })
+                item = names.setdefault(pkey, {"names": [], "canonical": 0, "model": 0, "detail": 0, "dates": []})
                 item["names"].append(str(player_name))
                 item["canonical"] += int(count_all or 0)
                 item["model"] += int(count_use or 0)
                 if latest:
                     item["dates"].append(str(latest))
-
         if "v15_player_history_imports" in tables:
             rows = con.execute(
                 """
@@ -304,37 +381,44 @@ def lookup_player_registration(name: str, db_path: str) -> dict:
             ).fetchall()
             for player_name, count_all, latest in rows:
                 pkey = normalize_player_key(player_name)
-                item = names.setdefault(pkey, {
-                    "names": [], "canonical": 0, "model": 0, "detail": 0, "dates": []
-                })
+                item = names.setdefault(pkey, {"names": [], "canonical": 0, "model": 0, "detail": 0, "dates": []})
                 item["names"].append(str(player_name))
                 item["detail"] += int(count_all or 0)
                 if latest:
                     item["dates"].append(str(latest))
+    return names
 
-        if key in names:
-            item = names[key]
+
+def lookup_player_registration(name: str, db_path: str) -> dict:
+    """キャッシュ済み索引から登録状況を即時確認する。"""
+    key = normalize_player_key(name)
+    result = {
+        "found": False, "matched_name": "", "canonical_count": 0,
+        "model_count": 0, "detail_count": 0, "latest": None, "candidates": [],
+    }
+    if not key or not Path(db_path).exists():
+        return result
+    names = _cached_player_registration_index(db_path, _db_cache_token(db_path))
+    if key in names:
+        item = names[key]
+        display_names = sorted(set(item["names"]), key=lambda x: (len(x), x))
+        result.update({
+            "found": True,
+            "matched_name": display_names[0] if display_names else str(name).strip(),
+            "canonical_count": item["canonical"],
+            "model_count": item["model"],
+            "detail_count": item["detail"],
+            "latest": max(item["dates"]) if item["dates"] else None,
+        })
+        return result
+    candidates = []
+    for pkey, item in names.items():
+        if key in pkey or pkey in key:
             display_names = sorted(set(item["names"]), key=lambda x: (len(x), x))
-            result.update({
-                "found": True,
-                "matched_name": display_names[0] if display_names else str(name).strip(),
-                "canonical_count": item["canonical"],
-                "model_count": item["model"],
-                "detail_count": item["detail"],
-                "latest": max(item["dates"]) if item["dates"] else None,
-            })
-            return result
-
-        # 完全一致しない場合は、入力文字を含む近い候補だけ表示する。
-        candidates = []
-        for pkey, item in names.items():
-            if key in pkey or pkey in key:
-                display_names = sorted(set(item["names"]), key=lambda x: (len(x), x))
-                if display_names:
-                    candidates.append(display_names[0])
-        result["candidates"] = sorted(set(candidates))[:8]
+            if display_names:
+                candidates.append(display_names[0])
+    result["candidates"] = sorted(set(candidates))[:8]
     return result
-
 
 def show_player_registration_status(name: str) -> None:
     """選手名入力直後にDB登録状況を表示する。"""
@@ -1132,9 +1216,15 @@ try:
 except Exception:
     pass
 
-prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
+main_page = st.radio(
+    "機能を選択",
+    ["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="main_page_selector",
+)
 
-with prediction_tab:
+if main_page == "🏁 予測":
     st.info("Ver20予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
@@ -1331,7 +1421,7 @@ with prediction_tab:
             with st.expander("🏟️ 今回の開催場重み・適用補正", expanded=True):
                 venue_name = str(meta.get("開催場") or "").strip()
                 try:
-                    profile = engine.v92_venue_weight_profile(venue_name, engine.DB_PATH)
+                    profile = _cached_venue_weight_profile(venue_name, engine.DB_PATH, _db_cache_token(engine.DB_PATH))
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("開催場", profile.get("開催場") or "未取得")
                     race_count = int(profile.get("レース数", 0) or 0)
@@ -1555,7 +1645,7 @@ with prediction_tab:
             st.error(f"保存済み予測の表示エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
 
-with result_tab:
+if main_page == "✅ 結果登録・解析":
     st.subheader("公式結果を登録して予測と比較")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
@@ -1741,7 +1831,7 @@ with result_tab:
         render_last_result_analysis(last_result_view)
 
 
-with db_tab:
+if main_page == "🗃️ 登録情報確認":
     st.subheader("全結果バックテスト・重み最適化")
     st.caption("単発レースの結果だけでなく、予測時に保存した特徴と登録済み結果をまとめて比較します。古い約70%で候補を探し、新しい約30%でも悪化しない候補だけを提案します。")
     candidate_count = st.slider("試す重み候補数", 200, 3000, 800, 100, key="v74_candidate_count")
@@ -1835,7 +1925,7 @@ with db_tab:
         else:
             st.warning(msg)
 
-with register_tab:
+if main_page == "👤 選手情報登録":
     st.subheader("選手情報を登録")
     st.session_state.setdefault("player_input_version", 0)
     if st.button("🗑️ 選手入力をリセット", use_container_width=True, key="reset_player_input"):
@@ -1976,7 +2066,7 @@ with db_tab:
         st.warning(f"保存済み開催場分析を読み込めませんでした: {exc}")
 
     try:
-        venue_profiles = engine.v92_all_venue_weight_profiles(engine.DB_PATH)
+        venue_profiles = _cached_all_venue_weight_profiles(engine.DB_PATH, _db_cache_token(engine.DB_PATH))
         st.dataframe(
             venue_profiles,
             use_container_width=True,
@@ -1998,7 +2088,7 @@ with db_tab:
             },
         )
         selected_venue = st.selectbox("詳しく見る開催場", engine.V92_VENUES, key="v92_selected_venue")
-        selected_profile = engine.v92_venue_weight_profile(selected_venue, engine.DB_PATH)
+        selected_profile = _cached_venue_weight_profile(selected_venue, engine.DB_PATH, _db_cache_token(engine.DB_PATH))
         detail = pd.DataFrame(selected_profile.get("重み明細", []))
         if not detail.empty:
             st.dataframe(
@@ -2030,31 +2120,10 @@ with db_tab:
                 canonical_count = int(con.execute("SELECT COUNT(*) FROM race_history").fetchone()[0]) if "race_history" in info["tables"] else 0
                 import_count = int(con.execute("SELECT COUNT(*) FROM v15_player_history_imports").fetchone()[0]) if "v15_player_history_imports" in info["tables"] else 0
 
-                if canonical_count > 0 and "players" in info["tables"]:
-                    players = pd.read_sql_query(
-                        """
-                        SELECT p.player_name AS 選手名, COUNT(h.history_id) AS 登録件数,
-                               MAX(h.race_date) AS 最新日
-                        FROM players p
-                        LEFT JOIN race_history h ON h.player_id=p.player_id
-                        GROUP BY p.player_id, p.player_name
-                        HAVING COUNT(h.history_id) > 0
-                        ORDER BY p.player_name
-                        """, con)
-                    source_mode = "players / race_history"
-                elif import_count > 0:
-                    players = pd.read_sql_query(
-                        """
-                        SELECT player_name AS 選手名, COUNT(*) AS 登録件数,
-                               MAX(race_date) AS 最新日
-                        FROM v15_player_history_imports
-                        WHERE player_name IS NOT NULL AND player_name <> ''
-                        GROUP BY player_name ORDER BY player_name
-                        """, con)
-                    source_mode = "v15_player_history_imports"
-                else:
-                    players = pd.DataFrame(columns=["選手名", "登録件数", "最新日"])
-                    source_mode = "データなし"
+                cache_token = _db_cache_token(engine.DB_PATH)
+                players, source_mode = _cached_registered_players(
+                    engine.DB_PATH, cache_token, canonical_count, import_count
+                )
 
                 st.caption(f"表示元: {source_mode}")
                 query = st.text_input("選手名検索", placeholder="例：横田翔", key="db_player_search")
@@ -2069,30 +2138,9 @@ with db_tab:
                 if names:
                     selected = st.selectbox("履歴を確認する選手", names)
                     show_all_history = st.checkbox("全履歴を表示", value=False, key=f"show_all_history_{selected}")
-                    history_limit = "" if show_all_history else " LIMIT 100"
-                    if canonical_count > 0:
-                        history = pd.read_sql_query(
-                            """
-                            SELECT h.history_id AS 履歴ID, h.race_date AS 日付, h.venue AS 開催場, h.race_no AS レース,
-                                   h.finish AS 着順, h.surface AS 走路, h.handicap AS ハンデ,
-                                   h.trial_time AS 試走T, h.race_time AS 競走T,
-                                   h.start_time AS ST, h.source AS 登録元, h.created_at AS 登録日時
-                            FROM race_history h JOIN players p ON p.player_id=h.player_id
-                            WHERE p.player_name=? ORDER BY h.race_date DESC, h.history_id DESC
-                            """ + history_limit, con, params=(selected,))
-                    else:
-                        history = pd.read_sql_query(
-                            """
-                            SELECT history_key AS 履歴キー, race_date AS 日付, venue AS 開催場, race_type AS レース種別,
-                                   rank AS 着順, weather AS 天候, surface AS 走路,
-                                   track_temp AS 走路温度, air_temp AS 気温, humidity AS 湿度,
-                                   car_no AS 車番, handicap AS ハンデ, distance AS 距離,
-                                   laps AS 周回数, popularity AS 人気,
-                                   trial_time AS 試走T, race_time AS 競走T, st AS ST,
-                                   created_at AS 登録日時
-                            FROM v15_player_history_imports
-                            WHERE player_name=? ORDER BY race_date DESC, created_at DESC
-                            """ + history_limit, con, params=(selected,))
+                    history = _cached_player_history(
+                        engine.DB_PATH, cache_token, selected, canonical_count > 0, show_all_history
+                    )
                     st.write(f"{selected}：履歴 {len(history)}件")
                     display_history = history.drop(columns=[c for c in ["履歴ID", "履歴キー"] if c in history.columns], errors="ignore")
                     st.dataframe(display_history, use_container_width=True, hide_index=True, height=430)
@@ -2110,73 +2158,78 @@ with db_tab:
                                 f"{idx + 1}. {r.get('日付', '')} {r.get('開催場', '')} {race_label or ''} "
                                 f"着{finish_label} 試{trial_label} 競{race_time_label}"
                             )
-                        selected_delete_label = st.selectbox(
-                            "削除する履歴", delete_options, key=f"delete_history_select_{selected}"
-                        )
-                        selected_delete_idx = delete_options.index(selected_delete_label)
-                        delete_row = history.reset_index(drop=True).iloc[selected_delete_idx]
-                        preview_delete = delete_row.drop(labels=[c for c in ["履歴ID", "履歴キー"] if c in delete_row.index])
-                        st.dataframe(pd.DataFrame([preview_delete]), use_container_width=True, hide_index=True)
-                        confirm_delete = st.checkbox(
-                            "この履歴を削除することを確認しました",
-                            key=f"confirm_delete_history_{selected}_{selected_delete_idx}",
-                        )
-                        if st.button(
-                            "選択した履歴を削除",
-                            type="primary",
-                            use_container_width=True,
-                            disabled=not confirm_delete,
-                            key=f"delete_history_button_{selected}",
-                        ):
-                            if "履歴ID" in history.columns:
-                                result = engine.v37_delete_race_history(int(delete_row["履歴ID"]), engine.DB_PATH)
+                        with st.form(f"delete_history_form_{selected}", clear_on_submit=False):
+                            selected_delete_label = st.selectbox(
+                                "削除する履歴", delete_options, key=f"delete_history_select_{selected}"
+                            )
+                            selected_delete_idx = delete_options.index(selected_delete_label)
+                            delete_row = history.reset_index(drop=True).iloc[selected_delete_idx]
+                            preview_delete = delete_row.drop(labels=[c for c in ["履歴ID", "履歴キー"] if c in delete_row.index])
+                            st.dataframe(pd.DataFrame([preview_delete]), use_container_width=True, hide_index=True)
+                            confirm_delete = st.checkbox(
+                                "この履歴を削除することを確認しました",
+                                key=f"confirm_delete_history_{selected}",
+                            )
+                            delete_submitted = st.form_submit_button(
+                                "選択した履歴を削除", type="primary", use_container_width=True
+                            )
+                        if delete_submitted:
+                            if not confirm_delete:
+                                st.warning("削除確認にチェックしてください。")
                             else:
-                                result = engine.v37_delete_import_history(str(delete_row["履歴キー"]), engine.DB_PATH)
-                            if result.get("deleted"):
-                                ok, msg = push_db_to_github(f"AutoRaceAI: {selected} の誤登録履歴を削除")
-                                if ok:
-                                    st.success(result["message"] + " " + msg)
+                                if "履歴ID" in history.columns:
+                                    result = engine.v37_delete_race_history(int(delete_row["履歴ID"]), engine.DB_PATH)
                                 else:
-                                    st.warning(result["message"] + " GitHub保存は未完了です。" + msg)
-                                st.rerun()
-                            else:
-                                st.warning(result.get("message", "削除できませんでした。"))
+                                    result = engine.v37_delete_import_history(str(delete_row["履歴キー"]), engine.DB_PATH)
+                                if result.get("deleted"):
+                                    _clear_registration_view_cache()
+                                    ok, msg = push_db_to_github(f"AutoRaceAI: {selected} の誤登録履歴を削除")
+                                    if ok:
+                                        st.success(result["message"] + " " + msg)
+                                    else:
+                                        st.warning(result["message"] + " GitHub保存は未完了です。" + msg)
+                                    st.rerun()
+                                else:
+                                    st.warning(result.get("message", "削除できませんでした。"))
 
                     st.markdown("#### 🧹 選手情報を一括削除")
                     st.caption("選択中の選手について、正規履歴・条件詳細・周回特徴・選手別予測スナップショットをまとめて削除します。他選手とレース本体は残ります。")
-                    delete_all_result_rows = st.checkbox(
-                        "結果登録内のこの選手の行も削除する",
-                        value=False,
-                        key=f"delete_all_result_rows_{selected}",
-                    )
-                    confirm_player_name = st.text_input(
-                        "確認のため選手名を入力",
-                        placeholder=selected,
-                        key=f"confirm_delete_player_name_{selected}",
-                    )
+                    with st.form(f"delete_player_form_{selected}", clear_on_submit=False):
+                        delete_all_result_rows = st.checkbox(
+                            "結果登録内のこの選手の行も削除する",
+                            value=False,
+                            key=f"delete_all_result_rows_{selected}",
+                        )
+                        confirm_player_name = st.text_input(
+                            "確認のため選手名を入力",
+                            placeholder=selected,
+                            key=f"confirm_delete_player_name_{selected}",
+                        )
+                        delete_player_submitted = st.form_submit_button(
+                            f"{selected} の選手情報を一括削除",
+                            type="primary", use_container_width=True
+                        )
                     normalized_confirm = re.sub(r"[\s　]+", "", confirm_player_name or "")
                     normalized_selected = re.sub(r"[\s　]+", "", selected or "")
                     can_delete_all = normalized_confirm == normalized_selected and bool(normalized_selected)
-                    if st.button(
-                        f"{selected} の選手情報を一括削除",
-                        type="primary",
-                        use_container_width=True,
-                        disabled=not can_delete_all,
-                        key=f"delete_all_player_button_{selected}",
-                    ):
-                        result = engine.v46_delete_player_all(
-                            selected, engine.DB_PATH, delete_result_rows=delete_all_result_rows
-                        )
-                        if result.get("deleted"):
-                            ok, msg = push_db_to_github(f"AutoRaceAI: {selected} の選手情報を一括削除")
-                            detail = " / ".join(f"{k}:{v}" for k, v in result.get("counts", {}).items() if v)
-                            if ok:
-                                st.success(result.get("message", "削除しました。") + (f" ({detail})" if detail else "") + " " + msg)
-                            else:
-                                st.warning(result.get("message", "削除しました。") + (f" ({detail})" if detail else "") + " GitHub保存は未完了です。" + msg)
-                            st.rerun()
+                    if delete_player_submitted:
+                        if not can_delete_all:
+                            st.warning("確認欄へ選手名を正しく入力してください。")
                         else:
-                            st.warning(result.get("message", "削除対象がありませんでした。"))
+                            result = engine.v46_delete_player_all(
+                                selected, engine.DB_PATH, delete_result_rows=delete_all_result_rows
+                            )
+                            if result.get("deleted"):
+                                _clear_registration_view_cache()
+                                ok, msg = push_db_to_github(f"AutoRaceAI: {selected} の選手情報を一括削除")
+                                detail = " / ".join(f"{k}:{v}" for k, v in result.get("counts", {}).items() if v)
+                                if ok:
+                                    st.success(result.get("message", "削除しました。") + (f" ({detail})" if detail else "") + " " + msg)
+                                else:
+                                    st.warning(result.get("message", "削除しました。") + (f" ({detail})" if detail else "") + " GitHub保存は未完了です。" + msg)
+                                st.rerun()
+                            else:
+                                st.warning(result.get("message", "削除対象がありませんでした。"))
 
                 st.divider()
                 st.subheader("DBメンテナンス")
