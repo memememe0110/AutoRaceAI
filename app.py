@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver110｜開催場重み完全遅延読込・選手登録照合エラー修正")
+st.caption("Ver111｜リセット軽量化・選手履歴遅延読込・予測重み保存値表示")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -213,6 +213,7 @@ def _clear_registration_view_cache() -> None:
     _cached_player_registration_index.clear()
     _cached_all_venue_weight_profiles.clear()
     _cached_venue_weight_profile.clear()
+    _cached_saved_venue_profile.clear()
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -225,6 +226,44 @@ def _cached_all_venue_weight_profiles(db_path: str, cache_token: tuple) -> pd.Da
 def _cached_venue_weight_profile(venue: str, db_path: str, cache_token: tuple) -> dict:
     del cache_token
     return engine.v92_venue_weight_profile(venue, db_path)
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _cached_saved_venue_profile(venue: str, db_path: str, cache_token: tuple) -> dict:
+    """再分析済みの保存値だけを高速取得する。履歴の再集計は行わない。"""
+    del cache_token
+    venue = str(venue or "").strip()
+    if not venue:
+        return {}
+    try:
+        with sqlite3.connect(db_path) as con:
+            row = con.execute(
+                "SELECT profile_json FROM venue_analysis_cache WHERE venue=?", (venue,)
+            ).fetchone()
+        if row and row[0]:
+            data = json.loads(row[0])
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _reset_prediction_inputs() -> None:
+    st.session_state["prediction_input_version"] = int(st.session_state.get("prediction_input_version", 0)) + 1
+    for key in ["last_prediction_view", "v111_prediction_weight_detail"]:
+        st.session_state.pop(key, None)
+
+
+def _reset_result_inputs() -> None:
+    st.session_state["result_input_version"] = int(st.session_state.get("result_input_version", 0)) + 1
+    for key in ["parsed_result", "last_result_report"]:
+        st.session_state.pop(key, None)
+
+
+def _reset_player_inputs() -> None:
+    st.session_state["player_input_version"] = int(st.session_state.get("player_input_version", 0)) + 1
+    for key in ["parsed_player_history", "pending_player_history"]:
+        st.session_state.pop(key, None)
 
 def normalize_player_key(name: str) -> str:
     """DB照合用に空白と所属表記を除去した選手名キーを返す。"""
@@ -1223,10 +1262,10 @@ with prediction_tab:
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
         st.caption("Ver20では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
     st.session_state.setdefault("prediction_input_version", 0)
-    if st.button("🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input"):
-        st.session_state["prediction_input_version"] += 1
-        st.session_state.pop("last_prediction_view", None)
-        st.rerun()
+    st.button(
+        "🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input",
+        on_click=_reset_prediction_inputs,
+    )
     prediction_version = st.session_state["prediction_input_version"]
     text = st.text_area(
         "公式出走表を全文貼り付け",
@@ -1414,7 +1453,10 @@ with prediction_tab:
             with st.expander("🏟️ 今回の開催場重み・適用補正", expanded=True):
                 venue_name = str(meta.get("開催場") or "").strip()
                 try:
-                    profile = _cached_venue_weight_profile(venue_name, engine.DB_PATH, _db_cache_token(engine.DB_PATH))
+                    profile = _cached_saved_venue_profile(venue_name, engine.DB_PATH, _db_cache_token(engine.DB_PATH))
+                    if not profile:
+                        st.info("保存済みの開催場分析がありません。登録情報確認タブで一括再分析すると表示できます。")
+                        st.stop()
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("開催場", profile.get("開催場") or "未取得")
                     race_count = int(profile.get("レース数", 0) or 0)
@@ -1921,10 +1963,10 @@ with db_tab:
 with register_tab:
     st.subheader("選手情報を登録")
     st.session_state.setdefault("player_input_version", 0)
-    if st.button("🗑️ 選手入力をリセット", use_container_width=True, key="reset_player_input"):
-        st.session_state["player_input_version"] += 1
-        st.session_state.pop("parsed_player_history", None)
-        st.rerun()
+    st.button(
+        "🗑️ 選手入力をリセット", use_container_width=True, key="reset_player_input",
+        on_click=_reset_player_inputs,
+    )
     player_version = st.session_state["player_input_version"]
     player_name = st.text_input("選手名", placeholder="例：横田翔", key=f"player_name_input_{player_version}")
     show_player_registration_status(player_name)
@@ -2155,12 +2197,20 @@ with db_tab:
                 if names:
                     selected = st.selectbox("履歴を確認する選手", names)
                     show_all_history = st.checkbox("全履歴を表示", value=False, key=f"show_all_history_{selected}")
-                    history = _cached_player_history(
-                        engine.DB_PATH, cache_token, selected, canonical_count > 0, show_all_history
-                    )
-                    st.write(f"{selected}：履歴 {len(history)}件")
-                    display_history = history.drop(columns=[c for c in ["履歴ID", "履歴キー"] if c in history.columns], errors="ignore")
-                    st.dataframe(display_history, use_container_width=True, hide_index=True, height=430)
+                    history_key = f"v111_loaded_history::{selected}::{int(show_all_history)}"
+                    if st.button("選手履歴を読み込む", use_container_width=True, key=f"load_history_{selected}_{int(show_all_history)}"):
+                        with st.spinner(f"{selected}の履歴だけを読み込んでいます…"):
+                            st.session_state[history_key] = _cached_player_history(
+                                engine.DB_PATH, cache_token, selected, canonical_count > 0, show_all_history
+                            )
+                    history = st.session_state.get(history_key)
+                    if history is None:
+                        st.caption("選手名の選択だけでは履歴を取得しません。上のボタンを押した時だけ読み込みます。")
+                        history = pd.DataFrame()
+                    else:
+                        st.write(f"{selected}：履歴 {len(history)}件")
+                        display_history = history.drop(columns=[c for c in ["履歴ID", "履歴キー"] if c in history.columns], errors="ignore")
+                        st.dataframe(display_history, use_container_width=True, hide_index=True, height=430)
 
                     if not history.empty:
                         st.markdown("#### 🗑️ 誤登録した履歴を削除")
