@@ -18,7 +18,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver114｜解析ボタン直下ショートカット追加・Ver113修正対応")
+st.caption("Ver115｜予測完了後ショートカット・試走T未計測時エラー修正")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1257,8 +1257,6 @@ except Exception:
 prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
-    # スマホで長い予測結果へすぐ移動できるよう、予測タブ最上部にもショートカットを表示。
-    v73_section_nav()
     st.info("Ver20予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
     with st.expander("🔧 今回どこを調整したか"):
         st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
@@ -1353,8 +1351,6 @@ with prediction_tab:
             st.caption("自動検出された欠車はありません。必要な車番だけ選択してください。")
 
     prediction_clicked = st.button("解析して元版設定で予測", type="primary", use_container_width=True)
-    # 長い入力欄を通過した直後にも、予測結果の各位置へ移動できるショートカットを表示。
-    v73_section_nav()
     if prediction_clicked:
         if not text.strip():
             st.warning("出走表を貼り付けてください。")
@@ -1405,6 +1401,8 @@ with prediction_tab:
             excluded = {int(car): "手動指定" for car in view.get("excluded", [])}
             boundary = view.get("learning_boundary") or {}
             audit = view.get("future_audit") or {}
+            # ショートカットは予測結果が存在するときだけ表示する。
+            v73_section_nav()
             if audit:
                 status = audit.get("status", "OK")
                 if status == "OK":

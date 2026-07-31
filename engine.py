@@ -12843,7 +12843,14 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
         "開催場特徴根拠": "",
     }.items():
         out[col] = [default] * n
-    conf = float(profile.get("信頼度", 0.0))
+    def _v115_finite(value, default=0.0):
+        try:
+            value = float(value)
+        except Exception:
+            return float(default)
+        return value if np.isfinite(value) else float(default)
+
+    conf = _v115_finite(profile.get("信頼度", 0.0), 0.0)
     if n == 0 or conf <= 0.0:
         return out
     handicap = pd.to_numeric(out.get("ハンデ", pd.Series(0.0, index=out.index)), errors="coerce").fillna(0.0)
@@ -12857,11 +12864,11 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
     st_strength = _v84_rank01(out.get(st_col, pd.Series(np.nan, index=out.index)), True)
     track_temp = number((meta or {}).get("走路温度"), 30.0)
     hot_level = float(np.clip((track_temp - 48.0) / 8.0, 0.0, 1.0))
-    front_diff = float(profile.get("前残り差", 0.0))
-    chase_diff = float(profile.get("追込み3着内差", 0.0)) * 0.65 + float(profile.get("追込み1着差", 0.0)) * 0.35
-    trial_diff = float(profile.get("試走信頼差", 0.0))
-    st_diff = float(profile.get("ST影響差", 0.0))
-    hot_front = float(profile.get("高温前残り差", 0.0))
+    front_diff = _v115_finite(profile.get("前残り差", 0.0), 0.0)
+    chase_diff = _v115_finite(profile.get("追込み3着内差", 0.0), 0.0) * 0.65 + _v115_finite(profile.get("追込み1着差", 0.0), 0.0) * 0.35
+    trial_diff = _v115_finite(profile.get("試走信頼差", 0.0), 0.0)
+    st_diff = _v115_finite(profile.get("ST影響差", 0.0), 0.0)
+    hot_front = _v115_finite(profile.get("高温前残り差", 0.0), 0.0)
     # 最大でも約±0.9点。開催場だけで順位がひっくり返り過ぎないよう抑える。
     bonus = conf * (
         front_diff * (front_role - 0.35) * 2.2
@@ -12871,14 +12878,18 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
         + hot_front * hot_level * (front_role - 0.35) * 1.55
     )
     bonus = pd.Series(np.clip(bonus, -0.90, 0.90), index=out.index)
+    # 試走Tが全車「-」など、学習値にNaN/infが混じっても順位変換を止めない。
+    bonus = pd.to_numeric(bonus, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
     out["開催場特徴補正"] = bonus.round(3)
     venue = str(profile.get("開催場") or "")
     out["開催場特徴根拠"] = [
         f"{venue}{profile['レース数']}R・信頼{conf:.2f} / 前残り差{front_diff:+.2f} / 追込み差{chase_diff:+.2f} / 試走差{trial_diff:+.2f}"
     ] * n
     if "改善後総合点" in out.columns:
-        out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0) + bonus
+        score = pd.to_numeric(score, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = score
+        out["改善後順位"] = score.rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.40
     if "予測競走T" in out.columns:
