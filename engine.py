@@ -15029,3 +15029,77 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
         out["改善後順位"] = score.rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
         out["開催場学習安全フォールバック"] = True
     return _v116_apply_race_development(out, entries, meta)
+
+# ============================================================
+# Ver117: 予測時と結果登録時の出走数不一致を安全停止
+# ============================================================
+def v117_prediction_result_entry_count_check(meta, results, db_path=DB_PATH):
+    """保存済み予測と結果の出走数を比較する。
+
+    予測が未保存の場合は比較不能として一致扱いにし、従来どおり結果登録のみ許可する。
+    保存済み予測がある場合、車番の集合または出走数が異なれば分析・登録を停止する。
+    """
+    v34_init_feedback_tables(db_path)
+    key = v34_race_key(meta)
+    result_df = results.copy() if isinstance(results, pd.DataFrame) else pd.DataFrame(results)
+    result_cars = set()
+    if not result_df.empty and "車番" in result_df.columns:
+        result_cars = set(
+            pd.to_numeric(result_df["車番"], errors="coerce")
+            .dropna().astype(int).tolist()
+        )
+    with sqlite3.connect(str(db_path)) as con:
+        pred_rows = con.execute(
+            "SELECT car_no FROM prediction_snapshots WHERE race_key=? ORDER BY car_no",
+            (key,),
+        ).fetchall()
+    prediction_cars = {int(r[0]) for r in pred_rows if r and r[0] is not None}
+    prediction_exists = bool(prediction_cars)
+    same_count = (not prediction_exists) or len(prediction_cars) == len(result_cars)
+    same_cars = (not prediction_exists) or prediction_cars == result_cars
+    ok = bool(same_count and same_cars)
+    missing_in_result = sorted(prediction_cars - result_cars)
+    extra_in_result = sorted(result_cars - prediction_cars)
+    return {
+        "ok": ok,
+        "prediction_exists": prediction_exists,
+        "race_key": key,
+        "prediction_count": len(prediction_cars),
+        "result_count": len(result_cars),
+        "prediction_cars": sorted(prediction_cars),
+        "result_cars": sorted(result_cars),
+        "missing_in_result": missing_in_result,
+        "extra_in_result": extra_in_result,
+    }
+
+
+def _v117_raise_on_entry_count_mismatch(meta, results, db_path=DB_PATH):
+    check = v117_prediction_result_entry_count_check(meta, results, db_path)
+    if check["prediction_exists"] and not check["ok"]:
+        details = []
+        if check["missing_in_result"]:
+            details.append("結果にない車番=" + ",".join(map(str, check["missing_in_result"])))
+        if check["extra_in_result"]:
+            details.append("予測にない車番=" + ",".join(map(str, check["extra_in_result"])))
+        suffix = (" / " + " / ".join(details)) if details else ""
+        raise ValueError(
+            "予測時と結果登録時の出走数が一致しないため、登録・分析を停止しました。"
+            f" 予測={check['prediction_count']}車、結果={check['result_count']}車{suffix}。"
+            "同じ日付・開催場・レース番号の出走表と結果を使用しているか確認してください。"
+        )
+    return check
+
+
+_v117_original_v41_register_result = v41_register_result
+
+def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    _v117_raise_on_entry_count_mismatch(meta, results, db_path)
+    return _v117_original_v41_register_result(meta, results, laps, payouts, db_path)
+
+
+_v117_original_v70_replace_registered_result = v70_replace_registered_result
+
+def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    # 置換処理は既存結果を削除する前に必ず照合する。
+    _v117_raise_on_entry_count_mismatch(meta, results, db_path)
+    return _v117_original_v70_replace_registered_result(meta, results, laps, payouts, db_path)

@@ -1415,17 +1415,51 @@ with prediction_tab:
                 with st.expander("未来データ監査の内訳", expanded=False):
                     events = audit.get("events", [])
                     if events:
-                        st.dataframe(pd.DataFrame(events).drop(columns=["details"], errors="ignore"), use_container_width=True, hide_index=True)
+                        event_df = pd.DataFrame(events)
+                        for col in ["total", "used", "excluded", "future_excluded", "violations"]:
+                            if col not in event_df.columns:
+                                event_df[col] = 0
+                            event_df[col] = pd.to_numeric(event_df[col], errors="coerce").fillna(0).astype(int)
+                        # 同じ種類の履歴が何十行も並ばないよう、参照元ごとに集約する。
+                        summary_df = (
+                            event_df.groupby("source", dropna=False)[["total", "used", "excluded", "future_excluded", "violations"]]
+                            .sum().reset_index()
+                            .rename(columns={
+                                "source": "参照元", "total": "確認件数", "used": "使用件数",
+                                "excluded": "除外合計", "future_excluded": "対象レース以降の除外",
+                                "violations": "除外後の混入"
+                            })
+                        )
+                        summary_df["通常除外"] = (
+                            summary_df["除外合計"] - summary_df["対象レース以降の除外"]
+                        ).clip(lower=0)
+                        summary_df = summary_df[[
+                            "参照元", "確認件数", "使用件数", "通常除外",
+                            "対象レース以降の除外", "除外後の混入"
+                        ]]
+                        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                        st.caption(
+                            "通常除外＝欠損・異常値・学習条件外など。対象レース以降の除外＝未来データとして安全に外した件数。"
+                            "除外後の混入が0件なら、未来データは予測に使われていません。"
+                        )
+                        detail_lines = []
                         for ev in events:
                             if ev.get("details"):
-                                st.caption(f"{ev.get('source')}: " + " / ".join(ev.get("details", [])))
+                                detail_lines.extend([f"{ev.get('source')}: {x}" for x in ev.get("details", [])])
+                        if detail_lines:
+                            st.caption("未来除外の例：" + " / ".join(detail_lines[:20]))
                     else:
                         st.caption("監査対象の履歴はありませんでした。")
             if boundary:
+                # 旧boundaryカウンターは count_stats=False の参照を数えないため、監査実績から表示する。
+                checked = int(audit.get("total_checked", 0)) if audit else int(boundary.get("used_rows", 0)) + int(boundary.get("excluded_rows", 0))
+                used_rows = int(audit.get("used", 0)) if audit else int(boundary.get("used_rows", 0))
+                future_rows = int(audit.get("future_excluded", 0)) if audit else int(boundary.get("excluded_rows", 0))
+                normal_excluded = max(0, int(audit.get("excluded", 0)) - future_rows) if audit else 0
                 st.info(
                     f"🕒 学習境界：{boundary.get('label', '')}｜"
-                    f"使用 {int(boundary.get('used_rows', 0))}件｜"
-                    f"対象レース以降を除外 {int(boundary.get('excluded_rows', 0))}件"
+                    f"確認 {checked}件｜境界内で使用 {used_rows}件｜"
+                    f"通常除外 {normal_excluded}件｜対象レース以降を除外 {future_rows}件"
                 )
                 if int(boundary.get('unknown_r_same_day_excluded', 0)):
                     st.caption(
@@ -1738,6 +1772,46 @@ with result_tab:
         else:
             st.caption("払戻金は見つかりませんでした。")
 
+        # 保存済み予測と結果の出走数・車番を照合する。
+        # 不一致時は、登録・予測差分析・重み調整・履歴追加を開始しない。
+        entry_count_check = {
+            "ok": True,
+            "prediction_exists": False,
+            "prediction_count": 0,
+            "result_count": int(rows_r["車番"].nunique()) if "車番" in rows_r.columns else len(rows_r),
+        }
+        try:
+            entry_count_check = engine.v117_prediction_result_entry_count_check(meta_r, rows_r, engine.DB_PATH)
+        except Exception as exc:
+            st.warning(f"出走数の照合を実行できませんでした: {exc}")
+
+        entry_count_mismatch = bool(
+            entry_count_check.get("prediction_exists") and not entry_count_check.get("ok")
+        )
+        if entry_count_check.get("prediction_exists"):
+            if entry_count_mismatch:
+                missing = entry_count_check.get("missing_in_result", [])
+                extra = entry_count_check.get("extra_in_result", [])
+                detail_parts = []
+                if missing:
+                    detail_parts.append("結果にない車番: " + ", ".join(map(str, missing)))
+                if extra:
+                    detail_parts.append("予測にない車番: " + ", ".join(map(str, extra)))
+                detail_text = " / ".join(detail_parts)
+                st.error(
+                    "⛔ 予測時と結果登録時の出走数または車番が一致しません。"
+                    f"予測は {entry_count_check.get('prediction_count', 0)}車、"
+                    f"結果は {entry_count_check.get('result_count', 0)}車です。"
+                    + (f"（{detail_text}）" if detail_text else "")
+                )
+                st.info("同じ日付・開催場・レース番号の出走表と結果を確認してください。不一致のままでは登録・分析・学習を実行しません。")
+            else:
+                st.success(
+                    f"✅ 予測と結果の出走数を確認しました：{entry_count_check.get('result_count', 0)}車"
+                )
+        else:
+            st.caption("同じレースの保存済み予測がないため、出走数比較は行わず結果登録のみ可能です。")
+
         result_exists = False
         existing_result_key = ""
         existing_registered_at = None
@@ -1758,7 +1832,7 @@ with result_tab:
                 st.info("再登録では、古い結果データを削除してから今回の内容を登録し直します。")
 
         button_label = "登録済み結果を置き換えて再解析" if replace_registered else "DBへ登録して予測差・展開を解析"
-        button_disabled = bool(result_exists and not replace_registered)
+        button_disabled = bool((result_exists and not replace_registered) or entry_count_mismatch)
         if st.button(button_label, type="primary", use_container_width=True, disabled=button_disabled):
             try:
                 if replace_registered:
