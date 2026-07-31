@@ -5964,7 +5964,10 @@ def v24_apply_race_context_bonus(df, entries=None, track_temp=30.0):
 
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + total
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        _v116_score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        _v116_fallback = pd.to_numeric(out.get("開催場補正前総合点", pd.Series(0.0, index=out.index)), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = _v116_score.fillna(_v116_fallback).fillna(0.0)
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
     # シミュレーションが参照する当日指数にも小さく反映。二重加点を避けて0.35倍。
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + total * 0.35
@@ -6132,7 +6135,10 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
     out["条件適性信頼度"] = confidences
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0)+bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        _v116_score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        _v116_fallback = pd.to_numeric(out.get("開催場補正前総合点", pd.Series(0.0, index=out.index)), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = _v116_score.fillna(_v116_fallback).fillna(0.0)
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0)+bonus*.42
     if "予測競走T" in out.columns:
@@ -6318,7 +6324,10 @@ def v59_apply_escape_history(df, entries=None, meta=None, db_path=None):
     bonus_s = pd.to_numeric(out["逃げ履歴補正"], errors="coerce").fillna(0.0)
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus_s
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        _v116_score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        _v116_fallback = pd.to_numeric(out.get("開催場補正前総合点", pd.Series(0.0, index=out.index)), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = _v116_score.fillna(_v116_fallback).fillna(0.0)
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus_s * 0.34
     if "予測競走T" in out.columns:
@@ -11009,7 +11018,10 @@ def v24_apply_race_context_bonus(df, entries=None, track_temp=30.0):
     out["近10走勢い補正"] = np.round(bonus, 3)
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        _v116_score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        _v116_fallback = pd.to_numeric(out.get("開催場補正前総合点", pd.Series(0.0, index=out.index)), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = _v116_score.fillna(_v116_fallback).fillna(0.0)
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.30
     if "予測競走T" in out.columns:
@@ -11229,7 +11241,10 @@ def v65_apply_weather_condition_learning(df, entries=None, meta=None, db_path=No
     out["天候適性根拠"] = reasons
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        _v116_score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        _v116_fallback = pd.to_numeric(out.get("開催場補正前総合点", pd.Series(0.0, index=out.index)), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = _v116_score.fillna(_v116_fallback).fillna(0.0)
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.38
     if "予測競走T" in out.columns:
@@ -13521,7 +13536,7 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
 
     if "改善後総合点" in out.columns:
         out["開催場補正前総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0)
-        out["開催場補正前順位"] = out["開催場補正前総合点"].rank(method="min", ascending=False).astype(int)
+        out["開催場補正前順位"] = out["開催場補正前総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
     if "予測競走T" in out.columns:
         out["開催場補正前予測T"] = pd.to_numeric(out["予測競走T"], errors="coerce")
 
@@ -13571,7 +13586,10 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
 
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = out["開催場補正前総合点"] + bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        _v116_score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        _v116_fallback = pd.to_numeric(out.get("開催場補正前総合点", pd.Series(0.0, index=out.index)), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = _v116_score.fillna(_v116_fallback).fillna(0.0)
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
         out["開催場補正後総合点"] = out["改善後総合点"]
         out["開催場補正後順位"] = out["改善後順位"]
         out["開催場順位変化"] = out["開催場補正前順位"] - out["開催場補正後順位"]
@@ -13871,7 +13889,10 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
     # 旧補正に追加し、最終列を更新。
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + total_extra_bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        _v116_score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        _v116_fallback = pd.to_numeric(out.get("開催場補正前総合点", pd.Series(0.0, index=out.index)), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = _v116_score.fillna(_v116_fallback).fillna(0.0)
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
         out["開催場補正後総合点"] = out["改善後総合点"]
         out["開催場補正後順位"] = out["改善後順位"]
         if "開催場補正前順位" in out.columns:
@@ -14873,3 +14894,138 @@ def v105_batch_progress(db_path=DB_PATH):
             )
         except Exception:
             return pd.DataFrame()
+
+
+# ============================================================
+# Ver116: NaN安全化 + 前方ライバル / 逃げ残り展開指数
+# ============================================================
+_V116_BASE_APPLY_VENUE = v84_apply_venue_learning
+
+
+def _v116_numeric_series(df, names, default=0.0):
+    """候補列の最初の存在列を有限数値Seriesとして返す。"""
+    for name in names:
+        if name in df.columns:
+            x = pd.to_numeric(df[name], errors="coerce").replace([np.inf, -np.inf], np.nan)
+            return x
+    return pd.Series(default, index=df.index, dtype=float)
+
+
+def _v116_rank_strength(series, lower_is_better=False, neutral=0.5):
+    """0..1の強さへ変換。全欠損や同値では中立値を返す。"""
+    x = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    valid = x.notna()
+    if int(valid.sum()) < 2 or x[valid].nunique() <= 1:
+        return pd.Series(float(neutral), index=x.index, dtype=float)
+    r = x.rank(method="average", ascending=lower_is_better, pct=True, na_option="keep")
+    # ascending=Trueでは小さい値のpctが小さいので反転し、常に大きいほど強いへ統一。
+    if lower_is_better:
+        r = 1.0 - r + (1.0 / max(int(valid.sum()), 1))
+    return pd.to_numeric(r, errors="coerce").fillna(float(neutral)).clip(0.0, 1.0)
+
+
+def _v116_apply_race_development(out, entries=None, meta=None):
+    """固定的な少頭数補正ではなく、前方選手の強さに応じた小幅な展開補正。"""
+    if out is None or len(out) == 0:
+        return out
+    out = out.copy()
+    idx = out.index
+    n = len(out)
+
+    handicap = _v116_numeric_series(out, ["ハンデ", "handicap"], 0.0).fillna(0.0)
+    base_score = _v116_numeric_series(out, ["改善後総合点", "総合点", "当日レース指数"], 0.0)
+    base_score = base_score.fillna(base_score.median() if base_score.notna().any() else 0.0)
+    score_strength = _v116_rank_strength(base_score, lower_is_better=False)
+
+    pred_t = _v116_numeric_series(out, ["予測競走T", "平均競走T", "競走T"], np.nan)
+    time_strength = _v116_rank_strength(pred_t, lower_is_better=True)
+    trial = _v116_numeric_series(out, ["試走T", "当日試走T", "平均試走T"], np.nan)
+    # 全員未計測のときは中立。これが今回の「-」入力の重要な安全策。
+    trial_strength = _v116_rank_strength(trial, lower_is_better=True, neutral=0.5)
+    st = _v116_numeric_series(out, ["ST", "平均ST", "想定ST"], np.nan)
+    st_strength = _v116_rank_strength(st, lower_is_better=True, neutral=0.5)
+
+    overall = (score_strength * 0.42 + time_strength * 0.34 + trial_strength * 0.14 + st_strength * 0.10).clip(0.0, 1.0)
+    hmin = float(handicap.min()) if len(handicap) else 0.0
+    hmax = float(handicap.max()) if len(handicap) else hmin
+    span = max(hmax - hmin, 10.0)
+    front_role = (1.0 - (handicap - hmin) / span).clip(0.0, 1.0)
+
+    rival_index = pd.Series(0.0, index=idx, dtype=float)
+    escape_index = pd.Series(0.0, index=idx, dtype=float)
+    correction = pd.Series(0.0, index=idx, dtype=float)
+
+    for i in idx:
+        hi = float(handicap.loc[i])
+        ahead = handicap < hi
+        if bool(ahead.any()):
+            gaps = (hi - handicap[ahead]).clip(lower=1.0)
+            # 近い前方選手ほど壁になりやすい。10mを1.0として距離で減衰。
+            proximity = (10.0 / gaps).clip(upper=1.0)
+            wall = float((overall[ahead] * proximity).sum() / max(float(proximity.sum()), 1e-9))
+            density = min(float(ahead.sum()) / max(n - 1, 1), 1.0)
+            rival = np.clip(wall * (0.72 + 0.28 * density), 0.0, 1.0)
+            rival_index.loc[i] = rival
+            # 後方選手は強い前方壁があるほど減点。ただし最大でも小幅。
+            correction.loc[i] -= float(np.clip((rival - 0.50) * 0.48, -0.16, 0.24))
+
+        # 前方位置かつ自身が強い場合だけ逃げ残りを加点。単なる0m一律加点はしない。
+        escape = float(np.clip(front_role.loc[i] * (overall.loc[i] - 0.35) / 0.65, 0.0, 1.0))
+        escape_index.loc[i] = escape
+        correction.loc[i] += float(np.clip((escape - 0.22) * 0.30, -0.06, 0.20))
+
+    # 6車は補正を強めず、前方人数密度だけ上記へ反映。過学習防止で全体を小幅に制限。
+    correction = correction.clip(-0.30, 0.30).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    seconds = (-correction * 0.010).clip(-0.0030, 0.0030)
+
+    out["前方ライバル指数"] = rival_index.round(3)
+    out["逃げ残り指数"] = escape_index.round(3)
+    out["展開補正"] = correction.round(3)
+    out["展開補正秒"] = seconds.round(4)
+
+    if "改善後総合点" in out.columns:
+        safe_score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        fallback = base_score.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = safe_score.fillna(fallback).fillna(0.0) + correction
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(n).astype(int)
+        out["開催場補正後総合点"] = out["改善後総合点"]
+        out["開催場補正後順位"] = out["改善後順位"]
+        if "開催場補正前順位" in out.columns:
+            pre = pd.to_numeric(out["開催場補正前順位"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(n).astype(int)
+            out["開催場順位変化"] = pre - out["改善後順位"]
+
+    if "予測競走T" in out.columns:
+        safe_t = pd.to_numeric(out["予測競走T"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if safe_t.notna().any():
+            fallback_t = float(safe_t.median())
+        else:
+            fallback_t = 3.60
+        out["予測競走T"] = np.round(safe_t.fillna(fallback_t) + seconds, 4)
+        out["開催場補正後予測T"] = out["予測競走T"]
+
+    out["展開補正根拠"] = [
+        f"前方壁{rival_index.loc[i]:.2f} / 逃げ残り{escape_index.loc[i]:.2f} / 補正{correction.loc[i]:+.3f}"
+        for i in idx
+    ]
+    return out
+
+
+def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
+    """Ver116最終入口。既存開催場学習をNaN安全化し、展開指数を追加。"""
+    try:
+        out = _V116_BASE_APPLY_VENUE(df, entries, meta, db_path)
+    except (pd.errors.IntCastingNaNError, ValueError, TypeError):
+        # 旧世代内部で順位変換が落ちても予測全体を止めない安全弁。
+        out = df.copy()
+        if "改善後総合点" not in out.columns:
+            if "総合点" in out.columns:
+                out["改善後総合点"] = pd.to_numeric(out["総合点"], errors="coerce")
+            elif "当日レース指数" in out.columns:
+                out["改善後総合点"] = pd.to_numeric(out["当日レース指数"], errors="coerce")
+            else:
+                out["改善後総合点"] = pd.Series(np.arange(len(out), 0, -1), index=out.index, dtype=float)
+        score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = score
+        out["改善後順位"] = score.rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
+        out["開催場学習安全フォールバック"] = True
+    return _v116_apply_race_development(out, entries, meta)
