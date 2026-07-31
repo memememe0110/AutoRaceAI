@@ -7144,14 +7144,20 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 "trial_time": trial, "race_time": race_time, "start_time": st,
             }
             if race_no_value is not None:
-                # Rがある場合は従来どおり、選手＋日付＋場＋Rで確定。
+                # Rありは、まず選手＋日付＋場＋Rで確定する。
                 same_race = [r for r in candidates if _v45_norm_race_no(r["race_no"]) == _v45_norm_race_no(race_no_value)]
-                # Ver56: Rが入力された場合は、そのRだけで既存履歴を特定する。
-                # 候補にないRなら新しいレースとして登録し、数値一致では上書きしない。
+                # Ver113: 以前Rなしで登録された同一走行が1件だけ数値一致する場合は、
+                # 新規行を作らず、その既存行へRを補完する。
+                if not same_race:
+                    missing_r = [r for r in candidates if _v45_norm_race_no(r["race_no"]) is None]
+                    matched = _v48_find_same_race_without_r(missing_r, incoming_identity)
+                    if matched is not None:
+                        same_race = [matched]
             else:
-                # Ver56: Rなし行は、保存前の候補判定で必要なら保留へ回す。
-                # 数値一致による自動統合は行わない。
-                same_race = []
+                # Ver113: Rなしでも、同日・同場で数値が一意に一致する既存走行なら統合する。
+                # 複数候補など曖昧な場合は既存の保留処理へ任せ、新規誤統合はしない。
+                matched = _v48_find_same_race_without_r(candidates, incoming_identity)
+                same_race = [matched] if matched is not None else []
             target = same_race[0] if same_race else None
 
             candidate_row = {
