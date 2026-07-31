@@ -491,16 +491,25 @@ def show_v67_self_evaluation(meta: dict) -> None:
         f"現在の設定：三連単が上位累積{int(outlier_cutoff)}%以上だったレースを、実用ラインだけから除外"
     )
 
+    starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH)
     stats = engine.v72_ticket_feedback_stats(
         engine.DB_PATH,
         trifecta_outlier_cutoff=float(outlier_cutoff),
+        starter_count=starter_count,
     )
+    if starter_count:
+        st.info(f"今回と同じ **{int(starter_count)}車立て** の過去レースだけで累積確率ラインを計算しています。")
+    else:
+        st.warning("今回の出走数を特定できないため、出走数を混ぜた集計になっています。出走表の『○車』表記を確認してください。")
     if stats.empty:
-        st.info("結果照合データがまだありません。今後、予測後に結果を登録すると券種別の平均と強調ラインが育ちます。")
+        if starter_count:
+            st.info(f"{int(starter_count)}車立ての結果照合データがまだありません。結果登録が増えると専用ラインが育ちます。")
+        else:
+            st.info("結果照合データがまだありません。今後、予測後に結果を登録すると券種別の平均と強調ラインが育ちます。")
         return
 
     summary = stats[[
-        "券種", "レース数", "大外し除外",
+        "券種", "出走数", "レース数", "大外し除外",
         "90%カバー", "実用90%カバー",
         "95%カバー", "実用95%カバー",
         "20点以内レース数", "20点以内90%カバー",
@@ -582,7 +591,9 @@ def show_v67_self_evaluation(meta: dict) -> None:
                         f"{coverage}%地点の累積確率：{w20_value:.2f}%"
                     )
                     with st.expander(f"過去20点以内で的中した{within20_count}レースを確認"):
-                        w20_details = engine.v81_trifecta_within20_details(engine.DB_PATH)
+                        w20_details = engine.v81_trifecta_within20_details(
+                            engine.DB_PATH, starter_count=starter_count
+                        )
                         st.dataframe(
                             w20_details,
                             use_container_width=True,
@@ -604,20 +615,20 @@ def show_v67_self_evaluation(meta: dict) -> None:
                 cutoff = float(r[f"20点以内{coverage}%カバー"])
                 used = int(r["20点以内レース数"])
                 st.success(
-                    f"過去20点以内的中{coverage}%ライン：上位累積 {cutoff:.2f}%まで "
-                    f"（三連単が上位20点以内で的中した過去{used}レースから計算）"
+                    f"{int(starter_count) if starter_count else '同'}車立て・過去20点以内的中{coverage}%ライン：上位累積 {cutoff:.2f}%まで "
+                    f"（同じ出走数で三連単が上位20点以内だった過去{used}レースから計算）"
                 )
                 st.caption("このラインは『20点以内で当たるレースの累積位置』を見る指標で、全レースの的中率を表すものではありません。")
             elif line_mode == "実用ライン":
                 cutoff = float(r[f"実用{coverage}%カバー"])
                 used = int(r["実用レース数"])
                 st.success(
-                    f"実用{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで "
+                    f"{int(starter_count) if starter_count else '同'}車立て・実用{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで "
                     f"（全{sample}レース中 {used}レース使用・三連単{int(outlier_cutoff)}%以上のレース{excluded}件を除外）"
                 )
             else:
                 cutoff = float(r[f"{coverage}%カバー"])
-                st.info(f"全結果{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで（{sample}レースすべて使用）")
+                st.info(f"{int(starter_count) if starter_count else '同'}車立て・全結果{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで（{sample}レースすべて使用）")
 
             if excluded > 0:
                 with st.expander(f"三連単{int(outlier_cutoff)}%以上で除外した{excluded}レースを確認"):
@@ -625,6 +636,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
                         bet_type,
                         engine.DB_PATH,
                         trifecta_outlier_cutoff=float(outlier_cutoff),
+                        starter_count=starter_count,
                     )
                     st.dataframe(
                         details,

@@ -14373,3 +14373,186 @@ def v99_run_batch_predictions(records, trials=5000, seed=20260719, db_path=DB_PA
 # Ver101: 未来データ監査の誤停止修正
 # 検出して除外した件数と、除外後に残った漏れを分離。
 # ============================================================
+
+# ============================================================
+# Ver102: 6車立て・8車立てを分離した累積確率ライン
+# ============================================================
+
+def _v102_ticket_feedback_with_starters(db_path=DB_PATH):
+    """券種結果へ出走数を付与する。結果表を優先し、予測表を予備に使う。"""
+    v67_init_ticket_feedback_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        return pd.read_sql_query("""
+            WITH result_counts AS (
+                SELECT race_key, COUNT(DISTINCT car_no) AS starters
+                  FROM result_entries
+                 GROUP BY race_key
+            ), prediction_counts AS (
+                SELECT race_key, COUNT(DISTINCT car_no) AS starters
+                  FROM prediction_snapshots
+                 GROUP BY race_key
+            )
+            SELECT f.race_key, f.bet_type, f.actual_combination,
+                   f.predicted_rank, f.individual_probability,
+                   f.cumulative_probability, f.total_combinations,
+                   COALESCE(rc.starters, pc.starters) AS starters
+              FROM v67_ticket_feedback f
+              LEFT JOIN result_counts rc ON rc.race_key=f.race_key
+              LEFT JOIN prediction_counts pc ON pc.race_key=f.race_key
+             WHERE f.cumulative_probability IS NOT NULL
+        """, con)
+
+
+def v102_starter_count_for_meta(meta, db_path=DB_PATH):
+    """今回レースの出走数。出走表の値を優先し、保存済み予測から補完する。"""
+    meta = meta or {}
+    for key in ("出走数", "車数", "出走"):
+        try:
+            value = int(float(meta.get(key)))
+            if 2 <= value <= 8:
+                return value
+        except Exception:
+            pass
+    try:
+        race_key = v34_race_key(meta)
+        with sqlite3.connect(str(db_path)) as con:
+            for table in ("prediction_snapshots", "result_entries"):
+                row = con.execute(
+                    f"SELECT COUNT(DISTINCT car_no) FROM {table} WHERE race_key=?",
+                    (race_key,),
+                ).fetchone()
+                if row and row[0] and 2 <= int(row[0]) <= 8:
+                    return int(row[0])
+    except Exception:
+        pass
+    return None
+
+
+def v72_ticket_feedback_stats(
+    db_path=DB_PATH,
+    trifecta_outlier_cutoff=V78_DEFAULT_RACE_OUTLIER_TRIFECTA_CUTOFF,
+    starter_count=None,
+):
+    """今回と同じ出走数だけで、全結果・実用・20点以内ラインを集計する。"""
+    df = _v102_ticket_feedback_with_starters(db_path)
+    columns = [
+        "券種", "出走数", "レース数", "平均", "中央値",
+        "80%カバー", "90%カバー", "95%カバー",
+        "実用レース数", "大外し除外", "実用平均", "実用中央値",
+        "実用80%カバー", "実用90%カバー", "実用95%カバー",
+        "20点以内レース数", "20点以内平均", "20点以内中央値",
+        "20点以内80%カバー", "20点以内90%カバー", "20点以内95%カバー",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df["starters"] = pd.to_numeric(df["starters"], errors="coerce")
+    if starter_count is not None:
+        try:
+            starter_count = int(starter_count)
+            df = df[df["starters"] == starter_count].copy()
+        except Exception:
+            starter_count = None
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    excluded_races = _v77_coverline_excluded_races(
+        db_path,
+        trifecta_outlier_cutoff=trifecta_outlier_cutoff,
+    )
+    out = []
+    for bet_type, g in df.groupby("bet_type"):
+        work = g.copy()
+        work["cumulative_probability"] = pd.to_numeric(work["cumulative_probability"], errors="coerce")
+        work["predicted_rank"] = pd.to_numeric(work["predicted_rank"], errors="coerce")
+        work = work.dropna(subset=["cumulative_probability"])
+        work = work[work["cumulative_probability"].between(0.0, 100.0)]
+        if work.empty:
+            continue
+
+        vals = work["cumulative_probability"].astype(float)
+        practical_rows = work[~work["race_key"].astype(str).isin(excluded_races)].copy()
+        practical = practical_rows["cumulative_probability"].astype(float)
+        removed_count = int(work["race_key"].astype(str).isin(excluded_races).sum())
+
+        def q(series, value):
+            return float(series.quantile(value)) if not series.empty else np.nan
+
+        within20 = pd.Series(dtype=float)
+        if str(bet_type) == "3連単":
+            within20 = work.loc[
+                work["predicted_rank"].between(1, 20, inclusive="both"),
+                "cumulative_probability",
+            ].astype(float)
+
+        out.append({
+            "券種": bet_type,
+            "出走数": int(starter_count) if starter_count is not None else (
+                int(work["starters"].dropna().iloc[0]) if work["starters"].notna().any() else np.nan
+            ),
+            "レース数": int(len(vals)),
+            "平均": float(vals.mean()), "中央値": float(vals.median()),
+            "80%カバー": q(vals, .80), "90%カバー": q(vals, .90), "95%カバー": q(vals, .95),
+            "実用レース数": int(len(practical)), "大外し除外": removed_count,
+            "実用平均": float(practical.mean()) if not practical.empty else np.nan,
+            "実用中央値": float(practical.median()) if not practical.empty else np.nan,
+            "実用80%カバー": q(practical, .80), "実用90%カバー": q(practical, .90), "実用95%カバー": q(practical, .95),
+            "20点以内レース数": int(len(within20)),
+            "20点以内平均": float(within20.mean()) if not within20.empty else np.nan,
+            "20点以内中央値": float(within20.median()) if not within20.empty else np.nan,
+            "20点以内80%カバー": q(within20, .80), "20点以内90%カバー": q(within20, .90), "20点以内95%カバー": q(within20, .95),
+        })
+
+    order = {"2連単": 0, "2連複": 1, "3連複": 2, "3連単": 3}
+    if not out:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(out, columns=columns).sort_values(
+        "券種", key=lambda s: s.map(order)
+    ).reset_index(drop=True)
+
+
+def v81_trifecta_within20_details(db_path=DB_PATH, starter_count=None):
+    """今回と同じ出走数で、三連単20点以内的中レースを返す。"""
+    df = _v102_ticket_feedback_with_starters(db_path)
+    if df.empty:
+        return pd.DataFrame(columns=["レース", "出走数", "的中組み合わせ", "的中順位", "個別確率", "上位累積確率"])
+    df = df[(df["bet_type"] == "3連単") & pd.to_numeric(df["predicted_rank"], errors="coerce").between(1, 20)]
+    if starter_count is not None:
+        df = df[pd.to_numeric(df["starters"], errors="coerce") == int(starter_count)]
+    if df.empty:
+        return pd.DataFrame(columns=["レース", "出走数", "的中組み合わせ", "的中順位", "個別確率", "上位累積確率"])
+    return df.rename(columns={
+        "race_key": "レース", "starters": "出走数", "actual_combination": "的中組み合わせ",
+        "predicted_rank": "的中順位", "individual_probability": "個別確率",
+        "cumulative_probability": "上位累積確率",
+    })[["レース", "出走数", "的中組み合わせ", "的中順位", "個別確率", "上位累積確率"]].reset_index(drop=True)
+
+
+def v72_ticket_outlier_details(
+    bet_type,
+    db_path=DB_PATH,
+    trifecta_outlier_cutoff=V78_DEFAULT_RACE_OUTLIER_TRIFECTA_CUTOFF,
+    starter_count=None,
+):
+    """今回と同じ出走数で、大外し除外レースを返す。"""
+    df = _v102_ticket_feedback_with_starters(db_path)
+    if df.empty:
+        return pd.DataFrame(columns=["レース", "出走数", "的中組み合わせ", "予測順位", "上位累積確率", "三連単上位累積確率"])
+    tri = df[df["bet_type"] == "3連単"][["race_key", "cumulative_probability", "starters"]].rename(
+        columns={"cumulative_probability": "三連単上位累積確率"}
+    )
+    tri = tri[pd.to_numeric(tri["三連単上位累積確率"], errors="coerce") >= float(trifecta_outlier_cutoff)]
+    selected = df[df["bet_type"] == str(bet_type)][[
+        "race_key", "actual_combination", "predicted_rank", "cumulative_probability"
+    ]]
+    merged = tri.merge(selected, on="race_key", how="left")
+    if starter_count is not None:
+        merged = merged[pd.to_numeric(merged["starters"], errors="coerce") == int(starter_count)]
+    if merged.empty:
+        return pd.DataFrame(columns=["レース", "出走数", "的中組み合わせ", "予測順位", "上位累積確率", "三連単上位累積確率"])
+    return merged.rename(columns={
+        "race_key": "レース", "starters": "出走数", "actual_combination": "的中組み合わせ",
+        "predicted_rank": "予測順位", "cumulative_probability": "上位累積確率",
+    })[["レース", "出走数", "的中組み合わせ", "予測順位", "上位累積確率", "三連単上位累積確率"]].sort_values(
+        ["三連単上位累積確率", "レース"], ascending=[False, True]
+    ).reset_index(drop=True)
