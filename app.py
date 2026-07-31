@@ -8,7 +8,9 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -18,7 +20,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver115｜予測完了後ショートカット・試走T未計測時エラー修正")
+st.caption("Ver120｜開催タイトル優先の開催場自動判定・所属LG判定を除外")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -109,6 +111,37 @@ def v73_copy_box(title: str, text: str, key: str, height: int = 145) -> None:
     components.html(html, height=height + 105, scrolling=False)
 
 
+JST = ZoneInfo("Asia/Tokyo")
+
+
+def v119_to_jst_display(value: object) -> str:
+    """DBに保存されたUTC日時を日本時間表示へ変換する。日付だけの値は変更しない。"""
+    if value is None or pd.isna(value):
+        return ""
+    raw = str(value).strip()
+    if not raw or not re.search(r"[T\s]\d{1,2}:\d{2}", raw):
+        return raw
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return raw
+
+
+def v119_jst_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
+    """日時列だけを日本時間表示へ変換したコピーを返す。"""
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame
+    out = frame.copy()
+    for col in ["登録日時", "更新日時", "保存日時", "作成日時", "分析日時"]:
+        if col in out.columns:
+            out[col] = out[col].map(v119_to_jst_display)
+    return out
+
+
 def qident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
@@ -184,7 +217,7 @@ def _cached_player_history(db_path: str, cache_token: tuple, player_name: str, c
     limit_sql = "" if show_all else " LIMIT 100"
     with sqlite3.connect(db_path) as con:
         if canonical:
-            return pd.read_sql_query(
+            frame = pd.read_sql_query(
                 """
                 SELECT h.history_id AS 履歴ID, h.race_date AS 日付, h.venue AS 開催場, h.race_no AS レース,
                        h.finish AS 着順, h.surface AS 走路, h.handicap AS ハンデ,
@@ -193,7 +226,8 @@ def _cached_player_history(db_path: str, cache_token: tuple, player_name: str, c
                 FROM race_history h JOIN players p ON p.player_id=h.player_id
                 WHERE p.player_name=? ORDER BY h.race_date DESC, h.history_id DESC
                 """ + limit_sql, con, params=(player_name,))
-        return pd.read_sql_query(
+            return v119_jst_dataframe(frame)
+        frame = pd.read_sql_query(
             """
             SELECT history_key AS 履歴キー, race_date AS 日付, venue AS 開催場, race_type AS レース種別,
                    rank AS 着順, weather AS 天候, surface AS 走路,
@@ -205,6 +239,7 @@ def _cached_player_history(db_path: str, cache_token: tuple, player_name: str, c
             FROM v15_player_history_imports
             WHERE player_name=? ORDER BY race_date DESC, created_at DESC
             """ + limit_sql, con, params=(player_name,))
+        return v119_jst_dataframe(frame)
 
 
 def _clear_registration_view_cache() -> None:
@@ -1716,6 +1751,40 @@ with prediction_tab:
             st.error(f"保存済み予測の表示エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
 
+
+
+def v120_detect_result_venue_from_title(text: str) -> str:
+    """結果ページの開催タイトル・主催表記から開催場を判定する。
+
+    選手欄の「選手名(LG)」や「山陽/20m」のような所属表記は、
+    開催場とは無関係なので判定対象から明示的に除外する。
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+
+    # 着順表以降には選手所属が多数出るため、開催ヘッダー部分だけを見る。
+    header = re.split(r"(?:^|\n)\s*着順\s*\t?\s*車番|出走表オッズ結果レース結果", raw, maxsplit=1)[0]
+    header = header[:5000]
+
+    # 明示的な補助表記があれば最優先。
+    explicit = re.search(r"(?:開催場|場名)\s*[:：]\s*(川口|伊勢崎|浜松|飯塚|山陽)", header)
+    if explicit:
+        return explicit.group(1)
+
+    # 市営・主催タイトルを最優先する。山陽は正式名称「山陽小野田市営」に対応。
+    title_patterns = [
+        ("山陽", r"山陽小野田市営|山陽(?:オート)?(?:レース)?(?:場|開催|ミッドナイト|ナイター)"),
+        ("飯塚", r"飯塚市営|飯塚(?:オート)?(?:レース)?(?:場|開催|ミッドナイト|オーバーミッドナイト|ナイター)"),
+        ("浜松", r"浜松市営|浜松(?:オート)?(?:レース)?(?:場|開催|記念|ナイター)"),
+        ("川口", r"川口市営|川口(?:オート)?(?:レース)?(?:場|開催|ナイター)"),
+        ("伊勢崎", r"伊勢崎市営|伊勢崎(?:オート)?(?:レース)?(?:場|開催|ナイター)"),
+    ]
+    for venue, pattern in title_patterns:
+        if re.search(pattern, header):
+            return venue
+    return ""
+
 with result_tab:
     st.subheader("公式結果を登録して予測と比較")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
@@ -1726,20 +1795,44 @@ with result_tab:
             st.session_state.pop(key, None)
         st.rerun()
     result_version = st.session_state["result_input_version"]
-    c1, c2 = st.columns(2)
-    venue_override = c1.text_input("開催場（本文から取れない場合のみ）", key=f"result_venue_{result_version}")
-    race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key=f"result_race_no_{result_version}")
+    race_no_override = st.text_input(
+        "レース番号（本文から取れない場合のみ）",
+        key=f"result_race_no_{result_version}",
+    )
     result_text = st.text_area(
         "公式結果ページを全文貼り付け",
         height=620,
         key=f"official_result_text_{result_version}",
         placeholder="6R\n確定\n2026年7月21日(火)\n…\n着順 車番 選手名\n…\nグランドノート\n…\n払戻金\n…",
     )
+
+    detected_result_venue = v120_detect_result_venue_from_title(result_text)
+    venue_override = ""
+    if detected_result_venue:
+        st.success(f"開催場を開催タイトルから自動判定：{detected_result_venue}")
+        st.caption("選手の所属（LG）は開催場判定に使用していません。")
+    else:
+        venue_override = st.selectbox(
+            "開催場（開催タイトルから判定できないため選択してください）",
+            [""] + list(engine.V92_VENUES),
+            key=f"result_venue_{result_version}",
+            format_func=lambda x: "選択してください" if not x else x,
+        )
+        st.caption("開催タイトルで判定できない場合だけ手動選択します。選手の所属（LG）は判定に使いません。")
+
     if st.button("結果を解析", use_container_width=True):
         try:
+            selected_venue = detected_result_venue or venue_override
+            if not selected_venue:
+                st.warning("開催場を開催タイトルから読み取れませんでした。開催場を選択してから、もう一度『結果を解析』を押してください。")
+                st.stop()
             meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(
-                result_text, venue_override, race_no_override
+                result_text, selected_venue, race_no_override
             )
+            parsed_venue = str((meta_r or {}).get("開催場") or "").strip()
+            if not parsed_venue:
+                st.warning("開催場を確定できませんでした。開催場を選択してから、もう一度『結果を解析』を押してください。")
+                st.stop()
             st.session_state["v35_result_meta"] = meta_r
             st.session_state["v35_result_rows"] = rows_r
             st.session_state["v35_result_laps"] = laps_r
@@ -1822,7 +1915,7 @@ with result_tab:
 
         replace_registered = False
         if result_exists:
-            st.warning(f"このレースは登録済みです：{existing_result_key}（{existing_registered_at or '登録日時不明'}）")
+            st.warning(f"このレースは登録済みです：{existing_result_key}（{v119_to_jst_display(existing_registered_at) or '登録日時不明'}）")
             replace_registered = st.checkbox(
                 "登録済みの結果を、今回の内容で置き換える",
                 key=f"replace_result_{existing_result_key}",
@@ -2148,17 +2241,18 @@ with db_tab:
         if rebuild.get("失敗", 0):
             st.warning(f"一括分析完了：成功 {rebuild.get('成功', 0)}場｜失敗 {rebuild.get('失敗', 0)}場")
         else:
-            st.success(f"一括分析完了：5開催場を {rebuild.get('分析日時', '')} に更新しました。")
+            st.success(f"一括分析完了：5開催場を {v119_to_jst_display(rebuild.get('分析日時', ''))} （日本時間）に更新しました。")
         st.rerun()
 
     try:
         cached_venue = engine.v103_load_venue_analysis_cache(engine.DB_PATH)
         if not cached_venue.empty:
-            latest_time = str(cached_venue["分析日時"].max())
-            st.info(f"保存済み一括分析：{latest_time}｜{len(cached_venue)}開催場")
+            latest_time = v119_to_jst_display(cached_venue["分析日時"].max())
+            cached_venue_display = v119_jst_dataframe(cached_venue)
+            st.info(f"保存済み一括分析：{latest_time}（日本時間）｜{len(cached_venue)}開催場")
             with st.expander("保存済みの開催場分析結果", expanded=False):
                 st.dataframe(
-                    cached_venue,
+                    cached_venue_display,
                     use_container_width=True,
                     hide_index=True,
                     column_config={
