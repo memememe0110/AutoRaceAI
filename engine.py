@@ -12693,8 +12693,11 @@ def _v84_race_level_features(rows):
         rear = g[pd.to_numeric(g["ハンデ数値"], errors="coerce") == max_h]
         trial_ok = g.dropna(subset=["試走T"])
         st_ok = g.dropna(subset=["ST"])
-        trial_corr = trial_ok["試走T"].corr(trial_ok["着順"], method="spearman") if len(trial_ok) >= 4 else np.nan
-        st_corr = st_ok["ST"].corr(st_ok["着順"], method="spearman") if len(st_ok) >= 4 else np.nan
+        # pandas の method="spearman" は内部で SciPy を要求するため、
+        # AutoRaceAI 内蔵の順位相関を使用する。これにより Streamlit Cloud でも
+        # requirements.txt に scipy を追加せず開催場学習を実行できる。
+        trial_corr = _v39_spearman(trial_ok["試走T"], trial_ok["着順"]) if len(trial_ok) >= 4 else np.nan
+        st_corr = _v39_spearman(st_ok["ST"], st_ok["着順"]) if len(st_ok) >= 4 else np.nan
         out.append({
             "race_key": race_key,
             "開催場": str(g["開催場"].iloc[0] or "").strip(),
