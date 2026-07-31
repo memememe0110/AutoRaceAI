@@ -1932,6 +1932,44 @@ with register_tab:
 with db_tab:
     st.subheader("🏟️ 開催場別の学習重み")
     st.caption("第1層はレース番号なしでも全履歴を使用し、第2層だけ開催日・開催場・R単位で展開を学習します。")
+
+    st.markdown("#### 過去分の一括再分析")
+    st.caption("現在DBに登録されている全履歴を5開催場まとめて再計算し、分析日時と特徴値をDBへ保存します。結果登録や履歴追加後に実行してください。")
+    if st.button("開催場特徴を過去分まとめて再分析", type="primary", use_container_width=True, key="v103_rebuild_venue_analysis"):
+        with st.spinner("川口・伊勢崎・浜松・飯塚・山陽を再分析しています…"):
+            rebuild = engine.v103_rebuild_all_venue_analysis(engine.DB_PATH)
+        st.session_state["v103_last_venue_rebuild"] = rebuild
+        if rebuild.get("失敗", 0):
+            st.warning(f"一括分析完了：成功 {rebuild.get('成功', 0)}場｜失敗 {rebuild.get('失敗', 0)}場")
+        else:
+            st.success(f"一括分析完了：5開催場を {rebuild.get('分析日時', '')} に更新しました。")
+        st.rerun()
+
+    try:
+        cached_venue = engine.v103_load_venue_analysis_cache(engine.DB_PATH)
+        if not cached_venue.empty:
+            latest_time = str(cached_venue["分析日時"].max())
+            st.info(f"保存済み一括分析：{latest_time}｜{len(cached_venue)}開催場")
+            with st.expander("保存済みの開催場分析結果", expanded=False):
+                st.dataframe(
+                    cached_venue,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "全履歴反映率": st.column_config.ProgressColumn(format="%.1%%", min_value=0.0, max_value=1.0),
+                        "展開反映率": st.column_config.ProgressColumn(format="%.1%%", min_value=0.0, max_value=1.0),
+                        "試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
+                        "ST影響差": st.column_config.NumberColumn(format="%+.3f"),
+                        "ハンデ影響差": st.column_config.NumberColumn(format="%+.3f"),
+                        "タイム基準差秒": st.column_config.NumberColumn(format="%+.4f"),
+                        "試走本走差秒": st.column_config.NumberColumn(format="%+.4f"),
+                    },
+                )
+        else:
+            st.info("保存済みの一括分析はまだありません。上のボタンで初回分析を実行してください。")
+    except Exception as exc:
+        st.warning(f"保存済み開催場分析を読み込めませんでした: {exc}")
+
     try:
         venue_profiles = engine.v92_all_venue_weight_profiles(engine.DB_PATH)
         st.dataframe(
@@ -2160,7 +2198,7 @@ with db_tab:
                 try:
                     v97_health = engine.v97_database_health(engine.DB_PATH)
                     v97_summary = v97_health.get("summary", {})
-                    c1, c2, c3, c4 = st.columns(4)
+                    c1, c2, c3, c4, c5 = st.columns(5)
                     c1.metric("完全データ", f"{v97_summary.get('完全データ', 0)}R")
                     c2.metric("予測可能・未予測", f"{v97_summary.get('未予測', 0)}R")
                     c3.metric("結果未登録", f"{v97_summary.get('結果未登録', 0)}R")

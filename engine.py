@@ -14556,3 +14556,132 @@ def v72_ticket_outlier_details(
     })[["レース", "出走数", "的中組み合わせ", "予測順位", "上位累積確率", "三連単上位累積確率"]].sort_values(
         ["三連単上位累積確率", "レース"], ascending=[False, True]
     ).reset_index(drop=True)
+
+# ============================================================
+# Ver103: 開催場特徴の過去分一括再分析・キャッシュ保存
+# ============================================================
+
+def v103_init_venue_analysis_cache(db_path=DB_PATH):
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS venue_analysis_cache (
+                venue TEXT PRIMARY KEY,
+                analyzed_at TEXT NOT NULL,
+                full_history_rows INTEGER NOT NULL DEFAULT 0,
+                row_layer_rate REAL NOT NULL DEFAULT 0,
+                reconstructed_races INTEGER NOT NULL DEFAULT 0,
+                race_layer_rate REAL NOT NULL DEFAULT 0,
+                trial_reliability_diff REAL,
+                st_effect_diff REAL,
+                handicap_effect_diff REAL,
+                time_baseline_diff REAL,
+                trial_to_race_diff REAL,
+                front_remain_diff REAL,
+                chase_win_diff REAL,
+                chase_top3_diff REAL,
+                hot_front_diff REAL,
+                profile_json TEXT
+            )
+        """)
+        con.commit()
+
+
+def v103_rebuild_all_venue_analysis(db_path=DB_PATH):
+    """全開催場を現在DBの全履歴から再計算し、診断用キャッシュへ保存する。"""
+    import json
+    from datetime import datetime
+
+    v103_init_venue_analysis_cache(db_path)
+    analyzed_at = datetime.now().isoformat(timespec="seconds")
+    rows = []
+    errors = []
+    for venue in V92_VENUES:
+        try:
+            p = v92_venue_weight_profile(venue, db_path)
+            row = {
+                "開催場": venue,
+                "分析日時": analyzed_at,
+                "全履歴行数": int(p.get("開催場全履歴行数", p.get("全履歴行数", 0)) or 0),
+                "全履歴反映率": float(p.get("レース番号不要反映率", p.get("全履歴反映率", 0.0)) or 0.0),
+                "展開学習R": int(p.get("レース数", p.get("展開学習R", 0)) or 0),
+                "展開反映率": float(p.get("学習反映率", p.get("信頼度", 0.0)) or 0.0),
+                "試走信頼差": float(p.get("行単位試走信頼差", p.get("試走信頼差", 0.0)) or 0.0),
+                "ST影響差": float(p.get("行単位ST影響差", p.get("ST影響差", 0.0)) or 0.0),
+                "ハンデ影響差": float(p.get("行単位ハンデ影響差", p.get("ハンデ影響差", 0.0)) or 0.0),
+                "タイム基準差秒": float(p.get("開催場タイム基準差", p.get("タイム基準差秒", 0.0)) or 0.0),
+                "試走本走差秒": float(p.get("開催場試走本走差", p.get("試走本走差秒", 0.0)) or 0.0),
+                "前残り差": float(p.get("前残り差", 0.0) or 0.0),
+                "追込み1着差": float(p.get("追込み1着差", 0.0) or 0.0),
+                "追込み3着内差": float(p.get("追込み3着内差", 0.0) or 0.0),
+                "高温前残り差": float(p.get("高温前残り差", 0.0) or 0.0),
+            }
+            with sqlite3.connect(str(db_path)) as con:
+                con.execute("""
+                    INSERT INTO venue_analysis_cache (
+                        venue, analyzed_at, full_history_rows, row_layer_rate,
+                        reconstructed_races, race_layer_rate,
+                        trial_reliability_diff, st_effect_diff, handicap_effect_diff,
+                        time_baseline_diff, trial_to_race_diff, front_remain_diff,
+                        chase_win_diff, chase_top3_diff, hot_front_diff, profile_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(venue) DO UPDATE SET
+                        analyzed_at=excluded.analyzed_at,
+                        full_history_rows=excluded.full_history_rows,
+                        row_layer_rate=excluded.row_layer_rate,
+                        reconstructed_races=excluded.reconstructed_races,
+                        race_layer_rate=excluded.race_layer_rate,
+                        trial_reliability_diff=excluded.trial_reliability_diff,
+                        st_effect_diff=excluded.st_effect_diff,
+                        handicap_effect_diff=excluded.handicap_effect_diff,
+                        time_baseline_diff=excluded.time_baseline_diff,
+                        trial_to_race_diff=excluded.trial_to_race_diff,
+                        front_remain_diff=excluded.front_remain_diff,
+                        chase_win_diff=excluded.chase_win_diff,
+                        chase_top3_diff=excluded.chase_top3_diff,
+                        hot_front_diff=excluded.hot_front_diff,
+                        profile_json=excluded.profile_json
+                """, (
+                    venue, analyzed_at, row["全履歴行数"], row["全履歴反映率"],
+                    row["展開学習R"], row["展開反映率"], row["試走信頼差"],
+                    row["ST影響差"], row["ハンデ影響差"], row["タイム基準差秒"],
+                    row["試走本走差秒"], row["前残り差"], row["追込み1着差"],
+                    row["追込み3着内差"], row["高温前残り差"],
+                    json.dumps(p, ensure_ascii=False, default=str),
+                ))
+                con.commit()
+            rows.append(row)
+        except Exception as exc:
+            errors.append({"開催場": venue, "エラー": f"{type(exc).__name__}: {exc}"})
+    return {
+        "分析日時": analyzed_at,
+        "成功": len(rows),
+        "失敗": len(errors),
+        "results": rows,
+        "errors": errors,
+    }
+
+
+def v103_load_venue_analysis_cache(db_path=DB_PATH):
+    v103_init_venue_analysis_cache(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        df = pd.read_sql_query("""
+            SELECT venue AS 開催場, analyzed_at AS 分析日時,
+                   full_history_rows AS 全履歴行数,
+                   row_layer_rate AS 全履歴反映率,
+                   reconstructed_races AS 展開学習R,
+                   race_layer_rate AS 展開反映率,
+                   trial_reliability_diff AS 試走信頼差,
+                   st_effect_diff AS ST影響差,
+                   handicap_effect_diff AS ハンデ影響差,
+                   time_baseline_diff AS タイム基準差秒,
+                   trial_to_race_diff AS 試走本走差秒,
+                   front_remain_diff AS 前残り差,
+                   chase_win_diff AS 追込み1着差,
+                   chase_top3_diff AS 追込み3着内差,
+                   hot_front_diff AS 高温前残り差
+              FROM venue_analysis_cache
+             ORDER BY CASE venue
+                 WHEN '川口' THEN 1 WHEN '伊勢崎' THEN 2 WHEN '浜松' THEN 3
+                 WHEN '飯塚' THEN 4 WHEN '山陽' THEN 5 ELSE 99 END
+        """, con)
+    return df
