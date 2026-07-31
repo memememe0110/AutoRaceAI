@@ -13846,3 +13846,128 @@ def v92_applied_venue_corrections(prediction_df):
     if "開催場特徴補正" in out.columns:
         out = out.sort_values("開催場特徴補正", ascending=False)
     return out.reset_index(drop=True)
+
+
+# ============================================================
+# v9.7 DB健康診断：全選手データあり・未予測／結果未登録
+# ============================================================
+def _v97_norm_date(value):
+    digits = re.sub(r"[^0-9]", "", str(value or ""))[:8]
+    return digits if len(digits) == 8 else ""
+
+
+def _v97_norm_race_no(value):
+    text = str(value or "").strip()
+    m = re.search(r"(?<!\d)(\d{1,2})\s*R?", text, re.I)
+    if not m:
+        return ""
+    n = int(m.group(1))
+    return f"{n}R" if 1 <= n <= 12 else ""
+
+
+def _v97_key(race_date, venue, race_no):
+    d = _v97_norm_date(race_date)
+    v = str(venue or "").strip()
+    r = _v97_norm_race_no(race_no)
+    return f"{d}_{v}_{r}" if d and v and r else ""
+
+
+def v97_database_health(db_path=DB_PATH):
+    """全選手履歴がそろうレースを復元し、未予測・結果未登録を抽出する。"""
+    v34_init_feedback_tables(db_path)
+    rows = []
+    ambiguous = 0
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        hist = pd.read_sql_query("""
+            SELECT h.race_date, h.venue, h.race_no, h.starters,
+                   h.player_id, p.player_name, h.finish, h.trial_time,
+                   h.race_time, h.start_time, h.result_status
+            FROM race_history h
+            LEFT JOIN players p ON p.player_id=h.player_id
+            WHERE COALESCE(TRIM(h.race_date),'')<>''
+              AND COALESCE(TRIM(h.venue),'')<>''
+        """, con)
+        pred_keys = set()
+        for table in ("prediction_snapshots", "v40_prediction_feature_snapshots", "prediction_races"):
+            try:
+                pred_keys.update(str(r[0]) for r in con.execute(f"SELECT DISTINCT race_key FROM {table} WHERE race_key IS NOT NULL"))
+            except Exception:
+                pass
+        result_keys = set()
+        try:
+            result_keys.update(str(r[0]) for r in con.execute("SELECT DISTINCT race_key FROM result_races WHERE race_key IS NOT NULL"))
+        except Exception:
+            pass
+
+    if hist.empty:
+        return {
+            "summary": {"復元候補": 0, "完全データ": 0, "未予測": 0, "結果未登録": 0, "予測済結果未登録": 0, "識別不能": 0},
+            "predictable_unpredicted": [], "complete_missing_result": [],
+            "predicted_missing_result": [], "incomplete": []
+        }
+
+    hist["norm_date"] = hist["race_date"].map(_v97_norm_date)
+    hist["norm_race"] = hist["race_no"].map(_v97_norm_race_no)
+    ambiguous = int(((hist["norm_date"] == "") | (hist["norm_race"] == "")).sum())
+    valid = hist[(hist["norm_date"] != "") & (hist["norm_race"] != "")].copy()
+    if valid.empty:
+        return {
+            "summary": {"復元候補": 0, "完全データ": 0, "未予測": 0, "結果未登録": 0, "予測済結果未登録": 0, "識別不能": ambiguous},
+            "predictable_unpredicted": [], "complete_missing_result": [],
+            "predicted_missing_result": [], "incomplete": []
+        }
+
+    complete, incomplete = [], []
+    group_cols = ["norm_date", "venue", "norm_race"]
+    for (d, venue, race_no), g in valid.groupby(group_cols, dropna=False):
+        # 同じ選手の重複履歴は1人として扱う
+        g = g.sort_values("player_id").drop_duplicates(subset=["player_id"], keep="last")
+        registered = int(g["player_id"].nunique())
+        starters_values = pd.to_numeric(g["starters"], errors="coerce").dropna()
+        expected = int(starters_values.max()) if not starters_values.empty else registered
+        if expected < 4 or expected > 8:
+            expected = registered
+        key = _v97_key(d, venue, race_no)
+        if not key:
+            continue
+        names = [str(x).strip() for x in g["player_name"].fillna("").tolist() if str(x).strip()]
+        base = {
+            "開催日": f"{d[:4]}-{d[4:6]}-{d[6:8]}",
+            "開催場": str(venue),
+            "R": race_no,
+            "登録選手": registered,
+            "想定出走": expected,
+            "登録状況": f"{registered}/{expected}",
+            "予測": "済" if key in pred_keys else "未",
+            "結果": "登録済" if key in result_keys else "未登録",
+            "選手": "、".join(names),
+            "race_key": key,
+        }
+        if registered >= expected and expected >= 4:
+            complete.append(base)
+        else:
+            base["不足人数"] = max(0, expected - registered)
+            incomplete.append(base)
+
+    predictable_unpredicted = [r for r in complete if r["予測"] == "未"]
+    complete_missing_result = [r for r in complete if r["結果"] == "未登録"]
+    predicted_missing_result = [r for r in complete if r["予測"] == "済" and r["結果"] == "未登録"]
+
+    def _sort(items):
+        return sorted(items, key=lambda r: (r["開催日"], r["開催場"], int(re.sub(r"\D", "", r["R"]) or 0)), reverse=True)
+
+    return {
+        "summary": {
+            "復元候補": len(complete) + len(incomplete),
+            "完全データ": len(complete),
+            "未予測": len(predictable_unpredicted),
+            "結果未登録": len(complete_missing_result),
+            "予測済結果未登録": len(predicted_missing_result),
+            "識別不能": ambiguous,
+        },
+        "predictable_unpredicted": _sort(predictable_unpredicted),
+        "complete_missing_result": _sort(complete_missing_result),
+        "predicted_missing_result": _sort(predicted_missing_result),
+        "incomplete": _sort(incomplete),
+    }

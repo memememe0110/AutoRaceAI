@@ -2143,6 +2143,73 @@ with db_tab:
                     st.rerun()
 
                 st.divider()
+                st.subheader("予測・結果の登録漏れチェック")
+                st.caption("同じ開催日・開催場・Rに出走選手全員の履歴がそろっているレースを復元し、予測未保存や結果未登録を抽出します。")
+                try:
+                    v97_health = engine.v97_database_health(engine.DB_PATH)
+                    v97_summary = v97_health.get("summary", {})
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("完全データ", f"{v97_summary.get('完全データ', 0)}R")
+                    c2.metric("予測可能・未予測", f"{v97_summary.get('未予測', 0)}R")
+                    c3.metric("結果未登録", f"{v97_summary.get('結果未登録', 0)}R")
+                    c4.metric("予測済・結果未登録", f"{v97_summary.get('予測済結果未登録', 0)}R")
+
+                    unpredicted = v97_health.get("predictable_unpredicted", [])
+                    missing_result = v97_health.get("complete_missing_result", [])
+                    predicted_missing = v97_health.get("predicted_missing_result", [])
+                    incomplete = v97_health.get("incomplete", [])
+
+                    with st.expander(f"全選手データあり・予測未保存（{len(unpredicted)}R）", expanded=bool(unpredicted)):
+                        if unpredicted:
+                            df_unpred = pd.DataFrame(unpredicted)
+                            show_cols = [c for c in ["開催日", "開催場", "R", "登録状況", "結果", "選手"] if c in df_unpred.columns]
+                            st.dataframe(df_unpred[show_cols], use_container_width=True, hide_index=True)
+                            st.download_button(
+                                "未予測一覧をCSV保存",
+                                df_unpred.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="predictable_but_unpredicted.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.success("全選手データがそろったレースは、すべて予測保存済みです。")
+
+                    with st.expander(f"全選手データあり・結果未登録（{len(missing_result)}R）", expanded=False):
+                        if missing_result:
+                            df_missing = pd.DataFrame(missing_result)
+                            show_cols = [c for c in ["開催日", "開催場", "R", "登録状況", "予測", "選手"] if c in df_missing.columns]
+                            st.dataframe(df_missing[show_cols], use_container_width=True, hide_index=True)
+                            st.download_button(
+                                "結果未登録一覧をCSV保存",
+                                df_missing.to_csv(index=False).encode("utf-8-sig"),
+                                file_name="complete_data_missing_results.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.success("完全データのレースに結果登録漏れはありません。")
+
+                    with st.expander(f"予測済み・結果未登録だけ（{len(predicted_missing)}R）", expanded=False):
+                        if predicted_missing:
+                            df_pm = pd.DataFrame(predicted_missing)
+                            st.dataframe(df_pm[[c for c in ["開催日", "開催場", "R", "登録状況", "選手"] if c in df_pm.columns]], use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("該当レースはありません。")
+
+                    with st.expander(f"選手データ不足・人数不一致（{len(incomplete)}R）", expanded=False):
+                        if incomplete:
+                            df_inc = pd.DataFrame(incomplete)
+                            st.dataframe(df_inc[[c for c in ["開催日", "開催場", "R", "登録状況", "不足人数", "選手"] if c in df_inc.columns]], use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("該当レースはありません。")
+
+                    if v97_summary.get("識別不能", 0):
+                        st.caption(f"日付またはRを特定できず集計対象外となった履歴: {v97_summary.get('識別不能', 0)}行")
+                    st.info("『予測未保存』は、予測スナップショットがDBに残っていない状態です。過去に画面表示だけ行い、保存前の版で予測したレースも含まれる場合があります。")
+                except Exception as exc:
+                    st.warning(f"登録漏れチェックを実行できませんでした: {exc}")
+
+                st.divider()
                 st.subheader("事故レースの学習除外")
                 st.caption("落車・反則・周回誤認・失格・競走中止などが1台でもあるレースは、結果を残したままレース全体をAI学習から除外します。")
                 try:
