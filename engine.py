@@ -15328,3 +15328,105 @@ def v33_cleanup_duplicate_histories(db_path=DB_PATH):
         "deleted_imports": deleted_imports,
         "keep_rule": "詳細データ優先・同点ならレース番号あり優先",
     }
+
+# ============================================================
+# Ver131: 不足行のDB保存を直接実行し、保存後に実在確認
+# ============================================================
+def _v131_pending_candidate_r(value):
+    """R候補表示から、候補が1件だけならR番号を返す。"""
+    nums = sorted({int(x) for x in re.findall(r"(?<!\d)(\d{1,2})R", str(value or "")) if 1 <= int(x) <= 12})
+    return nums[0] if len(nums) == 1 else None
+
+
+def _v131_history_exists(con, row):
+    name = _v27_norm_player_name(row.get("選手名"))
+    player = _v32_find_player(con, name)
+    if not player:
+        return False
+    race_date = _v47_normalize_date(row.get("開催日"))
+    venue = _v47_normalize_venue(row.get("開催場"))
+    race_no = _v47_normalize_race_no(row.get("レース"))
+    if race_no is not None:
+        hit = con.execute(
+            "SELECT 1 FROM race_history WHERE player_id=? AND race_date=? AND venue=? AND CAST(race_no AS INTEGER)=? LIMIT 1",
+            (player[0], race_date, venue, race_no),
+        ).fetchone()
+        return bool(hit)
+    race_name = _v55_race_name_key(row.get("レース名"))
+    rows = con.execute(
+        "SELECT race_name FROM race_history WHERE player_id=? AND race_date=? AND venue=?",
+        (player[0], race_date, venue),
+    ).fetchall()
+    return bool(race_name and any(_v55_race_name_key(r[0]) == race_name for r in rows))
+
+
+def v131_save_pending_player_history(df, db_path=DB_PATH):
+    """編集済み不足行を保存し、SQLite上の実在まで確認して返す。
+
+    v47の保留判定を再度通すと、利用者が修正した行まで再保留になる経路があるため、
+    ここでは必須項目だけ検証後、最終保存関数へ直接渡す。
+    """
+    if df is None:
+        df = pd.DataFrame()
+    work = df.copy().reset_index(drop=True)
+    if work.empty:
+        return {"read": 0, "changed": 0, "skipped": 0, "pending_count": 0, "pending": pd.DataFrame(), "verified": 0}
+
+    # 操作内容を保存値へ反映。
+    for idx, row in work.iterrows():
+        action = str(row.get("重複処理") or "").strip()
+        race_no = _v47_normalize_race_no(row.get("レース"))
+        if action == "既存Rへ統合" and race_no is None:
+            race_no = _v131_pending_candidate_r(row.get("R候補"))
+            if race_no is not None:
+                work.at[idx, "レース"] = race_no
+        # 利用者が登録方法を確定した行は、v58の再保留を通さない。
+        if action in {"既存Rへ統合", "入力したRで新規登録"}:
+            work.at[idx, "_v58_duplicate_confirmed"] = True
+
+    cleaned = work.drop(columns=["保留理由", "R候補"], errors="ignore")
+    valid, pending = v47_validate_player_history(cleaned)
+
+    # 操作選択があるのにRが未入力なら、分かる理由を付けて保留へ戻す。
+    action_pending = []
+    keep_indices = []
+    for idx, row in valid.iterrows():
+        action = str(row.get("重複処理") or "").strip()
+        race_no = _v47_normalize_race_no(row.get("レース"))
+        if action in {"既存Rへ統合", "入力したRで新規登録"} and race_no is None:
+            hold = row.copy()
+            hold["保留理由"] = "登録方法を選択したためRの入力が必要です"
+            action_pending.append(hold)
+        else:
+            keep_indices.append(idx)
+    valid = valid.loc[keep_indices].reset_index(drop=True) if keep_indices else valid.iloc[0:0].copy()
+    if action_pending:
+        pending = pd.concat([pending, pd.DataFrame(action_pending)], ignore_index=True, sort=False)
+
+    changed = skipped = verified = 0
+    if not valid.empty:
+        # v47の保留ラッパーを通さず、実保存関数へ直接渡す。
+        changed, skipped = v15_save_player_history(valid, db_path=db_path)
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory = sqlite3.Row
+            missing_rows = []
+            for _, row in valid.iterrows():
+                if _v131_history_exists(con, row):
+                    verified += 1
+                else:
+                    hold = row.copy()
+                    hold["保留理由"] = "DB保存後の確認で履歴が見つかりませんでした"
+                    missing_rows.append(hold)
+            if missing_rows:
+                pending = pd.concat([pending, pd.DataFrame(missing_rows)], ignore_index=True, sort=False)
+
+    pending = v56_add_r_candidates(pending, db_path=db_path) if isinstance(pending, pd.DataFrame) else pd.DataFrame()
+    return {
+        "read": int(len(work)),
+        "changed": int(changed),
+        "skipped": int(skipped),
+        "verified": int(verified),
+        "pending_count": int(len(pending)),
+        "pending": pending.reset_index(drop=True),
+        "valid": valid,
+    }
