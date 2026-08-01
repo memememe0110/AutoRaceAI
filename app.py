@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver172｜補正競合を自動抑制＋予測安定度＋DB63基準")
+st.caption("Ver175｜補正競合を自動抑制＋予測安定度＋DB63基準")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -224,16 +224,44 @@ def v123_parse_general_schedule_text(text_value: str) -> tuple[date | None, time
             parsed_time = time(hour=hour, minute=minute)
             break
 
-    parsed_title = None
-    for raw_line in source.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if re.search(r"20\d{2}年|\d{1,2}:\d{2}|発走|開始|締切", line):
-            continue
-        if len(line) <= 60:
-            parsed_title = line
+    # 通知タイトルは出走表ヘッダーの開催名とレース番号から「川口3R」の形にする。
+    # 選手欄の所属LGを開催場として誤使用しないよう、「予想印」「着順」より前だけを見る。
+    schedule_header = re.split(r"(?:予想印|着順\s*車番|選手名\(LG\))", source, maxsplit=1)[0]
+    normalized_header = re.sub(r"[\s　]+", "", schedule_header)
+    venue_patterns = [
+        ("川口", ["川口市営", "川口ナイトレース", "川口ナイター", "川口開催"]),
+        ("伊勢崎", ["伊勢崎市営", "伊勢崎ナイトレース", "伊勢崎ナイター", "伊勢崎開催"]),
+        ("浜松", ["浜松市営", "浜松記念", "浜松開催"]),
+        ("山陽", ["山陽小野田市営", "山陽市営", "山陽ミッドナイト", "山陽開催"]),
+        ("飯塚", ["飯塚市営", "飯塚ミッドナイト", "飯塚開催"]),
+    ]
+    parsed_venue = ""
+    for venue, patterns in venue_patterns:
+        if any(pattern in normalized_header for pattern in patterns):
+            parsed_venue = venue
             break
+    if not parsed_venue:
+        header_candidates = [venue for venue in RESULT_VENUES if venue in normalized_header]
+        if len(header_candidates) == 1:
+            parsed_venue = header_candidates[0]
+
+    race_match = re.search(r"(?m)^\s*(\d{1,2})\s*[RＲ]\s*$", schedule_header)
+    if race_match is None:
+        race_match = re.search(r"(?:^|[^0-9])(\d{1,2})\s*[RＲ](?:[^0-9]|$)", schedule_header)
+
+    parsed_title = None
+    if parsed_venue and race_match:
+        parsed_title = f"{parsed_venue}{int(race_match.group(1))}R"
+    else:
+        for raw_line in source.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if re.search(r"20\d{2}年|\d{1,2}:\d{2}|発走|開始|締切", line):
+                continue
+            if len(line) <= 60:
+                parsed_title = line
+                break
 
     return parsed_date, parsed_time, parsed_title
 
@@ -285,7 +313,13 @@ def v123_schedule_ntfy_reminder(title: str, event_date: date, event_time: time, 
     return event_dt, notify_dt
 
 
-def _v139_ntfy_request(topic: str, message: str, *, notify_at: datetime | None = None) -> dict:
+def _v139_ntfy_request(
+    topic: str,
+    message: str,
+    *,
+    title: str = "一般予定通知",
+    notify_at: datetime | None = None,
+) -> dict:
     """ntfyへサーバー側から送信する。ブラウザCORSやiOS WebViewの影響を受けない。"""
     clean_topic = str(topic or "").strip()
     if not clean_topic:
@@ -298,7 +332,7 @@ def _v139_ntfy_request(topic: str, message: str, *, notify_at: datetime | None =
     endpoint = GENERAL_REMINDER_NTFY_BASE
     payload = {
         "topic": clean_topic,
-        "title": "一般予定通知",
+        "title": str(title or "一般予定通知").strip() or "一般予定通知",
         "message": str(message),
         "priority": 4,
         "tags": ["bell"],
@@ -363,7 +397,8 @@ def v123_render_general_reminder_tab() -> None:
             st.session_state["v139_reminder_date"] = parsed_date
         if parsed_time:
             st.session_state["v139_reminder_time"] = parsed_time
-        if parsed_title and not str(st.session_state.get("v139_reminder_title", "")).strip():
+        if parsed_title:
+            # 開催場＋レース番号を読めた場合は、古い予定名が残っていても更新する。
             st.session_state["v139_reminder_title"] = parsed_title
         if parsed_date or parsed_time:
             st.session_state["v139_reminder_message"] = ("success", "日付・締切時刻を自動入力しました。")
@@ -395,9 +430,11 @@ def v123_render_general_reminder_tab() -> None:
         if st.button("今すぐテスト", use_container_width=True, key="v139_test_ntfy"):
             try:
                 with st.spinner("テスト通知を送信中…"):
+                    test_title = str(st.session_state.get("v139_reminder_title", "")).strip() or "通知テスト"
                     reply = _v139_ntfy_request(
                         st.session_state.get("v139_reminder_topic", ""),
                         "一般予定通知の接続テストです。",
+                        title=test_title,
                     )
                 receipt = f" 受付ID: {reply.get('id')}" if reply.get("id") else ""
                 st.session_state["v139_reminder_message"] = ("success", f"テスト通知を送信しました。{receipt}")
@@ -439,13 +476,13 @@ def v123_render_general_reminder_tab() -> None:
                 with st.spinner("通知を予約中…"):
                     for minutes, notify_dt in notify_times:
                         message = (
-                            f"{title}\n"
                             f"締切{minutes}分前です。\n"
                             f"締切時刻: {event_dt.strftime('%Y/%m/%d %H:%M')}"
                         )
                         reply = _v139_ntfy_request(
                             st.session_state.get("v139_reminder_topic", ""),
                             message,
+                            title=title,
                             notify_at=notify_dt,
                         )
                         receipt = f" / 受付ID: {reply.get('id')}" if reply.get("id") else ""

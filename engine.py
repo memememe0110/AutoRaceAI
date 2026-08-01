@@ -17928,3 +17928,100 @@ try:
     _v170_cached_fast_compress.cache_clear()
 except Exception:
     pass
+
+# ============================================================
+# Ver176: 三連単の同一表裏ペアを3着集合でまとめる
+# ============================================================
+# 例: 3=7-6 / 3=7-4 / 3=7-2 / 3=7-1
+#     -> 3=7-1246
+# 完全BOXなど、先に選ばれた候補と重なる車番は除外できるよう、
+# 3着候補の部分集合も生成する。独自表記は使わない。
+_V176_BASE_FAST_CANDIDATES = _v170_fast_candidate_lines
+
+
+def _v170_fast_candidate_lines(target, bet_type):
+    from itertools import combinations
+
+    target = set(target)
+    base = _V176_BASE_FAST_CANDIDATES(target, bet_type)
+    candidates = {frozenset(expanded): line for expanded, line in base}
+
+    if bet_type != "3連単":
+        return [(set(combo_set), line) for combo_set, line in candidates.items()]
+
+    cars = sorted({car for combo in target for car in combo})
+
+    # 1・2着の表裏が揃っているペアについて、複数の3着を1行へまとめる。
+    # 部分集合も候補化することで、357BOXを先に採用した後でも
+    # 3=7-1246 のように残りだけを重複なく圧縮できる。
+    for a, b in combinations(cars, 2):
+        thirds = sorted(
+            c for c in cars
+            if c not in {a, b} and (a, b, c) in target and (b, a, c) in target
+        )
+        for size in range(2, len(thirds) + 1):
+            for group in combinations(thirds, size):
+                third_text = "".join(str(c) for c in group)
+                line = f"{a}={b}-{third_text}"
+                _v174_add_candidate(candidates, line, target, bet_type)
+
+    return [(set(combo_set), line) for combo_set, line in candidates.items()]
+
+
+# 候補生成規則を更新したため、以前の圧縮キャッシュを破棄する。
+try:
+    _v170_cached_fast_compress.cache_clear()
+except Exception:
+    pass
+
+# 読みやすさのため、三連単の完全3車BOXは通常候補より先に確保する。
+@functools.lru_cache(maxsize=256)
+def _v170_cached_fast_compress(target_tuple, bet_type):
+    target = set(target_tuple)
+    if not target:
+        return ()
+
+    candidates = _v170_fast_candidate_lines(target, bet_type)
+    uncovered = set(target)
+    selected = []
+
+    if bet_type == "3連単":
+        box_candidates = [
+            (expanded, line) for expanded, line in candidates
+            if re.fullmatch(r"[1-8]{3}BOX", line)
+        ]
+        box_candidates.sort(key=lambda item: (item[1],))
+        for expanded, line in box_candidates:
+            if expanded and expanded.issubset(uncovered):
+                selected.append(line)
+                uncovered.difference_update(expanded)
+
+    # 残りは、大きく覆い、同数なら短い候補を優先する。
+    candidates.sort(key=lambda item: (-len(item[0]), len(item[1]), item[1]))
+    while uncovered:
+        best = None
+        for expanded, line in candidates:
+            if re.fullmatch(r"[1-8]{3}BOX", line):
+                continue
+            if len(expanded) < 2 or not expanded.issubset(uncovered):
+                continue
+            score = (len(expanded), -len(line), line)
+            if best is None or score > best[0]:
+                best = (score, expanded, line)
+        if best is None:
+            break
+        _, expanded, line = best
+        selected.append(line)
+        uncovered.difference_update(expanded)
+
+    selected.extend(_v165_plain_lines(uncovered, bet_type))
+
+    covered = set()
+    for line in selected:
+        expanded = _v165_expand_formation_line(line, bet_type)
+        if not expanded or not expanded.issubset(target) or expanded & covered:
+            return tuple(_v165_plain_lines(target, bet_type))
+        covered.update(expanded)
+    if covered != target:
+        return tuple(_v165_plain_lines(target, bet_type))
+    return tuple(selected)
