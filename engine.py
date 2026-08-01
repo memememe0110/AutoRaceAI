@@ -16895,3 +16895,72 @@ def v40_save_prediction_features(meta, df, db_path=DB_PATH):
             ))
         con.commit()
     return key
+
+# ============================================================
+# Ver153: 結果・選手履歴登録後の適性自動更新
+# ============================================================
+_V153_BASE_SAVE_PLAYER_HISTORY = v47_save_player_history
+
+def v47_save_player_history(df, db_path=DB_PATH):
+    """選手履歴の一括保存後に、レース種別適性を1回だけ再構築する。"""
+    report = _V153_BASE_SAVE_PLAYER_HISTORY(df, db_path)
+    try:
+        changed = int(report.get("changed", 0)) if isinstance(report, dict) else 0
+        if changed > 0:
+            refresh = v151_rebuild_player_race_context_profiles(db_path)
+            report["race_context_refresh"] = refresh
+            report["race_context_updated"] = True
+        elif isinstance(report, dict):
+            report["race_context_updated"] = False
+    except Exception as exc:
+        if isinstance(report, dict):
+            report["race_context_updated"] = False
+            report["race_context_refresh_error"] = f"{type(exc).__name__}: {exc}"
+    return report
+
+
+def _v153_refresh_after_result(result, db_path=DB_PATH):
+    """結果保存完了後、種別適性とグランドノート相性を更新して結果辞書へ記録する。"""
+    try:
+        if not isinstance(result, tuple) or len(result) < 5:
+            return result
+        registration = result[4] if isinstance(result[4], dict) else {}
+        if registration.get("duplicate"):
+            return result
+
+        context_stats = v151_rebuild_player_race_context_profiles(db_path)
+        overtake_stats = v152_rebuild_overtake_matchups(db_path)
+
+        registration["race_context_updated"] = True
+        registration["race_context_refresh"] = context_stats
+        registration["overtake_matchups_updated"] = True
+        registration["overtake_matchups_refresh"] = overtake_stats
+
+        analysis = result[2] if len(result) > 2 and isinstance(result[2], dict) else None
+        if analysis is not None:
+            analysis["レース種別適性更新"] = int(context_stats.get("profiles", 0))
+            analysis["追い抜き相性更新"] = int(overtake_stats.get("pairs", 0))
+            analysis["追い抜き検出累計"] = int(overtake_stats.get("events", 0))
+        return result
+    except Exception as exc:
+        try:
+            registration = result[4] if isinstance(result, tuple) and len(result) > 4 and isinstance(result[4], dict) else None
+            if registration is not None:
+                registration["post_analysis_error"] = f"{type(exc).__name__}: {exc}"
+        except Exception:
+            pass
+        return result
+
+
+_V153_BASE_REGISTER_RESULT = v41_register_result
+
+def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    result = _V153_BASE_REGISTER_RESULT(meta, results, laps, payouts, db_path)
+    return _v153_refresh_after_result(result, db_path)
+
+
+_V153_BASE_REPLACE_RESULT = v70_replace_registered_result
+
+def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    result = _V153_BASE_REPLACE_RESULT(meta, results, laps, payouts, db_path)
+    return _v153_refresh_after_result(result, db_path)

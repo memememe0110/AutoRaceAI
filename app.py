@@ -26,7 +26,7 @@ _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver152｜グランドノート追い抜き相性・一般予定通知対応")
+st.caption("Ver153｜登録後のレース種別適性・追い抜き相性自動更新")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2208,6 +2208,15 @@ with result_tab:
                     h2.metric("重複スキップ", analysis.get("履歴重複スキップ", 0))
                     h3.metric("周回順位", analysis.get("周回履歴保存", 0))
                     st.caption("結果登録した競走T・試走T・ST・着順・ハンデ・走路条件は、次回以降の予測用選手履歴へ反映されます。")
+                    if registration.get("race_context_updated"):
+                        ctx_stats = registration.get("race_context_refresh", {})
+                        ov_stats = registration.get("overtake_matchups_refresh", {})
+                        st.success(
+                            f"追加分析も更新しました｜レース種別適性 {ctx_stats.get('profiles', 0)}件 / "
+                            f"追い抜き相性 {ov_stats.get('pairs', 0)}組"
+                        )
+                    elif registration.get("post_analysis_error"):
+                        st.warning("結果は登録しましたが、追加適性の更新でエラー: " + str(registration.get("post_analysis_error")))
                     st.caption("同一判定は開催日・開催場・レース番号で行います。レース名称は判定に使いません。同じレースは通常登録では重複を防止します。再登録を選んだ場合だけ、古い結果を今回の内容へ置き換えます。")
                     st.caption(f"順位分析対象: {analysis.get('分析対象', 0)}名 / 除外: {analysis.get('分析除外', 0)}名。着順なし・欠車・中止・失格などは順位分析から除外します。")
                     with st.spinner("③ GitHubへDBを保存しています…"):
@@ -2384,6 +2393,12 @@ with register_tab:
                 else:
                     full_text = text + "｜新規登録対象はありませんでした。"
                     level = "info"
+                if report.get("race_context_updated"):
+                    rs = report.get("race_context_refresh", {})
+                    full_text += f"｜レース種別適性 {rs.get('profiles', 0)}件を再分析"
+                elif report.get("race_context_refresh_error"):
+                    full_text += "｜適性再分析エラー: " + str(report.get("race_context_refresh_error"))
+                    level = "warning"
                 _set_sticky_notice("player_register_notice", level, full_text)
                 getattr(st, level, st.info)(full_text)
             except Exception as exc:
