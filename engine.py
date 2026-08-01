@@ -17861,3 +17861,70 @@ def v172_apply_correction_conflict_guard(df, entries=None, meta=None, db_path=DB
 def v151_apply_race_context_adaptation(df, entries=None, meta=None, db_path=DB_PATH):
     out = _V172_BASE_CONTEXT_APPLY(df, entries, meta, db_path)
     return v172_apply_correction_conflict_guard(out, entries, meta, db_path)
+
+# ============================================================
+# Ver174: 三連単の標準表記を保ったまま、分かりやすい部分を追加圧縮
+# ============================================================
+# 独自の「二車BOX」表記や、三連単なのに2ブロックしかない表記は使わない。
+# 3車完全BOXは「367BOX」、固定着がある対称フォーメーションは
+# 「367-367-4」のように、必ず1着-2着-3着が読める形で表す。
+_V174_BASE_FAST_CANDIDATES = _v170_fast_candidate_lines
+
+
+def _v174_add_candidate(candidates, line, target, bet_type):
+    expanded = _v165_expand_formation_line(line, bet_type)
+    if len(expanded) < 2 or not expanded.issubset(target):
+        return
+    # 三連単は完全BOX以外、必ず3ブロック表記に限定する。
+    if bet_type == "3連単" and not re.fullmatch(r"[1-8]{3}BOX", line):
+        parts = re.split(r"[=-]", line)
+        if len(parts) != 3 or any(not part for part in parts):
+            return
+    frozen = frozenset(expanded)
+    old = candidates.get(frozen)
+    # 同じ買い目集合なら、短くて読みやすい表記を優先。
+    rank = (len(line), line.count("="), line)
+    if old is None or rank < (len(old), old.count("="), old):
+        candidates[frozen] = line
+
+
+def _v170_fast_candidate_lines(target, bet_type):
+    """Ver170候補に、標準的な3連単BOX・対称フォーメーションを追加する。"""
+    from itertools import combinations, permutations
+
+    target = set(target)
+    base = _V174_BASE_FAST_CANDIDATES(target, bet_type)
+    candidates = {frozenset(expanded): line for expanded, line in base}
+
+    if bet_type != "3連単":
+        return [(set(combo_set), line) for combo_set, line in candidates.items()]
+
+    cars = sorted({car for combo in target for car in combo})
+
+    # 完全な3車BOXを最優先候補にする。
+    for group in combinations(cars, 3):
+        expanded = set(permutations(group, 3))
+        if expanded.issubset(target):
+            _v174_add_candidate(candidates, "".join(map(str, group)) + "BOX", target, bet_type)
+
+    # 2つの着順に同じ車番集合を置き、残り1着を固定する標準表記。
+    # 例: 367-367-4 / 4-367-367 / 367-4-367
+    for fixed_pos in range(3):
+        for fixed_car in cars:
+            available = [car for car in cars if car != fixed_car]
+            for size in range(2, len(available) + 1):
+                for group in combinations(available, size):
+                    group_text = "".join(map(str, group))
+                    parts = [group_text, group_text, group_text]
+                    parts[fixed_pos] = str(fixed_car)
+                    line = "-".join(parts)
+                    _v174_add_candidate(candidates, line, target, bet_type)
+
+    return [(set(combo_set), line) for combo_set, line in candidates.items()]
+
+
+# 旧キャッシュにVer170候補が残らないよう初期化する。
+try:
+    _v170_cached_fast_compress.cache_clear()
+except Exception:
+    pass
