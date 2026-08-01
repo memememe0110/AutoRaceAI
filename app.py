@@ -1349,6 +1349,20 @@ with st.sidebar:
     except Exception as exc:
         st.warning(f"DB情報を確認できません: {exc}")
 
+def _show_sticky_notice(key: str) -> None:
+    notice = st.session_state.get(key)
+    if not isinstance(notice, dict):
+        return
+    level = str(notice.get("level", "info"))
+    message = str(notice.get("message", ""))
+    if message:
+        getattr(st, level, st.info)(message)
+
+
+def _set_sticky_notice(key: str, level: str, message: str) -> None:
+    st.session_state[key] = {"level": level, "message": message}
+
+
 def render_last_result_analysis(view: dict) -> None:
     """登録後の解析結果を、再描画後もセッションから復元して表示する。"""
     if not isinstance(view, dict) or not view:
@@ -1397,9 +1411,24 @@ def render_last_result_analysis(view: dict) -> None:
         st.info(adjustment.get("note", "学習重みを更新しました。"))
 
 
+# 一般予定通知はメインタブから完全分離する。
+# launcher は fragment、通知本体は dialog 内で動くため、開閉・入力・予約で他画面を再実行しない。
+@st.dialog("🔔 一般予定の10分前通知", width="large")
+def _v132_general_reminder_dialog():
+    v123_render_general_reminder_tab()
+
+
+@st.fragment
+def _v132_general_reminder_launcher():
+    if st.button("🔔 一般予定通知を開く", use_container_width=True, key="v132_open_general_reminder"):
+        _v132_general_reminder_dialog()
+
+
+_v132_general_reminder_launcher()
+
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
-prediction_tab, result_tab, register_tab, db_tab, reminder_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認", "🔔 一般予定通知"])
+prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
 
 with prediction_tab:
     st.info("Ver20予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
@@ -1824,11 +1853,12 @@ with prediction_tab:
 
 with result_tab:
     st.subheader("公式結果を登録して予測と比較")
+    _show_sticky_notice("result_register_notice")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
     if st.button("🗑️ 結果入力をリセット", use_container_width=True, key="reset_result_input"):
         st.session_state["result_input_version"] += 1
-        for key in ["v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts", "v41_last_result_view"]:
+        for key in ["v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts", "v41_last_result_view", "result_register_notice"]:
             st.session_state.pop(key, None)
         st.rerun()
     result_version = st.session_state["result_input_version"]
@@ -1901,105 +1931,115 @@ with result_tab:
         button_disabled = bool(result_exists and not replace_registered)
         if st.button(button_label, type="primary", use_container_width=True, disabled=button_disabled):
             try:
-                if replace_registered:
-                    key, comparison, analysis, adjustment, registration = engine.v70_replace_registered_result(
-                        meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
-                    )
-                else:
-                    key, comparison, analysis, adjustment, registration = engine.v41_register_result(
-                        meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
-                    )
-                ticket_analysis = engine.v67_analyze_ticket_result(meta_r, rows_r, engine.DB_PATH)
+                with st.spinner("① SQLiteへ保存 → ② 予測差・展開を解析しています…"):
+                    if replace_registered:
+                        key, comparison, analysis, adjustment, registration = engine.v70_replace_registered_result(
+                            meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
+                        )
+                    else:
+                        key, comparison, analysis, adjustment, registration = engine.v41_register_result(
+                            meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
+                        )
+                    ticket_analysis = engine.v67_analyze_ticket_result(meta_r, rows_r, engine.DB_PATH)
                 if registration.get("duplicate"):
-                    st.warning(analysis.get("message", "このレースは登録済みです。"))
-                    st.stop()
-                if registration.get("replaced"):
-                    st.success(f"登録済み結果を置き換えました: {key}")
+                    duplicate_message = analysis.get("message", "このレースは登録済みです。")
+                    _set_sticky_notice("result_register_notice", "warning", duplicate_message)
+                    st.warning(duplicate_message)
                 else:
-                    st.success(f"結果を登録しました: {key}")
-                if registration.get("learning_excluded"):
-                    st.warning(
-                        "⚠️ 事故レースのためAI学習対象外です。"
-                        f" 理由: {registration.get('learning_exclusion_reason') or '事故・異常終了'}。"
-                        "結果・払戻金・グランドノートは保存しましたが、選手履歴学習・展開学習・重み更新には使いません。"
-                    )
-                show_v67_result_analysis(ticket_analysis)
-                predicted_trifecta_saved = ""
-                actual_trifecta_saved = ""
-                if "message" not in analysis:
-                    predicted_trifecta_saved = "→".join(map(str, comparison.sort_values("predicted_rank")["車番"].head(3).astype(int)))
-                    actual_trifecta_saved = "→".join(map(str, rows_r.sort_values("着順")["車番"].head(3).astype(int)))
-                st.session_state["v41_last_result_view"] = {
-                    "key": key,
-                    "comparison": comparison,
-                    "analysis": analysis,
-                    "adjustment": adjustment,
-                    "predicted_trifecta": predicted_trifecta_saved,
-                    "actual_trifecta": actual_trifecta_saved,
-                }
-                if "message" in analysis:
-                    st.warning(analysis["message"])
-                else:
-                    a, b, c = st.columns(3)
-                    a.metric("平均順位誤差", analysis["平均順位誤差"])
-                    b.metric("1着的中", "○" if analysis["1着的中"] else "×")
-                    c.metric("予測TOP3一致", f"{analysis['3着内一致数']}/3")
-                    show_cols = [x for x in ["着順", "車番", "選手名_x", "predicted_rank", "順位誤差", "win_prob", "top3_prob"] if x in comparison.columns]
-                    st.dataframe(comparison[show_cols], use_container_width=True, hide_index=True)
+                    if registration.get("replaced"):
+                        result_message = f"登録済み結果を置き換えました: {key}"
+                    else:
+                        result_message = f"結果を登録しました: {key}"
+                    _set_sticky_notice("result_register_notice", "success", result_message)
+                    st.success(result_message)
+                    if registration.get("learning_excluded"):
+                        st.warning(
+                            "⚠️ 事故レースのためAI学習対象外です。"
+                            f" 理由: {registration.get('learning_exclusion_reason') or '事故・異常終了'}。"
+                            "結果・払戻金・グランドノートは保存しましたが、選手履歴学習・展開学習・重み更新には使いません。"
+                        )
+                    show_v67_result_analysis(ticket_analysis)
+                    predicted_trifecta_saved = ""
+                    actual_trifecta_saved = ""
+                    if "message" not in analysis:
+                        predicted_trifecta_saved = "→".join(map(str, comparison.sort_values("predicted_rank")["車番"].head(3).astype(int)))
+                        actual_trifecta_saved = "→".join(map(str, rows_r.sort_values("着順")["車番"].head(3).astype(int)))
+                    st.session_state["v41_last_result_view"] = {
+                        "key": key,
+                        "comparison": comparison,
+                        "analysis": analysis,
+                        "adjustment": adjustment,
+                        "predicted_trifecta": predicted_trifecta_saved,
+                        "actual_trifecta": actual_trifecta_saved,
+                    }
+                    if "message" in analysis:
+                        st.warning(analysis["message"])
+                    else:
+                        a, b, c = st.columns(3)
+                        a.metric("平均順位誤差", analysis["平均順位誤差"])
+                        b.metric("1着的中", "○" if analysis["1着的中"] else "×")
+                        c.metric("予測TOP3一致", f"{analysis['3着内一致数']}/3")
+                        show_cols = [x for x in ["着順", "車番", "選手名_x", "predicted_rank", "順位誤差", "win_prob", "top3_prob"] if x in comparison.columns]
+                        st.dataframe(comparison[show_cols], use_container_width=True, hide_index=True)
 
-                lap_items = []
-                for label in ["1周目先頭", "ゴール先頭", "先頭交代回数", "最大順位上昇車", "最大順位上昇"]:
-                    if label in analysis:
-                        lap_items.append(f"{label}: {analysis[label]}")
-                if lap_items:
-                    st.info("展開解析｜" + " / ".join(lap_items))
+                    lap_items = []
+                    for label in ["1周目先頭", "ゴール先頭", "先頭交代回数", "最大順位上昇車", "最大順位上昇"]:
+                        if label in analysis:
+                            lap_items.append(f"{label}: {analysis[label]}")
+                    if lap_items:
+                        st.info("展開解析｜" + " / ".join(lap_items))
 
-                # 三連単は上位3車の順番が完全一致した場合だけ的中。
-                if "message" not in analysis:
-                    pred_trifecta = "→".join(map(str, comparison.sort_values("predicted_rank")["車番"].head(3).astype(int)))
-                    actual_trifecta = "→".join(map(str, rows_r.sort_values("着順")["車番"].head(3).astype(int)))
-                    exact_hit = pred_trifecta == actual_trifecta
-                    st.subheader("三連単の完全一致判定")
-                    t1, t2, t3 = st.columns(3)
-                    t1.metric("予測", pred_trifecta)
-                    t2.metric("実結果", actual_trifecta)
-                    t3.metric("三連単的中", "○" if exact_hit else "×")
-                    st.caption("1着だけ、TOP3の車が同じだけでは三連単的中にしません。順番まで完全一致のみ○です。")
+                    # 三連単は上位3車の順番が完全一致した場合だけ的中。
+                    if "message" not in analysis:
+                        pred_trifecta = "→".join(map(str, comparison.sort_values("predicted_rank")["車番"].head(3).astype(int)))
+                        actual_trifecta = "→".join(map(str, rows_r.sort_values("着順")["車番"].head(3).astype(int)))
+                        exact_hit = pred_trifecta == actual_trifecta
+                        st.subheader("三連単の完全一致判定")
+                        t1, t2, t3 = st.columns(3)
+                        t1.metric("予測", pred_trifecta)
+                        t2.metric("実結果", actual_trifecta)
+                        t3.metric("三連単的中", "○" if exact_hit else "×")
+                        st.caption("1着だけ、TOP3の車が同じだけでは三連単的中にしません。順番まで完全一致のみ○です。")
 
-                st.subheader("結果による重みの微調整")
-                # v4.1登録処理内で、全履歴・直近重視の重み更新まで完了済み。
-                if "before" in adjustment:
-                    weight_rows=[]
-                    for name in adjustment["before"]:
-                        weight_rows.append({"項目":name,"調整前":adjustment["before"][name],"調整後":adjustment["after"][name],
-                                            "変化":adjustment["after"][name]-adjustment["before"][name],
-                                            "今回結果との相関":adjustment["evidence"][name]})
-                    st.dataframe(pd.DataFrame(weight_rows), use_container_width=True, hide_index=True,
-                        column_config={"調整前":st.column_config.NumberColumn(format="%.4f"),"調整後":st.column_config.NumberColumn(format="%.4f"),
-                                       "変化":st.column_config.NumberColumn(format="%+.4f"),"今回結果との相関":st.column_config.NumberColumn(format="%+.3f")})
-                    q1,q2,q3=st.columns(3)
-                    q1.metric("調整前の上位3車",adjustment["before_top3"])
-                    q2.metric("調整後の診断",adjustment["after_top3"])
-                    q3.metric("実結果",adjustment["actual_top3"])
-                    stats = adjustment.get("learning_stats", {})
-                    st.info(adjustment["note"])
-                    if stats:
-                        st.caption(f"学習対象: 全{stats.get('race_count',0)}レース / 直近{stats.get('recent_count',0)}レースを中心 / 最新レース寄与 約{stats.get('latest_contribution',0)*100:.1f}%")
-                else:
-                    st.info(adjustment.get("message","重みは変更していません。"))
+                    st.subheader("結果による重みの微調整")
+                    # v4.1登録処理内で、全履歴・直近重視の重み更新まで完了済み。
+                    if "before" in adjustment:
+                        weight_rows=[]
+                        for name in adjustment["before"]:
+                            weight_rows.append({"項目":name,"調整前":adjustment["before"][name],"調整後":adjustment["after"][name],
+                                                "変化":adjustment["after"][name]-adjustment["before"][name],
+                                                "今回結果との相関":adjustment["evidence"][name]})
+                        st.dataframe(pd.DataFrame(weight_rows), use_container_width=True, hide_index=True,
+                            column_config={"調整前":st.column_config.NumberColumn(format="%.4f"),"調整後":st.column_config.NumberColumn(format="%.4f"),
+                                           "変化":st.column_config.NumberColumn(format="%+.4f"),"今回結果との相関":st.column_config.NumberColumn(format="%+.3f")})
+                        q1,q2,q3=st.columns(3)
+                        q1.metric("調整前の上位3車",adjustment["before_top3"])
+                        q2.metric("調整後の診断",adjustment["after_top3"])
+                        q3.metric("実結果",adjustment["actual_top3"])
+                        stats = adjustment.get("learning_stats", {})
+                        st.info(adjustment["note"])
+                        if stats:
+                            st.caption(f"学習対象: 全{stats.get('race_count',0)}レース / 直近{stats.get('recent_count',0)}レースを中心 / 最新レース寄与 約{stats.get('latest_contribution',0)*100:.1f}%")
+                    else:
+                        st.info(adjustment.get("message","重みは変更していません。"))
 
-                st.subheader("選手履歴の更新結果")
-                h1, h2, h3 = st.columns(3)
-                h1.metric("新規履歴", analysis.get("履歴追加", 0))
-                h2.metric("重複スキップ", analysis.get("履歴重複スキップ", 0))
-                h3.metric("周回順位", analysis.get("周回履歴保存", 0))
-                st.caption("結果登録した競走T・試走T・ST・着順・ハンデ・走路条件は、次回以降の予測用選手履歴へ反映されます。")
-                st.caption("同一判定は開催日・開催場・レース番号で行います。レース名称は判定に使いません。同じレースは通常登録では重複を防止します。再登録を選んだ場合だけ、古い結果を今回の内容へ置き換えます。")
-                st.caption(f"順位分析対象: {analysis.get('分析対象', 0)}名 / 除外: {analysis.get('分析除外', 0)}名。着順なし・欠車・中止・失格などは順位分析から除外します。")
-                ok, msg = push_db_to_github(f"AutoRaceAI: {key} 結果・周回・払戻登録")
-                (st.success if ok else st.warning)(msg)
+                    st.subheader("選手履歴の更新結果")
+                    h1, h2, h3 = st.columns(3)
+                    h1.metric("新規履歴", analysis.get("履歴追加", 0))
+                    h2.metric("重複スキップ", analysis.get("履歴重複スキップ", 0))
+                    h3.metric("周回順位", analysis.get("周回履歴保存", 0))
+                    st.caption("結果登録した競走T・試走T・ST・着順・ハンデ・走路条件は、次回以降の予測用選手履歴へ反映されます。")
+                    st.caption("同一判定は開催日・開催場・レース番号で行います。レース名称は判定に使いません。同じレースは通常登録では重複を防止します。再登録を選んだ場合だけ、古い結果を今回の内容へ置き換えます。")
+                    st.caption(f"順位分析対象: {analysis.get('分析対象', 0)}名 / 除外: {analysis.get('分析除外', 0)}名。着順なし・欠車・中止・失格などは順位分析から除外します。")
+                    with st.spinner("③ GitHubへDBを保存しています…"):
+                        ok, msg = push_db_to_github(f"AutoRaceAI: {key} 結果・周回・払戻登録")
+                    full_message = result_message + (f"｜{msg}" if msg else "")
+                    _set_sticky_notice("result_register_notice", "success" if ok else "warning", full_message)
+                    (st.success if ok else st.warning)(msg)
             except Exception as exc:
-                st.error(f"結果登録エラー: {type(exc).__name__}: {exc}")
+                error_message = f"結果登録エラー: {type(exc).__name__}: {exc}"
+                _set_sticky_notice("result_register_notice", "error", error_message)
+                st.error(error_message)
                 st.exception(exc)
 
     last_result_view = st.session_state.get("v41_last_result_view")
@@ -2104,10 +2144,12 @@ with db_tab:
 
 with register_tab:
     st.subheader("選手情報を登録")
+    _show_sticky_notice("player_register_notice")
     st.session_state.setdefault("player_input_version", 0)
     if st.button("🗑️ 選手入力をリセット", use_container_width=True, key="reset_player_input"):
         st.session_state["player_input_version"] += 1
         st.session_state.pop("parsed_player_history", None)
+        st.session_state.pop("player_register_notice", None)
         st.rerun()
     player_version = st.session_state["player_input_version"]
     player_name = st.text_input("選手名", placeholder="例：横田翔", key=f"player_name_input_{player_version}")
@@ -2138,17 +2180,32 @@ with register_tab:
 
         if st.button("DBへ登録してGitHubに保存", type="primary", use_container_width=True):
             try:
-                report = engine.v47_save_player_history(parsed, db_path=engine.DB_PATH)
+                with st.spinner("① SQLiteへ選手履歴を保存しています…"):
+                    report = engine.v47_save_player_history(parsed, db_path=engine.DB_PATH)
                 st.session_state["pending_player_history"] = report["pending"]
                 changed, skipped, pending_count = report["changed"], report["skipped"], report["pending_count"]
+                text = (
+                    f"読込 {report['read']}件｜追加・更新 {changed}件｜"
+                    f"重複処理 {skipped}件（数値完全一致 {report.get('exact_duplicate_skipped', 0)}件）｜"
+                    f"保留 {pending_count}件"
+                )
                 if changed:
-                    ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新")
-                    text = f"読込 {report['read']}件｜追加・更新 {changed}件｜重複処理 {skipped}件（数値完全一致 {report.get('exact_duplicate_skipped', 0)}件）｜保留 {pending_count}件"
-                    (st.success if ok else st.warning)(text + (f"｜{msg}" if msg else ""))
+                    with st.spinner("② GitHubへDBを保存しています…"):
+                        ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新")
+                    full_text = text + (f"｜{msg}" if msg else "")
+                    level = "success" if ok else "warning"
+                elif pending_count:
+                    full_text = text + "｜必須項目を補完すると不足行だけ登録できます。"
+                    level = "warning"
                 else:
-                    st.info(f"読込 {report['read']}件｜追加・更新 0件｜保留 {pending_count}件")
+                    full_text = text + "｜新規登録対象はありませんでした。"
+                    level = "info"
+                _set_sticky_notice("player_register_notice", level, full_text)
+                getattr(st, level, st.info)(full_text)
             except Exception as exc:
-                st.error(f"登録エラー: {type(exc).__name__}: {exc}")
+                error_message = f"登録エラー: {type(exc).__name__}: {exc}"
+                _set_sticky_notice("player_register_notice", "error", error_message)
+                st.error(error_message)
                 st.exception(exc)
 
     pending_notice = st.session_state.pop("pending_save_notice", None)
@@ -2262,15 +2319,28 @@ with db_tab:
     except Exception as exc:
         st.warning(f"保存済み開催場分析を読み込めませんでした: {exc}")
 
-    try:
-        venue_profiles = engine.v92_all_venue_weight_profiles(engine.DB_PATH)
+    st.markdown("#### 開催場別重みの詳細")
+    st.caption("この処理は重いため自動実行しません。必要なときだけ読み込んでください。")
+    if st.button("開催場別重み一覧を読み込む", use_container_width=True, key="v132_load_venue_profiles"):
+        with st.spinner("開催場別重みを読み込んでいます…"):
+            try:
+                st.session_state["v132_venue_profiles"] = engine.v92_all_venue_weight_profiles(engine.DB_PATH)
+                st.session_state.pop("v132_venue_profile_error", None)
+            except Exception as exc:
+                st.session_state["v132_venue_profile_error"] = str(exc)
+
+    if st.session_state.get("v132_venue_profile_error"):
+        st.warning(f"開催場別重みを取得できませんでした: {st.session_state['v132_venue_profile_error']}")
+
+    venue_profiles = st.session_state.get("v132_venue_profiles")
+    if isinstance(venue_profiles, pd.DataFrame) and not venue_profiles.empty:
         st.dataframe(
             venue_profiles,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "全履歴反映率": st.column_config.ProgressColumn(format="%.1%%", min_value=0.0, max_value=1.0),
-                "展開反映率": st.column_config.ProgressColumn(format="%.1%%", min_value=0.0, max_value=1.0),
+                "全履歴反映率": st.column_config.ProgressColumn(format="%.1f%%", min_value=0.0, max_value=1.0),
+                "展開反映率": st.column_config.ProgressColumn(format="%.1f%%", min_value=0.0, max_value=1.0),
                 "試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
                 "ST影響差": st.column_config.NumberColumn(format="%+.3f"),
                 "ハンデ影響差": st.column_config.NumberColumn(format="%+.3f"),
@@ -2279,519 +2349,519 @@ with db_tab:
                 "前残り差": st.column_config.NumberColumn(format="%+.3f"),
                 "追込み1着差": st.column_config.NumberColumn(format="%+.3f"),
                 "追込み3着内差": st.column_config.NumberColumn(format="%+.3f"),
-                "試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
-                "ST影響差": st.column_config.NumberColumn(format="%+.3f"),
                 "高温前残り差": st.column_config.NumberColumn(format="%+.3f"),
             },
         )
-        selected_venue = st.selectbox("詳しく見る開催場", engine.V92_VENUES, key="v92_selected_venue")
-        selected_profile = engine.v92_venue_weight_profile(selected_venue, engine.DB_PATH)
-        detail = pd.DataFrame(selected_profile.get("重み明細", []))
-        if not detail.empty:
-            st.dataframe(
-                detail,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "基礎係数": st.column_config.NumberColumn(format="%.2f"),
-                    "開催場差": st.column_config.NumberColumn(format="%+.3f"),
-                    "信頼度": st.column_config.NumberColumn(format="%.1%%"),
-                    "実効係数": st.column_config.NumberColumn(format="%.3f"),
-                    "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
-                },
-            )
-        st.caption("全履歴層はレース番号なしでも利用します。展開層だけレース復元数に依存し、選手相性は予測時の選手ごとに別計算します。")
-    except Exception as exc:
-        st.warning(f"開催場別重みを取得できませんでした: {exc}")
+        selected_venue = st.selectbox("詳しく見る開催場", engine.V92_VENUES, key="v132_selected_venue")
+        if st.button("選択した開催場の詳細を読み込む", use_container_width=True, key="v132_load_selected_venue"):
+            with st.spinner(f"{selected_venue}の詳細を読み込んでいます…"):
+                try:
+                    st.session_state["v132_selected_venue_profile"] = engine.v92_venue_weight_profile(selected_venue, engine.DB_PATH)
+                    st.session_state["v132_selected_venue_name"] = selected_venue
+                except Exception as exc:
+                    st.warning(f"開催場詳細を取得できませんでした: {exc}")
+        selected_profile = st.session_state.get("v132_selected_venue_profile")
+        if selected_profile and st.session_state.get("v132_selected_venue_name") == selected_venue:
+            detail = pd.DataFrame(selected_profile.get("重み明細", []))
+            if not detail.empty:
+                st.dataframe(
+                    detail, use_container_width=True, hide_index=True,
+                    column_config={
+                        "基礎係数": st.column_config.NumberColumn(format="%.2f"),
+                        "開催場差": st.column_config.NumberColumn(format="%+.3f"),
+                        "信頼度": st.column_config.NumberColumn(format="%.1f%%"),
+                        "実効係数": st.column_config.NumberColumn(format="%.3f"),
+                        "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
+                    },
+                )
+            st.caption("全履歴層はレース番号なしでも利用します。展開層だけレース復元数に依存します。")
 
     st.divider()
-    st.subheader("登録されている情報")
-    try:
-        info = db_summary(engine.DB_PATH)
-        if not info["exists"]:
-            st.warning("DBファイルがありません。")
-        elif not info["tables"]:
-            st.warning("DBにテーブルがありません。")
-        else:
-            with sqlite3.connect(engine.DB_PATH) as con:
-                canonical_count = int(con.execute("SELECT COUNT(*) FROM race_history").fetchone()[0]) if "race_history" in info["tables"] else 0
-                import_count = int(con.execute("SELECT COUNT(*) FROM v15_player_history_imports").fetchone()[0]) if "v15_player_history_imports" in info["tables"] else 0
+    st.subheader("登録情報・DBメンテナンス")
+    st.caption("選手一覧、履歴、登録漏れ監査は重いため、開くまでDB集計を実行しません。")
+    if st.button("登録情報確認を開く", use_container_width=True, key="v132_open_registration_info"):
+        st.session_state["v132_registration_info_open"] = True
+    if st.session_state.get("v132_registration_info_open", False):
+        if st.button("登録情報確認を閉じる", use_container_width=True, key="v132_close_registration_info"):
+            st.session_state.pop("v132_registration_info_open", None)
+            st.rerun()
+        st.divider()
+        st.subheader("登録されている情報")
+        try:
+            info = db_summary(engine.DB_PATH)
+            if not info["exists"]:
+                st.warning("DBファイルがありません。")
+            elif not info["tables"]:
+                st.warning("DBにテーブルがありません。")
+            else:
+                with sqlite3.connect(engine.DB_PATH) as con:
+                    canonical_count = int(con.execute("SELECT COUNT(*) FROM race_history").fetchone()[0]) if "race_history" in info["tables"] else 0
+                    import_count = int(con.execute("SELECT COUNT(*) FROM v15_player_history_imports").fetchone()[0]) if "v15_player_history_imports" in info["tables"] else 0
 
-                if canonical_count > 0 and "players" in info["tables"]:
-                    players = pd.read_sql_query(
-                        """
-                        SELECT p.player_name AS 選手名, COUNT(h.history_id) AS 登録件数,
-                               MAX(h.race_date) AS 最新日
-                        FROM players p
-                        LEFT JOIN race_history h ON h.player_id=p.player_id
-                        GROUP BY p.player_id, p.player_name
-                        HAVING COUNT(h.history_id) > 0
-                        ORDER BY p.player_name
-                        """, con)
-                    source_mode = "players / race_history"
-                elif import_count > 0:
-                    players = pd.read_sql_query(
-                        """
-                        SELECT player_name AS 選手名, COUNT(*) AS 登録件数,
-                               MAX(race_date) AS 最新日
-                        FROM v15_player_history_imports
-                        WHERE player_name IS NOT NULL AND player_name <> ''
-                        GROUP BY player_name ORDER BY player_name
-                        """, con)
-                    source_mode = "v15_player_history_imports"
-                else:
-                    players = pd.DataFrame(columns=["選手名", "登録件数", "最新日"])
-                    source_mode = "データなし"
-
-                st.caption(f"表示元: {source_mode}")
-                query = st.text_input("選手名検索", placeholder="例：横田翔", key="db_player_search")
-                shown = players
-                if query.strip():
-                    compact = re.sub(r"[\s　]+", "", query.strip())
-                    shown = players[players["選手名"].astype(str).str.replace(r"[\s　]+", "", regex=True).str.contains(compact, case=False, na=False)]
-                st.write(f"選手一覧: {len(shown)}件")
-                st.dataframe(shown, use_container_width=True, hide_index=True, height=300)
-
-                names = shown["選手名"].astype(str).tolist()
-                if names:
-                    selected = st.selectbox("履歴を確認する選手", names)
-                    if canonical_count > 0:
-                        history = pd.read_sql_query(
+                    if canonical_count > 0 and "players" in info["tables"]:
+                        players = pd.read_sql_query(
                             """
-                            SELECT h.history_id AS 履歴ID, h.race_date AS 日付, h.venue AS 開催場, h.race_no AS レース,
-                                   h.finish AS 着順, h.surface AS 走路, h.handicap AS ハンデ,
-                                   h.trial_time AS 試走T, h.race_time AS 競走T,
-                                   h.start_time AS ST, h.source AS 登録元, h.created_at AS 登録日時
-                            FROM race_history h JOIN players p ON p.player_id=h.player_id
-                            WHERE p.player_name=? ORDER BY h.race_date DESC, h.history_id DESC
-                            """, con, params=(selected,))
-                    else:
-                        history = pd.read_sql_query(
+                            SELECT p.player_name AS 選手名, COUNT(h.history_id) AS 登録件数,
+                                   MAX(h.race_date) AS 最新日
+                            FROM players p
+                            LEFT JOIN race_history h ON h.player_id=p.player_id
+                            GROUP BY p.player_id, p.player_name
+                            HAVING COUNT(h.history_id) > 0
+                            ORDER BY p.player_name
+                            """, con)
+                        source_mode = "players / race_history"
+                    elif import_count > 0:
+                        players = pd.read_sql_query(
                             """
-                            SELECT history_key AS 履歴キー, race_date AS 日付, venue AS 開催場, race_type AS レース種別,
-                                   rank AS 着順, weather AS 天候, surface AS 走路,
-                                   track_temp AS 走路温度, air_temp AS 気温, humidity AS 湿度,
-                                   car_no AS 車番, handicap AS ハンデ, distance AS 距離,
-                                   laps AS 周回数, popularity AS 人気,
-                                   trial_time AS 試走T, race_time AS 競走T, st AS ST,
-                                   created_at AS 登録日時
+                            SELECT player_name AS 選手名, COUNT(*) AS 登録件数,
+                                   MAX(race_date) AS 最新日
                             FROM v15_player_history_imports
-                            WHERE player_name=? ORDER BY race_date DESC, created_at DESC
-                            """, con, params=(selected,))
-                    st.write(f"{selected}：履歴 {len(history)}件")
-                    display_history = history.drop(columns=[c for c in ["履歴ID", "履歴キー"] if c in history.columns], errors="ignore")
-                    st.dataframe(display_history, use_container_width=True, hide_index=True, height=430)
-
-                    if not history.empty:
-                        st.markdown("#### 🗑️ 誤登録した履歴を削除")
-                        st.caption("削除対象を選び、内容を確認してから実行してください。正規履歴を削除した場合、同じ走行の条件詳細データも同時に削除します。")
-                        delete_options = []
-                        for idx, r in history.reset_index(drop=True).iterrows():
-                            race_label = r.get("レース", r.get("レース種別", ""))
-                            finish_label = r.get("着順", "-")
-                            trial_label = r.get("試走T", "-")
-                            race_time_label = r.get("競走T", "-")
-                            delete_options.append(
-                                f"{idx + 1}. {r.get('日付', '')} {r.get('開催場', '')} {race_label or ''} "
-                                f"着{finish_label} 試{trial_label} 競{race_time_label}"
-                            )
-                        selected_delete_label = st.selectbox(
-                            "削除する履歴", delete_options, key=f"delete_history_select_{selected}"
-                        )
-                        selected_delete_idx = delete_options.index(selected_delete_label)
-                        delete_row = history.reset_index(drop=True).iloc[selected_delete_idx]
-                        preview_delete = delete_row.drop(labels=[c for c in ["履歴ID", "履歴キー"] if c in delete_row.index])
-                        st.dataframe(pd.DataFrame([preview_delete]), use_container_width=True, hide_index=True)
-                        confirm_delete = st.checkbox(
-                            "この履歴を削除することを確認しました",
-                            key=f"confirm_delete_history_{selected}_{selected_delete_idx}",
-                        )
-                        if st.button(
-                            "選択した履歴を削除",
-                            type="primary",
-                            use_container_width=True,
-                            disabled=not confirm_delete,
-                            key=f"delete_history_button_{selected}",
-                        ):
-                            if "履歴ID" in history.columns:
-                                result = engine.v37_delete_race_history(int(delete_row["履歴ID"]), engine.DB_PATH)
-                            else:
-                                result = engine.v37_delete_import_history(str(delete_row["履歴キー"]), engine.DB_PATH)
-                            if result.get("deleted"):
-                                ok, msg = push_db_to_github(f"AutoRaceAI: {selected} の誤登録履歴を削除")
-                                if ok:
-                                    st.success(result["message"] + " " + msg)
-                                else:
-                                    st.warning(result["message"] + " GitHub保存は未完了です。" + msg)
-                                st.rerun()
-                            else:
-                                st.warning(result.get("message", "削除できませんでした。"))
-
-                    st.markdown("#### 🧹 選手情報を一括削除")
-                    st.caption("選択中の選手について、正規履歴・条件詳細・周回特徴・選手別予測スナップショットをまとめて削除します。他選手とレース本体は残ります。")
-                    delete_all_result_rows = st.checkbox(
-                        "結果登録内のこの選手の行も削除する",
-                        value=False,
-                        key=f"delete_all_result_rows_{selected}",
-                    )
-                    confirm_player_name = st.text_input(
-                        "確認のため選手名を入力",
-                        placeholder=selected,
-                        key=f"confirm_delete_player_name_{selected}",
-                    )
-                    normalized_confirm = re.sub(r"[\s　]+", "", confirm_player_name or "")
-                    normalized_selected = re.sub(r"[\s　]+", "", selected or "")
-                    can_delete_all = normalized_confirm == normalized_selected and bool(normalized_selected)
-                    if st.button(
-                        f"{selected} の選手情報を一括削除",
-                        type="primary",
-                        use_container_width=True,
-                        disabled=not can_delete_all,
-                        key=f"delete_all_player_button_{selected}",
-                    ):
-                        result = engine.v46_delete_player_all(
-                            selected, engine.DB_PATH, delete_result_rows=delete_all_result_rows
-                        )
-                        if result.get("deleted"):
-                            ok, msg = push_db_to_github(f"AutoRaceAI: {selected} の選手情報を一括削除")
-                            detail = " / ".join(f"{k}:{v}" for k, v in result.get("counts", {}).items() if v)
-                            if ok:
-                                st.success(result.get("message", "削除しました。") + (f" ({detail})" if detail else "") + " " + msg)
-                            else:
-                                st.warning(result.get("message", "削除しました。") + (f" ({detail})" if detail else "") + " GitHub保存は未完了です。" + msg)
-                            st.rerun()
-                        else:
-                            st.warning(result.get("message", "削除対象がありませんでした。"))
-
-                st.divider()
-                st.subheader("DBメンテナンス")
-                st.caption("姓名の空白違いと数値完全一致の同一走行を整理します。ただしRが異なる組み合わせは勝手に統合せず、確認対象として残します。")
-                if st.button("完全一致を含む重複データを一括統合", use_container_width=True):
-                    result = engine.v32_merge_duplicate_players(engine.DB_PATH)
-                    exact_result = engine.v58_cleanup_exact_numeric_duplicates(engine.DB_PATH)
-                    race_result = engine.v33_cleanup_duplicate_histories(engine.DB_PATH)
-                    identity_result = engine.v46_cleanup_player_identity_duplicates(engine.DB_PATH)
-                    ok, msg = push_db_to_github("AutoRaceAI: 数値完全一致を含む重複履歴を一括統合")
-                    summary = (
-                        f"選手 {result['merged_players']}件を統合、履歴 {result['moved_histories']}件を移動、"
-                        f"数値完全一致の正規履歴 {exact_result['merged_histories']}件・詳細履歴 {exact_result['merged_imports']}件、R相違の確認対象 {exact_result.get('r_conflicts', 0)}組、"
-                        f"その他の同一走行履歴 {race_result['deleted_histories']}件・詳細履歴 {race_result['deleted_imports']}件、"
-                        f"レース識別違いの正規履歴 {identity_result['merged_histories']}件・詳細履歴 {identity_result['merged_imports']}件を統合しました。"
-                    )
-                    if ok:
-                        st.success(summary + " " + msg)
+                            WHERE player_name IS NOT NULL AND player_name <> ''
+                            GROUP BY player_name ORDER BY player_name
+                            """, con)
+                        source_mode = "v15_player_history_imports"
                     else:
-                        st.warning(summary + " GitHub保存は未完了です。" + msg)
-                    st.rerun()
+                        players = pd.DataFrame(columns=["選手名", "登録件数", "最新日"])
+                        source_mode = "データなし"
 
-                st.divider()
-                st.subheader("予測・結果の登録漏れチェック")
-                st.caption("選手別履歴を直接照合します。Rがあるデータは日付・開催場・Rで、Rがないデータも同時登録された選手セットから完全レースを復元します。")
-                try:
-                    v97_health = engine.v97_database_health(engine.DB_PATH)
-                    v97_summary = v97_health.get("summary", {})
-                    c1, c2, c3, c4, c5 = st.columns(5)
-                    c1.metric("完全データ", f"{v97_summary.get('完全データ', 0)}R")
-                    c2.metric("予測可能・未予測", f"{v97_summary.get('未予測', 0)}R")
-                    c3.metric("結果未登録", f"{v97_summary.get('結果未登録', 0)}R")
-                    c4.metric("予測済・結果未登録", f"{v97_summary.get('予測済結果未登録', 0)}R")
-                    c5.metric("Rなし復元", f"{v97_summary.get('Rなし完全データ', 0)}R")
+                    st.caption(f"表示元: {source_mode}")
+                    query = st.text_input("選手名検索", placeholder="例：横田翔", key="db_player_search")
+                    shown = players
+                    if query.strip():
+                        compact = re.sub(r"[\s　]+", "", query.strip())
+                        shown = players[players["選手名"].astype(str).str.replace(r"[\s　]+", "", regex=True).str.contains(compact, case=False, na=False)]
+                    st.write(f"選手一覧: {len(shown)}件")
+                    st.dataframe(shown, use_container_width=True, hide_index=True, height=300)
 
-                    complete_all = v97_health.get("complete_all", [])
-                    unidentified_complete = v97_health.get("unidentified_complete", [])
-                    unpredicted = v97_health.get("predictable_unpredicted", [])
-                    missing_result = v97_health.get("complete_missing_result", [])
-                    predicted_missing = v97_health.get("predicted_missing_result", [])
-                    incomplete = v97_health.get("incomplete", [])
-
-
-                    with st.expander(f"選手別データ照合・全員分が揃ったレース（{len(complete_all)}R）", expanded=True):
-                        if complete_all:
-                            df_complete = pd.DataFrame(complete_all)
-                            show_cols = [c for c in ["開催日", "開催場", "R", "登録状況", "予測", "結果", "抽出元", "照合状態", "選手"] if c in df_complete.columns]
-                            st.dataframe(df_complete[show_cols], use_container_width=True, hide_index=True)
-                            st.download_button(
-                                "完全データレース一覧をCSV保存",
-                                df_complete.to_csv(index=False).encode("utf-8-sig"),
-                                file_name="complete_player_data_races.csv",
-                                mime="text/csv",
-                                use_container_width=True,
-                            )
+                    names = shown["選手名"].astype(str).tolist()
+                    if names:
+                        selected = st.selectbox("履歴を確認する選手", names)
+                        if canonical_count > 0:
+                            history = pd.read_sql_query(
+                                """
+                                SELECT h.history_id AS 履歴ID, h.race_date AS 日付, h.venue AS 開催場, h.race_no AS レース,
+                                       h.finish AS 着順, h.surface AS 走路, h.handicap AS ハンデ,
+                                       h.trial_time AS 試走T, h.race_time AS 競走T,
+                                       h.start_time AS ST, h.source AS 登録元, h.created_at AS 登録日時
+                                FROM race_history h JOIN players p ON p.player_id=h.player_id
+                                WHERE p.player_name=? ORDER BY h.race_date DESC, h.history_id DESC
+                                """, con, params=(selected,))
                         else:
-                            st.caption("全員分が揃ったレースは見つかりませんでした。")
+                            history = pd.read_sql_query(
+                                """
+                                SELECT history_key AS 履歴キー, race_date AS 日付, venue AS 開催場, race_type AS レース種別,
+                                       rank AS 着順, weather AS 天候, surface AS 走路,
+                                       track_temp AS 走路温度, air_temp AS 気温, humidity AS 湿度,
+                                       car_no AS 車番, handicap AS ハンデ, distance AS 距離,
+                                       laps AS 周回数, popularity AS 人気,
+                                       trial_time AS 試走T, race_time AS 競走T, st AS ST,
+                                       created_at AS 登録日時
+                                FROM v15_player_history_imports
+                                WHERE player_name=? ORDER BY race_date DESC, created_at DESC
+                                """, con, params=(selected,))
+                        st.write(f"{selected}：履歴 {len(history)}件")
+                        display_history = history.drop(columns=[c for c in ["履歴ID", "履歴キー"] if c in history.columns], errors="ignore")
+                        st.dataframe(display_history, use_container_width=True, hide_index=True, height=430)
 
-                    if unidentified_complete:
-                        with st.expander(f"Rは不明だが全員分が揃った登録セット（{len(unidentified_complete)}R）", expanded=False):
-                            df_unknown = pd.DataFrame(unidentified_complete)
-                            st.dataframe(df_unknown[[c for c in ["開催日", "開催場", "R", "登録状況", "抽出元", "選手"] if c in df_unknown.columns]], use_container_width=True, hide_index=True)
-                            st.caption("選手全員分は揃っていますが、Rを特定できないため予測・結果の保存状況は断定していません。")
-
-                    with st.expander(f"全選手データあり・予測未保存（{len(unpredicted)}R）", expanded=bool(unpredicted)):
-                        if unpredicted:
-                            df_unpred = pd.DataFrame(unpredicted)
-                            show_cols = [c for c in ["開催日", "開催場", "R", "登録状況", "結果", "選手"] if c in df_unpred.columns]
-                            st.dataframe(df_unpred[show_cols], use_container_width=True, hide_index=True)
-                            st.download_button(
-                                "未予測一覧をCSV保存",
-                                df_unpred.to_csv(index=False).encode("utf-8-sig"),
-                                file_name="predictable_but_unpredicted.csv",
-                                mime="text/csv",
-                                use_container_width=True,
+                        if not history.empty:
+                            st.markdown("#### 🗑️ 誤登録した履歴を削除")
+                            st.caption("削除対象を選び、内容を確認してから実行してください。正規履歴を削除した場合、同じ走行の条件詳細データも同時に削除します。")
+                            delete_options = []
+                            for idx, r in history.reset_index(drop=True).iterrows():
+                                race_label = r.get("レース", r.get("レース種別", ""))
+                                finish_label = r.get("着順", "-")
+                                trial_label = r.get("試走T", "-")
+                                race_time_label = r.get("競走T", "-")
+                                delete_options.append(
+                                    f"{idx + 1}. {r.get('日付', '')} {r.get('開催場', '')} {race_label or ''} "
+                                    f"着{finish_label} 試{trial_label} 競{race_time_label}"
+                                )
+                            selected_delete_label = st.selectbox(
+                                "削除する履歴", delete_options, key=f"delete_history_select_{selected}"
                             )
-                            st.markdown("#### 一括予測")
-                            st.caption("全選手分が揃い、Rを特定できる未予測レースだけが対象です。各レースの予測時点より後の履歴は学習から遮断します。")
-                            selectable = [r for r in unpredicted if not str(r.get("R", "")).startswith("R不明")]
-                            label_map = {
-                                f"{r.get('開催日')}｜{r.get('開催場')}｜{r.get('R')}｜{r.get('登録状況')}": r
-                                for r in selectable
-                            }
-                            selected_labels = st.multiselect(
-                                "一括予測するレース",
-                                options=list(label_map.keys()),
-                                default=list(label_map.keys()),
-                                key="v99_batch_prediction_selection",
-                            )
-                            batch_trials = st.select_slider(
-                                "一括予測の試行回数",
-                                options=[2000, 5000, 10000, 20000],
-                                value=5000,
-                                help="大量レースでは5000回が軽めです。保存後に必要なレースだけ通常画面で20000回へ再予測できます。",
-                                key="v99_batch_trials",
-                            )
-                            if st.button("選択した未予測レースを一括予測", type="primary", use_container_width=True, disabled=not selected_labels):
-                                selected_records = [label_map[x] for x in selected_labels]
-                                with st.spinner(f"{len(selected_records)}レースを時系列順に予測しています…"):
-                                    batch_report = engine.v99_run_batch_predictions(
-                                        selected_records, int(batch_trials), 20260719, engine.DB_PATH
-                                    )
-                                st.session_state["v99_last_batch_report"] = batch_report
-                                if batch_report.get("成功", 0):
-                                    st.success(
-                                        f"一括予測完了：成功 {batch_report.get('成功', 0)}R｜"
-                                        f"スキップ {batch_report.get('スキップ', 0)}R｜エラー {batch_report.get('エラー', 0)}R"
-                                    )
-                                else:
-                                    st.warning(
-                                        f"保存できたレースはありませんでした。スキップ {batch_report.get('スキップ', 0)}R｜"
-                                        f"エラー {batch_report.get('エラー', 0)}R"
-                                    )
-                                st.rerun()
-                            last_batch = st.session_state.get("v99_last_batch_report")
-                            if last_batch:
-                                with st.expander("直前の一括予測レポート", expanded=bool(last_batch.get("エラー") or last_batch.get("スキップ"))):
-                                    st.write(
-                                        f"対象 {last_batch.get('対象', 0)}R｜成功 {last_batch.get('成功', 0)}R｜"
-                                        f"スキップ {last_batch.get('スキップ', 0)}R｜エラー {last_batch.get('エラー', 0)}R"
-                                    )
-                                    details = pd.DataFrame(last_batch.get("details", []))
-                                    if not details.empty:
-                                        st.dataframe(details, use_container_width=True, hide_index=True)
-                                        st.download_button(
-                                            "一括予測レポートをCSV保存",
-                                            details.to_csv(index=False).encode("utf-8-sig"),
-                                            file_name="batch_prediction_report.csv",
-                                            mime="text/csv",
-                                            use_container_width=True,
-                                        )
-                        else:
-                            st.success("全選手データがそろったレースは、すべて予測保存済みです。")
-
-                    with st.expander(f"全選手データあり・結果未登録（{len(missing_result)}R）", expanded=False):
-                        if missing_result:
-                            df_missing = pd.DataFrame(missing_result)
-                            show_cols = [c for c in ["開催日", "開催場", "R", "登録状況", "予測", "選手"] if c in df_missing.columns]
-                            st.dataframe(df_missing[show_cols], use_container_width=True, hide_index=True)
-                            st.download_button(
-                                "結果未登録一覧をCSV保存",
-                                df_missing.to_csv(index=False).encode("utf-8-sig"),
-                                file_name="complete_data_missing_results.csv",
-                                mime="text/csv",
-                                use_container_width=True,
-                            )
-                        else:
-                            st.success("完全データのレースに結果登録漏れはありません。")
-
-                    with st.expander(f"予測済み・結果未登録だけ（{len(predicted_missing)}R）", expanded=False):
-                        if predicted_missing:
-                            df_pm = pd.DataFrame(predicted_missing)
-                            st.dataframe(df_pm[[c for c in ["開催日", "開催場", "R", "登録状況", "選手"] if c in df_pm.columns]], use_container_width=True, hide_index=True)
-                        else:
-                            st.caption("該当レースはありません。")
-
-                    with st.expander(f"選手データ不足・人数不一致（{len(incomplete)}R）", expanded=False):
-                        if incomplete:
-                            df_inc = pd.DataFrame(incomplete)
-                            st.dataframe(df_inc[[c for c in ["開催日", "開催場", "R", "登録状況", "不足人数", "選手"] if c in df_inc.columns]], use_container_width=True, hide_index=True)
-                        else:
-                            st.caption("該当レースはありません。")
-
-                    if v97_summary.get("識別不能", 0):
-                        st.caption(f"日付を特定できず集計対象外となった履歴: {v97_summary.get('識別不能', 0)}行")
-                    st.info("『予測未保存』は、予測スナップショットがDBに残っていない状態です。過去に画面表示だけ行い、保存前の版で予測したレースも含まれる場合があります。")
-                except Exception as exc:
-                    st.warning(f"登録漏れチェックを実行できませんでした: {exc}")
-
-                st.divider()
-                st.subheader("事故レースの学習除外")
-                st.caption("落車・反則・周回誤認・失格・競走中止などが1台でもあるレースは、結果を残したままレース全体をAI学習から除外します。")
-                try:
-                    accident_status = engine.v76_accident_learning_status(engine.DB_PATH)
-                    st.caption(
-                        f"登録結果 {accident_status.get('登録結果', 0)}レース / "
-                        f"学習対象外 {accident_status.get('事故レース除外', 0)}レース"
-                    )
-                    if accident_status.get("対象レース"):
-                        with st.expander("学習対象外の事故レースを確認", expanded=False):
-                            st.dataframe(pd.DataFrame(accident_status["対象レース"]), use_container_width=True, hide_index=True)
-                except Exception as exc:
-                    st.caption(f"事故レース状況を取得できませんでした: {exc}")
-                if st.button("登録済み結果を再点検して事故レースを学習対象外にする", use_container_width=True):
-                    with st.spinner("登録済み結果を再点検しています..."):
-                        accident_result = engine.v76_reclassify_existing_accident_races(engine.DB_PATH)
-                    ok, msg = push_db_to_github("AutoRaceAI: 事故レースを学習対象外へ再分類")
-                    summary = (
-                        f"{accident_result.get('結果レース確認', 0)}レースを確認し、"
-                        f"事故 {accident_result.get('事故レース', 0)}レースを学習対象外にしました。"
-                        f" 選手履歴 {accident_result.get('選手履歴除外', 0)}行を除外、"
-                        f"周回学習 {accident_result.get('周回学習削除', 0)}行・"
-                        f"事故レースの重み履歴 {accident_result.get('重み履歴削除', 0)}件を削除しました。"
-                    )
-                    if ok:
-                        st.success(summary + " " + msg)
-                    else:
-                        st.warning(summary + " GitHub保存は未完了です。" + msg)
-                    st.rerun()
-
-                st.divider()
-                st.subheader("グランドノート再学習")
-                st.caption("旧バージョンを含む登録済み結果のグランドノートを、選手別の展開学習へ全件再同期します。再同期後は、初周主導・位置維持・捌き・追込み・終盤・失速・熱走路補正のすべてに反映されます。")
-                try:
-                    gn_status = engine.v62_grand_note_learning_status(engine.DB_PATH)
-                    st.caption(
-                        f"結果周回 {gn_status.get('結果周回行', 0)}行 / "
-                        f"学習済み {gn_status.get('選手別周回行', 0)}行 / "
-                        f"学習レース {gn_status.get('学習レース数', 0)}件 / "
-                        f"未同期推定 {gn_status.get('未同期行推定', 0)}行"
-                    )
-                except Exception as exc:
-                    st.caption(f"再学習状況を取得できませんでした: {exc}")
-
-                if st.button("登録済みグランドノートを全件再学習", use_container_width=True):
-                    with st.spinner("登録済みグランドノートを再同期しています..."):
-                        gn_result = engine.v62_rebuild_grand_note_learning(engine.DB_PATH)
-                    ok, msg = push_db_to_github("AutoRaceAI: 登録済みグランドノートを全件再学習")
-                    summary = (
-                        f"対象 {gn_result.get('対象レース', 0)}レース・{gn_result.get('対象選手', 0)}選手、"
-                        f"周回 {gn_result.get('同期成功', 0)}行を反映 "
-                        f"（新規 {gn_result.get('新規', 0)} / 更新 {gn_result.get('更新', 0)}）。"
-                    )
-                    if gn_result.get('結果選手不明', 0) or gn_result.get('選手不明', 0):
-                        summary += (
-                            f" 選手名不足 {gn_result.get('結果選手不明', 0)}行、"
-                            f"選手未解決 {gn_result.get('選手不明', 0)}行。"
-                        )
-                    if ok:
-                        st.success(summary + " " + msg)
-                    else:
-                        st.warning(summary + " GitHub保存は未完了です。" + msg)
-                    st.rerun()
-
-                st.divider()
-                st.subheader("グランドノート未リンク修復")
-                st.caption("結果の周回順位はあるのに選手名へ結び付いていないデータを、レース・車番単位で診断して修復します。候補が一意のものだけ自動修復し、曖昧なものは手動で選びます。")
-                try:
-                    health = engine.v63_db_health_report(engine.DB_PATH)
-                    score = health.get("health_score", 0)
-                    icon = "🟢" if score >= 99 else ("🟡" if score >= 95 else "🔴")
-                    st.metric("グランドノートDB健康度", f"{icon} {score:.1f}%")
-                    st.caption(
-                        f"未リンク {health.get('unlinked_groups', 0)}組・{health.get('unlinked_rows', 0)}行 / "
-                        f"結果周回 {health.get('result_lap_rows', 0)}行 / 学習済み {health.get('learned_lap_rows', 0)}行"
-                    )
-                    unresolved = engine.v63_grand_note_unlinked_groups(engine.DB_PATH)
-                except Exception as exc:
-                    unresolved = []
-                    st.error(f"未リンク診断に失敗しました: {exc}")
-
-                if unresolved:
-                    if st.button("一意に決まる未リンクだけ自動修復", use_container_width=True):
-                        repair_result = engine.v63_auto_repair_grand_note_links(engine.DB_PATH)
-                        ok, msg = push_db_to_github("AutoRaceAI: グランドノート未リンクを自動修復")
-                        summary = (
-                            f"{repair_result.get('repaired_groups', 0)}組・{repair_result.get('synced_rows', 0)}行を修復。"
-                            f"手動確認 {repair_result.get('manual_groups', 0)}組。"
-                        )
-                        st.success(summary + (" " + msg if ok else " GitHub保存は未完了です。" + msg))
-                        st.rerun()
-
-                    player_choices = engine.v63_player_name_choices(engine.DB_PATH)
-                    for idx, item in enumerate(unresolved):
-                        title = (
-                            f"{item.get('race_date', '')} {item.get('venue', '')} "
-                            f"{item.get('race_no', '')}R・{item.get('car_no')}番 "
-                            f"（未リンク {item.get('lap_rows', 0)}行）"
-                        )
-                        with st.expander(title, expanded=True):
-                            st.caption(
-                                f"1周目順位: {item.get('first_lap_position') or '-'} / "
-                                f"ゴール順位: {item.get('goal_position') or '-'} / "
-                                f"race_key: {item.get('race_key')}"
-                            )
-                            auto_candidates = [c.get('player_name') for c in item.get('candidates', [])]
-                            if auto_candidates:
-                                st.info("自動候補: " + " / ".join(auto_candidates))
-                            else:
-                                st.warning("自動候補を特定できません。結果ページを確認して選手名を選択してください。")
-
-                            options = ["選択してください"] + auto_candidates + [n for n in player_choices if n not in auto_candidates]
-                            selected_name = st.selectbox(
-                                "この車番の選手",
-                                options,
-                                key=f"v63_player_{item.get('race_key')}_{item.get('car_no')}_{idx}",
+                            selected_delete_idx = delete_options.index(selected_delete_label)
+                            delete_row = history.reset_index(drop=True).iloc[selected_delete_idx]
+                            preview_delete = delete_row.drop(labels=[c for c in ["履歴ID", "履歴キー"] if c in delete_row.index])
+                            st.dataframe(pd.DataFrame([preview_delete]), use_container_width=True, hide_index=True)
+                            confirm_delete = st.checkbox(
+                                "この履歴を削除することを確認しました",
+                                key=f"confirm_delete_history_{selected}_{selected_delete_idx}",
                             )
                             if st.button(
-                                "この未リンクを修復",
-                                key=f"v63_repair_{item.get('race_key')}_{item.get('car_no')}_{idx}",
+                                "選択した履歴を削除",
+                                type="primary",
                                 use_container_width=True,
-                                disabled=selected_name == "選択してください",
+                                disabled=not confirm_delete,
+                                key=f"delete_history_button_{selected}",
                             ):
-                                result = engine.v63_repair_grand_note_link(
-                                    item.get('race_key'), item.get('car_no'), selected_name, engine.DB_PATH
-                                )
-                                if result.get('ok'):
-                                    ok, msg = push_db_to_github("AutoRaceAI: グランドノート未リンクを手動修復")
-                                    st.success(result.get('message', '修復しました。') + f" 周回{result.get('synced_rows', 0)}行を再学習しました。" + (" " + msg if ok else " GitHub保存は未完了です。" + msg))
+                                if "履歴ID" in history.columns:
+                                    result = engine.v37_delete_race_history(int(delete_row["履歴ID"]), engine.DB_PATH)
+                                else:
+                                    result = engine.v37_delete_import_history(str(delete_row["履歴キー"]), engine.DB_PATH)
+                                if result.get("deleted"):
+                                    ok, msg = push_db_to_github(f"AutoRaceAI: {selected} の誤登録履歴を削除")
+                                    if ok:
+                                        st.success(result["message"] + " " + msg)
+                                    else:
+                                        st.warning(result["message"] + " GitHub保存は未完了です。" + msg)
                                     st.rerun()
                                 else:
-                                    st.warning(result.get('message', '修復できませんでした。'))
-                else:
-                    st.success("未リンクのグランドノートはありません。すべて選手別学習へ反映されています。")
+                                    st.warning(result.get("message", "削除できませんでした。"))
 
-                st.divider()
-                table = st.selectbox("DBテーブルを直接確認", info["tables"])
-                columns = [r[1] for r in con.execute(f"PRAGMA table_info({qident(table)})").fetchall()]
-                count = con.execute(f"SELECT COUNT(*) FROM {qident(table)}").fetchone()[0]
-                st.caption(f"{table}: {count}件 / 列: {', '.join(columns)}")
-                preview = pd.read_sql_query(f"SELECT * FROM {qident(table)} LIMIT 500", con)
-                st.dataframe(preview, use_container_width=True, hide_index=True, height=400)
-                if count > 500:
-                    st.caption("表示は先頭500件です。")
-    except Exception as exc:
-        st.error(f"登録情報の確認エラー: {type(exc).__name__}: {exc}")
-        st.exception(exc)
+                        st.markdown("#### 🧹 選手情報を一括削除")
+                        st.caption("選択中の選手について、正規履歴・条件詳細・周回特徴・選手別予測スナップショットをまとめて削除します。他選手とレース本体は残ります。")
+                        delete_all_result_rows = st.checkbox(
+                            "結果登録内のこの選手の行も削除する",
+                            value=False,
+                            key=f"delete_all_result_rows_{selected}",
+                        )
+                        confirm_player_name = st.text_input(
+                            "確認のため選手名を入力",
+                            placeholder=selected,
+                            key=f"confirm_delete_player_name_{selected}",
+                        )
+                        normalized_confirm = re.sub(r"[\s　]+", "", confirm_player_name or "")
+                        normalized_selected = re.sub(r"[\s　]+", "", selected or "")
+                        can_delete_all = normalized_confirm == normalized_selected and bool(normalized_selected)
+                        if st.button(
+                            f"{selected} の選手情報を一括削除",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not can_delete_all,
+                            key=f"delete_all_player_button_{selected}",
+                        ):
+                            result = engine.v46_delete_player_all(
+                                selected, engine.DB_PATH, delete_result_rows=delete_all_result_rows
+                            )
+                            if result.get("deleted"):
+                                ok, msg = push_db_to_github(f"AutoRaceAI: {selected} の選手情報を一括削除")
+                                detail = " / ".join(f"{k}:{v}" for k, v in result.get("counts", {}).items() if v)
+                                if ok:
+                                    st.success(result.get("message", "削除しました。") + (f" ({detail})" if detail else "") + " " + msg)
+                                else:
+                                    st.warning(result.get("message", "削除しました。") + (f" ({detail})" if detail else "") + " GitHub保存は未完了です。" + msg)
+                                st.rerun()
+                            else:
+                                st.warning(result.get("message", "削除対象がありませんでした。"))
 
-st.caption("GitHub保存にはStreamlit Secretsの設定が必要です。トークンはコードやGitHubへ直接書かないでください。")
+                    st.divider()
+                    st.subheader("DBメンテナンス")
+                    st.caption("姓名の空白違いと数値完全一致の同一走行を整理します。ただしRが異なる組み合わせは勝手に統合せず、確認対象として残します。")
+                    if st.button("完全一致を含む重複データを一括統合", use_container_width=True):
+                        result = engine.v32_merge_duplicate_players(engine.DB_PATH)
+                        exact_result = engine.v58_cleanup_exact_numeric_duplicates(engine.DB_PATH)
+                        race_result = engine.v33_cleanup_duplicate_histories(engine.DB_PATH)
+                        identity_result = engine.v46_cleanup_player_identity_duplicates(engine.DB_PATH)
+                        ok, msg = push_db_to_github("AutoRaceAI: 数値完全一致を含む重複履歴を一括統合")
+                        summary = (
+                            f"選手 {result['merged_players']}件を統合、履歴 {result['moved_histories']}件を移動、"
+                            f"数値完全一致の正規履歴 {exact_result['merged_histories']}件・詳細履歴 {exact_result['merged_imports']}件、R相違の確認対象 {exact_result.get('r_conflicts', 0)}組、"
+                            f"その他の同一走行履歴 {race_result['deleted_histories']}件・詳細履歴 {race_result['deleted_imports']}件、"
+                            f"レース識別違いの正規履歴 {identity_result['merged_histories']}件・詳細履歴 {identity_result['merged_imports']}件を統合しました。"
+                        )
+                        if ok:
+                            st.success(summary + " " + msg)
+                        else:
+                            st.warning(summary + " GitHub保存は未完了です。" + msg)
+                        st.rerun()
+
+                    st.divider()
+                    st.subheader("予測・結果の登録漏れチェック")
+                    st.caption("選手別履歴を直接照合します。Rがあるデータは日付・開催場・Rで、Rがないデータも同時登録された選手セットから完全レースを復元します。")
+                    try:
+                        v97_health = engine.v97_database_health(engine.DB_PATH)
+                        v97_summary = v97_health.get("summary", {})
+                        c1, c2, c3, c4, c5 = st.columns(5)
+                        c1.metric("完全データ", f"{v97_summary.get('完全データ', 0)}R")
+                        c2.metric("予測可能・未予測", f"{v97_summary.get('未予測', 0)}R")
+                        c3.metric("結果未登録", f"{v97_summary.get('結果未登録', 0)}R")
+                        c4.metric("予測済・結果未登録", f"{v97_summary.get('予測済結果未登録', 0)}R")
+                        c5.metric("Rなし復元", f"{v97_summary.get('Rなし完全データ', 0)}R")
+
+                        complete_all = v97_health.get("complete_all", [])
+                        unidentified_complete = v97_health.get("unidentified_complete", [])
+                        unpredicted = v97_health.get("predictable_unpredicted", [])
+                        missing_result = v97_health.get("complete_missing_result", [])
+                        predicted_missing = v97_health.get("predicted_missing_result", [])
+                        incomplete = v97_health.get("incomplete", [])
 
 
-with reminder_tab:
-    st.subheader("🔔 一般予定の10分前通知")
-    st.caption("通知画面は開くまで読み込みません。予測・結果解析・選手登録・DB確認には影響しません。")
-    if not st.session_state.get("v130_reminder_open", False):
-        if st.button("通知画面を開く", use_container_width=True, key="v130_open_reminder"):
-            st.session_state["v130_reminder_open"] = True
-            st.rerun()
-    else:
-        if st.button("通知画面を閉じる", use_container_width=True, key="v130_close_reminder"):
-            st.session_state.pop("v130_reminder_open", None)
-            st.rerun()
-        v123_render_general_reminder_tab()
+                        with st.expander(f"選手別データ照合・全員分が揃ったレース（{len(complete_all)}R）", expanded=True):
+                            if complete_all:
+                                df_complete = pd.DataFrame(complete_all)
+                                show_cols = [c for c in ["開催日", "開催場", "R", "登録状況", "予測", "結果", "抽出元", "照合状態", "選手"] if c in df_complete.columns]
+                                st.dataframe(df_complete[show_cols], use_container_width=True, hide_index=True)
+                                st.download_button(
+                                    "完全データレース一覧をCSV保存",
+                                    df_complete.to_csv(index=False).encode("utf-8-sig"),
+                                    file_name="complete_player_data_races.csv",
+                                    mime="text/csv",
+                                    use_container_width=True,
+                                )
+                            else:
+                                st.caption("全員分が揃ったレースは見つかりませんでした。")
+
+                        if unidentified_complete:
+                            with st.expander(f"Rは不明だが全員分が揃った登録セット（{len(unidentified_complete)}R）", expanded=False):
+                                df_unknown = pd.DataFrame(unidentified_complete)
+                                st.dataframe(df_unknown[[c for c in ["開催日", "開催場", "R", "登録状況", "抽出元", "選手"] if c in df_unknown.columns]], use_container_width=True, hide_index=True)
+                                st.caption("選手全員分は揃っていますが、Rを特定できないため予測・結果の保存状況は断定していません。")
+
+                        with st.expander(f"全選手データあり・予測未保存（{len(unpredicted)}R）", expanded=bool(unpredicted)):
+                            if unpredicted:
+                                df_unpred = pd.DataFrame(unpredicted)
+                                show_cols = [c for c in ["開催日", "開催場", "R", "登録状況", "結果", "選手"] if c in df_unpred.columns]
+                                st.dataframe(df_unpred[show_cols], use_container_width=True, hide_index=True)
+                                st.download_button(
+                                    "未予測一覧をCSV保存",
+                                    df_unpred.to_csv(index=False).encode("utf-8-sig"),
+                                    file_name="predictable_but_unpredicted.csv",
+                                    mime="text/csv",
+                                    use_container_width=True,
+                                )
+                                st.markdown("#### 一括予測")
+                                st.caption("全選手分が揃い、Rを特定できる未予測レースだけが対象です。各レースの予測時点より後の履歴は学習から遮断します。")
+                                selectable = [r for r in unpredicted if not str(r.get("R", "")).startswith("R不明")]
+                                label_map = {
+                                    f"{r.get('開催日')}｜{r.get('開催場')}｜{r.get('R')}｜{r.get('登録状況')}": r
+                                    for r in selectable
+                                }
+                                selected_labels = st.multiselect(
+                                    "一括予測するレース",
+                                    options=list(label_map.keys()),
+                                    default=list(label_map.keys()),
+                                    key="v99_batch_prediction_selection",
+                                )
+                                batch_trials = st.select_slider(
+                                    "一括予測の試行回数",
+                                    options=[2000, 5000, 10000, 20000],
+                                    value=5000,
+                                    help="大量レースでは5000回が軽めです。保存後に必要なレースだけ通常画面で20000回へ再予測できます。",
+                                    key="v99_batch_trials",
+                                )
+                                if st.button("選択した未予測レースを一括予測", type="primary", use_container_width=True, disabled=not selected_labels):
+                                    selected_records = [label_map[x] for x in selected_labels]
+                                    with st.spinner(f"{len(selected_records)}レースを時系列順に予測しています…"):
+                                        batch_report = engine.v99_run_batch_predictions(
+                                            selected_records, int(batch_trials), 20260719, engine.DB_PATH
+                                        )
+                                    st.session_state["v99_last_batch_report"] = batch_report
+                                    if batch_report.get("成功", 0):
+                                        st.success(
+                                            f"一括予測完了：成功 {batch_report.get('成功', 0)}R｜"
+                                            f"スキップ {batch_report.get('スキップ', 0)}R｜エラー {batch_report.get('エラー', 0)}R"
+                                        )
+                                    else:
+                                        st.warning(
+                                            f"保存できたレースはありませんでした。スキップ {batch_report.get('スキップ', 0)}R｜"
+                                            f"エラー {batch_report.get('エラー', 0)}R"
+                                        )
+                                    st.rerun()
+                                last_batch = st.session_state.get("v99_last_batch_report")
+                                if last_batch:
+                                    with st.expander("直前の一括予測レポート", expanded=bool(last_batch.get("エラー") or last_batch.get("スキップ"))):
+                                        st.write(
+                                            f"対象 {last_batch.get('対象', 0)}R｜成功 {last_batch.get('成功', 0)}R｜"
+                                            f"スキップ {last_batch.get('スキップ', 0)}R｜エラー {last_batch.get('エラー', 0)}R"
+                                        )
+                                        details = pd.DataFrame(last_batch.get("details", []))
+                                        if not details.empty:
+                                            st.dataframe(details, use_container_width=True, hide_index=True)
+                                            st.download_button(
+                                                "一括予測レポートをCSV保存",
+                                                details.to_csv(index=False).encode("utf-8-sig"),
+                                                file_name="batch_prediction_report.csv",
+                                                mime="text/csv",
+                                                use_container_width=True,
+                                            )
+                            else:
+                                st.success("全選手データがそろったレースは、すべて予測保存済みです。")
+
+                        with st.expander(f"全選手データあり・結果未登録（{len(missing_result)}R）", expanded=False):
+                            if missing_result:
+                                df_missing = pd.DataFrame(missing_result)
+                                show_cols = [c for c in ["開催日", "開催場", "R", "登録状況", "予測", "選手"] if c in df_missing.columns]
+                                st.dataframe(df_missing[show_cols], use_container_width=True, hide_index=True)
+                                st.download_button(
+                                    "結果未登録一覧をCSV保存",
+                                    df_missing.to_csv(index=False).encode("utf-8-sig"),
+                                    file_name="complete_data_missing_results.csv",
+                                    mime="text/csv",
+                                    use_container_width=True,
+                                )
+                            else:
+                                st.success("完全データのレースに結果登録漏れはありません。")
+
+                        with st.expander(f"予測済み・結果未登録だけ（{len(predicted_missing)}R）", expanded=False):
+                            if predicted_missing:
+                                df_pm = pd.DataFrame(predicted_missing)
+                                st.dataframe(df_pm[[c for c in ["開催日", "開催場", "R", "登録状況", "選手"] if c in df_pm.columns]], use_container_width=True, hide_index=True)
+                            else:
+                                st.caption("該当レースはありません。")
+
+                        with st.expander(f"選手データ不足・人数不一致（{len(incomplete)}R）", expanded=False):
+                            if incomplete:
+                                df_inc = pd.DataFrame(incomplete)
+                                st.dataframe(df_inc[[c for c in ["開催日", "開催場", "R", "登録状況", "不足人数", "選手"] if c in df_inc.columns]], use_container_width=True, hide_index=True)
+                            else:
+                                st.caption("該当レースはありません。")
+
+                        if v97_summary.get("識別不能", 0):
+                            st.caption(f"日付を特定できず集計対象外となった履歴: {v97_summary.get('識別不能', 0)}行")
+                        st.info("『予測未保存』は、予測スナップショットがDBに残っていない状態です。過去に画面表示だけ行い、保存前の版で予測したレースも含まれる場合があります。")
+                    except Exception as exc:
+                        st.warning(f"登録漏れチェックを実行できませんでした: {exc}")
+
+                    st.divider()
+                    st.subheader("事故レースの学習除外")
+                    st.caption("落車・反則・周回誤認・失格・競走中止などが1台でもあるレースは、結果を残したままレース全体をAI学習から除外します。")
+                    try:
+                        accident_status = engine.v76_accident_learning_status(engine.DB_PATH)
+                        st.caption(
+                            f"登録結果 {accident_status.get('登録結果', 0)}レース / "
+                            f"学習対象外 {accident_status.get('事故レース除外', 0)}レース"
+                        )
+                        if accident_status.get("対象レース"):
+                            with st.expander("学習対象外の事故レースを確認", expanded=False):
+                                st.dataframe(pd.DataFrame(accident_status["対象レース"]), use_container_width=True, hide_index=True)
+                    except Exception as exc:
+                        st.caption(f"事故レース状況を取得できませんでした: {exc}")
+                    if st.button("登録済み結果を再点検して事故レースを学習対象外にする", use_container_width=True):
+                        with st.spinner("登録済み結果を再点検しています..."):
+                            accident_result = engine.v76_reclassify_existing_accident_races(engine.DB_PATH)
+                        ok, msg = push_db_to_github("AutoRaceAI: 事故レースを学習対象外へ再分類")
+                        summary = (
+                            f"{accident_result.get('結果レース確認', 0)}レースを確認し、"
+                            f"事故 {accident_result.get('事故レース', 0)}レースを学習対象外にしました。"
+                            f" 選手履歴 {accident_result.get('選手履歴除外', 0)}行を除外、"
+                            f"周回学習 {accident_result.get('周回学習削除', 0)}行・"
+                            f"事故レースの重み履歴 {accident_result.get('重み履歴削除', 0)}件を削除しました。"
+                        )
+                        if ok:
+                            st.success(summary + " " + msg)
+                        else:
+                            st.warning(summary + " GitHub保存は未完了です。" + msg)
+                        st.rerun()
+
+                    st.divider()
+                    st.subheader("グランドノート再学習")
+                    st.caption("旧バージョンを含む登録済み結果のグランドノートを、選手別の展開学習へ全件再同期します。再同期後は、初周主導・位置維持・捌き・追込み・終盤・失速・熱走路補正のすべてに反映されます。")
+                    try:
+                        gn_status = engine.v62_grand_note_learning_status(engine.DB_PATH)
+                        st.caption(
+                            f"結果周回 {gn_status.get('結果周回行', 0)}行 / "
+                            f"学習済み {gn_status.get('選手別周回行', 0)}行 / "
+                            f"学習レース {gn_status.get('学習レース数', 0)}件 / "
+                            f"未同期推定 {gn_status.get('未同期行推定', 0)}行"
+                        )
+                    except Exception as exc:
+                        st.caption(f"再学習状況を取得できませんでした: {exc}")
+
+                    if st.button("登録済みグランドノートを全件再学習", use_container_width=True):
+                        with st.spinner("登録済みグランドノートを再同期しています..."):
+                            gn_result = engine.v62_rebuild_grand_note_learning(engine.DB_PATH)
+                        ok, msg = push_db_to_github("AutoRaceAI: 登録済みグランドノートを全件再学習")
+                        summary = (
+                            f"対象 {gn_result.get('対象レース', 0)}レース・{gn_result.get('対象選手', 0)}選手、"
+                            f"周回 {gn_result.get('同期成功', 0)}行を反映 "
+                            f"（新規 {gn_result.get('新規', 0)} / 更新 {gn_result.get('更新', 0)}）。"
+                        )
+                        if gn_result.get('結果選手不明', 0) or gn_result.get('選手不明', 0):
+                            summary += (
+                                f" 選手名不足 {gn_result.get('結果選手不明', 0)}行、"
+                                f"選手未解決 {gn_result.get('選手不明', 0)}行。"
+                            )
+                        if ok:
+                            st.success(summary + " " + msg)
+                        else:
+                            st.warning(summary + " GitHub保存は未完了です。" + msg)
+                        st.rerun()
+
+                    st.divider()
+                    st.subheader("グランドノート未リンク修復")
+                    st.caption("結果の周回順位はあるのに選手名へ結び付いていないデータを、レース・車番単位で診断して修復します。候補が一意のものだけ自動修復し、曖昧なものは手動で選びます。")
+                    try:
+                        health = engine.v63_db_health_report(engine.DB_PATH)
+                        score = health.get("health_score", 0)
+                        icon = "🟢" if score >= 99 else ("🟡" if score >= 95 else "🔴")
+                        st.metric("グランドノートDB健康度", f"{icon} {score:.1f}%")
+                        st.caption(
+                            f"未リンク {health.get('unlinked_groups', 0)}組・{health.get('unlinked_rows', 0)}行 / "
+                            f"結果周回 {health.get('result_lap_rows', 0)}行 / 学習済み {health.get('learned_lap_rows', 0)}行"
+                        )
+                        unresolved = engine.v63_grand_note_unlinked_groups(engine.DB_PATH)
+                    except Exception as exc:
+                        unresolved = []
+                        st.error(f"未リンク診断に失敗しました: {exc}")
+
+                    if unresolved:
+                        if st.button("一意に決まる未リンクだけ自動修復", use_container_width=True):
+                            repair_result = engine.v63_auto_repair_grand_note_links(engine.DB_PATH)
+                            ok, msg = push_db_to_github("AutoRaceAI: グランドノート未リンクを自動修復")
+                            summary = (
+                                f"{repair_result.get('repaired_groups', 0)}組・{repair_result.get('synced_rows', 0)}行を修復。"
+                                f"手動確認 {repair_result.get('manual_groups', 0)}組。"
+                            )
+                            st.success(summary + (" " + msg if ok else " GitHub保存は未完了です。" + msg))
+                            st.rerun()
+
+                        player_choices = engine.v63_player_name_choices(engine.DB_PATH)
+                        for idx, item in enumerate(unresolved):
+                            title = (
+                                f"{item.get('race_date', '')} {item.get('venue', '')} "
+                                f"{item.get('race_no', '')}R・{item.get('car_no')}番 "
+                                f"（未リンク {item.get('lap_rows', 0)}行）"
+                            )
+                            with st.expander(title, expanded=True):
+                                st.caption(
+                                    f"1周目順位: {item.get('first_lap_position') or '-'} / "
+                                    f"ゴール順位: {item.get('goal_position') or '-'} / "
+                                    f"race_key: {item.get('race_key')}"
+                                )
+                                auto_candidates = [c.get('player_name') for c in item.get('candidates', [])]
+                                if auto_candidates:
+                                    st.info("自動候補: " + " / ".join(auto_candidates))
+                                else:
+                                    st.warning("自動候補を特定できません。結果ページを確認して選手名を選択してください。")
+
+                                options = ["選択してください"] + auto_candidates + [n for n in player_choices if n not in auto_candidates]
+                                selected_name = st.selectbox(
+                                    "この車番の選手",
+                                    options,
+                                    key=f"v63_player_{item.get('race_key')}_{item.get('car_no')}_{idx}",
+                                )
+                                if st.button(
+                                    "この未リンクを修復",
+                                    key=f"v63_repair_{item.get('race_key')}_{item.get('car_no')}_{idx}",
+                                    use_container_width=True,
+                                    disabled=selected_name == "選択してください",
+                                ):
+                                    result = engine.v63_repair_grand_note_link(
+                                        item.get('race_key'), item.get('car_no'), selected_name, engine.DB_PATH
+                                    )
+                                    if result.get('ok'):
+                                        ok, msg = push_db_to_github("AutoRaceAI: グランドノート未リンクを手動修復")
+                                        st.success(result.get('message', '修復しました。') + f" 周回{result.get('synced_rows', 0)}行を再学習しました。" + (" " + msg if ok else " GitHub保存は未完了です。" + msg))
+                                        st.rerun()
+                                    else:
+                                        st.warning(result.get('message', '修復できませんでした。'))
+                    else:
+                        st.success("未リンクのグランドノートはありません。すべて選手別学習へ反映されています。")
+
+                    st.divider()
+                    table = st.selectbox("DBテーブルを直接確認", info["tables"])
+                    columns = [r[1] for r in con.execute(f"PRAGMA table_info({qident(table)})").fetchall()]
+                    count = con.execute(f"SELECT COUNT(*) FROM {qident(table)}").fetchone()[0]
+                    st.caption(f"{table}: {count}件 / 列: {', '.join(columns)}")
+                    preview = pd.read_sql_query(f"SELECT * FROM {qident(table)} LIMIT 500", con)
+                    st.dataframe(preview, use_container_width=True, hide_index=True, height=400)
+                    if count > 500:
+                        st.caption("表示は先頭500件です。")
+        except Exception as exc:
+            st.error(f"登録情報の確認エラー: {type(exc).__name__}: {exc}")
+            st.exception(exc)
+
+    st.caption("GitHub保存にはStreamlit Secretsの設定が必要です。トークンはコードやGitHubへ直接書かないでください。")
+
+
+
