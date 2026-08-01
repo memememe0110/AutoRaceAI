@@ -20,7 +20,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver96｜開催場学習2層化・選手×開催場相性を実反映")
+st.caption("Ver138｜不要再処理削減・入力中解析停止・DB参照キャッシュ")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -459,6 +459,86 @@ def db_summary(db_path: str) -> dict:
 
 
 
+
+def _v138_db_token(db_path: str) -> tuple[str, int, int]:
+    """DB内容が変わった時だけキャッシュを更新する軽量キー。"""
+    path = Path(db_path)
+    if not path.exists():
+        return (str(path), 0, 0)
+    stat = path.stat()
+    return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _v138_cached_db_summary(db_path: str, token: tuple) -> dict:
+    del token
+    return db_summary(db_path)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _v138_cached_adjustment_log(db_path: str, token: tuple) -> pd.DataFrame:
+    del token
+    return engine.v36_get_adjustment_log(db_path)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _v138_cached_venue_analysis(db_path: str, token: tuple) -> pd.DataFrame:
+    del token
+    return engine.v103_load_venue_analysis_cache(db_path)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _v138_cached_database_health(db_path: str, token: tuple) -> dict:
+    del token
+    return engine.v97_database_health(db_path)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _v138_player_registration_index(db_path: str, token: tuple) -> dict:
+    """全選手集計はDB更新時に一度だけ作る。名前入力ごとに全件SQLを実行しない。"""
+    del token
+    names = {}
+    if not Path(db_path).exists():
+        return names
+    with sqlite3.connect(db_path) as con:
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if {"players", "race_history"}.issubset(tables):
+            rows = con.execute(
+                """
+                SELECT p.player_name, COUNT(h.history_id),
+                       SUM(CASE WHEN COALESCE(h.use_for_model, 1)=1 THEN 1 ELSE 0 END),
+                       MAX(NULLIF(h.race_date, ''))
+                FROM players p
+                LEFT JOIN race_history h ON h.player_id=p.player_id
+                GROUP BY p.player_id, p.player_name
+                """
+            ).fetchall()
+            for player_name, count_all, count_use, latest in rows:
+                pkey = normalize_player_key(player_name)
+                item = names.setdefault(pkey, {"names": [], "canonical": 0, "model": 0, "detail": 0, "dates": []})
+                item["names"].append(str(player_name))
+                item["canonical"] += int(count_all or 0)
+                item["model"] += int(count_use or 0)
+                if latest:
+                    item["dates"].append(str(latest))
+        if "v15_player_history_imports" in tables:
+            rows = con.execute(
+                """
+                SELECT player_name, COUNT(*), MAX(NULLIF(race_date, ''))
+                FROM v15_player_history_imports
+                WHERE player_name IS NOT NULL AND TRIM(player_name)<>''
+                GROUP BY player_name
+                """
+            ).fetchall()
+            for player_name, count_all, latest in rows:
+                pkey = normalize_player_key(player_name)
+                item = names.setdefault(pkey, {"names": [], "canonical": 0, "model": 0, "detail": 0, "dates": []})
+                item["names"].append(str(player_name))
+                item["detail"] += int(count_all or 0)
+                if latest:
+                    item["dates"].append(str(latest))
+    return names
+
 def normalize_player_key(name: str) -> str:
     """DB照合用に空白と所属表記を除去した選手名キーを返す。"""
     value = str(name or "").strip()
@@ -574,88 +654,34 @@ def show_player_data_coverage(entries: pd.DataFrame) -> None:
 
 
 def lookup_player_registration(name: str, db_path: str) -> dict:
-    """入力した選手名がDBに登録済みか、重複加算せずに確認する。"""
+    """入力した選手名がDBに登録済みか、キャッシュ索引から確認する。"""
     key = normalize_player_key(name)
     result = {
-        "found": False,
-        "matched_name": "",
-        "canonical_count": 0,
-        "model_count": 0,
-        "detail_count": 0,
-        "latest": None,
-        "candidates": [],
+        "found": False, "matched_name": "", "canonical_count": 0,
+        "model_count": 0, "detail_count": 0, "latest": None, "candidates": [],
     }
     if not key or not Path(db_path).exists():
         return result
-
-    with sqlite3.connect(db_path) as con:
-        tables = {r[0] for r in con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        names = {}
-
-        if {"players", "race_history"}.issubset(tables):
-            rows = con.execute(
-                """
-                SELECT p.player_name, COUNT(h.history_id),
-                       SUM(CASE WHEN COALESCE(h.use_for_model, 1)=1 THEN 1 ELSE 0 END),
-                       MAX(NULLIF(h.race_date, ''))
-                FROM players p
-                LEFT JOIN race_history h ON h.player_id=p.player_id
-                GROUP BY p.player_id, p.player_name
-                """
-            ).fetchall()
-            for player_name, count_all, count_use, latest in rows:
-                pkey = normalize_player_key(player_name)
-                item = names.setdefault(pkey, {
-                    "names": [], "canonical": 0, "model": 0, "detail": 0, "dates": []
-                })
-                item["names"].append(str(player_name))
-                item["canonical"] += int(count_all or 0)
-                item["model"] += int(count_use or 0)
-                if latest:
-                    item["dates"].append(str(latest))
-
-        if "v15_player_history_imports" in tables:
-            rows = con.execute(
-                """
-                SELECT player_name, COUNT(*), MAX(NULLIF(race_date, ''))
-                FROM v15_player_history_imports
-                WHERE player_name IS NOT NULL AND TRIM(player_name)<>''
-                GROUP BY player_name
-                """
-            ).fetchall()
-            for player_name, count_all, latest in rows:
-                pkey = normalize_player_key(player_name)
-                item = names.setdefault(pkey, {
-                    "names": [], "canonical": 0, "model": 0, "detail": 0, "dates": []
-                })
-                item["names"].append(str(player_name))
-                item["detail"] += int(count_all or 0)
-                if latest:
-                    item["dates"].append(str(latest))
-
-        if key in names:
-            item = names[key]
+    names = _v138_player_registration_index(db_path, _v138_db_token(db_path))
+    if key in names:
+        item = names[key]
+        display_names = sorted(set(item["names"]), key=lambda x: (len(x), x))
+        result.update({
+            "found": True,
+            "matched_name": display_names[0] if display_names else str(name).strip(),
+            "canonical_count": item["canonical"],
+            "model_count": item["model"],
+            "detail_count": item["detail"],
+            "latest": max(item["dates"]) if item["dates"] else None,
+        })
+        return result
+    candidates = []
+    for pkey, item in names.items():
+        if key in pkey or pkey in key:
             display_names = sorted(set(item["names"]), key=lambda x: (len(x), x))
-            result.update({
-                "found": True,
-                "matched_name": display_names[0] if display_names else str(name).strip(),
-                "canonical_count": item["canonical"],
-                "model_count": item["model"],
-                "detail_count": item["detail"],
-                "latest": max(item["dates"]) if item["dates"] else None,
-            })
-            return result
-
-        # 完全一致しない場合は、入力文字を含む近い候補だけ表示する。
-        candidates = []
-        for pkey, item in names.items():
-            if key in pkey or pkey in key:
-                display_names = sorted(set(item["names"]), key=lambda x: (len(x), x))
-                if display_names:
-                    candidates.append(display_names[0])
-        result["candidates"] = sorted(set(candidates))[:8]
+            if display_names:
+                candidates.append(display_names[0])
+    result["candidates"] = sorted(set(candidates))[:8]
     return result
 
 
@@ -1484,7 +1510,15 @@ prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 
 with prediction_tab:
     st.info("Ver20予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
     with st.expander("🔧 今回どこを調整したか"):
-        st.dataframe(engine.v36_get_adjustment_log(engine.DB_PATH), use_container_width=True, hide_index=True)
+        if st.button("調整履歴を読み込む", key="v138_load_adjustment_log", use_container_width=True):
+            st.session_state["v138_show_adjustment_log"] = True
+        if st.session_state.get("v138_show_adjustment_log"):
+            st.dataframe(
+                _v138_cached_adjustment_log(engine.DB_PATH, _v138_db_token(engine.DB_PATH)),
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.caption("必要な時だけ読み込みます。")
         st.caption("Ver20では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
     st.session_state.setdefault("prediction_input_version", 0)
     if st.button("🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input"):
@@ -1520,47 +1554,55 @@ with prediction_tab:
             )
             st.caption("選手の所属場は開催場として使いません。実際の開催場を選択してください。")
 
-    # Ver64: 予測実行前に出走表の読み取り結果を確認できるようにする。
-    if text.strip():
+    # 出走表の事前解析は入力中に毎回走らせず、確認ボタンを押した時だけ実行する。
+    preview_key = hashlib.sha1(text.encode("utf-8")).hexdigest() if text.strip() else ""
+    if text.strip() and st.button("📋 出走表の読み取りを確認", use_container_width=True, key=f"v138_preview_{prediction_version}"):
         try:
             preview_entries = engine.v15_parse_entries(text)
+            preview_meta = engine.v15_parse_race_meta(text) or {}
+            st.session_state["v138_prediction_preview"] = {
+                "key": preview_key, "entries": preview_entries, "meta": preview_meta
+            }
+        except Exception as exc:
+            st.session_state["v138_prediction_preview"] = {"key": preview_key, "error": str(exc)}
+
+    preview_state = st.session_state.get("v138_prediction_preview", {})
+    if preview_state.get("key") == preview_key:
+        if preview_state.get("error"):
+            st.warning(f"出走表の事前確認に失敗しました: {preview_state['error']}")
+        else:
+            preview_entries = preview_state.get("entries")
+            preview_meta = preview_state.get("meta") or {}
             if isinstance(preview_entries, pd.DataFrame) and not preview_entries.empty:
                 preview_cols = [c for c in [
-                    "車番", "選手名", "所属", "ハンデ", "試走T", "ST",
-                    "試走偏差", "現ランク", "平均競走T", "最高競走T",
-                    "近10走着順", "近10走2連", "近10走3連", "車名"
+                    "車番", "選手名", "所属", "ハンデ", "試走T", "ST", "試走偏差",
+                    "現ランク", "平均競走T", "最高競走T", "近10走着順", "近10走2連",
+                    "近10走3連", "車名"
                 ] if c in preview_entries.columns]
-                expected_entries = None
-                try:
-                    preview_meta = engine.v15_parse_race_meta(text) or {}
-                    expected_entries = int(preview_meta.get("出走数")) if preview_meta.get("出走数") else None
-                except Exception:
-                    expected_entries = None
+                expected_entries = int(preview_meta.get("出走数")) if preview_meta.get("出走数") else None
                 actual_entries = int(preview_entries["車番"].nunique())
                 with st.expander(f"📋 出走表の読み取り確認（{actual_entries}名）", expanded=False):
                     st.dataframe(preview_entries[preview_cols], use_container_width=True, hide_index=True)
                     if expected_entries and actual_entries < expected_entries:
                         present = set(preview_entries["車番"].dropna().astype(int).tolist())
                         missing = [car for car in range(1, expected_entries + 1) if car not in present]
-                        missing_text = "、".join(f"{car}番" for car in missing) if missing else "不明"
-                        st.warning(f"⚠ {actual_entries}/{expected_entries}車のみ読み取りました。未読込候補: {missing_text}")
+                        st.warning(f"⚠ {actual_entries}/{expected_entries}車のみ読み取りました。未読込候補: " + "、".join(f"{car}番" for car in missing))
                     elif expected_entries:
                         st.success(f"✅ {actual_entries}/{expected_entries}車を正常に読み取りました。")
-                    else:
-                        st.info(f"読取車数: {actual_entries}車")
             else:
-                st.warning("出走表から選手を読み取れませんでした。ページ全体をコピーして貼り付けてください。")
-        except Exception as exc:
-            st.warning(f"出走表の事前確認に失敗しました: {exc}")
+                st.warning("出走表から選手を読み取れませんでした。")
 
     manual_excluded = []
     if text.strip():
         auto_excluded = {int(car): "手動指定" for car in manual_excluded}
-        # 欠車表示を一度除去して全車番を取得し、ユーザーが状態を上書きできるようにする。
-        status_removed = re.sub(r"(?m)^\s*(欠車|出走取消|出走取り消し|不出走|除外|参加解除)\s*$", "", text)
-        normalized = re.sub(r"(?m)^\s*ハンデ\s*", "", status_removed)
-        all_entries = engine.v152_parse_vertical_entries(engine.v15_clean_text(normalized))
-        available_cars = sorted(all_entries["車番"].dropna().astype(int).unique().tolist()) if not all_entries.empty else list(range(1, 9))
+        # 車番候補はヘッダの出走数から軽量生成。詳細パーサーを入力のたびに実行しない。
+        count_match = re.search(r"([1-8])車", text)
+        expected_count = int(count_match.group(1)) if count_match else 8
+        available_cars = list(range(1, expected_count + 1))
+        if preview_state.get("key") == preview_key and isinstance(preview_state.get("entries"), pd.DataFrame):
+            parsed_cars = sorted(preview_state["entries"]["車番"].dropna().astype(int).unique().tolist())
+            if parsed_cars:
+                available_cars = sorted(set(available_cars) | set(parsed_cars))
         defaults = [car for car in available_cars if car in auto_excluded]
         manual_excluded = st.multiselect(
             "欠車・出走取消として除外する車番（手動で変更できます）",
@@ -2390,30 +2432,20 @@ with db_tab:
             st.success(f"一括分析完了：5開催場を {rebuild.get('分析日時', '')} に更新しました。")
         st.rerun()
 
-    try:
-        cached_venue = engine.v103_load_venue_analysis_cache(engine.DB_PATH)
-        if not cached_venue.empty:
-            latest_time = str(cached_venue["分析日時"].max())
-            st.info(f"保存済み一括分析：{latest_time}｜{len(cached_venue)}開催場")
-            with st.expander("保存済みの開催場分析結果", expanded=False):
-                st.dataframe(
-                    cached_venue,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "全履歴反映率": st.column_config.ProgressColumn(format="%.1%%", min_value=0.0, max_value=1.0),
-                        "展開反映率": st.column_config.ProgressColumn(format="%.1%%", min_value=0.0, max_value=1.0),
-                        "試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
-                        "ST影響差": st.column_config.NumberColumn(format="%+.3f"),
-                        "ハンデ影響差": st.column_config.NumberColumn(format="%+.3f"),
-                        "タイム基準差秒": st.column_config.NumberColumn(format="%+.4f"),
-                        "試走本走差秒": st.column_config.NumberColumn(format="%+.4f"),
-                    },
-                )
-        else:
-            st.info("保存済みの一括分析はまだありません。上のボタンで初回分析を実行してください。")
-    except Exception as exc:
-        st.warning(f"保存済み開催場分析を読み込めませんでした: {exc}")
+    if st.button("保存済み開催場分析を表示", use_container_width=True, key="v138_load_saved_venue_analysis"):
+        st.session_state["v138_show_saved_venue_analysis"] = True
+    if st.session_state.get("v138_show_saved_venue_analysis"):
+        try:
+            cached_venue = _v138_cached_venue_analysis(engine.DB_PATH, _v138_db_token(engine.DB_PATH))
+            if not cached_venue.empty:
+                latest_time = _format_jst(cached_venue["分析日時"].max()) if "分析日時" in cached_venue.columns else ""
+                st.info(f"保存済み一括分析：{latest_time}｜{len(cached_venue)}開催場")
+                with st.expander("保存済みの開催場分析結果", expanded=False):
+                    st.dataframe(_jst_datetime_columns(cached_venue), use_container_width=True, hide_index=True)
+            else:
+                st.info("保存済みの一括分析はまだありません。")
+        except Exception as exc:
+            st.warning(f"保存済み開催場分析を読み込めませんでした: {exc}")
 
     st.markdown("#### 開催場別重みの詳細")
     st.caption("この処理は重いため自動実行しません。必要なときだけ読み込んでください。")
@@ -2484,7 +2516,7 @@ with db_tab:
         st.divider()
         st.subheader("登録されている情報")
         try:
-            info = db_summary(engine.DB_PATH)
+            info = _v138_cached_db_summary(engine.DB_PATH, _v138_db_token(engine.DB_PATH))
             if not info["exists"]:
                 st.warning("DBファイルがありません。")
             elif not info["tables"]:
@@ -2665,7 +2697,17 @@ with db_tab:
                     st.subheader("予測・結果の登録漏れチェック")
                     st.caption("選手別履歴を直接照合します。Rがあるデータは日付・開催場・Rで、Rがないデータも同時登録された選手セットから完全レースを復元します。")
                     try:
-                        v97_health = engine.v97_database_health(engine.DB_PATH)
+                        if st.button("登録漏れチェックを実行・更新", use_container_width=True, key="v138_refresh_health"):
+                            with st.spinner("登録履歴を照合しています…"):
+                                _v138_cached_database_health.clear()
+                                st.session_state["v138_health_loaded"] = True
+                        if not st.session_state.get("v138_health_loaded"):
+                            st.info("登録漏れチェックは重いため、自動実行しません。上のボタンを押した時だけ実行します。")
+                            v97_health = None
+                        else:
+                            v97_health = _v138_cached_database_health(engine.DB_PATH, _v138_db_token(engine.DB_PATH))
+                        if not v97_health:
+                            raise RuntimeError("登録漏れチェックは未実行です")
                         v97_summary = v97_health.get("summary", {})
                         c1, c2, c3, c4, c5 = st.columns(5)
                         c1.metric("完全データ", f"{v97_summary.get('完全データ', 0)}R")
@@ -2805,6 +2847,9 @@ with db_tab:
                         if v97_summary.get("識別不能", 0):
                             st.caption(f"日付を特定できず集計対象外となった履歴: {v97_summary.get('識別不能', 0)}行")
                         st.info("『予測未保存』は、予測スナップショットがDBに残っていない状態です。過去に画面表示だけ行い、保存前の版で予測したレースも含まれる場合があります。")
+                    except RuntimeError as exc:
+                        if "未実行" not in str(exc):
+                            st.warning(f"登録漏れチェックを実行できませんでした: {exc}")
                     except Exception as exc:
                         st.warning(f"登録漏れチェックを実行できませんでした: {exc}")
 
