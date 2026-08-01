@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver165｜フォーメーション被り目防止＋全開催場条件別補正")
+st.caption("Ver167｜通知時刻を締切基準へ変更＋DB62基準")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -197,7 +197,7 @@ GENERAL_REMINDER_NTFY_BASE = "https://ntfy.sh"
 
 
 def v123_parse_general_schedule_text(text_value: str) -> tuple[date | None, time | None, str | None]:
-    """一般予定の貼り付け文から日付・開始時刻・短い予定名を抽出する。"""
+    """貼り付け文から日付・締切時刻・短い予定名を抽出する。"""
     source = str(text_value or "")
 
     parsed_date = None
@@ -208,13 +208,14 @@ def v123_parse_general_schedule_text(text_value: str) -> tuple[date | None, time
         except ValueError:
             parsed_date = None
 
+    # 出走時刻より締切時刻を優先する。公式ページでは「19:51 締切」などの形が多い。
     parsed_time = None
-    time_patterns = [
-        r"(\d{1,2}):(\d{2})\s*(?:発走|開始|予定)",
-        r"(?:発走|開始)(?:予定|時刻)?\s*[:：]?\s*(\d{1,2}):(\d{2})",
-        r"(?m)^\s*(\d{1,2}):(\d{2})\s*$",
+    deadline_patterns = [
+        r"(\d{1,2}):(\d{2})\s*(?:投票)?締切(?:時刻)?",
+        r"(?:投票)?締切(?:予定|時刻)?\s*[:：]?\s*(\d{1,2}):(\d{2})",
+        r"締切まで[^\n]*?(\d{1,2}):(\d{2})",
     ]
-    for pattern in time_patterns:
+    for pattern in deadline_patterns:
         match = re.search(pattern, source)
         if not match:
             continue
@@ -228,7 +229,7 @@ def v123_parse_general_schedule_text(text_value: str) -> tuple[date | None, time
         line = raw_line.strip()
         if not line:
             continue
-        if re.search(r"20\d{2}年|\d{1,2}:\d{2}|発走|開始", line):
+        if re.search(r"20\d{2}年|\d{1,2}:\d{2}|発走|開始|締切", line):
             continue
         if len(line) <= 60:
             parsed_title = line
@@ -238,7 +239,7 @@ def v123_parse_general_schedule_text(text_value: str) -> tuple[date | None, time
 
 
 def v123_schedule_ntfy_reminder(title: str, event_date: date, event_time: time, topic: str) -> tuple[datetime, datetime]:
-    """一般予定の10分前通知をntfyへ予約する。"""
+    """締切10分前通知をntfyへ予約する。"""
     clean_title = str(title or "").strip()
     clean_topic = str(topic or "").strip()
     if not clean_title:
@@ -252,17 +253,17 @@ def v123_schedule_ntfy_reminder(title: str, event_date: date, event_time: time, 
     notify_dt = event_dt - timedelta(minutes=10)
     now = datetime.now(GENERAL_REMINDER_JST)
     if notify_dt <= now:
-        raise ValueError("通知予定時刻が過ぎています。開始時刻を10分以上先にしてください。")
+        raise ValueError("通知予定時刻が過ぎています。締切時刻を10分以上先にしてください。")
     if notify_dt - now > timedelta(days=3):
         raise ValueError("ntfy.shの予約通知は最大3日先です。3日以内の予定を指定してください。")
 
     endpoint = f"{GENERAL_REMINDER_NTFY_BASE}/{urllib.parse.quote(clean_topic, safe='')}"
-    message = f"{clean_title}\n開始時刻: {event_dt.strftime('%Y/%m/%d %H:%M')}"
+    message = f"{clean_title}\n締切時刻: {event_dt.strftime('%Y/%m/%d %H:%M')}"
     # HTTPヘッダーはASCIIのみ。日本語タイトルはURLエンコードして送る。
     # 本文はUTF-8バイト列にすることでUnicodeEncodeErrorを防ぐ。
     headers = {
         "At": str(int(notify_dt.timestamp())),
-        "Title": urllib.parse.quote("予定の10分前です", safe=""),
+        "Title": urllib.parse.quote("締切の10分前です", safe=""),
         "Priority": "high",
         "Tags": "bell",
         "Content-Type": "text/plain; charset=utf-8",
@@ -347,14 +348,14 @@ def v123_render_general_reminder_tab() -> None:
     """Streamlit標準UIで一般予定通知を表示する。ダイアログ内だけ再実行される。"""
     _v139_general_reminder_defaults()
 
-    st.caption("一般予定専用です。開始10分前・5分前、または両方を選べます。")
+    st.caption("貼り付け文の締切時刻を読み取り、締切10分前・5分前、または両方に通知します。")
     st.text_area(
         "予定情報を貼り付け（任意）",
         key="v139_reminder_source",
         height=115,
-        placeholder="例：オンライン面談\n2026年8月1日(土)\n10:39開始",
+        placeholder="例：19:51 締切\n2026年8月1日(土)\n一般戦 3100m",
     )
-    if st.button("日付・開始時刻を自動入力", use_container_width=True, key="v139_parse_reminder"):
+    if st.button("日付・締切時刻を自動入力", use_container_width=True, key="v139_parse_reminder"):
         parsed_date, parsed_time, parsed_title = v123_parse_general_schedule_text(
             st.session_state.get("v139_reminder_source", "")
         )
@@ -365,9 +366,9 @@ def v123_render_general_reminder_tab() -> None:
         if parsed_title and not str(st.session_state.get("v139_reminder_title", "")).strip():
             st.session_state["v139_reminder_title"] = parsed_title
         if parsed_date or parsed_time:
-            st.session_state["v139_reminder_message"] = ("success", "予定日時を自動入力しました。")
+            st.session_state["v139_reminder_message"] = ("success", "日付・締切時刻を自動入力しました。")
         else:
-            st.session_state["v139_reminder_message"] = ("warning", "日付または開始時刻を読み取れませんでした。")
+            st.session_state["v139_reminder_message"] = ("warning", "日付または締切時刻を読み取れませんでした。")
         st.rerun(scope="fragment")
 
     st.text_input("予定名", key="v139_reminder_title", placeholder="例：オンライン面談")
@@ -375,7 +376,7 @@ def v123_render_general_reminder_tab() -> None:
     with col1:
         st.date_input("予定日", key="v139_reminder_date")
     with col2:
-        st.time_input("開始時刻", key="v139_reminder_time", step=60)
+        st.time_input("締切時刻", key="v139_reminder_time", step=60)
     st.text_input(
         "ntfyトピック名",
         key="v139_reminder_topic",
@@ -427,7 +428,7 @@ def v123_render_general_reminder_tab() -> None:
                 expired = [minutes for minutes, dt in notify_times if dt <= now]
                 if expired:
                     minimum = max(lead_minutes)
-                    raise ValueError(f"通知時刻が過ぎています。開始時刻を{minimum}分以上先にしてください。")
+                    raise ValueError(f"通知時刻が過ぎています。締切時刻を{minimum}分以上先にしてください。")
                 if any(dt - now > timedelta(days=3) for _, dt in notify_times):
                     raise ValueError("ntfy.shの予約通知は最大3日先です。")
 
@@ -436,8 +437,8 @@ def v123_render_general_reminder_tab() -> None:
                     for minutes, notify_dt in notify_times:
                         message = (
                             f"{title}\n"
-                            f"開始{minutes}分前です。\n"
-                            f"開始時刻: {event_dt.strftime('%Y/%m/%d %H:%M')}"
+                            f"締切{minutes}分前です。\n"
+                            f"締切時刻: {event_dt.strftime('%Y/%m/%d %H:%M')}"
                         )
                         reply = _v139_ntfy_request(
                             st.session_state.get("v139_reminder_topic", ""),
