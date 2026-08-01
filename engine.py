@@ -17236,3 +17236,336 @@ def v162_register_no_contest(meta, payouts=None, db_path=DB_PATH, replace=False)
         "learning_exclusion_reason": "レース不成立・全返還",
         "message": "不成立・全返還として登録しました。選手履歴、予測評価、重み学習には使用しません。",
     }
+
+# ============================================================
+# Ver164: 全開催場の走路条件別前残り・追込み補正
+# ============================================================
+_V164_BASE_APPLY_VENUE = _V160_BASE_APPLY_VENUE
+_V164_VENUES = ("川口", "伊勢崎", "浜松", "山陽", "飯塚")
+
+
+def _v164_condition_label(surface, track_temp):
+    s = str(surface or "").strip()
+    t = number(track_temp, np.nan)
+    if any(x in s for x in ("湿", "斑")):
+        return "湿斑"
+    if pd.notna(t) and float(t) >= 55.0:
+        return "高温55以上"
+    if pd.notna(t) and float(t) >= 48.0:
+        return "高温48以上"
+    return "通常"
+
+
+def v164_rebuild_all_venue_condition_profiles(db_path=DB_PATH):
+    """全5会場を走路条件別に集計し、少数標本は同条件の全場平均へ縮小して保存する。"""
+    rows = _v84_race_level_features(_v84_history_rows(db_path))
+    columns = [
+        "venue", "condition", "sample_races", "global_races", "confidence",
+        "front_top3_rate", "rear_win_rate", "rear_top3_rate",
+        "global_front_top3_rate", "global_rear_win_rate", "global_rear_top3_rate",
+        "front_strength", "chase_strength",
+    ]
+    if rows is None or rows.empty:
+        return pd.DataFrame(columns=columns)
+    work = rows.copy()
+    work["開催場"] = work.get("開催場", "").astype(str).str.strip()
+    work["走路"] = work.get("走路", "").astype(str).str.strip()
+    work["走路温度"] = pd.to_numeric(work.get("走路温度"), errors="coerce")
+    work["condition"] = [
+        _v164_condition_label(s, t) for s, t in zip(work["走路"], work["走路温度"])
+    ]
+    metrics = ["前線3着内率", "最後方1着率", "最後方3着内率"]
+    for c in metrics:
+        work[c] = pd.to_numeric(work.get(c), errors="coerce")
+
+    result = []
+    conditions = ("通常", "高温48以上", "高温55以上", "湿斑")
+    for condition in conditions:
+        global_rows = work[work["condition"] == condition]
+        if global_rows.empty:
+            global_rows = work
+        global_n = int(len(global_rows))
+        gf = float(global_rows["前線3着内率"].dropna().mean()) if global_rows["前線3着内率"].notna().any() else 0.0
+        grw = float(global_rows["最後方1着率"].dropna().mean()) if global_rows["最後方1着率"].notna().any() else 0.0
+        gr3 = float(global_rows["最後方3着内率"].dropna().mean()) if global_rows["最後方3着内率"].notna().any() else 0.0
+        for venue in _V164_VENUES:
+            g = work[(work["開催場"] == venue) & (work["condition"] == condition)]
+            n = int(len(g))
+            # n/(n+20) により、数件だけの会場条件は全場平均へ強く寄せる。
+            confidence = float(n / (n + 20.0)) if n else 0.0
+            lf = float(g["前線3着内率"].dropna().mean()) if n and g["前線3着内率"].notna().any() else gf
+            lrw = float(g["最後方1着率"].dropna().mean()) if n and g["最後方1着率"].notna().any() else grw
+            lr3 = float(g["最後方3着内率"].dropna().mean()) if n and g["最後方3着内率"].notna().any() else gr3
+            sf = confidence * lf + (1.0 - confidence) * gf
+            srw = confidence * lrw + (1.0 - confidence) * grw
+            sr3 = confidence * lr3 + (1.0 - confidence) * gr3
+            front_strength = confidence * ((sf - gf) * 1.65 - (srw - grw) * 0.45 - (sr3 - gr3) * 0.20)
+            chase_strength = confidence * ((sr3 - gr3) * 1.15 + (srw - grw) * 0.75 - (sf - gf) * 0.55)
+            result.append({
+                "venue": venue, "condition": condition, "sample_races": n,
+                "global_races": global_n, "confidence": confidence,
+                "front_top3_rate": sf, "rear_win_rate": srw, "rear_top3_rate": sr3,
+                "global_front_top3_rate": gf, "global_rear_win_rate": grw,
+                "global_rear_top3_rate": gr3,
+                "front_strength": float(np.clip(front_strength, -0.35, 0.55)),
+                "chase_strength": float(np.clip(chase_strength, -0.35, 0.55)),
+            })
+    profile_df = pd.DataFrame(result, columns=columns)
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v164_venue_condition_profiles(
+                venue TEXT NOT NULL, condition TEXT NOT NULL,
+                sample_races INTEGER, global_races INTEGER, confidence REAL,
+                front_top3_rate REAL, rear_win_rate REAL, rear_top3_rate REAL,
+                global_front_top3_rate REAL, global_rear_win_rate REAL, global_rear_top3_rate REAL,
+                front_strength REAL, chase_strength REAL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(venue, condition)
+            )
+        """)
+        for _, r in profile_df.iterrows():
+            con.execute("""
+                INSERT INTO v164_venue_condition_profiles(
+                    venue,condition,sample_races,global_races,confidence,
+                    front_top3_rate,rear_win_rate,rear_top3_rate,
+                    global_front_top3_rate,global_rear_win_rate,global_rear_top3_rate,
+                    front_strength,chase_strength,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(venue,condition) DO UPDATE SET
+                    sample_races=excluded.sample_races,global_races=excluded.global_races,
+                    confidence=excluded.confidence,front_top3_rate=excluded.front_top3_rate,
+                    rear_win_rate=excluded.rear_win_rate,rear_top3_rate=excluded.rear_top3_rate,
+                    global_front_top3_rate=excluded.global_front_top3_rate,
+                    global_rear_win_rate=excluded.global_rear_win_rate,
+                    global_rear_top3_rate=excluded.global_rear_top3_rate,
+                    front_strength=excluded.front_strength,chase_strength=excluded.chase_strength,
+                    updated_at=CURRENT_TIMESTAMP
+            """, tuple(r[c] for c in columns))
+        con.commit()
+    return profile_df
+
+
+def _v164_get_venue_condition_profile(venue, condition, db_path=DB_PATH):
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            row = con.execute("""
+                SELECT venue,condition,sample_races,global_races,confidence,
+                       front_top3_rate,rear_win_rate,rear_top3_rate,
+                       global_front_top3_rate,global_rear_win_rate,global_rear_top3_rate,
+                       front_strength,chase_strength
+                  FROM v164_venue_condition_profiles
+                 WHERE venue=? AND condition=?
+            """, (str(venue), str(condition))).fetchone()
+        if row:
+            keys = ["venue","condition","sample_races","global_races","confidence",
+                    "front_top3_rate","rear_win_rate","rear_top3_rate",
+                    "global_front_top3_rate","global_rear_win_rate","global_rear_top3_rate",
+                    "front_strength","chase_strength"]
+            return dict(zip(keys, row))
+    except Exception:
+        pass
+    v164_rebuild_all_venue_condition_profiles(db_path)
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            row = con.execute("""
+                SELECT venue,condition,sample_races,global_races,confidence,
+                       front_top3_rate,rear_win_rate,rear_top3_rate,
+                       global_front_top3_rate,global_rear_win_rate,global_rear_top3_rate,
+                       front_strength,chase_strength
+                  FROM v164_venue_condition_profiles
+                 WHERE venue=? AND condition=?
+            """, (str(venue), str(condition))).fetchone()
+        if row:
+            keys = ["venue","condition","sample_races","global_races","confidence",
+                    "front_top3_rate","rear_win_rate","rear_top3_rate",
+                    "global_front_top3_rate","global_rear_win_rate","global_rear_top3_rate",
+                    "front_strength","chase_strength"]
+            return dict(zip(keys, row))
+    except Exception:
+        pass
+    return {}
+
+
+def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
+    out = _V164_BASE_APPLY_VENUE(df, entries, meta, db_path)
+    meta = meta or {}
+    venue = str(meta.get("開催場") or meta.get("venue") or "").strip()
+    temp = number(meta.get("走路温度"), np.nan)
+    surface = str(meta.get("走路状態") or meta.get("走路") or "").strip()
+    condition = _v164_condition_label(surface, temp)
+    n = len(out)
+    out["全会場条件別補正"] = 0.0
+    out["全会場条件別根拠"] = ""
+    if n == 0 or venue not in _V164_VENUES:
+        return out
+    p = _v164_get_venue_condition_profile(venue, condition, db_path)
+    confidence = float(p.get("confidence", 0.0) or 0.0)
+    front_strength = float(p.get("front_strength", 0.0) or 0.0)
+    chase_strength = float(p.get("chase_strength", 0.0) or 0.0)
+    if confidence <= 0.0:
+        return out
+    handicap = pd.to_numeric(out.get("ハンデ", pd.Series(0.0, index=out.index)), errors="coerce").fillna(0.0)
+    hmin, hmax = float(handicap.min()), float(handicap.max())
+    span = max(hmax - hmin, 10.0)
+    front_role = (1.0 - (handicap - hmin) / span).clip(0.0, 1.0)
+    rear_role = ((handicap - hmin) / span).clip(0.0, 1.0)
+    middle_role = (1.0 - np.abs((handicap - hmin) / span - 0.5) * 2.0).clip(0.0, 1.0)
+    # 前残りと追込みを別々に学習し、双方が強い会場では中間ハンデもわずかに評価する。
+    bonus = front_strength * (front_role ** 1.55) + chase_strength * (rear_role ** 1.45)
+    bonus += np.minimum(max(front_strength, 0.0), max(chase_strength, 0.0)) * middle_role * 0.12
+    bonus = pd.Series(np.clip(bonus, -0.32, 0.48), index=out.index)
+    out["全会場条件別補正"] = bonus.round(3)
+    out["全会場条件別根拠"] = [
+        f"{venue}/{condition} {int(p.get('sample_races',0))}R・信頼{confidence:.0%}・前{front_strength:+.3f}・追{chase_strength:+.3f}"
+    ] * n
+    if "改善後総合点" in out.columns:
+        out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(n).astype(int)
+        out["開催場補正後総合点"] = out["改善後総合点"]
+        out["開催場補正後順位"] = out["改善後順位"]
+    if "予測競走T" in out.columns:
+        sec = pd.Series(np.clip(-bonus * 0.0040, -0.0020, 0.0015), index=out.index)
+        out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"], errors="coerce") + sec, 4)
+        out["開催場補正後予測T"] = out["予測競走T"]
+        if "開催場補正秒" in out.columns:
+            out["開催場補正秒"] = np.round(pd.to_numeric(out["開催場補正秒"], errors="coerce").fillna(0.0) + sec, 4)
+    if "開催場特徴補正" in out.columns:
+        out["開催場特徴補正"] = np.round(pd.to_numeric(out["開催場特徴補正"], errors="coerce").fillna(0.0) + bonus, 3)
+    return out
+
+
+_V164_BASE_REGISTER_RESULT = v41_register_result
+
+def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    result = _V164_BASE_REGISTER_RESULT(meta, results, laps, payouts, db_path)
+    try:
+        v164_rebuild_all_venue_condition_profiles(db_path)
+    except Exception:
+        pass
+    return result
+
+
+_V164_BASE_REPLACE_RESULT = v70_replace_registered_result
+
+def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    result = _V164_BASE_REPLACE_RESULT(meta, results, laps, payouts, db_path)
+    try:
+        v164_rebuild_all_venue_condition_profiles(db_path)
+    except Exception:
+        pass
+    return result
+
+
+# Ver164: 実際の中止ページ形式にも対応。
+_v164_base_is_no_contest_text = _v162_is_no_contest_text
+
+def _v162_is_no_contest_text(text):
+    src = str(text or "")
+    payout_all_void = "不成立" in src and all(x in src for x in ("単勝", "複勝", "2連複", "2連単", "ワイド", "3連複", "3連単"))
+    explicit_cancel = "レース中止" in src or bool(re.search(r"(?m)^\s*中止\s*$", src))
+    previous = _v164_base_is_no_contest_text(src)
+    return bool(previous or (explicit_cancel and payout_all_void))
+
+# ============================================================
+# Ver165: フォーメーション折り返し時の被り目防止
+# ============================================================
+_v165_previous_compress_formations = v67_compress_formations
+
+
+def _v165_normalize_combo_texts(combos, bet_type):
+    ordered = bet_type in {"2連単", "3連単"}
+    arity = 2 if bet_type in {"2連単", "2連複"} else 3
+    out = set()
+    for value in combos or []:
+        nums = tuple(int(x) for x in re.findall(r"\d+", str(value)))
+        if len(nums) != arity or len(set(nums)) != arity:
+            continue
+        out.add(nums if ordered else tuple(sorted(nums)))
+    return out
+
+
+def _v165_expand_formation_line(line, bet_type):
+    """表示行を実買い目へ展開し、行間の被りを検査できる形にする。"""
+    from itertools import permutations, product
+
+    ordered = bet_type in {"2連単", "3連単"}
+    arity = 2 if bet_type in {"2連単", "2連複"} else 3
+    text = str(line or "").strip().upper()
+
+    box = re.fullmatch(r"([1-8]{3})BOX", text)
+    if box and bet_type == "3連単":
+        cars = tuple(int(x) for x in box.group(1))
+        if len(set(cars)) != 3:
+            return set()
+        return set(permutations(cars, 3))
+
+    parts = re.split(r"([=-])", text)
+    groups = parts[0::2]
+    separators = parts[1::2]
+    if len(groups) != arity or len(separators) != arity - 1:
+        return set()
+    if any(not re.fullmatch(r"[1-8]+", group or "") for group in groups):
+        return set()
+
+    group_values = [tuple(dict.fromkeys(int(x) for x in group)) for group in groups]
+    expanded = set()
+    for picked in product(*group_values):
+        if len(set(picked)) != arity:
+            continue
+        if not ordered:
+            expanded.add(tuple(sorted(picked)))
+            continue
+
+        blocks = []
+        start = 0
+        for pos, sep in enumerate(separators):
+            if sep == "-":
+                blocks.append(tuple(range(start, pos + 1)))
+                start = pos + 1
+        blocks.append(tuple(range(start, arity)))
+
+        variants = [list(picked)]
+        for block in blocks:
+            if len(block) <= 1:
+                continue
+            next_variants = []
+            values = [picked[i] for i in block]
+            for perm in permutations(values):
+                for base in variants:
+                    row = list(base)
+                    for idx, value in zip(block, perm):
+                        row[idx] = value
+                    next_variants.append(row)
+            variants = next_variants
+        expanded.update(tuple(row) for row in variants if len(set(row)) == arity)
+    return expanded
+
+
+def _v165_plain_lines(target, bet_type):
+    ordered = bet_type in {"2連単", "3連単"}
+    sep = "-" if ordered else "="
+    return [sep.join(str(x) for x in combo) for combo in sorted(target)]
+
+
+def v67_compress_formations(combos, bet_type):
+    """圧縮後の実買い目を検証し、被り・欠落・余分があれば安全表記へ戻す。"""
+    target = _v165_normalize_combo_texts(combos, bet_type)
+    if not target:
+        return []
+
+    lines = _v165_previous_compress_formations(combos, bet_type)
+    covered = set()
+    valid = True
+    for line in lines:
+        expanded = _v165_expand_formation_line(line, bet_type)
+        # 解釈不能、元にない目、既出目との重複をすべて不正扱いにする。
+        if not expanded or not expanded.issubset(target) or (expanded & covered):
+            valid = False
+            break
+        covered.update(expanded)
+
+    if valid and covered == target:
+        return list(lines)
+
+    # 圧縮より正確性を優先。各買い目を1回だけ出すため、折り返しても被らない。
+    return _v165_plain_lines(target, bet_type)

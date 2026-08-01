@@ -25,6 +25,7 @@ st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁",
 _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 
+# Ver164: 全開催場条件別補正と中止・全返還形式対応。
 # Ver163: 画面切替で非表示になったウィジェット値をStreamlitに削除されないよう、
 # 通常のウィジェットキーとは別の永続キーへ退避します。
 def _v163_restore_input(widget_key: str, saved_key: str, default=None) -> None:
@@ -45,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver163｜画面切替後も入力内容を保持")
+st.caption("Ver165｜フォーメーション被り目防止＋全開催場条件別補正")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
