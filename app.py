@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver167｜通知時刻を締切基準へ変更＋DB62基準")
+st.caption("Ver168｜締切30分前通知を追加＋DB62基準")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -348,7 +348,7 @@ def v123_render_general_reminder_tab() -> None:
     """Streamlit標準UIで一般予定通知を表示する。ダイアログ内だけ再実行される。"""
     _v139_general_reminder_defaults()
 
-    st.caption("貼り付け文の締切時刻を読み取り、締切10分前・5分前、または両方に通知します。")
+    st.caption("貼り付け文の締切時刻を読み取り、締切30分前・10分前・5分前、または組み合わせて通知します。")
     st.text_area(
         "予定情報を貼り付け（任意）",
         key="v139_reminder_source",
@@ -385,7 +385,7 @@ def v123_render_general_reminder_tab() -> None:
     )
     st.segmented_control(
         "通知タイミング",
-        options=["10分前", "5分前", "10分前と5分前"],
+        options=["30分前", "10分前", "5分前", "30分前と10分前", "10分前と5分前", "30分前・10分前・5分前"],
         key="v150_reminder_timing",
         selection_mode="single",
     )
@@ -419,9 +419,12 @@ def v123_render_general_reminder_tab() -> None:
                 )
                 selected = st.session_state.get("v150_reminder_timing", "10分前") or "10分前"
                 lead_minutes = {
+                    "30分前": [30],
                     "10分前": [10],
                     "5分前": [5],
+                    "30分前と10分前": [30, 10],
                     "10分前と5分前": [10, 5],
+                    "30分前・10分前・5分前": [30, 10, 5],
                 }.get(selected, [10])
                 now = datetime.now(GENERAL_REMINDER_JST)
                 notify_times = [(minutes, event_dt - timedelta(minutes=minutes)) for minutes in lead_minutes]

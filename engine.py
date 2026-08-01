@@ -6982,9 +6982,11 @@ def _v48_numeric_identity_match(existing, incoming):
     2項目以上が一致し、比較できた項目に明確な不一致がない場合のみ同一扱い。
     タイム類は小数丸め差を吸収する。
     """
+    # Ver169: 欠車・取消があると「出走」だけが 8→7 のように変わるため、
+    # starters は同一走行判定に使わない。着順・ハンデ・各タイムのうち
+    # 2項目以上が一致すれば、欠車前後の再登録でも同じ履歴へ統合する。
     specs = (
         ("finish", "finish", 0.0),
-        ("starters", "starters", 0.0),
         ("handicap", "handicap", 0.0),
         ("trial_time", "trial_time", 0.0015),
         ("race_time", "race_time", 0.0015),
@@ -7174,9 +7176,19 @@ def v15_save_player_history(df, db_path=DB_PATH):
                     if matched is not None:
                         same_race = [matched]
             else:
-                # Ver113: Rなしでも、同日・同場で数値が一意に一致する既存走行なら統合する。
-                # 複数候補など曖昧な場合は既存の保留処理へ任せ、新規誤統合はしない。
+                # Ver169: Rなしでも、同日・同場で数値が一意に一致する既存走行なら統合する。
+                # 欠車で出走数だけ変わっても同一扱いになる。さらにレース名と車番が
+                # 一致する候補が1件だけなら、タイム欠損を含む取消行も同じ履歴へまとめる。
                 matched = _v48_find_same_race_without_r(candidates, incoming_identity)
+                if matched is None:
+                    race_name_key = _v55_race_name_key(race_name)
+                    stable_matches = []
+                    for existing in candidates:
+                        existing_name_key = _v55_race_name_key(existing["race_name"] if "race_name" in existing.keys() else None)
+                        if not race_name_key or existing_name_key != race_name_key:
+                            continue
+                        stable_matches.append(existing)
+                    matched = stable_matches[0] if len(stable_matches) == 1 else None
                 same_race = [matched] if matched is not None else []
             target = same_race[0] if same_race else None
 
