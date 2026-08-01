@@ -15870,3 +15870,458 @@ def v141_initialize_db_weights(db_path=DB_PATH):
     """既存DBへ新テーブル・5重みを安全に追加する。既存10重みは変更しない。"""
     v141_init_heat_learning(db_path)
     return {"base_weights": v40_get_weights(db_path), "heat_weights": v141_get_heat_weights(db_path)}
+
+# ============================================================
+# Ver142: 固定補正6系統の倍率学習 + 全重みUndo完全化
+# ============================================================
+V142_AUX_DEFAULT_FACTORS = {
+    "当日文脈補正倍率": 1.00,
+    "選手条件適性倍率": 1.00,
+    "逃げ履歴補正倍率": 1.00,
+    "周回展開補正倍率": 1.00,
+    "天候時間帯補正倍率": 1.00,
+    "開催場展開補正倍率": 1.00,
+}
+
+V142_AUX_FEATURE_COLUMNS = {
+    "当日文脈補正倍率": "context_bonus",
+    "選手条件適性倍率": "condition_bonus",
+    "逃げ履歴補正倍率": "escape_bonus",
+    "周回展開補正倍率": "lap_bonus",
+    "天候時間帯補正倍率": "weather_bonus",
+    "開催場展開補正倍率": "venue_development_bonus",
+}
+
+
+def v142_init_aux_learning(db_path=DB_PATH):
+    v141_init_heat_learning(db_path)
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS v142_aux_feature_snapshots (
+            race_key TEXT NOT NULL,
+            car_no INTEGER NOT NULL,
+            player_name TEXT,
+            context_bonus REAL,
+            condition_bonus REAL,
+            escape_bonus REAL,
+            lap_bonus REAL,
+            weather_bonus REAL,
+            venue_development_bonus REAL,
+            final_score REAL,
+            final_rank INTEGER,
+            PRIMARY KEY(race_key, car_no)
+        )""")
+        for name, value in V142_AUX_DEFAULT_FACTORS.items():
+            con.execute("""INSERT OR IGNORE INTO adaptive_weights
+                (feature_name,current_weight,initial_weight,updated_at,update_count)
+                VALUES(?,?,?,?,0)""", (name, float(value), float(value), now))
+        con.commit()
+
+
+def v142_get_aux_factors(db_path=DB_PATH):
+    v142_init_aux_learning(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        rows = con.execute(
+            "SELECT feature_name,current_weight FROM adaptive_weights WHERE feature_name IN (%s)" %
+            ",".join("?" for _ in V142_AUX_DEFAULT_FACTORS),
+            tuple(V142_AUX_DEFAULT_FACTORS),
+        ).fetchall()
+    values = {str(k): float(v) for k, v in rows}
+    return {
+        k: float(np.clip(values.get(k, default), 0.50, 1.50))
+        for k, default in V142_AUX_DEFAULT_FACTORS.items()
+    }
+
+
+def _v142_series(df, names, default=0.0):
+    for name in names:
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+    return pd.Series(float(default), index=df.index, dtype=float)
+
+
+def v142_aux_feature_frame(df):
+    out = pd.DataFrame(index=df.index)
+    out["context_bonus"] = _v142_series(df, ["Ver24展開穴補正"], 0.0)
+    out["condition_bonus"] = _v142_series(df, ["選手別条件適性補正"], 0.0)
+    out["escape_bonus"] = _v142_series(df, ["逃げ履歴補正"], 0.0)
+    out["lap_bonus"] = _v142_series(df, ["Ver60総合補正"], 0.0)
+    out["weather_bonus"] = _v142_series(df, ["天候適性補正"], 0.0)
+    venue = _v142_series(df, ["開催場特徴補正"], 0.0)
+    development = _v142_series(df, ["展開補正"], 0.0)
+    out["venue_development_bonus"] = venue + development
+    return out.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def v142_apply_aux_calibration(df, db_path=DB_PATH):
+    """既存補正を初期倍率1.0のまま保ち、学習済み倍率との差分だけ追加する。"""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    factors = v142_get_aux_factors(db_path)
+    features = v142_aux_feature_frame(out)
+    extra = pd.Series(0.0, index=out.index, dtype=float)
+    reasons = []
+    for name, col in V142_AUX_FEATURE_COLUMNS.items():
+        factor = float(factors[name])
+        contribution = (factor - 1.0) * features[col]
+        extra = extra + contribution
+        out[f"倍率_{name}"] = factor
+        out[f"倍率差分_{name}"] = contribution.round(3)
+    extra = extra.clip(-1.50, 1.50).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    out["固定補正倍率学習差分"] = extra.round(3)
+    if "改善後総合点" in out.columns:
+        score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = score + extra
+        out["改善後順位"] = out["改善後総合点"].rank(
+            method="min", ascending=False, na_option="bottom"
+        ).fillna(len(out)).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + extra * 0.30
+    if "予測競走T" in out.columns:
+        t = pd.to_numeric(out["予測競走T"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        fallback = float(t.median()) if t.notna().any() else 3.60
+        out["予測競走T"] = np.round(t.fillna(fallback) - extra * 0.0008, 4)
+    for idx in out.index:
+        parts = []
+        for name, col in V142_AUX_FEATURE_COLUMNS.items():
+            val = float((factors[name] - 1.0) * features.loc[idx, col])
+            if abs(val) >= 0.015:
+                parts.append((abs(val), f"{name.replace('倍率','')} {factors[name]:.2f}倍"))
+        reasons.append(" / ".join(x[1] for x in sorted(parts, reverse=True)[:3]) or "補正倍率はほぼ標準")
+    out["固定補正倍率学習根拠"] = reasons
+    return out
+
+
+# 天候・時間帯補正が最終補助補正なので、その直後に倍率学習を適用する。
+_V142_BASE_WEATHER_APPLY = v65_apply_weather_condition_learning
+
+def v65_apply_weather_condition_learning(df, entries=None, meta=None, db_path=None):
+    out = _V142_BASE_WEATHER_APPLY(df, entries, meta, db_path)
+    return v142_apply_aux_calibration(out, db_path or DB_PATH)
+
+
+_V142_BASE_SAVE_FEATURES = v40_save_prediction_features
+
+def v40_save_prediction_features(meta, df, db_path=DB_PATH):
+    key = _V142_BASE_SAVE_FEATURES(meta, df, db_path)
+    v142_init_aux_learning(db_path)
+    feat = v142_aux_feature_frame(df)
+    car_col = "車" if "車" in df.columns else "車番"
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        con.execute("DELETE FROM v142_aux_feature_snapshots WHERE race_key=?", (key,))
+        for idx, row in df.iterrows():
+            car = pd.to_numeric(pd.Series([row.get(car_col)]), errors="coerce").iloc[0]
+            if pd.isna(car):
+                continue
+            con.execute("""INSERT OR REPLACE INTO v142_aux_feature_snapshots
+                (race_key,car_no,player_name,context_bonus,condition_bonus,escape_bonus,
+                 lap_bonus,weather_bonus,venue_development_bonus,final_score,final_rank)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
+                key, int(car), str(row.get("選手名", "")),
+                float(feat.loc[idx, "context_bonus"]),
+                float(feat.loc[idx, "condition_bonus"]),
+                float(feat.loc[idx, "escape_bonus"]),
+                float(feat.loc[idx, "lap_bonus"]),
+                float(feat.loc[idx, "weather_bonus"]),
+                float(feat.loc[idx, "venue_development_bonus"]),
+                float(pd.to_numeric(pd.Series([row.get("改善後総合点", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+                int(pd.to_numeric(pd.Series([row.get("改善後順位", len(df))]), errors="coerce").fillna(len(df)).iloc[0]),
+            ))
+        con.commit()
+    return key
+
+
+def _v142_collect_aux_evidence(db_path=DB_PATH):
+    v142_init_aux_learning(db_path)
+    rows = []
+    with sqlite3.connect(str(db_path)) as con:
+        races = pd.read_sql_query("""SELECT b.race_key,b.registered_at
+            FROM v41_registration_batches b
+            WHERE b.status='active'
+            ORDER BY b.registered_at DESC""", con)
+        for _, race in races.iterrows():
+            snap = pd.read_sql_query(
+                "SELECT * FROM v142_aux_feature_snapshots WHERE race_key=?",
+                con, params=(race["race_key"],)
+            )
+            result = pd.read_sql_query(
+                "SELECT car_no,finish,result_status FROM result_entries WHERE race_key=?",
+                con, params=(race["race_key"],)
+            )
+            if snap.empty or result.empty:
+                continue
+            merged = snap.merge(result, on="car_no", how="inner")
+            finish = pd.to_numeric(merged["finish"], errors="coerce")
+            status = merged.get("result_status", pd.Series("", index=merged.index)).fillna("").astype(str)
+            valid = finish.notna() & (finish >= 1) & ~status.str.contains(
+                "欠車|競走中止|落車|落妨|反妨|反則|不成立|失格|周誤|故障", regex=True
+            )
+            merged = merged.loc[valid].copy()
+            if len(merged) < 3:
+                continue
+            performance = (len(merged) + 1) - pd.to_numeric(merged["finish"], errors="coerce")
+            item = {"race_key": race["race_key"], "registered_at": race["registered_at"]}
+            for name, col in V142_AUX_FEATURE_COLUMNS.items():
+                values = pd.to_numeric(merged[col], errors="coerce")
+                if values.notna().sum() < 3 or values.nunique(dropna=True) <= 1:
+                    item[name] = np.nan
+                else:
+                    item[name] = _v39_spearman(values, performance)
+            rows.append(item)
+    if not rows:
+        return {k: 0.0 for k in V142_AUX_DEFAULT_FACTORS}, {"race_count": 0, "usable": {k: 0 for k in V142_AUX_DEFAULT_FACTORS}}
+    ev = pd.DataFrame(rows)
+    recency = np.array([V41_DECAY ** i for i in range(len(ev))], dtype=float)
+    evidence = {}
+    usable = {}
+    for name in V142_AUX_DEFAULT_FACTORS:
+        values = pd.to_numeric(ev[name], errors="coerce")
+        mask = values.notna()
+        usable[name] = int(mask.sum())
+        evidence[name] = _v141_weighted_average(values[mask], recency[mask.to_numpy()]) if mask.any() else 0.0
+    return evidence, {"race_count": int(len(ev)), "usable": usable}
+
+
+def v142_adjust_aux_factors_after_result(meta, db_path=DB_PATH):
+    key = v34_race_key(meta)
+    before = v142_get_aux_factors(db_path)
+    evidence, stats = _v142_collect_aux_evidence(db_path)
+    after = dict(before)
+    now = datetime.now().isoformat(timespec="seconds")
+    for name in before:
+        count = int(stats.get("usable", {}).get(name, 0))
+        if count < 3:
+            continue
+        target = float(np.clip(1.0 + evidence.get(name, 0.0) * 0.35, 0.55, 1.45))
+        step = float(np.clip((target - before[name]) * 0.12, -0.030, 0.030))
+        after[name] = float(np.clip(before[name] + step, 0.50, 1.50))
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        for name in before:
+            con.execute("UPDATE adaptive_weights SET current_weight=?,updated_at=?,update_count=update_count+1 WHERE feature_name=?",
+                        (after[name], now, name))
+            reason = (
+                f"固定補正の効かせる倍率を結果から校正。利用可能{stats.get('usable',{}).get(name,0)}R、"
+                f"順位相関{evidence.get(name,0.0):+.3f}。1.00倍を基準に0.50～1.50倍、1回最大±0.03。"
+            )
+            con.execute("""INSERT INTO weight_adjustment_history
+                (race_key,adjusted_at,feature_name,before_weight,after_weight,delta,evidence_score,reason,
+                 before_top3,after_top3,actual_top3,diagnostic_exact_before,diagnostic_exact_after)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                key, now, name, before[name], after[name], after[name]-before[name], evidence.get(name,0.0), reason,
+                "", "", "", 0, 0,
+            ))
+        con.commit()
+    return {"before": before, "after": after, "evidence": evidence, "learning_stats": stats}
+
+
+_V142_BASE_ADJUST_RESULT = v41_adjust_weights_after_result
+
+def v41_adjust_weights_after_result(meta, results, db_path=DB_PATH):
+    base = _V142_BASE_ADJUST_RESULT(meta, results, db_path)
+    if isinstance(base, dict) and base.get("duplicate"):
+        return base
+    aux = v142_adjust_aux_factors_after_result(meta, db_path)
+    if not isinstance(base, dict):
+        base = {"message": str(base)}
+    base = dict(base)
+    base["aux_calibration"] = aux
+    base["note"] = (
+        str(base.get("note", "")) +
+        " 固定だった6系統の補正倍率も結果から校正しました。"
+    ).strip()
+    return base
+
+
+# 結果登録のUndo用スナップショットを、通常10項目だけでなく全adaptive_weightsへ拡張。
+_V142_BASE_REGISTER_RESULT = v41_register_result
+
+def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    v142_init_aux_learning(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        all_before = {
+            str(k): float(v) for k, v in con.execute(
+                "SELECT feature_name,current_weight FROM adaptive_weights"
+            ).fetchall()
+        }
+    result = _V142_BASE_REGISTER_RESULT(meta, results, laps, payouts, db_path)
+    try:
+        key = result[0]
+        duplicate = bool(result[4].get("duplicate")) if len(result) > 4 and isinstance(result[4], dict) else False
+        if key and not duplicate:
+            with sqlite3.connect(str(db_path), timeout=30) as con:
+                con.execute(
+                    "UPDATE v41_registration_batches SET before_weights_json=? WHERE race_key=? AND status='active'",
+                    (json.dumps(all_before, ensure_ascii=False), key),
+                )
+                con.commit()
+    except Exception:
+        pass
+    return result
+
+
+_V142_BASE_CURRENT_WEIGHTS = v40_current_weights
+
+def v40_current_weights(db_path=DB_PATH):
+    base = _V142_BASE_CURRENT_WEIGHTS(db_path)
+    factors = v142_get_aux_factors(db_path)
+    extra = pd.DataFrame([
+        {
+            "分類": "補正倍率学習",
+            "項目": name,
+            "現在の重み": value,
+            "初期値": V142_AUX_DEFAULT_FACTORS[name],
+            "初期値からの差": value - V142_AUX_DEFAULT_FACTORS[name],
+        }
+        for name, value in factors.items()
+    ])
+    return pd.concat([base, extra], ignore_index=True, sort=False)
+
+
+def v142_initialize_db_weights(db_path=DB_PATH):
+    v142_init_aux_learning(db_path)
+    return {
+        "base_weights": v40_get_weights(db_path),
+        "heat_weights": v141_get_heat_weights(db_path),
+        "aux_factors": v142_get_aux_factors(db_path),
+    }
+
+# ============================================================
+# Ver143: 結果登録時の全履歴学習を一括SQL化して高速化
+# ============================================================
+def _v143_active_result_feature_rows(db_path=DB_PATH):
+    """通常・熱・補正倍率学習に必要な全行を、レースごとの反復SQLなしで一括取得する。"""
+    with sqlite3.connect(str(db_path)) as con:
+        return pd.read_sql_query("""
+            SELECT b.race_key, b.registered_at,
+                   rr.track_temp,
+                   s.car_no, s.player_name,
+                   s.trial_feature, s.st_feature, s.handicap_feature, s.form_feature,
+                   s.surface_feature, s.front_feature, s.chase_feature,
+                   s.stability_feature, s.course_feature, s.opponent_feature,
+                   s.before_rank,
+                   e.finish, e.result_status,
+                   h.heat_skill_feature, h.heat_front_feature, h.heat_chase_feature,
+                   h.heat_hold_feature, h.heat_adapt_feature,
+                   a.context_bonus, a.condition_bonus, a.escape_bonus,
+                   a.lap_bonus, a.weather_bonus, a.venue_development_bonus
+            FROM v41_registration_batches b
+            JOIN v40_prediction_feature_snapshots s ON s.race_key=b.race_key
+            JOIN result_entries e ON e.race_key=s.race_key AND e.car_no=s.car_no
+            LEFT JOIN result_races rr ON rr.race_key=b.race_key
+            LEFT JOIN v141_heat_feature_snapshots h ON h.race_key=s.race_key AND h.car_no=s.car_no
+            LEFT JOIN v142_aux_feature_snapshots a ON a.race_key=s.race_key AND a.car_no=s.car_no
+            WHERE b.status='active'
+            ORDER BY b.registered_at DESC, b.race_key, s.car_no
+        """, con)
+
+
+def _v143_valid_group(group):
+    finish = pd.to_numeric(group["finish"], errors="coerce")
+    status = group.get("result_status", pd.Series("", index=group.index)).fillna("").astype(str)
+    valid = finish.notna() & (finish >= 1) & ~status.str.contains(
+        "欠車|競走中止|落車|落妨|反妨|反則|不成立|失格|周誤|故障", regex=True
+    )
+    return group.loc[valid].copy()
+
+
+def _v141_collect_evidence(db_path=DB_PATH):
+    """Ver143高速版。従来の1レース2～3SQLを、全体1SQL＋メモリ集計へ置換。"""
+    v141_init_heat_learning(db_path)
+    all_rows = _v143_active_result_feature_rows(db_path)
+    base_colmap = {
+        "試走":"trial_feature", "ST":"st_feature", "ハンデ":"handicap_feature", "近況":"form_feature",
+        "走路適性":"surface_feature", "前残り":"front_feature", "追い込み":"chase_feature",
+        "周回安定":"stability_feature", "コース適性":"course_feature", "相手耐性":"opponent_feature",
+    }
+    if all_rows.empty:
+        names = list(V40_DEFAULT_WEIGHTS) + list(V141_HEAT_DEFAULT_WEIGHTS)
+        return {k: 0.0 for k in names}, {"race_count": 0, "hot_race_count": 0, "extreme_heat_count": 0}
+
+    rows = []
+    for race_key, group in all_rows.groupby("race_key", sort=False):
+        merged = _v143_valid_group(group)
+        if len(merged) < 3:
+            continue
+        finish = pd.to_numeric(merged["finish"], errors="coerce")
+        performance = (len(merged) + 1) - finish
+        track_temp_s = pd.to_numeric(merged.get("track_temp"), errors="coerce").dropna()
+        temp = float(track_temp_s.iloc[0]) if not track_temp_s.empty else 0.0
+        item = {
+            "race_key": race_key,
+            "registered_at": str(merged["registered_at"].iloc[0]),
+            "track_temp": temp,
+            "heat_level": v141_heat_level(temp),
+        }
+        for name, col in base_colmap.items():
+            item[name] = _v39_spearman(pd.to_numeric(merged[col], errors="coerce"), performance)
+        fallback_heat = {
+            "熱走路適性": pd.to_numeric(merged["surface_feature"], errors="coerce"),
+            "高温前残り": pd.to_numeric(merged["front_feature"], errors="coerce")*.65 + pd.to_numeric(merged["stability_feature"], errors="coerce")*.35,
+            "高温追い込み耐性": pd.to_numeric(merged["chase_feature"], errors="coerce")*.65 + pd.to_numeric(merged["opponent_feature"], errors="coerce")*.20 + pd.to_numeric(merged["course_feature"], errors="coerce")*.15,
+            "高温位置維持": pd.to_numeric(merged["stability_feature"], errors="coerce")*.60 + pd.to_numeric(merged["front_feature"], errors="coerce")*.40,
+            "高温展開適応": pd.to_numeric(merged["course_feature"], errors="coerce")*.30 + pd.to_numeric(merged["form_feature"], errors="coerce")*.25 + pd.to_numeric(merged["opponent_feature"], errors="coerce")*.25 + pd.to_numeric(merged["chase_feature"], errors="coerce")*.20,
+        }
+        for name, col in V141_HEAT_COLMAP.items():
+            series = pd.to_numeric(merged.get(col), errors="coerce") if col in merged.columns else pd.Series(np.nan, index=merged.index)
+            if series.notna().sum() < 3:
+                series = fallback_heat[name]
+            item[name] = _v39_spearman(series, performance)
+        rows.append(item)
+
+    if not rows:
+        names = list(V40_DEFAULT_WEIGHTS) + list(V141_HEAT_DEFAULT_WEIGHTS)
+        return {k: 0.0 for k in names}, {"race_count": 0, "hot_race_count": 0, "extreme_heat_count": 0}
+
+    ev = pd.DataFrame(rows).sort_values("registered_at", ascending=False).reset_index(drop=True)
+    recency = np.array([V41_DECAY ** i for i in range(len(ev))], dtype=float)
+    evidence = {}
+    heat_sensitive_base = {"走路適性", "前残り", "追い込み", "周回安定"}
+    temps = pd.to_numeric(ev["track_temp"], errors="coerce").fillna(0.0).to_numpy(float)
+    for name in V40_DEFAULT_WEIGHTS:
+        condition_weight = np.ones(len(ev), dtype=float)
+        if name in heat_sensitive_base:
+            condition_weight *= np.where(temps >= 60, .20, np.where(temps >= 56, .38, np.where(temps >= 50, .65, 1.0)))
+        evidence[name] = _v141_weighted_average(pd.to_numeric(ev[name], errors="coerce"), recency * condition_weight)
+    hot_mask = temps >= 50
+    for name in V141_HEAT_DEFAULT_WEIGHTS:
+        if not hot_mask.any():
+            evidence[name] = 0.0
+        else:
+            temp_weight = .45 + pd.to_numeric(ev.loc[hot_mask, "heat_level"], errors="coerce").fillna(0).to_numpy(float)*.55
+            evidence[name] = _v141_weighted_average(pd.to_numeric(ev.loc[hot_mask, name], errors="coerce"), recency[hot_mask] * temp_weight)
+    return evidence, {
+        "race_count": int(len(ev)),
+        "hot_race_count": int(hot_mask.sum()),
+        "extreme_heat_count": int((temps >= 60).sum()),
+    }
+
+
+def _v142_collect_aux_evidence(db_path=DB_PATH):
+    """Ver143高速版。補正倍率6系統も一括取得して集計する。"""
+    v142_init_aux_learning(db_path)
+    all_rows = _v143_active_result_feature_rows(db_path)
+    if all_rows.empty:
+        return {k: 0.0 for k in V142_AUX_DEFAULT_FACTORS}, {"race_count": 0, "usable": {k: 0 for k in V142_AUX_DEFAULT_FACTORS}}
+    rows = []
+    for race_key, group in all_rows.groupby("race_key", sort=False):
+        merged = _v143_valid_group(group)
+        if len(merged) < 3:
+            continue
+        performance = (len(merged) + 1) - pd.to_numeric(merged["finish"], errors="coerce")
+        item = {"race_key": race_key, "registered_at": str(merged["registered_at"].iloc[0])}
+        for name, col in V142_AUX_FEATURE_COLUMNS.items():
+            values = pd.to_numeric(merged.get(col), errors="coerce") if col in merged.columns else pd.Series(np.nan, index=merged.index)
+            item[name] = np.nan if values.notna().sum() < 3 or values.nunique(dropna=True) <= 1 else _v39_spearman(values, performance)
+        rows.append(item)
+    if not rows:
+        return {k: 0.0 for k in V142_AUX_DEFAULT_FACTORS}, {"race_count": 0, "usable": {k: 0 for k in V142_AUX_DEFAULT_FACTORS}}
+    ev = pd.DataFrame(rows).sort_values("registered_at", ascending=False).reset_index(drop=True)
+    recency = np.array([V41_DECAY ** i for i in range(len(ev))], dtype=float)
+    evidence, usable = {}, {}
+    for name in V142_AUX_DEFAULT_FACTORS:
+        values = pd.to_numeric(ev[name], errors="coerce")
+        mask = values.notna()
+        usable[name] = int(mask.sum())
+        evidence[name] = _v141_weighted_average(values[mask], recency[mask.to_numpy()]) if mask.any() else 0.0
+    return evidence, {"race_count": int(len(ev)), "usable": usable}
