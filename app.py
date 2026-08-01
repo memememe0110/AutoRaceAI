@@ -26,7 +26,7 @@ _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver150｜一般予定通知 5分前・10分前・両方に対応")
+st.caption("Ver152｜グランドノート追い抜き相性・一般予定通知対応")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1810,6 +1810,21 @@ with prediction_tab:
                     st.info("レース種別適性データを取得できませんでした。")
                 st.caption("『やる気』や意図は断定せず、一般戦・予選・準決勝系・優勝戦・選抜戦ごとの実走差を縮小推定します。履歴が少ない選手は本人の通常成績へ強く寄せます。")
                 st.caption("次走予定や調整目的は、未来の出走データがDBに十分揃うまでは補正に使いません。")
+
+            with st.expander("🔄 グランドノート追い抜き相性", expanded=True):
+                matchup_cols = [c for c in [
+                    "車", "選手名", "対戦周回比較数", "信頼対戦相手数",
+                    "追い抜き相性指数", "追い抜き相性補正", "追い抜き相性メモ"
+                ] if c in df.columns]
+                if matchup_cols:
+                    matchup_view = df[matchup_cols].sort_values(["追い抜き相性補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                    st.dataframe(matchup_view, use_container_width=True, hide_index=True, column_config={
+                        "追い抜き相性指数": st.column_config.NumberColumn(format="%+.3f"),
+                        "追い抜き相性補正": st.column_config.NumberColumn(format="%+.3f"),
+                    })
+                else:
+                    st.info("今回の出走選手間で比較できるグランドノート履歴がありません。")
+                st.caption("周回ごとの前後関係が反転した場合だけ追い抜きとして集計します。最終着順だけの先着は含めません。対戦数が少ない組み合わせは縮小し、補正を小さく制限します。")
 
             with st.expander("🏍️ 逃げ役・逃げ残り診断", expanded=True):
                 escape_cols = [c for c in [

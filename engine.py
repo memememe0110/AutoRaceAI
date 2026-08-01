@@ -16676,3 +16676,222 @@ def v41_adjust_weights_after_result(meta, results, db_path=DB_PATH):
     base["race_context_calibration"]=ctx
     base["note"]=(str(base.get("note",""))+" レース種別適性倍率も結果から小幅校正しました。").strip()
     return base
+
+# ============================================================
+# Ver152: グランドノート選手間追い抜き相性
+# ============================================================
+V152_FACTOR_NAME = "対戦追い抜き相性倍率"
+
+
+def v152_init_overtake_matchups(db_path=DB_PATH):
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v152_player_overtake_matchups (
+                player_a_key TEXT NOT NULL,
+                player_a_name TEXT NOT NULL,
+                player_b_key TEXT NOT NULL,
+                player_b_name TEXT NOT NULL,
+                shared_races INTEGER NOT NULL,
+                comparable_transitions INTEGER NOT NULL,
+                a_overtakes_b INTEGER NOT NULL,
+                b_overtakes_a INTEGER NOT NULL,
+                a_holds_b INTEGER NOT NULL,
+                b_holds_a INTEGER NOT NULL,
+                a_repasses_b INTEGER NOT NULL,
+                b_repasses_a INTEGER NOT NULL,
+                raw_a_advantage REAL NOT NULL,
+                shrunk_a_advantage REAL NOT NULL,
+                confidence REAL NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(player_a_key, player_b_key)
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v152_overtake_feature_snapshots (
+                race_key TEXT NOT NULL,
+                car_no INTEGER NOT NULL,
+                player_name TEXT,
+                matchup_count INTEGER,
+                reliable_matchups INTEGER,
+                overtake_advantage REAL,
+                overtake_bonus REAL,
+                matchup_note TEXT,
+                final_rank INTEGER,
+                PRIMARY KEY(race_key, car_no)
+            )
+        """)
+        now = datetime.now().isoformat(timespec="seconds")
+        con.execute("""
+            INSERT OR IGNORE INTO adaptive_weights
+            (feature_name,current_weight,initial_weight,updated_at,update_count)
+            VALUES(?,?,?,?,0)
+        """, (V152_FACTOR_NAME, 1.0, 1.0, now))
+        con.commit()
+
+
+def v152_get_factor(db_path=DB_PATH):
+    v152_init_overtake_matchups(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        row = con.execute("SELECT current_weight FROM adaptive_weights WHERE feature_name=?", (V152_FACTOR_NAME,)).fetchone()
+    return float(row[0]) if row else 1.0
+
+
+def v152_rebuild_overtake_matchups(db_path=DB_PATH):
+    """グランドノートの周回間で前後関係が反転した組み合わせを追い抜きとして集計する。"""
+    v152_init_overtake_matchups(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        laps = pd.read_sql_query("""
+            SELECT race_key,player_name,car_no,lap_label,lap_no,position
+            FROM player_lap_history
+            WHERE player_name IS NOT NULL AND player_name<>''
+        """, con)
+        bad = pd.read_sql_query("""
+            SELECT race_key,car_no,result_status FROM result_entries
+        """, con)
+    if laps.empty:
+        return {"races":0,"pairs":0,"events":0}
+    bad_pat = r"欠車|競走中止|落車|落妨|反妨|反則|不成立|失格|周誤|故障"
+    bad["bad"] = bad["result_status"].fillna("").astype(str).str.contains(bad_pat, regex=True)
+    bad_keys = set(zip(bad.loc[bad["bad"],"race_key"].astype(str), pd.to_numeric(bad.loc[bad["bad"],"car_no"],errors="coerce").fillna(-1).astype(int)))
+    laps["car_no"] = pd.to_numeric(laps["car_no"],errors="coerce")
+    laps["position"] = pd.to_numeric(laps["position"],errors="coerce")
+    laps["lap_no"] = pd.to_numeric(laps["lap_no"],errors="coerce")
+    laps = laps.dropna(subset=["car_no","position"]).copy()
+    laps["car_no"] = laps["car_no"].astype(int)
+    laps = laps[~laps.apply(lambda r:(str(r["race_key"]),int(r["car_no"])) in bad_keys,axis=1)]
+    laps["player_key"] = laps["player_name"].map(_v151_name_key)
+    # lap_noが空のゴール線は最後へ送る。
+    laps["lap_order"] = laps["lap_no"].fillna(999)
+    laps.loc[laps["lap_label"].astype(str).str.contains("ゴール"),"lap_order"] = 1000
+    agg = {}
+    race_count = 0
+    event_count = 0
+    for race_key,g in laps.groupby("race_key",sort=False):
+        frames=[]
+        for order,lg in g.groupby("lap_order",sort=True):
+            d={str(r.player_key):(float(r.position),str(r.player_name)) for r in lg.itertuples() if str(r.player_key)}
+            if len(d)>=2: frames.append(d)
+        if len(frames)<2: continue
+        race_count += 1
+        names={k:v[1] for f in frames for k,v in f.items()}
+        keys=sorted(names)
+        for i,a in enumerate(keys):
+            for b in keys[i+1:]:
+                seq=[]
+                for f in frames:
+                    if a in f and b in f:
+                        seq.append(-1 if f[a][0] < f[b][0] else (1 if f[a][0] > f[b][0] else 0))
+                if len(seq)<2: continue
+                rec=agg.setdefault((a,b),{"a_name":names[a],"b_name":names[b],"races":0,"trans":0,"a_over":0,"b_over":0,"a_hold":0,"b_hold":0,"a_repass":0,"b_repass":0})
+                rec["races"] += 1
+                a_seen=b_seen=0
+                for prev,cur in zip(seq[:-1],seq[1:]):
+                    if prev==0 or cur==0: continue
+                    rec["trans"] += 1
+                    if prev==1 and cur==-1:
+                        rec["a_over"] += 1; event_count += 1
+                        if b_seen: rec["a_repass"] += 1
+                        a_seen += 1
+                    elif prev==-1 and cur==1:
+                        rec["b_over"] += 1; event_count += 1
+                        if a_seen: rec["b_repass"] += 1
+                        b_seen += 1
+                if seq[0]==-1 and all(x!=1 for x in seq[1:]): rec["a_hold"] += 1
+                if seq[0]==1 and all(x!=-1 for x in seq[1:]): rec["b_hold"] += 1
+    now=datetime.now().isoformat(timespec="seconds")
+    rows=[]
+    for (a,b),r in agg.items():
+        decisive=r["a_over"]+r["b_over"]
+        raw=(r["a_over"]-r["b_over"])/max(1,decisive)
+        conf=min(0.85, r["races"]/(r["races"]+6.0))
+        shrunk=float(np.clip(raw*conf,-0.65,0.65))
+        rows.append((a,r["a_name"],b,r["b_name"],r["races"],r["trans"],r["a_over"],r["b_over"],r["a_hold"],r["b_hold"],r["a_repass"],r["b_repass"],raw,shrunk,conf,now))
+    with sqlite3.connect(str(db_path),timeout=30) as con:
+        con.execute("DELETE FROM v152_player_overtake_matchups")
+        con.executemany("""
+            INSERT INTO v152_player_overtake_matchups VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, rows)
+        con.commit()
+    return {"races":race_count,"pairs":len(rows),"events":event_count}
+
+
+def v152_apply_overtake_matchups(df, entries=None, meta=None, db_path=DB_PATH):
+    if df is None or df.empty: return df
+    out=df.copy()
+    names=out.get("選手名",pd.Series("",index=out.index)).fillna("").astype(str)
+    keys=[_v151_name_key(x) for x in names]
+    factor=v152_get_factor(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        prof=pd.read_sql_query("SELECT * FROM v152_player_overtake_matchups",con)
+    lookup={}
+    for _,r in prof.iterrows():
+        lookup[(str(r.player_a_key),str(r.player_b_key))]=(float(r.shrunk_a_advantage),int(r.shared_races),str(r.player_b_name))
+        lookup[(str(r.player_b_key),str(r.player_a_key))]=(-float(r.shrunk_a_advantage),int(r.shared_races),str(r.player_a_name))
+    advs=[]; counts=[]; reliable=[]; notes=[]; bonuses=[]
+    for i,k in enumerate(keys):
+        vals=[]; total=0; rel=0; best=[]
+        for j,opp in enumerate(keys):
+            if i==j: continue
+            item=lookup.get((k,opp))
+            if not item: continue
+            val,n,opp_name=item; total += n
+            weight=min(1.0,n/8.0)
+            vals.append(val*weight)
+            if n>=6: rel += 1
+            if n>=3 and abs(val)>=0.08: best.append((abs(val),val,n,opp_name))
+        adv=float(np.mean(vals)) if vals else 0.0
+        bonus=float(np.clip(adv*0.18*factor,-0.12,0.12))
+        best=sorted(best,reverse=True)[:2]
+        if best:
+            desc=[]
+            for _,v,n,opp_name in best:
+                desc.append(f"{opp_name}に{'突破優勢' if v>0 else '突破されやすい'}({n}戦)")
+            note=" / ".join(desc)
+        else: note="対戦履歴不足または明確な差なし"
+        advs.append(adv); counts.append(total); reliable.append(rel); notes.append(note); bonuses.append(bonus)
+    out["対戦周回比較数"]=counts
+    out["信頼対戦相手数"]=reliable
+    out["追い抜き相性指数"]=advs
+    out["追い抜き相性補正"]=bonuses
+    out["追い抜き相性メモ"]=notes
+    out["対戦追い抜き相性倍率"]=factor
+    if "改善後総合点" in out.columns:
+        s=pd.to_numeric(out["改善後総合点"],errors="coerce").fillna(0.0)
+        out["改善後総合点"]=s+pd.Series(bonuses,index=out.index)
+        out["改善後順位"]=out["改善後総合点"].rank(method="min",ascending=False,na_option="bottom").fillna(len(out)).astype(int)
+    if "予測競走T" in out.columns:
+        t=pd.to_numeric(out["予測競走T"],errors="coerce")
+        out["予測競走T"]=np.round(t-pd.Series(bonuses,index=out.index)*0.0008,4)
+    return out
+
+
+_V152_BASE_CONTEXT_APPLY = v151_apply_race_context_adaptation
+
+def v151_apply_race_context_adaptation(df, entries=None, meta=None, db_path=DB_PATH):
+    out=_V152_BASE_CONTEXT_APPLY(df,entries,meta,db_path)
+    return v152_apply_overtake_matchups(out,entries,meta,db_path)
+
+
+_V152_BASE_SAVE_FEATURES = v40_save_prediction_features
+
+def v40_save_prediction_features(meta, df, db_path=DB_PATH):
+    key=_V152_BASE_SAVE_FEATURES(meta,df,db_path)
+    v152_init_overtake_matchups(db_path)
+    car_col="車" if "車" in df.columns else "車番"
+    with sqlite3.connect(str(db_path),timeout=30) as con:
+        con.execute("DELETE FROM v152_overtake_feature_snapshots WHERE race_key=?",(key,))
+        for _,row in df.iterrows():
+            car=pd.to_numeric(pd.Series([row.get(car_col)]),errors="coerce").iloc[0]
+            if pd.isna(car): continue
+            con.execute("""INSERT OR REPLACE INTO v152_overtake_feature_snapshots
+                VALUES(?,?,?,?,?,?,?,?,?)""",(
+                key,int(car),str(row.get("選手名","")),
+                int(pd.to_numeric(pd.Series([row.get("対戦周回比較数",0)]),errors="coerce").fillna(0).iloc[0]),
+                int(pd.to_numeric(pd.Series([row.get("信頼対戦相手数",0)]),errors="coerce").fillna(0).iloc[0]),
+                float(pd.to_numeric(pd.Series([row.get("追い抜き相性指数",0)]),errors="coerce").fillna(0).iloc[0]),
+                float(pd.to_numeric(pd.Series([row.get("追い抜き相性補正",0)]),errors="coerce").fillna(0).iloc[0]),
+                str(row.get("追い抜き相性メモ","")),
+                int(pd.to_numeric(pd.Series([row.get("改善後順位",len(df))]),errors="coerce").fillna(len(df)).iloc[0])
+            ))
+        con.commit()
+    return key
