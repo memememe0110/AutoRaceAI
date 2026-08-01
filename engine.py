@@ -17581,3 +17581,126 @@ def v67_compress_formations(combos, bet_type):
 
     # 圧縮より正確性を優先。各買い目を1回だけ出すため、折り返しても被らない。
     return _v165_plain_lines(target, bet_type)
+
+import functools
+
+# ============================================================
+# Ver170: 点数が多いフォーメーションの高速圧縮
+# ============================================================
+# 少数点は従来の完全探索を維持し、多数点は重複しない単軸グループを
+# 貪欲に選ぶ。最終的な展開検査はVer165と同じ基準で行う。
+_v170_exact_compress_formations = v67_compress_formations
+
+
+def _v170_fast_candidate_lines(target, bet_type):
+    """単一位置だけをまとめた安全な圧縮候補を生成する。"""
+    ordered = bet_type in {"2連単", "3連単"}
+    arity = 2 if bet_type in {"2連単", "2連複"} else 3
+    sep = "-" if ordered else "="
+    target = set(target)
+    candidates = {}
+
+    # 他の位置が同じ買い目をまとめる。候補は必ず展開して検証する。
+    for varying_pos in range(arity):
+        grouped = {}
+        for combo in target:
+            key = tuple(combo[i] for i in range(arity) if i != varying_pos)
+            grouped.setdefault(key, set()).add(combo[varying_pos])
+
+        for key, values in grouped.items():
+            if len(values) < 2:
+                continue
+            parts = []
+            key_pos = 0
+            for pos in range(arity):
+                if pos == varying_pos:
+                    parts.append("".join(str(x) for x in sorted(values)))
+                else:
+                    parts.append(str(key[key_pos]))
+                    key_pos += 1
+            line = sep.join(parts)
+            expanded = _v165_expand_formation_line(line, bet_type)
+            if len(expanded) < 2 or not expanded.issubset(target):
+                continue
+            frozen = frozenset(expanded)
+            old = candidates.get(frozen)
+            if old is None or (len(line), line) < (len(old), old):
+                candidates[frozen] = line
+
+    # 2連単の表裏が両方ある場合は「=」候補も作る。
+    if bet_type == "2連単":
+        for a, b in target:
+            if a < b and (b, a) in target:
+                line = f"{a}={b}"
+                expanded = _v165_expand_formation_line(line, bet_type)
+                if expanded and expanded.issubset(target):
+                    candidates[frozenset(expanded)] = line
+
+    # 3連単は先頭2車の表裏が両方あり、3着が同じ場合もまとめる。
+    if bet_type == "3連単":
+        for a, b, c in target:
+            if a < b and (b, a, c) in target:
+                line = f"{a}={b}-{c}"
+                expanded = _v165_expand_formation_line(line, bet_type)
+                if expanded and expanded.issubset(target):
+                    frozen = frozenset(expanded)
+                    old = candidates.get(frozen)
+                    if old is None or (len(line), line) < (len(old), old):
+                        candidates[frozen] = line
+
+    return [(set(combo_set), line) for combo_set, line in candidates.items()]
+
+
+@functools.lru_cache(maxsize=256)
+def _v170_cached_fast_compress(target_tuple, bet_type):
+    target = set(target_tuple)
+    if not target:
+        return ()
+
+    candidates = _v170_fast_candidate_lines(target, bet_type)
+    # 大きく覆う候補を優先。同数なら短い表記を優先する。
+    candidates.sort(key=lambda item: (-len(item[0]), len(item[1]), item[1]))
+
+    uncovered = set(target)
+    selected = []
+    while uncovered:
+        best = None
+        for expanded, line in candidates:
+            if len(expanded) < 2 or not expanded.issubset(uncovered):
+                continue
+            score = (len(expanded), -len(line), line)
+            if best is None or score > best[0]:
+                best = (score, expanded, line)
+        if best is None:
+            break
+        _, expanded, line = best
+        selected.append(line)
+        uncovered.difference_update(expanded)
+
+    selected.extend(_v165_plain_lines(uncovered, bet_type))
+
+    # 最終安全検査。重複、欠落、余分が1つでもあれば単独表記へ戻す。
+    covered = set()
+    for line in selected:
+        expanded = _v165_expand_formation_line(line, bet_type)
+        if not expanded or not expanded.issubset(target) or expanded & covered:
+            return tuple(_v165_plain_lines(target, bet_type))
+        covered.update(expanded)
+    if covered != target:
+        return tuple(_v165_plain_lines(target, bet_type))
+    return tuple(selected)
+
+
+def v67_compress_formations(combos, bet_type):
+    """点数に応じて完全探索と高速圧縮を自動で切り替える。"""
+    target = _v165_normalize_combo_texts(combos, bet_type)
+    if not target:
+        return []
+
+    # 完全探索は少数点だけ。大量点では指数的に重くなるため高速方式へ切替。
+    exact_limit = 12
+    if len(target) <= exact_limit:
+        return _v170_exact_compress_formations(combos, bet_type)
+
+    target_tuple = tuple(sorted(target))
+    return list(_v170_cached_fast_compress(target_tuple, bet_type))
