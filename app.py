@@ -19,8 +19,14 @@ import streamlit.components.v1 as components
 import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
+
+# Ver148: Streamlit fragment互換デコレーター
+# st.fragment が利用できる環境では部分再実行、未対応環境では通常関数として動作します。
+_v146_fragment = getattr(st, "fragment", lambda func: func)
+
+
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver139｜通知画面を標準UI化・ntfy送信安定化")
+st.caption("Ver148｜DB57再学習・fragment定義漏れ修正")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
