@@ -26,7 +26,7 @@ _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver159｜高速表示を維持したまま全券種一括コピーを復活")
+st.caption("Ver160｜浜松高温前残り学習＋画面ナビを見分けやすく改善")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1595,21 +1595,34 @@ _main_pages = ["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登
 if st.session_state.get("v155_main_page") not in _main_pages:
     st.session_state["v155_main_page"] = _main_pages[0]
 
-st.markdown("#### 画面切替")
+st.markdown("""
+<style>
+.v160-nav-head{padding:12px 14px 8px;border-radius:16px 16px 0 0;background:linear-gradient(135deg,#eef5ff,#f7f9fc);border:1px solid #cbd8ea;border-bottom:0}
+.v160-nav-title{font-size:1.05rem;font-weight:800;letter-spacing:.02em;color:#243247}
+.v160-nav-note{font-size:.82rem;color:#607086;margin-top:3px}
+.v160-nav-foot{height:8px;border:1px solid #cbd8ea;border-top:0;border-radius:0 0 16px 16px;background:#f7f9fc;margin-bottom:14px}
+</style>
+<div class="v160-nav-head">
+ <div class="v160-nav-title">🧭 画面メニュー</div>
+ <div class="v160-nav-note">ここは操作ボタンではなく、表示する画面を切り替えるナビです</div>
+</div>
+""", unsafe_allow_html=True)
 _button_rows = (_main_pages[:2], _main_pages[2:])
 for _row_index, _row_pages in enumerate(_button_rows):
     _cols = st.columns(2, gap="small")
     for _col, _page in zip(_cols, _row_pages):
         with _col:
             _is_selected = st.session_state.get("v155_main_page") == _page
+            _label = ("● " if _is_selected else "○ ") + _page
             if st.button(
-                _page,
-                key=f"v158_main_page_{_row_index}_{_page}",
+                _label,
+                key=f"v160_main_page_{_row_index}_{_page}",
                 use_container_width=True,
                 type="primary" if _is_selected else "secondary",
             ):
                 st.session_state["v155_main_page"] = _page
                 st.rerun()
+st.markdown('<div class="v160-nav-foot"></div>', unsafe_allow_html=True)
 
 selected_main_page = st.session_state.get("v155_main_page", _main_pages[0])
 

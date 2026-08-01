@@ -16964,3 +16964,163 @@ _V153_BASE_REPLACE_RESULT = v70_replace_registered_result
 def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
     result = _V153_BASE_REPLACE_RESULT(meta, results, laps, payouts, db_path)
     return _v153_refresh_after_result(result, db_path)
+
+
+# ============================================================
+# Ver160: 浜松・高温走路の最前ハンデ前残りを専用学習
+# ============================================================
+_V160_BASE_APPLY_VENUE = v84_apply_venue_learning
+
+
+def v160_rebuild_hamamatsu_hot_front_profile(db_path=DB_PATH):
+    """登録済み結果から浜松55℃以上の前残り率を全場基準と比較して保存。"""
+    rows = _v84_race_level_features(_v84_history_rows(db_path))
+    result = {
+        "venue": "浜松", "min_temp": 55.0, "sample_races": 0,
+        "baseline_races": 0, "front_win_rate": 0.0, "front_top3_rate": 0.0,
+        "baseline_front_win_rate": 0.0, "baseline_front_top3_rate": 0.0,
+        "confidence": 0.0, "learned_strength": 0.0,
+    }
+    if rows is None or rows.empty:
+        return result
+    temp = pd.to_numeric(rows.get("走路温度"), errors="coerce")
+    venue = rows.get("開催場", pd.Series("", index=rows.index)).astype(str).str.strip()
+    target = rows[(venue == "浜松") & (temp >= 55.0)].copy()
+    baseline = rows[~((venue == "浜松") & (temp >= 55.0))].copy()
+    n, bn = len(target), len(baseline)
+    result["sample_races"], result["baseline_races"] = int(n), int(bn)
+    if n:
+        result["front_win_rate"] = float(pd.to_numeric(target["最後方1着率"], errors="coerce").fillna(0.0).mean())
+        # _v84_race_level_features の前線3着内率を利用
+        result["front_top3_rate"] = float(pd.to_numeric(target["前線3着内率"], errors="coerce").dropna().mean())
+        # 最前ハンデ勝率は race-level に直接無いため、前線3着内率と追込み抑制度を混ぜる。
+        # rear win が低いほど前が残る方向。
+        rear_win = float(pd.to_numeric(target["最後方1着率"], errors="coerce").fillna(0.0).mean())
+        result["front_win_rate"] = float(np.clip(1.0 - rear_win, 0.0, 1.0))
+    if bn:
+        result["baseline_front_top3_rate"] = float(pd.to_numeric(baseline["前線3着内率"], errors="coerce").dropna().mean())
+        rear_base = float(pd.to_numeric(baseline["最後方1着率"], errors="coerce").fillna(0.0).mean())
+        result["baseline_front_win_rate"] = float(np.clip(1.0 - rear_base, 0.0, 1.0))
+    confidence = float(np.clip(n / 35.0, 0.0, 1.0))
+    top3_excess = result["front_top3_rate"] - result["baseline_front_top3_rate"]
+    rear_suppression = result["front_win_rate"] - result["baseline_front_win_rate"]
+    strength = confidence * (top3_excess * 1.8 + rear_suppression * 0.55)
+    result["confidence"] = confidence
+    result["learned_strength"] = float(np.clip(strength, -0.35, 0.65))
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS v160_venue_hot_front_profiles(
+                    venue TEXT NOT NULL, min_temp REAL NOT NULL,
+                    sample_races INTEGER, baseline_races INTEGER,
+                    front_win_rate REAL, front_top3_rate REAL,
+                    baseline_front_win_rate REAL, baseline_front_top3_rate REAL,
+                    confidence REAL, learned_strength REAL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(venue,min_temp)
+                )
+            """)
+            con.execute("""
+                INSERT INTO v160_venue_hot_front_profiles(
+                    venue,min_temp,sample_races,baseline_races,front_win_rate,front_top3_rate,
+                    baseline_front_win_rate,baseline_front_top3_rate,confidence,learned_strength,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(venue,min_temp) DO UPDATE SET
+                    sample_races=excluded.sample_races, baseline_races=excluded.baseline_races,
+                    front_win_rate=excluded.front_win_rate, front_top3_rate=excluded.front_top3_rate,
+                    baseline_front_win_rate=excluded.baseline_front_win_rate,
+                    baseline_front_top3_rate=excluded.baseline_front_top3_rate,
+                    confidence=excluded.confidence, learned_strength=excluded.learned_strength,
+                    updated_at=CURRENT_TIMESTAMP
+            """, (
+                result["venue"], result["min_temp"], result["sample_races"], result["baseline_races"],
+                result["front_win_rate"], result["front_top3_rate"], result["baseline_front_win_rate"],
+                result["baseline_front_top3_rate"], result["confidence"], result["learned_strength"]
+            ))
+            con.commit()
+    except Exception:
+        pass
+    return result
+
+
+def _v160_hamamatsu_hot_profile(db_path=DB_PATH):
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            row = con.execute("""
+                SELECT venue,min_temp,sample_races,baseline_races,front_win_rate,front_top3_rate,
+                       baseline_front_win_rate,baseline_front_top3_rate,confidence,learned_strength
+                FROM v160_venue_hot_front_profiles WHERE venue='浜松' AND min_temp=55.0
+            """).fetchone()
+        if row:
+            keys=["venue","min_temp","sample_races","baseline_races","front_win_rate","front_top3_rate",
+                  "baseline_front_win_rate","baseline_front_top3_rate","confidence","learned_strength"]
+            return dict(zip(keys,row))
+    except Exception:
+        pass
+    return v160_rebuild_hamamatsu_hot_front_profile(db_path)
+
+
+def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
+    out = _V160_BASE_APPLY_VENUE(df, entries, meta, db_path)
+    meta = meta or {}
+    venue = str(meta.get("開催場") or meta.get("venue") or "").strip()
+    temp = number(meta.get("走路温度"), 0.0)
+    n = len(out)
+    out["浜松高温前残り補正"] = 0.0
+    out["浜松高温前残り根拠"] = ""
+    if n == 0 or venue != "浜松" or temp < 55.0:
+        return out
+    p = _v160_hamamatsu_hot_profile(db_path)
+    strength = float(p.get("learned_strength", 0.0) or 0.0)
+    confidence = float(p.get("confidence", 0.0) or 0.0)
+    if strength <= 0.0 or confidence <= 0.0:
+        return out
+    handicap = pd.to_numeric(out.get("ハンデ", pd.Series(0.0,index=out.index)), errors="coerce").fillna(0.0)
+    hmin, hmax = float(handicap.min()), float(handicap.max())
+    span = max(hmax-hmin, 10.0)
+    front_role = (1.0-(handicap-hmin)/span).clip(0.0,1.0)
+    rear_role = ((handicap-hmin)/span).clip(0.0,1.0)
+    heat_gate = float(np.clip((temp-55.0)/7.0,0.0,1.0))*0.45+0.55
+    # 最前ハンデを持ち上げ、最後方の「届く前提」を少し抑える。最大でも約±0.55点。
+    bonus = strength*heat_gate*((front_role**1.7)*1.15-(rear_role**1.5)*0.55)
+    bonus = pd.Series(np.clip(bonus,-0.35,0.55),index=out.index)
+    out["浜松高温前残り補正"] = bonus.round(3)
+    out["浜松高温前残り根拠"] = [
+        f"浜松55℃以上{int(p.get('sample_races',0))}R・信頼{confidence:.0%}・強度{strength:+.3f}"
+    ]*n
+    if "改善後総合点" in out.columns:
+        out["改善後総合点"] = pd.to_numeric(out["改善後総合点"],errors="coerce").fillna(0.0)+bonus
+        out["改善後順位"] = out["改善後総合点"].rank(method="min",ascending=False,na_option="bottom").fillna(n).astype(int)
+        out["開催場補正後総合点"] = out["改善後総合点"]
+        out["開催場補正後順位"] = out["改善後順位"]
+    if "予測競走T" in out.columns:
+        sec = pd.Series(np.clip(-bonus*0.0045,-0.0025,0.0018),index=out.index)
+        out["予測競走T"] = np.round(pd.to_numeric(out["予測競走T"],errors="coerce")+sec,4)
+        out["開催場補正後予測T"] = out["予測競走T"]
+        if "開催場補正秒" in out.columns:
+            out["開催場補正秒"] = np.round(pd.to_numeric(out["開催場補正秒"],errors="coerce").fillna(0.0)+sec,4)
+    if "開催場特徴補正" in out.columns:
+        out["開催場特徴補正"] = np.round(pd.to_numeric(out["開催場特徴補正"],errors="coerce").fillna(0.0)+bonus,3)
+    return out
+
+
+_V160_BASE_REGISTER_RESULT = v41_register_result
+
+def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    result = _V160_BASE_REGISTER_RESULT(meta, results, laps, payouts, db_path)
+    try:
+        v160_rebuild_hamamatsu_hot_front_profile(db_path)
+    except Exception:
+        pass
+    return result
+
+
+_V160_BASE_REPLACE_RESULT = v70_replace_registered_result
+
+def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    result = _V160_BASE_REPLACE_RESULT(meta, results, laps, payouts, db_path)
+    try:
+        v160_rebuild_hamamatsu_hot_front_profile(db_path)
+    except Exception:
+        pass
+    return result
