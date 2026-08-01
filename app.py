@@ -20,7 +20,7 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver138｜不要再処理削減・入力中解析停止・DB参照キャッシュ")
+st.caption("Ver139｜通知画面を標準UI化・ntfy送信安定化")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -258,179 +258,150 @@ def v123_schedule_ntfy_reminder(title: str, event_date: date, event_time: time, 
     return event_dt, notify_dt
 
 
+def _v139_ntfy_request(topic: str, message: str, *, notify_at: datetime | None = None) -> dict:
+    """ntfyへサーバー側から送信する。ブラウザCORSやiOS WebViewの影響を受けない。"""
+    clean_topic = str(topic or "").strip()
+    if not clean_topic:
+        raise ValueError("ntfyトピック名を入力してください。")
+    if any(ch in clean_topic for ch in "/?# "):
+        raise ValueError("トピック名には空白や / ? # を使わないでください。")
+
+    endpoint = f"{GENERAL_REMINDER_NTFY_BASE}/{urllib.parse.quote(clean_topic, safe='')}"
+    headers = {
+        "Title": urllib.parse.quote("一般予定通知", safe=""),
+        "Priority": "high",
+        "Tags": "bell",
+        "Content-Type": "text/plain; charset=utf-8",
+    }
+    if notify_at is not None:
+        headers["At"] = str(int(notify_at.timestamp()))
+
+    request = urllib.request.Request(
+        endpoint,
+        data=str(message).encode("utf-8", errors="strict"),
+        method="POST",
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            if int(getattr(response, "status", 200)) >= 400:
+                raise RuntimeError(f"ntfy応答エラー: {response.status} {raw[:160]}")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"ntfy HTTP {exc.code}: {body[:180]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"ntfyへ接続できませんでした: {exc.reason}") from exc
+
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {"raw": raw[:200]}
+
+
+def _v139_general_reminder_defaults() -> None:
+    base = datetime.now(GENERAL_REMINDER_JST) + timedelta(minutes=30)
+    st.session_state.setdefault("v139_reminder_source", "")
+    st.session_state.setdefault("v139_reminder_title", "")
+    st.session_state.setdefault("v139_reminder_date", base.date())
+    st.session_state.setdefault("v139_reminder_time", base.time().replace(second=0, microsecond=0))
+    st.session_state.setdefault("v139_reminder_topic", "")
+
+
 def v123_render_general_reminder_tab() -> None:
-    """一般予定通知をブラウザ内だけで処理し、Streamlit全体の再実行を避ける。"""
-    now_plus_30 = datetime.now(GENERAL_REMINDER_JST) + timedelta(minutes=30)
-    default_date = now_plus_30.strftime("%Y-%m-%d")
-    default_time = now_plus_30.strftime("%H:%M")
+    """Streamlit標準UIで一般予定通知を表示する。ダイアログ内だけ再実行される。"""
+    _v139_general_reminder_defaults()
 
-    html = f"""
-    <!doctype html>
-    <html lang="ja">
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width,initial-scale=1">
-      <style>
-        * {{ box-sizing:border-box; }}
-        body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; color:#1f2937; }}
-        h3 {{ margin:0 0 6px; font-size:24px; }}
-        .caption {{ color:#6b7280; margin-bottom:18px; line-height:1.55; }}
-        label {{ display:block; margin:14px 0 6px; font-weight:600; }}
-        textarea,input {{ width:100%; border:1px solid #d1d5db; border-radius:10px; padding:11px 12px; font-size:16px; background:#fff; }}
-        textarea {{ min-height:125px; resize:vertical; }}
-        .row {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
-        button {{ width:100%; border:0; border-radius:10px; padding:12px; font-size:16px; font-weight:700; cursor:pointer; }}
-        .secondary {{ background:#eef2ff; color:#1d4ed8; margin-top:10px; }}
-        .primary {{ background:#2563eb; color:white; margin-top:18px; }}
-        .status {{ margin-top:14px; padding:12px; border-radius:10px; line-height:1.55; display:none; }}
-        .ok {{ display:block; background:#ecfdf5; color:#166534; }}
-        .warn {{ display:block; background:#fff7ed; color:#9a3412; }}
-        .err {{ display:block; background:#fef2f2; color:#b91c1c; }}
-        .note {{ margin-top:14px; color:#6b7280; font-size:13px; line-height:1.5; }}
-        @media (max-width:520px) {{ .row {{ grid-template-columns:1fr; }} }}
-      </style>
-    </head>
-    <body>
-      <h3>🔔 一般予定の10分前通知</h3>
-      <div class="caption">予測機能とは独立した一般予定用です。入力と予約はこの枠内だけで動くため、他タブを再読み込みしません。</div>
+    st.caption("一般予定専用です。開始10分前にntfyへ通知します。")
+    st.text_area(
+        "予定情報を貼り付け（任意）",
+        key="v139_reminder_source",
+        height=115,
+        placeholder="例：オンライン面談\n2026年8月1日(土)\n10:39開始",
+    )
+    if st.button("日付・開始時刻を自動入力", use_container_width=True, key="v139_parse_reminder"):
+        parsed_date, parsed_time, parsed_title = v123_parse_general_schedule_text(
+            st.session_state.get("v139_reminder_source", "")
+        )
+        if parsed_date:
+            st.session_state["v139_reminder_date"] = parsed_date
+        if parsed_time:
+            st.session_state["v139_reminder_time"] = parsed_time
+        if parsed_title and not str(st.session_state.get("v139_reminder_title", "")).strip():
+            st.session_state["v139_reminder_title"] = parsed_title
+        if parsed_date or parsed_time:
+            st.session_state["v139_reminder_message"] = ("success", "予定日時を自動入力しました。")
+        else:
+            st.session_state["v139_reminder_message"] = ("warning", "日付または開始時刻を読み取れませんでした。")
+        st.rerun(scope="fragment")
 
-      <label for="source">予定情報を貼り付け（任意）</label>
-      <textarea id="source" placeholder="例：オンライン面談\n2026年8月1日(土)\n10:39開始"></textarea>
-      <button class="secondary" type="button" id="parseBtn">日付・開始時刻を自動入力</button>
+    st.text_input("予定名", key="v139_reminder_title", placeholder="例：オンライン面談")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.date_input("予定日", key="v139_reminder_date")
+    with col2:
+        st.time_input("開始時刻", key="v139_reminder_time", step=60)
+    st.text_input(
+        "ntfyトピック名",
+        key="v139_reminder_topic",
+        placeholder="推測されにくい長い文字列",
+        help="iPhoneのntfyアプリで同じトピックを購読してください。",
+    )
 
-      <label for="title">予定名</label>
-      <input id="title" placeholder="例：オンライン面談">
-      <div class="row">
-        <div>
-          <label for="date">予定日</label>
-          <input id="date" type="date" value="{default_date}">
-        </div>
-        <div>
-          <label for="time">開始時刻</label>
-          <input id="time" type="time" value="{default_time}" step="60">
-        </div>
-      </div>
-      <label for="topic">ntfyトピック名</label>
-      <input id="topic" placeholder="推測されにくい長い文字列" autocomplete="off">
-      <button class="secondary" type="button" id="testBtn">今すぐテスト通知を送る</button>
-      <button class="primary" type="button" id="sendBtn">10分前通知を予約</button>
-      <div id="status" class="status"></div>
-      <div class="note">最初に「今すぐテスト通知」を押し、iPhoneへ届くことを確認してください。ntfyアプリで同じトピック名を購読し、iPhoneの通知許可をオンにする必要があります。公開トピックには機密情報を入れないでください。</div>
+    test_col, reserve_col = st.columns(2)
+    with test_col:
+        if st.button("今すぐテスト", use_container_width=True, key="v139_test_ntfy"):
+            try:
+                with st.spinner("テスト通知を送信中…"):
+                    reply = _v139_ntfy_request(
+                        st.session_state.get("v139_reminder_topic", ""),
+                        "一般予定通知の接続テストです。",
+                    )
+                receipt = f" 受付ID: {reply.get('id')}" if reply.get("id") else ""
+                st.session_state["v139_reminder_message"] = ("success", f"テスト通知を送信しました。{receipt}")
+            except Exception as exc:
+                st.session_state["v139_reminder_message"] = ("error", str(exc))
+            st.rerun(scope="fragment")
 
-      <script>
-        const statusBox = document.getElementById('status');
-        const setStatus = (text, kind) => {{
-          statusBox.className = 'status ' + kind;
-          statusBox.textContent = text;
-        }};
+    with reserve_col:
+        if st.button("10分前通知を予約", type="primary", use_container_width=True, key="v139_reserve_ntfy"):
+            try:
+                title = str(st.session_state.get("v139_reminder_title", "")).strip()
+                if not title:
+                    raise ValueError("予定名を入力してください。")
+                event_dt = datetime.combine(
+                    st.session_state["v139_reminder_date"],
+                    st.session_state["v139_reminder_time"],
+                    tzinfo=GENERAL_REMINDER_JST,
+                )
+                notify_dt = event_dt - timedelta(minutes=10)
+                now = datetime.now(GENERAL_REMINDER_JST)
+                if notify_dt <= now:
+                    raise ValueError("通知時刻が過ぎています。開始時刻を10分以上先にしてください。")
+                if notify_dt - now > timedelta(days=3):
+                    raise ValueError("ntfy.shの予約通知は最大3日先です。")
+                message = f"{title}\n開始時刻: {event_dt.strftime('%Y/%m/%d %H:%M')}"
+                with st.spinner("通知を予約中…"):
+                    reply = _v139_ntfy_request(
+                        st.session_state.get("v139_reminder_topic", ""),
+                        message,
+                        notify_at=notify_dt,
+                    )
+                receipt = f" / 受付ID: {reply.get('id')}" if reply.get("id") else ""
+                st.session_state["v139_reminder_message"] = (
+                    "success",
+                    f"{notify_dt.strftime('%Y/%m/%d %H:%M')} に通知を予約しました{receipt}",
+                )
+            except Exception as exc:
+                st.session_state["v139_reminder_message"] = ("error", str(exc))
+            st.rerun(scope="fragment")
 
-        document.getElementById('parseBtn').addEventListener('click', () => {{
-          const text = document.getElementById('source').value || '';
-          const dm = text.match(/(20\d{{2}})年\s*(\d{{1,2}})月\s*(\d{{1,2}})日/);
-          const tm = text.match(/(?:^|\s)(\d{{1,2}}):(\d{{2}})\s*(?:開始|発走|予定)?/m);
-          if (dm) {{
-            const y = dm[1], m = String(dm[2]).padStart(2,'0'), d = String(dm[3]).padStart(2,'0');
-            document.getElementById('date').value = `${{y}}-${{m}}-${{d}}`;
-          }}
-          if (tm) {{
-            document.getElementById('time').value = `${{String(tm[1]).padStart(2,'0')}}:${{tm[2]}}`;
-          }}
-          if (!document.getElementById('title').value.trim()) {{
-            const lines = text.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-            const titleLine = lines.find(x => !/20\d{{2}}年|\d{{1,2}}:\d{{2}}|開始|発走/.test(x) && x.length <= 60);
-            if (titleLine) document.getElementById('title').value = titleLine;
-          }}
-          if (!dm && !tm) setStatus('日付または開始時刻を読み取れませんでした。', 'warn');
-          else setStatus('予定日時を自動入力しました。', 'ok');
-        }});
+    message = st.session_state.pop("v139_reminder_message", None)
+    if message:
+        kind, text = message
+        getattr(st, kind)(text)
 
-        document.getElementById('testBtn').addEventListener('click', async () => {{
-          const btn = document.getElementById('testBtn');
-          const topic = document.getElementById('topic').value.trim();
-          if (!topic) {{ setStatus('ntfyトピック名を入力してください。', 'warn'); return; }}
-          if (/[\s/?#]/.test(topic)) {{ setStatus('トピック名には空白や / ? # を使わないでください。', 'warn'); return; }}
-          btn.disabled = true;
-          btn.textContent = 'テスト送信中…';
-          setStatus('今すぐテスト通知を送信しています…', 'warn');
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 7000);
-          try {{
-            const response = await fetch(`https://ntfy.sh/${{encodeURIComponent(topic)}}`, {{
-              method:'POST',
-              body:'一般予定通知の接続テストです。',
-              headers:{{'Content-Type':'text/plain; charset=utf-8'}},
-              signal: controller.signal
-            }});
-            const raw = await response.text();
-            if (!response.ok) throw new Error(`HTTP ${{response.status}} ${{raw.slice(0,120)}}`);
-            let data = {{}};
-            try {{ data = JSON.parse(raw); }} catch (_) {{}}
-            const idText = data.id ? ` / 受付ID: ${{data.id}}` : '';
-            setStatus(`テスト通知をntfyが受け付けました${{idText}}。iPhoneに届かなければ、同じトピックを購読しているか、通知許可を確認してください。`, 'ok');
-          }} catch (e) {{
-            const msg = e.name === 'AbortError' ? '通信が7秒以内に完了しませんでした。' : `テスト通知に失敗しました: ${{e.message}}`;
-            setStatus(msg, 'err');
-          }} finally {{
-            clearTimeout(timer);
-            btn.disabled = false;
-            btn.textContent = '今すぐテスト通知を送る';
-          }}
-        }});
-
-        document.getElementById('sendBtn').addEventListener('click', async () => {{
-          const btn = document.getElementById('sendBtn');
-          const title = document.getElementById('title').value.trim();
-          const dateValue = document.getElementById('date').value;
-          const timeValue = document.getElementById('time').value;
-          const topic = document.getElementById('topic').value.trim();
-          if (!title || !dateValue || !timeValue || !topic) {{
-            setStatus('予定名・予定日・開始時刻・トピック名をすべて入力してください。', 'warn'); return;
-          }}
-          if (/[\s/?#]/.test(topic)) {{
-            setStatus('トピック名には空白や / ? # を使わないでください。', 'warn'); return;
-          }}
-          const eventDt = new Date(`${{dateValue}}T${{timeValue}}:00+09:00`);
-          const notifyDt = new Date(eventDt.getTime() - 10*60*1000);
-          const now = new Date();
-          if (notifyDt <= now) {{ setStatus('通知時刻が過ぎています。開始時刻を10分以上先にしてください。', 'warn'); return; }}
-          if (notifyDt - now > 3*24*60*60*1000) {{ setStatus('ntfy.shの予約通知は最大3日先です。', 'warn'); return; }}
-
-          btn.disabled = true;
-          btn.textContent = '予約中…';
-          setStatus('ntfyへ予約を送信しています…', 'warn');
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 7000);
-          try {{
-            const response = await fetch(`https://ntfy.sh/${{encodeURIComponent(topic)}}`, {{
-              method:'POST',
-              body:`${{title}}\n開始時刻: ${{dateValue.replaceAll('-','/')}} ${{timeValue}}`,
-              headers:{{
-                'At': String(Math.floor(notifyDt.getTime()/1000)),
-                'Content-Type':'text/plain; charset=utf-8'
-              }},
-              signal: controller.signal
-            }});
-            const raw = await response.text();
-            if (!response.ok) throw new Error(`HTTP ${{response.status}} ${{raw.slice(0,120)}}`);
-            let data = {{}};
-            try {{ data = JSON.parse(raw); }} catch (_) {{}}
-            const idText = data.id ? ` / 受付ID: ${{data.id}}` : '';
-            const serverTime = data.time ? new Date(Number(data.time)*1000).toLocaleString('ja-JP', {{timeZone:'Asia/Tokyo'}}) : notifyDt.toLocaleString('ja-JP', {{timeZone:'Asia/Tokyo'}});
-            setStatus(`ntfyが予約を受け付けました。通知時刻: ${{serverTime}}${{idText}}`, 'ok');
-          }} catch (e) {{
-            const msg = e.name === 'AbortError' ? '通信が7秒以内に完了しませんでした。時間をおいて再度お試しください。' : `通知予約に失敗しました: ${{e.message}}`;
-            setStatus(msg, 'err');
-          }} finally {{
-            clearTimeout(timer);
-            btn.disabled = false;
-            btn.textContent = '10分前通知を予約';
-          }}
-        }});
-      </script>
-    </body>
-    </html>
-    """
-    components.html(html, height=760, scrolling=False)
+    st.caption("通知が届かない場合は、ntfyアプリの購読トピックとiPhoneの通知許可を確認してください。")
 
 def qident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
@@ -2352,64 +2323,108 @@ with register_tab:
             )
 
         if save_pending_submitted:
+            import time as _time
+            _started_at = _time.perf_counter()
+            _stage = "入力内容の確認"
             try:
-                # 編集対象以外の元カラムも保持して戻す
-                repaired = pending.copy()
-                for c in edited.columns:
-                    if c != "保留理由":
-                        repaired[c] = edited[c].values
-                repaired = repaired.drop(columns=["保留理由"], errors="ignore")
+                with st.status("不足行の登録処理を開始しました", expanded=True) as pending_status:
+                    pending_status.write(f"① 入力内容を確認しています：{len(edited)}件")
+                    repaired = pending.copy()
+                    for c in edited.columns:
+                        if c != "保留理由":
+                            repaired[c] = edited[c].values
+                    repaired = repaired.drop(columns=["保留理由"], errors="ignore")
 
-                # 数値完全一致なのにRが異なる行は、利用者の選択後だけ保存する。
-                unresolved = pd.Series(False, index=repaired.index)
-                if "重複処理" in repaired.columns:
-                    conflict_mask = pending.get(
-                        "保留理由", pd.Series("", index=pending.index)
-                    ).astype(str).str.contains("Rが異なります", na=False)
-                    unresolved = conflict_mask & repaired["重複処理"].fillna(
-                        "選択してください"
-                    ).eq("選択してください")
-                    repaired["_v58_duplicate_confirmed"] = ~unresolved
+                    _stage = "重複候補とRの確認"
+                    pending_status.write("② 重複候補とレース番号の選択を確認しています")
+                    unresolved = pd.Series(False, index=repaired.index)
+                    if "重複処理" in repaired.columns:
+                        conflict_mask = pending.get(
+                            "保留理由", pd.Series("", index=pending.index)
+                        ).astype(str).str.contains("Rが異なります", na=False)
+                        unresolved = conflict_mask & repaired["重複処理"].fillna(
+                            "選択してください"
+                        ).eq("選択してください")
+                        repaired["_v58_duplicate_confirmed"] = ~unresolved
 
-                if unresolved.any():
-                    message = f"Rが異なる重複候補 {int(unresolved.sum())}件の登録方法を選択してください。"
-                    st.session_state["pending_save_notice"] = {
-                        "level": "warning", "message": message
-                    }
-                    st.warning(message)
-                else:
-                    with st.spinner("不足行をSQLiteへ保存し、登録結果を確認しています…"):
+                    if unresolved.any():
+                        message = f"Rが異なる重複候補 {int(unresolved.sum())}件の登録方法を選択してください。"
+                        pending_status.update(label="入力待ちで停止しました", state="error", expanded=True)
+                        pending_status.write("登録処理はまだSQLiteへ進んでいません。")
+                        st.session_state["pending_save_notice"] = {
+                            "level": "warning", "message": message
+                        }
+                        st.warning(message)
+                    else:
+                        _stage = "SQLiteへの保存"
+                        pending_status.write("③ SQLiteへ不足行を保存しています")
                         report2 = engine.v131_save_pending_player_history(
                             repaired, db_path=engine.DB_PATH
                         )
-                    st.session_state["pending_player_history"] = report2["pending"]
-                    verified = int(report2.get("verified", 0))
-                    if verified:
-                        ok, msg = push_db_to_github(
-                            f"AutoRaceAI: {player_name.strip()} の保留履歴を{verified}件登録"
+
+                        _stage = "保存結果の再照合"
+                        pending_status.write("④ SQLiteを再検索し、実際に保存された件数を確認しています")
+                        st.session_state["pending_player_history"] = report2["pending"]
+                        verified = int(report2.get("verified", 0))
+                        pending_count = int(report2.get("pending_count", 0))
+                        changed = int(report2.get("changed", report2.get("saved", verified)))
+                        skipped = int(report2.get("skipped", 0))
+                        pending_status.write(
+                            f"確認結果：保存確認 {verified}件 / 変更候補 {changed}件 / "
+                            f"重複・スキップ {skipped}件 / 残り保留 {pending_count}件"
                         )
-                        level = "success" if ok else "warning"
-                        message = (
-                            f"不足行をDBへ{verified}件登録し、保存後の確認も完了しました。"
-                            f"残り保留 {report2['pending_count']}件。"
-                            + (f" {msg}" if msg else "")
-                        )
-                    elif report2["pending_count"]:
-                        level = "warning"
-                        reasons = ""
-                        if isinstance(report2.get("pending"), pd.DataFrame) and "保留理由" in report2["pending"].columns:
-                            vals = report2["pending"]["保留理由"].dropna().astype(str).unique().tolist()[:3]
-                            reasons = " 理由: " + " / ".join(vals) if vals else ""
-                        message = f"DBへ登録できませんでした。残り保留 {report2['pending_count']}件。{reasons}"
-                    else:
-                        level = "info"
-                        message = "登録対象の変更はありませんでした。既に同じ履歴が登録されている可能性があります。"
-                    st.session_state["pending_save_notice"] = {
-                        "level": level, "message": message
-                    }
-                    st.rerun()
+
+                        if verified:
+                            _stage = "GitHubへの保存"
+                            pending_status.write("⑤ GitHubへ更新済みDBを保存しています")
+                            ok, msg = push_db_to_github(
+                                f"AutoRaceAI: {player_name.strip()} の保留履歴を{verified}件登録"
+                            )
+                            level = "success" if ok else "warning"
+                            message = (
+                                f"不足行をDBへ{verified}件登録し、保存後の確認も完了しました。"
+                                f"残り保留 {pending_count}件。"
+                                + (f" {msg}" if msg else "")
+                            )
+                            pending_status.write("⑥ 登録処理が完了しました")
+                            pending_status.update(
+                                label=f"不足行登録完了：{verified}件",
+                                state="complete", expanded=True
+                            )
+                        elif pending_count:
+                            level = "warning"
+                            reasons = ""
+                            if isinstance(report2.get("pending"), pd.DataFrame) and "保留理由" in report2["pending"].columns:
+                                vals = report2["pending"]["保留理由"].dropna().astype(str).unique().tolist()[:3]
+                                reasons = " 理由: " + " / ".join(vals) if vals else ""
+                            message = f"DBへ登録できませんでした。残り保留 {pending_count}件。{reasons}"
+                            pending_status.update(
+                                label="保存できない行が残っています",
+                                state="error", expanded=True
+                            )
+                            pending_status.write(message)
+                        else:
+                            level = "info"
+                            message = "登録対象の変更はありませんでした。既に同じ履歴が登録されている可能性があります。"
+                            pending_status.update(
+                                label="新しい登録対象はありませんでした",
+                                state="complete", expanded=True
+                            )
+                            pending_status.write(message)
+
+                        elapsed = _time.perf_counter() - _started_at
+                        pending_status.write(f"処理時間：{elapsed:.1f}秒")
+                        st.session_state["pending_save_notice"] = {
+                            "level": level,
+                            "message": message + f"（処理時間 {elapsed:.1f}秒）"
+                        }
+                        st.rerun()
             except Exception as exc:
-                error_message = f"不足行登録エラー: {type(exc).__name__}: {exc}"
+                elapsed = _time.perf_counter() - _started_at
+                error_message = (
+                    f"不足行登録エラー（{_stage}）: {type(exc).__name__}: {exc} "
+                    f"（開始から {elapsed:.1f}秒）"
+                )
                 st.session_state["pending_save_notice"] = {
                     "level": "error", "message": error_message
                 }

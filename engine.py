@@ -15430,3 +15430,443 @@ def v131_save_pending_player_history(df, db_path=DB_PATH):
         "pending": pending.reset_index(drop=True),
         "valid": valid,
     }
+
+# ============================================================
+# Ver141: 熱走路を独立学習し、全15重みを条件別に補正
+# ============================================================
+V141_HEAT_DEFAULT_WEIGHTS = {
+    "熱走路適性": 0.28,
+    "高温前残り": 0.22,
+    "高温追い込み耐性": 0.20,
+    "高温位置維持": 0.16,
+    "高温展開適応": 0.14,
+}
+V141_HEAT_COLMAP = {
+    "熱走路適性": "heat_skill_feature",
+    "高温前残り": "heat_front_feature",
+    "高温追い込み耐性": "heat_chase_feature",
+    "高温位置維持": "heat_hold_feature",
+    "高温展開適応": "heat_adapt_feature",
+}
+
+
+def v141_heat_level(track_temp):
+    """温度帯を0～1へ。56℃以上を一括にせず60℃台を強く区別する。"""
+    try:
+        t = float(track_temp)
+    except Exception:
+        return 0.0
+    if t < 50.0:
+        return 0.0
+    if t < 54.0:
+        return 0.20 + (t - 50.0) / 4.0 * 0.20
+    if t < 56.0:
+        return 0.40 + (t - 54.0) / 2.0 * 0.15
+    if t < 60.0:
+        return 0.55 + (t - 56.0) / 4.0 * 0.20
+    if t < 63.0:
+        return 0.75 + (t - 60.0) / 3.0 * 0.20
+    return min(1.0, 0.95 + (t - 63.0) * 0.01)
+
+
+def v60_heat_band(track_temp):
+    """Ver141温度帯。旧56℃以上を60℃前後で分割する。"""
+    try:
+        t = float(track_temp)
+    except Exception:
+        t = 30.0
+    if t < 42: return "～41℃", 0.00
+    if t < 47: return "42～46℃", 0.12
+    if t < 50: return "47～49℃", 0.30
+    if t < 52: return "50～51℃", 0.46
+    if t < 54: return "52～53℃", 0.58
+    if t < 56: return "54～55℃", 0.68
+    if t < 60: return "56～59℃", 0.78
+    if t < 63: return "60～62℃", 0.92
+    return "63℃以上", 1.00
+
+
+def v141_init_heat_learning(db_path=DB_PATH):
+    now = datetime.now().isoformat(timespec="seconds")
+    v40_init_learning_tables(db_path)
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        for name, weight in V141_HEAT_DEFAULT_WEIGHTS.items():
+            con.execute("""INSERT OR IGNORE INTO adaptive_weights
+                (feature_name,current_weight,initial_weight,updated_at,update_count)
+                VALUES(?,?,?,?,0)""", (name, weight, weight, now))
+        con.execute("""CREATE TABLE IF NOT EXISTS v141_heat_feature_snapshots (
+            race_key TEXT NOT NULL,
+            car_no INTEGER NOT NULL,
+            player_name TEXT,
+            track_temp REAL,
+            heat_level REAL,
+            heat_skill_feature REAL,
+            heat_front_feature REAL,
+            heat_chase_feature REAL,
+            heat_hold_feature REAL,
+            heat_adapt_feature REAL,
+            heat_bonus REAL,
+            PRIMARY KEY(race_key, car_no)
+        )""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_v141_heat_race ON v141_heat_feature_snapshots(race_key)")
+        con.commit()
+
+
+def v141_get_heat_weights(db_path=DB_PATH):
+    v141_init_heat_learning(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        rows = con.execute(
+            "SELECT feature_name,current_weight FROM adaptive_weights WHERE feature_name IN (?,?,?,?,?)",
+            tuple(V141_HEAT_DEFAULT_WEIGHTS),
+        ).fetchall()
+        try:
+            hot_count = int(con.execute(
+                "SELECT COUNT(*) FROM result_races WHERE COALESCE(track_temp,0)>=50 AND COALESCE(model_eligible,1)=1"
+            ).fetchone()[0])
+        except sqlite3.Error:
+            hot_count = 0
+    current = {str(k): float(v) for k, v in rows}
+    for k, v in V141_HEAT_DEFAULT_WEIGHTS.items():
+        current.setdefault(k, v)
+    total = sum(max(0.0, current[k]) for k in V141_HEAT_DEFAULT_WEIGHTS)
+    learned = ({k: current[k] / total for k in current} if total > 0 else dict(V141_HEAT_DEFAULT_WEIGHTS))
+    reliability = float(np.clip(hot_count / 25.0, 0.0, 1.0))
+    blended = {
+        k: V141_HEAT_DEFAULT_WEIGHTS[k] * (1.0 - reliability) + learned[k] * reliability
+        for k in V141_HEAT_DEFAULT_WEIGHTS
+    }
+    z = sum(blended.values()) or 1.0
+    return {k: blended[k] / z for k in V141_HEAT_DEFAULT_WEIGHTS}
+
+
+def _v141_rank_feature(values, higher_is_better=True):
+    x = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if x.notna().sum() < 2 or x.dropna().nunique() <= 1:
+        return pd.Series(0.5, index=x.index, dtype=float)
+    return x.rank(method="average", ascending=higher_is_better, pct=True, na_option="keep").fillna(0.5).clip(0.0, 1.0)
+
+
+def v141_heat_feature_frame(df):
+    out = pd.DataFrame(index=df.index)
+    handicap = pd.to_numeric(df.get("ハンデ", pd.Series(0, index=df.index)), errors="coerce").fillna(0.0)
+    front_position = 1.0 - _v141_rank_feature(handicap, higher_is_better=True)
+    hot_skill = pd.to_numeric(df.get("熱走路適性", pd.Series(0.5, index=df.index)), errors="coerce").fillna(0.5)
+    hot_rate = pd.to_numeric(df.get("50℃以上3着内率", pd.Series(np.nan, index=df.index)), errors="coerce")
+    hot_rate = hot_rate.fillna(hot_skill)
+    hold = pd.to_numeric(df.get("位置維持指数", df.get("内枠残存率", pd.Series(0.5, index=df.index))), errors="coerce").fillna(0.5)
+    chase = pd.to_numeric(df.get("追込み指数", df.get("混戦突破適性", pd.Series(0.5, index=df.index))), errors="coerce").fillna(0.5)
+    passing = pd.to_numeric(df.get("捌き指数", df.get("集団突破力", pd.Series(0.5, index=df.index))), errors="coerce").fillna(0.5)
+    stability = pd.to_numeric(df.get("終盤指数_実測", df.get("安定上位指数", pd.Series(0.5, index=df.index))), errors="coerce").fillna(0.5)
+    course = pd.to_numeric(df.get("会場適性点", df.get("コース適性", pd.Series(0.5, index=df.index))), errors="coerce").fillna(0.5)
+    current = pd.to_numeric(df.get("当日状態指数", df.get("近況信頼度", pd.Series(0.5, index=df.index))), errors="coerce").fillna(0.5)
+
+    out["熱走路適性"] = (hot_skill * 0.65 + hot_rate * 0.35).clip(0.0, 1.0)
+    out["高温前残り"] = (front_position * 0.36 + hold * 0.42 + hot_skill * 0.22).clip(0.0, 1.0)
+    # 後方位置でも捌きと高温適性があれば「追える人」として減点を解除できる。
+    rear_role = (1.0 - front_position).clip(0.0, 1.0)
+    out["高温追い込み耐性"] = (chase * 0.34 + passing * 0.28 + hot_skill * 0.24 + rear_role * 0.14).clip(0.0, 1.0)
+    out["高温位置維持"] = (hold * 0.48 + stability * 0.30 + hot_skill * 0.22).clip(0.0, 1.0)
+    out["高温展開適応"] = (passing * 0.26 + stability * 0.22 + course * 0.18 + current * 0.18 + hot_skill * 0.16).clip(0.0, 1.0)
+    return out.replace([np.inf, -np.inf], np.nan).fillna(0.5).clip(0.0, 1.0)
+
+
+_v141_base_v60_apply = v60_apply_lap_and_heat_learning
+
+def v60_apply_lap_and_heat_learning(df, entries=None, meta=None, db_path=None):
+    """旧熱補正後に、学習可能な5つの熱専用重みを条件付きで適用。"""
+    out = _v141_base_v60_apply(df, entries, meta, db_path)
+    db_path = db_path or globals().get("DB_PATH")
+    try:
+        track_temp = float((meta or {}).get("走路温度") or 30.0)
+    except Exception:
+        track_temp = 30.0
+    heat_level = v141_heat_level(track_temp)
+    features = v141_heat_feature_frame(out)
+    weights = v141_get_heat_weights(db_path)
+    centered = sum(weights[k] * (features[k] - 0.5) for k in V141_HEAT_DEFAULT_WEIGHTS)
+    # 50℃未満は0。60℃以上で強くなるが、元モデルを壊さないよう最大±2.4点。
+    bonus = (centered * 5.0 * heat_level).clip(-2.4, 2.4).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    out["熱専用学習補正"] = bonus
+    out["熱補正強度"] = float(heat_level)
+    for k in V141_HEAT_DEFAULT_WEIGHTS:
+        out[f"学習特徴_{k}"] = features[k]
+
+    if "改善後総合点" in out.columns:
+        score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = score + bonus
+        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False, na_option="bottom").fillna(len(out)).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.36
+    if "予測競走T" in out.columns:
+        t = pd.to_numeric(out["予測競走T"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        fallback = float(t.median()) if t.notna().any() else 3.60
+        out["予測競走T"] = np.round(t.fillna(fallback) - bonus * 0.0008, 4)
+
+    reasons = []
+    for idx in out.index:
+        parts = sorted(
+            ((k, weights[k] * (features.loc[idx, k] - 0.5)) for k in V141_HEAT_DEFAULT_WEIGHTS),
+            key=lambda x: abs(x[1]), reverse=True,
+        )[:3]
+        reasons.append(
+            f"{v60_heat_band(track_temp)[0]}・強度{heat_level:.2f} / "
+            + " / ".join(f"{k}{'+' if v >= 0 else '-'}" for k, v in parts)
+        )
+    out["熱専用補正根拠"] = reasons
+    return out
+
+
+_v141_base_save_prediction_features = v40_save_prediction_features
+
+def v40_save_prediction_features(meta, df, db_path=DB_PATH):
+    key = _v141_base_save_prediction_features(meta, df, db_path)
+    v141_init_heat_learning(db_path)
+    try:
+        track_temp = float((meta or {}).get("走路温度") or 30.0)
+    except Exception:
+        track_temp = 30.0
+    heat_level = v141_heat_level(track_temp)
+    features = v141_heat_feature_frame(df)
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        con.execute("DELETE FROM v141_heat_feature_snapshots WHERE race_key=?", (key,))
+        for idx, r in df.iterrows():
+            car = int(r.get("車", r.get("車番")))
+            con.execute("""INSERT INTO v141_heat_feature_snapshots
+                (race_key,car_no,player_name,track_temp,heat_level,
+                 heat_skill_feature,heat_front_feature,heat_chase_feature,
+                 heat_hold_feature,heat_adapt_feature,heat_bonus)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
+                key, car, str(r.get("選手名", "")), track_temp, heat_level,
+                float(features.loc[idx, "熱走路適性"]),
+                float(features.loc[idx, "高温前残り"]),
+                float(features.loc[idx, "高温追い込み耐性"]),
+                float(features.loc[idx, "高温位置維持"]),
+                float(features.loc[idx, "高温展開適応"]),
+                float(pd.to_numeric(pd.Series([r.get("熱専用学習補正", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
+            ))
+        con.commit()
+    return key
+
+
+def _v141_weighted_average(values, weights):
+    v = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    mask = np.isfinite(v) & np.isfinite(w) & (w > 0)
+    if not mask.any():
+        return 0.0
+    return float(np.average(v[mask], weights=w[mask]))
+
+
+def _v141_collect_evidence(db_path=DB_PATH):
+    """全登録結果を使い、通常要因と熱要因を分離して相関を集計する。"""
+    v141_init_heat_learning(db_path)
+    base_colmap = {
+        "試走": "trial_feature", "ST": "st_feature", "ハンデ": "handicap_feature",
+        "近況": "form_feature", "走路適性": "surface_feature", "前残り": "front_feature",
+        "追い込み": "chase_feature", "周回安定": "stability_feature",
+        "コース適性": "course_feature", "相手耐性": "opponent_feature",
+    }
+    rows = []
+    with sqlite3.connect(str(db_path)) as con:
+        races = pd.read_sql_query("""
+            SELECT rr.race_key, rr.registered_at, rr.track_temp
+            FROM result_races rr
+            JOIN v40_prediction_feature_snapshots s ON s.race_key=rr.race_key
+            LEFT JOIN v41_registration_batches b ON b.race_key=rr.race_key
+            WHERE COALESCE(b.status,'active')='active' AND COALESCE(rr.model_eligible,1)=1
+            GROUP BY rr.race_key, rr.registered_at, rr.track_temp
+            ORDER BY rr.registered_at DESC, rr.race_key DESC
+        """, con)
+        for _, race in races.iterrows():
+            merged = pd.read_sql_query("""
+                SELECT s.*, e.finish, e.result_status,
+                       h.heat_skill_feature,h.heat_front_feature,h.heat_chase_feature,
+                       h.heat_hold_feature,h.heat_adapt_feature
+                FROM v40_prediction_feature_snapshots s
+                JOIN result_entries e ON e.race_key=s.race_key AND e.car_no=s.car_no
+                LEFT JOIN v141_heat_feature_snapshots h ON h.race_key=s.race_key AND h.car_no=s.car_no
+                WHERE s.race_key=?
+            """, con, params=(race["race_key"],))
+            if merged.empty:
+                continue
+            finish = pd.to_numeric(merged["finish"], errors="coerce")
+            status = merged["result_status"].fillna("").astype(str)
+            valid = finish.notna() & (finish >= 1) & ~status.str.contains("欠車|競走中止|落車|落妨|反妨|反則|不成立|失格|周誤|故障", regex=True)
+            merged = merged.loc[valid].copy()
+            if len(merged) < 3:
+                continue
+            performance = (len(merged) + 1) - pd.to_numeric(merged["finish"], errors="coerce")
+            temp = float(race.get("track_temp") or 0.0)
+            heat_level = v141_heat_level(temp)
+            item = {"race_key": race["race_key"], "registered_at": race["registered_at"], "track_temp": temp, "heat_level": heat_level}
+            for name, col in base_colmap.items():
+                item[name] = _v39_spearman(merged[col], performance)
+            # 古いレースに熱専用スナップショットが無い場合も、既存10特徴から安全に復元。
+            fallback_heat = {
+                "熱走路適性": pd.to_numeric(merged["surface_feature"], errors="coerce"),
+                "高温前残り": (pd.to_numeric(merged["front_feature"], errors="coerce") * .65 + pd.to_numeric(merged["stability_feature"], errors="coerce") * .35),
+                "高温追い込み耐性": (pd.to_numeric(merged["chase_feature"], errors="coerce") * .65 + pd.to_numeric(merged["opponent_feature"], errors="coerce") * .20 + pd.to_numeric(merged["course_feature"], errors="coerce") * .15),
+                "高温位置維持": (pd.to_numeric(merged["stability_feature"], errors="coerce") * .60 + pd.to_numeric(merged["front_feature"], errors="coerce") * .40),
+                "高温展開適応": (pd.to_numeric(merged["course_feature"], errors="coerce") * .30 + pd.to_numeric(merged["form_feature"], errors="coerce") * .25 + pd.to_numeric(merged["opponent_feature"], errors="coerce") * .25 + pd.to_numeric(merged["chase_feature"], errors="coerce") * .20),
+            }
+            for name, col in V141_HEAT_COLMAP.items():
+                series = pd.to_numeric(merged[col], errors="coerce") if col in merged.columns else pd.Series(np.nan, index=merged.index)
+                if series.notna().sum() < 3:
+                    series = fallback_heat[name]
+                item[name] = _v39_spearman(series, performance)
+            rows.append(item)
+    if not rows:
+        all_names = list(V40_DEFAULT_WEIGHTS) + list(V141_HEAT_DEFAULT_WEIGHTS)
+        return {k: 0.0 for k in all_names}, {"race_count": 0, "hot_race_count": 0}
+
+    ev = pd.DataFrame(rows)
+    recency = np.array([V41_DECAY ** i for i in range(len(ev))], dtype=float)
+    evidence = {}
+    heat_sensitive_base = {"走路適性", "前残り", "追い込み", "周回安定"}
+    for name in V40_DEFAULT_WEIGHTS:
+        condition_weight = np.ones(len(ev), dtype=float)
+        if name in heat_sensitive_base:
+            # 熱いレースの影響を通常重みへ丸投げせず、熱専用重みへ渡す。
+            condition_weight *= np.where(ev["track_temp"].to_numpy(float) >= 60, 0.20,
+                                 np.where(ev["track_temp"].to_numpy(float) >= 56, 0.38,
+                                 np.where(ev["track_temp"].to_numpy(float) >= 50, 0.65, 1.0)))
+        evidence[name] = _v141_weighted_average(pd.to_numeric(ev[name], errors="coerce"), recency * condition_weight)
+    hot = ev[ev["track_temp"] >= 50].copy()
+    for name in V141_HEAT_DEFAULT_WEIGHTS:
+        if hot.empty:
+            evidence[name] = 0.0
+        else:
+            hot_pos = ev.index.get_indexer(hot.index)
+            temp_weight = 0.45 + hot["heat_level"].to_numpy(float) * 0.55
+            evidence[name] = _v141_weighted_average(pd.to_numeric(hot[name], errors="coerce"), recency[hot_pos] * temp_weight)
+    return evidence, {
+        "race_count": int(len(ev)),
+        "hot_race_count": int(len(hot)),
+        "extreme_heat_count": int((ev["track_temp"] >= 60).sum()),
+    }
+
+
+def _v141_move_weights(before, defaults, evidence, max_step, min_weight=0.02, max_weight=0.35):
+    strength = {k: max(0.04, (float(evidence.get(k, 0.0)) + 1.0) / 2.0) for k in defaults}
+    z = sum(strength.values()) or 1.0
+    target = {k: strength[k] / z for k in defaults}
+    raw = {
+        k: float(np.clip(before[k] + np.clip((target[k] - before[k]) * 0.08, -max_step, max_step), min_weight, max_weight))
+        for k in defaults
+    }
+    total = sum(raw.values()) or 1.0
+    return {k: raw[k] / total for k in defaults}
+
+
+def v41_adjust_weights_after_result(meta, results, db_path=DB_PATH):
+    """通常10項目と熱専用5項目を条件分離して全て再評価する。"""
+    v141_init_heat_learning(db_path)
+    key = v34_race_key(meta)
+    valid, excluded = v41_valid_results(results)
+    if len(valid) < 3:
+        return {"message": f"有効着順が{len(valid)}人のため、重みは変更していません。", "valid_count": len(valid), "excluded_count": len(excluded)}
+    with sqlite3.connect(str(db_path)) as con:
+        already = con.execute("SELECT 1 FROM weight_adjustment_history WHERE race_key=? LIMIT 1", (key,)).fetchone()
+    if already:
+        return {"message": "このレースはすでに学習済みのため、重みを二重更新していません。", "duplicate": True}
+
+    evidence, stats = _v141_collect_evidence(db_path)
+    base_before = v40_get_weights(db_path)
+    heat_before = v141_get_heat_weights(db_path)
+    base_after = _v141_move_weights(base_before, V40_DEFAULT_WEIGHTS, evidence, max_step=0.0025)
+    if stats.get("hot_race_count", 0) >= 3:
+        heat_after = _v141_move_weights(heat_before, V141_HEAT_DEFAULT_WEIGHTS, evidence, max_step=0.0040)
+    else:
+        heat_after = dict(heat_before)
+
+    with sqlite3.connect(str(db_path)) as con:
+        snap = pd.read_sql_query("SELECT * FROM v40_prediction_feature_snapshots WHERE race_key=?", con, params=(key,))
+        heat_snap = pd.read_sql_query("SELECT * FROM v141_heat_feature_snapshots WHERE race_key=?", con, params=(key,))
+    merged = snap.merge(valid[["車番", "着順"]], left_on="car_no", right_on="車番", how="inner")
+    if not heat_snap.empty:
+        merged = merged.merge(heat_snap, on=["race_key", "car_no"], how="left", suffixes=("", "_heat"))
+    base_colmap = {
+        "試走":"trial_feature", "ST":"st_feature", "ハンデ":"handicap_feature", "近況":"form_feature",
+        "走路適性":"surface_feature", "前残り":"front_feature", "追い込み":"chase_feature",
+        "周回安定":"stability_feature", "コース適性":"course_feature", "相手耐性":"opponent_feature",
+    }
+    before_top3 = "→".join(map(str, merged.sort_values("before_rank")["car_no"].head(3).astype(int))) if not merged.empty else ""
+    try:
+        track_temp = float((meta or {}).get("走路温度") or 0.0)
+    except Exception:
+        track_temp = 0.0
+    heat_level = v141_heat_level(track_temp)
+    if not merged.empty:
+        base_diag = sum(base_after[k] * pd.to_numeric(merged[base_colmap[k]], errors="coerce").fillna(.5) for k in base_after)
+        heat_diag = pd.Series(0.0, index=merged.index)
+        for k, col in V141_HEAT_COLMAP.items():
+            if col in merged.columns:
+                feat = pd.to_numeric(merged[col], errors="coerce").fillna(.5)
+            else:
+                feat = pd.Series(.5, index=merged.index)
+            heat_diag += heat_after[k] * feat
+        diagnostic = base_diag + heat_level * (heat_diag - 0.5) * 0.45
+        after_top3 = "→".join(map(str, merged.assign(diag_score=diagnostic).sort_values("diag_score", ascending=False)["car_no"].head(3).astype(int)))
+    else:
+        after_top3 = ""
+    actual_top3 = "→".join(map(str, valid.sort_values("着順")["車番"].head(3).astype(int)))
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        all_before = {**base_before, **heat_before}
+        all_after = {**base_after, **heat_after}
+        for name in all_before:
+            is_heat = name in V141_HEAT_DEFAULT_WEIGHTS
+            if is_heat:
+                reason = (
+                    f"熱走路専用学習。高温{stats.get('hot_race_count',0)}R（60℃以上{stats.get('extreme_heat_count',0)}R）を温度強度付きで集計。"
+                    f"通常の前残り・追い込みへ熱要因を重複配分しません。"
+                )
+            else:
+                reason = (
+                    f"通常要因学習。全{stats.get('race_count',0)}Rを集計。50℃以上では熱に敏感な通常要因の寄与を縮小し、熱専用5項目へ分離。"
+                )
+            con.execute("UPDATE adaptive_weights SET current_weight=?,updated_at=?,update_count=update_count+1 WHERE feature_name=?",
+                        (float(all_after[name]), now, name))
+            con.execute("""INSERT INTO weight_adjustment_history
+                (race_key,adjusted_at,feature_name,before_weight,after_weight,delta,evidence_score,reason,
+                 before_top3,after_top3,actual_top3,diagnostic_exact_before,diagnostic_exact_after)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                key, now, name, float(all_before[name]), float(all_after[name]), float(all_after[name]-all_before[name]),
+                float(evidence.get(name, 0.0)), reason, before_top3, after_top3, actual_top3,
+                int(before_top3 == actual_top3), int(after_top3 == actual_top3),
+            ))
+        con.commit()
+    return {
+        "race_key": key,
+        "before": all_before,
+        "after": all_after,
+        "evidence": evidence,
+        "before_top3": before_top3,
+        "after_top3": after_top3,
+        "actual_top3": actual_top3,
+        "diagnostic_exact_before": before_top3 == actual_top3,
+        "diagnostic_exact_after": after_top3 == actual_top3,
+        "valid_count": len(valid),
+        "excluded_count": len(excluded),
+        "learning_stats": stats,
+        "note": "通常10項目と熱走路専用5項目を分離し、全15項目を再評価しました。熱要因を通常の前残りへ丸投げしません。",
+    }
+
+
+def v40_current_weights(db_path=DB_PATH):
+    """通常重みと熱専用重みを同じ画面へ表示。"""
+    base = v40_get_weights(db_path)
+    heat = v141_get_heat_weights(db_path)
+    rows = []
+    for k, v in base.items():
+        rows.append({"分類": "通常", "項目": k, "現在の重み": v, "初期値": V40_DEFAULT_WEIGHTS[k], "初期値からの差": v - V40_DEFAULT_WEIGHTS[k]})
+    for k, v in heat.items():
+        rows.append({"分類": "熱走路専用", "項目": k, "現在の重み": v, "初期値": V141_HEAT_DEFAULT_WEIGHTS[k], "初期値からの差": v - V141_HEAT_DEFAULT_WEIGHTS[k]})
+    return pd.DataFrame(rows)
+
+
+def v141_initialize_db_weights(db_path=DB_PATH):
+    """既存DBへ新テーブル・5重みを安全に追加する。既存10重みは変更しない。"""
+    v141_init_heat_learning(db_path)
+    return {"base_weights": v40_get_weights(db_path), "heat_weights": v141_get_heat_weights(db_path)}
