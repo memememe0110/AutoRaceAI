@@ -8,7 +8,7 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -26,7 +26,7 @@ _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver155｜予測後の画面切替・券種表示を軽量化")
+st.caption("Ver159｜高速表示を維持したまま全券種一括コピーを復活")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -925,6 +925,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
     )
     all_formation_text: dict[str, str] = {}
     all_formation_points: dict[str, int] = {}
+    selected_trifecta_line_mode = "通常選択"
     for bet_type in [selected_bet_type]:
         row = stats[stats["券種"] == bet_type]
         if row.empty:
@@ -947,6 +948,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
                 key=f"v81_trifecta_line_mode_{coverage}_{line_mode}",
                 help="『過去20点以内的中ライン』は、三連単が予測上位20点以内で当たった過去レースだけを集め、その累積確率の分位点を使います。全レースのカバー率ではありません。",
             )
+            selected_trifecta_line_mode = trifecta_line_mode
             if within20_count > 0:
                 w20_value = float(r[f"20点以内{coverage}%カバー"])
                 st.caption(
@@ -1092,21 +1094,91 @@ def show_v67_self_evaluation(meta: dict) -> None:
             )
             st.caption("共通部分だけをまとめた簡易表記です。正確な対象は上の一覧表でも確認できます。")
 
-    if all_formation_text:
-        st.markdown('<div id="copy-all-formations"></div>', unsafe_allow_html=True)
-        st.markdown("### 📋 選択中の券種をコピー")
-        all_text = "\n\n".join(
-            f"{ticket_point_heading(bet_type, all_formation_points.get(bet_type, 0))}\n{all_formation_text[bet_type]}"
-            for bet_type in ["2連単", "2連複", "3連複", "3連単"]
-            if bet_type in all_formation_text
-        )
-        v73_copy_box(
-            "選択中の強調フォーメーション",
-            all_text,
-            f"all_{coverage}_{line_mode}_{cap_enabled}_{cap_points}",
-            height=max(180, min(420, 75 + 26 * all_text.count("\n"))),
-        )
-        st.markdown('<div class="v73-nav"><a href="#ticket-probability">券種別確率へ</a><a href="#prediction-summary">予測概要へ</a><a href="#page-top">ページ上部へ</a></div>', unsafe_allow_html=True)
+    # Ver159: 通常表示は選択中の1券種だけ。4券種はボタンを押した時だけ生成する。
+    st.markdown('<div id="copy-all-formations"></div>', unsafe_allow_html=True)
+    st.markdown("### 📋 全券種を一括コピー")
+    st.caption("普段は選択中の1券種だけを計算します。下のボタンを押した時だけ4券種をまとめて生成します。")
+
+    meta_signature = hashlib.sha256(repr(meta).encode("utf-8", errors="ignore")).hexdigest()[:16]
+    all_copy_signature = (
+        f"{meta_signature}|{starter_count}|{coverage}|{line_mode}|{int(outlier_cutoff)}|"
+        f"{cap_enabled}|{int(cap_points)}|{selected_trifecta_line_mode}"
+    )
+    cache_key = "v159_all_ticket_copy_cache"
+
+    if st.button("📋 全券種のフォーメーションを生成", key="v159_generate_all_ticket_copy", use_container_width=True):
+        generated_text: dict[str, str] = {}
+        generated_points: dict[str, int] = {}
+        generated_notes: list[str] = []
+
+        with st.spinner("4券種をまとめています…"):
+            for copy_bet_type in bet_types:
+                copy_row = stats[stats["券種"] == copy_bet_type]
+                if copy_row.empty:
+                    generated_notes.append(f"{copy_bet_type}: 結果照合データなし")
+                    continue
+                copy_r = copy_row.iloc[0]
+
+                use_copy_within20 = (
+                    copy_bet_type == "3連単"
+                    and selected_trifecta_line_mode == "過去20点以内的中ライン"
+                    and int(copy_r.get("20点以内レース数", 0) or 0) > 0
+                )
+                if use_copy_within20:
+                    copy_cutoff = float(copy_r[f"20点以内{coverage}%カバー"])
+                elif line_mode == "実用ライン":
+                    copy_cutoff = float(copy_r[f"実用{coverage}%カバー"])
+                else:
+                    copy_cutoff = float(copy_r[f"{coverage}%カバー"])
+
+                copy_table = engine.v67_ticket_highlight_table(
+                    meta, copy_bet_type, copy_cutoff, engine.DB_PATH
+                )
+                if copy_table.empty:
+                    generated_notes.append(f"{copy_bet_type}: 現在の予測分布なし")
+                    continue
+                if cap_enabled:
+                    copy_table = copy_table.head(int(cap_points)).copy()
+
+                copy_formations = engine.v67_compress_formations(
+                    copy_table["組み合わせ"].tolist(), copy_bet_type
+                )
+                if not copy_formations:
+                    generated_notes.append(f"{copy_bet_type}: フォーメーション作成不可")
+                    continue
+
+                generated_text[copy_bet_type] = "\n".join(str(line) for line in copy_formations)
+                generated_points[copy_bet_type] = len(copy_table)
+
+        st.session_state[cache_key] = {
+            "signature": all_copy_signature,
+            "text": generated_text,
+            "points": generated_points,
+            "notes": generated_notes,
+        }
+
+    cached_all = st.session_state.get(cache_key)
+    if isinstance(cached_all, dict) and cached_all.get("signature") == all_copy_signature:
+        cached_text = cached_all.get("text") or {}
+        cached_points = cached_all.get("points") or {}
+        if cached_text:
+            all_text = "\n\n".join(
+                f"{ticket_point_heading(copy_bet_type, cached_points.get(copy_bet_type, 0))}\n{cached_text[copy_bet_type]}"
+                for copy_bet_type in bet_types
+                if copy_bet_type in cached_text
+            )
+            v73_copy_box(
+                "全券種の強調フォーメーション",
+                all_text,
+                f"v159_all_{coverage}_{line_mode}_{cap_enabled}_{cap_points}_{meta_signature}",
+                height=max(220, min(520, 90 + 26 * all_text.count("\n"))),
+            )
+        for note in cached_all.get("notes") or []:
+            st.caption(note)
+    else:
+        st.caption("ラインや点数設定を変えた場合は、もう一度生成ボタンを押してください。")
+
+    st.markdown('<div class="v73-nav"><a href="#ticket-probability">券種別確率へ</a><a href="#prediction-summary">予測概要へ</a><a href="#page-top">ページ上部へ</a></div>', unsafe_allow_html=True)
 
 def show_v67_result_analysis(ticket_analysis: pd.DataFrame) -> None:
     st.subheader("🎯 実結果は予測の上位累積何%地点だったか")
@@ -1520,15 +1592,26 @@ _v132_general_reminder_launcher()
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
 _main_pages = ["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"]
-if hasattr(st, "segmented_control"):
-    selected_main_page = st.segmented_control(
-        "画面切替", _main_pages, default=_main_pages[0], key="v155_main_page"
-    )
-else:
-    selected_main_page = st.radio(
-        "画面切替", _main_pages, horizontal=True, key="v155_main_page"
-    )
-selected_main_page = selected_main_page or _main_pages[0]
+if st.session_state.get("v155_main_page") not in _main_pages:
+    st.session_state["v155_main_page"] = _main_pages[0]
+
+st.markdown("#### 画面切替")
+_button_rows = (_main_pages[:2], _main_pages[2:])
+for _row_index, _row_pages in enumerate(_button_rows):
+    _cols = st.columns(2, gap="small")
+    for _col, _page in zip(_cols, _row_pages):
+        with _col:
+            _is_selected = st.session_state.get("v155_main_page") == _page
+            if st.button(
+                _page,
+                key=f"v158_main_page_{_row_index}_{_page}",
+                use_container_width=True,
+                type="primary" if _is_selected else "secondary",
+            ):
+                st.session_state["v155_main_page"] = _page
+                st.rerun()
+
+selected_main_page = st.session_state.get("v155_main_page", _main_pages[0])
 
 if selected_main_page == "🏁 予測":
     st.info("Ver20予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
@@ -1763,14 +1846,18 @@ if selected_main_page == "🏁 予測":
                     st.caption("選手×開催場相性も本人の全場成績との差から縮小推定し、走数が少ない選手は弱く反映します。")
                     weight_df = pd.DataFrame(profile.get("重み明細", []))
                     if not weight_df.empty:
+                        # 表示専用に0〜1の信頼度を百分率へ変換する。学習値そのものは変更しない。
+                        weight_view = weight_df.copy()
+                        if "信頼度" in weight_view.columns:
+                            weight_view["信頼度"] = pd.to_numeric(weight_view["信頼度"], errors="coerce") * 100.0
                         st.dataframe(
-                            weight_df,
+                            weight_view,
                             use_container_width=True,
                             hide_index=True,
                             column_config={
                                 "基礎係数": st.column_config.NumberColumn(format="%.2f"),
                                 "開催場差": st.column_config.NumberColumn(format="%+.3f"),
-                                "信頼度": st.column_config.NumberColumn(format="%.1%%"),
+                                "信頼度": st.column_config.NumberColumn(format="%.1f%%"),
                                 "実効係数": st.column_config.NumberColumn(format="%.3f"),
                                 "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
                                 "実際寄与目安": st.column_config.NumberColumn(format="%.3f"),
@@ -1779,8 +1866,16 @@ if selected_main_page == "🏁 予測":
                     applied = engine.v92_applied_venue_corrections(df)
                     if not applied.empty:
                         st.markdown("#### 各選手へ実際に掛かった補正")
+                        # 表示専用に0〜1の信頼度を百分率へ変換する。予測計算値は維持する。
+                        applied_view = applied.copy()
+                        for pct_col in [
+                            "選手開催場相性信頼度", "開催場全履歴反映率",
+                            "開催場学習反映率", "開催場特徴信頼度",
+                        ]:
+                            if pct_col in applied_view.columns:
+                                applied_view[pct_col] = pd.to_numeric(applied_view[pct_col], errors="coerce") * 100.0
                         st.dataframe(
-                            applied,
+                            applied_view,
                             use_container_width=True,
                             hide_index=True,
                             column_config={
@@ -1792,10 +1887,10 @@ if selected_main_page == "🏁 予測":
                                 "選手開催場相性秒": st.column_config.NumberColumn(format="%+.4f"),
                                 "開催場補正秒": st.column_config.NumberColumn(format="%+.4f"),
                                 "開催場補正後予測T": st.column_config.NumberColumn(format="%.4f"),
-                                "選手開催場相性信頼度": st.column_config.NumberColumn(format="%.1%%"),
-                                "開催場全履歴反映率": st.column_config.NumberColumn(format="%.1%%"),
-                                "開催場学習反映率": st.column_config.NumberColumn(format="%.1%%"),
-                                "開催場特徴信頼度": st.column_config.NumberColumn(format="%.1%%"),
+                                "選手開催場相性信頼度": st.column_config.NumberColumn(format="%.1f%%"),
+                                "開催場全履歴反映率": st.column_config.NumberColumn(format="%.1f%%"),
+                                "開催場学習反映率": st.column_config.NumberColumn(format="%.1f%%"),
+                                "開催場特徴信頼度": st.column_config.NumberColumn(format="%.1f%%"),
                                 "開催場前残り差": st.column_config.NumberColumn(format="%+.3f"),
                                 "開催場追込み差": st.column_config.NumberColumn(format="%+.3f"),
                                 "開催場試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
