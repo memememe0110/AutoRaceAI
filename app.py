@@ -25,8 +25,27 @@ st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁",
 _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 
+# Ver163: 画面切替で非表示になったウィジェット値をStreamlitに削除されないよう、
+# 通常のウィジェットキーとは別の永続キーへ退避します。
+def _v163_restore_input(widget_key: str, saved_key: str, default=None) -> None:
+    if widget_key not in st.session_state:
+        if saved_key in st.session_state:
+            st.session_state[widget_key] = st.session_state[saved_key]
+        elif default is not None:
+            st.session_state[widget_key] = default
+
+
+def _v163_save_input(widget_key: str, saved_key: str) -> None:
+    st.session_state[saved_key] = st.session_state.get(widget_key)
+
+
+def _v163_clear_saved_inputs(*saved_keys: str) -> None:
+    for saved_key in saved_keys:
+        st.session_state.pop(saved_key, None)
+
+
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver160｜浜松高温前残り学習＋画面ナビを見分けやすく改善")
+st.caption("Ver163｜画面切替後も入力内容を保持")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1597,32 +1616,24 @@ if st.session_state.get("v155_main_page") not in _main_pages:
 
 st.markdown("""
 <style>
-.v160-nav-head{padding:12px 14px 8px;border-radius:16px 16px 0 0;background:linear-gradient(135deg,#eef5ff,#f7f9fc);border:1px solid #cbd8ea;border-bottom:0}
-.v160-nav-title{font-size:1.05rem;font-weight:800;letter-spacing:.02em;color:#243247}
-.v160-nav-note{font-size:.82rem;color:#607086;margin-top:3px}
-.v160-nav-foot{height:8px;border:1px solid #cbd8ea;border-top:0;border-radius:0 0 16px 16px;background:#f7f9fc;margin-bottom:14px}
+.v161-nav-card{padding:12px 14px;margin:4px 0 8px;border:1px solid #cbd8ea;border-radius:14px;background:linear-gradient(135deg,#eef5ff,#f8fafc)}
+.v161-nav-title{font-size:1.03rem;font-weight:800;color:#243247}
+.v161-nav-note{font-size:.82rem;color:#607086;margin-top:3px}
 </style>
-<div class="v160-nav-head">
- <div class="v160-nav-title">🧭 画面メニュー</div>
- <div class="v160-nav-note">ここは操作ボタンではなく、表示する画面を切り替えるナビです</div>
+<div class="v161-nav-card">
+ <div class="v161-nav-title">🧭 表示する画面</div>
+ <div class="v161-nav-note">下の選択欄で画面を切り替えます。通常の実行ボタンとは別のメニューです。</div>
 </div>
 """, unsafe_allow_html=True)
-_button_rows = (_main_pages[:2], _main_pages[2:])
-for _row_index, _row_pages in enumerate(_button_rows):
-    _cols = st.columns(2, gap="small")
-    for _col, _page in zip(_cols, _row_pages):
-        with _col:
-            _is_selected = st.session_state.get("v155_main_page") == _page
-            _label = ("● " if _is_selected else "○ ") + _page
-            if st.button(
-                _label,
-                key=f"v160_main_page_{_row_index}_{_page}",
-                use_container_width=True,
-                type="primary" if _is_selected else "secondary",
-            ):
-                st.session_state["v155_main_page"] = _page
-                st.rerun()
-st.markdown('<div class="v160-nav-foot"></div>', unsafe_allow_html=True)
+_current_page = st.session_state.get("v155_main_page", _main_pages[0])
+_selected_from_nav = st.selectbox(
+    "画面を選択",
+    options=_main_pages,
+    index=_main_pages.index(_current_page),
+    key="v161_main_page_select",
+    label_visibility="collapsed",
+)
+st.session_state["v155_main_page"] = _selected_from_nav
 
 selected_main_page = st.session_state.get("v155_main_page", _main_pages[0])
 
@@ -1643,13 +1654,18 @@ if selected_main_page == "🏁 予測":
     if st.button("🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input"):
         st.session_state["prediction_input_version"] += 1
         st.session_state.pop("last_prediction_view", None)
+        _v163_clear_saved_inputs("v163_saved_prediction_text", "v163_saved_prediction_venue")
         st.rerun()
     prediction_version = st.session_state["prediction_input_version"]
+    prediction_text_key = f"race_card_text_{prediction_version}"
+    _v163_restore_input(prediction_text_key, "v163_saved_prediction_text", "")
     text = st.text_area(
         "公式出走表を全文貼り付け",
         height=430,
         placeholder="autorace.jpの出走表をコピーして貼り付け",
-        key=f"race_card_text_{prediction_version}",
+        key=prediction_text_key,
+        on_change=_v163_save_input,
+        args=(prediction_text_key, "v163_saved_prediction_text"),
     )
 
     # 本文から開催場を取得できない場合だけ、予測用の補助入力を表示する。
@@ -1665,11 +1681,15 @@ if selected_main_page == "🏁 予測":
         if detected_prediction_venue:
             st.caption(f"開催場を自動取得: {detected_prediction_venue}")
         else:
+            prediction_venue_key = f"prediction_venue_override_{prediction_version}"
+            _v163_restore_input(prediction_venue_key, "v163_saved_prediction_venue", "")
             prediction_venue_override = st.selectbox(
                 "開催場（出走表から取得できないため選択してください）",
                 options=["", "川口", "伊勢崎", "浜松", "山陽", "飯塚"],
                 format_func=lambda value: "選択してください" if value == "" else value,
-                key=f"prediction_venue_override_{prediction_version}",
+                key=prediction_venue_key,
+                on_change=_v163_save_input,
+                args=(prediction_venue_key, "v163_saved_prediction_venue"),
             )
             st.caption("選手の所属場は開催場として使いません。実際の開催場を選択してください。")
 
@@ -2142,6 +2162,9 @@ if selected_main_page == "✅ 結果登録・解析":
         ]
         for key in result_only_keys:
             st.session_state.pop(key, None)
+        _v163_clear_saved_inputs(
+            "v163_saved_result_text", "v163_saved_result_venue", "v163_saved_result_race_no"
+        )
         st.session_state["result_reset_notice"] = "結果入力だけをリセットしました。予測結果・DBキャッシュ・重み設定は維持しています。"
 
     st.button(
@@ -2153,11 +2176,15 @@ if selected_main_page == "✅ 結果登録・解析":
     if st.session_state.get("result_reset_notice"):
         st.success(st.session_state.pop("result_reset_notice"))
     result_version = st.session_state["result_input_version"]
+    result_text_key = f"official_result_text_{result_version}"
+    _v163_restore_input(result_text_key, "v163_saved_result_text", "")
     result_text = st.text_area(
         "公式結果ページを全文貼り付け",
         height=620,
-        key=f"official_result_text_{result_version}",
+        key=result_text_key,
         placeholder="6R\n確定\n2026年7月21日(火)\n…\n着順 車番 選手名\n…\nグランドノート\n…\n払戻金\n…",
+        on_change=_v163_save_input,
+        args=(result_text_key, "v163_saved_result_text"),
     )
 
     detected_result_venue = _detect_result_venue_from_title(result_text)
@@ -2166,14 +2193,25 @@ if selected_main_page == "✅ 結果登録・解析":
         c1.success(f"開催場をタイトルから自動判定：{detected_result_venue}")
         venue_override = detected_result_venue
     else:
+        result_venue_key = f"result_venue_select_{result_version}"
+        _v163_restore_input(result_venue_key, "v163_saved_result_venue", "")
         venue_override = c1.selectbox(
             "開催場（タイトルから判定できないため選択してください）",
             [""] + RESULT_VENUES,
-            key=f"result_venue_select_{result_version}",
+            key=result_venue_key,
             format_func=lambda value: "選択してください" if value == "" else value,
+            on_change=_v163_save_input,
+            args=(result_venue_key, "v163_saved_result_venue"),
         )
         c1.caption("選手の所属LGは開催場判定に使用しません。")
-    race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key=f"result_race_no_{result_version}")
+    result_race_no_key = f"result_race_no_{result_version}"
+    _v163_restore_input(result_race_no_key, "v163_saved_result_race_no", "")
+    race_no_override = c2.text_input(
+        "レース番号（本文から取れない場合のみ）",
+        key=result_race_no_key,
+        on_change=_v163_save_input,
+        args=(result_race_no_key, "v163_saved_result_race_no"),
+    )
 
     if st.button("結果を解析", use_container_width=True):
         if not venue_override:
@@ -2195,7 +2233,52 @@ if selected_main_page == "✅ 結果登録・解析":
     laps_r = st.session_state.get("v35_result_laps")
     payouts_r = st.session_state.get("v35_result_payouts")
 
-    if isinstance(rows_r, pd.DataFrame) and not rows_r.empty:
+    no_contest_r = bool(isinstance(meta_r, dict) and meta_r.get("レース状態") == "不成立")
+
+    if no_contest_r:
+        st.write("解析したレース情報", meta_r)
+        st.error("🚫 レース不成立・全返還")
+        st.info("着順・競走タイム・STは登録せず、選手履歴・予測評価・重み学習の対象外として保存します。")
+        if isinstance(payouts_r, pd.DataFrame) and not payouts_r.empty:
+            st.subheader("全返還")
+            st.dataframe(payouts_r, use_container_width=True, hide_index=True)
+
+        result_exists = False
+        existing_result_key = ""
+        existing_registered_at = None
+        try:
+            result_exists, existing_result_key, existing_registered_at = engine.v41_race_exists(meta_r, engine.DB_PATH)
+        except Exception:
+            pass
+        replace_registered = False
+        if result_exists:
+            st.warning(f"このレースは登録済みです：{existing_result_key}（{existing_registered_at or '登録日時不明'}）")
+            replace_registered = st.checkbox(
+                "登録済み内容を、不成立・全返還へ置き換える",
+                key=f"replace_no_contest_{existing_result_key}",
+            )
+        label = "登録済み結果を不成立へ置き換える" if replace_registered else "不成立・全返還としてDBへ登録"
+        if st.button(label, type="primary", use_container_width=True, disabled=bool(result_exists and not replace_registered), key="register_no_contest"):
+            try:
+                key, registration = engine.v162_register_no_contest(
+                    meta_r, payouts_r, engine.DB_PATH, replace=replace_registered
+                )
+                if registration.get("duplicate"):
+                    st.warning(registration.get("message"))
+                else:
+                    msg = f"不成立・全返還として登録しました: {key}"
+                    _set_sticky_notice("result_register_notice", "success", msg)
+                    st.success(msg)
+                    st.warning("AI学習対象外です。着順・選手履歴・追い抜き相性・レース種別適性・重みは更新していません。")
+                    try:
+                        ok, push_msg = push_db_to_github(f"AutoRaceAI: {key} 不成立・全返還登録")
+                        (st.success if ok else st.warning)(push_msg)
+                    except Exception as push_exc:
+                        st.warning(f"DB保存後のGitHub反映に失敗しました: {push_exc}")
+            except Exception as exc:
+                st.error(f"不成立登録エラー: {type(exc).__name__}: {exc}")
+
+    elif isinstance(rows_r, pd.DataFrame) and not rows_r.empty:
         st.write("解析したレース情報", meta_r)
         st.subheader("着順・タイム")
         st.dataframe(rows_r, use_container_width=True, hide_index=True)
@@ -2462,6 +2545,7 @@ def _v146_reset_player_input():
     st.session_state["player_input_version"] = int(st.session_state.get("player_input_version", 0)) + 1
     for key in ["parsed_player_history", "player_register_notice", "player_registration_lookup"]:
         st.session_state.pop(key, None)
+    _v163_clear_saved_inputs("v163_saved_player_name", "v163_saved_player_history")
     st.session_state["player_register_notice"] = {"level":"success", "message":"選手入力だけをリセットしました。"}
 
 if selected_main_page == "👤 選手情報登録":
@@ -2473,13 +2557,23 @@ if selected_main_page == "👤 選手情報登録":
         on_click=_v146_reset_player_input,
     )
     player_version = st.session_state["player_input_version"]
-    player_name = st.text_input("選手名", placeholder="例：横田翔", key=f"player_name_input_{player_version}")
+    player_name_key = f"player_name_input_{player_version}"
+    _v163_restore_input(player_name_key, "v163_saved_player_name", "")
+    player_name = st.text_input(
+        "選手名", placeholder="例：横田翔", key=player_name_key,
+        on_change=_v163_save_input,
+        args=(player_name_key, "v163_saved_player_name"),
+    )
     show_player_registration_status(player_name)
+    player_history_key = f"player_history_text_{player_version}"
+    _v163_restore_input(player_history_key, "v163_saved_player_history", "")
     history_text = st.text_area(
         "公式プロフィールの直近履歴を貼り付け",
         height=520,
         placeholder="前走\n4\n2026年7月21日\n伊勢崎\n予選\n…",
-        key=f"player_history_text_{player_version}",
+        key=player_history_key,
+        on_change=_v163_save_input,
+        args=(player_history_key, "v163_saved_player_history"),
     )
 
     if st.button("貼り付け内容を解析", use_container_width=True):

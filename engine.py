@@ -17124,3 +17124,115 @@ def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_pat
     except Exception:
         pass
     return result
+
+# ============================================================
+# Ver162: レース結果なし・全返還（不成立）登録
+# ============================================================
+_v162_base_parse_result_text = v35_parse_result_text
+
+
+def _v162_is_no_contest_text(text):
+    src = str(text or "")
+    return ("レース結果がありません" in src and "不成立" in src) or ("全返還" in src and "不成立" in src)
+
+
+def _v162_no_contest_payouts(text):
+    bet_types = ["単勝", "複勝", "2連複", "2連単", "ワイド", "3連複", "3連単"]
+    present = [b for b in bet_types if re.search(rf"(?m)^\s*{re.escape(b)}(?:\s|$)", str(text or ""))]
+    if not present:
+        present = bet_types
+    return pd.DataFrame([
+        {"券種": b, "組合せ": "全返還", "払戻金": 100, "人気": np.nan}
+        for b in present
+    ])
+
+
+def v35_parse_result_text(text, venue_override="", race_no_override=""):
+    """通常結果に加え、結果なし・全返還の不成立レースを解析する。"""
+    if not _v162_is_no_contest_text(text):
+        return _v162_base_parse_result_text(text, venue_override, race_no_override)
+    meta = _v35_parse_meta(str(text), venue_override, race_no_override)
+    if not meta.get("開催日") or not meta.get("開催場") or not meta.get("レース"):
+        raise ValueError("開催日・開催場・レース番号を取得できませんでした。開催場が本文にない場合は補助入力で指定してください。")
+    meta = dict(meta)
+    meta["レース状態"] = "不成立"
+    meta["払戻状態"] = "全返還"
+    meta["学習対象"] = False
+    meta["学習除外理由"] = "レース不成立・全返還"
+    rows = pd.DataFrame(columns=["着順", "車番", "選手名", "所属", "ハンデ", "試走T", "競走T", "ST", "人気", "事故", "結果区分"])
+    laps = pd.DataFrame(columns=["周回", "周回番号", "順位", "車番"])
+    payouts = _v162_no_contest_payouts(text)
+    return meta, rows, laps, payouts
+
+
+def v162_init_no_contest_columns(db_path=DB_PATH):
+    v41_init_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        _ensure_sqlite_columns(con, "result_races", {
+            "race_status": "TEXT",
+            "refund_status": "TEXT",
+            "learning_eligible": "INTEGER DEFAULT 1",
+            "learning_exclusion_reason": "TEXT",
+        })
+        con.commit()
+
+
+def v162_register_no_contest(meta, payouts=None, db_path=DB_PATH, replace=False):
+    """不成立レースを全返還として保存し、選手履歴・予測評価・重み学習を行わない。"""
+    v162_init_no_contest_columns(db_path)
+    v35_init_result_tables(db_path)
+    key = v34_race_key(meta)
+    exists, _, registered_at = v41_race_exists(meta, db_path)
+    if exists and not replace:
+        return key, {"duplicate": True, "message": f"同じ開催日・開催場・レース番号は登録済みです（{registered_at}）。"}
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(str(db_path)) as con:
+        if replace:
+            for table in ["result_laps", "result_payouts", "prediction_feedback", "result_entries", "player_lap_history", "weight_adjustment_history", "v67_ticket_feedback"]:
+                try:
+                    con.execute(f"DELETE FROM {table} WHERE race_key=?", (key,))
+                except sqlite3.Error:
+                    pass
+            try:
+                con.execute("DELETE FROM v41_registration_batches WHERE race_key=?", (key,))
+            except sqlite3.Error:
+                pass
+        con.execute("""INSERT INTO result_races
+            (race_key,race_date,venue,race_no,surface,track_temp,air_temp,humidity,registered_at,
+             race_status,refund_status,learning_eligible,learning_exclusion_reason)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(race_key) DO UPDATE SET
+             race_date=excluded.race_date,venue=excluded.venue,race_no=excluded.race_no,
+             surface=excluded.surface,track_temp=excluded.track_temp,air_temp=excluded.air_temp,
+             humidity=excluded.humidity,registered_at=excluded.registered_at,
+             race_status=excluded.race_status,refund_status=excluded.refund_status,
+             learning_eligible=excluded.learning_eligible,
+             learning_exclusion_reason=excluded.learning_exclusion_reason""",
+            (key, meta.get("開催日"), meta.get("開催場"), str(meta.get("レース") or ""),
+             meta.get("走路状態"), meta.get("走路温度"), meta.get("気温"), meta.get("湿度"), now,
+             "不成立", "全返還", 0, "レース不成立・全返還"))
+        con.execute("DELETE FROM result_entries WHERE race_key=?", (key,))
+        con.execute("DELETE FROM result_laps WHERE race_key=?", (key,))
+        con.execute("DELETE FROM prediction_feedback WHERE race_key=?", (key,))
+        con.execute("DELETE FROM result_payouts WHERE race_key=?", (key,))
+        pay = payouts if isinstance(payouts, pd.DataFrame) and not payouts.empty else _v162_no_contest_payouts("")
+        for _, r in pay.iterrows():
+            popularity = None if pd.isna(r.get("人気")) else int(r.get("人気"))
+            con.execute("INSERT OR REPLACE INTO result_payouts(race_key,bet_type,combination,payout_yen,popularity) VALUES(?,?,?,?,?)",
+                        (key, str(r.get("券種")), "全返還", 100, popularity))
+        try:
+            con.execute("""INSERT OR REPLACE INTO v41_registration_batches
+                (race_key,registered_at,status,before_weights_json,valid_count,excluded_count,undone_at)
+                VALUES(?,?,'active',?,0,0,NULL)""", (key, now, json.dumps({}, ensure_ascii=False)))
+        except sqlite3.Error:
+            pass
+        con.commit()
+    return key, {
+        "duplicate": False,
+        "replaced": bool(replace and exists),
+        "race_status": "不成立",
+        "refund_status": "全返還",
+        "learning_excluded": True,
+        "learning_exclusion_reason": "レース不成立・全返還",
+        "message": "不成立・全返還として登録しました。選手履歴、予測評価、重み学習には使用しません。",
+    }
