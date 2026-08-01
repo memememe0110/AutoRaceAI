@@ -3510,6 +3510,58 @@ def simulate_detailed(df, trials, seed, track_temp=30.0):
 
 
 
+# ============================================================
+# Ver177: 特定選手同士の追い抜き相性を展開シミュレーションへ直接反映
+# ============================================================
+def v177_simulation_matchup_matrix(df, db_path=DB_PATH):
+    """出走選手間の追い抜き確率補正行列を返す。
+
+    行=追う側、列=前を走る側。値は追い抜き判定の確率加算値。
+    3戦未満は無効、3〜5戦は最大±2%、6〜9戦は最大±4%、
+    10戦以上は最大±6%。少数対戦や差が小さい組合せは縮小する。
+    """
+    n = 0 if df is None else len(df)
+    matrix = np.zeros((n, n), dtype=float)
+    counts = np.zeros((n, n), dtype=np.int16)
+    if n < 2:
+        return matrix, counts
+    names = df.get("選手名", pd.Series([""] * n, index=df.index)).fillna("").astype(str).tolist()
+    keys = [_v151_name_key(x) for x in names]
+    if not any(keys):
+        return matrix, counts
+    try:
+        v152_init_overtake_matchups(db_path)
+        with sqlite3.connect(str(db_path), timeout=10) as con:
+            prof = pd.read_sql_query(
+                """SELECT player_a_key,player_b_key,shared_races,
+                          a_overtakes_b,b_overtakes_a,a_holds_b,b_holds_a,
+                          a_repasses_b,b_repasses_a,shrunk_a_advantage
+                   FROM v152_player_overtake_matchups""", con)
+    except Exception:
+        return matrix, counts
+    index = {k: i for i, k in enumerate(keys) if k}
+    for r in prof.itertuples(index=False):
+        a = index.get(str(r.player_a_key)); b = index.get(str(r.player_b_key))
+        if a is None or b is None or a == b:
+            continue
+        shared = int(r.shared_races or 0)
+        if shared < 3:
+            continue
+        cap = 0.02 if shared <= 5 else (0.04 if shared <= 9 else 0.06)
+        shrunk = float(r.shrunk_a_advantage or 0.0)
+        # 抜き返し差は展開相性として小さく補助し、抑え込み差は逆方向へ作用。
+        decisive = max(1, int(r.a_overtakes_b or 0) + int(r.b_overtakes_a or 0))
+        repass = (int(r.a_repasses_b or 0) - int(r.b_repasses_a or 0)) / decisive
+        holds = max(1, int(r.a_holds_b or 0) + int(r.b_holds_a or 0))
+        hold_diff = (int(r.a_holds_b or 0) - int(r.b_holds_a or 0)) / holds
+        signal = float(np.clip(shrunk / 0.65 + repass * 0.16 + hold_diff * 0.10, -1.0, 1.0))
+        effect = cap * signal
+        matrix[a, b] = effect
+        matrix[b, a] = -effect
+        counts[a, b] = counts[b, a] = shared
+    return matrix, counts
+
+
 def simulate(df, trials, seed, track_temp=30.0):
     """v3.8: 高速ベクトル型の6周イベントモデル。
 
@@ -3520,6 +3572,8 @@ def simulate(df, trials, seed, track_temp=30.0):
     arr = prepare_simulation_arrays(df)
     cars = np.asarray(arr["cars"], dtype=int)
     n = len(cars); trials = int(trials)
+    # Ver177: 現在の出走メンバーに限った方向付き対戦相性。
+    matchup_pass_adj, matchup_shared = v177_simulation_matchup_matrix(df, DB_PATH)
     handicap = np.asarray(arr["handicap"], dtype=float)
     z = np.asarray(arr["z_scores"], dtype=float)
     finish_sd = np.asarray(arr["finish_sd"], dtype=float)
@@ -3629,7 +3683,13 @@ def simulate(df, trials, seed, track_temp=30.0):
         margin=sorted_score[:,rank]-sorted_score[:,rank+1]
         chase_kick=goal_power[np.arange(trials),chase_idx]
         lead_hold=position_hold[lead_idx]*.11 + stable[lead_idx]*.06
-        pass_mask=(margin < .22) & ((chase_kick-lead_hold) > margin*.55) & (rng.random(trials)<.52)
+        # Ver177: 前後に並んだこの瞬間だけ、当該2選手の追い抜き履歴を使う。
+        # 対戦回数に応じて最大±2/4/6%まで。平均総合点にはほぼ重ねない。
+        pair_adj = matchup_pass_adj[chase_idx, lead_idx]
+        pair_prob = np.clip(.52 + pair_adj, .40, .64)
+        # 相性が強い側は僅差条件をほんの少し緩和し、苦手側は厳しくする。
+        pair_gate = np.clip(.55 - pair_adj * 0.90, .49, .61)
+        pass_mask=(margin < .22) & ((chase_kick-lead_hold) > margin*pair_gate) & (rng.random(trials)<pair_prob)
         if np.any(pass_mask):
             a=order[pass_mask,rank].copy(); b=order[pass_mask,rank+1].copy()
             order[pass_mask,rank]=b; order[pass_mask,rank+1]=a
@@ -16852,7 +16912,9 @@ def v152_apply_overtake_matchups(df, entries=None, meta=None, db_path=DB_PATH):
             if n>=6: rel += 1
             if n>=3 and abs(val)>=0.08: best.append((abs(val),val,n,opp_name))
         adv=float(np.mean(vals)) if vals else 0.0
-        bonus=float(np.clip(adv*0.18*factor,-0.12,0.12))
+        # Ver177: 選手間相性の主反映先を展開シミュレーションへ移したため、
+        # 総合点への平均加点は表示・事前評価用のごく小さい補助に留める。
+        bonus=float(np.clip(adv*0.055*factor,-0.035,0.035))
         best=sorted(best,reverse=True)[:2]
         if best:
             desc=[]
@@ -18025,3 +18087,6 @@ def _v170_cached_fast_compress(target_tuple, bet_type):
     if covered != target:
         return tuple(_v165_plain_lines(target, bet_type))
     return tuple(selected)
+
+
+# AutoRaceAI Ver177: player matchup history is applied inside the final-lap adjacent passing simulation.
