@@ -17704,3 +17704,160 @@ def v67_compress_formations(combos, bet_type):
 
     target_tuple = tuple(sorted(target))
     return list(_v170_cached_fast_compress(target_tuple, bet_type))
+
+# ============================================================
+# Ver171: 類似補正の重なりを整理し、基本性能を隠し過ぎないよう制限
+# ============================================================
+# 浜松2026-08-01の保存済み8レースで、過去予測を変更せず再順位付けして検証。
+# 当日文脈を最大±1.0、熱・会場・前残り等の近縁補正合計を最大±0.8へ制限。
+# 会場展開補正は直接加点を70%へ縮小する。
+_V171_BASE_CONTEXT_APPLY = v151_apply_race_context_adaptation
+
+
+def v171_apply_correction_guard(df, entries=None, meta=None, db_path=DB_PATH):
+    """似た意味の補正が重なって順位を数段動かす現象を抑える。
+
+    元の各特徴量は保持し、実際に抑えた差分だけ総合点・指数・予測Tへ反映する。
+    試走・近況などの基礎評価は変更しない。
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    features = v142_aux_feature_frame(out)
+    idx = out.index
+
+    context_old = pd.to_numeric(features.get("context_bonus"), errors="coerce").fillna(0.0)
+    condition = pd.to_numeric(features.get("condition_bonus"), errors="coerce").fillna(0.0)
+    escape = pd.to_numeric(features.get("escape_bonus"), errors="coerce").fillna(0.0)
+    lap = pd.to_numeric(features.get("lap_bonus"), errors="coerce").fillna(0.0)
+    weather = pd.to_numeric(features.get("weather_bonus"), errors="coerce").fillna(0.0)
+    venue_old = pd.to_numeric(features.get("venue_development_bonus"), errors="coerce").fillna(0.0)
+    heat = pd.to_numeric(out.get("熱専用学習補正", pd.Series(0.0, index=idx)), errors="coerce").fillna(0.0)
+
+    # 当日文脈は単独で順位を大きく反転させない。
+    context_new = context_old.clip(-1.0, 1.0)
+    # 会場・展開の直接加点は弱め、今後は到達率側へ寄せる余地を残す。
+    venue_new = venue_old * 0.70
+
+    old_group = context_old + condition + escape + lap + weather + venue_old + heat
+    raw_new_group = context_new + condition + escape + lap + weather + venue_new + heat
+    new_group = raw_new_group.clip(-0.80, 0.80)
+    delta = (new_group - old_group).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    out["補正整理前合計"] = old_group.round(3)
+    out["補正整理後合計"] = new_group.round(3)
+    out["補正整理差分"] = delta.round(3)
+    out["当日文脈上限後"] = context_new.round(3)
+    out["会場展開縮小後"] = venue_new.round(3)
+    out["補正整理根拠"] = [
+        f"近縁補正 {a:+.2f}→{b:+.2f}（文脈±1.0・合計±0.8・会場70%）"
+        for a, b in zip(old_group, new_group)
+    ]
+
+    if "改善後総合点" in out.columns:
+        score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = score + delta
+        out["改善後順位"] = out["改善後総合点"].rank(
+            method="min", ascending=False, na_option="bottom"
+        ).fillna(len(out)).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = (
+            pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + delta * 0.30
+        )
+    if "予測競走T" in out.columns:
+        t = pd.to_numeric(out["予測競走T"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        fallback = float(t.median()) if t.notna().any() else 3.60
+        out["予測競走T"] = np.round(t.fillna(fallback) - delta * 0.0008, 4)
+    return out
+
+
+def v151_apply_race_context_adaptation(df, entries=None, meta=None, db_path=DB_PATH):
+    out = _V171_BASE_CONTEXT_APPLY(df, entries, meta, db_path)
+    return v171_apply_correction_guard(out, entries, meta, db_path)
+
+
+# ============================================================
+# Ver172: 補正同士の競合を検出し、方向が割れる時だけ追加抑制
+# ============================================================
+# Ver171の固定±0.8上限を土台に、近縁補正の符号が割れる場合は
+# 上限を±0.45まで自動的に縮小する。方向が揃う場合は±0.8を維持。
+_V172_BASE_CONTEXT_APPLY = v151_apply_race_context_adaptation
+
+
+def v172_apply_correction_conflict_guard(df, entries=None, meta=None, db_path=DB_PATH):
+    """近縁補正の方向一致度から、補正の信頼度と動的上限を算出する。"""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    features = v142_aux_feature_frame(out)
+    idx = out.index
+
+    def _num(value):
+        if isinstance(value, pd.Series):
+            return pd.to_numeric(value, errors="coerce").reindex(idx).fillna(0.0)
+        return pd.Series(0.0, index=idx, dtype=float)
+
+    context = _num(features.get("context_bonus")).clip(-1.0, 1.0)
+    condition = _num(features.get("condition_bonus"))
+    escape = _num(features.get("escape_bonus"))
+    lap = _num(features.get("lap_bonus"))
+    weather = _num(features.get("weather_bonus"))
+    venue = _num(features.get("venue_development_bonus")) * 0.70
+    heat = _num(out.get("熱専用学習補正", pd.Series(0.0, index=idx)))
+
+    component_frame = pd.concat(
+        [context, condition, escape, lap, weather, venue, heat], axis=1
+    )
+    component_frame.columns = [
+        "context", "condition", "escape", "lap", "weather", "venue", "heat"
+    ]
+    raw_sum = component_frame.sum(axis=1)
+    absolute_sum = component_frame.abs().sum(axis=1)
+    agreement = (raw_sum.abs() / absolute_sum.replace(0.0, np.nan)).fillna(1.0).clip(0.0, 1.0)
+
+    # 完全に競合する時は±0.45、全補正の方向が揃う時は±0.80。
+    dynamic_cap = 0.45 + 0.35 * agreement
+    guarded_sum = pd.Series(
+        np.clip(raw_sum.to_numpy(dtype=float), -dynamic_cap.to_numpy(dtype=float), dynamic_cap.to_numpy(dtype=float)),
+        index=idx,
+    )
+
+    current_sum = pd.to_numeric(
+        out.get("補正整理後合計", raw_sum.clip(-0.8, 0.8)), errors="coerce"
+    ).reindex(idx).fillna(0.0)
+    delta = (guarded_sum - current_sum).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    out["補正方向一致度"] = (agreement * 100.0).round(1)
+    out["動的補正上限"] = dynamic_cap.round(3)
+    out["競合抑制後合計"] = guarded_sum.round(3)
+    out["補正競合抑制差分"] = delta.round(3)
+    out["予測安定度"] = np.select(
+        [agreement >= 0.70, agreement >= 0.40],
+        ["高", "中"],
+        default="低",
+    )
+    out["補正競合メモ"] = [
+        f"方向一致 {a:.0f}%・上限±{c:.2f}・追加調整{d:+.2f}"
+        for a, c, d in zip(agreement * 100.0, dynamic_cap, delta)
+    ]
+
+    if "改善後総合点" in out.columns:
+        score = pd.to_numeric(out["改善後総合点"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out["改善後総合点"] = score + delta
+        out["改善後順位"] = out["改善後総合点"].rank(
+            method="min", ascending=False, na_option="bottom"
+        ).fillna(len(out)).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = (
+            pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + delta * 0.30
+        )
+    if "予測競走T" in out.columns:
+        t = pd.to_numeric(out["予測競走T"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        fallback = float(t.median()) if t.notna().any() else 3.60
+        out["予測競走T"] = np.round(t.fillna(fallback) - delta * 0.0008, 4)
+    return out
+
+
+def v151_apply_race_context_adaptation(df, entries=None, meta=None, db_path=DB_PATH):
+    out = _V172_BASE_CONTEXT_APPLY(df, entries, meta, db_path)
+    return v172_apply_correction_conflict_guard(out, entries, meta, db_path)

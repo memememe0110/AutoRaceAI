@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver168｜締切30分前通知を追加＋DB62基準")
+st.caption("Ver172｜補正競合を自動抑制＋予測安定度＋DB63基準")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
