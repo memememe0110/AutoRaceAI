@@ -1923,11 +1923,34 @@ with result_tab:
     _show_sticky_notice("result_register_notice")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
-    if st.button("🗑️ 結果入力をリセット", use_container_width=True, key="reset_result_input"):
-        st.session_state["result_input_version"] += 1
-        for key in ["v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts", "v41_last_result_view", "result_register_notice"]:
+
+    def _reset_result_input_only():
+        """結果入力関連だけを初期化し、DB・予測・学習キャッシュは維持する。"""
+        st.session_state["result_input_version"] = int(st.session_state.get("result_input_version", 0)) + 1
+        result_only_keys = [
+            "v35_result_meta",
+            "v35_result_rows",
+            "v35_result_laps",
+            "v35_result_payouts",
+            "v41_last_result_view",
+            "result_register_notice",
+            "result_register_progress",
+            "result_register_stage",
+            "result_entry_count_check",
+            "result_replace_confirmed",
+        ]
+        for key in result_only_keys:
             st.session_state.pop(key, None)
-        st.rerun()
+        st.session_state["result_reset_notice"] = "結果入力だけをリセットしました。予測結果・DBキャッシュ・重み設定は維持しています。"
+
+    st.button(
+        "🗑️ 結果入力をリセット",
+        use_container_width=True,
+        key="reset_result_input",
+        on_click=_reset_result_input_only,
+    )
+    if st.session_state.get("result_reset_notice"):
+        st.success(st.session_state.pop("result_reset_notice"))
     result_version = st.session_state["result_input_version"]
     result_text = st.text_area(
         "公式結果ページを全文貼り付け",
