@@ -113,7 +113,7 @@ def v73_copy_box(title: str, text: str, key: str, height: int = 145) -> None:
 
 
 # ============================================================
-# Ver123: 一般予定専用 10分前プッシュ通知
+# Ver124: 一般予定専用 10分前プッシュ通知（Unicode送信修正）
 # ============================================================
 GENERAL_REMINDER_JST = ZoneInfo("Asia/Tokyo")
 GENERAL_REMINDER_NTFY_BASE = "https://ntfy.sh"
@@ -181,21 +181,29 @@ def v123_schedule_ntfy_reminder(title: str, event_date: date, event_time: time, 
 
     endpoint = f"{GENERAL_REMINDER_NTFY_BASE}/{urllib.parse.quote(clean_topic, safe='')}"
     message = f"{clean_title}\n開始時刻: {event_dt.strftime('%Y/%m/%d %H:%M')}"
+    # HTTPヘッダーはASCIIのみ。日本語タイトルはURLエンコードして送る。
+    # 本文はUTF-8バイト列にすることでUnicodeEncodeErrorを防ぐ。
+    headers = {
+        "At": str(int(notify_dt.timestamp())),
+        "Title": urllib.parse.quote("予定の10分前です", safe=""),
+        "Priority": "high",
+        "Tags": "bell",
+        "Content-Type": "text/plain; charset=utf-8",
+    }
     request = urllib.request.Request(
         endpoint,
-        data=message.encode("utf-8"),
+        data=message.encode("utf-8", errors="strict"),
         method="POST",
-        headers={
-            "At": str(int(notify_dt.timestamp())),
-            "Title": urllib.parse.quote("予定の10分前です"),
-            "Priority": "high",
-            "Tags": "bell",
-            "Content-Type": "text/plain; charset=utf-8",
-        },
+        headers=headers,
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        if int(getattr(response, "status", 200)) >= 400:
-            raise RuntimeError(f"ntfy応答エラー: {response.status}")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            if int(getattr(response, "status", 200)) >= 400:
+                raise RuntimeError(f"ntfy応答エラー: {response.status}")
+    except UnicodeEncodeError as exc:
+        raise RuntimeError(
+            "通知送信時の文字コード変換に失敗しました。日本語はUTF-8本文として送信する必要があります。"
+        ) from exc
     return event_dt, notify_dt
 
 
