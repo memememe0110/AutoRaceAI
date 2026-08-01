@@ -116,6 +116,42 @@ def v73_copy_box(title: str, text: str, key: str, height: int = 145) -> None:
 # Ver124: 一般予定専用 10分前プッシュ通知（Unicode送信修正）
 # ============================================================
 GENERAL_REMINDER_JST = ZoneInfo("Asia/Tokyo")
+
+
+RESULT_VENUES = ["飯塚", "山陽", "浜松", "川口", "伊勢崎"]
+
+def _detect_result_venue_from_title(text: str) -> str:
+    header = str(text or "").split("着順", 1)[0]
+    normalized = re.sub(r"[\s　]+", "", header)
+    for venue, patterns in [("山陽", ["山陽小野田市営", "山陽市営"]), ("飯塚", ["飯塚市営"]), ("浜松", ["浜松市営"]), ("川口", ["川口市営"]), ("伊勢崎", ["伊勢崎市営"])]:
+        if any(x in normalized for x in patterns):
+            return venue
+    for venue in RESULT_VENUES:
+        if venue in normalized and any(word in normalized for word in ("記念", "開催", "ミッドナイト", "ナイター", "普通開催", "オーバーミッドナイト")):
+            return venue
+    return ""
+
+def _format_jst(value) -> str:
+    if value is None or str(value).strip() in {"", "None", "NaT"}:
+        return ""
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.isna(ts):
+            return str(value)
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert("Asia/Tokyo").strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value)
+
+def _jst_datetime_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame):
+        return frame
+    out = frame.copy()
+    for col in out.columns:
+        if any(token in str(col) for token in ["登録日時", "保存日時", "更新日時", "作成日時", "分析日時", "started_at", "finished_at"]):
+            out[col] = out[col].map(_format_jst)
+    return out
 GENERAL_REMINDER_NTFY_BASE = "https://ntfy.sh"
 
 
@@ -208,65 +244,142 @@ def v123_schedule_ntfy_reminder(title: str, event_date: date, event_time: time, 
 
 
 def v123_render_general_reminder_tab() -> None:
-    st.subheader("🔔 一般予定の10分前通知")
-    st.caption("予測機能とは独立した一般予定用です。開始10分前にntfyへ通知を予約します。")
-
+    """一般予定通知をブラウザ内だけで処理し、Streamlit全体の再実行を避ける。"""
     now_plus_30 = datetime.now(GENERAL_REMINDER_JST) + timedelta(minutes=30)
-    st.session_state.setdefault("v123_general_event_date", now_plus_30.date())
-    st.session_state.setdefault("v123_general_event_time", time(now_plus_30.hour, now_plus_30.minute))
-    st.session_state.setdefault("v123_general_event_title", "")
+    default_date = now_plus_30.strftime("%Y-%m-%d")
+    default_time = now_plus_30.strftime("%H:%M")
 
-    schedule_text = st.text_area(
-        "予定情報を貼り付け（任意）",
-        placeholder="例：オンライン面談\n2026年8月1日(土)\n10:39開始",
-        height=130,
-        key="v123_general_schedule_text",
-        help="日付と『10:39開始』『10:39発走』などの時刻表記を読み取ります。",
-    )
-    if st.button("日付・開始時刻を自動入力", use_container_width=True, key="v123_general_parse"):
-        parsed_date, parsed_time, parsed_title = v123_parse_general_schedule_text(schedule_text)
-        if parsed_date is None and parsed_time is None:
-            st.warning("日付または開始時刻を読み取れませんでした。")
-        else:
-            if parsed_date is not None:
-                st.session_state["v123_general_event_date"] = parsed_date
-            if parsed_time is not None:
-                st.session_state["v123_general_event_time"] = parsed_time
-            if parsed_title and not str(st.session_state.get("v123_general_event_title", "")).strip():
-                st.session_state["v123_general_event_title"] = parsed_title
-            st.success("予定日時を自動入力しました。")
-            st.rerun()
+    html = f"""
+    <!doctype html>
+    <html lang="ja">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <style>
+        * {{ box-sizing:border-box; }}
+        body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; color:#1f2937; }}
+        h3 {{ margin:0 0 6px; font-size:24px; }}
+        .caption {{ color:#6b7280; margin-bottom:18px; line-height:1.55; }}
+        label {{ display:block; margin:14px 0 6px; font-weight:600; }}
+        textarea,input {{ width:100%; border:1px solid #d1d5db; border-radius:10px; padding:11px 12px; font-size:16px; background:#fff; }}
+        textarea {{ min-height:125px; resize:vertical; }}
+        .row {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
+        button {{ width:100%; border:0; border-radius:10px; padding:12px; font-size:16px; font-weight:700; cursor:pointer; }}
+        .secondary {{ background:#eef2ff; color:#1d4ed8; margin-top:10px; }}
+        .primary {{ background:#2563eb; color:white; margin-top:18px; }}
+        .status {{ margin-top:14px; padding:12px; border-radius:10px; line-height:1.55; display:none; }}
+        .ok {{ display:block; background:#ecfdf5; color:#166534; }}
+        .warn {{ display:block; background:#fff7ed; color:#9a3412; }}
+        .err {{ display:block; background:#fef2f2; color:#b91c1c; }}
+        .note {{ margin-top:14px; color:#6b7280; font-size:13px; line-height:1.5; }}
+        @media (max-width:520px) {{ .row {{ grid-template-columns:1fr; }} }}
+      </style>
+    </head>
+    <body>
+      <h3>🔔 一般予定の10分前通知</h3>
+      <div class="caption">予測機能とは独立した一般予定用です。入力と予約はこの枠内だけで動くため、他タブを再読み込みしません。</div>
 
-    with st.form("v123_general_reminder_form"):
-        title = st.text_input("予定名", key="v123_general_event_title", placeholder="例：オンライン面談")
-        event_date_value = st.date_input("予定日", key="v123_general_event_date")
-        event_time_value = st.time_input("開始時刻", key="v123_general_event_time", step=60)
-        topic = st.text_input(
-            "ntfyトピック名",
-            key="v123_general_ntfy_topic",
-            placeholder="推測されにくい長い文字列",
-            help="iPhoneのntfyアプリで、同じトピック名を購読してください。",
-        )
-        submit = st.form_submit_button("10分前通知を予約", type="primary", use_container_width=True)
+      <label for="source">予定情報を貼り付け（任意）</label>
+      <textarea id="source" placeholder="例：オンライン面談\n2026年8月1日(土)\n10:39開始"></textarea>
+      <button class="secondary" type="button" id="parseBtn">日付・開始時刻を自動入力</button>
 
-    if submit:
-        try:
-            event_dt, notify_dt = v123_schedule_ntfy_reminder(
-                title, event_date_value, event_time_value, topic
-            )
-        except urllib.error.HTTPError as exc:
-            st.error(f"通知予約に失敗しました: HTTP {exc.code}")
-        except urllib.error.URLError as exc:
-            st.error(f"通知予約に失敗しました: {exc.reason}")
-        except Exception as exc:
-            st.error(str(exc))
-        else:
-            st.success("10分前通知を予約しました。")
-            st.write(f"通知時刻：**{notify_dt.strftime('%Y/%m/%d %H:%M')}（日本時間）**")
-            st.write(f"予定時刻：**{event_dt.strftime('%Y/%m/%d %H:%M')}（日本時間）**")
-            st.info("iPhoneのntfyアプリで同じトピック名を購読しておいてください。")
+      <label for="title">予定名</label>
+      <input id="title" placeholder="例：オンライン面談">
+      <div class="row">
+        <div>
+          <label for="date">予定日</label>
+          <input id="date" type="date" value="{default_date}">
+        </div>
+        <div>
+          <label for="time">開始時刻</label>
+          <input id="time" type="time" value="{default_time}" step="60">
+        </div>
+      </div>
+      <label for="topic">ntfyトピック名</label>
+      <input id="topic" placeholder="推測されにくい長い文字列" autocomplete="off">
+      <button class="primary" type="button" id="sendBtn">10分前通知を予約</button>
+      <div id="status" class="status"></div>
+      <div class="note">iPhoneのntfyアプリで同じトピック名を購読してください。公開トピックには機密情報を入れないでください。</div>
 
-    st.caption("公開ntfy.shでは、他人に推測されにくいトピック名を使い、機密情報を通知本文へ入れないでください。")
+      <script>
+        const statusBox = document.getElementById('status');
+        const setStatus = (text, kind) => {{
+          statusBox.className = 'status ' + kind;
+          statusBox.textContent = text;
+        }};
+
+        document.getElementById('parseBtn').addEventListener('click', () => {{
+          const text = document.getElementById('source').value || '';
+          const dm = text.match(/(20\d{{2}})年\s*(\d{{1,2}})月\s*(\d{{1,2}})日/);
+          const tm = text.match(/(?:^|\s)(\d{{1,2}}):(\d{{2}})\s*(?:開始|発走|予定)?/m);
+          if (dm) {{
+            const y = dm[1], m = String(dm[2]).padStart(2,'0'), d = String(dm[3]).padStart(2,'0');
+            document.getElementById('date').value = `${{y}}-${{m}}-${{d}}`;
+          }}
+          if (tm) {{
+            document.getElementById('time').value = `${{String(tm[1]).padStart(2,'0')}}:${{tm[2]}}`;
+          }}
+          if (!document.getElementById('title').value.trim()) {{
+            const lines = text.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+            const titleLine = lines.find(x => !/20\d{{2}}年|\d{{1,2}}:\d{{2}}|開始|発走/.test(x) && x.length <= 60);
+            if (titleLine) document.getElementById('title').value = titleLine;
+          }}
+          if (!dm && !tm) setStatus('日付または開始時刻を読み取れませんでした。', 'warn');
+          else setStatus('予定日時を自動入力しました。', 'ok');
+        }});
+
+        document.getElementById('sendBtn').addEventListener('click', async () => {{
+          const btn = document.getElementById('sendBtn');
+          const title = document.getElementById('title').value.trim();
+          const dateValue = document.getElementById('date').value;
+          const timeValue = document.getElementById('time').value;
+          const topic = document.getElementById('topic').value.trim();
+          if (!title || !dateValue || !timeValue || !topic) {{
+            setStatus('予定名・予定日・開始時刻・トピック名をすべて入力してください。', 'warn'); return;
+          }}
+          if (/[\s/?#]/.test(topic)) {{
+            setStatus('トピック名には空白や / ? # を使わないでください。', 'warn'); return;
+          }}
+          const eventDt = new Date(`${{dateValue}}T${{timeValue}}:00+09:00`);
+          const notifyDt = new Date(eventDt.getTime() - 10*60*1000);
+          const now = new Date();
+          if (notifyDt <= now) {{ setStatus('通知時刻が過ぎています。開始時刻を10分以上先にしてください。', 'warn'); return; }}
+          if (notifyDt - now > 3*24*60*60*1000) {{ setStatus('ntfy.shの予約通知は最大3日先です。', 'warn'); return; }}
+
+          btn.disabled = true;
+          btn.textContent = '予約中…';
+          setStatus('ntfyへ予約を送信しています…', 'warn');
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 7000);
+          try {{
+            const response = await fetch(`https://ntfy.sh/${{encodeURIComponent(topic)}}`, {{
+              method:'POST',
+              body:`${{title}}\n開始時刻: ${{dateValue.replaceAll('-','/')}} ${{timeValue}}`,
+              headers:{{
+                'At': String(Math.floor(notifyDt.getTime()/1000)),
+                'Title': encodeURIComponent('予定の10分前です'),
+                'Priority':'high',
+                'Tags':'bell',
+                'Content-Type':'text/plain; charset=utf-8'
+              }},
+              signal: controller.signal
+            }});
+            if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
+            setStatus(`10分前通知を予約しました。通知時刻: ${{notifyDt.toLocaleString('ja-JP', {{timeZone:'Asia/Tokyo'}})}}`, 'ok');
+          }} catch (e) {{
+            const msg = e.name === 'AbortError' ? '通信が7秒以内に完了しませんでした。時間をおいて再度お試しください。' : `通知予約に失敗しました: ${{e.message}}`;
+            setStatus(msg, 'err');
+          }} finally {{
+            clearTimeout(timer);
+            btn.disabled = false;
+            btn.textContent = '10分前通知を予約';
+          }}
+        }});
+      </script>
+    </body>
+    </html>
+    """
+    components.html(html, height=760, scrolling=False)
 
 def qident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
@@ -1445,23 +1558,25 @@ with prediction_tab:
                 with st.expander("未来データ監査の内訳", expanded=False):
                     events = audit.get("events", [])
                     if events:
-                        st.dataframe(pd.DataFrame(events).drop(columns=["details"], errors="ignore"), use_container_width=True, hide_index=True)
-                        for ev in events:
-                            if ev.get("details"):
-                                st.caption(f"{ev.get('source')}: " + " / ".join(ev.get("details", [])))
+                        event_df = pd.DataFrame(events)
+                        for col in ["total", "used", "excluded", "future_excluded", "violations"]:
+                            if col not in event_df.columns:
+                                event_df[col] = 0
+                            event_df[col] = pd.to_numeric(event_df[col], errors="coerce").fillna(0).astype(int)
+                        summary_df = event_df.groupby("source", dropna=False)[["total", "used", "excluded", "future_excluded", "violations"]].sum().reset_index().rename(columns={"source":"参照元","total":"確認件数","used":"使用件数","excluded":"除外合計","future_excluded":"対象レース以降の除外","violations":"除外後の混入"})
+                        summary_df["通常除外"] = (summary_df["除外合計"] - summary_df["対象レース以降の除外"]).clip(lower=0)
+                        st.dataframe(summary_df[["参照元","確認件数","使用件数","通常除外","対象レース以降の除外","除外後の混入"]], use_container_width=True, hide_index=True)
+                        st.caption("通常除外＝欠損・異常値・学習条件外など。対象レース以降の除外＝未来データとして安全に外した件数。除外後の混入が0件なら、未来データは予測に使われていません。")
                     else:
                         st.caption("監査対象の履歴はありませんでした。")
             if boundary:
-                st.info(
-                    f"🕒 学習境界：{boundary.get('label', '')}｜"
-                    f"使用 {int(boundary.get('used_rows', 0))}件｜"
-                    f"対象レース以降を除外 {int(boundary.get('excluded_rows', 0))}件"
-                )
+                checked = int(audit.get("total_checked", 0)) if audit else int(boundary.get("used_rows", 0)) + int(boundary.get("excluded_rows", 0))
+                used_rows = int(audit.get("used", 0)) if audit else int(boundary.get("used_rows", 0))
+                future_rows = int(audit.get("future_excluded", 0)) if audit else int(boundary.get("excluded_rows", 0))
+                normal_excluded = max(0, int(audit.get("excluded", 0)) - future_rows) if audit else 0
+                st.info(f"🕒 学習境界：{boundary.get('label', '')}｜確認 {checked}件｜境界内で使用 {used_rows}件｜通常除外 {normal_excluded}件｜対象レース以降を除外 {future_rows}件")
                 if int(boundary.get('unknown_r_same_day_excluded', 0)):
-                    st.caption(
-                        f"同日でR不明の履歴 {int(boundary.get('unknown_r_same_day_excluded', 0))}件は、"
-                        "先読み防止のため安全側で除外しました。"
-                    )
+                    st.caption(f"同日でR不明の履歴 {int(boundary.get('unknown_r_same_day_excluded', 0))}件は、先読み防止のため安全側で除外しました。")
             if excluded:
                 detail = "、".join(f"{car}番（{status}）" for car, status in sorted(excluded.items()))
                 st.warning(f"解析対象外: {detail}。確率・順位・買い目の組み合わせから完全に除外しました。")
@@ -1719,20 +1834,27 @@ with result_tab:
             st.session_state.pop(key, None)
         st.rerun()
     result_version = st.session_state["result_input_version"]
-    c1, c2 = st.columns(2)
-    venue_override = c1.text_input("開催場（本文から取れない場合のみ）", key=f"result_venue_{result_version}")
-    race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key=f"result_race_no_{result_version}")
     result_text = st.text_area(
         "公式結果ページを全文貼り付け",
         height=620,
         key=f"official_result_text_{result_version}",
         placeholder="6R\n確定\n2026年7月21日(火)\n…\n着順 車番 選手名\n…\nグランドノート\n…\n払戻金\n…",
     )
+    auto_venue = _detect_result_venue_from_title(result_text)
+    c1, c2 = st.columns(2)
+    manual_venue_choice = c1.selectbox("開催場（タイトルから取れない場合だけ選択）", ["自動判定"] + RESULT_VENUES, key=f"result_venue_{result_version}")
+    race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key=f"result_race_no_{result_version}")
+    venue_override = auto_venue if manual_venue_choice == "自動判定" else manual_venue_choice
+    if auto_venue and manual_venue_choice == "自動判定":
+        st.caption(f"開催タイトルから自動判定：{auto_venue}（選手所属LGは判定に使いません）")
+    elif manual_venue_choice == "自動判定" and result_text.strip():
+        st.warning("開催タイトルから開催場を判定できません。上の選択欄から開催場を指定してください。")
     if st.button("結果を解析", use_container_width=True):
         try:
-            meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(
-                result_text, venue_override, race_no_override
-            )
+            if not venue_override:
+                st.warning("開催場を選択して、もう一度『結果を解析』を押してください。")
+                st.stop()
+            meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(result_text, venue_override, race_no_override)
             st.session_state["v35_result_meta"] = meta_r
             st.session_state["v35_result_rows"] = rows_r
             st.session_state["v35_result_laps"] = laps_r
@@ -1765,6 +1887,32 @@ with result_tab:
         else:
             st.caption("払戻金は見つかりませんでした。")
 
+        entry_count_check = {"ok": True, "prediction_exists": False, "prediction_count": 0, "result_count": int(rows_r["車番"].nunique()) if "車番" in rows_r.columns else len(rows_r)}
+        try:
+            entry_count_check = engine.v117_prediction_result_entry_count_check(meta_r, rows_r, engine.DB_PATH)
+        except Exception as exc:
+            st.warning(f"出走数の照合を実行できませんでした: {exc}")
+        entry_count_mismatch = bool(entry_count_check.get("prediction_exists") and not entry_count_check.get("ok"))
+        if entry_count_check.get("prediction_exists"):
+            if entry_count_mismatch:
+                missing = entry_count_check.get("missing_in_result", [])
+                extra = entry_count_check.get("extra_in_result", [])
+                parts = []
+                if missing:
+                    parts.append("結果にない車番: " + ", ".join(map(str, missing)))
+                if extra:
+                    parts.append("予測にない車番: " + ", ".join(map(str, extra)))
+                st.error("⛔ 予測時と結果登録時の出走数または車番が一致しません。" + f"予測は {entry_count_check.get('prediction_count', 0)}車、結果は {entry_count_check.get('result_count', 0)}車です。" + (("（" + " / ".join(parts) + "）") if parts else ""))
+                st.info("同じ日付・開催場・レース番号の出走表と結果を確認してください。不一致のままでは登録・分析・学習を実行しません。")
+            else:
+                st.success(f"✅ 予測と結果の出走数を確認しました：{entry_count_check.get('result_count', 0)}車")
+                incident_cars = entry_count_check.get("incident_cars", {}) or {}
+                if incident_cars:
+                    incident_text = "、".join(f"{car}番 {status}" for car, status in sorted(incident_cars.items(), key=lambda x: int(x[0])))
+                    st.info(f"発走後事故として出走数には含め、着順分析・学習から除外します：{incident_text}")
+        else:
+            st.caption("同じレースの保存済み予測がないため、出走数比較は行わず結果登録のみ可能です。")
+
         result_exists = False
         existing_result_key = ""
         existing_registered_at = None
@@ -1775,7 +1923,8 @@ with result_tab:
 
         replace_registered = False
         if result_exists:
-            st.warning(f"このレースは登録済みです：{existing_result_key}（{existing_registered_at or '登録日時不明'}）")
+            registered_display = _format_jst(existing_registered_at) or "登録日時不明"
+            st.warning(f"このレースは登録済みです：{existing_result_key}（日本時間 {registered_display}）")
             replace_registered = st.checkbox(
                 "登録済みの結果を、今回の内容で置き換える",
                 key=f"replace_result_{existing_result_key}",
@@ -1785,7 +1934,7 @@ with result_tab:
                 st.info("再登録では、古い結果データを削除してから今回の内容を登録し直します。")
 
         button_label = "登録済み結果を置き換えて再解析" if replace_registered else "DBへ登録して予測差・展開を解析"
-        button_disabled = bool(result_exists and not replace_registered)
+        button_disabled = bool((result_exists and not replace_registered) or entry_count_mismatch)
         if st.button(button_label, type="primary", use_container_width=True, disabled=button_disabled):
             try:
                 if replace_registered:
@@ -2107,8 +2256,8 @@ with db_tab:
     try:
         cached_venue = engine.v103_load_venue_analysis_cache(engine.DB_PATH)
         if not cached_venue.empty:
-            latest_time = str(cached_venue["分析日時"].max())
-            st.info(f"保存済み一括分析：{latest_time}｜{len(cached_venue)}開催場")
+            latest_time = _format_jst(cached_venue["分析日時"].max())
+            st.info(f"保存済み一括分析（日本時間）：{latest_time}｜{len(cached_venue)}開催場")
             with st.expander("保存済みの開催場分析結果", expanded=False):
                 st.dataframe(
                     cached_venue,
