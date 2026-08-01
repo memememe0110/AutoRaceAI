@@ -5996,7 +5996,10 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
     def bucket_temp(v):
         try: v=float(v)
         except Exception: return None
-        if v >= 50: return "50℃以上"
+        if v >= 63: return "63℃以上"
+        if v >= 60: return "60-62℃"
+        if v >= 56: return "56-59℃"
+        if v >= 50: return "50-55℃"
         if v >= 45: return "45-49℃"
         if v >= 35: return "35-44℃"
         if v >= 25: return "25-34℃"
@@ -6080,28 +6083,37 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
             bonuses.append(0.0); labels.append("履歴不足"); match_counts.append(len(hist)); confidences.append(0.0); continue
         base=float(perf.mean())
         hist["temp_bucket"] = hist["track_temp"].map(bucket_temp)
+        hist["hot_bucket"] = pd.to_numeric(hist["track_temp"], errors="coerce").ge(50).map({True:"50℃以上", False:"50℃未満"})
         hist["humidity_bucket"] = hist["humidity"].map(bucket_humidity)
         hist["handicap_bucket"] = hist["handicap"].map(bucket_handicap)
+        current_temp = pd.to_numeric(pd.Series([meta.get("走路温度")]), errors="coerce").iloc[0]
+        exact_heat_min = 2 if pd.notna(current_temp) and float(current_temp) >= 50 else 4
         specs=[
-            ("走路", "surface", current_conditions["surface"], 1.00),
-            ("熱走路", "temp_bucket", current_conditions["track_temp"], 0.95),
-            ("湿度", "humidity_bucket", current_conditions["humidity"], .70),
-            ("開催場", "venue", current_conditions["venue"], .65),
-            ("ハンデ帯", "handicap_bucket", h_now, .90),
-            ("レース種別", "race_type", current_conditions["race_type"], .55),
+            # label, column, current value, strength, prior sample size, minimum observations
+            ("走路", "surface", current_conditions["surface"], 1.00, 7.0, 3),
+            ("熱走路帯", "temp_bucket", current_conditions["track_temp"], 0.95, 10.0, exact_heat_min),
+            ("湿度", "humidity_bucket", current_conditions["humidity"], .70, 8.0, 3),
+            ("開催場", "venue", current_conditions["venue"], .65, 9.0, 3),
+            ("ハンデ帯", "handicap_bucket", h_now, .90, 7.0, 3),
+            ("レース種別", "race_type", current_conditions["race_type"], .55, 10.0, 3),
         ]
+        # 細分化した高温帯の件数が少ない場合に、50℃以上全体を弱い補助根拠として使う。
+        if pd.notna(current_temp) and float(current_temp) >= 50:
+            specs.append(("高温全体", "hot_bucket", "50℃以上", .45, 14.0, 2))
         parts=[]
-        for label,col,val,strength in specs:
+        for label,col,val,strength,prior_n,min_n in specs:
             if val in (None, "") or col not in hist.columns: continue
             mask=hist[col].astype(str).eq(str(val))
             n=int(mask.sum())
-            if n < 4: continue
-            cond=float(perf.loc[hist.index[mask]].mean())
+            if n < int(min_n): continue
+            cond_raw=float(perf.loc[hist.index[mask]].mean())
+            # Empirical-Bayes型の縮小。少数データほど本人全体平均へ強く戻す。
+            cond=(cond_raw*n + base*float(prior_n))/(n+float(prior_n))
             delta=cond-base
-            # Ver27: 少数条件の偶然を強く学習しない。
-            # 4-7件±0.3、8-14件±0.7、15-24件±1.2、25件以上±1.8が上限。
-            conf=min(1.0, max(0.0, (n-3)/18.0))
-            if n <= 7:
+            conf=float(n/(n+float(prior_n)))
+            if n <= 3:
+                sample_cap = 0.15
+            elif n <= 7:
                 sample_cap = 0.30
             elif n <= 14:
                 sample_cap = 0.70
@@ -6109,9 +6121,8 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
                 sample_cap = 1.20
             else:
                 sample_cap = 1.80
-            # 直近偏重を避けながら、顕著な差だけ採用。
-            effect=float(np.clip(delta*4.4*strength*conf, -sample_cap, sample_cap))
-            if abs(effect) >= .08:
+            effect=float(np.clip(delta*4.4*strength, -sample_cap, sample_cap))
+            if abs(effect) >= .05:
                 parts.append((effect,label,n,delta,conf))
         if not parts:
             bonuses.append(0.0); labels.append("顕著な適性なし"); match_counts.append(0); confidences.append(0.0); continue
@@ -16325,3 +16336,38 @@ def _v142_collect_aux_evidence(db_path=DB_PATH):
         usable[name] = int(mask.sum())
         evidence[name] = _v141_weighted_average(values[mask], recency[mask.to_numpy()]) if mask.any() else 0.0
     return evidence, {"race_count": int(len(ev)), "usable": usable}
+
+
+# ============================================================
+# Ver146: DB全履歴からの保守的再学習
+# ============================================================
+def v146_retrain_all_from_history(db_path=DB_PATH):
+    """登録済み結果を一括集計し、通常10・熱5・補正倍率6を保守的に再学習する。"""
+    v141_init_heat_learning(db_path)
+    v142_init_aux_learning(db_path)
+    evidence, stats = _v141_collect_evidence(db_path)
+    base_before = v40_get_weights(db_path)
+    heat_before = v141_get_heat_weights(db_path)
+    base_after = _v141_move_weights(base_before, V40_DEFAULT_WEIGHTS, evidence, max_step=0.0060)
+    heat_after = (_v141_move_weights(heat_before, V141_HEAT_DEFAULT_WEIGHTS, evidence, max_step=0.0080)
+                  if int(stats.get("hot_race_count",0)) >= 8 else dict(heat_before))
+    aux_before = v142_get_aux_factors(db_path)
+    aux_evidence, aux_stats = _v142_collect_aux_evidence(db_path)
+    aux_after = dict(aux_before)
+    for name in aux_before:
+        count=int(aux_stats.get("usable",{}).get(name,0))
+        if count < 5:
+            continue
+        target=float(np.clip(1.0 + float(aux_evidence.get(name,0.0))*0.35,0.65,1.35))
+        aux_after[name]=float(np.clip(aux_before[name]+np.clip((target-aux_before[name])*0.18,-0.04,0.04),0.50,1.50))
+    now=datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        for name,value in {**base_after,**heat_after,**aux_after}.items():
+            con.execute("UPDATE adaptive_weights SET current_weight=?,updated_at=?,update_count=update_count+1 WHERE feature_name=?",(float(value),now,name))
+        con.commit()
+    return {
+        "base_before":base_before,"base_after":base_after,
+        "heat_before":heat_before,"heat_after":heat_after,
+        "aux_before":aux_before,"aux_after":aux_after,
+        "evidence":evidence,"stats":stats,"aux_stats":aux_stats,
+    }

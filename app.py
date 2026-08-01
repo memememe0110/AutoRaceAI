@@ -792,6 +792,7 @@ def show_ticket_table(bet_type: str, bets: dict, key: str, trials: int, top_n: i
 
 
 
+@_v146_fragment
 def show_v67_self_evaluation(meta: dict) -> None:
     """全結果ラインと、大外しを分離した実用ラインを表示する。"""
     st.markdown('<div id="cover-line"></div>', unsafe_allow_html=True)
@@ -2248,15 +2249,20 @@ with db_tab:
         else:
             st.warning(msg)
 
+def _v146_reset_player_input():
+    st.session_state["player_input_version"] = int(st.session_state.get("player_input_version", 0)) + 1
+    for key in ["parsed_player_history", "player_register_notice", "player_registration_lookup"]:
+        st.session_state.pop(key, None)
+    st.session_state["player_register_notice"] = {"level":"success", "message":"選手入力だけをリセットしました。"}
+
 with register_tab:
     st.subheader("選手情報を登録")
     _show_sticky_notice("player_register_notice")
     st.session_state.setdefault("player_input_version", 0)
-    if st.button("🗑️ 選手入力をリセット", use_container_width=True, key="reset_player_input"):
-        st.session_state["player_input_version"] += 1
-        st.session_state.pop("parsed_player_history", None)
-        st.session_state.pop("player_register_notice", None)
-        st.rerun()
+    st.button(
+        "🗑️ 選手入力をリセット", use_container_width=True, key="reset_player_input",
+        on_click=_v146_reset_player_input,
+    )
     player_version = st.session_state["player_input_version"]
     player_name = st.text_input("選手名", placeholder="例：横田翔", key=f"player_name_input_{player_version}")
     show_player_registration_status(player_name)
