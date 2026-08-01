@@ -121,14 +121,29 @@ GENERAL_REMINDER_JST = ZoneInfo("Asia/Tokyo")
 RESULT_VENUES = ["飯塚", "山陽", "浜松", "川口", "伊勢崎"]
 
 def _detect_result_venue_from_title(text: str) -> str:
+    """結果ページの開催タイトル部分だけから開催場を判定する。
+
+    選手名・所属LGが並ぶ「着順」以降は対象外。タイトルで確定できない場合は
+    空文字を返し、画面側で手動選択させる。
+    """
     header = str(text or "").split("着順", 1)[0]
     normalized = re.sub(r"[\s　]+", "", header)
-    for venue, patterns in [("山陽", ["山陽小野田市営", "山陽市営"]), ("飯塚", ["飯塚市営"]), ("浜松", ["浜松市営"]), ("川口", ["川口市営"]), ("伊勢崎", ["伊勢崎市営"])]:
-        if any(x in normalized for x in patterns):
+    venue_patterns = [
+        ("山陽", ["山陽小野田市営", "山陽市営", "山陽ミッドナイト", "山陽オーバーミッドナイト"]),
+        ("飯塚", ["飯塚市営", "飯塚ミッドナイト", "飯塚オーバーミッドナイト"]),
+        ("浜松", ["浜松市営", "浜松記念", "Ｇ２浜松記念", "G2浜松記念"]),
+        ("川口", ["川口市営", "川口ナイター"]),
+        ("伊勢崎", ["伊勢崎市営", "伊勢崎ナイター"]),
+    ]
+    for venue, patterns in venue_patterns:
+        if any(pattern in normalized for pattern in patterns):
             return venue
-    for venue in RESULT_VENUES:
-        if venue in normalized and any(word in normalized for word in ("記念", "開催", "ミッドナイト", "ナイター", "普通開催", "オーバーミッドナイト")):
-            return venue
+
+    # 「開催名＋場名」がタイトルに明記されている場合だけ補助判定する。
+    title_words = ("記念", "市営", "開催", "ミッドナイト", "ナイター", "普通開催", "オーバーミッドナイト")
+    candidates = [venue for venue in RESULT_VENUES if venue in normalized]
+    if len(candidates) == 1 and any(word in normalized for word in title_words):
+        return candidates[0]
     return ""
 
 def _format_jst(value) -> str:
@@ -297,9 +312,10 @@ def v123_render_general_reminder_tab() -> None:
       </div>
       <label for="topic">ntfyトピック名</label>
       <input id="topic" placeholder="推測されにくい長い文字列" autocomplete="off">
+      <button class="secondary" type="button" id="testBtn">今すぐテスト通知を送る</button>
       <button class="primary" type="button" id="sendBtn">10分前通知を予約</button>
       <div id="status" class="status"></div>
-      <div class="note">iPhoneのntfyアプリで同じトピック名を購読してください。公開トピックには機密情報を入れないでください。</div>
+      <div class="note">最初に「今すぐテスト通知」を押し、iPhoneへ届くことを確認してください。ntfyアプリで同じトピック名を購読し、iPhoneの通知許可をオンにする必要があります。公開トピックには機密情報を入れないでください。</div>
 
       <script>
         const statusBox = document.getElementById('status');
@@ -326,6 +342,39 @@ def v123_render_general_reminder_tab() -> None:
           }}
           if (!dm && !tm) setStatus('日付または開始時刻を読み取れませんでした。', 'warn');
           else setStatus('予定日時を自動入力しました。', 'ok');
+        }});
+
+        document.getElementById('testBtn').addEventListener('click', async () => {{
+          const btn = document.getElementById('testBtn');
+          const topic = document.getElementById('topic').value.trim();
+          if (!topic) {{ setStatus('ntfyトピック名を入力してください。', 'warn'); return; }}
+          if (/[\s/?#]/.test(topic)) {{ setStatus('トピック名には空白や / ? # を使わないでください。', 'warn'); return; }}
+          btn.disabled = true;
+          btn.textContent = 'テスト送信中…';
+          setStatus('今すぐテスト通知を送信しています…', 'warn');
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 7000);
+          try {{
+            const response = await fetch(`https://ntfy.sh/${{encodeURIComponent(topic)}}`, {{
+              method:'POST',
+              body:'一般予定通知の接続テストです。',
+              headers:{{'Content-Type':'text/plain; charset=utf-8'}},
+              signal: controller.signal
+            }});
+            const raw = await response.text();
+            if (!response.ok) throw new Error(`HTTP ${{response.status}} ${{raw.slice(0,120)}}`);
+            let data = {{}};
+            try {{ data = JSON.parse(raw); }} catch (_) {{}}
+            const idText = data.id ? ` / 受付ID: ${{data.id}}` : '';
+            setStatus(`テスト通知をntfyが受け付けました${{idText}}。iPhoneに届かなければ、同じトピックを購読しているか、通知許可を確認してください。`, 'ok');
+          }} catch (e) {{
+            const msg = e.name === 'AbortError' ? '通信が7秒以内に完了しませんでした。' : `テスト通知に失敗しました: ${{e.message}}`;
+            setStatus(msg, 'err');
+          }} finally {{
+            clearTimeout(timer);
+            btn.disabled = false;
+            btn.textContent = '今すぐテスト通知を送る';
+          }}
         }});
 
         document.getElementById('sendBtn').addEventListener('click', async () => {{
@@ -357,15 +406,17 @@ def v123_render_general_reminder_tab() -> None:
               body:`${{title}}\n開始時刻: ${{dateValue.replaceAll('-','/')}} ${{timeValue}}`,
               headers:{{
                 'At': String(Math.floor(notifyDt.getTime()/1000)),
-                'Title': encodeURIComponent('予定の10分前です'),
-                'Priority':'high',
-                'Tags':'bell',
                 'Content-Type':'text/plain; charset=utf-8'
               }},
               signal: controller.signal
             }});
-            if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
-            setStatus(`10分前通知を予約しました。通知時刻: ${{notifyDt.toLocaleString('ja-JP', {{timeZone:'Asia/Tokyo'}})}}`, 'ok');
+            const raw = await response.text();
+            if (!response.ok) throw new Error(`HTTP ${{response.status}} ${{raw.slice(0,120)}}`);
+            let data = {{}};
+            try {{ data = JSON.parse(raw); }} catch (_) {{}}
+            const idText = data.id ? ` / 受付ID: ${{data.id}}` : '';
+            const serverTime = data.time ? new Date(Number(data.time)*1000).toLocaleString('ja-JP', {{timeZone:'Asia/Tokyo'}}) : notifyDt.toLocaleString('ja-JP', {{timeZone:'Asia/Tokyo'}});
+            setStatus(`ntfyが予約を受け付けました。通知時刻: ${{serverTime}}${{idText}}`, 'ok');
           }} catch (e) {{
             const msg = e.name === 'AbortError' ? '通信が7秒以内に完了しませんでした。時間をおいて再度お試しください。' : `通知予約に失敗しました: ${{e.message}}`;
             setStatus(msg, 'err');
@@ -1563,6 +1614,9 @@ with prediction_tab:
 
     view = st.session_state.get("last_prediction_view")
     if view:
+        # 予測が完了した後だけ、解析ボタン直下にショートカットを表示する。
+        # 監査・補正テーブルより先に置き、スマホでもすぐ結果各部へ移動できるようにする。
+        v73_section_nav()
         try:
             df = view["df"]
             bets = view["bets"]
@@ -1862,26 +1916,42 @@ with result_tab:
             st.session_state.pop(key, None)
         st.rerun()
     result_version = st.session_state["result_input_version"]
-    c1, c2 = st.columns(2)
-    venue_override = c1.text_input("開催場（本文から取れない場合のみ）", key=f"result_venue_{result_version}")
-    race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key=f"result_race_no_{result_version}")
     result_text = st.text_area(
         "公式結果ページを全文貼り付け",
         height=620,
         key=f"official_result_text_{result_version}",
         placeholder="6R\n確定\n2026年7月21日(火)\n…\n着順 車番 選手名\n…\nグランドノート\n…\n払戻金\n…",
     )
+
+    detected_result_venue = _detect_result_venue_from_title(result_text)
+    c1, c2 = st.columns(2)
+    if detected_result_venue:
+        c1.success(f"開催場をタイトルから自動判定：{detected_result_venue}")
+        venue_override = detected_result_venue
+    else:
+        venue_override = c1.selectbox(
+            "開催場（タイトルから判定できないため選択してください）",
+            [""] + RESULT_VENUES,
+            key=f"result_venue_select_{result_version}",
+            format_func=lambda value: "選択してください" if value == "" else value,
+        )
+        c1.caption("選手の所属LGは開催場判定に使用しません。")
+    race_no_override = c2.text_input("レース番号（本文から取れない場合のみ）", key=f"result_race_no_{result_version}")
+
     if st.button("結果を解析", use_container_width=True):
-        try:
-            meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(
-                result_text, venue_override, race_no_override
-            )
-            st.session_state["v35_result_meta"] = meta_r
-            st.session_state["v35_result_rows"] = rows_r
-            st.session_state["v35_result_laps"] = laps_r
-            st.session_state["v35_result_payouts"] = payouts_r
-        except Exception as exc:
-            st.error(f"結果解析エラー: {exc}")
+        if not venue_override:
+            st.warning("開催場を選択してください。")
+        else:
+            try:
+                meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(
+                    result_text, venue_override, race_no_override
+                )
+                st.session_state["v35_result_meta"] = meta_r
+                st.session_state["v35_result_rows"] = rows_r
+                st.session_state["v35_result_laps"] = laps_r
+                st.session_state["v35_result_payouts"] = payouts_r
+            except Exception as exc:
+                st.error(f"結果解析エラー: {exc}")
 
     meta_r = st.session_state.get("v35_result_meta")
     rows_r = st.session_state.get("v35_result_rows")
@@ -2219,63 +2289,89 @@ with register_tab:
         st.markdown("### ⚠️ R・必須項目の入力待ち")
         st.caption("R候補は参考表示です。数値が完全一致していてRだけ違う場合は、「既存Rへ統合」または「入力したRで新規登録」を選択してください。Rを空欄のままにすると保留されます。")
         edit_cols = [c for c in ["選手名","開催日","開催場","レース","R候補","重複処理","レース名","着順","車番","走路","ハンデ","試走T","競走T","ST","保留理由"] if c in pending.columns]
-        edited = st.data_editor(
-            pending[edit_cols], use_container_width=True, hide_index=True,
-            key=f"pending_history_editor_{player_version}",
-            disabled=[c for c in ["R候補", "保留理由"] if c in edit_cols],
-            column_config={
-                "開催場": st.column_config.SelectboxColumn("開催場", options=["川口","伊勢崎","浜松","飯塚","山陽"]),
-                "レース": st.column_config.NumberColumn("R", min_value=1, max_value=12, step=1),
-                "重複処理": st.column_config.SelectboxColumn(
-                    "重複処理",
-                    options=["選択してください", "既存Rへ統合", "入力したRで新規登録"],
-                ),
-            },
-        )
-        if st.button("不足行だけ登録", type="primary", use_container_width=True, key=f"save_pending_{player_version}"):
+        # 不足行の編集はフォーム内に固定する。
+        # 文字入力や選択変更だけではアプリ全体を再実行せず、登録ボタンでまとめて送信する。
+        with st.form(f"pending_history_form_{player_version}", clear_on_submit=False):
+            edited = st.data_editor(
+                pending[edit_cols], use_container_width=True, hide_index=True,
+                key=f"pending_history_editor_{player_version}",
+                disabled=[c for c in ["R候補", "保留理由"] if c in edit_cols],
+                column_config={
+                    "開催場": st.column_config.SelectboxColumn("開催場", options=["川口","伊勢崎","浜松","飯塚","山陽"]),
+                    "レース": st.column_config.NumberColumn("R", min_value=1, max_value=12, step=1),
+                    "重複処理": st.column_config.SelectboxColumn(
+                        "重複処理",
+                        options=["選択してください", "既存Rへ統合", "入力したRで新規登録"],
+                    ),
+                },
+            )
+            save_pending_submitted = st.form_submit_button(
+                "不足行だけ登録", type="primary", use_container_width=True
+            )
+
+        if save_pending_submitted:
             try:
                 # 編集対象以外の元カラムも保持して戻す
                 repaired = pending.copy()
                 for c in edited.columns:
-                    if c != "保留理由": repaired[c] = edited[c].values
+                    if c != "保留理由":
+                        repaired[c] = edited[c].values
                 repaired = repaired.drop(columns=["保留理由"], errors="ignore")
 
                 # 数値完全一致なのにRが異なる行は、利用者の選択後だけ保存する。
                 unresolved = pd.Series(False, index=repaired.index)
                 if "重複処理" in repaired.columns:
-                    conflict_mask = pending.get("保留理由", pd.Series("", index=pending.index)).astype(str).str.contains("Rが異なります", na=False)
-                    unresolved = conflict_mask & repaired["重複処理"].fillna("選択してください").eq("選択してください")
+                    conflict_mask = pending.get(
+                        "保留理由", pd.Series("", index=pending.index)
+                    ).astype(str).str.contains("Rが異なります", na=False)
+                    unresolved = conflict_mask & repaired["重複処理"].fillna(
+                        "選択してください"
+                    ).eq("選択してください")
                     repaired["_v58_duplicate_confirmed"] = ~unresolved
-                if unresolved.any():
-                    st.warning(f"Rが異なる重複候補 {int(unresolved.sum())}件の登録方法を選択してください。")
-                    st.stop()
 
-                with st.spinner("不足行をSQLiteへ保存し、登録結果を確認しています…"):
-                    report2 = engine.v131_save_pending_player_history(repaired, db_path=engine.DB_PATH)
-                st.session_state["pending_player_history"] = report2["pending"]
-                verified = int(report2.get("verified", 0))
-                if verified:
-                    ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の保留履歴を{verified}件登録")
-                    level = "success" if ok else "warning"
-                    message = (
-                        f"不足行をDBへ{verified}件登録し、保存後の確認も完了しました。"
-                        f"残り保留 {report2['pending_count']}件。"
-                        + (f" {msg}" if msg else "")
-                    )
-                elif report2["pending_count"]:
-                    level = "warning"
-                    reasons = ""
-                    if isinstance(report2.get("pending"), pd.DataFrame) and "保留理由" in report2["pending"].columns:
-                        vals = report2["pending"]["保留理由"].dropna().astype(str).unique().tolist()[:3]
-                        reasons = " 理由: " + " / ".join(vals) if vals else ""
-                    message = f"DBへ登録できませんでした。残り保留 {report2['pending_count']}件。{reasons}"
+                if unresolved.any():
+                    message = f"Rが異なる重複候補 {int(unresolved.sum())}件の登録方法を選択してください。"
+                    st.session_state["pending_save_notice"] = {
+                        "level": "warning", "message": message
+                    }
+                    st.warning(message)
                 else:
-                    level = "info"
-                    message = "登録対象の変更はありませんでした。既に同じ履歴が登録されている可能性があります。"
-                st.session_state["pending_save_notice"] = {"level": level, "message": message}
-                st.rerun()
+                    with st.spinner("不足行をSQLiteへ保存し、登録結果を確認しています…"):
+                        report2 = engine.v131_save_pending_player_history(
+                            repaired, db_path=engine.DB_PATH
+                        )
+                    st.session_state["pending_player_history"] = report2["pending"]
+                    verified = int(report2.get("verified", 0))
+                    if verified:
+                        ok, msg = push_db_to_github(
+                            f"AutoRaceAI: {player_name.strip()} の保留履歴を{verified}件登録"
+                        )
+                        level = "success" if ok else "warning"
+                        message = (
+                            f"不足行をDBへ{verified}件登録し、保存後の確認も完了しました。"
+                            f"残り保留 {report2['pending_count']}件。"
+                            + (f" {msg}" if msg else "")
+                        )
+                    elif report2["pending_count"]:
+                        level = "warning"
+                        reasons = ""
+                        if isinstance(report2.get("pending"), pd.DataFrame) and "保留理由" in report2["pending"].columns:
+                            vals = report2["pending"]["保留理由"].dropna().astype(str).unique().tolist()[:3]
+                            reasons = " 理由: " + " / ".join(vals) if vals else ""
+                        message = f"DBへ登録できませんでした。残り保留 {report2['pending_count']}件。{reasons}"
+                    else:
+                        level = "info"
+                        message = "登録対象の変更はありませんでした。既に同じ履歴が登録されている可能性があります。"
+                    st.session_state["pending_save_notice"] = {
+                        "level": level, "message": message
+                    }
+                    st.rerun()
             except Exception as exc:
-                st.error(f"不足行登録エラー: {type(exc).__name__}: {exc}")
+                error_message = f"不足行登録エラー: {type(exc).__name__}: {exc}"
+                st.session_state["pending_save_notice"] = {
+                    "level": "error", "message": error_message
+                }
+                st.error(error_message)
                 st.exception(exc)
 
 with db_tab:
