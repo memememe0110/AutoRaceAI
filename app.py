@@ -26,7 +26,7 @@ _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver153｜登録後のレース種別適性・追い抜き相性自動更新")
+st.caption("Ver155｜予測後の画面切替・券種表示を軽量化")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -283,7 +283,10 @@ def _v139_ntfy_request(topic: str, message: str, *, notify_at: datetime | None =
         "tags": ["bell"],
     }
     if notify_at is not None:
-        payload["at"] = str(int(notify_at.timestamp()))
+        # ntfyのJSON Publish APIでは予約指定は `delay` を使用する。
+        # `at` はJSON項目として解釈されず即時配信になる環境があるため使用しない。
+        scheduled_unix = int(notify_at.astimezone(timezone.utc).timestamp())
+        payload["delay"] = str(scheduled_unix)
 
     request = urllib.request.Request(
         endpoint,
@@ -914,187 +917,191 @@ def show_v67_self_evaluation(meta: dict) -> None:
     else:
         st.caption("現在の設定：点数制限なし。選択したカバーラインまで強調")
 
-    tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
+    bet_types = ["2連単", "2連複", "3連複", "3連単"]
+    selected_bet_type = st.radio(
+        "表示する券種", bet_types, horizontal=True,
+        key=f"v155_cover_bet_type_{coverage}_{line_mode}",
+        help="選んだ券種だけを計算・表示するため、ライン変更時の再処理を軽くします。",
+    )
     all_formation_text: dict[str, str] = {}
     all_formation_points: dict[str, int] = {}
-    for tab, bet_type in zip(tabs, ["2連単", "2連複", "3連複", "3連単"]):
-        with tab:
-            row = stats[stats["券種"] == bet_type]
-            if row.empty:
-                st.info(f"{bet_type}は結果照合がまだありません。")
-                continue
-            r = row.iloc[0]
-            sample = int(r["レース数"])
-            excluded = int(r["大外し除外"])
+    for bet_type in [selected_bet_type]:
+        row = stats[stats["券種"] == bet_type]
+        if row.empty:
+            st.info(f"{bet_type}は結果照合がまだありません。")
+            continue
+        r = row.iloc[0]
+        sample = int(r["レース数"])
+        excluded = int(r["大外し除外"])
 
-            # 三連単だけは、過去に上位20点以内で的中したレース群の
-            # 累積確率分布を強調基準として選べる。
-            trifecta_line_mode = "通常選択"
-            if bet_type == "3連単":
-                within20_count = int(r.get("20点以内レース数", 0) or 0)
-                st.markdown("#### 三連単の強調基準")
-                trifecta_line_mode = st.radio(
-                    "三連単ライン",
-                    ["通常選択", "過去20点以内的中ライン"],
-                    horizontal=True,
-                    key=f"v81_trifecta_line_mode_{coverage}_{line_mode}",
-                    help="『過去20点以内的中ライン』は、三連単が予測上位20点以内で当たった過去レースだけを集め、その累積確率の分位点を使います。全レースのカバー率ではありません。",
-                )
-                if within20_count > 0:
-                    w20_value = float(r[f"20点以内{coverage}%カバー"])
-                    st.caption(
-                        f"過去20点以内的中：{within20_count}レース ／ "
-                        f"{coverage}%地点の累積確率：{w20_value:.2f}%"
-                    )
-                    with st.expander(f"過去20点以内で的中した{within20_count}レースを確認"):
-                        w20_details = engine.v81_trifecta_within20_details(
-                            engine.DB_PATH, starter_count=starter_count
-                        )
-                        st.dataframe(
-                            w20_details,
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "個別確率": st.column_config.NumberColumn(format="%.3f%%"),
-                                "上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
-                            },
-                        )
-                else:
-                    st.caption("三連単が上位20点以内で的中した過去データはまだありません。")
-
-            use_within20 = (
-                bet_type == "3連単"
-                and trifecta_line_mode == "過去20点以内的中ライン"
-                and int(r.get("20点以内レース数", 0) or 0) > 0
+        # 三連単だけは、過去に上位20点以内で的中したレース群の
+        # 累積確率分布を強調基準として選べる。
+        trifecta_line_mode = "通常選択"
+        if bet_type == "3連単":
+            within20_count = int(r.get("20点以内レース数", 0) or 0)
+            st.markdown("#### 三連単の強調基準")
+            trifecta_line_mode = st.radio(
+                "三連単ライン",
+                ["通常選択", "過去20点以内的中ライン"],
+                horizontal=True,
+                key=f"v81_trifecta_line_mode_{coverage}_{line_mode}",
+                help="『過去20点以内的中ライン』は、三連単が予測上位20点以内で当たった過去レースだけを集め、その累積確率の分位点を使います。全レースのカバー率ではありません。",
             )
-            if use_within20:
-                cutoff = float(r[f"20点以内{coverage}%カバー"])
-                used = int(r["20点以内レース数"])
-                st.success(
-                    f"{int(starter_count) if starter_count else '同'}車立て・過去20点以内的中{coverage}%ライン：上位累積 {cutoff:.2f}%まで "
-                    f"（同じ出走数で三連単が上位20点以内だった過去{used}レースから計算）"
+            if within20_count > 0:
+                w20_value = float(r[f"20点以内{coverage}%カバー"])
+                st.caption(
+                    f"過去20点以内的中：{within20_count}レース ／ "
+                    f"{coverage}%地点の累積確率：{w20_value:.2f}%"
                 )
-                st.caption("このラインは『20点以内で当たるレースの累積位置』を見る指標で、全レースの的中率を表すものではありません。")
-            elif line_mode == "実用ライン":
-                cutoff = float(r[f"実用{coverage}%カバー"])
-                used = int(r["実用レース数"])
-                st.success(
-                    f"{int(starter_count) if starter_count else '同'}車立て・実用{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで "
-                    f"（全{sample}レース中 {used}レース使用・三連単{int(outlier_cutoff)}%以上のレース{excluded}件を除外）"
-                )
-            else:
-                cutoff = float(r[f"{coverage}%カバー"])
-                st.info(f"{int(starter_count) if starter_count else '同'}車立て・全結果{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで（{sample}レースすべて使用）")
-
-            if excluded > 0:
-                with st.expander(f"三連単{int(outlier_cutoff)}%以上で除外した{excluded}レースを確認"):
-                    details = engine.v72_ticket_outlier_details(
-                        bet_type,
-                        engine.DB_PATH,
-                        trifecta_outlier_cutoff=float(outlier_cutoff),
-                        starter_count=starter_count,
+                with st.expander(f"過去20点以内で的中した{within20_count}レースを確認"):
+                    w20_details = engine.v81_trifecta_within20_details(
+                        engine.DB_PATH, starter_count=starter_count
                     )
                     st.dataframe(
-                        details,
+                        w20_details,
                         use_container_width=True,
                         hide_index=True,
                         column_config={
+                            "個別確率": st.column_config.NumberColumn(format="%.3f%%"),
                             "上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
-                            "三連単上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
                         },
                     )
-
-            highlighted_full = engine.v67_ticket_highlight_table(meta, bet_type, cutoff, engine.DB_PATH)
-            if highlighted_full.empty:
-                st.caption("現在の予測分布を取得できませんでした。予測をもう一度実行してください。")
-                continue
-
-            highlighted = highlighted_full.copy()
-            if cap_enabled:
-                highlighted = highlighted.head(int(cap_points)).copy()
-
-            actual_points = len(highlighted)
-            original_points = len(highlighted_full)
-            actual_cover = float(pd.to_numeric(highlighted["累積確率"], errors="coerce").dropna().max()) if not highlighted.empty else 0.0
-
-            st.markdown(f"### {ticket_point_heading(bet_type, actual_points)}")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("強調点数", f"{actual_points}点")
-            m2.metric("強調範囲の累積", f"{actual_cover:.2f}%")
-            m3.metric("ライン要求", f"{cutoff:.2f}%")
-            if cap_enabled and original_points > actual_points:
-                st.warning(
-                    f"{ticket_point_heading(bet_type, original_points)}が{coverage}%カバーラインに必要ですが、"
-                    f"{ticket_point_heading(bet_type, actual_points)}へ制限しました。"
-                    f" 現在の強調範囲は累積{actual_cover:.2f}%です。"
-                )
             else:
-                st.success(f"{ticket_point_heading(bet_type, actual_points)}・累積{actual_cover:.2f}%で選択ラインをカバーしています。")
+                st.caption("三連単が上位20点以内で的中した過去データはまだありません。")
 
-            # ダークモードでも埋もれないよう、色だけでなく記号・太字・境界線を併用する。
-            display_highlighted = highlighted.copy().reset_index(drop=True)
-            # 保存済み予測の形式によっては、すでに「強調」「順位」列を持つことがある。
-            # insert() の重複エラーを避け、表示用の列を毎回安全に作り直す。
-            display_highlighted = display_highlighted.drop(
-                columns=[c for c in ["強調", "順位"] if c in display_highlighted.columns],
-                errors="ignore",
+        use_within20 = (
+            bet_type == "3連単"
+            and trifecta_line_mode == "過去20点以内的中ライン"
+            and int(r.get("20点以内レース数", 0) or 0) > 0
+        )
+        if use_within20:
+            cutoff = float(r[f"20点以内{coverage}%カバー"])
+            used = int(r["20点以内レース数"])
+            st.success(
+                f"{int(starter_count) if starter_count else '同'}車立て・過去20点以内的中{coverage}%ライン：上位累積 {cutoff:.2f}%まで "
+                f"（同じ出走数で三連単が上位20点以内だった過去{used}レースから計算）"
             )
-            display_highlighted.insert(0, "強調", ["★" if i < len(display_highlighted) - 1 else "★ ここまで" for i in range(len(display_highlighted))])
-            display_highlighted.insert(1, "順位", [f"{i + 1}位" for i in range(len(display_highlighted))])
-
-            def _v79_row_style(row):
-                is_last = row.name == display_highlighted.index[-1]
-                base = (
-                    "background-color:#FFF3B0;color:#111827;font-weight:800;"
-                    "border-left:6px solid #F59E0B;"
-                )
-                if is_last:
-                    base += "border-top:3px solid #F59E0B;border-bottom:4px solid #F59E0B;"
-                else:
-                    base += "border-bottom:1px solid #D97706;"
-                return [base] * len(row)
-
-            styled = display_highlighted.style.apply(_v79_row_style, axis=1).format({
-                "確率": "{:.3f}%",
-                "累積確率": "{:.2f}%",
-            })
-            st.dataframe(
-                styled,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "強調": st.column_config.TextColumn(width="small"),
-                    "順位": st.column_config.TextColumn(width="small"),
-                    "確率": st.column_config.NumberColumn(format="%.3f%%"),
-                    "累積確率": st.column_config.NumberColumn(format="%.2f%%"),
-                },
+            st.caption("このラインは『20点以内で当たるレースの累積位置』を見る指標で、全レースの的中率を表すものではありません。")
+        elif line_mode == "実用ライン":
+            cutoff = float(r[f"実用{coverage}%カバー"])
+            used = int(r["実用レース数"])
+            st.success(
+                f"{int(starter_count) if starter_count else '同'}車立て・実用{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで "
+                f"（全{sample}レース中 {used}レース使用・三連単{int(outlier_cutoff)}%以上のレース{excluded}件を除外）"
             )
-            st.caption("★付きの黄色い行が強調対象です。『★ ここまで』が現在の強調境界です。")
+        else:
+            cutoff = float(r[f"{coverage}%カバー"])
+            st.info(f"{int(starter_count) if starter_count else '同'}車立て・全結果{coverage}%カバーライン：上位累積 {cutoff:.2f}%まで（{sample}レースすべて使用）")
 
-            formations = engine.v67_compress_formations(highlighted["組み合わせ"].tolist(), bet_type)
-            if formations:
-                st.markdown("#### 強調範囲のまとめ・一括コピー")
-                formation_text = "\n".join(str(line) for line in formations)
-                all_formation_text[bet_type] = formation_text
-                all_formation_points[bet_type] = actual_points
-                v73_copy_box(
-                    ticket_point_heading(bet_type, actual_points),
-                    formation_text,
-                    f"{bet_type}_{coverage}_{line_mode}_{trifecta_line_mode}_{cap_enabled}_{cap_points}",
-                    height=max(105, min(260, 44 + 28 * len(formations))),
+        if excluded > 0:
+            with st.expander(f"三連単{int(outlier_cutoff)}%以上で除外した{excluded}レースを確認"):
+                details = engine.v72_ticket_outlier_details(
+                    bet_type,
+                    engine.DB_PATH,
+                    trifecta_outlier_cutoff=float(outlier_cutoff),
+                    starter_count=starter_count,
                 )
-                st.caption("共通部分だけをまとめた簡易表記です。正確な対象は上の一覧表でも確認できます。")
+                st.dataframe(
+                    details,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
+                        "三連単上位累積確率": st.column_config.NumberColumn(format="%.2f%%"),
+                    },
+                )
+
+        highlighted_full = engine.v67_ticket_highlight_table(meta, bet_type, cutoff, engine.DB_PATH)
+        if highlighted_full.empty:
+            st.caption("現在の予測分布を取得できませんでした。予測をもう一度実行してください。")
+            continue
+
+        highlighted = highlighted_full.copy()
+        if cap_enabled:
+            highlighted = highlighted.head(int(cap_points)).copy()
+
+        actual_points = len(highlighted)
+        original_points = len(highlighted_full)
+        actual_cover = float(pd.to_numeric(highlighted["累積確率"], errors="coerce").dropna().max()) if not highlighted.empty else 0.0
+
+        st.markdown(f"### {ticket_point_heading(bet_type, actual_points)}")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("強調点数", f"{actual_points}点")
+        m2.metric("強調範囲の累積", f"{actual_cover:.2f}%")
+        m3.metric("ライン要求", f"{cutoff:.2f}%")
+        if cap_enabled and original_points > actual_points:
+            st.warning(
+                f"{ticket_point_heading(bet_type, original_points)}が{coverage}%カバーラインに必要ですが、"
+                f"{ticket_point_heading(bet_type, actual_points)}へ制限しました。"
+                f" 現在の強調範囲は累積{actual_cover:.2f}%です。"
+            )
+        else:
+            st.success(f"{ticket_point_heading(bet_type, actual_points)}・累積{actual_cover:.2f}%で選択ラインをカバーしています。")
+
+        # ダークモードでも埋もれないよう、色だけでなく記号・太字・境界線を併用する。
+        display_highlighted = highlighted.copy().reset_index(drop=True)
+        # 保存済み予測の形式によっては、すでに「強調」「順位」列を持つことがある。
+        # insert() の重複エラーを避け、表示用の列を毎回安全に作り直す。
+        display_highlighted = display_highlighted.drop(
+            columns=[c for c in ["強調", "順位"] if c in display_highlighted.columns],
+            errors="ignore",
+        )
+        display_highlighted.insert(0, "強調", ["★" if i < len(display_highlighted) - 1 else "★ ここまで" for i in range(len(display_highlighted))])
+        display_highlighted.insert(1, "順位", [f"{i + 1}位" for i in range(len(display_highlighted))])
+
+        def _v79_row_style(row):
+            is_last = row.name == display_highlighted.index[-1]
+            base = (
+                "background-color:#FFF3B0;color:#111827;font-weight:800;"
+                "border-left:6px solid #F59E0B;"
+            )
+            if is_last:
+                base += "border-top:3px solid #F59E0B;border-bottom:4px solid #F59E0B;"
+            else:
+                base += "border-bottom:1px solid #D97706;"
+            return [base] * len(row)
+
+        styled = display_highlighted.style.apply(_v79_row_style, axis=1).format({
+            "確率": "{:.3f}%",
+            "累積確率": "{:.2f}%",
+        })
+        st.dataframe(
+            styled,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "強調": st.column_config.TextColumn(width="small"),
+                "順位": st.column_config.TextColumn(width="small"),
+                "確率": st.column_config.NumberColumn(format="%.3f%%"),
+                "累積確率": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
+        st.caption("★付きの黄色い行が強調対象です。『★ ここまで』が現在の強調境界です。")
+
+        formations = engine.v67_compress_formations(highlighted["組み合わせ"].tolist(), bet_type)
+        if formations:
+            st.markdown("#### 強調範囲のまとめ・一括コピー")
+            formation_text = "\n".join(str(line) for line in formations)
+            all_formation_text[bet_type] = formation_text
+            all_formation_points[bet_type] = actual_points
+            v73_copy_box(
+                ticket_point_heading(bet_type, actual_points),
+                formation_text,
+                f"{bet_type}_{coverage}_{line_mode}_{trifecta_line_mode}_{cap_enabled}_{cap_points}",
+                height=max(105, min(260, 44 + 28 * len(formations))),
+            )
+            st.caption("共通部分だけをまとめた簡易表記です。正確な対象は上の一覧表でも確認できます。")
 
     if all_formation_text:
         st.markdown('<div id="copy-all-formations"></div>', unsafe_allow_html=True)
-        st.markdown("### 📋 全券種まとめてコピー")
+        st.markdown("### 📋 選択中の券種をコピー")
         all_text = "\n\n".join(
             f"{ticket_point_heading(bet_type, all_formation_points.get(bet_type, 0))}\n{all_formation_text[bet_type]}"
             for bet_type in ["2連単", "2連複", "3連複", "3連単"]
             if bet_type in all_formation_text
         )
         v73_copy_box(
-            "強調対象フォーメーション一式",
+            "選択中の強調フォーメーション",
             all_text,
             f"all_{coverage}_{line_mode}_{cap_enabled}_{cap_points}",
             height=max(180, min(420, 75 + 26 * all_text.count("\n"))),
@@ -1512,9 +1519,18 @@ _v132_general_reminder_launcher()
 
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
-prediction_tab, result_tab, register_tab, db_tab = st.tabs(["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"])
+_main_pages = ["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"]
+if hasattr(st, "segmented_control"):
+    selected_main_page = st.segmented_control(
+        "画面切替", _main_pages, default=_main_pages[0], key="v155_main_page"
+    )
+else:
+    selected_main_page = st.radio(
+        "画面切替", _main_pages, horizontal=True, key="v155_main_page"
+    )
+selected_main_page = selected_main_page or _main_pages[0]
 
-with prediction_tab:
+if selected_main_page == "🏁 予測":
     st.info("Ver20予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
     with st.expander("🔧 今回どこを調整したか"):
         if st.button("調整履歴を読み込む", key="v138_load_adjustment_log", use_container_width=True):
@@ -1961,19 +1977,23 @@ with prediction_tab:
             odds_namespace = re.sub(r"[^0-9A-Za-z_-]+", "_", str(race_key))[-80:] or "current"
             st.markdown('<div id="ticket-probability"></div>', unsafe_allow_html=True)
             st.subheader("券種別確率・オッズ比較")
-            ticket_tabs = st.tabs(["2連単", "2連複", "3連複", "3連単"])
-            with ticket_tabs[0]:
-                show_ticket_table("2連単", bets, "2車単", view_trials, 20)
-                show_odds_comparison("2連単", bets, "2車単", view_trials, "2tansho", unordered=False, namespace=odds_namespace)
-            with ticket_tabs[1]:
-                show_ticket_table("2連複", bets, "2車複", view_trials, 20)
-                show_odds_comparison("2連複", bets, "2車複", view_trials, "2fuku", unordered=True, namespace=odds_namespace)
-            with ticket_tabs[2]:
-                show_ticket_table("3連複", bets, "三連複", view_trials, 20)
-                show_odds_comparison("3連複", bets, "三連複", view_trials, "3fuku", unordered=True, namespace=odds_namespace)
-            with ticket_tabs[3]:
-                show_ticket_table("3連単", bets, "三連単", view_trials, 20)
-                show_odds_comparison("3連単", bets, "三連単", view_trials, "3tan", unordered=False, namespace=odds_namespace)
+            ticket_options = {
+                "2連単": ("2車単", "2tansho", False),
+                "2連複": ("2車複", "2fuku", True),
+                "3連複": ("三連複", "3fuku", True),
+                "3連単": ("三連単", "3tan", False),
+            }
+            selected_ticket = st.radio(
+                "表示する券種", list(ticket_options), horizontal=True,
+                key=f"v155_ticket_view_{odds_namespace}",
+                help="選択した券種だけを集計・表示します。ほかの券種は切り替えた時に計算します。",
+            )
+            ticket_key, odds_key, unordered = ticket_options[selected_ticket]
+            show_ticket_table(selected_ticket, bets, ticket_key, view_trials, 20)
+            show_odds_comparison(
+                selected_ticket, bets, ticket_key, view_trials, odds_key,
+                unordered=unordered, namespace=odds_namespace,
+            )
 
             show_v67_self_evaluation(meta)
 
@@ -1991,7 +2011,7 @@ with prediction_tab:
             st.error(f"保存済み予測の表示エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
 
-with result_tab:
+if selected_main_page == "✅ 結果登録・解析":
     st.subheader("公式結果を登録して予測と比較")
     _show_sticky_notice("result_register_notice")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
@@ -2236,7 +2256,7 @@ with result_tab:
         render_last_result_analysis(last_result_view)
 
 
-with db_tab:
+if selected_main_page == "🗃️ 登録情報確認":
     st.subheader("全結果バックテスト・重み最適化")
     st.caption("単発レースの結果だけでなく、予測時に保存した特徴と登録済み結果をまとめて比較します。古い約70%で候補を探し、新しい約30%でも悪化しない候補だけを提案します。")
     candidate_count = st.slider("試す重み候補数", 200, 3000, 800, 100, key="v74_candidate_count")
@@ -2336,7 +2356,7 @@ def _v146_reset_player_input():
         st.session_state.pop(key, None)
     st.session_state["player_register_notice"] = {"level":"success", "message":"選手入力だけをリセットしました。"}
 
-with register_tab:
+if selected_main_page == "👤 選手情報登録":
     st.subheader("選手情報を登録")
     _show_sticky_notice("player_register_notice")
     st.session_state.setdefault("player_input_version", 0)
@@ -2547,7 +2567,7 @@ with register_tab:
                 st.error(error_message)
                 st.exception(exc)
 
-with db_tab:
+if selected_main_page == "🗃️ 登録情報確認":
     st.subheader("🏟️ 開催場別の学習重み")
     st.caption("第1層はレース番号なしでも全履歴を使用し、第2層だけ開催日・開催場・R単位で展開を学習します。")
 
