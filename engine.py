@@ -16371,3 +16371,308 @@ def v146_retrain_all_from_history(db_path=DB_PATH):
         "aux_before":aux_before,"aux_after":aux_after,
         "evidence":evidence,"stats":stats,"aux_stats":aux_stats,
     }
+
+# ============================================================
+# Ver151: レース種別適性・一般戦傾向の縮小推定
+# ============================================================
+V151_FACTOR_NAME = "レース種別適性倍率"
+
+
+def v151_normalize_race_context(value):
+    text = str(value or "").strip()
+    if "特別一般" in text or "一般" in text:
+        return "一般戦"
+    if "準決" in text or "準々決" in text:
+        return "準決勝系"
+    if "優勝" in text:
+        return "優勝戦"
+    if "選抜" in text:
+        return "選抜戦"
+    if "予選" in text:
+        return "予選"
+    return "その他"
+
+
+def _v151_name_key(value):
+    return re.sub(r"[\s　]+", "", str(value or ""))
+
+
+def v151_init_race_context_learning(db_path=DB_PATH):
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v151_player_race_context_profiles (
+                player_key TEXT NOT NULL,
+                player_name TEXT NOT NULL,
+                context_key TEXT NOT NULL,
+                sample_count INTEGER NOT NULL,
+                overall_count INTEGER NOT NULL,
+                raw_context_score REAL NOT NULL,
+                overall_score REAL NOT NULL,
+                shrunk_delta REAL NOT NULL,
+                confidence REAL NOT NULL,
+                top3_rate REAL,
+                avg_finish REAL,
+                avg_trial_race_gap REAL,
+                label TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(player_key, context_key)
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v151_race_context_feature_snapshots (
+                race_key TEXT NOT NULL,
+                car_no INTEGER NOT NULL,
+                player_name TEXT,
+                context_key TEXT,
+                sample_count INTEGER,
+                confidence REAL,
+                context_delta REAL,
+                context_bonus REAL,
+                final_rank INTEGER,
+                PRIMARY KEY(race_key, car_no)
+            )
+        """)
+        now = datetime.now().isoformat(timespec="seconds")
+        con.execute("""
+            INSERT OR IGNORE INTO adaptive_weights
+            (feature_name,current_weight,updated_at,update_count)
+            VALUES(?,?,?,0)
+        """, (V151_FACTOR_NAME, 1.0, now))
+        con.commit()
+
+
+def v151_get_factor(db_path=DB_PATH):
+    v151_init_race_context_learning(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        row = con.execute(
+            "SELECT current_weight FROM adaptive_weights WHERE feature_name=?",
+            (V151_FACTOR_NAME,),
+        ).fetchone()
+    return float(row[0]) if row else 1.0
+
+
+def v151_rebuild_player_race_context_profiles(db_path=DB_PATH):
+    """詳細履歴からレース種別適性を再構築する。
+
+    意図や『やる気』は推定せず、着順・実走・試走→実走変換・STの差だけを見る。
+    少数履歴は本人の全体成績へ寄せる縮小推定を使う。
+    """
+    v151_init_race_context_learning(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        hist = pd.read_sql_query("""
+            SELECT player_name,race_date,surface,race_type,rank,starters,
+                   trial_time,race_time,st
+            FROM v15_player_history_imports
+            WHERE player_name IS NOT NULL AND player_name<>''
+              AND rank BETWEEN 1 AND 8
+        """, con)
+    if hist.empty:
+        return {"players": 0, "profiles": 0, "rows": 0}
+
+    hist["player_key"] = hist["player_name"].map(_v151_name_key)
+    hist["context_key"] = hist["race_type"].map(v151_normalize_race_context)
+    hist["surface_key"] = hist["surface"].fillna("").astype(str).map(
+        lambda x: "湿" if any(k in x for k in ["湿", "雨", "斑"]) else "良"
+    )
+    for col in ["rank", "starters", "trial_time", "race_time", "st"]:
+        hist[col] = pd.to_numeric(hist[col], errors="coerce")
+
+    starters = hist["starters"].where(hist["starters"].between(3, 8), 8.0)
+    hist["finish_score"] = (1.0 - (hist["rank"] - 1.0) / (starters - 1.0)).clip(0.0, 1.0)
+    hist["top3"] = (hist["rank"] <= 3).astype(float)
+    hist["gap"] = hist["race_time"] - hist["trial_time"]
+
+    # 選手×走路ごとの基準から、当日の実走と試走→実走変換を評価。
+    base = hist.groupby(["player_key", "surface_key"], dropna=False).agg(
+        base_race=("race_time", "median"), base_gap=("gap", "median"), base_st=("st", "median")
+    ).reset_index()
+    hist = hist.merge(base, on=["player_key", "surface_key"], how="left")
+    hist["race_quality"] = (0.5 + (hist["base_race"] - hist["race_time"]) / 0.12).clip(0.0, 1.0).fillna(0.5)
+    hist["conversion_quality"] = (0.5 + (hist["base_gap"] - hist["gap"]) / 0.10).clip(0.0, 1.0).fillna(0.5)
+    hist["st_quality"] = (0.5 + (hist["base_st"] - hist["st"]) / 0.20).clip(0.0, 1.0).fillna(0.5)
+    hist["performance_score"] = (
+        hist["finish_score"] * 0.50 + hist["top3"] * 0.15 +
+        hist["race_quality"] * 0.20 + hist["conversion_quality"] * 0.10 +
+        hist["st_quality"] * 0.05
+    ).clip(0.0, 1.0)
+
+    overall = hist.groupby("player_key").agg(
+        overall_score=("performance_score", "mean"), overall_count=("performance_score", "size")
+    ).reset_index()
+    ctx = hist.groupby(["player_key", "player_name", "context_key"]).agg(
+        sample_count=("performance_score", "size"),
+        raw_context_score=("performance_score", "mean"),
+        top3_rate=("top3", "mean"),
+        avg_finish=("rank", "mean"),
+        avg_trial_race_gap=("gap", "mean"),
+    ).reset_index().merge(overall, on="player_key", how="left")
+    ctx["confidence"] = (ctx["sample_count"] / (ctx["sample_count"] + 6.0)).clip(0.0, 0.85)
+    ctx["shrunk_delta"] = (
+        (ctx["raw_context_score"] - ctx["overall_score"]) * ctx["confidence"]
+    ).clip(-0.12, 0.12)
+
+    def label_row(r):
+        d = float(r["shrunk_delta"])
+        context = r["context_key"]
+        if d <= -0.035:
+            return f"{context}で実走低下傾向"
+        if d >= 0.035:
+            return f"{context}で好走傾向"
+        return f"{context}は概ね通常どおり"
+    ctx["label"] = ctx.apply(label_row, axis=1)
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        con.execute("DELETE FROM v151_player_race_context_profiles")
+        con.executemany("""
+            INSERT INTO v151_player_race_context_profiles
+            (player_key,player_name,context_key,sample_count,overall_count,
+             raw_context_score,overall_score,shrunk_delta,confidence,top3_rate,
+             avg_finish,avg_trial_race_gap,label,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, [(
+            r.player_key, r.player_name, r.context_key, int(r.sample_count), int(r.overall_count),
+            float(r.raw_context_score), float(r.overall_score), float(r.shrunk_delta),
+            float(r.confidence), float(r.top3_rate), float(r.avg_finish),
+            None if pd.isna(r.avg_trial_race_gap) else float(r.avg_trial_race_gap), r.label, now
+        ) for r in ctx.itertuples(index=False)])
+        con.commit()
+    return {
+        "players": int(ctx["player_key"].nunique()),
+        "profiles": int(len(ctx)),
+        "rows": int(len(hist)),
+        "general_profiles": int((ctx["context_key"] == "一般戦").sum()),
+    }
+
+
+def v151_apply_race_context_adaptation(df, entries=None, meta=None, db_path=DB_PATH):
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    context = v151_normalize_race_context((meta or {}).get("レース種別") or (meta or {}).get("レース名"))
+    names = out.get("選手名", pd.Series("", index=out.index)).fillna("").astype(str)
+    keys = [_v151_name_key(x) for x in names]
+    if not any(keys):
+        return out
+    v151_init_race_context_learning(db_path)
+    placeholders = ",".join("?" for _ in set(keys))
+    with sqlite3.connect(str(db_path)) as con:
+        profiles = pd.read_sql_query(
+            f"SELECT * FROM v151_player_race_context_profiles WHERE context_key=? AND player_key IN ({placeholders})",
+            con, params=[context] + sorted(set(keys))
+        )
+    lookup = {str(r["player_key"]): r for _, r in profiles.iterrows()}
+    factor = v151_get_factor(db_path)
+    deltas=[]; confs=[]; counts=[]; labels=[]; bonuses=[]; gaps=[]
+    for key in keys:
+        r=lookup.get(key)
+        if r is None:
+            delta=0.0; conf=0.0; count=0; label=f"{context}履歴不足"; gap=np.nan
+        else:
+            delta=float(r["shrunk_delta"]); conf=float(r["confidence"]); count=int(r["sample_count"])
+            label=str(r["label"]); gap=r["avg_trial_race_gap"]
+        bonus=float(np.clip(delta * 2.0 * factor, -0.28, 0.28))
+        deltas.append(delta); confs.append(conf); counts.append(count); labels.append(label); bonuses.append(bonus); gaps.append(gap)
+    out["今回レース種別"] = context
+    out["レース種別履歴件数"] = counts
+    out["レース種別適性信頼度"] = confs
+    out["レース種別適性差"] = deltas
+    out["レース種別適性補正"] = bonuses
+    out["試走実走変換平均"] = gaps
+    out["レース種別適性傾向"] = labels
+    out["レース種別適性倍率"] = factor
+    if "改善後総合点" in out.columns:
+        score=pd.to_numeric(out["改善後総合点"],errors="coerce").replace([np.inf,-np.inf],np.nan).fillna(0.0)
+        out["改善後総合点"] = score + pd.Series(bonuses,index=out.index)
+        out["改善後順位"] = out["改善後総合点"].rank(method="min",ascending=False,na_option="bottom").fillna(len(out)).astype(int)
+    if "当日レース指数" in out.columns:
+        out["当日レース指数"] = pd.to_numeric(out["当日レース指数"],errors="coerce").fillna(50.0) + pd.Series(bonuses,index=out.index)*0.25
+    if "予測競走T" in out.columns:
+        t=pd.to_numeric(out["予測競走T"],errors="coerce").replace([np.inf,-np.inf],np.nan)
+        fallback=float(t.median()) if t.notna().any() else 3.60
+        out["予測競走T"] = np.round(t.fillna(fallback) - pd.Series(bonuses,index=out.index)*0.0010,4)
+    return out
+
+
+_V151_BASE_WEATHER_APPLY = v65_apply_weather_condition_learning
+
+def v65_apply_weather_condition_learning(df, entries=None, meta=None, db_path=None):
+    out = _V151_BASE_WEATHER_APPLY(df, entries, meta, db_path)
+    return v151_apply_race_context_adaptation(out, entries, meta, db_path or DB_PATH)
+
+
+_V151_BASE_SAVE_FEATURES = v40_save_prediction_features
+
+def v40_save_prediction_features(meta, df, db_path=DB_PATH):
+    key = _V151_BASE_SAVE_FEATURES(meta, df, db_path)
+    v151_init_race_context_learning(db_path)
+    car_col = "車" if "車" in df.columns else "車番"
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        con.execute("DELETE FROM v151_race_context_feature_snapshots WHERE race_key=?", (key,))
+        for _, row in df.iterrows():
+            car = pd.to_numeric(pd.Series([row.get(car_col)]), errors="coerce").iloc[0]
+            if pd.isna(car):
+                continue
+            con.execute("""
+                INSERT OR REPLACE INTO v151_race_context_feature_snapshots
+                (race_key,car_no,player_name,context_key,sample_count,confidence,context_delta,context_bonus,final_rank)
+                VALUES(?,?,?,?,?,?,?,?,?)
+            """, (
+                key,int(car),str(row.get("選手名","")),str(row.get("今回レース種別","")),
+                int(pd.to_numeric(pd.Series([row.get("レース種別履歴件数",0)]),errors="coerce").fillna(0).iloc[0]),
+                float(pd.to_numeric(pd.Series([row.get("レース種別適性信頼度",0)]),errors="coerce").fillna(0).iloc[0]),
+                float(pd.to_numeric(pd.Series([row.get("レース種別適性差",0)]),errors="coerce").fillna(0).iloc[0]),
+                float(pd.to_numeric(pd.Series([row.get("レース種別適性補正",0)]),errors="coerce").fillna(0).iloc[0]),
+                int(pd.to_numeric(pd.Series([row.get("改善後順位",len(df))]),errors="coerce").fillna(len(df)).iloc[0]),
+            ))
+        con.commit()
+    return key
+
+
+def v151_adjust_factor_after_result(meta, db_path=DB_PATH):
+    v151_init_race_context_learning(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        data = pd.read_sql_query("""
+            SELECT s.race_key,s.context_bonus,e.finish,e.result_status,b.registered_at
+            FROM v151_race_context_feature_snapshots s
+            JOIN result_entries e ON e.race_key=s.race_key AND e.car_no=s.car_no
+            JOIN v41_registration_batches b ON b.race_key=s.race_key AND b.status='active'
+            ORDER BY b.registered_at DESC
+        """, con)
+    if data.empty:
+        return {"before":v151_get_factor(db_path),"after":v151_get_factor(db_path),"usable_races":0}
+    rows=[]
+    for key,g in data.groupby("race_key",sort=False):
+        f=pd.to_numeric(g["finish"],errors="coerce")
+        status=g["result_status"].fillna("").astype(str)
+        valid=f.notna() & (f>=1) & ~status.str.contains("欠車|競走中止|落車|落妨|反妨|反則|不成立|失格|周誤|故障",regex=True)
+        gg=g.loc[valid].copy()
+        if len(gg)<3 or pd.to_numeric(gg["context_bonus"],errors="coerce").nunique()<=1:
+            continue
+        perf=(len(gg)+1)-pd.to_numeric(gg["finish"],errors="coerce")
+        rows.append(_v39_spearman(pd.to_numeric(gg["context_bonus"],errors="coerce"),perf))
+    before=v151_get_factor(db_path)
+    if len(rows)<5:
+        return {"before":before,"after":before,"usable_races":len(rows)}
+    evidence=float(np.nanmean(rows))
+    target=float(np.clip(1.0+evidence*0.30,0.70,1.30))
+    after=float(np.clip(before+np.clip((target-before)*0.12,-0.025,0.025),0.60,1.40))
+    now=datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(str(db_path),timeout=30) as con:
+        con.execute("UPDATE adaptive_weights SET current_weight=?,updated_at=?,update_count=update_count+1 WHERE feature_name=?",(after,now,V151_FACTOR_NAME))
+        con.commit()
+    return {"before":before,"after":after,"usable_races":len(rows),"evidence":evidence}
+
+
+_V151_BASE_ADJUST_RESULT = v41_adjust_weights_after_result
+
+def v41_adjust_weights_after_result(meta, results, db_path=DB_PATH):
+    base=_V151_BASE_ADJUST_RESULT(meta,results,db_path)
+    if isinstance(base,dict) and base.get("duplicate"):
+        return base
+    ctx=v151_adjust_factor_after_result(meta,db_path)
+    if not isinstance(base,dict):
+        base={"message":str(base)}
+    base=dict(base)
+    base["race_context_calibration"]=ctx
+    base["note"]=(str(base.get("note",""))+" レース種別適性倍率も結果から小幅校正しました。").strip()
+    return base

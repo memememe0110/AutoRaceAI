@@ -26,7 +26,7 @@ _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver148｜DB57再学習・fragment定義漏れ修正")
+st.caption("Ver150｜一般予定通知 5分前・10分前・両方に対応")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -272,21 +272,24 @@ def _v139_ntfy_request(topic: str, message: str, *, notify_at: datetime | None =
     if any(ch in clean_topic for ch in "/?# "):
         raise ValueError("トピック名には空白や / ? # を使わないでください。")
 
-    endpoint = f"{GENERAL_REMINDER_NTFY_BASE}/{urllib.parse.quote(clean_topic, safe='')}"
-    headers = {
-        "Title": urllib.parse.quote("一般予定通知", safe=""),
-        "Priority": "high",
-        "Tags": "bell",
-        "Content-Type": "text/plain; charset=utf-8",
+    # 日本語タイトルをHTTPヘッダーへ入れると、環境によってLatin-1変換や
+    # URLエンコード文字列の表示が起きるため、UTF-8のJSON本文で送信する。
+    endpoint = GENERAL_REMINDER_NTFY_BASE
+    payload = {
+        "topic": clean_topic,
+        "title": "一般予定通知",
+        "message": str(message),
+        "priority": 4,
+        "tags": ["bell"],
     }
     if notify_at is not None:
-        headers["At"] = str(int(notify_at.timestamp()))
+        payload["at"] = str(int(notify_at.timestamp()))
 
     request = urllib.request.Request(
         endpoint,
-        data=str(message).encode("utf-8", errors="strict"),
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="strict"),
         method="POST",
-        headers=headers,
+        headers={"Content-Type": "application/json; charset=utf-8"},
     )
     try:
         with urllib.request.urlopen(request, timeout=8) as response:
@@ -311,14 +314,17 @@ def _v139_general_reminder_defaults() -> None:
     st.session_state.setdefault("v139_reminder_title", "")
     st.session_state.setdefault("v139_reminder_date", base.date())
     st.session_state.setdefault("v139_reminder_time", base.time().replace(second=0, microsecond=0))
-    st.session_state.setdefault("v139_reminder_topic", "")
+    # 初期トピックはユーザー指定の notify。既存セッションが空欄でも補完する。
+    if not str(st.session_state.get("v139_reminder_topic", "")).strip():
+        st.session_state["v139_reminder_topic"] = "notify"
+    st.session_state.setdefault("v150_reminder_timing", "10分前")
 
 
 def v123_render_general_reminder_tab() -> None:
     """Streamlit標準UIで一般予定通知を表示する。ダイアログ内だけ再実行される。"""
     _v139_general_reminder_defaults()
 
-    st.caption("一般予定専用です。開始10分前にntfyへ通知します。")
+    st.caption("一般予定専用です。開始10分前・5分前、または両方を選べます。")
     st.text_area(
         "予定情報を貼り付け（任意）",
         key="v139_reminder_source",
@@ -353,6 +359,12 @@ def v123_render_general_reminder_tab() -> None:
         placeholder="推測されにくい長い文字列",
         help="iPhoneのntfyアプリで同じトピックを購読してください。",
     )
+    st.segmented_control(
+        "通知タイミング",
+        options=["10分前", "5分前", "10分前と5分前"],
+        key="v150_reminder_timing",
+        selection_mode="single",
+    )
 
     test_col, reserve_col = st.columns(2)
     with test_col:
@@ -370,7 +382,8 @@ def v123_render_general_reminder_tab() -> None:
             st.rerun(scope="fragment")
 
     with reserve_col:
-        if st.button("10分前通知を予約", type="primary", use_container_width=True, key="v139_reserve_ntfy"):
+        timing_label = st.session_state.get("v150_reminder_timing", "10分前") or "10分前"
+        if st.button("通知を予約", type="primary", use_container_width=True, key="v139_reserve_ntfy"):
             try:
                 title = str(st.session_state.get("v139_reminder_title", "")).strip()
                 if not title:
@@ -380,23 +393,39 @@ def v123_render_general_reminder_tab() -> None:
                     st.session_state["v139_reminder_time"],
                     tzinfo=GENERAL_REMINDER_JST,
                 )
-                notify_dt = event_dt - timedelta(minutes=10)
+                selected = st.session_state.get("v150_reminder_timing", "10分前") or "10分前"
+                lead_minutes = {
+                    "10分前": [10],
+                    "5分前": [5],
+                    "10分前と5分前": [10, 5],
+                }.get(selected, [10])
                 now = datetime.now(GENERAL_REMINDER_JST)
-                if notify_dt <= now:
-                    raise ValueError("通知時刻が過ぎています。開始時刻を10分以上先にしてください。")
-                if notify_dt - now > timedelta(days=3):
+                notify_times = [(minutes, event_dt - timedelta(minutes=minutes)) for minutes in lead_minutes]
+                expired = [minutes for minutes, dt in notify_times if dt <= now]
+                if expired:
+                    minimum = max(lead_minutes)
+                    raise ValueError(f"通知時刻が過ぎています。開始時刻を{minimum}分以上先にしてください。")
+                if any(dt - now > timedelta(days=3) for _, dt in notify_times):
                     raise ValueError("ntfy.shの予約通知は最大3日先です。")
-                message = f"{title}\n開始時刻: {event_dt.strftime('%Y/%m/%d %H:%M')}"
+
+                receipts = []
                 with st.spinner("通知を予約中…"):
-                    reply = _v139_ntfy_request(
-                        st.session_state.get("v139_reminder_topic", ""),
-                        message,
-                        notify_at=notify_dt,
-                    )
-                receipt = f" / 受付ID: {reply.get('id')}" if reply.get("id") else ""
+                    for minutes, notify_dt in notify_times:
+                        message = (
+                            f"{title}\n"
+                            f"開始{minutes}分前です。\n"
+                            f"開始時刻: {event_dt.strftime('%Y/%m/%d %H:%M')}"
+                        )
+                        reply = _v139_ntfy_request(
+                            st.session_state.get("v139_reminder_topic", ""),
+                            message,
+                            notify_at=notify_dt,
+                        )
+                        receipt = f" / 受付ID: {reply.get('id')}" if reply.get("id") else ""
+                        receipts.append(f"{notify_dt.strftime('%Y/%m/%d %H:%M')}（{minutes}分前）{receipt}")
                 st.session_state["v139_reminder_message"] = (
                     "success",
-                    f"{notify_dt.strftime('%Y/%m/%d %H:%M')} に通知を予約しました{receipt}",
+                    "通知を予約しました：" + " ／ ".join(receipts),
                 )
             except Exception as exc:
                 st.session_state["v139_reminder_message"] = ("error", str(exc))
@@ -1468,7 +1497,7 @@ def render_last_result_analysis(view: dict) -> None:
 
 # 一般予定通知はメインタブから完全分離する。
 # launcher は fragment、通知本体は dialog 内で動くため、開閉・入力・予約で他画面を再実行しない。
-@st.dialog("🔔 一般予定の10分前通知", width="large")
+@st.dialog("🔔 一般予定通知", width="large")
 def _v132_general_reminder_dialog():
     v123_render_general_reminder_tab()
 
@@ -1692,7 +1721,8 @@ with prediction_tab:
                 "スタート伸び指数", "ゴール前伸び指数", "安定上位指数",
                 "混戦突破適性", "逃げ判定", "初周先頭推定", "逃げ残り推定", "逃切り推定", "逃げ履歴件数", "逃げ履歴補正",
                 "展開タイプ_実測", "展開履歴件数", "展開学習補正", "熱走路帯", "高温履歴件数", "熱走路適性", "熱走路学習補正", "Ver60総合補正",
-                "同ハンデ内枠補正", "車中期成績補正", "試走偏差補正", "高温位置補正", "Ver24展開穴補正", "選手別条件適性補正", "条件適性根拠", "条件一致最大件数", "条件適性信頼度", "改善後総合点",
+                "同ハンデ内枠補正", "車中期成績補正", "試走偏差補正", "高温位置補正", "Ver24展開穴補正", "選手別条件適性補正", "条件適性根拠", "条件一致最大件数", "条件適性信頼度",
+                "今回レース種別", "レース種別履歴件数", "レース種別適性信頼度", "レース種別適性差", "レース種別適性補正", "レース種別適性傾向", "改善後総合点",
             ] if c in df.columns]
             result = df[cols].sort_values(["改善後順位", "車"]).reset_index(drop=True)
             st.subheader("予測順位")
@@ -1759,6 +1789,27 @@ with prediction_tab:
                     st.caption("Ver96は展開層・全履歴層・選手相性を分けて表示します。補正は縮小・上限制御され、少数データだけで順位が暴れない設計です。")
                 except Exception as exc:
                     st.warning(f"開催場重みを表示できませんでした: {exc}")
+
+            with st.expander("🎯 レース種別適性・一般戦傾向", expanded=True):
+                type_cols = [c for c in [
+                    "車", "選手名", "今回レース種別", "レース種別履歴件数",
+                    "レース種別適性信頼度", "レース種別適性差", "レース種別適性補正",
+                    "試走実走変換平均", "レース種別適性傾向"
+                ] if c in df.columns]
+                if type_cols:
+                    type_view = df[type_cols].sort_values(["レース種別適性補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                    if "レース種別適性信頼度" in type_view.columns:
+                        type_view["レース種別適性信頼度"] = pd.to_numeric(type_view["レース種別適性信頼度"], errors="coerce") * 100.0
+                    st.dataframe(type_view, use_container_width=True, hide_index=True, column_config={
+                        "レース種別適性信頼度": st.column_config.NumberColumn(format="%.1f%%"),
+                        "レース種別適性差": st.column_config.NumberColumn(format="%+.3f"),
+                        "レース種別適性補正": st.column_config.NumberColumn(format="%+.3f"),
+                        "試走実走変換平均": st.column_config.NumberColumn(format="%.3f"),
+                    })
+                else:
+                    st.info("レース種別適性データを取得できませんでした。")
+                st.caption("『やる気』や意図は断定せず、一般戦・予選・準決勝系・優勝戦・選抜戦ごとの実走差を縮小推定します。履歴が少ない選手は本人の通常成績へ強く寄せます。")
+                st.caption("次走予定や調整目的は、未来の出走データがDBに十分揃うまでは補正に使いません。")
 
             with st.expander("🏍️ 逃げ役・逃げ残り診断", expanded=True):
                 escape_cols = [c for c in [
