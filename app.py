@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver199｜DB71検証・確率整合順位・着順別評価・前後位置学習・6/7/8車回収率合成")
+st.caption("Ver201｜DB72基準・券種別高確率本線保護・6/7/8車回収率合成")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2041,6 +2041,61 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             "target": target_cover,
         }
 
+    # Ver201: 合成最適化で高確率本線まで削らないよう、券種ごとに保護候補を設定する。
+    # 点数を固定せず、順位と確率の両方で判定する。保護候補は回収率判定には含めるが、
+    # 最終構成の組み替え処理では削除対象にしない。
+    protected_ids = set()
+    protected_reasons = {}
+
+    def protect_ticket(ticket, reason):
+        key = (str(ticket.get("type")), str(ticket.get("combo")))
+        protected_ids.add(key)
+        protected_reasons.setdefault(key, []).append(str(reason))
+        ticket["protected"] = True
+
+    by_type = {}
+    for ticket in candidates:
+        by_type.setdefault(ticket["type"], []).append(ticket)
+    for rows in by_type.values():
+        rows.sort(key=lambda t: (float(t.get("probability", 0.0)), float(t.get("odds", 0.0))), reverse=True)
+
+    # 三連単は全車立てで上位2点を必ず保護。上位と差が小さい候補も最大4点まで保護する。
+    tri_rows_all = by_type.get("三連単", [])
+    if tri_rows_all:
+        tri_top = float(tri_rows_all[0].get("probability", 0.0))
+        for idx, ticket in enumerate(tri_rows_all[:4]):
+            prob = float(ticket.get("probability", 0.0))
+            if idx < 2 or (prob >= 2.5 and prob >= tri_top * 0.55):
+                protect_ticket(ticket, f"三連単{idx + 1}位・高確率本線")
+
+    # 三連複は広い結果を1点で拾うため、上位2点と単独確率閾値以上を保護する。
+    trio_threshold = {6: 12.0, 7: 10.0, 8: 8.0}[starter_count]
+    for idx, ticket in enumerate(by_type.get("三連複", [])):
+        prob = float(ticket.get("probability", 0.0))
+        if idx < 2 or prob >= trio_threshold:
+            protect_ticket(ticket, f"三連複{idx + 1}位・確率{prob:.2f}%")
+
+    # 2連単は最上位を保護し、2位も首位との差が小さい場合は残す。
+    exacta_rows = by_type.get("2連単", [])
+    if exacta_rows:
+        exacta_top = float(exacta_rows[0].get("probability", 0.0))
+        for idx, ticket in enumerate(exacta_rows[:2]):
+            prob = float(ticket.get("probability", 0.0))
+            if idx == 0 or (prob >= 6.0 and prob >= exacta_top * 0.55):
+                protect_ticket(ticket, f"2連単{idx + 1}位・高確率本線")
+
+    # 2連複も広い結果を拾うため上位1点を保護。2位は確率が十分高い場合に保護する。
+    quinella_threshold = {6: 15.0, 7: 12.0, 8: 10.0}[starter_count]
+    for idx, ticket in enumerate(by_type.get("2連複", [])[:2]):
+        prob = float(ticket.get("probability", 0.0))
+        if idx == 0 or prob >= quinella_threshold:
+            protect_ticket(ticket, f"2連複{idx + 1}位・確率{prob:.2f}%")
+
+    protected_tickets = [
+        ticket for ticket in candidates
+        if (str(ticket.get("type")), str(ticket.get("combo"))) in protected_ids
+    ]
+
     tri_candidates = [c for c in candidates if c["type"] == "三連単"]
     if len(tri_candidates) < 2:
         return {"available": False, "reason": "三連単上位候補のオッズが2点以上必要です。"}
@@ -2229,6 +2284,20 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     )
     selected = list(selected)
 
+    # Ver201: 高確率本線を最終候補へ戻す。追加後の購入総額を含めて再評価し、
+    # 回収率が悪ければ判定自体を下げるが、本線を黙って削ることはしない。
+    protected_add_notes = []
+    selected_ids = {(str(t.get("type")), str(t.get("combo"))) for t in selected}
+    for ticket in protected_tickets:
+        key = (str(ticket.get("type")), str(ticket.get("combo")))
+        if key not in selected_ids:
+            selected.append(ticket)
+            selected_ids.add(key)
+            protected_add_notes.append(
+                f"{ticket['type']} {ticket['combo']}（モデル{float(ticket.get('probability',0.0)):.2f}%）を高確率本線として保護"
+            )
+    metrics = evaluate(selected)
+
     # Ver192: 単独ではガミになる2連系を、同じ展開に含まれる三連単へ分解して比較する。
     # 的中範囲を極端に捨てず、黒字的中率・期待倍率が改善する場合だけ差し替える。
     replacement_notes = []
@@ -2237,6 +2306,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         base_cost = float(base_metrics.get("cost", len(selected) * 100.0))
         best_swap = None
         for low_ticket in list(selected):
+            if low_ticket.get("protected"):
+                continue
             if low_ticket.get("type") not in ("2連単", "2連複"):
                 continue
             # 現在の総点数に対し、この券だけの払戻では回収できないものを対象にする。
@@ -2303,6 +2374,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         for quinella_ticket in list(selected):
             if quinella_ticket.get("type") != "2連複":
                 continue
+            if quinella_ticket.get("protected"):
+                continue
             try:
                 qa, qb = [int(x) for x in str(quinella_ticket.get("combo", "")).split("-")[:2]]
             except Exception:
@@ -2344,6 +2417,10 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                     ("2連単表裏", [forward, reverse]),
                     ("2連複＋2連単表裏", [quinella_ticket, forward, reverse]),
                 ])
+
+            # 同一ペア内に保護された2連単がある場合、その本線を外す比較は行わない。
+            if any(t.get("protected") for t in related):
+                continue
 
             current_ids = {(t.get("type"), t.get("combo")) for t in related}
             current_name = "現在構成"
@@ -2501,6 +2578,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "learning": learning, "pool_summary": pool_summary,
         "tri_seed_points": int(tri_seed_points),
         "replacement_notes": replacement_notes,
+        "protected_add_notes": protected_add_notes,
+        "protected_count": len([t for t in selected if t.get("protected")]),
         "tri_seed_cover": float(tri_seed_metrics.get("cover", 0.0)),
         "tri_seed_black": float(tri_seed_metrics.get("black", 0.0)),
         **metrics,
@@ -2521,6 +2600,10 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     except Exception as exc:
         st.warning(f"合成プランをDBへ保存できませんでした: {exc}")
     st.subheader(f"{result['icon']} 合成参考：{result['points']}点・{result['grade']}")
+    if result.get("protected_add_notes"):
+        st.info(f"高確率本線を{int(result.get('protected_count', 0))}点保護しています。")
+        for note in result.get("protected_add_notes", []):
+            st.caption(f"・{note}")
     if result.get("replacement_notes"):
         st.success("ガミ保険を三連単へ置換しました。")
         for note in result.get("replacement_notes", []):
@@ -2589,8 +2672,9 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
                 combos.append(combo)
             solo_gami = float(r["odds"]) * 100.0 < float(result["cost"])
             note = " / 単独的中ではガミ注意" if solo_gami else ""
+            protect_note = " / 本線保護" if r.get("protected") else ""
             ticket_lines.append(
-                f"{combo}  ({r['odds']:.1f}倍 / モデル{r['probability']:.2f}%{note})"
+                f"{combo}  ({r['odds']:.1f}倍 / モデル{r['probability']:.2f}%{protect_note}{note})"
             )
         st.code("\n".join(ticket_lines), language=None)
 
@@ -2628,6 +2712,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     )
     st.caption(
         "判定は黒字的中率を最優先し、的中時の黒字割合・ガミ割合・平均合成倍率・モデル期待倍率を使用します。"
+        "券種別の高確率本線は先に保護し、合成最適化の都合だけで削除しません。"
         "低配当保険は、ほかの券種との同時的中を含めて黒字確率を増やす場合だけ採用します。"
         "単独でガミになる2連系は三連単1〜4点への分解を比較し、2連複は片側2連単・表裏2連単・2連複との重ね買いを全比較し、合成全体が改善する構成だけ採用します。"
     )
