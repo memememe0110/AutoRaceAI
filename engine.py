@@ -2517,6 +2517,10 @@ def simulate_detailed(df, trials, seed, track_temp=30.0):
     scenario_names = np.array(["先行縦長", "前残り", "混戦", "追い込み"], dtype=object)
     scenario_prob = np.array([0.36, 0.12, 0.28, 0.24], dtype=float)
     scenario_prob += heat_index * np.array([-0.055, 0.185, -0.040, -0.090])
+    # Ver197: 時系列検証で有効な場合だけ、同日直前結果を展開確率へ反映。
+    _day = globals().get("V197_ACTIVE_DAY_TREND") or {}
+    _shift = float(_day.get("effective_shift", 0.0) or 0.0)
+    scenario_prob += np.array([0.20*_shift, 0.80*_shift, 0.0, -1.00*_shift], dtype=float)
     scenario_prob = np.clip(scenario_prob, 0.03, None)
     scenario_prob /= scenario_prob.sum()
     scenario_ids = rng.choice(4, size=int(trials), p=scenario_prob)
@@ -6617,6 +6621,7 @@ def ver16_run_prediction(text, trials=10000, seed=20260719, manual_excluded=None
     # run_model内でも当日出走表の補助指標を参照できるよう、一回の予測中だけ保持する。
     globals()["LATEST_ENTRY_STATS"] = entries.copy()
     globals()["LATEST_RACE_META"] = dict(meta)
+    globals()["V197_ACTIVE_DAY_TREND"] = v197_same_day_trend_profile(meta, DB_PATH)
     track_temp = ver16_safe_float(meta.get("走路温度"), 30.0)
     filename = f"AutoRaceAI_Ver16_{meta.get('開催場') or 'race'}_{meta.get('レース') or ''}R.xlsx"
     df, bets, output = run_model(
@@ -18200,3 +18205,185 @@ def v40_apply_adaptive_weights(df, db_path=DB_PATH):
         comments.append(f"{head}。検証適用率{profile.get('blend',1.0)*100:.0f}%／主因: {detail}")
     out["重み調整コメント"] = comments
     return out
+
+# ============================================================
+# Ver196: 表示順位と本シミュレーション確率の一本化・着順別評価
+# ============================================================
+def v196_apply_probability_aligned_ranks(df, finish_prob):
+    """本シミュレーションの着順確率から、1着・連対・3着候補の順位を作る。
+
+    従来の総合点順位は診断用に保持し、画面上の最終順位は1着率と整合させる。
+    三連単確率そのものは既にシミュレーション結果なので再加工しない。
+    """
+    if df is None or df.empty or finish_prob is None or finish_prob.empty:
+        return df
+    out = df.copy()
+    fp = finish_prob.copy()
+    car_col = "車" if "車" in fp.columns else ("車番" if "車番" in fp.columns else None)
+    if car_col is None or "1着率" not in fp.columns:
+        return out
+    fp[car_col] = pd.to_numeric(fp[car_col], errors="coerce")
+    fp = fp.dropna(subset=[car_col]).copy()
+    fp[car_col] = fp[car_col].astype(int)
+    for c in ["1着率", "2着率", "3着率", "3着内率"]:
+        if c not in fp.columns:
+            fp[c] = 0.0
+        fp[c] = pd.to_numeric(fp[c], errors="coerce").fillna(0.0)
+    if "3着内率" not in finish_prob.columns:
+        fp["3着内率"] = fp[["1着率", "2着率", "3着率"]].sum(axis=1)
+
+    keyed = fp.set_index(car_col)
+    cars = pd.to_numeric(out.get("車"), errors="coerce")
+    p1 = cars.map(keyed["1着率"]).fillna(0.0)
+    p2 = cars.map(keyed["2着率"]).fillna(0.0)
+    p3 = cars.map(keyed["3着率"]).fillna(0.0)
+    top2 = p1 + p2
+    top3 = p1 + p2 + p3
+
+    if "改善後順位" in out.columns:
+        out["総合点順位_従来"] = pd.to_numeric(out["改善後順位"], errors="coerce")
+    out["本番1着率"] = p1.round(4)
+    out["本番2着率"] = p2.round(4)
+    out["本番3着率"] = p3.round(4)
+    out["本番連対率"] = top2.round(4)
+    out["本番3着内率"] = top3.round(4)
+    out["1着候補順位"] = p1.rank(method="min", ascending=False).astype(int)
+    out["連対候補順位"] = top2.rank(method="min", ascending=False).astype(int)
+    # 3着専用は純粋な3着率を中心に、着外へ散りにくい選手を少し加味。
+    third_score = p3 * 0.75 + top3 * 0.25
+    out["3着候補順位"] = third_score.rank(method="min", ascending=False).astype(int)
+    out["確率整合順位"] = out["1着候補順位"]
+    out["改善後順位"] = out["確率整合順位"]
+    out["順位整合メモ"] = [
+        f"1着{a:.2f}%・連対{b:.2f}%・3着内{c:.2f}%"
+        for a, b, c in zip(p1, top2, top3)
+    ]
+    return out
+
+
+def v196_probability_rank_validation(db_path=DB_PATH):
+    """保存済み予測で、従来順位と1着率順位を比較する診断。"""
+    result = {"race_count": 0, "baseline_top3": None, "aligned_top3": None,
+              "baseline_winner_rank": None, "aligned_winner_rank": None}
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            snap = pd.read_sql_query("SELECT * FROM prediction_snapshots", con)
+            actual = pd.read_sql_query(
+                "SELECT race_key,car_no,finish FROM result_entries WHERE finish BETWEEN 1 AND 8", con
+            )
+        if snap.empty or actual.empty:
+            return result
+        snap = snap.sort_values("created_at").drop_duplicates(["race_key", "car_no"], keep="last")
+        data = snap.merge(actual, on=["race_key", "car_no"], how="inner")
+        if data.empty:
+            return result
+        data["aligned_rank"] = data.groupby("race_key")["win_prob"].rank(method="first", ascending=False)
+        rows = []
+        for _, g in data.groupby("race_key"):
+            actual_top = set(g.loc[g["finish"] <= 3, "car_no"].astype(int))
+            if len(actual_top) < 3 or not (g["finish"] == 1).any():
+                continue
+            base_top = set(g.nsmallest(3, "predicted_rank")["car_no"].astype(int))
+            aligned_top = set(g.nsmallest(3, "aligned_rank")["car_no"].astype(int))
+            winner = g.loc[g["finish"] == 1].iloc[0]
+            rows.append((len(actual_top & base_top), len(actual_top & aligned_top),
+                         float(winner["predicted_rank"]), float(winner["aligned_rank"])))
+        if not rows:
+            return result
+        arr = np.asarray(rows, dtype=float)
+        result.update({
+            "race_count": int(len(arr)),
+            "baseline_top3": float(arr[:,0].mean()),
+            "aligned_top3": float(arr[:,1].mean()),
+            "baseline_winner_rank": float(arr[:,2].mean()),
+            "aligned_winner_rank": float(arr[:,3].mean()),
+        })
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+# ============================================================
+# Ver197: 当日開催の前残り・追い込み傾向を時系列検証して反映
+# ============================================================
+def _v197_race_no(value):
+    m = re.search(r"(\d+)", str(value or ""))
+    return int(m.group(1)) if m else None
+
+def _v197_result_flow_rows(db_path=DB_PATH):
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            rr = pd.read_sql_query("SELECT race_key,race_date,venue,race_no,track_temp,surface FROM result_races WHERE COALESCE(learning_eligible,1)=1", con)
+            en = pd.read_sql_query("SELECT race_key,finish,handicap FROM result_entries WHERE finish BETWEEN 1 AND 8", con)
+        if rr.empty or en.empty:
+            return pd.DataFrame()
+        rr["race_no_num"] = rr["race_no"].map(_v197_race_no)
+        en["handicap_num"] = pd.to_numeric(en["handicap"].astype(str).str.replace("m", "", regex=False), errors="coerce")
+        data = en.merge(rr, on="race_key", how="inner")
+        rows=[]
+        for key,g in data.groupby("race_key"):
+            g=g.dropna(subset=["finish","handicap_num"])
+            if g.empty or not (g["finish"]==1).any() or (g["finish"]<=3).sum()<3:
+                continue
+            lo=float(g["handicap_num"].min()); hi=float(g["handicap_num"].max())
+            if hi <= lo:
+                continue
+            winner=g.loc[g["finish"]==1].iloc[0]; top=g.loc[g["finish"]<=3]
+            win_norm=(float(winner["handicap_num"])-lo)/(hi-lo)
+            top_norm=float(((top["handicap_num"]-lo)/(hi-lo)).mean())
+            front_score=float(np.clip(1.0-(0.65*win_norm+0.35*top_norm),0.0,1.0))
+            r=g.iloc[0]
+            rows.append({"race_key":key,"race_date":str(r["race_date"]),"venue":str(r["venue"]),"race_no":_v197_race_no(r["race_no_num"]),"track_temp":float(r["track_temp"] or 0),"surface":str(r["surface"] or ""),"front_score":front_score})
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows).sort_values(["race_date","venue","race_no","race_key"])
+    except Exception:
+        return pd.DataFrame()
+
+def v197_same_day_validation(db_path=DB_PATH):
+    df=_v197_result_flow_rows(db_path)
+    result={"race_count":0,"baseline_mae":None,"day_mae":None,"blend":0.0,"enabled":False}
+    if df.empty or len(df)<30:
+        result["reason"]="比較可能な結果が不足"; return result
+    rec=[]
+    for _,row in df.iterrows():
+        prior=df[(df["race_date"]<row["race_date"]) | ((df["race_date"]==row["race_date"]) & (df["venue"]==row["venue"]) & (df["race_no"]<row["race_no"]))]
+        venue=prior[prior["venue"]==row["venue"]].tail(40)
+        day=prior[(prior["race_date"]==row["race_date"]) & (prior["venue"]==row["venue"])]
+        if venue.empty or len(day)<2:
+            continue
+        base=float(venue["front_score"].mean()); day_mean=float(day["front_score"].mean())
+        conf=min(0.25, len(day)/8.0*0.25)
+        pred=base*(1-conf)+day_mean*conf
+        rec.append((float(row["front_score"]),base,pred))
+    if not rec:
+        result["reason"]="同日比較可能レースなし"; return result
+    a=np.asarray(rec,float)
+    bmae=float(np.mean(np.abs(a[:,0]-a[:,1]))); dmae=float(np.mean(np.abs(a[:,0]-a[:,2])))
+    blend=1.0 if dmae+0.002 < bmae else 0.0
+    result.update({"race_count":len(a),"baseline_mae":bmae,"day_mae":dmae,"blend":blend,"enabled":bool(blend),"reason":("時系列検証で改善したため反映" if blend else "時系列検証で改善未確認のため反映停止")})
+    return result
+
+def v197_same_day_trend_profile(meta, db_path=DB_PATH):
+    df=_v197_result_flow_rows(db_path)
+    venue=str((meta or {}).get("開催場") or "").strip()
+    date=str((meta or {}).get("日付") or (meta or {}).get("開催日") or "").strip()
+    race_no=_v197_race_no((meta or {}).get("レース") or (meta or {}).get("R"))
+    out={"venue":venue,"race_date":date,"race_no":race_no,"prior_races":0,"front_score":0.5,"raw_shift":0.0,"effective_shift":0.0,"blend":0.0,"label":"中立","reason":"当日結果なし"}
+    if df.empty or not venue or not date or race_no is None:
+        return out
+    prior_day=df[(df["venue"]==venue)&(df["race_date"]==date)&(df["race_no"]<race_no)]
+    prior_base=df[(df["venue"]==venue)&(df["race_date"]<date)].tail(40)
+    out["prior_races"]=int(len(prior_day))
+    if prior_day.empty:
+        return out
+    day_mean=float(prior_day["front_score"].mean()); base=float(prior_base["front_score"].mean()) if not prior_base.empty else 0.5
+    raw=float(np.clip(day_mean-base,-0.35,0.35)); val=v197_same_day_validation(db_path)
+    sample_conf=min(1.0,len(prior_day)/6.0)
+    effective=float(np.clip(raw*0.22*sample_conf*float(val.get("blend",0.0)),-0.07,0.07))
+    label="前残り寄り" if effective>0.012 else ("追い込み寄り" if effective<-0.012 else "中立")
+    out.update({"front_score":day_mean,"venue_baseline":base,"raw_shift":raw,"effective_shift":effective,"blend":float(val.get("blend",0.0)),"label":label,"validation":val,"reason":f"直前{len(prior_day)}Rの前残り指数{day_mean:.3f}／会場基準{base:.3f}。{val.get('reason','')}"})
+    return out
+
+def v197_get_active_day_trend():
+    return dict(globals().get("V197_ACTIVE_DAY_TREND") or {})

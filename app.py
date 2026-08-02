@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver194｜DB70検証・2連複と片側2連単の重ね買い含む全構成比較・ガミ保険分解・8車黒字的中重視合成")
+st.caption("Ver197｜DB71検証・確率整合順位・着順別評価・当日展開傾向ゲート・8車黒字的中重視合成")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1904,6 +1904,31 @@ def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict) -> str:
     return plan_hash
 
 
+def _v195_return_calibration(db_path: str) -> dict:
+    """保存済み合成のモデル回収率と実回収率の乖離を、少数標本では弱く反映する。"""
+    _v187_ensure_mixed_learning_tables(db_path)
+    _v187_sync_mixed_feedback(db_path)
+    out = {"samples": 0, "raw_factor": 1.0, "factor": 1.0, "actual_return": None}
+    try:
+        with sqlite3.connect(db_path) as con:
+            row = con.execute("""
+                SELECT COUNT(*), SUM(f.payout_yen), SUM(f.cost_yen),
+                       SUM(f.cost_yen * COALESCE(r.model_return_rate,0) / 100.0)
+                FROM v187_mixed_plan_feedback f
+                JOIN v187_mixed_plan_runs r
+                  ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+            """).fetchone()
+        n, payout, cost, model_payout = row if row else (0,0,0,0)
+        n=int(n or 0); payout=float(payout or 0); cost=float(cost or 0); model_payout=float(model_payout or 0)
+        raw = payout/model_payout if model_payout>0 else 1.0
+        raw = min(1.10, max(0.35, raw))
+        reliability=min(1.0, n/30.0)
+        factor=1.0+(raw-1.0)*reliability
+        out.update(samples=n, raw_factor=raw, factor=factor, actual_return=(payout/cost*100.0 if cost>0 else None))
+    except Exception:
+        pass
+    return out
+
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
     """8車立て向けの役割分担型・複数券種合成。
 
@@ -2395,48 +2420,53 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     replacement_notes.extend(pair_mix_notes)
 
     metrics = evaluate(selected)
+    calibration = _v195_return_calibration(engine.DB_PATH)
+    adjusted_expected_multiple = float(metrics.get("model_expected_multiple", 0.0)) * float(calibration.get("factor", 1.0))
+    adjusted_return_rate = adjusted_expected_multiple * 100.0
+    metrics["adjusted_expected_multiple"] = adjusted_expected_multiple
+    metrics["adjusted_return_rate"] = adjusted_return_rate
+    metrics["return_calibration"] = calibration
 
-    # 的中率だけでなく、的中時に黒字となる割合と合成倍率を主軸に評価する。
+    # 的中率だけでなく、的中時に黒字となる割合と実績補正後回収率を主軸に評価する。
     gami_share = float(metrics.get("gami_share_of_hits", 0.0))
     black_share = float(metrics.get("black_share_of_hits", 0.0))
     avg_multiple = float(metrics.get("hit_average_multiple", 0.0))
     expected_multiple = float(metrics.get("model_expected_multiple", 0.0))
+    adjusted_multiple = float(metrics.get("adjusted_expected_multiple", expected_multiple))
 
-    if avg_multiple >= 1.80 and expected_multiple >= 1.05 and black_share >= 68.0 and gami_share <= 32.0:
-        multiple_grade = "合成倍率が高い"
-    elif avg_multiple >= 1.25 and expected_multiple >= 0.85 and black_share >= 52.0:
-        multiple_grade = "合成倍率は良好"
-    elif avg_multiple >= 1.00 and black_share >= 45.0:
-        multiple_grade = "合成倍率は標準"
+    if adjusted_multiple >= 1.15 and avg_multiple >= 1.35 and black_share >= 68.0 and gami_share <= 25.0:
+        multiple_grade = "実績補正後も回収率基準を超える"
+    elif adjusted_multiple >= 1.00 and black_share >= 55.0:
+        multiple_grade = "実績補正後100%前後"
     else:
-        multiple_grade = "ガミ注意"
+        multiple_grade = "実績補正後100%未満"
 
-    if (metrics["black"] < 15.0 or gami_share >= 42.0 or avg_multiple < 1.05
-            or expected_multiple < 0.82):
+    samples = int(calibration.get("samples", 0))
+    if adjusted_multiple < 0.95 or metrics["black"] < 15.0 or gami_share >= 42.0 or avg_multiple < 1.05:
         grade, icon = "非推奨", "⛔"
         reason = (
-            f"的中時のガミ割合が{gami_share:.1f}%で、平均合成倍率は{avg_multiple:.2f}倍です。"
-            "的中範囲を作れても購入総額を回収しにくい構成です。"
+            f"実績補正後の参考回収率は{adjusted_return_rate:.1f}%です。"
+            "的中範囲があっても、長期的に購入総額を回収しにくい構成です。"
         )
-    elif (metrics["diversity"] >= 2 and metrics["black"] >= 30.0
-          and black_share >= 68.0 and gami_share <= 25.0
-          and avg_multiple >= 1.35 and expected_multiple >= 1.05):
-        grade, icon = "黒字合成推奨", "✅"
+    elif (adjusted_multiple >= 1.15 and metrics["diversity"] >= 2 and metrics["black"] >= 30.0
+          and black_share >= 68.0 and gami_share <= 20.0 and avg_multiple >= 1.35
+          and samples >= 15):
+        grade, icon = "回収率基準を満たす", "✅"
         reason = (
-            f"的中時の黒字割合が{black_share:.1f}%、平均合成倍率が{avg_multiple:.2f}倍です。"
-            "券種ごとの保険が働きつつ、ガミ側への偏りを抑えています。"
+            f"実績補正後の参考回収率が{adjusted_return_rate:.1f}%で、黒字的中率は{metrics['black']:.1f}%です。"
+            "保存実績も15レース以上あるため、回収率100%以上を狙う候補として扱います。"
         )
-    elif gami_share >= 30.0 or avg_multiple < 1.18 or expected_multiple < 0.95:
-        grade, icon = "ガミ注意・条件付き", "⚠️"
+    elif adjusted_multiple >= 1.00:
+        grade, icon = "回収率100%候補・検証中", "△"
         reason = (
-            f"合成的中率はありますが、的中時のガミ割合が{gami_share:.1f}%です。"
-            "低配当側が多いため、的中優先の場合だけ参考にする構成です。"
+            f"実績補正後の参考回収率は{adjusted_return_rate:.1f}%です。"
+            f"ただし現ロジックの評価可能実績が{samples}レースのため、まだ検証中です。"
         )
     else:
-        grade, icon = "的中優先なら候補", "△"
+        grade, icon = "的中優先なら候補", "⚠️"
         reason = (
-            f"的中時の黒字割合は{black_share:.1f}%、平均合成倍率は{avg_multiple:.2f}倍です。"
-            "配当と的中範囲のバランスは中間的です。"
+            f"モデル上は的中範囲がありますが、実績補正後の参考回収率は{adjusted_return_rate:.1f}%です。"
+            "回収率100%以上を優先する場合は見送り寄りです。"
         )
 
     grouped = {}
@@ -2487,6 +2517,11 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     m2.metric("最低合成倍率", f"{result['hit_min_multiple']:.2f}倍")
     m3.metric("最高合成倍率", f"{result['hit_max_multiple']:.2f}倍")
     m4.metric("モデル期待倍率", f"{result['model_expected_multiple']:.2f}倍")
+    cal = result.get("return_calibration", {})
+    r1, r2, r3 = st.columns(3)
+    r1.metric("実績補正後回収率", f"{result.get('adjusted_return_rate',0):.1f}%")
+    r2.metric("回収率補正係数", f"×{float(cal.get('factor',1.0)):.3f}")
+    r3.metric("補正実績数", f"{int(cal.get('samples',0))}R")
 
     pool = result.get("pool_summary", {})
     if pool:
@@ -2535,7 +2570,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
             )
         st.code("\n".join(ticket_lines), language=None)
     st.caption(
-        f"モデル上の全外れ率 {result['miss']:.2f}%・参考モデル回収率 {result['model_return_rate']:.1f}% 。"
+        f"モデル上の全外れ率 {result['miss']:.2f}%・参考モデル回収率 {result['model_return_rate']:.1f}%・実績補正後 {result.get('adjusted_return_rate',0):.1f}% 。"
         "基本上限は12点で、13〜14点目は黒字的中率が明確に改善し、期待倍率を悪化させない場合だけ採用します。"
     )
     st.caption(
@@ -3000,6 +3035,8 @@ if selected_main_page == "🏁 予測":
             with st.spinner("高速6周イベントシミュレーションを実行中…"):
                 df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
                 finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
+                # Ver196: 表示順位を本シミュレーションの1着率へ一本化し、着順別順位も付与。
+                df = engine.v196_apply_probability_aligned_ranks(df, finish_prob)
                 race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
                 engine.v67_save_ticket_snapshot(meta, bets, int(trials), engine.DB_PATH)
                 engine.v40_save_prediction_features(meta, df, engine.DB_PATH)
@@ -3016,6 +3053,7 @@ if selected_main_page == "🏁 予測":
                 "excluded": [int(x) for x in manual_excluded],
                 "learning_boundary": engine.v61_learning_boundary_summary(),
                 "future_audit": engine.v68_get_latest_future_audit(),
+                "day_trend": engine.v197_get_active_day_trend(),
             }
             st.success("予測が完了しました")
         except Exception as exc:
@@ -3039,6 +3077,17 @@ if selected_main_page == "🏁 予測":
             excluded = {int(car): "手動指定" for car in view.get("excluded", [])}
             boundary = view.get("learning_boundary") or {}
             audit = view.get("future_audit") or {}
+            day_trend = view.get("day_trend") or {}
+            if day_trend:
+                val = day_trend.get("validation") or {}
+                if float(day_trend.get("blend", 0.0) or 0.0) > 0:
+                    st.info(f"📍 当日展開傾向：{day_trend.get('label','中立')}｜直前{int(day_trend.get('prior_races',0))}R｜シナリオ補正 {float(day_trend.get('effective_shift',0.0)):+.3f}")
+                else:
+                    st.caption(f"当日展開傾向は直前{int(day_trend.get('prior_races',0))}Rを確認しましたが、時系列検証で改善が確認できないため本番反映を停止しています。")
+                with st.expander("当日展開傾向の検証", expanded=False):
+                    st.write(day_trend.get("reason", ""))
+                    if int(val.get("race_count",0)):
+                        st.write(f"過去{int(val['race_count'])}Rの未来参照なし検証：会場基準MAE {float(val['baseline_mae']):.4f} / 当日補正MAE {float(val['day_mae']):.4f}")
             if audit:
                 status = audit.get("status", "OK")
                 if status == "OK":
@@ -3077,7 +3126,9 @@ if selected_main_page == "🏁 予測":
             show_player_data_coverage(entries)
 
             cols = [c for c in [
-                "改善後順位", "車", "選手名", "ハンデ", "試走換算", "予測競走T", "レース信頼度",
+                "改善後順位", "1着候補順位", "連対候補順位", "3着候補順位", "総合点順位_従来",
+                "車", "選手名", "ハンデ", "試走換算", "予測競走T", "レース信頼度",
+                "本番1着率", "本番連対率", "本番3着率", "本番3着内率", "順位整合メモ",
                 "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
                 "スタート伸び指数", "ゴール前伸び指数", "安定上位指数",
                 "混戦突破適性", "逃げ判定", "初周先頭推定", "逃げ残り推定", "逃切り推定", "逃げ履歴件数", "逃げ履歴補正",
@@ -3088,6 +3139,17 @@ if selected_main_page == "🏁 予測":
             result = df[cols].sort_values(["改善後順位", "車"]).reset_index(drop=True)
             st.subheader("予測順位")
             st.dataframe(result, use_container_width=True, hide_index=True)
+            st.caption("Ver196では最終順位を本シミュレーションの1着率と一致させます。従来の総合点順位は診断列として残し、連対・3着候補は別順位で確認できます。")
+            try:
+                v196_val = engine.v196_probability_rank_validation(engine.DB_PATH)
+                if int(v196_val.get("race_count", 0)):
+                    st.info(
+                        f"DB検証 {int(v196_val['race_count'])}R｜上位3車捕捉 平均 "
+                        f"{v196_val['baseline_top3']:.3f}→{v196_val['aligned_top3']:.3f}台｜"
+                        f"勝者の平均順位 {v196_val['baseline_winner_rank']:.3f}→{v196_val['aligned_winner_rank']:.3f}位"
+                    )
+            except Exception as exc:
+                st.caption(f"確率整合順位の履歴検証を表示できませんでした: {exc}")
 
             with st.expander("🏟️ 今回の開催場重み・適用補正", expanded=True):
                 venue_name = str(meta.get("開催場") or "").strip()
