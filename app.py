@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver211｜事前確認2表を最上部表示・堅いレースは中心ペア固定で3連単少点数化")
+st.caption("Ver212｜事前確認2表を最上部表示・堅いレースは中心ペア固定で3連単少点数化")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1946,7 +1946,20 @@ def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
         con.commit()
 
 
+def _v212_norm_bet_type(bet_type: str) -> str:
+    """券種名の漢数字・数字表記を同一キーへ統一する。"""
+    text = str(bet_type or "").strip().replace("　", "")
+    aliases = {
+        "三連単": "3連単", "3連単": "3連単",
+        "三連複": "3連複", "3連複": "3連複",
+        "二連単": "2連単", "2連単": "2連単",
+        "二連複": "2連複", "2連複": "2連複",
+    }
+    return aliases.get(text, text)
+
+
 def _v187_norm_combo(bet_type: str, combo: str) -> str:
+    bet_type = _v212_norm_bet_type(bet_type)
     nums = re.findall(r"\d+", str(combo))
     if bet_type in ("3連複", "2連複"):
         nums = sorted(nums, key=int)
@@ -1974,7 +1987,7 @@ def _v187_sync_mixed_feedback(db_path: str) -> int:
             ).fetchall()
             payout_map = {}
             for p in payouts:
-                payout_map[(p["bet_type"], _v187_norm_combo(p["bet_type"], p["combination"]))] = int(p["payout_yen"] or 0)
+                payout_map[(_v212_norm_bet_type(p["bet_type"]), _v187_norm_combo(p["bet_type"], p["combination"]))] = int(p["payout_yen"] or 0)
             if not payout_map:
                 continue
             tickets = con.execute(
@@ -1984,7 +1997,7 @@ def _v187_sync_mixed_feedback(db_path: str) -> int:
             total_payout = 0
             winning_types = []
             for t in tickets:
-                key = (t["bet_type"], _v187_norm_combo(t["bet_type"], t["combination"]))
+                key = (_v212_norm_bet_type(t["bet_type"]), _v187_norm_combo(t["bet_type"], t["combination"]))
                 pay = int(payout_map.get(key, 0))
                 hit = int(pay > 0)
                 total_payout += pay
@@ -2010,6 +2023,57 @@ def _v187_sync_mixed_feedback(db_path: str) -> int:
     return done
 
 
+def _v212_recalculate_plan_feedback(db_path: str, race_key: str, plan_hash: str) -> None:
+    """表記差を吸収して指定プランの実績を再計算し、過去の誤判定も修復する。"""
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        plan = con.execute(
+            "SELECT * FROM v187_mixed_plan_runs WHERE race_key=? AND plan_hash=?",
+            (race_key, plan_hash),
+        ).fetchone()
+        if plan is None:
+            return
+        payouts = con.execute(
+            "SELECT bet_type, combination, payout_yen FROM result_payouts WHERE race_key=?",
+            (race_key,),
+        ).fetchall()
+        if not payouts:
+            return
+        payout_map = {
+            (_v212_norm_bet_type(p["bet_type"]), _v187_norm_combo(p["bet_type"], p["combination"])): int(p["payout_yen"] or 0)
+            for p in payouts
+        }
+        tickets = con.execute(
+            "SELECT * FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?",
+            (race_key, plan_hash),
+        ).fetchall()
+        total_payout = 0
+        winning_types = []
+        for t in tickets:
+            key = (_v212_norm_bet_type(t["bet_type"]), _v187_norm_combo(t["bet_type"], t["combination"]))
+            pay = int(payout_map.get(key, 0))
+            hit = int(pay > 0)
+            total_payout += pay
+            if hit:
+                winning_types.append(_v212_norm_bet_type(t["bet_type"]))
+            con.execute("""
+                INSERT OR REPLACE INTO v187_mixed_ticket_feedback
+                (race_key,plan_hash,bet_type,combination,hit,payout_yen) VALUES (?,?,?,?,?,?)
+            """, (race_key, plan_hash, t["bet_type"], t["combination"], hit, pay))
+        cost = int(plan["cost_yen"] or len(tickets) * 100)
+        hit = int(total_payout > 0)
+        black = int(hit and total_payout >= cost)
+        gami = int(0 < total_payout < cost)
+        multiple = total_payout / cost if cost else 0.0
+        con.execute("""
+            INSERT OR REPLACE INTO v187_mixed_plan_feedback
+            (race_key,plan_hash,hit,black_hit,gami_hit,payout_yen,cost_yen,realized_multiple,return_rate,winning_types,evaluated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (race_key, plan_hash, hit, black, gami, total_payout, cost, multiple, multiple * 100.0,
+                json.dumps(sorted(set(winning_types)), ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+        con.commit()
+
+
 def _v208_latest_mixed_plan_result(race_key: str, db_path: str) -> dict:
     """予測時に保存された最新の回収率重視プランを、登録済み払戻と照合して返す。"""
     if not race_key:
@@ -2030,6 +2094,19 @@ def _v208_latest_mixed_plan_result(race_key: str, db_path: str) -> dict:
         """, (race_key,)).fetchone()
         if plan is None:
             return {"available": False, "reason": "このレースでは回収率重視プランが保存されていません。"}
+        latest_plan_hash = plan["plan_hash"]
+    _v212_recalculate_plan_feedback(db_path, race_key, latest_plan_hash)
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        plan = con.execute("""
+            SELECT r.*, f.hit, f.black_hit, f.gami_hit, f.payout_yen,
+                   f.return_rate, f.winning_types, f.evaluated_at
+            FROM v187_mixed_plan_runs r
+            LEFT JOIN v187_mixed_plan_feedback f
+              ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+            WHERE r.race_key=? AND r.plan_hash=?
+            LIMIT 1
+        """, (race_key, latest_plan_hash)).fetchone()
         tickets = con.execute("""
             SELECT t.bet_type, t.combination, t.odds, t.role,
                    COALESCE(f.hit,0) AS hit, COALESCE(f.payout_yen,0) AS payout_yen
@@ -2766,7 +2843,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
     replacement_notes.extend(pair_mix_notes)
 
-    # Ver211: 長期回収率重視の最低基準。
+    # Ver212: 長期回収率重視の最低基準。
     # 本線保護の有無にかかわらず、極端な低配当かつ単体期待値100%未満の券は
     # 「的中数を増やすだけの保険」として最終構成から除外する。
     low_odds_floor_notes = []
@@ -2877,7 +2954,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             f"ガミ率{before['low']:.2f}%→{after['low']:.2f}%"
         )
 
-    # Ver211: 堅いレースでは、通常合成の期待値比較だけで見送らない。
+    # Ver212: 堅いレースでは、通常合成の期待値比較だけで見送らない。
     # 最有力の1・2着ペアを固定し、3着候補ごとに表裏を揃えた3連単2〜4点を優先する。
     hard_race_info = {"enabled": False}
     try:
