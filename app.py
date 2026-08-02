@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver203｜DB72基準・オッズ先行入力高速化・三連単片折り返し標準表記")
+st.caption("Ver204｜DB75基準・深いガミ券除外・券種横断重複最適化")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2669,6 +2669,77 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
     replacement_notes.extend(pair_mix_notes)
 
+    # Ver204: 券種をまたいだ重複と深いガミ券を、最終総額ベースで再評価する。
+    # 高確率本線でも、追加的中範囲が小さく、単体期待値が低く、除外後に
+    # 黒字確率・ガミ率・参考回収率が改善する場合は保護を解除して除外する。
+    gami_prune_notes = []
+    for _ in range(8):
+        before = evaluate(selected)
+        best_remove = None
+        for ticket in list(selected):
+            trial_plan = [t for t in selected if t is not ticket]
+            if len(trial_plan) < 4:
+                continue
+            after = evaluate(trial_plan)
+
+            other_matched = set()
+            for other in trial_plan:
+                other_matched.update(other.get("matched", set()))
+            unique_indexes = set(ticket.get("matched", set())) - other_matched
+            unique_prob = sum(outcomes[i][1] for i in unique_indexes)
+
+            odds = float(ticket.get("odds", 0.0) or 0.0)
+            prob = float(ticket.get("probability", 0.0) or 0.0)
+            standalone_ev = (prob / 100.0) * odds
+            payout_ratio = (odds * 100.0 / float(before.get("cost", 1.0))) if before.get("cost") else 0.0
+            cover_loss = float(before["cover"] - after["cover"])
+            black_delta = float(after["black"] - before["black"])
+            gami_drop = float(before["low"] - after["low"])
+            return_gain = float(after["model_return_rate"] - before["model_return_rate"])
+
+            deep_gami = payout_ratio < 0.70
+            low_ev_overlap = unique_prob <= 6.0 and standalone_ev < 0.95
+            pure_overlap = unique_prob <= 0.01 and standalone_ev < 0.75
+            total_gami_cleanup = (
+                payout_ratio < 1.0 and gami_drop >= 2.0 and return_gain >= 1.0
+                and cover_loss <= 3.5 and black_delta >= -0.5
+            )
+            removable = (
+                (deep_gami and low_ev_overlap and return_gain >= 1.0 and black_delta >= -2.5)
+                or (pure_overlap and return_gain >= 1.0 and black_delta >= -2.5)
+                or total_gami_cleanup
+            )
+            if not removable:
+                continue
+
+            # 保護券は通常残す。ただし深いガミかつ低期待値で、追加範囲も小さい場合だけ解除する。
+            if ticket.get("protected") and not (deep_gami and low_ev_overlap):
+                continue
+
+            score = (
+                return_gain + 1.50 * gami_drop + 0.80 * black_delta
+                - 0.25 * max(0.0, cover_loss) + 20.0 * max(0.0, 1.0 - payout_ratio)
+            )
+            key = (score, return_gain, gami_drop, black_delta, -cover_loss, -unique_prob)
+            if best_remove is None or key > best_remove[0]:
+                best_remove = (
+                    key, ticket, trial_plan, after, unique_prob, standalone_ev,
+                    payout_ratio, cover_loss, black_delta, gami_drop, return_gain
+                )
+
+        if best_remove is None:
+            break
+
+        (_, ticket, selected, after, unique_prob, standalone_ev, payout_ratio,
+         cover_loss, black_delta, gami_drop, return_gain) = best_remove
+        ticket["protected"] = False
+        gami_prune_notes.append(
+            f"{ticket['type']} {ticket['combo']}（{float(ticket.get('odds',0)):.1f}倍）を除外。"
+            f"追加カバー{unique_prob:.2f}%・単体期待値{standalone_ev*100:.1f}%・"
+            f"参考回収率{before['model_return_rate']:.1f}%→{after['model_return_rate']:.1f}%・"
+            f"ガミ率{before['low']:.2f}%→{after['low']:.2f}%"
+        )
+
     metrics = evaluate(selected)
     calibration = _v195_return_calibration(engine.DB_PATH)
     adjusted_expected_multiple = float(metrics.get("model_expected_multiple", 0.0)) * float(calibration.get("factor", 1.0))
@@ -2734,6 +2805,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "learning": learning, "pool_summary": pool_summary,
         "tri_seed_points": int(tri_seed_points),
         "replacement_notes": replacement_notes,
+        "gami_prune_notes": gami_prune_notes,
         "protected_add_notes": protected_add_notes,
         "protected_count": len([t for t in selected if t.get("protected")]),
         "tri_seed_cover": float(tri_seed_metrics.get("cover", 0.0)),
@@ -2761,8 +2833,12 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
         for note in result.get("protected_add_notes", []):
             st.caption(f"・{note}")
     if result.get("replacement_notes"):
-        st.success("ガミ保険を三連単へ置換しました。")
+        st.success("ガミ保険を三連単へ置換・同一ペアを再編しました。")
         for note in result.get("replacement_notes", []):
+            st.caption(f"・{note}")
+    if result.get("gami_prune_notes"):
+        st.warning("深いガミ券・重複効率の低い券を最終総額ベースで除外しました。")
+        for note in result.get("gami_prune_notes", []):
             st.caption(f"・{note}")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("合成的中率", f"{result['cover']:.2f}%")
@@ -2870,7 +2946,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     )
     st.caption(
         "判定は黒字的中率を最優先し、的中時の黒字割合・ガミ割合・平均合成倍率・モデル期待倍率を使用します。"
-        "券種別の高確率本線は先に保護し、合成最適化の都合だけで削除しません。"
+        "券種別の高確率本線は先に保護しますが、最終総額に対して深いガミで、追加カバーと単体期待値が低い場合は保護を解除して除外します。"
         "低配当保険は、ほかの券種との同時的中を含めて黒字確率を増やす場合だけ採用します。"
         "単独でガミになる2連系は三連単1〜4点への分解を比較し、2連複は片側2連単・表裏2連単・2連複との重ね買いを全比較し、合成全体が改善する構成だけ採用します。"
     )
