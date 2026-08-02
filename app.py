@@ -1944,6 +1944,18 @@ def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
             PRIMARY KEY (race_key, plan_hash, bet_type, combination)
         );
         """)
+        # Ver215: 予測時点のプランを後から完全に切り分けられるよう、メタ情報を保持する。
+        existing_cols = {row[1] for row in con.execute("PRAGMA table_info(v187_mixed_plan_runs)").fetchall()}
+        for col_name, col_type in [
+            ("app_version", "TEXT"),
+            ("logic_version", "TEXT"),
+            ("race_date", "TEXT"),
+            ("venue", "TEXT"),
+            ("race_no", "TEXT"),
+            ("starter_count", "INTEGER"),
+        ]:
+            if col_name not in existing_cols:
+                con.execute(f"ALTER TABLE v187_mixed_plan_runs ADD COLUMN {col_name} {col_type}")
         con.commit()
 
 
@@ -2209,27 +2221,68 @@ def _v187_learning_profile(db_path: str) -> dict:
     return out
 
 
+def _v215_race_meta_from_key(race_key: str, db_path: str) -> dict:
+    """レースキーまたは結果DBから、集計用の日付・開催場・Rを取得する。"""
+    out = {"race_date": "", "venue": "", "race_no": "", "starter_count": None}
+    key = str(race_key or "")
+    m = re.match(r"^(\d{8})_([^_]+)_(\d+)R$", key)
+    if m:
+        ymd, venue, race_no = m.groups()
+        out.update(race_date=f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}", venue=venue, race_no=race_no)
+    try:
+        with sqlite3.connect(db_path) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                "SELECT race_date, venue, race_no FROM result_races WHERE race_key=? LIMIT 1",
+                (key,),
+            ).fetchone()
+            if row:
+                out["race_date"] = str(row["race_date"] or out["race_date"])
+                out["venue"] = str(row["venue"] or out["venue"])
+                out["race_no"] = str(row["race_no"] or out["race_no"])
+    except Exception:
+        pass
+    return out
+
+
 def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict) -> str:
+    """回収率重視プランを、予測時点の買い目・オッズ・確率・版情報ごと完全保存する。"""
     _v187_ensure_mixed_learning_tables(db_path)
-    payload = [(t.get("type"),t.get("combo"),round(float(t.get("odds",0)),3)) for t in result.get("tickets",[])]
-    plan_hash = hashlib.sha1(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    payload = [
+        (t.get("type"), t.get("combo"), round(float(t.get("odds", 0)), 3), round(float(t.get("probability", 0)), 5))
+        for t in result.get("tickets", [])
+    ]
+    plan_hash = hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     now = datetime.now(timezone.utc).isoformat()
+    meta = _v215_race_meta_from_key(str(race_key), db_path)
+    starter_count = result.get("starter_count")
+    try:
+        starter_count = int(starter_count) if starter_count else None
+    except Exception:
+        starter_count = None
     with sqlite3.connect(db_path) as con:
         con.execute("""
             INSERT OR REPLACE INTO v187_mixed_plan_runs
-            (race_key,plan_hash,points,cost_yen,grade,cover,black,low,hit_average_multiple,model_expected_multiple,model_return_rate,role_count,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (str(race_key),plan_hash,int(result.get("points",0)),int(result.get("cost",0)),result.get("grade"),
-                float(result.get("cover",0)),float(result.get("black",0)),float(result.get("low",0)),
-                float(result.get("hit_average_multiple",0)),float(result.get("model_expected_multiple",0)),
-                float(result.get("model_return_rate",0)),len(result.get("grouped",{})),now))
-        con.execute("DELETE FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?", (str(race_key),plan_hash))
-        for t in result.get("tickets",[]):
+            (race_key,plan_hash,points,cost_yen,grade,cover,black,low,hit_average_multiple,
+             model_expected_multiple,model_return_rate,role_count,created_at,
+             app_version,logic_version,race_date,venue,race_no,starter_count)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            str(race_key), plan_hash, int(result.get("points", 0)), int(result.get("cost", 0)), result.get("grade"),
+            float(result.get("cover", 0)), float(result.get("black", 0)), float(result.get("low", 0)),
+            float(result.get("hit_average_multiple", 0)), float(result.get("model_expected_multiple", 0)),
+            float(result.get("model_return_rate", 0)), len(result.get("grouped", {})), now,
+            "Ver215", "return_plan_v215", meta.get("race_date"), meta.get("venue"), meta.get("race_no"), starter_count,
+        ))
+        con.execute("DELETE FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?", (str(race_key), plan_hash))
+        for t in result.get("tickets", []):
             con.execute("""
                 INSERT OR REPLACE INTO v187_mixed_plan_tickets
                 (race_key,plan_hash,bet_type,combination,probability,odds,role) VALUES (?,?,?,?,?,?,?)
-            """, (str(race_key),plan_hash,t.get("type"),t.get("combo"),float(t.get("probability",0)),
-                    float(t.get("odds",0)),t.get("role")))
+            """, (
+                str(race_key), plan_hash, _v212_norm_bet_type(t.get("type")), t.get("combo"),
+                float(t.get("probability", 0)), float(t.get("odds", 0)), t.get("role"),
+            ))
         con.commit()
     _v187_sync_mixed_feedback(db_path)
     return plan_hash
@@ -3658,6 +3711,200 @@ def secret_value(name: str, default: str = "") -> str:
     return str(value).strip() if value is not None else default
 
 
+
+def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
+    """各レースの最新プランだけを採用し、結果済み実績を集計用DataFrameで返す。"""
+    _v187_ensure_mixed_learning_tables(db_path)
+    _v187_sync_mixed_feedback(db_path)
+    query = """
+        WITH latest AS (
+            SELECT r.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY r.race_key
+                       ORDER BY datetime(r.created_at) DESC, r.rowid DESC
+                   ) AS rn
+            FROM v187_mixed_plan_runs r
+        )
+        SELECT l.race_key,
+               COALESCE(NULLIF(l.race_date,''), rr.race_date) AS race_date,
+               COALESCE(NULLIF(l.venue,''), rr.venue) AS venue,
+               COALESCE(NULLIF(l.race_no,''), rr.race_no) AS race_no,
+               l.app_version, l.logic_version, l.points, l.cost_yen,
+               l.grade, l.model_return_rate, l.created_at,
+               f.hit, f.black_hit, f.gami_hit, f.payout_yen,
+               f.return_rate, f.evaluated_at
+        FROM latest l
+        LEFT JOIN result_races rr ON rr.race_key=l.race_key
+        LEFT JOIN v187_mixed_plan_feedback f
+          ON f.race_key=l.race_key AND f.plan_hash=l.plan_hash
+        WHERE l.rn=1 AND f.return_rate IS NOT NULL
+        ORDER BY COALESCE(NULLIF(l.race_date,''), rr.race_date),
+                 COALESCE(NULLIF(l.venue,''), rr.venue),
+                 CAST(COALESCE(NULLIF(l.race_no,''), rr.race_no) AS INTEGER)
+    """
+    try:
+        with sqlite3.connect(db_path) as con:
+            df = pd.read_sql_query(query, con)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
+    df["month"] = df["race_date"].dt.strftime("%Y-%m")
+    df["収支"] = pd.to_numeric(df["payout_yen"], errors="coerce").fillna(0) - pd.to_numeric(df["cost_yen"], errors="coerce").fillna(0)
+    df["推奨区分"] = df["grade"].fillna("").astype(str).apply(
+        lambda x: "非推奨" if ("非推奨" in x or "⛔" in x) else "推奨"
+    )
+    return df
+
+
+def _v216_summary_values(df: pd.DataFrame) -> dict:
+    """全体・推奨のみ・非推奨のみの実績を同じ基準で返す。"""
+    def one(part: pd.DataFrame) -> dict:
+        if part.empty:
+            return {"races": 0, "cost": 0, "payout": 0, "profit": 0, "return": None,
+                    "hit_rate": None, "black_rate": None, "gami_rate": None}
+        cost = float(pd.to_numeric(part["cost_yen"], errors="coerce").fillna(0).sum())
+        payout = float(pd.to_numeric(part["payout_yen"], errors="coerce").fillna(0).sum())
+        return {
+            "races": int(len(part)), "cost": int(cost), "payout": int(payout),
+            "profit": int(payout - cost), "return": (payout / cost * 100.0) if cost > 0 else None,
+            "hit_rate": float(pd.to_numeric(part["hit"], errors="coerce").fillna(0).mean() * 100.0),
+            "black_rate": float(pd.to_numeric(part["black_hit"], errors="coerce").fillna(0).mean() * 100.0),
+            "gami_rate": float(pd.to_numeric(part["gami_hit"], errors="coerce").fillna(0).mean() * 100.0),
+        }
+    return {
+        "全レース": one(df),
+        "推奨のみ": one(df[df["推奨区分"] == "推奨"]),
+        "非推奨のみ": one(df[df["推奨区分"] == "非推奨"]),
+    }
+
+
+def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    grouped = work.groupby(group_cols, dropna=False).agg(
+        レース数=("race_key", "count"),
+        的中数=("hit", "sum"),
+        黒字数=("black_hit", "sum"),
+        ガミ数=("gami_hit", "sum"),
+        購入額=("cost_yen", "sum"),
+        払戻額=("payout_yen", "sum"),
+        収支=("収支", "sum"),
+    ).reset_index()
+    grouped["的中率"] = grouped["的中数"] / grouped["レース数"].clip(lower=1) * 100.0
+    grouped["黒字率"] = grouped["黒字数"] / grouped["レース数"].clip(lower=1) * 100.0
+    grouped["回収率"] = grouped["払戻額"] / grouped["購入額"].replace(0, pd.NA) * 100.0
+
+    # 同じ集計単位について、非推奨を除いた成績を横並びにする。
+    recommended = work[work["推奨区分"] == "推奨"]
+    if not recommended.empty:
+        rec = recommended.groupby(group_cols, dropna=False).agg(
+            推奨レース数=("race_key", "count"),
+            推奨的中数=("hit", "sum"),
+            推奨黒字数=("black_hit", "sum"),
+            推奨ガミ数=("gami_hit", "sum"),
+            推奨購入額=("cost_yen", "sum"),
+            推奨払戻額=("payout_yen", "sum"),
+            推奨収支=("収支", "sum"),
+        ).reset_index()
+        rec["非推奨除外回収率"] = rec["推奨払戻額"] / rec["推奨購入額"].replace(0, pd.NA) * 100.0
+        rec["非推奨除外的中率"] = rec["推奨的中数"] / rec["推奨レース数"].clip(lower=1) * 100.0
+        rec["非推奨除外黒字率"] = rec["推奨黒字数"] / rec["推奨レース数"].clip(lower=1) * 100.0
+        keep = group_cols + ["推奨レース数", "非推奨除外回収率", "非推奨除外的中率", "非推奨除外黒字率", "推奨収支"]
+        grouped = grouped.merge(rec[keep], on=group_cols, how="left")
+    else:
+        grouped["推奨レース数"] = 0
+        grouped["非推奨除外回収率"] = pd.NA
+        grouped["非推奨除外的中率"] = pd.NA
+        grouped["非推奨除外黒字率"] = pd.NA
+        grouped["推奨収支"] = 0
+    return grouped
+
+
+def _v215_render_return_dashboard(db_path: str) -> None:
+    st.markdown("## 📊 回収率重視プラン実績")
+    st.caption("各レースで最後に保存されたプランだけを、予測時点の買い目のまま集計します。結果後の差し替えは含みません。")
+    df = _v215_return_dashboard_rows(db_path)
+    if df.empty:
+        st.info("結果まで照合済みの回収率重視プランがまだありません。今後の予測では買い目・オッズ・確率・バージョンを自動保存します。")
+        return
+
+    venues = sorted([str(v) for v in df["venue"].dropna().unique() if str(v)])
+    c1, c2 = st.columns(2)
+    selected_venue = c1.selectbox("開催場で絞る", ["全開催場"] + venues, key="v215_return_venue")
+    versions = sorted([str(v) for v in df["app_version"].dropna().unique() if str(v)])
+    selected_version = c2.selectbox("バージョンで絞る", ["全バージョン"] + versions, key="v215_return_version")
+    filtered = df.copy()
+    if selected_venue != "全開催場":
+        filtered = filtered[filtered["venue"].astype(str) == selected_venue]
+    if selected_version != "全バージョン":
+        filtered = filtered[filtered["app_version"].astype(str) == selected_version]
+    if filtered.empty:
+        st.warning("選択条件に該当する実績がありません。")
+        return
+
+    summary = _v216_summary_values(filtered)
+    all_s = summary["全レース"]
+    rec_s = summary["推奨のみ"]
+    no_s = summary["非推奨のみ"]
+
+    st.markdown("### 全体と非推奨除外の比較")
+    a,b,c,d,e = st.columns(5)
+    a.metric("全レース", f"{all_s['races']}R")
+    b.metric("全体回収率", f"{all_s['return']:.1f}%" if all_s['return'] is not None else "－")
+    c.metric("非推奨除外回収率", f"{rec_s['return']:.1f}%" if rec_s['return'] is not None else "－",
+             delta=(f"{rec_s['return']-all_s['return']:+.1f}pt" if rec_s['return'] is not None and all_s['return'] is not None else None))
+    d.metric("推奨のみ収支", f"{rec_s['profit']:+,}円")
+    e.metric("推奨率", f"{(rec_s['races']/all_s['races']*100.0):.1f}%" if all_s['races'] else "－")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**全レース**")
+        st.caption(f"的中率 {all_s['hit_rate']:.1f}% / 黒字率 {all_s['black_rate']:.1f}% / ガミ率 {all_s['gami_rate']:.1f}% / 収支 {all_s['profit']:+,}円")
+    with c2:
+        st.markdown("**推奨のみ（非推奨除外）**")
+        if rec_s['races']:
+            st.caption(f"{rec_s['races']}R・的中率 {rec_s['hit_rate']:.1f}% / 黒字率 {rec_s['black_rate']:.1f}% / ガミ率 {rec_s['gami_rate']:.1f}% / 収支 {rec_s['profit']:+,}円")
+        else:
+            st.caption("該当なし")
+    with c3:
+        st.markdown("**非推奨のみ**")
+        if no_s['races']:
+            st.caption(f"{no_s['races']}R・回収率 {no_s['return']:.1f}% / 的中率 {no_s['hit_rate']:.1f}% / 収支 {no_s['profit']:+,}円")
+        else:
+            st.caption("該当なし")
+
+    st.markdown("### 日別")
+    daily = _v215_aggregate_return(filtered, ["race_date"])
+    if not daily.empty:
+        daily["race_date"] = pd.to_datetime(daily["race_date"]).dt.strftime("%Y-%m-%d")
+        st.dataframe(daily.sort_values("race_date", ascending=False), use_container_width=True, hide_index=True)
+
+    st.markdown("### 開催場別")
+    st.dataframe(_v215_aggregate_return(filtered, ["venue"]).sort_values("回収率", ascending=False), use_container_width=True, hide_index=True)
+
+    st.markdown("### 日付 × 開催場")
+    day_venue = _v215_aggregate_return(filtered, ["race_date", "venue"])
+    if not day_venue.empty:
+        day_venue["race_date"] = pd.to_datetime(day_venue["race_date"]).dt.strftime("%Y-%m-%d")
+        st.dataframe(day_venue.sort_values(["race_date", "venue"], ascending=[False, True]), use_container_width=True, hide_index=True)
+
+    st.markdown("### 月別")
+    st.dataframe(_v215_aggregate_return(filtered, ["month"]).sort_values("month", ascending=False), use_container_width=True, hide_index=True)
+
+    with st.expander("レース別の明細", expanded=False):
+        detail = filtered.copy()
+        detail["日付"] = detail["race_date"].dt.strftime("%Y-%m-%d")
+        detail["判定"] = detail.apply(lambda r: "◎黒字" if r.get("black_hit") else ("△ガミ" if r.get("gami_hit") else "×外れ"), axis=1)
+        cols = ["日付","venue","race_no","推奨区分","grade","判定","points","cost_yen","payout_yen","return_rate","収支","app_version"]
+        detail = detail[cols].rename(columns={
+            "venue":"開催場","race_no":"R","points":"点数","cost_yen":"購入額",
+            "payout_yen":"払戻額","return_rate":"回収率","app_version":"バージョン","grade":"元判定",
+        })
+        st.dataframe(detail.sort_values(["日付","開催場","R"], ascending=[False,True,True]), use_container_width=True, hide_index=True)
+
 def github_config() -> dict:
     return {
         "token": secret_value("GITHUB_TOKEN"),
@@ -3891,7 +4138,7 @@ _v132_general_reminder_launcher()
 
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
-_main_pages = ["🏁 予測", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"]
+_main_pages = ["🏁 予測", "📊 回収率実績", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"]
 if st.session_state.get("v155_main_page") not in _main_pages:
     st.session_state["v155_main_page"] = _main_pages[0]
 
@@ -3918,7 +4165,10 @@ st.session_state["v155_main_page"] = _selected_from_nav
 
 selected_main_page = st.session_state.get("v155_main_page", _main_pages[0])
 
-if selected_main_page == "🏁 予測":
+if selected_main_page == "📊 回収率実績":
+    _v215_render_return_dashboard(engine.DB_PATH)
+
+elif selected_main_page == "🏁 予測":
     st.info("Ver20予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
     with st.expander("🔧 今回どこを調整したか"):
         if st.button("調整履歴を読み込む", key="v138_load_adjustment_log", use_container_width=True):
@@ -5743,3 +5993,8 @@ if selected_main_page == "🗃️ 登録情報確認":
 # Ver213: 予測必須経路の全DB診断を遅延化、工程別時間計測、回収率重視プランの単独ガミ完全除外。
 
 # Ver214: 2連単・2連複・3連複から関連高期待値3連単への1対1置換を長期回収率基準で自動比較。
+
+# Ver215: 回収率重視プランを版情報付きで完全保存し、日別・開催場別・日付×開催場・月別・全体の実回収率ダッシュボードを追加。
+
+
+# Ver216: 回収率実績に非推奨除外・推奨のみ・非推奨のみ比較を追加
