@@ -2081,8 +2081,31 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             "after": after,
         }
 
-    # 三連単上位2点を本線に固定。
-    plan = tri_candidates[:2]
+    # Ver189: 三連単も2点固定にせず、上位2〜6点を合成全体の土台として比較する。
+    # 的中範囲を優先しつつ、追加による黒字側の改善、ガミ化、点数増を同時に評価する。
+    tri_seed_options = []
+    max_tri_seed = min(6, len(tri_candidates))
+    for k in range(2, max_tri_seed + 1):
+        seed_plan = tri_candidates[:k]
+        seed_metrics = evaluate(seed_plan)
+        # 三連単だけの土台選定では、カバーと黒字側を重視し、
+        # ガミ側と点数増には穏やかなペナルティを置く。
+        seed_utility = (
+            seed_metrics["cover"]
+            + 0.52 * seed_metrics["black"]
+            - 0.30 * seed_metrics["low"]
+            - 0.16 * k
+        )
+        tri_seed_options.append((k, seed_plan, seed_metrics, seed_utility))
+
+    best_seed_utility = max(x[3] for x in tri_seed_options)
+    # 最高評価にほぼ並ぶなら少ない点数を優先し、無意味な膨張を避ける。
+    seed_near = [x for x in tri_seed_options if x[3] >= best_seed_utility - 0.35]
+    tri_seed_points, plan, tri_seed_metrics, _ = min(
+        seed_near,
+        key=lambda x: (x[0], -x[2]["black"], -x[2]["cover"], x[2]["low"]),
+    )
+    plan = list(plan)
     remaining = [c for c in candidates if c not in plan]
 
     # まず異なる外れ方を補う券種を1点ずつ検討する。
@@ -2199,7 +2222,11 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "available": True, "grade": grade, "icon": icon, "reason": reason,
         "multiple_grade": multiple_grade,
         "tickets": selected, "grouped": grouped, "role_lines": role_lines,
-        "learning": learning, "pool_summary": pool_summary, **metrics,
+        "learning": learning, "pool_summary": pool_summary,
+        "tri_seed_points": int(tri_seed_points),
+        "tri_seed_cover": float(tri_seed_metrics.get("cover", 0.0)),
+        "tri_seed_black": float(tri_seed_metrics.get("black", 0.0)),
+        **metrics,
     }
 
 
@@ -2241,6 +2268,11 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
                 f"累積{float(info.get('cover', 0.0)):.1f}%・{target_text}",
             )
         st.caption("三連単以外は、この累積88〜90%の候補母集団から、合成効果・ガミ・倍率を比較して最終採用しています。母集団の全点を購入するわけではありません。")
+    st.caption(
+        f"三連単の初期本線は上位2〜6点を比較し、今回は{int(result.get('tri_seed_points', 2))}点を採用。"
+        f"本線段階のカバー{float(result.get('tri_seed_cover', 0.0)):.2f}%・黒字側{float(result.get('tri_seed_black', 0.0)):.2f}%を基準に、"
+        "その後ほかの券種と三連単追加候補を同じ土俵で比較しています。"
+    )
     q1, q2, q3 = st.columns(3)
     q1.metric("的中時の黒字割合", f"{result['black_share_of_hits']:.1f}%")
     q2.metric("的中時のガミ割合", f"{result['gami_share_of_hits']:.1f}%")
