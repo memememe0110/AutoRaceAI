@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver182｜的中重視＋オッズ点数調整・4券種一括読込＋DB67基準")
+st.caption("Ver187｜8車合成プランDB保存・結果照合・実績学習補正・DB67基準")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1730,6 +1730,543 @@ def show_v182_odds_adjusted_tight_recommendation(bets: dict, trials: int, meta: 
     st.code("\n".join(adjusted["combos"]), language=None)
     st.caption("これは過去分布と入力オッズを使った参考判定です。的中や収益を保証するものではありません。")
 
+
+
+
+# Ver187: 8車合成プランをDB保存し、結果登録後に自動照合して次回判定へ反映する。
+def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS v187_mixed_plan_runs (
+            race_key TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            points INTEGER NOT NULL,
+            cost_yen INTEGER NOT NULL,
+            grade TEXT,
+            cover REAL,
+            black REAL,
+            low REAL,
+            hit_average_multiple REAL,
+            model_expected_multiple REAL,
+            model_return_rate REAL,
+            role_count INTEGER,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (race_key, plan_hash)
+        );
+        CREATE TABLE IF NOT EXISTS v187_mixed_plan_tickets (
+            race_key TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            bet_type TEXT NOT NULL,
+            combination TEXT NOT NULL,
+            probability REAL,
+            odds REAL,
+            role TEXT,
+            PRIMARY KEY (race_key, plan_hash, bet_type, combination)
+        );
+        CREATE TABLE IF NOT EXISTS v187_mixed_plan_feedback (
+            race_key TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            hit INTEGER NOT NULL,
+            black_hit INTEGER NOT NULL,
+            gami_hit INTEGER NOT NULL,
+            payout_yen INTEGER NOT NULL,
+            cost_yen INTEGER NOT NULL,
+            realized_multiple REAL NOT NULL,
+            return_rate REAL NOT NULL,
+            winning_types TEXT,
+            evaluated_at TEXT NOT NULL,
+            PRIMARY KEY (race_key, plan_hash)
+        );
+        CREATE TABLE IF NOT EXISTS v187_mixed_ticket_feedback (
+            race_key TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            bet_type TEXT NOT NULL,
+            combination TEXT NOT NULL,
+            hit INTEGER NOT NULL,
+            payout_yen INTEGER NOT NULL,
+            PRIMARY KEY (race_key, plan_hash, bet_type, combination)
+        );
+        """)
+        con.commit()
+
+
+def _v187_norm_combo(bet_type: str, combo: str) -> str:
+    nums = re.findall(r"\d+", str(combo))
+    if bet_type in ("3連複", "2連複"):
+        nums = sorted(nums, key=int)
+    return "-".join(nums)
+
+
+def _v187_sync_mixed_feedback(db_path: str) -> int:
+    """結果登録済みプランを照合。戻り値は今回新しく評価した件数。"""
+    _v187_ensure_mixed_learning_tables(db_path)
+    done = 0
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        plans = con.execute("""
+            SELECT r.* FROM v187_mixed_plan_runs r
+            LEFT JOIN v187_mixed_plan_feedback f
+              ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+            WHERE f.race_key IS NULL
+              AND EXISTS (SELECT 1 FROM result_races rr WHERE rr.race_key=r.race_key
+                          AND COALESCE(rr.learning_eligible,1)=1)
+        """).fetchall()
+        for plan in plans:
+            payouts = con.execute(
+                "SELECT bet_type, combination, payout_yen FROM result_payouts WHERE race_key=?",
+                (plan["race_key"],),
+            ).fetchall()
+            payout_map = {}
+            for p in payouts:
+                payout_map[(p["bet_type"], _v187_norm_combo(p["bet_type"], p["combination"]))] = int(p["payout_yen"] or 0)
+            if not payout_map:
+                continue
+            tickets = con.execute(
+                "SELECT * FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?",
+                (plan["race_key"], plan["plan_hash"]),
+            ).fetchall()
+            total_payout = 0
+            winning_types = []
+            for t in tickets:
+                key = (t["bet_type"], _v187_norm_combo(t["bet_type"], t["combination"]))
+                pay = int(payout_map.get(key, 0))
+                hit = int(pay > 0)
+                total_payout += pay
+                if hit:
+                    winning_types.append(t["bet_type"])
+                con.execute("""
+                    INSERT OR REPLACE INTO v187_mixed_ticket_feedback
+                    (race_key,plan_hash,bet_type,combination,hit,payout_yen) VALUES (?,?,?,?,?,?)
+                """, (plan["race_key"],plan["plan_hash"],t["bet_type"],t["combination"],hit,pay))
+            cost = int(plan["cost_yen"] or len(tickets)*100)
+            hit = int(total_payout > 0)
+            black = int(total_payout >= cost and hit)
+            gami = int(0 < total_payout < cost)
+            multiple = total_payout / cost if cost else 0.0
+            con.execute("""
+                INSERT OR REPLACE INTO v187_mixed_plan_feedback
+                (race_key,plan_hash,hit,black_hit,gami_hit,payout_yen,cost_yen,realized_multiple,return_rate,winning_types,evaluated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (plan["race_key"],plan["plan_hash"],hit,black,gami,total_payout,cost,multiple,multiple*100.0,
+                    json.dumps(sorted(set(winning_types)), ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+            done += 1
+        con.commit()
+    return done
+
+
+def _v187_learning_profile(db_path: str) -> dict:
+    _v187_ensure_mixed_learning_tables(db_path)
+    _v187_sync_mixed_feedback(db_path)
+    out = {"samples":0, "hit_rate":None, "black_rate":None, "gami_rate":None, "return_rate":None, "type_weights":{}}
+    with sqlite3.connect(db_path) as con:
+        row = con.execute("""
+            SELECT COUNT(*), AVG(hit)*100.0, AVG(black_hit)*100.0, AVG(gami_hit)*100.0, AVG(return_rate)
+            FROM v187_mixed_plan_feedback
+        """).fetchone()
+        if row and int(row[0] or 0)>0:
+            out.update(samples=int(row[0]), hit_rate=float(row[1] or 0), black_rate=float(row[2] or 0),
+                       gami_rate=float(row[3] or 0), return_rate=float(row[4] or 0))
+        rows = con.execute("""
+            SELECT bet_type, COUNT(*) n, AVG(hit)*100.0 hit_rate, AVG(payout_yen) avg_payout
+            FROM v187_mixed_ticket_feedback GROUP BY bet_type
+        """).fetchall()
+        for bet_type,n,hit_rate,avg_payout in rows:
+            # 少数データは1.0へ縮小。実績が増えるほど0.80～1.20の範囲で効かせる。
+            reliability = min(1.0, float(n)/30.0)
+            raw = 0.80 + min(0.40, max(0.0, float(hit_rate or 0)/25.0))
+            out["type_weights"][bet_type] = 1.0 + (raw-1.0)*reliability
+    return out
+
+
+def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict) -> str:
+    _v187_ensure_mixed_learning_tables(db_path)
+    payload = [(t.get("type"),t.get("combo"),round(float(t.get("odds",0)),3)) for t in result.get("tickets",[])]
+    plan_hash = hashlib.sha1(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            INSERT OR REPLACE INTO v187_mixed_plan_runs
+            (race_key,plan_hash,points,cost_yen,grade,cover,black,low,hit_average_multiple,model_expected_multiple,model_return_rate,role_count,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (str(race_key),plan_hash,int(result.get("points",0)),int(result.get("cost",0)),result.get("grade"),
+                float(result.get("cover",0)),float(result.get("black",0)),float(result.get("low",0)),
+                float(result.get("hit_average_multiple",0)),float(result.get("model_expected_multiple",0)),
+                float(result.get("model_return_rate",0)),len(result.get("grouped",{})),now))
+        con.execute("DELETE FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?", (str(race_key),plan_hash))
+        for t in result.get("tickets",[]):
+            con.execute("""
+                INSERT OR REPLACE INTO v187_mixed_plan_tickets
+                (race_key,plan_hash,bet_type,combination,probability,odds,role) VALUES (?,?,?,?,?,?,?)
+            """, (str(race_key),plan_hash,t.get("type"),t.get("combo"),float(t.get("probability",0)),
+                    float(t.get("odds",0)),t.get("role")))
+        con.commit()
+    _v187_sync_mixed_feedback(db_path)
+    return plan_hash
+
+
+def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
+    """8車立て向けの役割分担型・複数券種合成。
+
+    点数上限を先に決めず、三連単本線、着順ずれ、3着抜け、1・2着逆転という
+    異なる外れ方を補う券を組み合わせる。追加効果が続く場合は10点を超えて採用し、
+    最大18点で止める。純粋な期待値最大化ではなく、的中範囲と重複の少なさを重視する。
+    """
+    starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH)
+    if not starter_count or int(starter_count) != 8:
+        return {"available": False, "reason": "役割分担型の複数券種合成は8車立て専用です。"}
+    if not isinstance(bets, dict) or int(trials or 0) <= 0:
+        return {"available": False, "reason": "シミュレーション確率を取得できません。"}
+
+    tri_counter = bets.get("三連単", {}) or {}
+    if not tri_counter:
+        return {"available": False, "reason": "三連単シミュレーションがありません。"}
+
+    learning = _v187_learning_profile(engine.DB_PATH)
+    type_weights = learning.get("type_weights", {})
+
+    type_specs = {
+        "三連単": {"counter": "三連単", "odds": "3tan", "limit": 14, "cap": 9, "role": "本線・着順まで一致"},
+        "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 10, "cap": 5, "role": "上位3車の着順ずれ保険"},
+        "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 8, "cap": 4, "role": "1・2着一致／3着抜け保険"},
+        "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 6, "cap": 3, "role": "1・2着逆転保険"},
+    }
+
+    def combo_text(value, unordered=False):
+        vals = tuple(value) if isinstance(value, (tuple, list)) else (value,)
+        nums = [str(int(v)) for v in vals]
+        if unordered:
+            nums = sorted(nums, key=int)
+        return "-".join(nums)
+
+    outcomes = []
+    for combo, count in tri_counter.items():
+        vals = tuple(int(v) for v in (tuple(combo) if isinstance(combo, (tuple, list)) else (combo,)))
+        if len(vals) == 3:
+            outcomes.append((vals, float(count) / max(int(trials), 1) * 100.0))
+    if not outcomes:
+        return {"available": False, "reason": "三連単結果空間を作れませんでした。"}
+
+    def ticket_matches(ticket, outcome):
+        a, b, c = outcome
+        nums = tuple(int(x) for x in ticket["combo"].split("-"))
+        if ticket["type"] == "三連単":
+            return nums == (a, b, c)
+        if ticket["type"] == "三連複":
+            return tuple(sorted(nums)) == tuple(sorted((a, b, c)))
+        if ticket["type"] == "2連単":
+            return nums == (a, b)
+        return tuple(sorted(nums)) == tuple(sorted((a, b)))
+
+    candidates = []
+    for label, spec in type_specs.items():
+        counter = bets.get(spec["counter"], {}) or {}
+        odds_map = odds_maps.get(spec["odds"], {}) or {}
+        unordered = label in ("三連複", "2連複")
+        ordered = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+        added = 0
+        for combo, count in ordered:
+            key = combo_text(combo, unordered=unordered)
+            odds = float(odds_map.get(key, 0) or 0)
+            if odds <= 0:
+                continue
+            probability = float(count) / max(int(trials), 1) * 100.0
+            learned_weight = float(type_weights.get(label, 1.0))
+            ticket = {
+                "type": label, "combo": key, "probability": probability,
+                "odds": odds, "cap": int(spec["cap"]), "role": spec["role"],
+                "learned_weight": learned_weight,
+            }
+            matched = {i for i, (outcome, _) in enumerate(outcomes) if ticket_matches(ticket, outcome)}
+            if not matched:
+                continue
+            ticket["matched"] = matched
+            ticket["matched_probability"] = sum(outcomes[i][1] for i in matched)
+            candidates.append(ticket)
+            added += 1
+            if added >= int(spec["limit"]):
+                break
+
+    tri_candidates = [c for c in candidates if c["type"] == "三連単"]
+    if len(tri_candidates) < 2:
+        return {"available": False, "reason": "三連単上位候補のオッズが2点以上必要です。"}
+    if len(candidates) < 6:
+        return {"available": False, "reason": "合成判定に必要なオッズ候補が不足しています。4券種表を読み込んでください。"}
+
+    def evaluate(plan):
+        n = len(plan)
+        cost = n * 100.0
+        cover = black = low = expected_return = 0.0
+        covered = set()
+        hit_payout_rows = []
+        for i, (outcome, probability) in enumerate(outcomes):
+            payout = sum(t["odds"] * 100.0 for t in plan if i in t["matched"])
+            if payout > 0:
+                covered.add(i)
+                cover += probability
+                expected_return += probability / 100.0 * payout
+                hit_payout_rows.append((float(payout), float(probability)))
+                if payout >= cost:
+                    black += probability
+                else:
+                    low += probability
+        counts = {}
+        for t in plan:
+            counts[t["type"]] = counts.get(t["type"], 0) + 1
+        diversity = len(counts)
+        role_bonus = 0.0
+        if counts.get("三連単", 0) >= 2:
+            role_bonus += 0.5
+        if counts.get("三連複", 0) >= 1:
+            role_bonus += 0.8
+        if counts.get("2連単", 0) >= 1:
+            role_bonus += 0.8
+        if counts.get("2連複", 0) >= 1:
+            role_bonus += 0.35
+        # 合成倍率は候補総額に対する払戻倍率。複数券種が同時的中する結果では払戻を合算する。
+        if hit_payout_rows and cost > 0 and cover > 0:
+            hit_average_payout = expected_return / (cover / 100.0)
+            hit_average_multiple = hit_average_payout / cost
+            hit_min_multiple = min(payout / cost for payout, _ in hit_payout_rows)
+            hit_max_multiple = max(payout / cost for payout, _ in hit_payout_rows)
+        else:
+            hit_average_payout = 0.0
+            hit_average_multiple = 0.0
+            hit_min_multiple = 0.0
+            hit_max_multiple = 0.0
+        model_expected_multiple = expected_return / cost if cost else 0.0
+        # 点数より、的中範囲・黒字側・役割分担を優先。トリガミと過剰な膨張だけを軽く抑える。
+        score = cover + 0.46 * black - 0.22 * low + role_bonus - 0.075 * n
+        black_share_of_hits = black / cover * 100.0 if cover > 0 else 0.0
+        gami_share_of_hits = low / cover * 100.0 if cover > 0 else 0.0
+        return {
+            "points": n, "cost": cost, "cover": cover, "black": black, "low": low,
+            "miss": max(0.0, 100.0 - cover), "expected_return": expected_return,
+            "model_return_rate": model_expected_multiple * 100.0,
+            "model_expected_multiple": model_expected_multiple,
+            "hit_average_payout": hit_average_payout,
+            "hit_average_multiple": hit_average_multiple,
+            "hit_min_multiple": hit_min_multiple,
+            "hit_max_multiple": hit_max_multiple,
+            "black_share_of_hits": black_share_of_hits,
+            "gami_share_of_hits": gami_share_of_hits,
+            "score": score, "diversity": diversity, "counts": counts, "covered": covered,
+        }
+
+    def marginal(plan, cand):
+        before = evaluate(plan)
+        after = evaluate(plan + [cand])
+        unique = cand["matched"] - before["covered"]
+        unique_prob = sum(outcomes[i][1] for i in unique)
+        return {
+            "unique_prob": unique_prob,
+            "cover_gain": after["cover"] - before["cover"],
+            "black_gain": after["black"] - before["black"],
+            "low_gain": after["low"] - before["low"],
+            "score_gain": after["score"] - before["score"],
+            "after": after,
+        }
+
+    # 三連単上位2点を本線に固定。
+    plan = tri_candidates[:2]
+    remaining = [c for c in candidates if c not in plan]
+
+    # まず異なる外れ方を補う券種を1点ずつ検討する。
+    for required_type in ("三連複", "2連単", "2連複"):
+        choices = []
+        for cand in remaining:
+            if cand["type"] != required_type:
+                continue
+            mg = marginal(plan, cand)
+            lw = float(cand.get("learned_weight", 1.0))
+            key = ((mg["cover_gain"] + 0.45 * mg["black_gain"] - 0.15 * max(0.0, mg["low_gain"])) * lw,
+                   mg["unique_prob"] * lw, cand["probability"], cand["odds"])
+            choices.append((key, cand, mg))
+        if choices:
+            key, cand, mg = max(choices, key=lambda x: x[0])
+            # 役割券でも、ほとんど範囲が増えないものは無理に入れない。
+            if mg["cover_gain"] >= (0.35 if required_type == "2連複" else 0.65):
+                plan.append(cand)
+                remaining.remove(cand)
+
+    snapshots = []
+    if len(plan) >= 6:
+        snapshots.append((list(plan), evaluate(plan)))
+
+    # 追加効果がある限り、最大18点まで券種横断で積み上げる。
+    while len(plan) < 18 and remaining:
+        counts = evaluate(plan)["counts"]
+        best = None
+        for cand in remaining:
+            if counts.get(cand["type"], 0) >= cand["cap"]:
+                continue
+            mg = marginal(plan, cand)
+            # 既存券と重複するだけの券より、新しい外れ方を拾う券を優先。
+            lw = float(cand.get("learned_weight", 1.0))
+            complement = (mg["unique_prob"] + 0.55 * mg["black_gain"] - 0.18 * max(0.0, mg["low_gain"])) * lw
+            if cand["type"] != "三連単" and counts.get(cand["type"], 0) == 0:
+                complement += 0.6
+            key = (complement, mg["score_gain"], mg["cover_gain"], cand["probability"], cand["odds"])
+            if best is None or key > best[0]:
+                best = (key, cand, mg)
+        if best is None:
+            break
+        _, cand, mg = best
+        # 8点以降は、独自カバーまたは黒字側の改善が小さければ止める。
+        if len(plan) >= 8 and mg["unique_prob"] < 0.30 and mg["black_gain"] < 0.18:
+            break
+        plan.append(cand)
+        remaining.remove(cand)
+        if len(plan) >= 6:
+            snapshots.append((list(plan), evaluate(plan)))
+
+    if not snapshots:
+        return {"available": False, "reason": "役割の異なる券を組み合わせた有効な構成を作れませんでした。"}
+
+    # 10点を境にせず、最高評価に近ければ役割数と黒字側を優先する。
+    best_score = max(m["score"] for _, m in snapshots)
+    near = [(p, m) for p, m in snapshots if m["score"] >= best_score - 0.25]
+    selected, metrics = max(
+        near,
+        key=lambda x: (x[1]["diversity"], x[1]["black"], x[1]["cover"], -x[1]["low"], -x[1]["points"]),
+    )
+
+    # 的中率だけでなく、的中時に黒字となる割合と合成倍率を主軸に評価する。
+    gami_share = float(metrics.get("gami_share_of_hits", 0.0))
+    black_share = float(metrics.get("black_share_of_hits", 0.0))
+    avg_multiple = float(metrics.get("hit_average_multiple", 0.0))
+    expected_multiple = float(metrics.get("model_expected_multiple", 0.0))
+
+    if avg_multiple >= 1.80 and expected_multiple >= 1.05 and black_share >= 68.0 and gami_share <= 32.0:
+        multiple_grade = "合成倍率が高い"
+    elif avg_multiple >= 1.25 and expected_multiple >= 0.85 and black_share >= 52.0:
+        multiple_grade = "合成倍率は良好"
+    elif avg_multiple >= 1.00 and black_share >= 45.0:
+        multiple_grade = "合成倍率は標準"
+    else:
+        multiple_grade = "ガミ注意"
+
+    if (metrics["black"] < 10.0 or gami_share >= 55.0 or avg_multiple < 0.95
+            or (expected_multiple < 0.70 and gami_share >= 40.0)):
+        grade, icon = "非推奨", "⛔"
+        reason = (
+            f"的中時のガミ割合が{gami_share:.1f}%で、平均合成倍率は{avg_multiple:.2f}倍です。"
+            "的中範囲を作れても購入総額を回収しにくい構成です。"
+        )
+    elif (metrics["diversity"] >= 3 and metrics["black"] >= 22.0
+          and black_share >= 62.0 and avg_multiple >= 1.35 and expected_multiple >= 0.90):
+        grade, icon = "合成推奨", "✅"
+        reason = (
+            f"的中時の黒字割合が{black_share:.1f}%、平均合成倍率が{avg_multiple:.2f}倍です。"
+            "券種ごとの保険が働きつつ、ガミ側への偏りを抑えています。"
+        )
+    elif gami_share >= 42.0 or avg_multiple < 1.10:
+        grade, icon = "ガミ注意・条件付き", "⚠️"
+        reason = (
+            f"合成的中率はありますが、的中時のガミ割合が{gami_share:.1f}%です。"
+            "低配当側が多いため、的中優先の場合だけ参考にする構成です。"
+        )
+    else:
+        grade, icon = "的中優先なら候補", "△"
+        reason = (
+            f"的中時の黒字割合は{black_share:.1f}%、平均合成倍率は{avg_multiple:.2f}倍です。"
+            "配当と的中範囲のバランスは中間的です。"
+        )
+
+    grouped = {}
+    for ticket in selected:
+        grouped.setdefault(ticket["type"], []).append(ticket)
+    role_lines = []
+    for ticket_type in ("三連単", "三連複", "2連単", "2連複"):
+        rows = grouped.get(ticket_type, [])
+        if rows:
+            role_lines.append(f"{ticket_type}{len(rows)}点：{rows[0]['role']}")
+    return {
+        "available": True, "grade": grade, "icon": icon, "reason": reason,
+        "multiple_grade": multiple_grade,
+        "tickets": selected, "grouped": grouped, "role_lines": role_lines,
+        "learning": learning, **metrics,
+    }
+
+
+def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict, race_key: str = "") -> None:
+    result = v184_eight_car_mixed_plan(bets, trials, meta, odds_maps)
+    st.markdown("#### 🧩 8車向け・役割分担型の複数券種合成")
+    if not result.get("available"):
+        st.caption(result.get("reason", "4券種オッズを読み込むと表示します。"))
+        return
+    saved_hash = ""
+    try:
+        if race_key and str(race_key) != "current":
+            saved_hash = _v187_save_mixed_plan(engine.DB_PATH, str(race_key), result)
+    except Exception as exc:
+        st.warning(f"合成プランをDBへ保存できませんでした: {exc}")
+    st.subheader(f"{result['icon']} 合成参考：{result['points']}点・{result['grade']}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("合成的中率", f"{result['cover']:.2f}%")
+    c2.metric("黒字的中率", f"{result['black']:.2f}%")
+    c3.metric("トリガミ率", f"{result['low']:.2f}%")
+    c4.metric("候補総額", f"{int(result['cost']):,}円")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("的中時平均合成倍率", f"{result['hit_average_multiple']:.2f}倍")
+    m2.metric("最低合成倍率", f"{result['hit_min_multiple']:.2f}倍")
+    m3.metric("最高合成倍率", f"{result['hit_max_multiple']:.2f}倍")
+    m4.metric("モデル期待倍率", f"{result['model_expected_multiple']:.2f}倍")
+    q1, q2, q3 = st.columns(3)
+    q1.metric("的中時の黒字割合", f"{result['black_share_of_hits']:.1f}%")
+    q2.metric("的中時のガミ割合", f"{result['gami_share_of_hits']:.1f}%")
+    q3.metric("倍率判定", result.get("multiple_grade", "参考"))
+    if result["grade"] == "非推奨":
+        st.error(result["reason"])
+    elif result["grade"] == "合成推奨":
+        st.success(result["reason"])
+    elif "ガミ注意" in result["grade"]:
+        st.warning(result["reason"])
+    else:
+        st.info(result["reason"])
+    st.caption(" / ".join(result.get("role_lines", [])))
+    order = ("三連単", "三連複", "2連単", "2連複")
+    for ticket_type in order:
+        rows = result["grouped"].get(ticket_type, [])
+        if not rows:
+            continue
+        st.markdown(f"**{ticket_type}：{len(rows)}点｜{rows[0]['role']}**")
+        ticket_lines = []
+        for r in rows:
+            solo_gami = float(r["odds"]) * 100.0 < float(result["cost"])
+            note = " / 単独的中ではガミ注意" if solo_gami else ""
+            ticket_lines.append(
+                f"{r['combo']}  ({r['odds']:.1f}倍 / モデル{r['probability']:.2f}%{note})"
+            )
+        st.code("\n".join(ticket_lines), language=None)
+    st.caption(
+        f"モデル上の全外れ率 {result['miss']:.2f}%・参考モデル回収率 {result['model_return_rate']:.1f}% 。"
+        "点数を10点で切らず、独自の的中範囲または黒字側の改善が続く場合は最大18点まで採用します。"
+    )
+    st.caption(
+        "判定は、合成的中率だけでなく、的中時の黒字割合・ガミ割合・平均合成倍率・モデル期待倍率を使用します。"
+        "合成倍率が高く黒字側が多い構成は推奨し、ガミ側が過半数に近い構成は非推奨または条件付きにします。"
+    )
+    st.caption(
+        "各買い目の『単独的中ではガミ注意』は、その券だけが当たった場合の払戻が候補総額を下回る意味です。"
+        "別券種も同時的中すれば、合算で黒字になる場合があります。"
+    )
+    st.caption(
+        "合成倍率は、各候補を100円ずつ購入した候補総額に対する払戻倍率です。"
+        "結果によって当たる券種と同時的中数が変わるため、固定値ではなく最低・平均・最高で表示しています。"
+    )
+    learning = result.get("learning", {})
+    samples = int(learning.get("samples", 0) or 0)
+    if samples > 0:
+        st.caption(
+            f"結果学習：{samples}レース｜実績的中率 {learning.get('hit_rate',0):.1f}%｜"
+            f"実績黒字率 {learning.get('black_rate',0):.1f}%｜実績回収率 {learning.get('return_rate',0):.1f}%"
+        )
+    else:
+        st.caption("結果学習：保存開始直後のため実績なし。結果登録後、自動照合して次回の券種配分へ少しずつ反映します。")
+    if saved_hash:
+        st.caption(f"💾 この合成プランはDB保存済み（ID: {saved_hash}）。結果登録後に自動評価されます。")
+    st.caption("同じ結果で複数券種が同時的中する場合は払戻を合算しています。確率とオッズによる参考構成です。")
+
 def install_uploaded_db(uploaded) -> tuple[bool, str]:
     data = uploaded.getvalue()
     if not data.startswith(b"SQLite format 3\x00"):
@@ -2521,6 +3058,15 @@ if selected_main_page == "🏁 予測":
             trifecta_odds = st.session_state.get(f"saved_odds_{odds_namespace}_3tan", {})
             show_v182_odds_adjusted_tight_recommendation(
                 bets, view_trials, meta, trifecta_odds
+            )
+            all_odds_maps = {
+                "3tan": st.session_state.get(f"saved_odds_{odds_namespace}_3tan", {}),
+                "3fuku": st.session_state.get(f"saved_odds_{odds_namespace}_3fuku", {}),
+                "2tansho": st.session_state.get(f"saved_odds_{odds_namespace}_2tansho", {}),
+                "2fuku": st.session_state.get(f"saved_odds_{odds_namespace}_2fuku", {}),
+            }
+            show_v184_eight_car_mixed_plan(
+                bets, view_trials, meta, all_odds_maps, race_key=race_key
             )
 
             show_v67_self_evaluation(meta)
