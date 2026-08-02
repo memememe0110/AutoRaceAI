@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver208｜DB76基準・結果分析に回収率重視プランの的中・実回収率を表示")
+st.caption("Ver209｜事前確認2表を最上部表示・オッズ後の堅いレースは3連単少点数化")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2837,6 +2837,79 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             f"ガミ率{before['low']:.2f}%→{after['low']:.2f}%"
         )
 
+    # Ver209: オッズ入力後に上位2車へ確率が集中した「堅いレース」を検出し、
+    # 低配当の保険を広く持たず、3連単2〜5点の少点数構成と通常合成を比較する。
+    hard_race_info = {"enabled": False}
+    try:
+        win_share = {}
+        pair_share = {}
+        for outcome, probability in outcomes:
+            a, b, _ = outcome
+            win_share[a] = win_share.get(a, 0.0) + float(probability)
+            pair = tuple(sorted((a, b)))
+            pair_share[pair] = pair_share.get(pair, 0.0) + float(probability)
+        top_wins = sorted(win_share.items(), key=lambda x: x[1], reverse=True)
+        top_pair, top_pair_prob = max(pair_share.items(), key=lambda x: x[1]) if pair_share else ((0, 0), 0.0)
+        top2_win_share = sum(v for _, v in top_wins[:2])
+        top_tri_prob = max((float(t.get("probability", 0.0)) for t in tri_candidates), default=0.0)
+        hard_score = 0
+        hard_score += int(top2_win_share >= 72.0)
+        hard_score += int(float(top_pair_prob) >= 38.0)
+        hard_score += int(top_tri_prob >= 5.0)
+        # 市場側も上位3連単が低〜中配当に集中している場合だけ強判定にする。
+        top_tri_rows = sorted(tri_candidates, key=lambda t: float(t.get("probability", 0.0)), reverse=True)[:8]
+        low_odds_count = sum(1 for t in top_tri_rows[:5] if 0 < float(t.get("odds", 0.0)) <= 25.0)
+        hard_score += int(low_odds_count >= 3)
+        if hard_score >= 3 and len(top_tri_rows) >= 3:
+            compact_options = []
+            for k in range(2, min(5, len(top_tri_rows)) + 1):
+                compact = top_tri_rows[:k]
+                compact_metrics = evaluate(compact)
+                # 少点数化では、黒字確率、期待倍率、的中範囲の順に評価する。
+                utility = (1.75 * compact_metrics["black"]
+                           + 9.0 * compact_metrics["model_expected_multiple"]
+                           + 0.22 * compact_metrics["cover"]
+                           - 0.55 * compact_metrics["low"]
+                           - 0.20 * k)
+                compact_options.append((utility, compact, compact_metrics))
+            _, compact_plan, compact_metrics = max(
+                compact_options,
+                key=lambda x: (x[0], x[2]["black"], x[2]["model_expected_multiple"], -x[2]["points"]),
+            )
+            normal_metrics = evaluate(selected)
+            # 通常合成より回収率が極端に悪化せず、ガミ率を大きく下げる場合に少点数へ切替。
+            compact_is_better = (
+                compact_metrics["model_return_rate"] >= normal_metrics["model_return_rate"] * 0.90
+                and compact_metrics["low"] <= normal_metrics["low"] - 2.0
+                and compact_metrics["black"] >= normal_metrics["black"] - 7.0
+            )
+            hard_race_info = {
+                "enabled": True,
+                "applied": bool(compact_is_better),
+                "score": hard_score,
+                "top_pair": top_pair,
+                "top_pair_prob": float(top_pair_prob),
+                "top2_win_share": float(top2_win_share),
+                "normal_points": int(normal_metrics.get("points", len(selected))),
+                "compact_points": int(compact_metrics.get("points", len(compact_plan))),
+                "normal_return": float(normal_metrics.get("model_return_rate", 0.0)),
+                "compact_return": float(compact_metrics.get("model_return_rate", 0.0)),
+                "normal_black": float(normal_metrics.get("black", 0.0)),
+                "compact_black": float(compact_metrics.get("black", 0.0)),
+                "normal_low": float(normal_metrics.get("low", 0.0)),
+                "compact_low": float(compact_metrics.get("low", 0.0)),
+            }
+            if compact_is_better:
+                selected = list(compact_plan)
+                metrics = compact_metrics
+                replacement_notes.append(
+                    f"堅いレース判定により通常{normal_metrics['points']}点から3連単{compact_metrics['points']}点へ絞り込み。"
+                    f"上位2車勝率合計{top2_win_share:.1f}%・中心ペア確率{top_pair_prob:.1f}%・"
+                    f"ガミ率{normal_metrics['low']:.2f}%→{compact_metrics['low']:.2f}%"
+                )
+    except Exception:
+        hard_race_info = {"enabled": False}
+
     # Ver206: 低評価でも3着へ残る選手を、無条件で本線へ追加しない。
     # 既存の1・2着軸、3連複、別の3連単から自然に派生し、オッズ込みの期待値がある3連単だけを
     # 「余裕がある場合の追加候補」または「低効率券との入れ替え候補」として提示する。
@@ -2989,6 +3062,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "protected_add_notes": protected_add_notes,
         "protected_count": len([t for t in selected if t.get("protected")]),
         "residual_trifecta_candidates": residual_candidates,
+        "hard_race_info": hard_race_info,
         "tri_seed_cover": float(tri_seed_metrics.get("cover", 0.0)),
         "tri_seed_black": float(tri_seed_metrics.get("black", 0.0)),
         **metrics,
@@ -3047,6 +3121,18 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
         st.warning(f"合成プランをDBへ保存できませんでした: {exc}")
 
     # Ver207: ユーザーが主に見る最終買い目と一括コピーを、説明・監査・指標より先に表示する。
+    hard_info = result.get("hard_race_info") or {}
+    if hard_info.get("enabled"):
+        pair = hard_info.get("top_pair") or (0, 0)
+        if hard_info.get("applied"):
+            st.success(
+                f"🔒 堅いレース判定：3連単{int(hard_info.get('compact_points',0))}点へ自動絞り込み｜"
+                f"中心ペア {pair[0]}・{pair[1]}（1・2着確率{float(hard_info.get('top_pair_prob',0)):.1f}%）"
+            )
+        else:
+            st.info(
+                f"🔒 堅いレース候補を検出しましたが、少点数化で黒字確率または参考回収率が悪化するため通常構成を維持しました。"
+            )
     formation_sections, formation_notes = v207_build_mixed_formation_sections(result)
     st.subheader(f"{result['icon']} 回収率重視：{result['points']}点・{result['grade']}")
     if formation_sections:
@@ -3595,14 +3681,18 @@ if selected_main_page == "🏁 予測":
                 ] if c in preview_entries.columns]
                 expected_entries = int(preview_meta.get("出走数")) if preview_meta.get("出走数") else None
                 actual_entries = int(preview_entries["車番"].nunique())
-                with st.expander(f"📋 出走表の読み取り確認（{actual_entries}名）", expanded=False):
-                    st.dataframe(preview_entries[preview_cols], use_container_width=True, hide_index=True)
-                    if expected_entries and actual_entries < expected_entries:
-                        present = set(preview_entries["車番"].dropna().astype(int).tolist())
-                        missing = [car for car in range(1, expected_entries + 1) if car not in present]
-                        st.warning(f"⚠ {actual_entries}/{expected_entries}車のみ読み取りました。未読込候補: " + "、".join(f"{car}番" for car in missing))
-                    elif expected_entries:
-                        st.success(f"✅ {actual_entries}/{expected_entries}車を正常に読み取りました。")
+                # Ver209: シミュレーション前に入力内容とDB量を確認できるよう、2表を最上部へ常時表示する。
+                st.markdown("## 🔎 シミュレーション前の確認")
+                st.subheader(f"解析した出走表（{actual_entries}名）")
+                st.dataframe(preview_entries[preview_cols], use_container_width=True, hide_index=True)
+                if expected_entries and actual_entries < expected_entries:
+                    present = set(preview_entries["車番"].dropna().astype(int).tolist())
+                    missing = [car for car in range(1, expected_entries + 1) if car not in present]
+                    st.warning(f"⚠ {actual_entries}/{expected_entries}車のみ読み取りました。未読込候補: " + "、".join(f"{car}番" for car in missing))
+                elif expected_entries:
+                    st.success(f"✅ {actual_entries}/{expected_entries}車を正常に読み取りました。")
+                show_player_data_coverage(preview_entries)
+                st.caption("この2表を確認してから、下の予測ボタンを押してください。")
             else:
                 st.warning("出走表から選手を読み取れませんでした。")
 
@@ -3749,9 +3839,9 @@ if selected_main_page == "🏁 予測":
                 detail = "、".join(f"{car}番（{status}）" for car, status in sorted(excluded.items()))
                 st.warning(f"解析対象外: {detail}。確率・順位・買い目の組み合わせから完全に除外しました。")
             st.caption(f"実出走数: {len(entries)}車 / 三連単組み合わせ数: {len(entries)*(len(entries)-1)*(len(entries)-2)}通り")
-            st.subheader("解析した出走表")
-            st.dataframe(entries.drop(columns=["_raw"], errors="ignore"), use_container_width=True, hide_index=True)
-            show_player_data_coverage(entries)
+            with st.expander("解析入力と登録データ量を再確認", expanded=False):
+                st.dataframe(entries.drop(columns=["_raw"], errors="ignore"), use_container_width=True, hide_index=True)
+                show_player_data_coverage(entries)
 
             cols = [c for c in [
                 "改善後順位", "1着候補順位", "連対候補順位", "3着候補順位", "総合点順位_従来",
