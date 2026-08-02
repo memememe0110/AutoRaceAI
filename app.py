@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver175｜補正競合を自動抑制＋予測安定度＋DB63基準")
+st.caption("Ver182｜的中重視＋オッズ点数調整・4券種一括読込＋DB67基準")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -868,6 +868,203 @@ def show_prediction_confidence(finish_prob: pd.DataFrame, bets: dict, trials: in
     st.caption("自信度は、1着率の高さ・次点との差・3着内率・三連単確率の集中度をまとめた診断です。的中を保証する数値ではありません。")
 
 
+
+def v180_trifecta_tight_recommendation(bets: dict, trials: int, meta: dict) -> dict:
+    """三連単1〜10点の推奨。
+
+    6車立ては同じ6車立ての確率分布が近い過去レースで点数別に検証する。
+    7車は十分な履歴と強い確率集中が揃う場合だけ参考表示、8車は原則非推奨。
+    通常カバーラインやフォーメーション生成には影響しない。
+    """
+    empty = {
+        "points": 10, "level": "判定不能", "icon": "⚪", "hit_rate": None,
+        "lower_bound": None, "samples": 0, "topn_cover": 0.0, "top10_cover": 0.0,
+        "reason": "三連単の確率分布を取得できません。", "combos": [],
+    }
+    counter = bets.get("三連単", {}) if isinstance(bets, dict) else {}
+    if not counter or int(trials or 0) <= 0:
+        return empty
+
+    ordered = sorted(counter.items(), key=lambda item: item[1], reverse=True)
+    rows, cumulative = [], 0.0
+    for rank, (combo, count) in enumerate(ordered[:10], 1):
+        probability = float(count) / max(int(trials), 1) * 100.0
+        cumulative += probability
+        combo_tuple = tuple(combo) if isinstance(combo, (tuple, list)) else (combo,)
+        rows.append({
+            "rank": rank, "combo": "-".join(map(str, combo_tuple)),
+            "probability": probability, "cumulative": cumulative,
+        })
+    if not rows:
+        return empty
+
+    current_cum = {r["rank"]: r["cumulative"] for r in rows}
+    starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH)
+    top10_cover = float(rows[-1]["cumulative"])
+
+    # 8車は過去検証で少点数との相性が弱いため、原則として出さない。
+    if starter_count and int(starter_count) >= 8:
+        return {
+            "points": 10, "level": "非推奨", "icon": "🌫️", "hit_rate": None,
+            "lower_bound": None, "samples": 0, "topn_cover": top10_cover,
+            "top10_cover": top10_cover,
+            "reason": "8車立ては確率が広がりやすく、DB67の過去検証でも10点以内の再現性が低いため、激絞りは原則非推奨です。",
+            "combos": [],
+        }
+
+    historical = pd.DataFrame()
+    try:
+        with sqlite3.connect(engine.DB_PATH) as con:
+            historical = pd.read_sql_query(
+                """
+                WITH starters AS (
+                    SELECT race_key, COUNT(DISTINCT car_no) AS starters
+                    FROM result_entries
+                    WHERE COALESCE(result_status, '') NOT IN ('欠車','出走取消','競走除外')
+                    GROUP BY race_key
+                )
+                SELECT f.race_key, f.predicted_rank AS actual_rank,
+                       s.starters, t.predicted_rank AS n,
+                       t.cumulative_probability AS cumulative_probability
+                FROM v67_ticket_feedback f
+                JOIN starters s ON s.race_key=f.race_key
+                JOIN v67_prediction_tickets t
+                  ON t.race_key=f.race_key
+                 AND t.bet_type='3連単'
+                 AND t.predicted_rank BETWEEN 1 AND 10
+                WHERE f.bet_type='3連単' AND f.predicted_rank IS NOT NULL
+                """, con,
+            )
+    except Exception:
+        historical = pd.DataFrame()
+
+    if historical.empty or not starter_count:
+        return {
+            **empty, "points": min(10, len(rows)), "level": "履歴不足", "icon": "⚪",
+            "topn_cover": top10_cover, "top10_cover": top10_cover,
+            "reason": "同じ車立ての検証履歴が不足しているため、激絞り点数は推奨しません。",
+        }
+
+    for col in ("n", "actual_rank", "cumulative_probability", "starters"):
+        historical[col] = pd.to_numeric(historical[col], errors="coerce")
+    same = historical[historical["starters"] == int(starter_count)].dropna().copy()
+    pivot = same.pivot_table(
+        index=["race_key", "actual_rank"], columns="n",
+        values="cumulative_probability", aggfunc="first"
+    ).reset_index()
+    needed = list(range(1, min(10, len(rows)) + 1))
+    if any(n not in pivot.columns for n in needed) or len(pivot) < 15:
+        return {
+            **empty, "points": min(10, len(rows)), "level": "履歴不足", "icon": "⚪",
+            "topn_cover": top10_cover, "top10_cover": top10_cover,
+            "reason": f"{int(starter_count)}車立ての完全な比較履歴が15レース未満のため、激絞り点数は推奨しません。",
+        }
+
+    # 7車は履歴15件以上かつ上位10点累積45%以上のときだけ参考判定。
+    if int(starter_count) == 7 and (len(pivot) < 15 or top10_cover < 45.0):
+        return {
+            "points": 10, "level": "非推奨", "icon": "🌫️", "hit_rate": None,
+            "lower_bound": None, "samples": int(len(pivot)), "topn_cover": top10_cover,
+            "top10_cover": top10_cover,
+            "reason": "7車立ては履歴または確率集中が不足しています。データが増えるまでは激絞り非推奨です。",
+            "combos": [],
+        }
+
+    import math
+    import numpy as np
+
+    current_vector = np.array([float(current_cum[n]) for n in needed], dtype=float)
+    matrix = pivot[needed].to_numpy(dtype=float)
+    scale = np.nanstd(matrix, axis=0)
+    scale[~np.isfinite(scale) | (scale < 1.0)] = 1.0
+    distances = np.sqrt(np.nanmean(((matrix - current_vector) / scale) ** 2, axis=1))
+    nearest_count = min(20, len(pivot))
+    peer = pivot.iloc[np.argsort(distances)[:nearest_count]].copy()
+
+    def wilson_lower(hits: int, samples: int, z: float = 1.2815515655) -> float:
+        if samples <= 0:
+            return 0.0
+        p = hits / samples
+        denominator = 1.0 + z * z / samples
+        centre = p + z * z / (2.0 * samples)
+        spread = z * math.sqrt(p * (1.0 - p) / samples + z * z / (4.0 * samples * samples))
+        return max(0.0, (centre - spread) / denominator)
+
+    candidates = []
+    for n in needed:
+        hits = int((peer["actual_rank"] <= n).sum())
+        samples = int(len(peer))
+        hit_rate = hits / samples if samples else 0.0
+        lower = wilson_lower(hits, samples)
+        # 信頼区間下限を中心にし、点数増加へ小さなペナルティを付ける。
+        score = lower - 0.015 * n
+        candidates.append({
+            "n": n, "hits": hits, "samples": samples,
+            "hit_rate": hit_rate, "lower": lower, "score": score,
+            "cover": float(current_cum[n]),
+        })
+
+    best_score = max(c["score"] for c in candidates)
+    # ほぼ同等なら少ない点数を優先。点数を増やしても改善しない膨張を防ぐ。
+    near_best = [c for c in candidates if c["score"] >= best_score - 0.02]
+    selected = min(near_best, key=lambda c: c["n"])
+
+    # 6車でも信頼区間下限25%未満、または上位10点累積28%未満は非推奨。
+    recommended = selected["lower"] >= 0.25 and top10_cover >= 28.0
+    if not recommended:
+        return {
+            "points": int(selected["n"]), "level": "非推奨", "icon": "🌫️",
+            "hit_rate": selected["hit_rate"] * 100.0,
+            "lower_bound": selected["lower"] * 100.0,
+            "samples": int(selected["samples"]),
+            "topn_cover": float(selected["cover"]), "top10_cover": top10_cover,
+            "reason": (
+                f"近い過去{selected['samples']}レースを比較しましたが、"
+                f"信頼区間下限が{selected['lower']*100:.1f}%のため激絞り非推奨です。"
+            ), "combos": [],
+        }
+
+    level, icon = ("高", "🎯") if selected["lower"] >= 0.45 else ("中", "🟡")
+    reason = (
+        f"{int(starter_count)}車立ての確率分布が近い過去{selected['samples']}レースで、"
+        f"上位{selected['n']}点以内が{selected['hits']}件。"
+        f"実績{selected['hit_rate']*100:.1f}%、80%信頼区間下限{selected['lower']*100:.1f}%です。"
+    )
+    return {
+        "points": int(selected["n"]), "level": level, "icon": icon,
+        "hit_rate": selected["hit_rate"] * 100.0,
+        "lower_bound": selected["lower"] * 100.0,
+        "samples": int(selected["samples"]),
+        "topn_cover": float(selected["cover"]), "top10_cover": top10_cover,
+        "reason": reason, "combos": [r["combo"] for r in rows[:int(selected["n"])]],
+    }
+
+def show_v180_trifecta_tight_recommendation(bets: dict, trials: int, meta: dict) -> None:
+    info = v180_trifecta_tight_recommendation(bets, trials, meta)
+    st.subheader(f"{info['icon']} 三連単 激絞り推奨：{info['points']}点")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("推奨点数", f"{info['points']}点")
+    c2.metric("推奨範囲の累積", f"{info['topn_cover']:.2f}%")
+    c3.metric("上位10点の累積", f"{info['top10_cover']:.2f}%")
+    if info.get("hit_rate") is not None:
+        lower_text = (
+            f"・80%信頼区間下限 {info['lower_bound']:.1f}%"
+            if info.get("lower_bound") is not None else ""
+        )
+        st.caption(
+            f"近い過去条件の上位{info['points']}点以内率：{info['hit_rate']:.1f}% "
+            f"（{info['samples']}レース）{lower_text}"
+        )
+    if info["level"] == "非推奨":
+        st.warning(info["reason"])
+    elif info["level"] == "高":
+        st.success(info["reason"])
+    else:
+        st.info(info["reason"])
+    if info["combos"]:
+        st.code("\n".join(info["combos"]), language=None)
+    st.caption("通常のカバーラインとは別の参考表示です。少点数を常に推奨するものではありません。")
+
 def ticket_point_heading(bet_type: str, points: int) -> str:
     """券種と点数を全画面で同じ書式にそろえる。"""
     return f"【{bet_type}】({int(points)}点)"
@@ -1312,7 +1509,28 @@ def parse_manual_odds(text: str, unordered: bool = False) -> tuple[pd.DataFrame,
 def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_key: str, unordered: bool = False, namespace: str = "current") -> None:
     """各確率表の直下でオッズを入力し、再描画後も入力値を保持する。"""
     st.markdown(f"#### {title} オッズ入力")
-    st.caption("確率上位の各行へオッズを直接入力できます。公平倍率との差のみを表示し、購入推奨は行いません。")
+    st.caption("各行へ直接入力できます。公式の4券種横並び表は、下の一括貼り付けから読み込めます。")
+
+    bulk_key = f"bulk_odds_text_{namespace}"
+    with st.expander("公式オッズ表を一括貼り付け"):
+        bulk_text = st.text_area(
+            "3連単人気・3連複人気・2連単人気・2連複人気の表",
+            key=bulk_key, height=180,
+            placeholder="公式オッズ表を見出しからそのまま貼り付け",
+        )
+        if st.button("4券種のオッズを読み込む", key=f"load_bulk_odds_{namespace}", use_container_width=True):
+            parsed = v182_parse_four_block_odds(bulk_text)
+            total = sum(len(v) for v in parsed.values())
+            if total <= 0:
+                st.error("オッズを読み取れませんでした。タブ区切りの表をそのまま貼り付けてください。")
+            else:
+                for parsed_key, values in parsed.items():
+                    st.session_state[f"saved_odds_{namespace}_{parsed_key}"] = values
+                st.success(
+                    f"読込完了：三連単{len(parsed['3tan'])}件、三連複{len(parsed['3fuku'])}件、"
+                    f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
+                )
+                st.rerun()
 
     prob_df = ticket_probability_table(bets, key, trials, top_n=40).drop(columns=["的中回数"], errors="ignore")
     if prob_df.empty:
@@ -1376,6 +1594,141 @@ def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_k
     )
     st.caption("倍率差は入力オッズ÷公平倍率です。市場とモデルの評価差を見るための参考値です。")
 
+
+
+def v182_parse_four_block_odds(text: str) -> dict:
+    """公式オッズの4券種横並び表を解析する。
+
+    期待する列は、三連単4列・三連複4列・2連単3列・2連複3列。
+    タブ区切りを優先し、空欄を保持する。
+    """
+    result = {"3tan": {}, "3fuku": {}, "2tansho": {}, "2fuku": {}}
+    for raw in str(text or "").splitlines():
+        line = raw.rstrip("\r\n")
+        if not line.strip() or "3連単人気" in line:
+            continue
+        cols = line.split("\t")
+        if len(cols) < 4:
+            continue
+        cols += [""] * (14 - len(cols))
+
+        def num(index):
+            value = str(cols[index]).strip().replace(",", "")
+            return value if re.fullmatch(r"\d+", value) else ""
+
+        def odd(index):
+            value = str(cols[index]).strip().replace(",", "")
+            try:
+                parsed = float(value)
+                return parsed if parsed > 0 else None
+            except Exception:
+                return None
+
+        a, b, c, o = num(0), num(1), num(2), odd(3)
+        if a and b and c and o:
+            result["3tan"][f"{a}-{b}-{c}"] = o
+        a, b, c, o = num(4), num(5), num(6), odd(7)
+        if a and b and c and o:
+            result["3fuku"]["-".join(sorted((a, b, c), key=int))] = o
+        a, b, o = num(8), num(9), odd(10)
+        if a and b and o:
+            result["2tansho"][f"{a}-{b}"] = o
+        a, b, o = num(11), num(12), odd(13)
+        if a and b and o:
+            result["2fuku"]["-".join(sorted((a, b), key=int))] = o
+    return result
+
+
+def v182_hit_first_odds_adjustment(bets: dict, trials: int, base_info: dict, odds_map: dict) -> dict:
+    """的中重視の上位順を維持したまま、オッズで1〜10点を微調整する。"""
+    counter = bets.get("三連単", {}) if isinstance(bets, dict) else {}
+    if not counter or not odds_map or int(trials or 0) <= 0:
+        return {"available": False, "reason": "三連単オッズを読み込むと点数調整を表示します。"}
+    ordered = sorted(counter.items(), key=lambda item: item[1], reverse=True)[:10]
+    rows = []
+    for rank, (combo, count) in enumerate(ordered, 1):
+        key = "-".join(map(str, tuple(combo) if isinstance(combo, (tuple, list)) else (combo,)))
+        probability = float(count) / max(int(trials), 1) * 100.0
+        odds = float(odds_map.get(key, 0) or 0)
+        rows.append({"rank": rank, "combo": key, "probability": probability, "odds": odds})
+    if not rows or not any(r["odds"] > 0 for r in rows):
+        return {"available": False, "reason": "上位10点に対応する三連単オッズが見つかりません。"}
+
+    base_points = max(1, min(10, int(base_info.get("points") or 10)))
+    candidates = []
+    for n in range(max(1, base_points - 3), min(10, base_points + 3) + 1):
+        chosen = rows[:n]
+        cost = n * 100.0
+        cover = sum(r["probability"] for r in chosen)
+        known = [r for r in chosen if r["odds"] > 0]
+        black = [r for r in known if r["odds"] * 100.0 >= cost]
+        black_cover = sum(r["probability"] for r in black)
+        low_cover = sum(r["probability"] for r in known if r["odds"] * 100.0 < cost)
+        # 的中カバーを主役にし、黒字で当たり得る範囲を加点、低配当範囲と点数を軽く減点。
+        score = cover + 0.35 * black_cover - 0.20 * low_cover - 0.22 * n
+        candidates.append({
+            "n": n, "cost": cost, "cover": cover, "black_cover": black_cover,
+            "low_cover": low_cover, "known": len(known), "score": score,
+        })
+    best = max(candidates, key=lambda x: (x["score"], -abs(x["n"] - base_points), -x["n"]))
+    final_points = int(best["n"])
+    selected = rows[:final_points]
+    known_selected = [r for r in selected if r["odds"] > 0]
+    low_count = sum(1 for r in known_selected if r["odds"] * 100.0 < best["cost"])
+    profitable_count = sum(1 for r in known_selected if r["odds"] * 100.0 >= best["cost"])
+
+    if best["known"] < max(3, final_points // 2):
+        grade, icon = "参考", "⚪"
+        reason = "上位候補のオッズ入力が少ないため、点数調整は参考扱いです。"
+    elif best["black_cover"] < best["cover"] * 0.35 or low_count >= max(2, final_points // 2):
+        grade, icon = "非推奨", "⛔"
+        reason = "的中候補はありますが、購入点数に対して低配当となる候補の割合が高めです。"
+    elif best["black_cover"] >= best["cover"] * 0.70:
+        grade, icon = "推奨", "✅"
+        reason = "的中カバーを維持しつつ、候補総額を上回る配当余地のある組み合わせが多めです。"
+    else:
+        grade, icon = "的中優先なら候補", "△"
+        reason = "的中カバーは妥当ですが、回収効率は中程度です。"
+
+    delta = final_points - base_points
+    if delta > 0:
+        adjust_reason = f"次点候補の確率寄与と配当余地を考慮し、基本{base_points}点から{delta}点追加しました。"
+    elif delta < 0:
+        adjust_reason = f"下位候補の確率寄与と低配当リスクを考慮し、基本{base_points}点から{-delta}点減らしました。"
+    else:
+        adjust_reason = f"基本{base_points}点を維持しました。"
+    return {
+        "available": True, "base_points": base_points, "final_points": final_points,
+        "delta": delta, "cover": best["cover"], "black_cover": best["black_cover"],
+        "low_cover": best["low_cover"], "cost": best["cost"], "grade": grade, "icon": icon,
+        "reason": reason, "adjust_reason": adjust_reason, "profitable_count": profitable_count,
+        "low_count": low_count, "combos": [r["combo"] for r in selected],
+    }
+
+
+def show_v182_odds_adjusted_tight_recommendation(bets: dict, trials: int, meta: dict, odds_map: dict) -> None:
+    base = v180_trifecta_tight_recommendation(bets, trials, meta)
+    adjusted = v182_hit_first_odds_adjustment(bets, trials, base, odds_map)
+    st.markdown("#### 🎛️ 的中重視＋オッズ点数調整")
+    if not adjusted.get("available"):
+        st.caption(adjusted.get("reason", "オッズを読み込むと表示します。"))
+        return
+    st.subheader(f"{adjusted['icon']} 最終参考：{adjusted['final_points']}点・{adjusted['grade']}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("基本点数", f"{adjusted['base_points']}点")
+    c2.metric("オッズ調整", f"{adjusted['delta']:+d}点")
+    c3.metric("候補累積", f"{adjusted['cover']:.2f}%")
+    c4.metric("黒字余地側の累積", f"{adjusted['black_cover']:.2f}%")
+    if adjusted["grade"] == "非推奨":
+        st.warning(adjusted["reason"])
+    elif adjusted["grade"] == "推奨":
+        st.success(adjusted["reason"])
+    else:
+        st.info(adjusted["reason"])
+    st.caption(adjusted["adjust_reason"] + f" 100円ずつなら候補総額は{int(adjusted['cost']):,}円。")
+    st.caption(f"総額以上の配当余地あり {adjusted['profitable_count']}点 / 低配当側 {adjusted['low_count']}点")
+    st.code("\n".join(adjusted["combos"]), language=None)
+    st.caption("これは過去分布と入力オッズを使った参考判定です。的中や収益を保証するものではありません。")
 
 def install_uploaded_db(uploaded) -> tuple[bool, str]:
     data = uploaded.getvalue()
@@ -2112,6 +2465,7 @@ if selected_main_page == "🏁 予測":
                 )
                 st.caption("上昇幅順位は、保存済み学習重みを適用したことで三連単確率がどれだけ増えたかの順位です。")
             show_prediction_confidence(finish_prob, bets, view_trials)
+            show_v180_trifecta_tight_recommendation(bets, view_trials, meta)
 
             st.markdown('<div id="finish-probability"></div>', unsafe_allow_html=True)
             st.subheader("着順確率")
@@ -2163,6 +2517,10 @@ if selected_main_page == "🏁 予測":
             show_odds_comparison(
                 selected_ticket, bets, ticket_key, view_trials, odds_key,
                 unordered=unordered, namespace=odds_namespace,
+            )
+            trifecta_odds = st.session_state.get(f"saved_odds_{odds_namespace}_3tan", {})
+            show_v182_odds_adjusted_tight_recommendation(
+                bets, view_trials, meta, trifecta_odds
             )
 
             show_v67_self_evaluation(meta)
