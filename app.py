@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time as time_module
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,7 +47,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver212｜事前確認2表を最上部表示・堅いレースは中心ペア固定で3連単少点数化")
+st.caption("Ver214｜保険券を関連する高期待値3連単へ置換比較・単独ガミ除外後に再最適化")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -3075,13 +3076,161 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     # 「余裕がある場合の追加候補」または「低効率券との入れ替え候補」として提示する。
     base_for_residual = evaluate(selected)
     selected_ids = {(t.get("type"), t.get("combo")) for t in selected}
+    # Ver213: 回収率重視の最終構成では「その券だけが的中した場合に赤字」の券を残さない。
+    # 券を1点ずつ外すたびに購入総額が下がるため、最終総額に対して再判定を繰り返す。
+    # 長期回収率を優先し、本線保護よりも単独黒字条件を優先する。
+    solo_gami_exclusion_notes = []
+    for _ in range(20):
+        current = evaluate(selected)
+        current_cost = float(current.get("cost", 0.0) or 0.0)
+        if current_cost <= 0 or len(selected) <= 1:
+            break
+        solo_gami = []
+        for ticket in selected:
+            odds = float(ticket.get("odds", 0.0) or 0.0)
+            payout = odds * 100.0
+            if payout + 1e-9 >= current_cost:
+                continue
+            prob = float(ticket.get("probability", 0.0) or 0.0)
+            ev = (prob / 100.0) * odds
+            trial = [t for t in selected if t is not ticket]
+            after = evaluate(trial)
+            return_gain = float(after.get("model_return_rate", 0.0) - current.get("model_return_rate", 0.0))
+            black_delta = float(after.get("black", 0.0) - current.get("black", 0.0))
+            cover_loss = float(current.get("cover", 0.0) - after.get("cover", 0.0))
+            # 低EV、回収率改善、黒字率を傷めにくい券から除外。
+            key = (
+                1 if ev < 1.0 else 0,
+                return_gain,
+                black_delta,
+                -cover_loss,
+                current_cost - payout,
+                -ev,
+            )
+            solo_gami.append((key, ticket, trial, after, payout, ev))
+        if not solo_gami:
+            break
+        solo_gami.sort(key=lambda x: x[0], reverse=True)
+        _, ticket, selected, after, payout, ev = solo_gami[0]
+        ticket["protected"] = False
+        solo_gami_exclusion_notes.append(
+            f"{ticket['type']} {ticket['combo']}（{float(ticket.get('odds',0)):.1f}倍）を除外。"
+            f"単独払戻{payout:.0f}円が除外前総額{current_cost:.0f}円を下回り、"
+            f"単体期待値は{ev*100:.1f}%"
+        )
+
+    # Ver214: 単独ガミ除外後、2連単・2連複・3連複を削除して終わりにせず、
+    # 同じ展開から派生する高期待値3連単へ1対1で置換した場合を再評価する。
+    # 長期回収率・黒字的中率・ガミ率を同時比較し、改善する交換だけ自動採用する。
+    cross_type_tri_swap_notes = []
+    for _ in range(8):
+        base_swap = evaluate(selected)
+        best_cross_swap = None
+        selected_now = {(t.get("type"), t.get("combo")) for t in selected}
+
+        for old in list(selected):
+            old_type = str(old.get("type", ""))
+            if old_type not in {"2連単", "2連複", "3連複", "二連単", "二連複", "三連複"}:
+                continue
+
+            try:
+                nums = tuple(int(x) for x in str(old.get("combo", "")).replace("=", "-").split("-") if str(x).strip())
+            except Exception:
+                continue
+
+            related_combos = set()
+            if old_type in {"2連単", "二連単"} and len(nums) == 2:
+                a, b = nums
+                for c in range(1, starter_count + 1):
+                    if c not in (a, b):
+                        related_combos.add(f"{a}-{b}-{c}")
+            elif old_type in {"2連複", "二連複"} and len(nums) == 2:
+                a, b = nums
+                for c in range(1, starter_count + 1):
+                    if c not in (a, b):
+                        related_combos.add(f"{a}-{b}-{c}")
+                        related_combos.add(f"{b}-{a}-{c}")
+            elif old_type in {"3連複", "三連複"} and len(nums) == 3:
+                import itertools as _itertools_v214
+                for p in _itertools_v214.permutations(nums, 3):
+                    related_combos.add("-".join(map(str, p)))
+
+            if not related_combos:
+                continue
+
+            for cand in candidates:
+                if str(cand.get("type", "")) not in {"3連単", "三連単"}:
+                    continue
+                if str(cand.get("combo", "")) not in related_combos:
+                    continue
+                if (cand.get("type"), cand.get("combo")) in selected_now or any(
+                    str(t.get("type", "")) in {"3連単", "三連単"}
+                    and str(t.get("combo", "")) == str(cand.get("combo", "")) for t in selected
+                ):
+                    continue
+
+                odds = float(cand.get("odds", 0.0) or 0.0)
+                probability = float(cand.get("probability", 0.0) or 0.0)
+                standalone_ev = probability / 100.0 * odds
+                if odds <= 0 or standalone_ev < 1.00:
+                    continue
+
+                swapped = [t for t in selected if t is not old] + [cand]
+                sm = evaluate(swapped)
+                return_gain = float(sm.get("model_return_rate", 0.0) - base_swap.get("model_return_rate", 0.0))
+                black_delta = float(sm.get("black", 0.0) - base_swap.get("black", 0.0))
+                gami_drop = float(base_swap.get("low", 0.0) - sm.get("low", 0.0))
+                cover_loss = float(base_swap.get("cover", 0.0) - sm.get("cover", 0.0))
+                avg_gain = float(sm.get("hit_average_multiple", 0.0) - base_swap.get("hit_average_multiple", 0.0))
+
+                # 高配当化だけで的中範囲を壊さないよう、長期回収率の改善を必須にし、
+                # 黒字率・ガミ率の悪化とカバー損失には上限を設ける。
+                if return_gain < 0.50:
+                    continue
+                if black_delta < -0.35:
+                    continue
+                if gami_drop < -0.25:
+                    continue
+                if cover_loss > 3.0:
+                    continue
+                if avg_gain < -0.03:
+                    continue
+
+                old_odds = float(old.get("odds", 0.0) or 0.0)
+                score = (
+                    2.2 * return_gain + 1.4 * black_delta + 1.1 * gami_drop
+                    - 0.35 * max(0.0, cover_loss) + 8.0 * max(0.0, avg_gain)
+                    + 0.02 * max(0.0, odds - old_odds)
+                )
+                key = (score, return_gain, black_delta, gami_drop, -cover_loss, standalone_ev, odds)
+                if best_cross_swap is None or key > best_cross_swap[0]:
+                    best_cross_swap = (key, old, cand, swapped, sm, standalone_ev, cover_loss)
+
+        if best_cross_swap is None or best_cross_swap[0][0] <= 0.0:
+            break
+
+        _, old, cand, selected, after_swap, standalone_ev, cover_loss = best_cross_swap
+        cross_type_tri_swap_notes.append(
+            f"{old['type']} {old['combo']}（{float(old.get('odds',0)):.1f}倍）を "
+            f"3連単 {cand['combo']}（{float(cand.get('odds',0)):.1f}倍）へ置換。"
+            f"参考回収率{base_swap['model_return_rate']:.1f}%→{after_swap['model_return_rate']:.1f}%・"
+            f"黒字的中率{base_swap['black']:.2f}%→{after_swap['black']:.2f}%・"
+            f"ガミ率{base_swap['low']:.2f}%→{after_swap['low']:.2f}%・"
+            f"3連単単体期待値{standalone_ev*100:.1f}%"
+        )
+
+    replacement_notes.extend(cross_type_tri_swap_notes)
+
+    # 置換後の最終構成を基準に追加候補を作り直す。
+    base_for_residual = evaluate(selected)
+    selected_ids = {(t.get("type"), t.get("combo")) for t in selected}
     residual_candidates = []
-    selected_exacta = {tuple(int(x) for x in t["combo"].split("-")) for t in selected if t.get("type") == "2連単"}
-    selected_trio = {tuple(sorted(int(x) for x in t["combo"].split("-"))) for t in selected if t.get("type") == "三連複"}
-    selected_tris = [tuple(int(x) for x in t["combo"].split("-")) for t in selected if t.get("type") == "三連単"]
+    selected_exacta = {tuple(int(x) for x in t["combo"].split("-")) for t in selected if t.get("type") in {"2連単", "二連単"}}
+    selected_trio = {tuple(sorted(int(x) for x in t["combo"].split("-"))) for t in selected if t.get("type") in {"3連複", "三連複"}}
+    selected_tris = [tuple(int(x) for x in t["combo"].split("-")) for t in selected if t.get("type") in {"3連単", "三連単"}]
 
     for cand in candidates:
-        if cand.get("type") != "三連単" or (cand.get("type"), cand.get("combo")) in selected_ids:
+        if cand.get("type") not in {"3連単", "三連単"} or (cand.get("type"), cand.get("combo")) in selected_ids:
             continue
         vals = tuple(int(x) for x in str(cand.get("combo", "")).split("-"))
         if len(vals) != 3:
@@ -3220,6 +3369,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "replacement_notes": replacement_notes,
         "gami_prune_notes": gami_prune_notes,
         "low_odds_floor_notes": low_odds_floor_notes,
+        "solo_gami_exclusion_notes": solo_gami_exclusion_notes,
         "protected_add_notes": protected_add_notes,
         "protected_count": len([t for t in selected if t.get("protected")]),
         "residual_trifecta_candidates": residual_candidates,
@@ -3321,6 +3471,10 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     if result.get("low_odds_floor_notes"):
         st.info("長期回収率基準により、極端な低配当・低期待値の保険券を除外しました。")
         for note in result.get("low_odds_floor_notes", []):
+            st.caption(f"・{note}")
+    if result.get("solo_gami_exclusion_notes"):
+        st.info("長期回収率優先のため、単独的中で購入総額を回収できない買い目を最終構成から除外しました。")
+        for note in result.get("solo_gami_exclusion_notes", []):
             st.caption(f"・{note}")
 
     if result.get("gami_prune_notes"):
@@ -3899,14 +4053,25 @@ if selected_main_page == "🏁 予測":
             prediction_text = text
             if prediction_venue_override:
                 prediction_text = f"開催場: {prediction_venue_override}\n" + text
+            prediction_timing = {}
             with st.spinner("高速6周イベントシミュレーションを実行中…"):
+                _t0 = time_module.perf_counter()
                 df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
+                _t1 = time_module.perf_counter()
                 finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
-                # Ver196: 表示順位を本シミュレーションの1着率へ一本化し、着順別順位も付与。
                 df = engine.v196_apply_probability_aligned_ranks(df, finish_prob)
+                _t2 = time_module.perf_counter()
                 race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
                 engine.v67_save_ticket_snapshot(meta, bets, int(trials), engine.DB_PATH)
                 engine.v40_save_prediction_features(meta, df, engine.DB_PATH)
+                _t3 = time_module.perf_counter()
+                prediction_timing = {
+                    "simulation": _t1 - _t0,
+                    "aggregation": _t2 - _t1,
+                    "db_save": _t3 - _t2,
+                    "total": _t3 - _t0,
+                }
+            # 重いDB全体診断は予測完了の必須経路から外し、詳細表示時に必要になった場合だけ取得する。
             # オッズ入力などによる再描画後も、直前の予測結果を保持する。
             st.session_state["last_prediction_view"] = {
                 "df": df,
@@ -3918,11 +4083,18 @@ if selected_main_page == "🏁 予測":
                 "race_key": race_key,
                 "trials": int(trials),
                 "excluded": [int(x) for x in manual_excluded],
-                "learning_boundary": engine.v61_learning_boundary_summary(),
-                "future_audit": engine.v68_get_latest_future_audit(),
-                "day_trend": engine.v197_get_active_day_trend(),
+                "learning_boundary": {},
+                "future_audit": {},
+                "day_trend": {},
+                "prediction_timing": prediction_timing,
             }
             st.success("予測が完了しました")
+            if prediction_timing:
+                st.caption(
+                    f"処理時間：イベント計算 {prediction_timing['simulation']:.2f}秒 / "
+                    f"確率集計 {prediction_timing['aggregation']:.2f}秒 / "
+                    f"DB保存 {prediction_timing['db_save']:.2f}秒 / 合計 {prediction_timing['total']:.2f}秒"
+                )
         except Exception as exc:
             st.error(f"予測エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
@@ -3932,6 +4104,13 @@ if selected_main_page == "🏁 予測":
         # 予測が完了した後だけ、解析ボタン直下にショートカットを表示する。
         # 監査・補正テーブルより先に置き、スマホでもすぐ結果各部へ移動できるようにする。
         v73_section_nav()
+        timing = view.get("prediction_timing") or {}
+        if timing:
+            st.caption(
+                f"前回処理時間：イベント計算 {float(timing.get('simulation',0)):.2f}秒 / "
+                f"確率集計 {float(timing.get('aggregation',0)):.2f}秒 / "
+                f"DB保存 {float(timing.get('db_save',0)):.2f}秒"
+            )
         try:
             df = view["df"]
             bets = view["bets"]
@@ -5560,3 +5739,7 @@ if selected_main_page == "🗃️ 登録情報確認":
 
 
 
+
+# Ver213: 予測必須経路の全DB診断を遅延化、工程別時間計測、回収率重視プランの単独ガミ完全除外。
+
+# Ver214: 2連単・2連複・3連複から関連高期待値3連単への1対1置換を長期回収率基準で自動比較。
