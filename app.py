@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver206｜DB76基準・3着残りの期待値追加候補・3連系への入れ替え比較")
+st.caption("Ver208｜DB76基準・結果分析に回収率重視プランの的中・実回収率を表示")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2010,6 +2010,103 @@ def _v187_sync_mixed_feedback(db_path: str) -> int:
     return done
 
 
+def _v208_latest_mixed_plan_result(race_key: str, db_path: str) -> dict:
+    """予測時に保存された最新の回収率重視プランを、登録済み払戻と照合して返す。"""
+    if not race_key:
+        return {"available": False, "reason": "レースキーがありません。"}
+    _v187_ensure_mixed_learning_tables(db_path)
+    _v187_sync_mixed_feedback(db_path)
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        plan = con.execute("""
+            SELECT r.*, f.hit, f.black_hit, f.gami_hit, f.payout_yen,
+                   f.return_rate, f.winning_types, f.evaluated_at
+            FROM v187_mixed_plan_runs r
+            LEFT JOIN v187_mixed_plan_feedback f
+              ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+            WHERE r.race_key=?
+            ORDER BY datetime(r.created_at) DESC, r.rowid DESC
+            LIMIT 1
+        """, (race_key,)).fetchone()
+        if plan is None:
+            return {"available": False, "reason": "このレースでは回収率重視プランが保存されていません。"}
+        tickets = con.execute("""
+            SELECT t.bet_type, t.combination, t.odds, t.role,
+                   COALESCE(f.hit,0) AS hit, COALESCE(f.payout_yen,0) AS payout_yen
+            FROM v187_mixed_plan_tickets t
+            LEFT JOIN v187_mixed_ticket_feedback f
+              ON f.race_key=t.race_key AND f.plan_hash=t.plan_hash
+             AND f.bet_type=t.bet_type AND f.combination=t.combination
+            WHERE t.race_key=? AND t.plan_hash=?
+            ORDER BY CASE t.bet_type WHEN '3連単' THEN 1 WHEN '3連複' THEN 2 WHEN '2連単' THEN 3 WHEN '2連複' THEN 4 ELSE 9 END, t.combination
+        """, (race_key, plan["plan_hash"])).fetchall()
+    evaluated = plan["return_rate"] is not None
+    hit_tickets = [dict(t) for t in tickets if int(t["hit"] or 0) == 1]
+    cost = int(plan["cost_yen"] or len(tickets) * 100)
+    payout = int(plan["payout_yen"] or 0) if evaluated else 0
+    return {
+        "available": True,
+        "evaluated": evaluated,
+        "race_key": race_key,
+        "plan_hash": plan["plan_hash"],
+        "created_at": plan["created_at"],
+        "points": int(plan["points"] or len(tickets)),
+        "cost_yen": cost,
+        "payout_yen": payout,
+        "profit_yen": payout - cost if evaluated else None,
+        "return_rate": float(plan["return_rate"] or 0.0) if evaluated else None,
+        "hit": bool(plan["hit"]) if evaluated else False,
+        "black_hit": bool(plan["black_hit"]) if evaluated else False,
+        "gami_hit": bool(plan["gami_hit"]) if evaluated else False,
+        "hit_tickets": hit_tickets,
+        "tickets": [dict(t) for t in tickets],
+    }
+
+
+def _v208_render_mixed_plan_result(result: dict) -> None:
+    """結果分析の先頭付近に、回収率重視プランを買った想定の実績を表示する。"""
+    st.subheader("💰 回収率重視プランの実結果")
+    if not isinstance(result, dict) or not result.get("available"):
+        st.info((result or {}).get("reason", "保存された回収率重視プランがありません。"))
+        return
+    if not result.get("evaluated"):
+        st.warning("プランは保存されていますが、払戻金との照合がまだ完了していません。")
+        return
+    hit = bool(result.get("hit"))
+    black = bool(result.get("black_hit"))
+    gami = bool(result.get("gami_hit"))
+    if not hit:
+        verdict = "× 外れ"
+    elif black:
+        verdict = "◎ 的中・黒字"
+    elif gami:
+        verdict = "△ 的中・ガミ"
+    else:
+        verdict = "○ 的中"
+    a,b,c,d = st.columns(4)
+    a.metric("的中判定", verdict)
+    b.metric("購入想定", f"{int(result.get('cost_yen',0)):,}円")
+    c.metric("払戻合計", f"{int(result.get('payout_yen',0)):,}円")
+    d.metric("実回収率", f"{float(result.get('return_rate',0)):.1f}%")
+    profit = int(result.get("profit_yen") or 0)
+    st.metric("収支", f"{profit:+,}円")
+    hit_tickets = result.get("hit_tickets") or []
+    if hit_tickets:
+        rows=[]
+        for t in hit_tickets:
+            rows.append({
+                "券種": t.get("bet_type", ""),
+                "的中買い目": t.get("combination", ""),
+                "払戻": int(t.get("payout_yen") or 0),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+            column_config={"払戻": st.column_config.NumberColumn(format="%d円")})
+        st.caption("複数券種が同時的中した場合は、100円購入時の払戻を合算しています。")
+    else:
+        st.caption("保存された推奨買い目に的中券はありませんでした。")
+    st.caption(f"予測時に保存された最新プラン（{int(result.get('points',0))}点）だけで判定しています。結果確認後の買い目差し替えは行いません。")
+
+
 def _v187_learning_profile(db_path: str) -> dict:
     _v187_ensure_mixed_learning_tables(db_path)
     _v187_sync_mixed_feedback(db_path)
@@ -2910,6 +3007,31 @@ def v205_ticket_display_name(ticket_type: str) -> str:
 
 
 
+def v207_build_mixed_formation_sections(result: dict):
+    """回収率重視の最終買い目を、画面最上段で使えるコピー形式へ整形する。"""
+    sections = []
+    notes = []
+    for ticket_type in ("三連単", "三連複", "2連単", "2連複"):
+        rows = result.get("grouped", {}).get(ticket_type, []) or []
+        combos = [str(r.get("combo", "")).strip() for r in rows if str(r.get("combo", "")).strip()]
+        if not combos:
+            continue
+        try:
+            formations = engine.v67_compress_formations(combos, ticket_type)
+            if ticket_type == "三連単":
+                formations = v203_standard_trifecta_formations(formations, combos)
+        except Exception as exc:
+            formations = []
+            notes.append(f"{v205_ticket_display_name(ticket_type)}: フォーメーション変換に失敗したため個別表記を使用（{exc}）")
+        if not formations:
+            formations = combos
+            notes.append(f"{v205_ticket_display_name(ticket_type)}: 圧縮できない組み合わせは個別表記のまま出力")
+        sections.append(
+            f"{v205_ticket_display_name(ticket_type)} {len(combos)}点\n" + "\n".join(str(x) for x in formations)
+        )
+    return sections, notes
+
+
 def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict, race_key: str = "") -> None:
     result = v184_eight_car_mixed_plan(bets, trials, meta, odds_maps)
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH) or 0
@@ -2923,7 +3045,24 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
             saved_hash = _v187_save_mixed_plan(engine.DB_PATH, str(race_key), result)
     except Exception as exc:
         st.warning(f"合成プランをDBへ保存できませんでした: {exc}")
-    st.subheader(f"{result['icon']} 合成参考：{result['points']}点・{result['grade']}")
+
+    # Ver207: ユーザーが主に見る最終買い目と一括コピーを、説明・監査・指標より先に表示する。
+    formation_sections, formation_notes = v207_build_mixed_formation_sections(result)
+    st.subheader(f"{result['icon']} 回収率重視：{result['points']}点・{result['grade']}")
+    if formation_sections:
+        formation_copy_text = "\n\n".join(formation_sections)
+        v73_copy_box(
+            "回収率重視の推奨買い目・一括コピー",
+            formation_copy_text,
+            f"v207_priority_formation_{race_key}_{saved_hash}_{result.get('points', 0)}",
+            height=max(190, min(520, 95 + 27 * formation_copy_text.count("\n"))),
+        )
+        st.caption(
+            f"候補総額 {int(result.get('cost', 0)):,}円｜黒字的中率 {float(result.get('black', 0)):.2f}%｜"
+            f"ガミ率 {float(result.get('low', 0)):.2f}%｜実績補正後回収率 {float(result.get('adjusted_return_rate', 0)):.1f}%"
+        )
+        for note in formation_notes:
+            st.caption(note)
     if result.get("protected_add_notes"):
         st.info(f"高確率本線を{int(result.get('protected_count', 0))}点保護しています。")
         for note in result.get("protected_add_notes", []):
@@ -3015,9 +3154,8 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     else:
         st.info(result["reason"])
     st.caption(" / ".join(result.get("role_lines", [])))
+    st.markdown("##### 買い目ごとの詳細")
     order = ("三連単", "三連複", "2連単", "2連複")
-    formation_sections = []
-    formation_notes = []
     for ticket_type in order:
         rows = result["grouped"].get(ticket_type, [])
         if not rows:
@@ -3037,36 +3175,6 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
             )
         st.code("\n".join(ticket_lines), language=None)
 
-        # Ver200: 推奨された買い目だけを、既存の標準フォーメーション表記へ圧縮する。
-        # 圧縮不能時も買い目を欠落させず、個別表記をそのまま一括コピーへ残す。
-        try:
-            formations = engine.v67_compress_formations(combos, ticket_type) if combos else []
-            if ticket_type == "三連単":
-                formations = v203_standard_trifecta_formations(formations, combos)
-        except Exception as exc:
-            formations = []
-            formation_notes.append(f"{v205_ticket_display_name(ticket_type)}: フォーメーション変換に失敗したため個別表記を使用（{exc}）")
-        if not formations:
-            formations = combos
-            if combos:
-                formation_notes.append(f"{v205_ticket_display_name(ticket_type)}: 圧縮できない組み合わせは個別表記のまま出力")
-        if formations:
-            formation_sections.append(
-                f"{v205_ticket_display_name(ticket_type)} {len(combos)}点\n" + "\n".join(str(x) for x in formations)
-            )
-
-    if formation_sections:
-        st.markdown("##### 📋 推奨買い目フォーメーション・一括コピー")
-        formation_copy_text = "\n\n".join(formation_sections)
-        v73_copy_box(
-            "推奨合成フォーメーション（全券種）",
-            formation_copy_text,
-            f"v200_mixed_formation_{race_key}_{saved_hash}_{result.get('points', 0)}",
-            height=max(190, min(520, 95 + 27 * formation_copy_text.count("\n"))),
-        )
-        st.caption("この欄は、上に表示された推奨買い目だけを券種別に圧縮しています。3連単は「=」を1行につき最大1個まで使い、BOXまたは1着-2着-3着で表示します。点数と対象買い目は変えません。")
-        for note in formation_notes:
-            st.caption(note)
     st.caption(
         f"モデル上の全外れ率 {result['miss']:.2f}%・参考モデル回収率 {result['model_return_rate']:.1f}%・実績補正後 {result.get('adjusted_return_rate',0):.1f}% 。"
         "車立て別に点数と券種配分を変え、黒字的中率が明確に改善する候補だけ追加します。6車は3連単中心、7車は中間、8車は補完券種を厚めに評価します。"
@@ -3317,6 +3425,10 @@ def render_last_result_analysis(view: dict) -> None:
     adjustment = view.get("adjustment") or {}
     st.markdown("### 📌 直前に登録した結果解析")
     st.caption(f"登録キー: {view.get('key', '不明')}｜別タブ操作や再描画後も保持されます。")
+    mixed_result = view.get("mixed_plan_result")
+    if not isinstance(mixed_result, dict):
+        mixed_result = _v208_latest_mixed_plan_result(str(view.get("key", "")), engine.DB_PATH)
+    _v208_render_mixed_plan_result(mixed_result)
     if "message" in analysis:
         st.warning(analysis["message"])
     else:
@@ -3578,8 +3690,22 @@ if selected_main_page == "🏁 予測":
             audit = view.get("future_audit") or {}
             day_trend = view.get("day_trend") or {}
             odds_namespace = re.sub(r"[^0-9A-Za-z_-]+", "_", str(race_key))[-80:] or "current"
-            # Ver202: DB全体診断や詳細表より先に、オッズ入力欄を即表示する。
+            # Ver207: DB全体診断や詳細表より先に、オッズ入力と回収率重視の買い目を最優先表示する。
             v202_quick_bulk_odds_input(odds_namespace)
+            fast_odds_maps = {
+                "3tan": st.session_state.get(f"saved_odds_{odds_namespace}_3tan", {}),
+                "3fuku": st.session_state.get(f"saved_odds_{odds_namespace}_3fuku", {}),
+                "2tansho": st.session_state.get(f"saved_odds_{odds_namespace}_2tansho", {}),
+                "2fuku": st.session_state.get(f"saved_odds_{odds_namespace}_2fuku", {}),
+            }
+            st.markdown('<div id="return-priority-plan"></div>', unsafe_allow_html=True)
+            st.markdown("## ⭐ 最優先・回収率重視の推奨買い目")
+            st.caption("オッズ読込後、監査・確率表・展開表などの詳細表示より先に計算して表示します。")
+            show_v184_eight_car_mixed_plan(
+                bets, view_trials, meta, fast_odds_maps, race_key=race_key
+            )
+            st.divider()
+            st.markdown("### 詳細予測・診断")
             if day_trend:
                 val = day_trend.get("validation") or {}
                 if float(day_trend.get("blend", 0.0) or 0.0) > 0:
@@ -3939,16 +4065,6 @@ if selected_main_page == "🏁 予測":
             show_v182_odds_adjusted_tight_recommendation(
                 bets, view_trials, meta, trifecta_odds
             )
-            all_odds_maps = {
-                "3tan": st.session_state.get(f"saved_odds_{odds_namespace}_3tan", {}),
-                "3fuku": st.session_state.get(f"saved_odds_{odds_namespace}_3fuku", {}),
-                "2tansho": st.session_state.get(f"saved_odds_{odds_namespace}_2tansho", {}),
-                "2fuku": st.session_state.get(f"saved_odds_{odds_namespace}_2fuku", {}),
-            }
-            show_v184_eight_car_mixed_plan(
-                bets, view_trials, meta, all_odds_maps, race_key=race_key
-            )
-
             show_v67_self_evaluation(meta)
 
             v73_section_nav()
@@ -4157,6 +4273,7 @@ if selected_main_page == "✅ 結果登録・解析":
                             meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
                         )
                     ticket_analysis = engine.v67_analyze_ticket_result(meta_r, rows_r, engine.DB_PATH)
+                    mixed_plan_result = _v208_latest_mixed_plan_result(key, engine.DB_PATH)
                 if registration.get("duplicate"):
                     duplicate_message = analysis.get("message", "このレースは登録済みです。")
                     _set_sticky_notice("result_register_notice", "warning", duplicate_message)
@@ -4187,7 +4304,9 @@ if selected_main_page == "✅ 結果登録・解析":
                         "adjustment": adjustment,
                         "predicted_trifecta": predicted_trifecta_saved,
                         "actual_trifecta": actual_trifecta_saved,
+                        "mixed_plan_result": mixed_plan_result,
                     }
+                    _v208_render_mixed_plan_result(mixed_plan_result)
                     if "message" in analysis:
                         st.warning(analysis["message"])
                     else:

@@ -18449,3 +18449,7 @@ def v197_get_active_day_trend():
 # Ver204: DB75 baseline; final mixed-plan deep-gami and cross-bet overlap pruning is implemented in app.py.
 
 # Ver206: DB76 baseline; residual third-place trifecta suggestions are implemented in app.py.
+
+# Ver207: UI側で回収率重視の買い目を最優先表示（予測ロジック変更なし）
+
+# Ver208: result analysis UI displays saved return-focused mixed-plan realized performance.
