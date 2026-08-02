@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver201｜DB72基準・券種別高確率本線保護・6/7/8車回収率合成")
+st.caption("Ver203｜DB72基準・オッズ先行入力高速化・三連単片折り返し標準表記")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1506,31 +1506,32 @@ def parse_manual_odds(text: str, unordered: bool = False) -> tuple[pd.DataFrame,
     return pd.DataFrame(rows).drop_duplicates("組み合わせ", keep="last"), errors
 
 
-def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_key: str, unordered: bool = False, namespace: str = "current") -> None:
+def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_key: str, unordered: bool = False, namespace: str = "current", show_bulk: bool = True) -> None:
     """各確率表の直下でオッズを入力し、再描画後も入力値を保持する。"""
     st.markdown(f"#### {title} オッズ入力")
     st.caption("各行へ直接入力できます。公式の4券種横並び表は、下の一括貼り付けから読み込めます。")
 
-    bulk_key = f"bulk_odds_text_{namespace}"
-    with st.expander("公式オッズ表を一括貼り付け"):
-        bulk_text = st.text_area(
-            "3連単人気・3連複人気・2連単人気・2連複人気の表",
-            key=bulk_key, height=180,
-            placeholder="公式オッズ表を見出しからそのまま貼り付け",
-        )
-        if st.button("4券種のオッズを読み込む", key=f"load_bulk_odds_{namespace}", use_container_width=True):
-            parsed = v182_parse_four_block_odds(bulk_text)
-            total = sum(len(v) for v in parsed.values())
-            if total <= 0:
-                st.error("オッズを読み取れませんでした。タブ区切りの表をそのまま貼り付けてください。")
-            else:
-                for parsed_key, values in parsed.items():
-                    st.session_state[f"saved_odds_{namespace}_{parsed_key}"] = values
-                st.success(
-                    f"読込完了：三連単{len(parsed['3tan'])}件、三連複{len(parsed['3fuku'])}件、"
-                    f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
-                )
-                st.rerun()
+    if show_bulk:
+        bulk_key = f"bulk_odds_text_{namespace}"
+        with st.expander("公式オッズ表を一括貼り付け"):
+            bulk_text = st.text_area(
+                "3連単人気・3連複人気・2連単人気・2連複人気の表",
+                key=bulk_key, height=180,
+                placeholder="公式オッズ表を見出しからそのまま貼り付け",
+            )
+            if st.button("4券種のオッズを読み込む", key=f"load_bulk_odds_{namespace}", use_container_width=True):
+                parsed = v182_parse_four_block_odds(bulk_text)
+                total = sum(len(v) for v in parsed.values())
+                if total <= 0:
+                    st.error("オッズを読み取れませんでした。タブ区切りの表をそのまま貼り付けてください。")
+                else:
+                    for parsed_key, values in parsed.items():
+                        st.session_state[f"saved_odds_{namespace}_{parsed_key}"] = values
+                    st.success(
+                        f"読込完了：三連単{len(parsed['3tan'])}件、三連複{len(parsed['3fuku'])}件、"
+                        f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
+                    )
+                    st.rerun()
 
     prob_df = ticket_probability_table(bets, key, trials, top_n=40).drop(columns=["的中回数"], errors="ignore")
     if prob_df.empty:
@@ -1638,6 +1639,161 @@ def v182_parse_four_block_odds(text: str) -> dict:
             result["2fuku"]["-".join(sorted((a, b), key=int))] = o
     return result
 
+
+
+def v202_quick_bulk_odds_input(namespace: str) -> None:
+    """重い診断より先に、公式4券種オッズの貼り付け欄だけを表示する。"""
+    st.markdown('<div id="quick-odds-input"></div>', unsafe_allow_html=True)
+    st.subheader("オッズ一括入力")
+    st.caption("予測結果の詳細診断を待たず、先に公式4券種表を読み込めます。")
+    bulk_key = f"bulk_odds_text_{namespace}"
+    bulk_text = st.text_area(
+        "3連単人気・3連複人気・2連単人気・2連複人気の表",
+        key=bulk_key,
+        height=180,
+        placeholder="公式オッズ表を見出しからそのまま貼り付け",
+    )
+    if st.button("4券種のオッズを読み込む", key=f"load_bulk_odds_{namespace}", use_container_width=True):
+        parsed = v182_parse_four_block_odds(bulk_text)
+        total = sum(len(v) for v in parsed.values())
+        if total <= 0:
+            st.error("オッズを読み取れませんでした。タブ区切りの表をそのまま貼り付けてください。")
+        else:
+            for parsed_key, values in parsed.items():
+                st.session_state[f"saved_odds_{namespace}_{parsed_key}"] = values
+            st.success(
+                f"読込完了：三連単{len(parsed['3tan'])}件、三連複{len(parsed['3fuku'])}件、"
+                f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
+            )
+            st.rerun()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def v202_cached_probability_rank_validation(db_path: str, db_mtime: float):
+    return engine.v196_probability_rank_validation(db_path)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def v202_cached_position_bias_profile(db_path: str, db_mtime: float):
+    return engine.v198_position_bias_profile(db_path)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def v202_cached_weight_validation_profile(db_path: str, db_mtime: float):
+    return engine.v190_weight_validation_profile(db_path)
+
+
+def v203_standard_trifecta_formations(formations, combos):
+    """三連単をBOX・通常ハイフン・片折り返し（=は最大1個）だけで正確に圧縮する。"""
+    from itertools import combinations, permutations, product
+
+    target = engine._v165_normalize_combo_texts(combos, "3連単")
+    if not target:
+        return []
+    target = set(target)
+    cars = sorted({x for combo in target for x in combo})
+    candidates = {}
+
+    def add_candidate(line):
+        text = str(line or "").strip().upper()
+        if not text or text.count("=") > 1:
+            return
+        expanded = engine._v165_expand_formation_line(text, "3連単")
+        if len(expanded) < 2 or not expanded.issubset(target):
+            return
+        frozen = frozenset(expanded)
+        old = candidates.get(frozen)
+        if old is None or (len(text), text) < (len(old), old):
+            candidates[frozen] = text
+
+    # 既存圧縮のうち、BOX・通常表記・片折り返しだけを再利用する。
+    for line in formations or []:
+        add_candidate(line)
+
+    # 3車6通りがすべてある場合はABCBOX候補。
+    for trio in combinations(cars, 3):
+        if set(permutations(trio, 3)).issubset(target):
+            add_candidate("".join(map(str, trio)) + "BOX")
+
+    # 片折り返し候補 A=B-C を生成する。
+    # A/Bの各集合を折り返し、成立する3着集合Cを最大限まとめる。
+    nonempty_subsets = []
+    for size in range(1, len(cars) + 1):
+        nonempty_subsets.extend(combinations(cars, size))
+    for left in nonempty_subsets:
+        for middle in nonempty_subsets:
+            valid_thirds = []
+            for third in cars:
+                expanded = set()
+                for a, b in product(left, middle):
+                    if len({a, b, third}) != 3:
+                        continue
+                    expanded.add((a, b, third))
+                    expanded.add((b, a, third))
+                if expanded and expanded.issubset(target):
+                    valid_thirds.append(third)
+            if valid_thirds:
+                add_candidate(
+                    "".join(map(str, left)) + "=" +
+                    "".join(map(str, middle)) + "-" +
+                    "".join(map(str, valid_thirds))
+                )
+
+    # 2・3着の片折り返し候補 A-B=C も、正確に成立する場合だけ許可する。
+    for firsts in nonempty_subsets:
+        for middle in nonempty_subsets:
+            valid_thirds = []
+            for third in cars:
+                expanded = set()
+                for a, b in product(firsts, middle):
+                    if len({a, b, third}) != 3:
+                        continue
+                    expanded.add((a, b, third))
+                    expanded.add((a, third, b))
+                if expanded and expanded.issubset(target):
+                    valid_thirds.append(third)
+            if valid_thirds:
+                add_candidate(
+                    "".join(map(str, firsts)) + "-" +
+                    "".join(map(str, middle)) + "=" +
+                    "".join(map(str, valid_thirds))
+                )
+
+    # 大きく覆い、短い表記を優先。行同士は絶対に重複させない。
+    ranked = sorted(
+        ((set(expanded), line) for expanded, line in candidates.items()),
+        key=lambda item: (-len(item[0]), len(item[1]), item[1]),
+    )
+    uncovered = set(target)
+    output = []
+    while uncovered:
+        best = None
+        for expanded, line in ranked:
+            if not expanded.issubset(uncovered):
+                continue
+            score = (len(expanded), -len(line), line.count("="), line)
+            if best is None or score > best[0]:
+                best = (score, expanded, line)
+        if best is None or len(best[1]) < 2:
+            break
+        _, expanded, line = best
+        output.append(line)
+        uncovered.difference_update(expanded)
+
+    output.extend("-".join(map(str, combo)) for combo in sorted(uncovered))
+
+    # 最終展開検証。欠落・余分・重複・二重折り返しがあれば安全な個別表記へ戻す。
+    covered = set()
+    for line in output:
+        if str(line).count("=") > 1:
+            return ["-".join(map(str, combo)) for combo in sorted(target)]
+        expanded = engine._v165_expand_formation_line(line, "3連単")
+        if not expanded or not expanded.issubset(target) or expanded & covered:
+            return ["-".join(map(str, combo)) for combo in sorted(target)]
+        covered.update(expanded)
+    if covered != target:
+        return ["-".join(map(str, combo)) for combo in sorted(target)]
+    return output
 
 def v182_hit_first_odds_adjustment(bets: dict, trials: int, base_info: dict, odds_map: dict) -> dict:
     """的中重視の上位順を維持したまま、オッズで1〜10点を微調整する。"""
@@ -2682,6 +2838,8 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
         # 圧縮不能時も買い目を欠落させず、個別表記をそのまま一括コピーへ残す。
         try:
             formations = engine.v67_compress_formations(combos, ticket_type) if combos else []
+            if ticket_type == "三連単":
+                formations = v203_standard_trifecta_formations(formations, combos)
         except Exception as exc:
             formations = []
             formation_notes.append(f"{ticket_type}: フォーメーション変換に失敗したため個別表記を使用（{exc}）")
@@ -2703,7 +2861,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
             f"v200_mixed_formation_{race_key}_{saved_hash}_{result.get('points', 0)}",
             height=max(190, min(520, 95 + 27 * formation_copy_text.count("\n"))),
         )
-        st.caption("この欄は、上に表示された推奨買い目だけを券種別に圧縮しています。点数と対象買い目は変えません。")
+        st.caption("この欄は、上に表示された推奨買い目だけを券種別に圧縮しています。三連単は「=」連結を使わず、ABCBOXまたは1着-2着-3着で表示します。点数と対象買い目は変えません。")
         for note in formation_notes:
             st.caption(note)
     st.caption(
@@ -3216,6 +3374,9 @@ if selected_main_page == "🏁 予測":
             boundary = view.get("learning_boundary") or {}
             audit = view.get("future_audit") or {}
             day_trend = view.get("day_trend") or {}
+            odds_namespace = re.sub(r"[^0-9A-Za-z_-]+", "_", str(race_key))[-80:] or "current"
+            # Ver202: DB全体診断や詳細表より先に、オッズ入力欄を即表示する。
+            v202_quick_bulk_odds_input(odds_namespace)
             if day_trend:
                 val = day_trend.get("validation") or {}
                 if float(day_trend.get("blend", 0.0) or 0.0) > 0:
@@ -3279,7 +3440,7 @@ if selected_main_page == "🏁 予測":
             st.dataframe(result, use_container_width=True, hide_index=True)
             st.caption("Ver196では最終順位を本シミュレーションの1着率と一致させます。従来の総合点順位は診断列として残し、連対・3着候補は別順位で確認できます。")
             try:
-                v196_val = engine.v196_probability_rank_validation(engine.DB_PATH)
+                v196_val = v202_cached_probability_rank_validation(str(engine.DB_PATH), Path(engine.DB_PATH).stat().st_mtime)
                 if int(v196_val.get("race_count", 0)):
                     st.info(
                         f"DB検証 {int(v196_val['race_count'])}R｜上位3車捕捉 平均 "
@@ -3289,7 +3450,7 @@ if selected_main_page == "🏁 予測":
             except Exception as exc:
                 st.caption(f"確率整合順位の履歴検証を表示できませんでした: {exc}")
             try:
-                pb = engine.v198_position_bias_profile(engine.DB_PATH)
+                pb = v202_cached_position_bias_profile(str(engine.DB_PATH), Path(engine.DB_PATH).stat().st_mtime)
                 state = "反映" if pb.get("enabled") else "停止"
                 st.info(
                     f"原因別学習ゲート（前後位置）: {state}｜比較{int(pb.get('race_count',0))}R "
@@ -3484,7 +3645,7 @@ if selected_main_page == "🏁 予測":
 
             with st.expander("🧪 学習重みによる順位・確率の変化", expanded=False):
                 try:
-                    v190_profile = engine.v190_weight_validation_profile(engine.DB_PATH)
+                    v190_profile = v202_cached_weight_validation_profile(str(engine.DB_PATH), Path(engine.DB_PATH).stat().st_mtime)
                     st.caption(
                         f"重み検証ゲート：現在重みの{float(v190_profile.get('blend',1.0))*100:.0f}%を適用 "
                         f"（比較{int(v190_profile.get('race_count',0))}R／直近検証{int(v190_profile.get('validation_count',0))}R）"
@@ -3569,7 +3730,7 @@ if selected_main_page == "🏁 予測":
             show_ticket_table(selected_ticket, bets, ticket_key, view_trials, 20)
             show_odds_comparison(
                 selected_ticket, bets, ticket_key, view_trials, odds_key,
-                unordered=unordered, namespace=odds_namespace,
+                unordered=unordered, namespace=odds_namespace, show_bulk=False,
             )
             trifecta_odds = st.session_state.get(f"saved_odds_{odds_namespace}_3tan", {})
             show_v182_odds_adjusted_tight_recommendation(
