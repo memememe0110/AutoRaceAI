@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver191｜DB69検証・重み時系列ゲート・8車黒字的中重視合成")
+st.caption("Ver192｜DB70検証・ガミ保険の三連単分解置換・8車黒字的中重視合成")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2185,6 +2185,68 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         key=lambda x: (x[1]["black"], x[1]["model_expected_multiple"],
                        x[1]["black_share_of_hits"], x[1]["cover"], -x[1]["low"], -x[1]["points"]),
     )
+    selected = list(selected)
+
+    # Ver192: 単独ではガミになる2連系を、同じ展開に含まれる三連単へ分解して比較する。
+    # 的中範囲を極端に捨てず、黒字的中率・期待倍率が改善する場合だけ差し替える。
+    replacement_notes = []
+    for _ in range(3):
+        base_metrics = evaluate(selected)
+        base_cost = float(base_metrics.get("cost", len(selected) * 100.0))
+        best_swap = None
+        for low_ticket in list(selected):
+            if low_ticket.get("type") not in ("2連単", "2連複"):
+                continue
+            # 現在の総点数に対し、この券だけの払戻では回収できないものを対象にする。
+            if float(low_ticket.get("odds", 0.0)) * 100.0 >= base_cost:
+                continue
+            available_tri = [
+                t for t in tri_candidates
+                if t not in selected and t.get("matched")
+                and t["matched"].issubset(low_ticket.get("matched", set()))
+            ]
+            available_tri.sort(
+                key=lambda t: (float(t.get("probability", 0.0)), float(t.get("odds", 0.0))),
+                reverse=True,
+            )
+            # 1〜4点への分解を比較。総点数は最大14点を維持する。
+            max_add = min(4, len(available_tri), 15 - len(selected))
+            for k in range(1, max_add + 1):
+                tri_rows = available_tri[:k]
+                trial_plan = [t for t in selected if t is not low_ticket] + tri_rows
+                if len(trial_plan) > 14:
+                    continue
+                trial_metrics = evaluate(trial_plan)
+                cover_loss = base_metrics["cover"] - trial_metrics["cover"]
+                black_gain = trial_metrics["black"] - base_metrics["black"]
+                expected_gain = (trial_metrics["model_expected_multiple"]
+                                 - base_metrics["model_expected_multiple"])
+                gami_drop = base_metrics["low"] - trial_metrics["low"]
+                # 的中重視なので、カバー低下は原則2.5pt以内。大幅な黒字改善時のみ4ptまで許容。
+                allowed_loss = 4.0 if black_gain >= 1.20 else 2.5
+                if cover_loss > allowed_loss:
+                    continue
+                if black_gain <= 0.05:
+                    continue
+                if expected_gain < -0.03:
+                    continue
+                utility = (1.55 * black_gain + 0.55 * max(0.0, gami_drop)
+                           + 8.0 * expected_gain - 0.28 * max(0.0, cover_loss)
+                           - 0.06 * max(0, len(trial_plan) - len(selected)))
+                key = (utility, black_gain, gami_drop, expected_gain, -cover_loss, -len(trial_plan))
+                if best_swap is None or key > best_swap[0]:
+                    best_swap = (key, low_ticket, tri_rows, trial_plan, trial_metrics, cover_loss)
+        if best_swap is None or best_swap[0][0] <= 0.0:
+            break
+        _, low_ticket, tri_rows, selected, metrics, cover_loss = best_swap
+        replacement_notes.append(
+            f"{low_ticket['type']} {low_ticket['combo']}（{float(low_ticket.get('odds',0)):.1f}倍）を外し、"
+            f"三連単 {', '.join(t['combo'] for t in tri_rows)} へ分解。"
+            f"黒字的中率 {base_metrics['black']:.2f}%→{metrics['black']:.2f}%、"
+            f"カバー率 {base_metrics['cover']:.2f}%→{metrics['cover']:.2f}%"
+        )
+
+    metrics = evaluate(selected)
 
     # 的中率だけでなく、的中時に黒字となる割合と合成倍率を主軸に評価する。
     gami_share = float(metrics.get("gami_share_of_hits", 0.0))
@@ -2243,6 +2305,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "tickets": selected, "grouped": grouped, "role_lines": role_lines,
         "learning": learning, "pool_summary": pool_summary,
         "tri_seed_points": int(tri_seed_points),
+        "replacement_notes": replacement_notes,
         "tri_seed_cover": float(tri_seed_metrics.get("cover", 0.0)),
         "tri_seed_black": float(tri_seed_metrics.get("black", 0.0)),
         **metrics,
@@ -2262,6 +2325,10 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     except Exception as exc:
         st.warning(f"合成プランをDBへ保存できませんでした: {exc}")
     st.subheader(f"{result['icon']} 合成参考：{result['points']}点・{result['grade']}")
+    if result.get("replacement_notes"):
+        st.success("ガミ保険を三連単へ置換しました。")
+        for note in result.get("replacement_notes", []):
+            st.caption(f"・{note}")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("合成的中率", f"{result['cover']:.2f}%")
     c2.metric("黒字的中率", f"{result['black']:.2f}%")
@@ -2326,6 +2393,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     st.caption(
         "判定は黒字的中率を最優先し、的中時の黒字割合・ガミ割合・平均合成倍率・モデル期待倍率を使用します。"
         "低配当保険は、ほかの券種との同時的中を含めて黒字確率を増やす場合だけ採用します。"
+        "単独でガミになる2連系は、同じ展開の三連単1〜4点に分解した方が黒字的中率を改善する場合、自動で差し替えます。"
     )
     st.caption(
         "各買い目の『単独的中ではガミ注意』は、その券だけが当たった場合の払戻が候補総額を下回る意味です。"
