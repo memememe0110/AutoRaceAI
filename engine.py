@@ -2521,6 +2521,10 @@ def simulate_detailed(df, trials, seed, track_temp=30.0):
     _day = globals().get("V197_ACTIVE_DAY_TREND") or {}
     _shift = float(_day.get("effective_shift", 0.0) or 0.0)
     scenario_prob += np.array([0.20*_shift, 0.80*_shift, 0.0, -1.00*_shift], dtype=float)
+    # Ver198: 過去学習と直近検証で同じ位置誤差が再現した場合だけ補正。
+    _pb = globals().get("V198_POSITION_BIAS") or {}
+    _pbs = float(_pb.get("front_shift", 0.0) or 0.0) if _pb.get("enabled") else 0.0
+    scenario_prob += np.array([0.20*_pbs, 0.80*_pbs, 0.0, -1.00*_pbs], dtype=float)
     scenario_prob = np.clip(scenario_prob, 0.03, None)
     scenario_prob /= scenario_prob.sum()
     scenario_ids = rng.choice(4, size=int(trials), p=scenario_prob)
@@ -6622,6 +6626,7 @@ def ver16_run_prediction(text, trials=10000, seed=20260719, manual_excluded=None
     globals()["LATEST_ENTRY_STATS"] = entries.copy()
     globals()["LATEST_RACE_META"] = dict(meta)
     globals()["V197_ACTIVE_DAY_TREND"] = v197_same_day_trend_profile(meta, DB_PATH)
+    globals()["V198_POSITION_BIAS"] = v198_position_bias_profile(DB_PATH)
     track_temp = ver16_safe_float(meta.get("走路温度"), 30.0)
     filename = f"AutoRaceAI_Ver16_{meta.get('開催場') or 'race'}_{meta.get('レース') or ''}R.xlsx"
     df, bets, output = run_model(
@@ -6634,6 +6639,56 @@ def ver16_run_prediction(text, trials=10000, seed=20260719, manual_excluded=None
     return df, bets, output, entries, meta
 
 
+
+
+# ============================================================
+# Ver198: 前後位置の系統誤差を原因別に診断し、再現した場合だけ補正
+# ============================================================
+def v198_position_bias_validation(db_path=DB_PATH):
+    result={"race_count":0,"train_count":0,"valid_count":0,"enabled":False,"front_shift":0.0,"reason":"比較可能データ不足"}
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            snap=pd.read_sql_query("SELECT race_key,car_no,predicted_rank,win_prob,created_at FROM prediction_snapshots",con)
+            ent=pd.read_sql_query("SELECT race_key,car_no,finish,handicap FROM result_entries WHERE finish BETWEEN 1 AND 8",con)
+        if snap.empty or ent.empty: return result
+        snap=snap.sort_values("created_at").drop_duplicates(["race_key","car_no"],keep="last")
+        d=snap.merge(ent,on=["race_key","car_no"],how="inner")
+        d["h"]=pd.to_numeric(d["handicap"].astype(str).str.replace("m","",regex=False),errors="coerce")
+        rows=[]
+        for key,g in d.groupby("race_key"):
+            g=g.dropna(subset=["h","predicted_rank","finish"])
+            if len(g)<5 or not (g["finish"]==1).any(): continue
+            lo,hi=float(g.h.min()),float(g.h.max())
+            if hi<=lo: continue
+            w=g.loc[g.finish==1].iloc[0]
+            hn=(float(w.h)-lo)/(hi-lo)
+            grp="front" if hn<=0.34 else ("back" if hn>=0.66 else "middle")
+            rows.append({"race_key":key,"created_at":str(w.created_at),"group":grp,"winner_rank":float(w.predicted_rank)})
+        if len(rows)<40: return result
+        x=pd.DataFrame(rows).sort_values(["created_at","race_key"]).reset_index(drop=True)
+        cut=max(25,int(len(x)*0.70)); tr=x.iloc[:cut]; va=x.iloc[cut:]
+        def gap(z):
+            f=z[z.group=="front"].winner_rank; b=z[z.group=="back"].winner_rank
+            if len(f)<5 or len(b)<5: return None
+            return float(f.mean()-b.mean())
+        gt,gv=gap(tr),gap(va)
+        result.update({"race_count":len(x),"train_count":len(tr),"valid_count":len(va),"train_gap":gt,"valid_gap":gv})
+        if gt is None or gv is None:
+            result["reason"]="前後位置別の検証件数不足"; return result
+        same=(gt>0 and gv>0) or (gt<0 and gv<0)
+        mag=min(abs(gt),abs(gv))
+        if same and mag>=0.20:
+            # front winnerの予測順位が悪いほど前残り側へ。逆なら追込み側へ。
+            shift=float(max(-0.05,min(0.05,0.0125*gv)))
+            result.update({"enabled":True,"front_shift":shift,"reason":f"学習側と直近側で同方向の位置誤差を確認（差 {gt:+.2f}位 / {gv:+.2f}位）"})
+        else:
+            result["reason"]=f"位置誤差が直近側で再現せず補正停止（差 {gt:+.2f}位 / {gv:+.2f}位）"
+        return result
+    except Exception as exc:
+        result["error"]=str(exc); result["reason"]="位置誤差検証エラー"; return result
+
+def v198_position_bias_profile(db_path=DB_PATH):
+    return v198_position_bias_validation(db_path)
 
 # ============================================================
 # v2.7: Ver13系DB互換登録・展開確率表示
@@ -18387,3 +18442,6 @@ def v197_same_day_trend_profile(meta, db_path=DB_PATH):
 
 def v197_get_active_day_trend():
     return dict(globals().get("V197_ACTIVE_DAY_TREND") or {})
+
+
+# Ver199: 6/7/8車の回収率合成はapp側で車立て別最適化。Ver198前後位置ゲートを継承。

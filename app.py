@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver197｜DB71検証・確率整合順位・着順別評価・当日展開傾向ゲート・8車黒字的中重視合成")
+st.caption("Ver199｜DB71検証・確率整合順位・着順別評価・前後位置学習・6/7/8車回収率合成")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1930,15 +1930,16 @@ def _v195_return_calibration(db_path: str) -> dict:
     return out
 
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
-    """8車立て向けの役割分担型・複数券種合成。
+    """6〜8車立て向けの役割分担型・回収率合成。
 
-    三連単本線、着順ずれ、3着抜け、1・2着逆転という異なる外れ方を補う。
+    車立てに応じて三連単中心度を変え、着順ずれ・3着抜け・1・2着逆転を補う。
     Ver191では単なる合成的中率ではなく、購入総額を超える黒字的中率を最優先する。
     低配当保険は、ほかの券種との同時的中を含めて黒字側を実際に増やす場合だけ採用する。
     """
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH)
-    if not starter_count or int(starter_count) != 8:
-        return {"available": False, "reason": "役割分担型の複数券種合成は8車立て専用です。"}
+    if not starter_count or int(starter_count) not in (6, 7, 8):
+        return {"available": False, "reason": "回収率重視の合成推奨は6〜8車立てに対応しています。"}
+    starter_count = int(starter_count)
     if not isinstance(bets, dict) or int(trials or 0) <= 0:
         return {"available": False, "reason": "シミュレーション確率を取得できません。"}
 
@@ -1949,14 +1950,28 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     learning = _v187_learning_profile(engine.DB_PATH)
     type_weights = learning.get("type_weights", {})
 
-    type_specs = {
-        "三連単": {"counter": "三連単", "odds": "3tan", "limit": 14, "cap": 9, "target_cover": None, "role": "本線・着順まで一致"},
-        # 三連単以外は固定上位件数ではなく、累積確率88〜90%までを候補母集団にする。
-        # 全点購入ではなく、この母集団から合成効果・ガミ・倍率を見て最終採用する。
-        "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "cap": 7, "target_cover": 90.0, "role": "上位3車の着順ずれ保険"},
-        "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 999, "cap": 6, "target_cover": 90.0, "role": "1・2着一致／3着抜け保険"},
-        "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 999, "cap": 4, "target_cover": 88.0, "role": "1・2着逆転保険"},
-    }
+    # 車立て別に役割を変更。6車は三連単中心、7車は準中心、8車は複数券種の補完を厚くする。
+    if starter_count == 6:
+        type_specs = {
+            "三連単": {"counter": "三連単", "odds": "3tan", "limit": 24, "cap": 10, "target_cover": None, "role": "主軸・着順まで一致"},
+            "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "cap": 3, "target_cover": 86.0, "role": "着順ずれを少点数で補完"},
+            "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 999, "cap": 2, "target_cover": 84.0, "role": "3着抜けの限定保険"},
+            "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 999, "cap": 1, "target_cover": 82.0, "role": "逆転保険・黒字時のみ"},
+        }
+    elif starter_count == 7:
+        type_specs = {
+            "三連単": {"counter": "三連単", "odds": "3tan", "limit": 18, "cap": 9, "target_cover": None, "role": "本線・着順まで一致"},
+            "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "cap": 5, "target_cover": 88.0, "role": "上位3車の着順ずれ保険"},
+            "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 999, "cap": 4, "target_cover": 88.0, "role": "1・2着一致／3着抜け保険"},
+            "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 999, "cap": 2, "target_cover": 86.0, "role": "1・2着逆転保険"},
+        }
+    else:
+        type_specs = {
+            "三連単": {"counter": "三連単", "odds": "3tan", "limit": 14, "cap": 9, "target_cover": None, "role": "本線・着順まで一致"},
+            "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "cap": 7, "target_cover": 90.0, "role": "上位3車の着順ずれ保険"},
+            "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 999, "cap": 6, "target_cover": 90.0, "role": "1・2着一致／3着抜け保険"},
+            "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 999, "cap": 4, "target_cover": 88.0, "role": "1・2着逆転保険"},
+        }
 
     def combo_text(value, unordered=False):
         vals = tuple(value) if isinstance(value, (tuple, list)) else (value,)
@@ -2076,7 +2091,9 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         model_expected_multiple = expected_return / cost if cost else 0.0
         # Ver191: 黒字的中率を主役にする。単なる的中範囲とガミ的中は強く評価しない。
         # 点数増加は購入総額そのものを押し上げるため、以前より明確に減点する。
-        score = 0.48 * cover + 1.22 * black - 0.72 * low + 0.55 * role_bonus - 0.16 * n
+        tri_share = (counts.get("三連単", 0) / max(1, n))
+        field_bonus = (0.34 * tri_share if starter_count == 6 else (0.12 * tri_share if starter_count == 7 else 0.0))
+        score = 0.48 * cover + 1.22 * black - 0.72 * low + 0.55 * role_bonus - 0.16 * n + field_bonus
         black_share_of_hits = black / cover * 100.0 if cover > 0 else 0.0
         gami_share_of_hits = low / cover * 100.0 if cover > 0 else 0.0
         return {
@@ -2110,7 +2127,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     # Ver189: 三連単も2点固定にせず、上位2〜6点を合成全体の土台として比較する。
     # 的中範囲を優先しつつ、追加による黒字側の改善、ガミ化、点数増を同時に評価する。
     tri_seed_options = []
-    max_tri_seed = min(6, len(tri_candidates))
+    max_tri_seed = min(8 if starter_count == 6 else (7 if starter_count == 7 else 6), len(tri_candidates))
     for k in range(2, max_tri_seed + 1):
         seed_plan = tri_candidates[:k]
         seed_metrics = evaluate(seed_plan)
@@ -2235,7 +2252,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 reverse=True,
             )
             # 1〜4点への分解を比較。総点数は最大14点を維持する。
-            max_add = min(4, len(available_tri), 15 - len(selected))
+            max_add = min(5 if starter_count == 6 else 4, len(available_tri), (12 if starter_count == 6 else 15) - len(selected))
             for k in range(1, max_add + 1):
                 tri_rows = available_tri[:k]
                 trial_plan = [t for t in selected if t is not low_ticket] + tri_rows
@@ -2492,7 +2509,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
 def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict, race_key: str = "") -> None:
     result = v184_eight_car_mixed_plan(bets, trials, meta, odds_maps)
-    st.markdown("#### 🧩 8車向け・黒字的中重視の複数券種合成")
+    starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH) or 0
+    st.markdown(f"#### 🧩 {int(starter_count)}車向け・黒字的中重視の回収率合成")
     if not result.get("available"):
         st.caption(result.get("reason", "4券種オッズを読み込むと表示します。"))
         return
@@ -2536,7 +2554,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
                 f"{int(info.get('points', 0))}点",
                 f"累積{float(info.get('cover', 0.0)):.1f}%・{target_text}",
             )
-        st.caption("三連単以外は、この累積88〜90%の候補母集団から、合成効果・ガミ・倍率を比較して最終採用しています。母集団の全点を購入するわけではありません。")
+        st.caption("三連単以外は車立て別の累積確率候補から、合成効果・ガミ・倍率を比較して採用します。6車は三連単だけが最良なら、ほかの券種を無理に混ぜません。")
     st.caption(
         f"三連単の初期本線は上位2〜6点を比較し、今回は{int(result.get('tri_seed_points', 2))}点を採用。"
         f"本線段階のカバー{float(result.get('tri_seed_cover', 0.0)):.2f}%・黒字側{float(result.get('tri_seed_black', 0.0)):.2f}%を基準に、"
@@ -2571,7 +2589,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
         st.code("\n".join(ticket_lines), language=None)
     st.caption(
         f"モデル上の全外れ率 {result['miss']:.2f}%・参考モデル回収率 {result['model_return_rate']:.1f}%・実績補正後 {result.get('adjusted_return_rate',0):.1f}% 。"
-        "基本上限は12点で、13〜14点目は黒字的中率が明確に改善し、期待倍率を悪化させない場合だけ採用します。"
+        "車立て別に点数と券種配分を変え、黒字的中率が明確に改善する候補だけ追加します。6車は三連単中心、7車は中間、8車は補完券種を厚めに評価します。"
     )
     st.caption(
         "判定は黒字的中率を最優先し、的中時の黒字割合・ガミ割合・平均合成倍率・モデル期待倍率を使用します。"
@@ -3150,6 +3168,16 @@ if selected_main_page == "🏁 予測":
                     )
             except Exception as exc:
                 st.caption(f"確率整合順位の履歴検証を表示できませんでした: {exc}")
+            try:
+                pb = engine.v198_position_bias_profile(engine.DB_PATH)
+                state = "反映" if pb.get("enabled") else "停止"
+                st.info(
+                    f"原因別学習ゲート（前後位置）: {state}｜比較{int(pb.get('race_count',0))}R "
+                    f"（学習{int(pb.get('train_count',0))}R／直近{int(pb.get('valid_count',0))}R）｜"
+                    f"展開補正 {float(pb.get('front_shift',0.0))*100:+.1f}pt\n\n{pb.get('reason','')}"
+                )
+            except Exception as exc:
+                st.caption(f"原因別学習ゲートを表示できませんでした: {exc}")
 
             with st.expander("🏟️ 今回の開催場重み・適用補正", expanded=True):
                 venue_name = str(meta.get("開催場") or "").strip()
