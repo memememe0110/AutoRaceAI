@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver192｜DB70検証・ガミ保険の三連単分解置換・8車黒字的中重視合成")
+st.caption("Ver194｜DB70検証・2連複と片側2連単の重ね買い含む全構成比較・ガミ保険分解・8車黒字的中重視合成")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2246,6 +2246,154 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             f"カバー率 {base_metrics['cover']:.2f}%→{metrics['cover']:.2f}%"
         )
 
+    # Ver194: 同じ2車について、2連複・片側2連単・表裏2連単・重ね買いを全比較する。
+    # 例: 2連複6-8 + 高配当側の2連単6-8 は、同じ2点の表裏2連単より
+    # 両方向の払戻が高くなる場合がある。固定パターンではなく合成全体を再評価して採用する。
+    pair_mix_notes = []
+    for _ in range(4):
+        base_metrics = evaluate(selected)
+        exacta_by_combo = {
+            str(t.get("combo")): t for t in candidates
+            if t.get("type") == "2連単" and float(t.get("odds", 0.0)) > 0
+        }
+        best_pair_swap = None
+
+        for quinella_ticket in list(selected):
+            if quinella_ticket.get("type") != "2連複":
+                continue
+            try:
+                qa, qb = [int(x) for x in str(quinella_ticket.get("combo", "")).split("-")[:2]]
+            except Exception:
+                continue
+
+            forward = exacta_by_combo.get(f"{qa}-{qb}")
+            reverse = exacta_by_combo.get(f"{qb}-{qa}")
+            pair_set = {qa, qb}
+
+            # 現在選択中の同一ペア券を一度まとめて外し、候補構成を公平に比較する。
+            related = []
+            fixed_plan = []
+            for ticket in selected:
+                is_related = ticket is quinella_ticket
+                if ticket.get("type") == "2連単":
+                    try:
+                        ea, eb = [int(x) for x in str(ticket.get("combo", "")).split("-")[:2]]
+                        is_related = is_related or ({ea, eb} == pair_set)
+                    except Exception:
+                        pass
+                if is_related:
+                    related.append(ticket)
+                else:
+                    fixed_plan.append(ticket)
+
+            option_rows = [("2連複のみ", [quinella_ticket])]
+            if forward is not None:
+                option_rows.extend([
+                    (f"2連単{forward['combo']}のみ", [forward]),
+                    (f"2連複＋2連単{forward['combo']}", [quinella_ticket, forward]),
+                ])
+            if reverse is not None:
+                option_rows.extend([
+                    (f"2連単{reverse['combo']}のみ", [reverse]),
+                    (f"2連複＋2連単{reverse['combo']}", [quinella_ticket, reverse]),
+                ])
+            if forward is not None and reverse is not None:
+                option_rows.extend([
+                    ("2連単表裏", [forward, reverse]),
+                    ("2連複＋2連単表裏", [quinella_ticket, forward, reverse]),
+                ])
+
+            current_ids = {(t.get("type"), t.get("combo")) for t in related}
+            current_name = "現在構成"
+            pair_base_metrics = evaluate(selected)
+            current_score = (
+                1.70 * pair_base_metrics["black"]
+                + 0.18 * pair_base_metrics["cover"]
+                - 0.88 * pair_base_metrics["low"]
+                + 10.0 * pair_base_metrics["model_expected_multiple"]
+                + 2.2 * pair_base_metrics["hit_average_multiple"]
+                - 0.12 * len(selected)
+            )
+
+            seen_options = set()
+            for option_name, option_tickets in option_rows:
+                ids = tuple(sorted((t.get("type"), t.get("combo")) for t in option_tickets))
+                if ids in seen_options:
+                    continue
+                seen_options.add(ids)
+                trial_plan = list(fixed_plan)
+                for ticket in option_tickets:
+                    if ticket not in trial_plan:
+                        trial_plan.append(ticket)
+                if len(trial_plan) > 14:
+                    continue
+
+                trial_metrics = evaluate(trial_plan)
+                cover_loss = pair_base_metrics["cover"] - trial_metrics["cover"]
+                black_gain = trial_metrics["black"] - pair_base_metrics["black"]
+                gami_drop = pair_base_metrics["low"] - trial_metrics["low"]
+                expected_gain = (trial_metrics["model_expected_multiple"]
+                                 - pair_base_metrics["model_expected_multiple"])
+                avg_gain = (trial_metrics["hit_average_multiple"]
+                            - pair_base_metrics["hit_average_multiple"])
+                point_gain = len(trial_plan) - len(selected)
+
+                # 的中重視なので、両方向を拾う構成同士ではカバーをほぼ維持する。
+                # 片方向のみへ絞る場合は、黒字側の改善が大きい場合だけ最大2.0ptまで許容する。
+                allowed_cover_loss = 2.0 if black_gain >= 0.80 else 0.40
+                if cover_loss > allowed_cover_loss:
+                    continue
+                if expected_gain < -0.025:
+                    continue
+                if avg_gain < -0.06:
+                    continue
+
+                score = (
+                    1.70 * trial_metrics["black"]
+                    + 0.18 * trial_metrics["cover"]
+                    - 0.88 * trial_metrics["low"]
+                    + 10.0 * trial_metrics["model_expected_multiple"]
+                    + 2.2 * trial_metrics["hit_average_multiple"]
+                    - 0.12 * len(trial_plan)
+                )
+                gain = score - current_score
+                # 同点付近なら、点数が少なくガミ率が低い構成を優先する。
+                key = (
+                    gain,
+                    black_gain,
+                    gami_drop,
+                    expected_gain,
+                    avg_gain,
+                    -max(0.0, cover_loss),
+                    -len(trial_plan),
+                )
+                if best_pair_swap is None or key > best_pair_swap[0]:
+                    best_pair_swap = (
+                        key, quinella_ticket, related, option_name, option_tickets,
+                        trial_plan, trial_metrics, pair_base_metrics
+                    )
+
+        if best_pair_swap is None or best_pair_swap[0][0] <= 0.015:
+            break
+
+        (_, quinella_ticket, old_tickets, option_name, option_tickets,
+         selected, metrics, before_metrics) = best_pair_swap
+
+        old_desc = "・".join(
+            f"{t['type']} {t['combo']}（{float(t.get('odds',0)):.1f}倍）" for t in old_tickets
+        )
+        new_desc = "・".join(
+            f"{t['type']} {t['combo']}（{float(t.get('odds',0)):.1f}倍）" for t in option_tickets
+        )
+        pair_mix_notes.append(
+            f"同一ペア構成を全比較し、{old_desc} から {new_desc} へ変更（{option_name}）。"
+            f"黒字的中率 {before_metrics['black']:.2f}%→{metrics['black']:.2f}%、"
+            f"ガミ率 {before_metrics['low']:.2f}%→{metrics['low']:.2f}%、"
+            f"合成倍率 {before_metrics['hit_average_multiple']:.2f}倍→{metrics['hit_average_multiple']:.2f}倍"
+        )
+
+    replacement_notes.extend(pair_mix_notes)
+
     metrics = evaluate(selected)
 
     # 的中率だけでなく、的中時に黒字となる割合と合成倍率を主軸に評価する。
@@ -2393,7 +2541,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     st.caption(
         "判定は黒字的中率を最優先し、的中時の黒字割合・ガミ割合・平均合成倍率・モデル期待倍率を使用します。"
         "低配当保険は、ほかの券種との同時的中を含めて黒字確率を増やす場合だけ採用します。"
-        "単独でガミになる2連系は、同じ展開の三連単1〜4点に分解した方が黒字的中率を改善する場合、自動で差し替えます。"
+        "単独でガミになる2連系は三連単1〜4点への分解を比較し、2連複は片側2連単・表裏2連単・2連複との重ね買いを全比較し、合成全体が改善する構成だけ採用します。"
     )
     st.caption(
         "各買い目の『単独的中ではガミ注意』は、その券だけが当たった場合の払戻が候補総額を下回る意味です。"
