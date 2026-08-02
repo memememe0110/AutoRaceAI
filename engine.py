@@ -18447,3 +18447,5 @@ def v197_get_active_day_trend():
 # Ver199: 6/7/8車の回収率合成はapp側で車立て別最適化。Ver198前後位置ゲートを継承。
 
 # Ver204: DB75 baseline; final mixed-plan deep-gami and cross-bet overlap pruning is implemented in app.py.
+
+# Ver206: DB76 baseline; residual third-place trifecta suggestions are implemented in app.py.

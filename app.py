@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver205｜DB75基準・券種名を数字表記へ統一")
+st.caption("Ver206｜DB76基準・3着残りの期待値追加候補・3連系への入れ替え比較")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2740,6 +2740,89 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             f"ガミ率{before['low']:.2f}%→{after['low']:.2f}%"
         )
 
+    # Ver206: 低評価でも3着へ残る選手を、無条件で本線へ追加しない。
+    # 既存の1・2着軸、3連複、別の3連単から自然に派生し、オッズ込みの期待値がある3連単だけを
+    # 「余裕がある場合の追加候補」または「低効率券との入れ替え候補」として提示する。
+    base_for_residual = evaluate(selected)
+    selected_ids = {(t.get("type"), t.get("combo")) for t in selected}
+    residual_candidates = []
+    selected_exacta = {tuple(int(x) for x in t["combo"].split("-")) for t in selected if t.get("type") == "2連単"}
+    selected_trio = {tuple(sorted(int(x) for x in t["combo"].split("-"))) for t in selected if t.get("type") == "三連複"}
+    selected_tris = [tuple(int(x) for x in t["combo"].split("-")) for t in selected if t.get("type") == "三連単"]
+
+    for cand in candidates:
+        if cand.get("type") != "三連単" or (cand.get("type"), cand.get("combo")) in selected_ids:
+            continue
+        vals = tuple(int(x) for x in str(cand.get("combo", "")).split("-"))
+        if len(vals) != 3:
+            continue
+        a, b, c = vals
+        support = []
+        if (a, b) in selected_exacta:
+            support.append(f"2連単 {a}-{b}を3着まで延長")
+        if tuple(sorted(vals)) in selected_trio:
+            support.append(f"3連複 {'-'.join(map(str, sorted(vals)))}の着順候補")
+        if any(x[0] == a and x[2] == c and x[1] != b for x in selected_tris):
+            support.append(f"1着{a}・3着{c}の相手替わり")
+        if any(x[0] == a and x[1] == b and x[2] != c for x in selected_tris):
+            support.append(f"1・2着{a}-{b}の3着替わり")
+        if len(support) < 2:
+            continue
+
+        probability = float(cand.get("probability", 0.0) or 0.0)
+        odds = float(cand.get("odds", 0.0) or 0.0)
+        standalone_ev = probability / 100.0 * odds
+        add_metrics = evaluate(selected + [cand])
+        cover_gain = add_metrics["cover"] - base_for_residual["cover"]
+        black_gain = add_metrics["black"] - base_for_residual["black"]
+        return_delta = add_metrics["model_return_rate"] - base_for_residual["model_return_rate"]
+        low_delta = add_metrics["low"] - base_for_residual["low"]
+
+        best_swap = None
+        for old in selected:
+            if old.get("type") == "三連単" and old.get("protected"):
+                continue
+            swapped = [t for t in selected if t is not old] + [cand]
+            sm = evaluate(swapped)
+            if sm["model_return_rate"] + 0.01 < base_for_residual["model_return_rate"]:
+                continue
+            if sm["black"] + 0.25 < base_for_residual["black"]:
+                continue
+            if sm["low"] > base_for_residual["low"] + 0.25:
+                continue
+            if sm["cover"] + 1.0 < base_for_residual["cover"]:
+                continue
+            key = (
+                sm["black"] - base_for_residual["black"],
+                sm["model_return_rate"] - base_for_residual["model_return_rate"],
+                base_for_residual["low"] - sm["low"],
+                sm["cover"] - base_for_residual["cover"],
+            )
+            if best_swap is None or key > best_swap[0]:
+                best_swap = (key, old, sm)
+
+        mode = None
+        old_ticket = None
+        comparison = add_metrics
+        if best_swap is not None:
+            mode = "入れ替え候補"
+            old_ticket = best_swap[1]
+            comparison = best_swap[2]
+        elif (standalone_ev >= 1.00 and cover_gain >= 0.20
+              and return_delta >= -3.0 and black_gain >= -1.0 and low_delta <= 1.5):
+            mode = "余裕がある場合の追加候補"
+
+        if mode:
+            residual_candidates.append({
+                "mode": mode, "ticket": cand, "replace": old_ticket,
+                "support": support, "standalone_ev": standalone_ev * 100.0,
+                "before": base_for_residual, "after": comparison,
+                "score": (1 if mode == "入れ替え候補" else 0, standalone_ev, probability, odds),
+            })
+
+    residual_candidates.sort(key=lambda x: x["score"], reverse=True)
+    residual_candidates = residual_candidates[:3]
+
     metrics = evaluate(selected)
     calibration = _v195_return_calibration(engine.DB_PATH)
     adjusted_expected_multiple = float(metrics.get("model_expected_multiple", 0.0)) * float(calibration.get("factor", 1.0))
@@ -2808,6 +2891,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "gami_prune_notes": gami_prune_notes,
         "protected_add_notes": protected_add_notes,
         "protected_count": len([t for t in selected if t.get("protected")]),
+        "residual_trifecta_candidates": residual_candidates,
         "tri_seed_cover": float(tri_seed_metrics.get("cover", 0.0)),
         "tri_seed_black": float(tri_seed_metrics.get("black", 0.0)),
         **metrics,
@@ -2852,6 +2936,37 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
         st.warning("深いガミ券・重複効率の低い券を最終総額ベースで除外しました。")
         for note in result.get("gami_prune_notes", []):
             st.caption(f"・{note}")
+    residual_rows = result.get("residual_trifecta_candidates", []) or []
+    if residual_rows:
+        st.markdown("##### 🪶 3着残り・期待値追加候補")
+        st.caption("本線には自動追加しません。既存の軸・3連複・相手関係から自然に派生し、オッズ込みで条件を満たした3連単だけを表示します。")
+        residual_copy = []
+        for item in residual_rows:
+            ticket = item.get("ticket", {})
+            old = item.get("replace")
+            before = item.get("before", {})
+            after = item.get("after", {})
+            mode = item.get("mode", "追加候補")
+            combo = str(ticket.get("combo", ""))
+            residual_copy.append(combo)
+            if old:
+                title = f"{mode}：{v205_ticket_display_name(old.get('type'))} {old.get('combo')} → 3連単 {combo}"
+            else:
+                title = f"{mode}：3連単 {combo}"
+            st.markdown(f"**{title}**")
+            st.caption(
+                f"モデル{float(ticket.get('probability',0)):.3f}%・{float(ticket.get('odds',0)):.1f}倍・単体期待値{float(item.get('standalone_ev',0)):.1f}% ／ "
+                f"黒字的中率 {float(before.get('black',0)):.2f}%→{float(after.get('black',0)):.2f}%・"
+                f"参考回収率 {float(before.get('model_return_rate',0)):.1f}%→{float(after.get('model_return_rate',0)):.1f}%"
+            )
+            st.caption("根拠：" + "／".join(item.get("support", [])))
+        if residual_copy:
+            v73_copy_box(
+                "余裕がある場合の3連単追加候補",
+                "3連単 追加候補\n" + "\n".join(residual_copy),
+                f"v206_residual_trifecta_{race_key}_{saved_hash}",
+                height=max(125, 82 + 27 * len(residual_copy)),
+            )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("合成的中率", f"{result['cover']:.2f}%")
     c2.metric("黒字的中率", f"{result['black']:.2f}%")
