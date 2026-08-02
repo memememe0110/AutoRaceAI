@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver204｜DB75基準・深いガミ券除外・券種横断重複最適化")
+st.caption("Ver205｜DB75基準・券種名を数字表記へ統一")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2797,7 +2797,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     for ticket_type in ("三連単", "三連複", "2連単", "2連複"):
         rows = grouped.get(ticket_type, [])
         if rows:
-            role_lines.append(f"{ticket_type}{len(rows)}点：{rows[0]['role']}")
+            role_lines.append(f"{v205_ticket_display_name(ticket_type)}{len(rows)}点：{rows[0]['role']}")
     return {
         "available": True, "grade": grade, "icon": icon, "reason": reason,
         "multiple_grade": multiple_grade,
@@ -2812,6 +2812,18 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "tri_seed_black": float(tri_seed_metrics.get("black", 0.0)),
         **metrics,
     }
+
+
+
+def v205_ticket_display_name(ticket_type: str) -> str:
+    """内部キーは変えず、画面とコピー欄だけ券種名を数字表記へ統一する。"""
+    return {
+        "三連単": "3連単",
+        "三連複": "3連複",
+        "2連単": "2連単",
+        "2連複": "2連複",
+    }.get(str(ticket_type), str(ticket_type))
+
 
 
 def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict, race_key: str = "") -> None:
@@ -2833,7 +2845,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
         for note in result.get("protected_add_notes", []):
             st.caption(f"・{note}")
     if result.get("replacement_notes"):
-        st.success("ガミ保険を三連単へ置換・同一ペアを再編しました。")
+        st.success("ガミ保険を3連単へ置換・同一ペアを再編しました。")
         for note in result.get("replacement_notes", []):
             st.caption(f"・{note}")
     if result.get("gami_prune_notes"):
@@ -2865,15 +2877,15 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
             target = info.get("target")
             target_text = f"目標{target:.0f}%" if isinstance(target, (int, float)) else "上位候補"
             cols[idx].metric(
-                ticket_type,
+                v205_ticket_display_name(ticket_type),
                 f"{int(info.get('points', 0))}点",
                 f"累積{float(info.get('cover', 0.0)):.1f}%・{target_text}",
             )
-        st.caption("三連単以外は車立て別の累積確率候補から、合成効果・ガミ・倍率を比較して採用します。6車は三連単だけが最良なら、ほかの券種を無理に混ぜません。")
+        st.caption("3連単以外は車立て別の累積確率候補から、合成効果・ガミ・倍率を比較して採用します。6車は3連単だけが最良なら、ほかの券種を無理に混ぜません。")
     st.caption(
-        f"三連単の初期本線は上位2〜6点を比較し、今回は{int(result.get('tri_seed_points', 2))}点を採用。"
+        f"3連単の初期本線は上位2〜6点を比較し、今回は{int(result.get('tri_seed_points', 2))}点を採用。"
         f"本線段階のカバー{float(result.get('tri_seed_cover', 0.0)):.2f}%・黒字側{float(result.get('tri_seed_black', 0.0)):.2f}%を基準に、"
-        "その後ほかの券種と三連単追加候補を同じ土俵で比較しています。"
+        "その後ほかの券種と3連単追加候補を同じ土俵で比較しています。"
     )
     q1, q2, q3 = st.columns(3)
     q1.metric("的中時の黒字割合", f"{result['black_share_of_hits']:.1f}%")
@@ -2895,7 +2907,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
         rows = result["grouped"].get(ticket_type, [])
         if not rows:
             continue
-        st.markdown(f"**{ticket_type}：{len(rows)}点｜{rows[0]['role']}**")
+        st.markdown(f"**{v205_ticket_display_name(ticket_type)}：{len(rows)}点｜{rows[0]['role']}**")
         ticket_lines = []
         combos = []
         for r in rows:
@@ -2918,14 +2930,14 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
                 formations = v203_standard_trifecta_formations(formations, combos)
         except Exception as exc:
             formations = []
-            formation_notes.append(f"{ticket_type}: フォーメーション変換に失敗したため個別表記を使用（{exc}）")
+            formation_notes.append(f"{v205_ticket_display_name(ticket_type)}: フォーメーション変換に失敗したため個別表記を使用（{exc}）")
         if not formations:
             formations = combos
             if combos:
-                formation_notes.append(f"{ticket_type}: 圧縮できない組み合わせは個別表記のまま出力")
+                formation_notes.append(f"{v205_ticket_display_name(ticket_type)}: 圧縮できない組み合わせは個別表記のまま出力")
         if formations:
             formation_sections.append(
-                f"{ticket_type} {len(combos)}点\n" + "\n".join(str(x) for x in formations)
+                f"{v205_ticket_display_name(ticket_type)} {len(combos)}点\n" + "\n".join(str(x) for x in formations)
             )
 
     if formation_sections:
@@ -2937,18 +2949,18 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
             f"v200_mixed_formation_{race_key}_{saved_hash}_{result.get('points', 0)}",
             height=max(190, min(520, 95 + 27 * formation_copy_text.count("\n"))),
         )
-        st.caption("この欄は、上に表示された推奨買い目だけを券種別に圧縮しています。三連単は「=」連結を使わず、ABCBOXまたは1着-2着-3着で表示します。点数と対象買い目は変えません。")
+        st.caption("この欄は、上に表示された推奨買い目だけを券種別に圧縮しています。3連単は「=」を1行につき最大1個まで使い、BOXまたは1着-2着-3着で表示します。点数と対象買い目は変えません。")
         for note in formation_notes:
             st.caption(note)
     st.caption(
         f"モデル上の全外れ率 {result['miss']:.2f}%・参考モデル回収率 {result['model_return_rate']:.1f}%・実績補正後 {result.get('adjusted_return_rate',0):.1f}% 。"
-        "車立て別に点数と券種配分を変え、黒字的中率が明確に改善する候補だけ追加します。6車は三連単中心、7車は中間、8車は補完券種を厚めに評価します。"
+        "車立て別に点数と券種配分を変え、黒字的中率が明確に改善する候補だけ追加します。6車は3連単中心、7車は中間、8車は補完券種を厚めに評価します。"
     )
     st.caption(
         "判定は黒字的中率を最優先し、的中時の黒字割合・ガミ割合・平均合成倍率・モデル期待倍率を使用します。"
         "券種別の高確率本線は先に保護しますが、最終総額に対して深いガミで、追加カバーと単体期待値が低い場合は保護を解除して除外します。"
         "低配当保険は、ほかの券種との同時的中を含めて黒字確率を増やす場合だけ採用します。"
-        "単独でガミになる2連系は三連単1〜4点への分解を比較し、2連複は片側2連単・表裏2連単・2連複との重ね買いを全比較し、合成全体が改善する構成だけ採用します。"
+        "単独でガミになる2連系は3連単1〜4点への分解を比較し、2連複は片側2連単・表裏2連単・2連複との重ね買いを全比較し、合成全体が改善する構成だけ採用します。"
     )
     st.caption(
         "各買い目の『単独的中ではガミ注意』は、その券だけが当たった場合の払戻が候補総額を下回る意味です。"
