@@ -2574,19 +2574,54 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
         st.info(result["reason"])
     st.caption(" / ".join(result.get("role_lines", [])))
     order = ("三連単", "三連複", "2連単", "2連複")
+    formation_sections = []
+    formation_notes = []
     for ticket_type in order:
         rows = result["grouped"].get(ticket_type, [])
         if not rows:
             continue
         st.markdown(f"**{ticket_type}：{len(rows)}点｜{rows[0]['role']}**")
         ticket_lines = []
+        combos = []
         for r in rows:
+            combo = str(r.get("combo", "")).strip()
+            if combo:
+                combos.append(combo)
             solo_gami = float(r["odds"]) * 100.0 < float(result["cost"])
             note = " / 単独的中ではガミ注意" if solo_gami else ""
             ticket_lines.append(
-                f"{r['combo']}  ({r['odds']:.1f}倍 / モデル{r['probability']:.2f}%{note})"
+                f"{combo}  ({r['odds']:.1f}倍 / モデル{r['probability']:.2f}%{note})"
             )
         st.code("\n".join(ticket_lines), language=None)
+
+        # Ver200: 推奨された買い目だけを、既存の標準フォーメーション表記へ圧縮する。
+        # 圧縮不能時も買い目を欠落させず、個別表記をそのまま一括コピーへ残す。
+        try:
+            formations = engine.v67_compress_formations(combos, ticket_type) if combos else []
+        except Exception as exc:
+            formations = []
+            formation_notes.append(f"{ticket_type}: フォーメーション変換に失敗したため個別表記を使用（{exc}）")
+        if not formations:
+            formations = combos
+            if combos:
+                formation_notes.append(f"{ticket_type}: 圧縮できない組み合わせは個別表記のまま出力")
+        if formations:
+            formation_sections.append(
+                f"{ticket_type} {len(combos)}点\n" + "\n".join(str(x) for x in formations)
+            )
+
+    if formation_sections:
+        st.markdown("##### 📋 推奨買い目フォーメーション・一括コピー")
+        formation_copy_text = "\n\n".join(formation_sections)
+        v73_copy_box(
+            "推奨合成フォーメーション（全券種）",
+            formation_copy_text,
+            f"v200_mixed_formation_{race_key}_{saved_hash}_{result.get('points', 0)}",
+            height=max(190, min(520, 95 + 27 * formation_copy_text.count("\n"))),
+        )
+        st.caption("この欄は、上に表示された推奨買い目だけを券種別に圧縮しています。点数と対象買い目は変えません。")
+        for note in formation_notes:
+            st.caption(note)
     st.caption(
         f"モデル上の全外れ率 {result['miss']:.2f}%・参考モデル回収率 {result['model_return_rate']:.1f}%・実績補正後 {result.get('adjusted_return_rate',0):.1f}% 。"
         "車立て別に点数と券種配分を変え、黒字的中率が明確に改善する候補だけ追加します。6車は三連単中心、7車は中間、8車は補完券種を厚めに評価します。"
