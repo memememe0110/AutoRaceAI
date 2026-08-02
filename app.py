@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver187｜8車合成プランDB保存・結果照合・実績学習補正・DB67基準")
+st.caption("Ver188｜8車合成候補母集団88〜90%化・DB保存・結果学習補正・DB67基準")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1925,10 +1925,12 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     type_weights = learning.get("type_weights", {})
 
     type_specs = {
-        "三連単": {"counter": "三連単", "odds": "3tan", "limit": 14, "cap": 9, "role": "本線・着順まで一致"},
-        "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 10, "cap": 5, "role": "上位3車の着順ずれ保険"},
-        "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 8, "cap": 4, "role": "1・2着一致／3着抜け保険"},
-        "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 6, "cap": 3, "role": "1・2着逆転保険"},
+        "三連単": {"counter": "三連単", "odds": "3tan", "limit": 14, "cap": 9, "target_cover": None, "role": "本線・着順まで一致"},
+        # 三連単以外は固定上位件数ではなく、累積確率88〜90%までを候補母集団にする。
+        # 全点購入ではなく、この母集団から合成効果・ガミ・倍率を見て最終採用する。
+        "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "cap": 7, "target_cover": 90.0, "role": "上位3車の着順ずれ保険"},
+        "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 999, "cap": 6, "target_cover": 90.0, "role": "1・2着一致／3着抜け保険"},
+        "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 999, "cap": 4, "target_cover": 88.0, "role": "1・2着逆転保険"},
     }
 
     def combo_text(value, unordered=False):
@@ -1958,18 +1960,22 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         return tuple(sorted(nums)) == tuple(sorted((a, b)))
 
     candidates = []
+    pool_summary = {}
     for label, spec in type_specs.items():
         counter = bets.get(spec["counter"], {}) or {}
         odds_map = odds_maps.get(spec["odds"], {}) or {}
         unordered = label in ("三連複", "2連複")
         ordered = sorted(counter.items(), key=lambda x: x[1], reverse=True)
         added = 0
+        cumulative = 0.0
+        target_cover = spec.get("target_cover")
         for combo, count in ordered:
+            probability = float(count) / max(int(trials), 1) * 100.0
             key = combo_text(combo, unordered=unordered)
             odds = float(odds_map.get(key, 0) or 0)
+            # オッズが無い券は最終候補にできないため、候補母集団の累積にも含めない。
             if odds <= 0:
                 continue
-            probability = float(count) / max(int(trials), 1) * 100.0
             learned_weight = float(type_weights.get(label, 1.0))
             ticket = {
                 "type": label, "combo": key, "probability": probability,
@@ -1983,8 +1989,17 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             ticket["matched_probability"] = sum(outcomes[i][1] for i in matched)
             candidates.append(ticket)
             added += 1
-            if added >= int(spec["limit"]):
+            cumulative += probability
+            # 三連単は従来通り上位件数。その他は累積88〜90%到達まで候補化。
+            if target_cover is not None and cumulative >= float(target_cover):
                 break
+            if target_cover is None and added >= int(spec["limit"]):
+                break
+        pool_summary[label] = {
+            "points": added,
+            "cover": cumulative,
+            "target": target_cover,
+        }
 
     tri_candidates = [c for c in candidates if c["type"] == "三連単"]
     if len(tri_candidates) < 2:
@@ -2184,7 +2199,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "available": True, "grade": grade, "icon": icon, "reason": reason,
         "multiple_grade": multiple_grade,
         "tickets": selected, "grouped": grouped, "role_lines": role_lines,
-        "learning": learning, **metrics,
+        "learning": learning, "pool_summary": pool_summary, **metrics,
     }
 
 
@@ -2211,6 +2226,21 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     m2.metric("最低合成倍率", f"{result['hit_min_multiple']:.2f}倍")
     m3.metric("最高合成倍率", f"{result['hit_max_multiple']:.2f}倍")
     m4.metric("モデル期待倍率", f"{result['model_expected_multiple']:.2f}倍")
+
+    pool = result.get("pool_summary", {})
+    if pool:
+        st.markdown("##### 🎯 券種別の候補母集団")
+        cols = st.columns(4)
+        for idx, ticket_type in enumerate(("三連単", "三連複", "2連単", "2連複")):
+            info = pool.get(ticket_type, {})
+            target = info.get("target")
+            target_text = f"目標{target:.0f}%" if isinstance(target, (int, float)) else "上位候補"
+            cols[idx].metric(
+                ticket_type,
+                f"{int(info.get('points', 0))}点",
+                f"累積{float(info.get('cover', 0.0)):.1f}%・{target_text}",
+            )
+        st.caption("三連単以外は、この累積88〜90%の候補母集団から、合成効果・ガミ・倍率を比較して最終採用しています。母集団の全点を購入するわけではありません。")
     q1, q2, q3 = st.columns(3)
     q1.metric("的中時の黒字割合", f"{result['black_share_of_hits']:.1f}%")
     q2.metric("的中時のガミ割合", f"{result['gami_share_of_hits']:.1f}%")
