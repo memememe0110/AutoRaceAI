@@ -18090,3 +18090,113 @@ def _v170_cached_fast_compress(target_tuple, bet_type):
 
 
 # AutoRaceAI Ver177: player matchup history is applied inside the final-lap adjacent passing simulation.
+
+# ============================================================
+# Ver190: 学習重みの時系列検証ゲート
+# 結果ごとの微調整をそのまま全量適用せず、過去70%/直近30%で
+# 初期値との混合率を検証し、直近側で最も安定した強さだけを本番へ使う。
+# ============================================================
+_V190_PROFILE_CACHE = {}
+
+def _v190_initial_feature_weights(db_path=DB_PATH):
+    v40_init_learning_tables(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        rows = con.execute(
+            "SELECT feature_name, initial_weight FROM adaptive_weights WHERE feature_name IN (%s)" %
+            ",".join("?" for _ in V40_DEFAULT_WEIGHTS),
+            tuple(V40_DEFAULT_WEIGHTS.keys()),
+        ).fetchall()
+    raw = {str(k): float(v) for k, v in rows}
+    return _v74_normalize_weights({k: raw.get(k, V40_DEFAULT_WEIGHTS[k]) for k in V40_DEFAULT_WEIGHTS})
+
+def v190_weight_validation_profile(db_path=DB_PATH, force=False):
+    """現在重みを初期値へどこまで縮めるか、時系列の直近30%で決める。"""
+    try:
+        stamp = (str(db_path), int(Path(str(db_path)).stat().st_mtime_ns))
+    except Exception:
+        stamp = (str(db_path), 0)
+    if not force and stamp in _V190_PROFILE_CACHE:
+        return dict(_V190_PROFILE_CACHE[stamp])
+
+    data = _v74_dataset(db_path)
+    current = _v74_normalize_weights(v40_get_weights(db_path))
+    initial = _v190_initial_feature_weights(db_path)
+    result = {
+        "enabled": False, "race_count": 0, "train_count": 0, "validation_count": 0,
+        "blend": 1.0, "current": current, "initial": initial,
+        "effective": current, "reason": "比較可能な履歴が不足しているため現在重みを使用",
+    }
+    if data is None or data.empty:
+        _V190_PROFILE_CACHE.clear(); _V190_PROFILE_CACHE[stamp] = dict(result); return result
+    races = (data[["race_key","race_date","race_no","registered_at"]]
+             .drop_duplicates("race_key")
+             .sort_values(["race_date","race_no","registered_at","race_key"]))
+    result["race_count"] = int(len(races))
+    if len(races) < 20:
+        _V190_PROFILE_CACHE.clear(); _V190_PROFILE_CACHE[stamp] = dict(result); return result
+
+    split = max(12, min(len(races)-6, int(round(len(races)*0.70))))
+    train_keys = set(races.iloc[:split]["race_key"])
+    valid_keys = set(races.iloc[split:]["race_key"])
+    train = data[data["race_key"].isin(train_keys)]
+    valid = data[data["race_key"].isin(valid_keys)]
+    result["train_count"] = len(train_keys); result["validation_count"] = len(valid_keys)
+
+    candidates = []
+    # 0=初期値、1=現在値。中間も比較し、直近側の過学習を抑える。
+    for blend in (0.0, 0.25, 0.50, 0.75, 1.0):
+        w = _v74_normalize_weights({
+            k: initial[k]*(1.0-blend) + current[k]*blend for k in V40_DEFAULT_WEIGHTS
+        })
+        mt = _v74_metrics(train, w); mv = _v74_metrics(valid, w); ma = _v74_metrics(data, w)
+        # 直近側を最優先。微差なら全体、さらに微差なら縮小の強い方。
+        key = (float(mv.get("objective") or -1), float(ma.get("objective") or -1), -blend)
+        candidates.append((key, blend, w, mt, mv, ma))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, blend, effective, mt, mv, ma = candidates[0]
+    cur_valid = _v74_metrics(valid, current)
+    result.update({
+        "enabled": True, "blend": float(blend), "effective": effective,
+        "train_metrics": mt, "validation_metrics": mv, "all_metrics": ma,
+        "current_validation_metrics": cur_valid,
+        "validation_improvement": float((mv.get("objective") or 0) - (cur_valid.get("objective") or 0)),
+        "reason": (
+            f"過去{len(train_keys)}Rで作った傾向を直近{len(valid_keys)}Rで確認し、"
+            f"現在重みの適用率を{blend*100:.0f}%に抑制" if blend < 1.0 else
+            f"直近{len(valid_keys)}Rでも悪化が見られないため現在重みを100%適用"
+        ),
+    })
+    _V190_PROFILE_CACHE.clear(); _V190_PROFILE_CACHE[stamp] = dict(result)
+    return result
+
+def v190_effective_weights(db_path=DB_PATH):
+    p = v190_weight_validation_profile(db_path)
+    return dict(p.get("effective") or v40_get_weights(db_path))
+
+def v40_apply_adaptive_weights(df, db_path=DB_PATH):
+    """Ver190: 結果学習重みを時系列検証ゲート後の強さで適用。"""
+    out = df.copy()
+    profile = v190_weight_validation_profile(db_path)
+    weights = dict(profile.get("effective") or v40_get_weights(db_path))
+    features = v40_feature_frame(out)
+    base = pd.to_numeric(out.get("改善後総合点", pd.Series(0, index=out.index)), errors="coerce").fillna(0.0)
+    out["調整前総合点"] = base
+    out["調整前順位"] = base.rank(method="min", ascending=False).astype(int)
+    centered = sum(weights[k] * (features[k] - 0.5) for k in V40_DEFAULT_WEIGHTS)
+    bonus = (centered * 6.0).clip(-3.0, 3.0)
+    out["学習重み補正"] = bonus
+    out["改善後総合点"] = base + bonus
+    out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+    out["重み検証適用率"] = float(profile.get("blend", 1.0))
+    for k in V40_DEFAULT_WEIGHTS:
+        out[f"学習特徴_{k}"] = features[k]
+    comments=[]
+    for idx in out.index:
+        before_rank=int(out.at[idx,"調整前順位"]); after_rank=int(out.at[idx,"改善後順位"])
+        move=before_rank-after_rank
+        parts=sorted(((k,weights[k]*(features.loc[idx,k]-0.5),weights[k]) for k in V40_DEFAULT_WEIGHTS), key=lambda x:abs(x[1]), reverse=True)[:3]
+        detail="、".join(f"{k}{v*6:+.2f}点(実効{w:.3f})" for k,v,w in parts)
+        head=f"重み補正で{move}位上昇" if move>0 else (f"重み補正で{abs(move)}位下降" if move<0 else "順位変化なし")
+        comments.append(f"{head}。検証適用率{profile.get('blend',1.0)*100:.0f}%／主因: {detail}")
+    out["重み調整コメント"] = comments
+    return out

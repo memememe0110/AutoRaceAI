@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver188｜8車合成候補母集団88〜90%化・DB保存・結果学習補正・DB67基準")
+st.caption("Ver191｜DB69検証・重み時系列ゲート・8車黒字的中重視合成")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1907,9 +1907,9 @@ def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict) -> str:
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
     """8車立て向けの役割分担型・複数券種合成。
 
-    点数上限を先に決めず、三連単本線、着順ずれ、3着抜け、1・2着逆転という
-    異なる外れ方を補う券を組み合わせる。追加効果が続く場合は10点を超えて採用し、
-    最大18点で止める。純粋な期待値最大化ではなく、的中範囲と重複の少なさを重視する。
+    三連単本線、着順ずれ、3着抜け、1・2着逆転という異なる外れ方を補う。
+    Ver191では単なる合成的中率ではなく、購入総額を超える黒字的中率を最優先する。
+    低配当保険は、ほかの券種との同時的中を含めて黒字側を実際に増やす場合だけ採用する。
     """
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH)
     if not starter_count or int(starter_count) != 8:
@@ -2049,8 +2049,9 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             hit_min_multiple = 0.0
             hit_max_multiple = 0.0
         model_expected_multiple = expected_return / cost if cost else 0.0
-        # 点数より、的中範囲・黒字側・役割分担を優先。トリガミと過剰な膨張だけを軽く抑える。
-        score = cover + 0.46 * black - 0.22 * low + role_bonus - 0.075 * n
+        # Ver191: 黒字的中率を主役にする。単なる的中範囲とガミ的中は強く評価しない。
+        # 点数増加は購入総額そのものを押し上げるため、以前より明確に減点する。
+        score = 0.48 * cover + 1.22 * black - 0.72 * low + 0.55 * role_bonus - 0.16 * n
         black_share_of_hits = black / cover * 100.0 if cover > 0 else 0.0
         gami_share_of_hits = low / cover * 100.0 if cover > 0 else 0.0
         return {
@@ -2088,8 +2089,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     for k in range(2, max_tri_seed + 1):
         seed_plan = tri_candidates[:k]
         seed_metrics = evaluate(seed_plan)
-        # 三連単だけの土台選定では、カバーと黒字側を重視し、
-        # ガミ側と点数増には穏やかなペナルティを置く。
+        # 三連単だけの土台でも黒字側を優先し、ガミ化と点数増を強めに抑える。
         seed_utility = (
             seed_metrics["cover"]
             + 0.52 * seed_metrics["black"]
@@ -2116,13 +2116,19 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 continue
             mg = marginal(plan, cand)
             lw = float(cand.get("learned_weight", 1.0))
-            key = ((mg["cover_gain"] + 0.45 * mg["black_gain"] - 0.15 * max(0.0, mg["low_gain"])) * lw,
-                   mg["unique_prob"] * lw, cand["probability"], cand["odds"])
+            new_cost = (len(plan) + 1) * 100.0
+            solo_recovers = float(cand.get("odds", 0.0)) * 100.0 >= new_cost
+            key = ((1.35 * mg["black_gain"] + 0.35 * mg["cover_gain"] - 0.75 * max(0.0, mg["low_gain"])) * lw,
+                   int(solo_recovers), mg["unique_prob"] * lw, cand["probability"], cand["odds"])
             choices.append((key, cand, mg))
         if choices:
             key, cand, mg = max(choices, key=lambda x: x[0])
             # 役割券でも、ほとんど範囲が増えないものは無理に入れない。
-            if mg["cover_gain"] >= (0.35 if required_type == "2連複" else 0.65):
+            new_cost = (len(plan) + 1) * 100.0
+            solo_recovers = float(cand.get("odds", 0.0)) * 100.0 >= new_cost
+            min_black_gain = 0.18 if required_type == "2連複" else 0.28
+            # 低配当保険は、単独回収できるか、同時的中込みで黒字確率を明確に増やす場合だけ採用。
+            if mg["black_gain"] >= min_black_gain and (solo_recovers or mg["black_gain"] >= 0.65):
                 plan.append(cand)
                 remaining.remove(cand)
 
@@ -2130,8 +2136,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     if len(plan) >= 6:
         snapshots.append((list(plan), evaluate(plan)))
 
-    # 追加効果がある限り、最大18点まで券種横断で積み上げる。
-    while len(plan) < 18 and remaining:
+    # 基本上限は12点。13〜14点目は黒字側が明確に伸びる場合だけ例外採用する。
+    while len(plan) < 14 and remaining:
         counts = evaluate(plan)["counts"]
         best = None
         for cand in remaining:
@@ -2140,17 +2146,28 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             mg = marginal(plan, cand)
             # 既存券と重複するだけの券より、新しい外れ方を拾う券を優先。
             lw = float(cand.get("learned_weight", 1.0))
-            complement = (mg["unique_prob"] + 0.55 * mg["black_gain"] - 0.18 * max(0.0, mg["low_gain"])) * lw
-            if cand["type"] != "三連単" and counts.get(cand["type"], 0) == 0:
-                complement += 0.6
-            key = (complement, mg["score_gain"], mg["cover_gain"], cand["probability"], cand["odds"])
+            new_cost = (len(plan) + 1) * 100.0
+            solo_recovers = float(cand.get("odds", 0.0)) * 100.0 >= new_cost
+            complement = (1.50 * mg["black_gain"] + 0.28 * mg["cover_gain"]
+                          - 0.78 * max(0.0, mg["low_gain"]) + 0.10 * mg["unique_prob"]) * lw
+            if cand["type"] != "三連単" and counts.get(cand["type"], 0) == 0 and mg["black_gain"] > 0:
+                complement += 0.18
+            key = (complement, mg["black_gain"], int(solo_recovers), mg["score_gain"], cand["odds"])
             if best is None or key > best[0]:
                 best = (key, cand, mg)
         if best is None:
             break
         _, cand, mg = best
-        # 8点以降は、独自カバーまたは黒字側の改善が小さければ止める。
-        if len(plan) >= 8 and mg["unique_prob"] < 0.30 and mg["black_gain"] < 0.18:
+        new_cost = (len(plan) + 1) * 100.0
+        solo_recovers = float(cand.get("odds", 0.0)) * 100.0 >= new_cost
+        # 黒字確率が増えない追加は不採用。低配当券は、強い黒字改善が無ければ止める。
+        if mg["black_gain"] <= 0.0:
+            break
+        if not solo_recovers and mg["black_gain"] < 0.60:
+            break
+        if len(plan) >= 8 and mg["black_gain"] < 0.22:
+            break
+        if len(plan) >= 12 and (mg["black_gain"] < 0.80 or mg["after"]["model_expected_multiple"] < evaluate(plan)["model_expected_multiple"]):
             break
         plan.append(cand)
         remaining.remove(cand)
@@ -2160,12 +2177,13 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     if not snapshots:
         return {"available": False, "reason": "役割の異なる券を組み合わせた有効な構成を作れませんでした。"}
 
-    # 10点を境にせず、最高評価に近ければ役割数と黒字側を優先する。
+    # Ver191: 最高評価に近い構成から、黒字的中率と期待倍率を優先して選ぶ。
     best_score = max(m["score"] for _, m in snapshots)
-    near = [(p, m) for p, m in snapshots if m["score"] >= best_score - 0.25]
+    near = [(p, m) for p, m in snapshots if m["score"] >= best_score - 0.18]
     selected, metrics = max(
         near,
-        key=lambda x: (x[1]["diversity"], x[1]["black"], x[1]["cover"], -x[1]["low"], -x[1]["points"]),
+        key=lambda x: (x[1]["black"], x[1]["model_expected_multiple"],
+                       x[1]["black_share_of_hits"], x[1]["cover"], -x[1]["low"], -x[1]["points"]),
     )
 
     # 的中率だけでなく、的中時に黒字となる割合と合成倍率を主軸に評価する。
@@ -2183,21 +2201,22 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     else:
         multiple_grade = "ガミ注意"
 
-    if (metrics["black"] < 10.0 or gami_share >= 55.0 or avg_multiple < 0.95
-            or (expected_multiple < 0.70 and gami_share >= 40.0)):
+    if (metrics["black"] < 15.0 or gami_share >= 42.0 or avg_multiple < 1.05
+            or expected_multiple < 0.82):
         grade, icon = "非推奨", "⛔"
         reason = (
             f"的中時のガミ割合が{gami_share:.1f}%で、平均合成倍率は{avg_multiple:.2f}倍です。"
             "的中範囲を作れても購入総額を回収しにくい構成です。"
         )
-    elif (metrics["diversity"] >= 3 and metrics["black"] >= 22.0
-          and black_share >= 62.0 and avg_multiple >= 1.35 and expected_multiple >= 0.90):
-        grade, icon = "合成推奨", "✅"
+    elif (metrics["diversity"] >= 2 and metrics["black"] >= 30.0
+          and black_share >= 68.0 and gami_share <= 25.0
+          and avg_multiple >= 1.35 and expected_multiple >= 1.05):
+        grade, icon = "黒字合成推奨", "✅"
         reason = (
             f"的中時の黒字割合が{black_share:.1f}%、平均合成倍率が{avg_multiple:.2f}倍です。"
             "券種ごとの保険が働きつつ、ガミ側への偏りを抑えています。"
         )
-    elif gami_share >= 42.0 or avg_multiple < 1.10:
+    elif gami_share >= 30.0 or avg_multiple < 1.18 or expected_multiple < 0.95:
         grade, icon = "ガミ注意・条件付き", "⚠️"
         reason = (
             f"合成的中率はありますが、的中時のガミ割合が{gami_share:.1f}%です。"
@@ -2232,7 +2251,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
 def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict, race_key: str = "") -> None:
     result = v184_eight_car_mixed_plan(bets, trials, meta, odds_maps)
-    st.markdown("#### 🧩 8車向け・役割分担型の複数券種合成")
+    st.markdown("#### 🧩 8車向け・黒字的中重視の複数券種合成")
     if not result.get("available"):
         st.caption(result.get("reason", "4券種オッズを読み込むと表示します。"))
         return
@@ -2279,7 +2298,7 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
     q3.metric("倍率判定", result.get("multiple_grade", "参考"))
     if result["grade"] == "非推奨":
         st.error(result["reason"])
-    elif result["grade"] == "合成推奨":
+    elif "合成推奨" in result["grade"]:
         st.success(result["reason"])
     elif "ガミ注意" in result["grade"]:
         st.warning(result["reason"])
@@ -2302,11 +2321,11 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
         st.code("\n".join(ticket_lines), language=None)
     st.caption(
         f"モデル上の全外れ率 {result['miss']:.2f}%・参考モデル回収率 {result['model_return_rate']:.1f}% 。"
-        "点数を10点で切らず、独自の的中範囲または黒字側の改善が続く場合は最大18点まで採用します。"
+        "基本上限は12点で、13〜14点目は黒字的中率が明確に改善し、期待倍率を悪化させない場合だけ採用します。"
     )
     st.caption(
-        "判定は、合成的中率だけでなく、的中時の黒字割合・ガミ割合・平均合成倍率・モデル期待倍率を使用します。"
-        "合成倍率が高く黒字側が多い構成は推奨し、ガミ側が過半数に近い構成は非推奨または条件付きにします。"
+        "判定は黒字的中率を最優先し、的中時の黒字割合・ガミ割合・平均合成倍率・モデル期待倍率を使用します。"
+        "低配当保険は、ほかの券種との同時的中を含めて黒字確率を増やす場合だけ採用します。"
     )
     st.caption(
         "各買い目の『単独的中ではガミ注意』は、その券だけが当たった場合の払戻が候補総額を下回る意味です。"
@@ -3038,6 +3057,15 @@ if selected_main_page == "🏁 予測":
             st.caption(f"予測保存キー: {race_key}（結果登録時の比較・重み調整に使用）")
 
             with st.expander("🧪 学習重みによる順位・確率の変化", expanded=False):
+                try:
+                    v190_profile = engine.v190_weight_validation_profile(engine.DB_PATH)
+                    st.caption(
+                        f"重み検証ゲート：現在重みの{float(v190_profile.get('blend',1.0))*100:.0f}%を適用 "
+                        f"（比較{int(v190_profile.get('race_count',0))}R／直近検証{int(v190_profile.get('validation_count',0))}R）"
+                    )
+                    st.caption(str(v190_profile.get("reason", "")))
+                except Exception as exc:
+                    st.caption(f"重み検証ゲートの表示を取得できませんでした: {exc}")
                 impact_df = engine.v50_weight_impact_summary(df)
                 st.dataframe(
                     impact_df, use_container_width=True, hide_index=True,
