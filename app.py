@@ -46,7 +46,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver209｜事前確認2表を最上部表示・オッズ後の堅いレースは3連単少点数化")
+st.caption("Ver211｜事前確認2表を最上部表示・堅いレースは中心ペア固定で3連単少点数化")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2766,6 +2766,46 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
     replacement_notes.extend(pair_mix_notes)
 
+    # Ver211: 長期回収率重視の最低基準。
+    # 本線保護の有無にかかわらず、極端な低配当かつ単体期待値100%未満の券は
+    # 「的中数を増やすだけの保険」として最終構成から除外する。
+    low_odds_floor_notes = []
+    for _ in range(8):
+        base = evaluate(selected)
+        forced = None
+        for ticket in list(selected):
+            if len(selected) <= 2:
+                break
+            odds = float(ticket.get("odds", 0.0) or 0.0)
+            prob = float(ticket.get("probability", 0.0) or 0.0)
+            standalone_ev = (prob / 100.0) * odds
+            payout_ratio = (odds * 100.0 / float(base.get("cost", 1.0))) if base.get("cost") else 0.0
+
+            # 2.0倍以下はEV100%未満なら無条件除外。
+            # それ以上でも、総額の25%未満しか戻らずEV95%未満なら除外する。
+            too_low = (odds <= 2.0 and standalone_ev < 1.0)
+            deep_low_return = (payout_ratio < 0.25 and standalone_ev < 0.95)
+            if not (too_low or deep_low_return):
+                continue
+
+            trial = [t for t in selected if t is not ticket]
+            after = evaluate(trial)
+            key = (
+                base["model_return_rate"] - after["model_return_rate"],
+                odds, standalone_ev
+            )
+            if forced is None or key < forced[0]:
+                forced = (key, ticket, trial, after, standalone_ev, payout_ratio)
+
+        if forced is None:
+            break
+        _, ticket, selected, after, standalone_ev, payout_ratio = forced
+        ticket["protected"] = False
+        low_odds_floor_notes.append(
+            f"{ticket['type']} {ticket['combo']}（{float(ticket.get('odds',0)):.1f}倍）を長期回収率基準で除外。"
+            f"単体期待値{standalone_ev*100:.1f}%・単独払戻は候補総額の{payout_ratio*100:.1f}%"
+        )
+
     # Ver204: 券種をまたいだ重複と深いガミ券を、最終総額ベースで再評価する。
     # 高確率本線でも、追加的中範囲が小さく、単体期待値が低く、除外後に
     # 黒字確率・ガミ率・参考回収率が改善する場合は保護を解除して除外する。
@@ -2837,8 +2877,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             f"ガミ率{before['low']:.2f}%→{after['low']:.2f}%"
         )
 
-    # Ver209: オッズ入力後に上位2車へ確率が集中した「堅いレース」を検出し、
-    # 低配当の保険を広く持たず、3連単2〜5点の少点数構成と通常合成を比較する。
+    # Ver211: 堅いレースでは、通常合成の期待値比較だけで見送らない。
+    # 最有力の1・2着ペアを固定し、3着候補ごとに表裏を揃えた3連単2〜4点を優先する。
     hard_race_info = {"enabled": False}
     try:
         win_share = {}
@@ -2856,36 +2896,77 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         hard_score += int(top2_win_share >= 72.0)
         hard_score += int(float(top_pair_prob) >= 38.0)
         hard_score += int(top_tri_prob >= 5.0)
-        # 市場側も上位3連単が低〜中配当に集中している場合だけ強判定にする。
-        top_tri_rows = sorted(tri_candidates, key=lambda t: float(t.get("probability", 0.0)), reverse=True)[:8]
+        top_tri_rows = sorted(tri_candidates, key=lambda t: float(t.get("probability", 0.0)), reverse=True)[:10]
         low_odds_count = sum(1 for t in top_tri_rows[:5] if 0 < float(t.get("odds", 0.0)) <= 25.0)
         hard_score += int(low_odds_count >= 3)
-        if hard_score >= 3 and len(top_tri_rows) >= 3:
+
+        if hard_score >= 3 and len(top_tri_rows) >= 2:
+            pair_set = set(int(x) for x in top_pair)
+            pair_rows = []
+            third_scores = {}
+            for t in tri_candidates:
+                try:
+                    a, b, c = (int(x) for x in str(t.get("combo", "")).split("-"))
+                except Exception:
+                    continue
+                if {a, b} == pair_set and c not in pair_set:
+                    pair_rows.append(t)
+                    third_scores[c] = third_scores.get(c, 0.0) + float(t.get("probability", 0.0))
+
+            third_order = [c for c, _ in sorted(third_scores.items(), key=lambda x: x[1], reverse=True)]
+            structured = []
+            used = set()
+            for c in third_order[:2]:
+                rows = [t for t in pair_rows if str(t.get("combo", "")).endswith(f"-{c}")]
+                rows.sort(key=lambda t: float(t.get("probability", 0.0)), reverse=True)
+                # 最有力3着候補は中心ペアの表裏を両方残す。
+                for t in rows[:2]:
+                    key = (t.get("type"), t.get("combo"))
+                    if key not in used:
+                        structured.append(t); used.add(key)
+
+            # ペア固定だけで不足する場合は、全体上位から補完する。
+            for t in top_tri_rows:
+                if len(structured) >= 4:
+                    break
+                key = (t.get("type"), t.get("combo"))
+                if key not in used:
+                    structured.append(t); used.add(key)
+
             compact_options = []
-            for k in range(2, min(5, len(top_tri_rows)) + 1):
-                compact = top_tri_rows[:k]
+            min_k = 2 if len(structured) >= 2 else 1
+            for k in range(min_k, min(4, len(structured)) + 1):
+                compact = structured[:k]
                 compact_metrics = evaluate(compact)
-                # 少点数化では、黒字確率、期待倍率、的中範囲の順に評価する。
-                utility = (1.75 * compact_metrics["black"]
-                           + 9.0 * compact_metrics["model_expected_multiple"]
-                           + 0.22 * compact_metrics["cover"]
-                           - 0.55 * compact_metrics["low"]
-                           - 0.20 * k)
-                compact_options.append((utility, compact, compact_metrics))
-            _, compact_plan, compact_metrics = max(
+                # どの1点が当たっても購入総額以上になりやすい構成を優先。
+                break_even_ok = all(float(t.get("odds", 0.0)) >= float(k) for t in compact)
+                utility = (
+                    2.10 * compact_metrics["black"]
+                    + 10.0 * compact_metrics["model_expected_multiple"]
+                    + 0.18 * compact_metrics["cover"]
+                    - 0.75 * compact_metrics["low"]
+                    - 0.35 * k
+                    + (12.0 if break_even_ok else -12.0)
+                )
+                compact_options.append((utility, compact, compact_metrics, break_even_ok))
+
+            _, compact_plan, compact_metrics, break_even_ok = max(
                 compact_options,
-                key=lambda x: (x[0], x[2]["black"], x[2]["model_expected_multiple"], -x[2]["points"]),
+                key=lambda x: (x[3], x[0], x[2]["black"], x[2]["model_expected_multiple"], -x[2]["points"]),
             )
             normal_metrics = evaluate(selected)
-            # 通常合成より回収率が極端に悪化せず、ガミ率を大きく下げる場合に少点数へ切替。
-            compact_is_better = (
-                compact_metrics["model_return_rate"] >= normal_metrics["model_return_rate"] * 0.90
-                and compact_metrics["low"] <= normal_metrics["low"] - 2.0
-                and compact_metrics["black"] >= normal_metrics["black"] - 7.0
+
+            # 強い堅い判定では、ガミ保険を多数残す通常構成より中心ペア固定を優先。
+            # ただし全点が単独ガミになる構成、または参考回収率が著しく低い構成は採用しない。
+            compact_is_better = bool(
+                break_even_ok
+                and compact_metrics["points"] <= 4
+                and compact_metrics["model_return_rate"] >= 95.0
+                and compact_metrics["low"] <= normal_metrics["low"]
             )
             hard_race_info = {
                 "enabled": True,
-                "applied": bool(compact_is_better),
+                "applied": compact_is_better,
                 "score": hard_score,
                 "top_pair": top_pair,
                 "top_pair_prob": float(top_pair_prob),
@@ -2898,12 +2979,14 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 "compact_black": float(compact_metrics.get("black", 0.0)),
                 "normal_low": float(normal_metrics.get("low", 0.0)),
                 "compact_low": float(compact_metrics.get("low", 0.0)),
+                "break_even_ok": bool(break_even_ok),
             }
             if compact_is_better:
                 selected = list(compact_plan)
                 metrics = compact_metrics
                 replacement_notes.append(
-                    f"堅いレース判定により通常{normal_metrics['points']}点から3連単{compact_metrics['points']}点へ絞り込み。"
+                    f"堅いレース判定により通常{normal_metrics['points']}点から、中心ペア"
+                    f"{top_pair[0]}・{top_pair[1]}固定の3連単{compact_metrics['points']}点へ絞り込み。"
                     f"上位2車勝率合計{top2_win_share:.1f}%・中心ペア確率{top_pair_prob:.1f}%・"
                     f"ガミ率{normal_metrics['low']:.2f}%→{compact_metrics['low']:.2f}%"
                 )
@@ -3059,6 +3142,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "tri_seed_points": int(tri_seed_points),
         "replacement_notes": replacement_notes,
         "gami_prune_notes": gami_prune_notes,
+        "low_odds_floor_notes": low_odds_floor_notes,
         "protected_add_notes": protected_add_notes,
         "protected_count": len([t for t in selected if t.get("protected")]),
         "residual_trifecta_candidates": residual_candidates,
@@ -3157,6 +3241,11 @@ def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_map
         st.success("ガミ保険を3連単へ置換・同一ペアを再編しました。")
         for note in result.get("replacement_notes", []):
             st.caption(f"・{note}")
+    if result.get("low_odds_floor_notes"):
+        st.info("長期回収率基準により、極端な低配当・低期待値の保険券を除外しました。")
+        for note in result.get("low_odds_floor_notes", []):
+            st.caption(f"・{note}")
+
     if result.get("gami_prune_notes"):
         st.warning("深いガミ券・重複効率の低い券を最終総額ベースで除外しました。")
         for note in result.get("gami_prune_notes", []):
