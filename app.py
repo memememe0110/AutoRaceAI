@@ -25,8 +25,8 @@ import engine
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 
 
-# Ver224: 結果本文に欠車・発走除外・競走除外がある場合、
-# 結果DataFrameへ比較専用行を補い、予測時の出走数不一致で停止しないようにする。
+# Ver225: 欠車・発走前除外は「事故」ではなく事前除外として扱う。
+# 比較用の行は補うが、事故判定に使われる欄へ「欠車」等の語を残さない。
 def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFrame) -> tuple[dict, pd.DataFrame, list[int]]:
     if not isinstance(rows, pd.DataFrame) or rows.empty:
         return meta, rows, []
@@ -73,7 +73,7 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
             if mask is not None:
                 for col in ("事故", "異常", "異", "備考", "事故内容"):
                     if col in out.columns:
-                        out.loc[mask, col] = reason
+                        out.loc[mask, col] = "事前除外"
             continue
 
         row = {col: None for col in out.columns}
@@ -86,20 +86,23 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
                 row[col] = 0.0
         for col in ("事故", "異常", "異", "備考", "事故内容"):
             if col in row:
-                row[col] = reason
+                row[col] = "事前除外"
         # 事故欄が元DataFrameにない場合でも、engine側が参照できる共通列を追加する。
         if not any(col in out.columns for col in ("事故", "異常", "異", "備考", "事故内容")):
             out["事故"] = ""
-            row["事故"] = reason
+            row["事故"] = "事前除外"
         out = pd.concat([out, pd.DataFrame([row])], ignore_index=True)
         existing.add(car_no)
         added.append(car_no)
 
     meta_out = dict(meta or {})
-    if added:
-        meta_out["欠車車番"] = sorted(set(added))
-        meta_out["比較対象外車番"] = sorted(set(added))
-        meta_out["実出走数"] = int(len(out) - len(added))
+    detected_numbers = sorted({int(car_no) for car_no, _reason in detected})
+    if detected_numbers:
+        meta_out["事前除外車番"] = detected_numbers
+        meta_out["欠車車番"] = detected_numbers
+        meta_out["比較対象外車番"] = detected_numbers
+        meta_out["事前除外理由"] = {str(int(car_no)): str(reason) for car_no, reason in detected}
+        meta_out["実出走数"] = int(len(out) - len(detected_numbers))
         meta_out["予測照合用出走数"] = int(len(out))
     return meta_out, out, sorted(set(added))
 
@@ -190,7 +193,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 
 
 
-# Ver224: 欠車・発走除外の結果登録補正。
+# Ver225: 欠車・発走前除外を事故レースから分離。
 # Ver223: 結果登録後の解析表示をDBへ保存し、再描画・画面移動後も復元する。
 def _v223_ensure_result_view_table(db_path: str) -> None:
     with sqlite3.connect(db_path) as con:
@@ -271,7 +274,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver224｜欠車・発走除外を自動認識し、結果登録後も解析表示を保持")
+st.caption("Ver225｜欠車・発走前除外は事故レースにせず、実走車だけで結果を解析")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -5616,8 +5619,8 @@ if selected_main_page == "✅ 結果登録・解析":
         if nonstarter_numbers:
             cars_text = "・".join(f"{int(x)}番" for x in nonstarter_numbers)
             st.info(
-                f"{cars_text}の欠車・除外を検出しました。"
-                f" 予測時の車数には含め、実着順・学習・的中判定では比較対象外として扱います。"
+                f"{cars_text}の欠車・発走前除外を検出しました。"
+                f" 事故レースにはせず、実着順・学習・的中判定ではその車だけ比較対象外にします。"
             )
         st.subheader("着順・タイム")
         st.dataframe(rows_r, use_container_width=True, hide_index=True)
