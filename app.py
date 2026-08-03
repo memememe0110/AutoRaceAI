@@ -24,6 +24,85 @@ import engine
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 
+
+# Ver224: 結果本文に欠車・発走除外・競走除外がある場合、
+# 結果DataFrameへ比較専用行を補い、予測時の出走数不一致で停止しないようにする。
+def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFrame) -> tuple[dict, pd.DataFrame, list[int]]:
+    if not isinstance(rows, pd.DataFrame) or rows.empty:
+        return meta, rows, []
+
+    raw = str(result_text or "")
+    if not raw:
+        return meta, rows, []
+
+    # 公式結果では「- 4 選手名 ... /欠車」のように掲載される。
+    # 改行・タブ・全角空白の揺れを許容して、事故語の直前にある車番を拾う。
+    normalized = re.sub(r"[\t\u3000]+", " ", raw)
+    accident_words = r"欠車|発走除外|競走除外|出走取消|出走取り消し"
+    detected: list[tuple[int, str]] = []
+
+    # まず事故語を含む周辺ブロックから「着順 - の次にある車番」を優先取得。
+    block_pattern = re.compile(
+        rf"(?:^|\n)\s*-\s*(?:\n|\s)+([1-8])(?:\s|\n)+(.{{0,160}}?)(?:/\s*)?({accident_words})(?=\s|$)",
+        re.MULTILINE | re.DOTALL,
+    )
+    for m in block_pattern.finditer(normalized):
+        car_no = int(m.group(1))
+        reason = str(m.group(3))
+        detected.append((car_no, reason))
+
+    # 保存テキストの整形によって1行化されている場合の補助。
+    if not detected:
+        line_pattern = re.compile(rf"-\s*([1-8])\b[^\n]{{0,220}}?({accident_words})")
+        for m in line_pattern.finditer(normalized):
+            detected.append((int(m.group(1)), str(m.group(2))))
+
+    if not detected:
+        return meta, rows, []
+
+    existing = set()
+    if "車番" in rows.columns:
+        existing = set(pd.to_numeric(rows["車番"], errors="coerce").dropna().astype(int).tolist())
+
+    added: list[int] = []
+    out = rows.copy()
+    for car_no, reason in detected:
+        if car_no in existing:
+            # 既に行がある場合も事故欄だけ補完する。
+            mask = pd.to_numeric(out["車番"], errors="coerce") == car_no if "車番" in out.columns else None
+            if mask is not None:
+                for col in ("事故", "異常", "異", "備考", "事故内容"):
+                    if col in out.columns:
+                        out.loc[mask, col] = reason
+            continue
+
+        row = {col: None for col in out.columns}
+        if "車番" in row:
+            row["車番"] = car_no
+        if "着順" in row:
+            row["着順"] = 999
+        for col in ("試走T", "競走T", "ST"):
+            if col in row:
+                row[col] = 0.0
+        for col in ("事故", "異常", "異", "備考", "事故内容"):
+            if col in row:
+                row[col] = reason
+        # 事故欄が元DataFrameにない場合でも、engine側が参照できる共通列を追加する。
+        if not any(col in out.columns for col in ("事故", "異常", "異", "備考", "事故内容")):
+            out["事故"] = ""
+            row["事故"] = reason
+        out = pd.concat([out, pd.DataFrame([row])], ignore_index=True)
+        existing.add(car_no)
+        added.append(car_no)
+
+    meta_out = dict(meta or {})
+    if added:
+        meta_out["欠車車番"] = sorted(set(added))
+        meta_out["比較対象外車番"] = sorted(set(added))
+        meta_out["実出走数"] = int(len(out) - len(added))
+        meta_out["予測照合用出走数"] = int(len(out))
+    return meta_out, out, sorted(set(added))
+
 # Ver148: Streamlit fragment互換デコレーター
 # st.fragment が利用できる環境では部分再実行、未対応環境では通常関数として動作します。
 _v146_fragment = getattr(st, "fragment", lambda func: func)
@@ -109,6 +188,53 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
         return {}, "", ""
 
 
+
+
+# Ver224: 欠車・発走除外の結果登録補正。
+# Ver223: 結果登録後の解析表示をDBへ保存し、再描画・画面移動後も復元する。
+def _v223_ensure_result_view_table(db_path: str) -> None:
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v223_result_view_restore (
+                race_key TEXT PRIMARY KEY,
+                payload BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_v223_result_view_latest ON v223_result_view_restore(updated_at DESC)")
+        con.commit()
+
+
+def _v223_save_result_view(db_path: str, race_key: str, view: dict) -> None:
+    race_key = str(race_key or "").strip()
+    if not race_key or not isinstance(view, dict):
+        return
+    _v223_ensure_result_view_table(db_path)
+    payload = zlib.compress(pickle.dumps(view, protocol=pickle.HIGHEST_PROTOCOL), level=6)
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            INSERT INTO v223_result_view_restore (race_key,payload,created_at,updated_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(race_key) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at
+        """, (race_key, sqlite3.Binary(payload), now, now))
+        con.commit()
+
+
+def _v223_load_latest_result_view(db_path: str) -> dict:
+    try:
+        _v223_ensure_result_view_table(db_path)
+        with sqlite3.connect(db_path) as con:
+            row = con.execute("SELECT payload FROM v223_result_view_restore ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if not row:
+            return {}
+        view = pickle.loads(zlib.decompress(bytes(row[0])))
+        return view if isinstance(view, dict) else {}
+    except Exception:
+        return {}
+
+
 def _v217_deferred_prediction_db_save(meta, bets, trials, df) -> None:
     """全買い目確率・特徴量をバックグラウンド保存する。
 
@@ -145,7 +271,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver222｜保存済み予測・出走表・全オッズのワンクリック復元")
+st.caption("Ver224｜欠車・発走除外を自動認識し、結果登録後も解析表示を保持")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -5356,7 +5482,6 @@ if selected_main_page == "✅ 結果登録・解析":
             "v35_result_rows",
             "v35_result_laps",
             "v35_result_payouts",
-            "v41_last_result_view",
             "result_register_notice",
             "result_register_progress",
             "result_register_stage",
@@ -5424,6 +5549,10 @@ if selected_main_page == "✅ 結果登録・解析":
                 meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(
                     result_text, venue_override, race_no_override
                 )
+                meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(
+                    result_text, meta_r, rows_r
+                )
+                st.session_state["v224_nonstarter_numbers"] = nonstarter_numbers
                 st.session_state["v35_result_meta"] = meta_r
                 st.session_state["v35_result_rows"] = rows_r
                 st.session_state["v35_result_laps"] = laps_r
@@ -5483,6 +5612,13 @@ if selected_main_page == "✅ 結果登録・解析":
 
     elif isinstance(rows_r, pd.DataFrame) and not rows_r.empty:
         st.write("解析したレース情報", meta_r)
+        nonstarter_numbers = st.session_state.get("v224_nonstarter_numbers") or []
+        if nonstarter_numbers:
+            cars_text = "・".join(f"{int(x)}番" for x in nonstarter_numbers)
+            st.info(
+                f"{cars_text}の欠車・除外を検出しました。"
+                f" 予測時の車数には含め、実着順・学習・的中判定では比較対象外として扱います。"
+            )
         st.subheader("着順・タイム")
         st.dataframe(rows_r, use_container_width=True, hide_index=True)
 
@@ -5558,7 +5694,7 @@ if selected_main_page == "✅ 結果登録・解析":
                     if "message" not in analysis:
                         predicted_trifecta_saved = "→".join(map(str, comparison.sort_values("predicted_rank")["車番"].head(3).astype(int)))
                         actual_trifecta_saved = "→".join(map(str, rows_r.sort_values("着順")["車番"].head(3).astype(int)))
-                    st.session_state["v41_last_result_view"] = {
+                    result_view_payload = {
                         "key": key,
                         "comparison": comparison,
                         "analysis": analysis,
@@ -5567,6 +5703,11 @@ if selected_main_page == "✅ 結果登録・解析":
                         "actual_trifecta": actual_trifecta_saved,
                         "mixed_plan_result": mixed_plan_result,
                     }
+                    st.session_state["v41_last_result_view"] = result_view_payload
+                    try:
+                        _v223_save_result_view(engine.DB_PATH, key, result_view_payload)
+                    except Exception:
+                        pass
                     _v208_render_mixed_plan_result(mixed_plan_result)
                     if "message" in analysis:
                         st.warning(analysis["message"])
@@ -5648,8 +5789,13 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.exception(exc)
 
     last_result_view = st.session_state.get("v41_last_result_view")
+    if not last_result_view:
+        last_result_view = _v223_load_latest_result_view(engine.DB_PATH)
+        if last_result_view:
+            st.session_state["v41_last_result_view"] = last_result_view
     if last_result_view:
         st.divider()
+        st.caption("直前の結果解析を保持しています。結果入力をリセットしても消えません。")
         render_last_result_analysis(last_result_view)
 
 
