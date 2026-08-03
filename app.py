@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import pickle
 import re
+import zlib
 import sqlite3
 import time as time_module
 import threading
@@ -29,6 +31,82 @@ _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 # Ver217: 予測後の重いDB保存を待たず、オッズ入力を先に表示する。
 _v217_db_save_lock = threading.Lock()
+
+
+# Ver222: 一度実行した予測を、出走表・計算結果ごとDBへ保存して再利用する。
+def _v222_ensure_prediction_restore_table(db_path: str) -> None:
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v222_prediction_restore (
+                race_key TEXT PRIMARY KEY,
+                race_label TEXT NOT NULL,
+                raw_text TEXT NOT NULL,
+                venue_override TEXT,
+                payload BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_v222_prediction_restore_latest ON v222_prediction_restore(updated_at DESC)")
+        con.commit()
+
+
+def _v222_race_label(meta: dict, race_key: str) -> str:
+    meta = meta or {}
+    race_date = str(meta.get("開催日") or meta.get("日付") or "").strip()
+    venue = str(meta.get("開催場") or "").strip()
+    race_no = str(meta.get("R") or meta.get("レース") or meta.get("レース番号") or "").strip()
+    parts = [x for x in (race_date, venue, f"{race_no}R" if race_no and not race_no.endswith("R") else race_no) if x]
+    return " ".join(parts) if parts else str(race_key or "保存済み予測")
+
+
+def _v222_save_prediction_restore(db_path: str, race_key: str, raw_text: str, venue_override: str, view: dict) -> None:
+    race_key = str(race_key or "").strip()
+    if not race_key or not isinstance(view, dict):
+        return
+    _v222_ensure_prediction_restore_table(db_path)
+    payload = zlib.compress(pickle.dumps(view, protocol=pickle.HIGHEST_PROTOCOL), level=6)
+    now = datetime.now(timezone.utc).isoformat()
+    label = _v222_race_label(view.get("meta") or {}, race_key)
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            INSERT INTO v222_prediction_restore
+            (race_key,race_label,raw_text,venue_override,payload,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(race_key) DO UPDATE SET
+                race_label=excluded.race_label, raw_text=excluded.raw_text,
+                venue_override=excluded.venue_override, payload=excluded.payload,
+                updated_at=excluded.updated_at
+        """, (race_key, label, str(raw_text or ""), str(venue_override or ""), sqlite3.Binary(payload), now, now))
+        con.commit()
+
+
+def _v222_list_prediction_restores(db_path: str, limit: int = 60) -> list[dict]:
+    try:
+        _v222_ensure_prediction_restore_table(db_path)
+        with sqlite3.connect(db_path) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute("""
+                SELECT race_key,race_label,updated_at FROM v222_prediction_restore
+                ORDER BY updated_at DESC LIMIT ?
+            """, (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, str, str]:
+    try:
+        _v222_ensure_prediction_restore_table(db_path)
+        with sqlite3.connect(db_path) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute("SELECT * FROM v222_prediction_restore WHERE race_key=?", (str(race_key or ""),)).fetchone()
+        if not row:
+            return {}, "", ""
+        view = pickle.loads(zlib.decompress(bytes(row["payload"])))
+        return view if isinstance(view, dict) else {}, str(row["raw_text"] or ""), str(row["venue_override"] or "")
+    except Exception:
+        return {}, "", ""
 
 
 def _v217_deferred_prediction_db_save(meta, bets, trials, df) -> None:
@@ -67,7 +145,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver219｜HTMLオッズ読込修正・オッズ入力最速表示")
+st.caption("Ver222｜保存済み予測・出走表・全オッズのワンクリック復元")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -4631,6 +4709,37 @@ elif selected_main_page == "🏁 予測":
         else:
             st.caption("必要な時だけ読み込みます。")
         st.caption("Ver20では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
+    # Ver222: 一度予測したレースは、出走表の再貼付け・再シミュレーションなしで復元する。
+    saved_predictions = _v222_list_prediction_restores(engine.DB_PATH)
+    if saved_predictions:
+        st.markdown("### ♻️ 保存済みレースを復元")
+        restore_labels = []
+        restore_by_label = {}
+        for item in saved_predictions:
+            updated = str(item.get("updated_at") or "").replace("T", " ")[:19]
+            label = f"{item.get('race_label') or item.get('race_key')}｜保存 {updated}"
+            restore_labels.append(label)
+            restore_by_label[label] = item
+        rc1, rc2 = st.columns([3, 1])
+        with rc1:
+            restore_label = st.selectbox("保存済み予測", restore_labels, key="v222_prediction_restore_select", label_visibility="collapsed")
+        with rc2:
+            if st.button("復元", key="v222_prediction_restore_button", use_container_width=True):
+                target = restore_by_label.get(restore_label) or {}
+                restored_view, restored_text, restored_venue = _v222_load_prediction_restore(engine.DB_PATH, target.get("race_key", ""))
+                if restored_view:
+                    st.session_state["last_prediction_view"] = restored_view
+                    st.session_state["v163_saved_prediction_text"] = restored_text
+                    st.session_state["v163_saved_prediction_venue"] = restored_venue
+                    st.session_state["prediction_input_version"] = int(st.session_state.get("prediction_input_version", 0)) + 1
+                    st.session_state["v222_restore_notice"] = target.get("race_label") or "保存済みレース"
+                    st.rerun()
+                else:
+                    st.warning("保存済み予測を復元できませんでした。")
+        if st.session_state.pop("v222_restore_notice", None):
+            st.success("出走表・予測結果を復元しました。保存済みオッズも下で自動復元されます。")
+        st.caption("初回だけ出走表を貼り付けて予測すれば、次回からこの一覧で復元できます。")
+
     st.session_state.setdefault("prediction_input_version", 0)
     if st.button("🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input"):
         st.session_state["prediction_input_version"] += 1
@@ -4781,7 +4890,7 @@ elif selected_main_page == "🏁 予測":
             }
             # 重いDB全体診断は予測完了の必須経路から外し、詳細表示時に必要になった場合だけ取得する。
             # オッズ入力などによる再描画後も、直前の予測結果を保持する。
-            st.session_state["last_prediction_view"] = {
+            prediction_view = {
                 "df": df,
                 "bets": bets,
                 "output": output,
@@ -4796,7 +4905,16 @@ elif selected_main_page == "🏁 予測":
                 "day_trend": {},
                 "prediction_timing": prediction_timing,
             }
-            st.success("予測が完了しました")
+            st.session_state["last_prediction_view"] = prediction_view
+            # 復元に必要な出走表と計算済み結果を同期保存。次回は再シミュレーション不要。
+            try:
+                _v222_save_prediction_restore(
+                    engine.DB_PATH, race_key, text, prediction_venue_override, prediction_view
+                )
+                st.success("予測が完了しました。出走表と予測結果を復元用に保存しました。")
+            except Exception as save_exc:
+                st.success("予測が完了しました。")
+                st.warning(f"復元用保存だけ失敗しました: {type(save_exc).__name__}: {save_exc}")
             if prediction_timing:
                 st.caption(
                     f"処理時間：イベント計算 {prediction_timing['simulation']:.2f}秒 / "
