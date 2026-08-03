@@ -3222,6 +3222,44 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             gami_drop = float(before["low"] - after["low"])
             return_gain = float(after["model_return_rate"] - before["model_return_rate"])
 
+            # Ver220: 「ほかの券が何か当たる」だけではカバー扱いにしない。
+            # 券を外したことで、黒字→ガミ／黒字→外れ／的中→外れになる確率を
+            # 各シミュレーション着順の払戻額から直接計算する。
+            before_cost = len(selected) * 100.0
+            after_cost = len(trial_plan) * 100.0
+            black_to_gami = 0.0
+            black_to_miss = 0.0
+            hit_to_miss = 0.0
+            payout_loss_expected = 0.0
+            for i, (_, outcome_prob) in enumerate(outcomes):
+                before_payout = sum(
+                    float(t.get("odds", 0.0) or 0.0) * 100.0
+                    for t in selected if i in t.get("matched", set())
+                )
+                after_payout = sum(
+                    float(t.get("odds", 0.0) or 0.0) * 100.0
+                    for t in trial_plan if i in t.get("matched", set())
+                )
+                outcome_prob = float(outcome_prob)
+                payout_loss_expected += (outcome_prob / 100.0) * max(0.0, before_payout - after_payout)
+                if before_payout > 0 and after_payout <= 0:
+                    hit_to_miss += outcome_prob
+                if before_payout >= before_cost:
+                    if after_payout <= 0:
+                        black_to_miss += outcome_prob
+                    elif after_payout < after_cost:
+                        black_to_gami += outcome_prob
+
+            black_result_loss = black_to_gami + black_to_miss
+            is_trifecta = str(ticket.get("type", "")).replace("三", "3") == "3連単"
+            # 上位10点などの固定順位では守らない。実際に失う黒字結果・固有的中が
+            # 十分大きい券だけを、チーム貢献として保護する。
+            contribution_protected = is_trifecta and (
+                black_result_loss >= 0.75
+                or hit_to_miss >= 1.25
+                or (prob >= 2.0 and payout_ratio >= 1.0)
+            )
+
             deep_gami = payout_ratio < 0.70
             low_ev_overlap = unique_prob <= 6.0 and standalone_ev < 0.95
             pure_overlap = unique_prob <= 0.01 and standalone_ev < 0.75
@@ -3235,6 +3273,10 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 or total_gami_cleanup
             )
             if not removable:
+                continue
+
+            # 黒字結果や固有的中を実際に失う3連単は、平均回収率だけを理由に切らない。
+            if contribution_protected:
                 continue
 
             # 保護券は通常残す。ただし深いガミかつ低期待値で、追加範囲も小さい場合だけ解除する。
@@ -3260,7 +3302,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         ticket["protected"] = False
         gami_prune_notes.append(
             f"{ticket['type']} {ticket['combo']}（{float(ticket.get('odds',0)):.1f}倍）を除外。"
-            f"追加カバー{unique_prob:.2f}%・単体期待値{standalone_ev*100:.1f}%・"
+            f"固有的中{hit_to_miss:.2f}%・黒字→ガミ{black_to_gami:.2f}%・"
+            f"黒字→外れ{black_to_miss:.2f}%・単体期待値{standalone_ev*100:.1f}%・"
             f"参考回収率{before['model_return_rate']:.1f}%→{after['model_return_rate']:.1f}%・"
             f"ガミ率{before['low']:.2f}%→{after['low']:.2f}%"
         )
