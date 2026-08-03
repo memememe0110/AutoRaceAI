@@ -25,6 +25,7 @@ import engine
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 
 
+# Ver227: 発走前除外と発走後事故を分離。
 # Ver225: 欠車・発走前除外は「事故」ではなく事前除外として扱う。
 # 比較用の行は補うが、事故判定に使われる欄へ「欠車」等の語を残さない。
 def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFrame) -> tuple[dict, pd.DataFrame, list[int]]:
@@ -105,6 +106,41 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
         meta_out["実出走数"] = int(len(out) - len(detected_numbers))
         meta_out["予測照合用出走数"] = int(len(out))
     return meta_out, out, sorted(set(added))
+
+# Ver227: 発走後の事故・反則は、結果と回収率だけ保存し、予測精度・AI学習から除外する。
+def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict, list[dict]]:
+    raw = str(result_text or "")
+    if not raw:
+        return dict(meta or {}), []
+    normalized = re.sub(r"[\t\u3000]+", " ", raw)
+    words = r"反妨|反則妨害|妨害失格|反則失格|落車|競走中止|周回誤認|周誤|失格"
+    found: list[dict] = []
+    # 公式結果の「- 6 選手名 ... /反妨」形式を優先。
+    pat = re.compile(
+        rf"(?:^|\n)\s*-?\s*(?:\n|\s)+([1-8])(?:\s|\n)+(.{{0,180}}?)(?:/\s*)?({words})(?=\s|$)",
+        re.MULTILINE | re.DOTALL,
+    )
+    for m in pat.finditer(normalized):
+        found.append({"車番": int(m.group(1)), "理由": str(m.group(3))})
+    if not found:
+        line_pat = re.compile(rf"(?:^|\n)\s*-?\s*([1-8])\b[^\n]{{0,240}}?({words})", re.MULTILINE)
+        for m in line_pat.finditer(normalized):
+            found.append({"車番": int(m.group(1)), "理由": str(m.group(2))})
+    unique=[]
+    seen=set()
+    for item in found:
+        key=(int(item["車番"]), str(item["理由"]))
+        if key not in seen:
+            seen.add(key); unique.append(item)
+    meta_out=dict(meta or {})
+    if unique:
+        meta_out["発走後事故"] = True
+        meta_out["発走後事故車番"] = sorted({int(x["車番"]) for x in unique})
+        meta_out["発走後事故理由"] = {str(int(x["車番"])): str(x["理由"]) for x in unique}
+        meta_out["予測精度評価対象"] = False
+        meta_out["AI学習対象"] = False
+    return meta_out, unique
+
 
 # Ver148: Streamlit fragment互換デコレーター
 # st.fragment が利用できる環境では部分再実行、未対応環境では通常関数として動作します。
@@ -274,7 +310,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver225｜欠車・発走前除外は事故レースにせず、実走車だけで結果を解析")
+st.caption("Ver227｜欠車は通常解析、発走後の事故・反則は予測精度・AI学習対象外")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -4551,6 +4587,8 @@ def _v215_render_return_dashboard(db_path: str) -> None:
     st.markdown("### 月別")
     st.dataframe(_v215_aggregate_return(filtered, ["month"]).sort_values("month", ascending=False), use_container_width=True, hide_index=True)
 
+    _v226_render_prediction_condition_analysis(db_path)
+
     with st.expander("レース別の明細", expanded=False):
         detail = filtered.copy()
         detail["日付"] = detail["race_date"].dt.strftime("%Y-%m-%d")
@@ -4561,6 +4599,144 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             "payout_yen":"払戻額","return_rate":"回収率","app_version":"バージョン","grade":"元判定",
         })
         st.dataframe(detail.sort_values(["日付","開催場","R"], ascending=[False,True,True]), use_container_width=True, hide_index=True)
+
+
+def _v226_prediction_condition_rows(db_path: str) -> pd.DataFrame:
+    """開催場・ハンデ構成別に予測順位の実績を集計するためのレース単位データ。"""
+    query = """
+        WITH finish_info AS (
+            SELECT race_key,
+                   MAX(CASE WHEN finish=1 THEN car_no END) AS winner,
+                   COUNT(CASE WHEN finish IS NOT NULL THEN 1 END) AS starter_count,
+                   COUNT(DISTINCT CASE WHEN finish IS NOT NULL THEN CAST(handicap AS TEXT) END) AS handicap_kinds,
+                   MIN(CASE WHEN finish IS NOT NULL THEN CAST(handicap AS REAL) END) AS min_handicap,
+                   MAX(CASE WHEN finish IS NOT NULL THEN CAST(handicap AS REAL) END) AS max_handicap
+            FROM result_entries
+            GROUP BY race_key
+        ),
+        pred AS (
+            SELECT race_key,
+                   MAX(CASE WHEN predicted_rank=1 THEN car_no END) AS predicted_winner
+            FROM prediction_snapshots
+            GROUP BY race_key
+        ),
+        feedback AS (
+            SELECT race_key,
+                   MAX(CASE WHEN bet_type='3連単' THEN predicted_rank END) AS trifecta_rank,
+                   MAX(CASE WHEN bet_type='3連複' THEN predicted_rank END) AS trio_rank,
+                   MAX(CASE WHEN bet_type='2連単' THEN predicted_rank END) AS exacta_rank,
+                   MAX(CASE WHEN bet_type='2連複' THEN predicted_rank END) AS quinella_rank
+            FROM v67_ticket_feedback
+            GROUP BY race_key
+        )
+        SELECT rr.race_key, rr.race_date, rr.venue, rr.race_no, rr.surface, rr.track_temp,
+               f.winner, f.starter_count, f.handicap_kinds, f.min_handicap, f.max_handicap,
+               p.predicted_winner, fb.trifecta_rank, fb.trio_rank, fb.exacta_rank, fb.quinella_rank
+        FROM result_races rr
+        JOIN finish_info f ON f.race_key=rr.race_key
+        LEFT JOIN pred p ON p.race_key=rr.race_key
+        LEFT JOIN feedback fb ON fb.race_key=rr.race_key
+        WHERE COALESCE(rr.model_eligible,1)=1
+    """
+    try:
+        with sqlite3.connect(db_path) as con:
+            df = pd.read_sql_query(query, con)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
+    df["勝者1位的中"] = (pd.to_numeric(df["winner"], errors="coerce") == pd.to_numeric(df["predicted_winner"], errors="coerce")).astype(int)
+    df["ハンデ構成"] = df.apply(
+        lambda r: "同ハンデ" if int(r.get("handicap_kinds") or 0) == 1 else "ハンデ差あり", axis=1
+    )
+    df["ハンデ幅"] = pd.to_numeric(df["max_handicap"], errors="coerce") - pd.to_numeric(df["min_handicap"], errors="coerce")
+    df["日付×開催場"] = df["race_date"].dt.strftime("%Y-%m-%d") + " " + df["venue"].fillna("").astype(str)
+    return df
+
+
+def _v226_prediction_condition_summary(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    def pct_le(series, n):
+        s = pd.to_numeric(series, errors="coerce").dropna()
+        return float((s <= n).mean() * 100.0) if len(s) else pd.NA
+    out = df.groupby(group_cols, dropna=False).agg(
+        races=("race_key", "count"),
+        winner_top1=("勝者1位的中", lambda s: float(pd.to_numeric(s, errors="coerce").fillna(0).mean() * 100.0)),
+        trifecta_avg=("trifecta_rank", lambda s: float(pd.to_numeric(s, errors="coerce").dropna().mean()) if len(pd.to_numeric(s, errors="coerce").dropna()) else pd.NA),
+        trifecta_top10=("trifecta_rank", lambda s: pct_le(s, 10)),
+        trifecta_top20=("trifecta_rank", lambda s: pct_le(s, 20)),
+        trio_top10=("trio_rank", lambda s: pct_le(s, 10)),
+        exacta_top10=("exacta_rank", lambda s: pct_le(s, 10)),
+    ).reset_index()
+    return out.rename(columns={
+        "races":"レース数", "winner_top1":"勝者1位的中率", "trifecta_avg":"3連単平均順位",
+        "trifecta_top10":"3連単10位内率", "trifecta_top20":"3連単20位内率",
+        "trio_top10":"3連複10位内率", "exacta_top10":"2連単10位内率",
+    })
+
+
+def _v226_render_prediction_condition_analysis(db_path: str) -> None:
+    st.markdown("### 🧭 開催場・ハンデ構成別の予測成績")
+    st.caption("回収率だけでなく、勝者の1位予測率と実結果買い目の予測順位を比較します。件数が少ない区分は参考値です。")
+    df = _v226_prediction_condition_rows(db_path)
+    if df.empty:
+        st.info("開催場・ハンデ構成別に集計できる予測結果がありません。")
+        return
+
+    max_date = df["race_date"].max()
+    recent_days = st.selectbox("分析期間", ["全期間", "直近7日", "直近30日"], key="v226_condition_period")
+    view = df.copy()
+    if pd.notna(max_date) and recent_days != "全期間":
+        days = 7 if recent_days == "直近7日" else 30
+        view = view[view["race_date"] >= max_date - pd.Timedelta(days=days-1)]
+    if view.empty:
+        st.warning("選択期間に該当する結果がありません。")
+        return
+
+    st.markdown("#### 開催場別")
+    venue = _v226_prediction_condition_summary(view, ["venue"])
+    if not venue.empty:
+        venue = venue.rename(columns={"venue":"開催場"}).sort_values(["3連単20位内率","勝者1位的中率"], ascending=False)
+        st.dataframe(venue, use_container_width=True, hide_index=True, column_config={
+            "勝者1位的中率": st.column_config.NumberColumn(format="%.1f%%"),
+            "3連単平均順位": st.column_config.NumberColumn(format="%.1f位"),
+            "3連単10位内率": st.column_config.NumberColumn(format="%.1f%%"),
+            "3連単20位内率": st.column_config.NumberColumn(format="%.1f%%"),
+            "3連複10位内率": st.column_config.NumberColumn(format="%.1f%%"),
+            "2連単10位内率": st.column_config.NumberColumn(format="%.1f%%"),
+        })
+
+    st.markdown("#### ハンデ構成別")
+    handicap = _v226_prediction_condition_summary(view, ["ハンデ構成"])
+    if not handicap.empty:
+        st.dataframe(handicap, use_container_width=True, hide_index=True, column_config={
+            "勝者1位的中率": st.column_config.NumberColumn(format="%.1f%%"),
+            "3連単平均順位": st.column_config.NumberColumn(format="%.1f位"),
+            "3連単10位内率": st.column_config.NumberColumn(format="%.1f%%"),
+            "3連単20位内率": st.column_config.NumberColumn(format="%.1f%%"),
+            "3連複10位内率": st.column_config.NumberColumn(format="%.1f%%"),
+            "2連単10位内率": st.column_config.NumberColumn(format="%.1f%%"),
+        })
+
+    st.markdown("#### 日付 × 開催場")
+    day_venue = _v226_prediction_condition_summary(view, ["日付×開催場"])
+    if not day_venue.empty:
+        st.dataframe(day_venue.sort_values("日付×開催場", ascending=False), use_container_width=True, hide_index=True, column_config={
+            "勝者1位的中率": st.column_config.NumberColumn(format="%.1f%%"),
+            "3連単平均順位": st.column_config.NumberColumn(format="%.1f位"),
+            "3連単10位内率": st.column_config.NumberColumn(format="%.1f%%"),
+            "3連単20位内率": st.column_config.NumberColumn(format="%.1f%%"),
+            "3連複10位内率": st.column_config.NumberColumn(format="%.1f%%"),
+            "2連単10位内率": st.column_config.NumberColumn(format="%.1f%%"),
+        })
+
+    with st.expander("レース別の予測順位を確認", expanded=False):
+        detail = view[["race_date","venue","race_no","ハンデ構成","winner","predicted_winner","trifecta_rank","trio_rank","exacta_rank","quinella_rank"]].copy()
+        detail["日付"] = detail["race_date"].dt.strftime("%Y-%m-%d")
+        detail = detail.rename(columns={"venue":"開催場","race_no":"R","winner":"実勝者","predicted_winner":"予測1位","trifecta_rank":"3連単順位","trio_rank":"3連複順位","exacta_rank":"2連単順位","quinella_rank":"2連複順位"})
+        st.dataframe(detail[["日付","開催場","R","ハンデ構成","実勝者","予測1位","3連単順位","3連複順位","2連単順位","2連複順位"]].sort_values(["日付","開催場","R"], ascending=[False,True,True]), use_container_width=True, hide_index=True)
 
 def github_config() -> dict:
     return {
@@ -5555,7 +5731,9 @@ if selected_main_page == "✅ 結果登録・解析":
                 meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(
                     result_text, meta_r, rows_r
                 )
+                meta_r, poststart_incidents = _v227_detect_poststart_incidents(result_text, meta_r)
                 st.session_state["v224_nonstarter_numbers"] = nonstarter_numbers
+                st.session_state["v227_poststart_incidents"] = poststart_incidents
                 st.session_state["v35_result_meta"] = meta_r
                 st.session_state["v35_result_rows"] = rows_r
                 st.session_state["v35_result_laps"] = laps_r
@@ -5616,11 +5794,19 @@ if selected_main_page == "✅ 結果登録・解析":
     elif isinstance(rows_r, pd.DataFrame) and not rows_r.empty:
         st.write("解析したレース情報", meta_r)
         nonstarter_numbers = st.session_state.get("v224_nonstarter_numbers") or []
+        poststart_incidents = st.session_state.get("v227_poststart_incidents") or []
         if nonstarter_numbers:
             cars_text = "・".join(f"{int(x)}番" for x in nonstarter_numbers)
             st.info(
                 f"{cars_text}の欠車・発走前除外を検出しました。"
                 f" 事故レースにはせず、実着順・学習・的中判定ではその車だけ比較対象外にします。"
+            )
+        if poststart_incidents:
+            detail = " / ".join(f"{int(x.get('車番'))}番 {x.get('理由')}" for x in poststart_incidents)
+            st.warning(
+                f"発走後の事故・反則を検出しました：{detail}。"
+                "このレースは予測精度評価・選手履歴学習・展開学習・重み更新の対象外です。"
+                "結果、払戻金、実際の回収率判定は保存します。"
             )
         st.subheader("着順・タイム")
         st.dataframe(rows_r, use_container_width=True, hide_index=True)
@@ -5705,6 +5891,8 @@ if selected_main_page == "✅ 結果登録・解析":
                         "predicted_trifecta": predicted_trifecta_saved,
                         "actual_trifecta": actual_trifecta_saved,
                         "mixed_plan_result": mixed_plan_result,
+                        "learning_excluded": bool(registration.get("learning_excluded")),
+                        "learning_exclusion_reason": registration.get("learning_exclusion_reason"),
                     }
                     st.session_state["v41_last_result_view"] = result_view_payload
                     try:
@@ -5712,7 +5900,12 @@ if selected_main_page == "✅ 結果登録・解析":
                     except Exception:
                         pass
                     _v208_render_mixed_plan_result(mixed_plan_result)
-                    if "message" in analysis:
+                    if registration.get("learning_excluded"):
+                        st.info(
+                            "このレースの予測順位誤差・TOP3一致・三連単完全一致は成績集計へ加えません。"
+                            "発走後の出来事で着順が変わった可能性があるためです。"
+                        )
+                    elif "message" in analysis:
                         st.warning(analysis["message"])
                     else:
                         a, b, c = st.columns(3)
@@ -5730,7 +5923,7 @@ if selected_main_page == "✅ 結果登録・解析":
                         st.info("展開解析｜" + " / ".join(lap_items))
 
                     # 三連単は上位3車の順番が完全一致した場合だけ的中。
-                    if "message" not in analysis:
+                    if not registration.get("learning_excluded") and "message" not in analysis:
                         pred_trifecta = "→".join(map(str, comparison.sort_values("predicted_rank")["車番"].head(3).astype(int)))
                         actual_trifecta = "→".join(map(str, rows_r.sort_values("着順")["車番"].head(3).astype(int)))
                         exact_hit = pred_trifecta == actual_trifecta
@@ -5764,6 +5957,8 @@ if selected_main_page == "✅ 結果登録・解析":
                         st.info(adjustment.get("message","重みは変更していません。"))
 
                     st.subheader("選手履歴の更新結果")
+                    if registration.get("learning_excluded"):
+                        st.caption("発走後事故レースのため、選手履歴・展開・重みは更新していません。")
                     h1, h2, h3 = st.columns(3)
                     h1.metric("新規履歴", analysis.get("履歴追加", 0))
                     h2.metric("重複スキップ", analysis.get("履歴重複スキップ", 0))
@@ -6727,3 +6922,5 @@ if selected_main_page == "🗃️ 登録情報確認":
 # Ver217: シミュレーション後は最小スナップショットだけ同期保存し、全買い目・特徴量保存をバックグラウンド化。
 
 # Ver221: 4券種全オッズの時刻別DB保存・最新自動復元・履歴選択復元
+
+# Ver226: 開催場別・ハンデ構成別・日付開催場別の予測成績分析を回収率実績画面へ追加。
