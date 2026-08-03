@@ -300,6 +300,11 @@ def _v230_matchup_map(names: list[str]) -> dict[tuple[str,str], tuple[float,floa
     return result
 
 
+def _v230_num(value, default=0.0) -> float:
+    """Ver230用の安全な数値変換。既存Ver229実装を再利用する。"""
+    return _v229_num(value, default)
+
+
 def _v230_col_num(row, keys, default=0.0):
     for k in keys:
         try:
