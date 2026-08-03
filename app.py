@@ -1866,11 +1866,157 @@ def v218_store_parsed_odds(namespace: str, parsed: dict) -> int:
     return total
 
 
-def v202_quick_bulk_odds_input(namespace: str) -> None:
+# Ver221: 読み込んだ4券種の全オッズを時刻別スナップショットとして保存し、再入力なしで復元する。
+def _v221_ensure_odds_tables(db_path: str) -> None:
+    with sqlite3.connect(db_path) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS v221_odds_runs (
+            race_key TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            source TEXT,
+            created_at TEXT NOT NULL,
+            count_3tan INTEGER NOT NULL DEFAULT 0,
+            count_3fuku INTEGER NOT NULL DEFAULT 0,
+            count_2tansho INTEGER NOT NULL DEFAULT 0,
+            count_2fuku INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (race_key, snapshot_id)
+        );
+        CREATE TABLE IF NOT EXISTS v221_odds_values (
+            race_key TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            bet_key TEXT NOT NULL,
+            combination TEXT NOT NULL,
+            odds REAL NOT NULL,
+            PRIMARY KEY (race_key, snapshot_id, bet_key, combination)
+        );
+        CREATE INDEX IF NOT EXISTS idx_v221_odds_runs_latest
+          ON v221_odds_runs(race_key, created_at DESC);
+        """)
+        con.commit()
+
+
+def _v221_save_all_odds(db_path: str, race_key: str, parsed: dict, source: str) -> str:
+    """4券種の全オッズを重複排除しつつ履歴保存する。"""
+    race_key = str(race_key or '').strip()
+    if not race_key:
+        return ''
+    clean = {}
+    for bet_key in ('3tan', '3fuku', '2tansho', '2fuku'):
+        values = parsed.get(bet_key, {}) or {}
+        clean[bet_key] = {str(k): float(v) for k, v in values.items() if v is not None and float(v) > 0}
+    if sum(len(v) for v in clean.values()) <= 0:
+        return ''
+    payload = [(bk, combo, round(odd, 4)) for bk in clean for combo, odd in sorted(clean[bk].items())]
+    snapshot_id = hashlib.sha1(json.dumps(payload, ensure_ascii=False).encode('utf-8')).hexdigest()[:20]
+    now = datetime.now(timezone.utc).isoformat()
+    _v221_ensure_odds_tables(db_path)
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            INSERT OR IGNORE INTO v221_odds_runs
+            (race_key,snapshot_id,source,created_at,count_3tan,count_3fuku,count_2tansho,count_2fuku)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (race_key, snapshot_id, str(source or ''), now,
+              len(clean['3tan']), len(clean['3fuku']), len(clean['2tansho']), len(clean['2fuku'])))
+        exists = con.execute(
+            'SELECT 1 FROM v221_odds_values WHERE race_key=? AND snapshot_id=? LIMIT 1',
+            (race_key, snapshot_id),
+        ).fetchone()
+        if not exists:
+            rows = [(race_key, snapshot_id, bk, combo, odd)
+                    for bk, vals in clean.items() for combo, odd in vals.items()]
+            con.executemany("""
+                INSERT OR REPLACE INTO v221_odds_values
+                (race_key,snapshot_id,bet_key,combination,odds) VALUES (?,?,?,?,?)
+            """, rows)
+        con.commit()
+    return snapshot_id
+
+
+def _v221_load_odds_snapshot(db_path: str, race_key: str, snapshot_id: str = '') -> tuple[dict, dict]:
+    empty = {'3tan': {}, '3fuku': {}, '2tansho': {}, '2fuku': {}}
+    race_key = str(race_key or '').strip()
+    if not race_key:
+        return empty, {}
+    try:
+        _v221_ensure_odds_tables(db_path)
+        with sqlite3.connect(db_path) as con:
+            con.row_factory = sqlite3.Row
+            if snapshot_id:
+                run = con.execute(
+                    'SELECT * FROM v221_odds_runs WHERE race_key=? AND snapshot_id=?',
+                    (race_key, snapshot_id),
+                ).fetchone()
+            else:
+                run = con.execute(
+                    'SELECT * FROM v221_odds_runs WHERE race_key=? ORDER BY created_at DESC LIMIT 1',
+                    (race_key,),
+                ).fetchone()
+            if not run:
+                return empty, {}
+            rows = con.execute("""
+                SELECT bet_key, combination, odds FROM v221_odds_values
+                WHERE race_key=? AND snapshot_id=?
+            """, (race_key, run['snapshot_id'])).fetchall()
+        parsed = {k: {} for k in empty}
+        for row in rows:
+            if row['bet_key'] in parsed:
+                parsed[row['bet_key']][str(row['combination'])] = float(row['odds'])
+        return parsed, dict(run)
+    except Exception:
+        return empty, {}
+
+
+def _v221_list_odds_snapshots(db_path: str, race_key: str, limit: int = 8) -> list[dict]:
+    try:
+        _v221_ensure_odds_tables(db_path)
+        with sqlite3.connect(db_path) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute("""
+                SELECT * FROM v221_odds_runs WHERE race_key=?
+                ORDER BY created_at DESC LIMIT ?
+            """, (str(race_key or ''), int(limit))).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
     """重い診断より先に、HTMLまたは公式4券種表からオッズを読み込む。"""
     st.markdown('<div id="quick-odds-input"></div>', unsafe_allow_html=True)
     st.subheader("オッズ一括入力")
-    st.caption("AutoRace.JPの保存HTMLなら、3連単・3連複・2連単・2連複の全オッズを自動入力できます。")
+    st.caption("AutoRace.JPの保存HTMLなら、3連単・3連複・2連単・2連複の全オッズを自動入力できます。読み込んだ全オッズはDBへ保存されます。")
+
+    # セッションにオッズがない場合は、このレースの最新保存分を自動復元する。
+    odds_store_keys = [f"saved_odds_{namespace}_{k}" for k in ('3tan','3fuku','2tansho','2fuku')]
+    has_session_odds = any(bool(st.session_state.get(k)) for k in odds_store_keys)
+    if race_key and not has_session_odds:
+        restored, run = _v221_load_odds_snapshot(engine.DB_PATH, race_key)
+        if sum(len(v) for v in restored.values()) > 0:
+            v218_store_parsed_odds(namespace, restored)
+            st.session_state[f"v221_restored_snapshot_{namespace}"] = run.get('snapshot_id', '')
+            has_session_odds = True
+
+    snapshots = _v221_list_odds_snapshots(engine.DB_PATH, race_key) if race_key else []
+    if has_session_odds and st.session_state.get(f"v221_restored_snapshot_{namespace}"):
+        st.success("保存済みの全オッズを自動復元しました。再入力は不要です。")
+    if len(snapshots) > 1:
+        labels = []
+        by_label = {}
+        for run in snapshots:
+            created = str(run.get('created_at','')).replace('T',' ')[:19]
+            label = f"{created} / {run.get('source') or '保存オッズ'} / {run.get('count_3tan',0)+run.get('count_3fuku',0)+run.get('count_2tansho',0)+run.get('count_2fuku',0)}件"
+            labels.append(label); by_label[label] = run
+        c_restore, c_button = st.columns([3,1])
+        with c_restore:
+            selected_label = st.selectbox("保存済みオッズ履歴", labels, key=f"v221_odds_history_{namespace}")
+        with c_button:
+            st.write('')
+            if st.button("復元", key=f"v221_restore_odds_{namespace}", use_container_width=True):
+                run = by_label[selected_label]
+                restored, _ = _v221_load_odds_snapshot(engine.DB_PATH, race_key, run.get('snapshot_id',''))
+                v218_store_parsed_odds(namespace, restored)
+                st.session_state[f"v221_restored_snapshot_{namespace}"] = run.get('snapshot_id','')
+                st.rerun()
 
     html_file = st.file_uploader(
         "AutoRace.JPのオッズHTML／テキストファイル",
@@ -1899,8 +2045,10 @@ def v202_quick_bulk_odds_input(namespace: str) -> None:
         if total <= 0:
             st.error("HTMLからオッズを読み取れませんでした。オッズ表が表示された状態で保存したHTMLを使用してください。")
         else:
+            if race_key:
+                _v221_save_all_odds(engine.DB_PATH, race_key, parsed, f"HTML/TXT:{getattr(html_file, 'name', '') or '貼付'}")
             st.success(
-                f"HTML読込完了：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
+                f"HTML読込完了・DB保存済み：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
                 f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
             )
             st.rerun()
@@ -1919,8 +2067,10 @@ def v202_quick_bulk_odds_input(namespace: str) -> None:
         if total <= 0:
             st.error("オッズを読み取れませんでした。タブ区切りの表をそのまま貼り付けてください。")
         else:
+            if race_key:
+                _v221_save_all_odds(engine.DB_PATH, race_key, parsed, "人気表貼付")
             st.success(
-                f"読込完了：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
+                f"読込完了・DB保存済み：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
                 f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
             )
             st.rerun()
@@ -2529,7 +2679,7 @@ def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict) -> str:
             float(result.get("cover", 0)), float(result.get("black", 0)), float(result.get("low", 0)),
             float(result.get("hit_average_multiple", 0)), float(result.get("model_expected_multiple", 0)),
             float(result.get("model_return_rate", 0)), len(result.get("grouped", {})), now,
-            "Ver215", "return_plan_v215", meta.get("race_date"), meta.get("venue"), meta.get("race_no"), starter_count,
+            "Ver221", "return_plan_v221", meta.get("race_date"), meta.get("venue"), meta.get("race_no"), starter_count,
         ))
         con.execute("DELETE FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?", (str(race_key), plan_hash))
         for t in result.get("tickets", []):
@@ -4684,7 +4834,7 @@ elif selected_main_page == "🏁 予測":
             day_trend = view.get("day_trend") or {}
             odds_namespace = re.sub(r"[^0-9A-Za-z_-]+", "_", str(race_key))[-80:] or "current"
             # Ver207: DB全体診断や詳細表より先に、オッズ入力と回収率重視の買い目を最優先表示する。
-            v202_quick_bulk_odds_input(odds_namespace)
+            v202_quick_bulk_odds_input(odds_namespace, race_key=race_key)
             fast_odds_maps = {
                 "3tan": st.session_state.get(f"saved_odds_{odds_namespace}_3tan", {}),
                 "3fuku": st.session_state.get(f"saved_odds_{odds_namespace}_3fuku", {}),
@@ -6308,3 +6458,5 @@ if selected_main_page == "🗃️ 登録情報確認":
 # Ver216: 回収率実績に非推奨除外・推奨のみ・非推奨のみ比較を追加
 
 # Ver217: シミュレーション後は最小スナップショットだけ同期保存し、全買い目・特徴量保存をバックグラウンド化。
+
+# Ver221: 4券種全オッズの時刻別DB保存・最新自動復元・履歴選択復元
