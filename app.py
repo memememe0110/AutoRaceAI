@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import time as time_module
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +25,25 @@ st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁",
 # Ver148: Streamlit fragment互換デコレーター
 # st.fragment が利用できる環境では部分再実行、未対応環境では通常関数として動作します。
 _v146_fragment = getattr(st, "fragment", lambda func: func)
+
+
+# Ver217: 予測後の重いDB保存を待たず、オッズ入力を先に表示する。
+_v217_db_save_lock = threading.Lock()
+
+
+def _v217_deferred_prediction_db_save(meta, bets, trials, df) -> None:
+    """全買い目確率・特徴量をバックグラウンド保存する。
+
+    予測スナップショットは呼び出し元で先に保存済み。SQLiteの同時書込を避けるため
+    この処理内は単一ロックで直列化する。
+    """
+    try:
+        with _v217_db_save_lock:
+            engine.v67_save_ticket_snapshot(meta, bets, int(trials), engine.DB_PATH)
+            engine.v40_save_prediction_features(meta, df, engine.DB_PATH)
+    except Exception:
+        # 表示を止めないことを最優先。次回予測・結果分析で再保存できる。
+        return
 
 
 # Ver164: 全開催場条件別補正と中止・全返還形式対応。
@@ -47,7 +67,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver214｜保険券を関連する高期待値3連単へ置換比較・単独ガミ除外後に再最適化")
+st.caption("Ver218｜HTMLオッズ自動読込・オッズ入力最速表示")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1642,28 +1662,187 @@ def v182_parse_four_block_odds(text: str) -> dict:
 
 
 
+
+def v218_parse_autorace_odds_html(text: str) -> dict:
+    """AutoRace.JPの保存済みオッズHTMLから4券種の全オッズを読み取る。"""
+    result = {"3tan": {}, "3fuku": {}, "2tansho": {}, "2fuku": {}}
+    raw = str(text or "")
+    if "live-odds-rt3-container" not in raw and "live-odds-pop-container" not in raw:
+        return result
+
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        return result
+
+    soup = BeautifulSoup(raw, "html.parser")
+
+    def _number(value):
+        match = re.fullmatch(r"\s*(\d+)\s*", str(value or ""))
+        return match.group(1) if match else None
+
+    def _odd(value):
+        try:
+            parsed = float(str(value or "").replace(",", "").strip())
+            return parsed if parsed > 0 else None
+        except Exception:
+            return None
+
+    def _parse_three(container_id: str, ordered: bool) -> dict:
+        values = {}
+        container = soup.find(id=container_id)
+        if container is None:
+            return values
+        for block in container.select("[data-odds-rt3-tables-axis]"):
+            axis = _number(block.get("data-odds-rt3-tables-axis"))
+            if not axis:
+                continue
+            for table in block.find_all("table"):
+                rows = table.find_all("tr")
+                if not rows:
+                    continue
+                headers = []
+                for cell in rows[0].find_all("td"):
+                    if "live-oddsTable__name" in (cell.get("class") or []):
+                        continue
+                    candidate = _number(cell.get_text(" ", strip=True))
+                    if candidate:
+                        headers.append(candidate)
+                if not headers:
+                    continue
+                for row in rows[1:]:
+                    cells = row.find_all("td")
+                    pairs = []
+                    for index in range(0, len(cells) - 1, 2):
+                        third = _number(cells[index].get_text(" ", strip=True))
+                        price = _odd(cells[index + 1].get_text(" ", strip=True))
+                        pairs.append((third, price))
+                    for second, (third, price) in zip(headers, pairs):
+                        if not third or not price or len({axis, second, third}) != 3:
+                            continue
+                        combo = (axis, second, third)
+                        if not ordered:
+                            combo = tuple(sorted(combo, key=int))
+                        values["-".join(combo)] = price
+        return values
+
+    def _parse_two(container_id: str, ordered: bool) -> dict:
+        values = {}
+        container = soup.find(id=container_id)
+        if container is None:
+            return values
+        tables = [
+            table for table in container.find_all("table")
+            if "liveTable-Info" not in (table.get("class") or [])
+        ]
+        for table in tables:
+            rows = table.find_all("tr")
+            if not rows:
+                continue
+            headers = []
+            for cell in rows[0].find_all("td"):
+                candidate = _number(cell.get_text(" ", strip=True))
+                if candidate:
+                    headers.append(candidate)
+            if not headers:
+                continue
+            for row in rows[1:]:
+                cells = row.find_all("td")
+                pairs = []
+                for index in range(0, len(cells) - 1, 2):
+                    opponent = _number(cells[index].get_text(" ", strip=True))
+                    price = _odd(cells[index + 1].get_text(" ", strip=True))
+                    pairs.append((opponent, price))
+                for first, (second, price) in zip(headers, pairs):
+                    if not second or not price or first == second:
+                        continue
+                    combo = (first, second)
+                    if not ordered:
+                        combo = tuple(sorted(combo, key=int))
+                    values["-".join(combo)] = price
+        return values
+
+    result["3tan"] = _parse_three("live-odds-rt3-container", True)
+    result["3fuku"] = _parse_three("live-odds-rf3-container", False)
+    result["2tansho"] = _parse_two("live-odds-rt2-container", True)
+    result["2fuku"] = _parse_two("live-odds-rf2-container", False)
+
+    # 人気表しか含まれない簡易HTMLにも対応する。
+    if sum(len(values) for values in result.values()) == 0:
+        popular = soup.select_one("#live-odds-pop-container table.liveTable-ninki")
+        if popular is not None:
+            lines = ["3連単人気\t\t\t\t3連複人気\t\t\t\t2連単人気\t\t\t2連複人気"]
+            for row in popular.select("tbody tr"):
+                cols = [cell.get_text(" ", strip=True) for cell in row.find_all("td")]
+                if cols:
+                    lines.append("\t".join(cols))
+            result = v182_parse_four_block_odds("\n".join(lines))
+    return result
+
+
+def v218_store_parsed_odds(namespace: str, parsed: dict) -> int:
+    total = sum(len(values) for values in parsed.values())
+    if total > 0:
+        for parsed_key, values in parsed.items():
+            st.session_state[f"saved_odds_{namespace}_{parsed_key}"] = values
+    return total
+
+
 def v202_quick_bulk_odds_input(namespace: str) -> None:
-    """重い診断より先に、公式4券種オッズの貼り付け欄だけを表示する。"""
+    """重い診断より先に、HTMLまたは公式4券種表からオッズを読み込む。"""
     st.markdown('<div id="quick-odds-input"></div>', unsafe_allow_html=True)
     st.subheader("オッズ一括入力")
-    st.caption("予測結果の詳細診断を待たず、先に公式4券種表を読み込めます。")
+    st.caption("AutoRace.JPの保存HTMLなら、3連単・3連複・2連単・2連複の全オッズを自動入力できます。")
+
+    html_file = st.file_uploader(
+        "AutoRace.JPのオッズHTML／テキストファイル",
+        type=["html", "htm", "txt"],
+        key=f"v218_odds_html_file_{namespace}",
+        help="ブラウザで保存したHTML、またはページ内容を保存したテキストを選択してください。",
+    )
+    html_paste_key = f"v218_odds_html_text_{namespace}"
+    with st.expander("HTMLを直接貼り付ける"):
+        html_paste = st.text_area(
+            "HTMLソース",
+            key=html_paste_key,
+            height=140,
+            placeholder="AutoRace.JPのオッズページHTMLを貼り付け",
+        )
+
+    if st.button("HTMLから4券種の全オッズを読み込む", key=f"v218_load_html_odds_{namespace}", use_container_width=True):
+        source = str(html_paste or "")
+        if html_file is not None:
+            try:
+                source = html_file.getvalue().decode("utf-8", errors="replace")
+            except Exception:
+                source = ""
+        parsed = v218_parse_autorace_odds_html(source)
+        total = v218_store_parsed_odds(namespace, parsed)
+        if total <= 0:
+            st.error("HTMLからオッズを読み取れませんでした。オッズ表が表示された状態で保存したHTMLを使用してください。")
+        else:
+            st.success(
+                f"HTML読込完了：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
+                f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
+            )
+            st.rerun()
+
+    st.markdown("##### 表をコピーして読み込む場合")
     bulk_key = f"bulk_odds_text_{namespace}"
     bulk_text = st.text_area(
         "3連単人気・3連複人気・2連単人気・2連複人気の表",
         key=bulk_key,
-        height=180,
+        height=140,
         placeholder="公式オッズ表を見出しからそのまま貼り付け",
     )
-    if st.button("4券種のオッズを読み込む", key=f"load_bulk_odds_{namespace}", use_container_width=True):
+    if st.button("人気表の4券種オッズを読み込む", key=f"load_bulk_odds_{namespace}", use_container_width=True):
         parsed = v182_parse_four_block_odds(bulk_text)
-        total = sum(len(v) for v in parsed.values())
+        total = v218_store_parsed_odds(namespace, parsed)
         if total <= 0:
             st.error("オッズを読み取れませんでした。タブ区切りの表をそのまま貼り付けてください。")
         else:
-            for parsed_key, values in parsed.items():
-                st.session_state[f"saved_odds_{namespace}_{parsed_key}"] = values
             st.success(
-                f"読込完了：三連単{len(parsed['3tan'])}件、三連複{len(parsed['3fuku'])}件、"
+                f"読込完了：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
                 f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
             )
             st.rerun()
@@ -4311,16 +4490,24 @@ elif selected_main_page == "🏁 予測":
                 finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
                 df = engine.v196_apply_probability_aligned_ranks(df, finish_prob)
                 _t2 = time_module.perf_counter()
-                race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
-                engine.v67_save_ticket_snapshot(meta, bets, int(trials), engine.DB_PATH)
-                engine.v40_save_prediction_features(meta, df, engine.DB_PATH)
-                _t3 = time_module.perf_counter()
-                prediction_timing = {
-                    "simulation": _t1 - _t0,
-                    "aggregation": _t2 - _t1,
-                    "db_save": _t3 - _t2,
-                    "total": _t3 - _t0,
-                }
+            # オッズ欄の表示に必要なレースキーだけ同期保存。
+            _t_save0 = time_module.perf_counter()
+            race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
+            _t_save1 = time_module.perf_counter()
+            # 全買い目確率と特徴量は待たずにバックグラウンド保存する。
+            threading.Thread(
+                target=_v217_deferred_prediction_db_save,
+                args=(meta, bets, int(trials), df),
+                daemon=True,
+                name="autorace-deferred-db-save",
+            ).start()
+            prediction_timing = {
+                "simulation": _t1 - _t0,
+                "aggregation": _t2 - _t1,
+                "db_save": _t_save1 - _t_save0,
+                "deferred_db_save": True,
+                "total": _t_save1 - _t0,
+            }
             # 重いDB全体診断は予測完了の必須経路から外し、詳細表示時に必要になった場合だけ取得する。
             # オッズ入力などによる再描画後も、直前の予測結果を保持する。
             st.session_state["last_prediction_view"] = {
@@ -4343,7 +4530,7 @@ elif selected_main_page == "🏁 予測":
                 st.caption(
                     f"処理時間：イベント計算 {prediction_timing['simulation']:.2f}秒 / "
                     f"確率集計 {prediction_timing['aggregation']:.2f}秒 / "
-                    f"DB保存 {prediction_timing['db_save']:.2f}秒 / 合計 {prediction_timing['total']:.2f}秒"
+                    f"最小DB保存 {prediction_timing['db_save']:.2f}秒 / 表示まで {prediction_timing['total']:.2f}秒"
                 )
         except Exception as exc:
             st.error(f"予測エラー: {type(exc).__name__}: {exc}")
@@ -4359,7 +4546,7 @@ elif selected_main_page == "🏁 予測":
             st.caption(
                 f"前回処理時間：イベント計算 {float(timing.get('simulation',0)):.2f}秒 / "
                 f"確率集計 {float(timing.get('aggregation',0)):.2f}秒 / "
-                f"DB保存 {float(timing.get('db_save',0)):.2f}秒"
+                f"最小DB保存 {float(timing.get('db_save',0)):.2f}秒（詳細保存はバックグラウンド）"
             )
         try:
             df = view["df"]
@@ -5998,3 +6185,5 @@ if selected_main_page == "🗃️ 登録情報確認":
 
 
 # Ver216: 回収率実績に非推奨除外・推奨のみ・非推奨のみ比較を追加
+
+# Ver217: シミュレーション後は最小スナップショットだけ同期保存し、全買い目・特徴量保存をバックグラウンド化。
