@@ -25,6 +25,27 @@ import engine
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 
 
+# Ver228: DB保存時刻・画面表示時刻を日本時間へ統一。
+_V228_JST = ZoneInfo("Asia/Tokyo")
+
+def _v228_now_jst_iso() -> str:
+    return datetime.now(_V228_JST).isoformat(timespec="seconds")
+
+def _v228_format_saved_time(value) -> str:
+    """新規のJST時刻と、旧版のUTC時刻を日本時間表示へそろえる。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        # 旧DBのタイムゾーンなし値は、従来の保存仕様に合わせてUTCとして扱う。
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_V228_JST).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return text.replace("T", " ")[:19]
+
+
 # Ver227: 発走前除外と発走後事故を分離。
 # Ver225: 欠車・発走前除外は「事故」ではなく事前除外として扱う。
 # 比較用の行は補うが、事故判定に使われる欄へ「欠車」等の語を残さない。
@@ -134,11 +155,30 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
             seen.add(key); unique.append(item)
     meta_out=dict(meta or {})
     if unique:
-        meta_out["発走後事故"] = True
-        meta_out["発走後事故車番"] = sorted({int(x["車番"]) for x in unique})
-        meta_out["発走後事故理由"] = {str(int(x["車番"])): str(x["理由"]) for x in unique}
-        meta_out["予測精度評価対象"] = False
-        meta_out["AI学習対象"] = False
+        reasons = {str(int(x["車番"])): str(x["理由"]) for x in unique}
+        reason_text = " / ".join(f"{k}番 {v}" for k, v in reasons.items())
+        # engineの旧版・新版で参照名が異なっても、学習側へ流れないよう共通ゲートを多重指定する。
+        meta_out.update({
+            "発走後事故": True,
+            "発走後事故車番": sorted({int(x["車番"]) for x in unique}),
+            "発走後事故理由": reasons,
+            "事故レース": True,
+            "事故あり": True,
+            "レース状態": "発走後事故",
+            "予測精度評価対象": False,
+            "予測精度評価対象外": True,
+            "AI学習対象": False,
+            "学習対象外": True,
+            "学習除外": True,
+            "選手履歴学習対象": False,
+            "展開学習対象": False,
+            "追い抜き相性学習対象": False,
+            "開催場補正学習対象": False,
+            "壁補正学習対象": False,
+            "重み更新対象": False,
+            "learning_excluded": True,
+            "learning_exclusion_reason": reason_text or "発走後事故・反則",
+        })
     return meta_out, unique
 
 
@@ -184,7 +224,7 @@ def _v222_save_prediction_restore(db_path: str, race_key: str, raw_text: str, ve
         return
     _v222_ensure_prediction_restore_table(db_path)
     payload = zlib.compress(pickle.dumps(view, protocol=pickle.HIGHEST_PROTOCOL), level=6)
-    now = datetime.now(timezone.utc).isoformat()
+    now = _v228_now_jst_iso()
     label = _v222_race_label(view.get("meta") or {}, race_key)
     with sqlite3.connect(db_path) as con:
         con.execute("""
@@ -251,7 +291,7 @@ def _v223_save_result_view(db_path: str, race_key: str, view: dict) -> None:
         return
     _v223_ensure_result_view_table(db_path)
     payload = zlib.compress(pickle.dumps(view, protocol=pickle.HIGHEST_PROTOCOL), level=6)
-    now = datetime.now(timezone.utc).isoformat()
+    now = _v228_now_jst_iso()
     with sqlite3.connect(db_path) as con:
         con.execute("""
             INSERT INTO v223_result_view_restore (race_key,payload,created_at,updated_at)
@@ -310,7 +350,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver227｜欠車は通常解析、発走後の事故・反則は予測精度・AI学習対象外")
+st.caption("Ver228｜保存時刻を日本時間へ統一・発走後事故は全学習と補正更新を共通ゲートで遮断")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -2151,7 +2191,7 @@ def _v221_save_all_odds(db_path: str, race_key: str, parsed: dict, source: str) 
         return ''
     payload = [(bk, combo, round(odd, 4)) for bk in clean for combo, odd in sorted(clean[bk].items())]
     snapshot_id = hashlib.sha1(json.dumps(payload, ensure_ascii=False).encode('utf-8')).hexdigest()[:20]
-    now = datetime.now(timezone.utc).isoformat()
+    now = _v228_now_jst_iso()
     _v221_ensure_odds_tables(db_path)
     with sqlite3.connect(db_path) as con:
         con.execute("""
@@ -2246,7 +2286,7 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
         labels = []
         by_label = {}
         for run in snapshots:
-            created = str(run.get('created_at','')).replace('T',' ')[:19]
+            created = _v228_format_saved_time(run.get('created_at',''))
             label = f"{created} / {run.get('source') or '保存オッズ'} / {run.get('count_3tan',0)+run.get('count_3fuku',0)+run.get('count_2tansho',0)+run.get('count_2fuku',0)}件"
             labels.append(label); by_label[label] = run
         c_restore, c_button = st.columns([3,1])
@@ -2680,7 +2720,7 @@ def _v187_sync_mixed_feedback(db_path: str) -> int:
                 (race_key,plan_hash,hit,black_hit,gami_hit,payout_yen,cost_yen,realized_multiple,return_rate,winning_types,evaluated_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """, (plan["race_key"],plan["plan_hash"],hit,black,gami,total_payout,cost,multiple,multiple*100.0,
-                    json.dumps(sorted(set(winning_types)), ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+                    json.dumps(sorted(set(winning_types)), ensure_ascii=False), _v228_now_jst_iso()))
             done += 1
         con.commit()
     return done
@@ -2733,7 +2773,7 @@ def _v212_recalculate_plan_feedback(db_path: str, race_key: str, plan_hash: str)
             (race_key,plan_hash,hit,black_hit,gami_hit,payout_yen,cost_yen,realized_multiple,return_rate,winning_types,evaluated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (race_key, plan_hash, hit, black, gami, total_payout, cost, multiple, multiple * 100.0,
-                json.dumps(sorted(set(winning_types)), ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+                json.dumps(sorted(set(winning_types)), ensure_ascii=False), _v228_now_jst_iso()))
         con.commit()
 
 
@@ -2903,7 +2943,7 @@ def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict) -> str:
         for t in result.get("tickets", [])
     ]
     plan_hash = hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-    now = datetime.now(timezone.utc).isoformat()
+    now = _v228_now_jst_iso()
     meta = _v215_race_meta_from_key(str(race_key), db_path)
     starter_count = result.get("starter_count")
     try:
@@ -5021,7 +5061,7 @@ elif selected_main_page == "🏁 予測":
         restore_labels = []
         restore_by_label = {}
         for item in saved_predictions:
-            updated = str(item.get("updated_at") or "").replace("T", " ")[:19]
+            updated = _v228_format_saved_time(item.get("updated_at"))
             label = f"{item.get('race_label') or item.get('race_key')}｜保存 {updated}"
             restore_labels.append(label)
             restore_by_label[label] = item
@@ -5849,6 +5889,10 @@ if selected_main_page == "✅ 結果登録・解析":
         button_disabled = bool(result_exists and not replace_registered)
         if st.button(button_label, type="primary", use_container_width=True, disabled=button_disabled):
             try:
+                # 解析後のsession_state復元や再登録でも、発走後事故の学習遮断フラグを再適用する。
+                meta_r, poststart_incidents = _v227_detect_poststart_incidents(result_text, dict(meta_r or {}))
+                st.session_state["v35_result_meta"] = meta_r
+                st.session_state["v227_poststart_incidents"] = poststart_incidents
                 with st.spinner("① SQLiteへ保存 → ② 予測差・展開を解析しています…"):
                     if replace_registered:
                         key, comparison, analysis, adjustment, registration = engine.v70_replace_registered_result(
@@ -5871,11 +5915,16 @@ if selected_main_page == "✅ 結果登録・解析":
                         result_message = f"結果を登録しました: {key}"
                     _set_sticky_notice("result_register_notice", "success", result_message)
                     st.success(result_message)
-                    if registration.get("learning_excluded"):
+                    if registration.get("learning_excluded") or meta_r.get("学習対象外"):
+                        exclusion_reason = registration.get('learning_exclusion_reason') or meta_r.get('learning_exclusion_reason') or '事故・異常終了'
                         st.warning(
-                            "⚠️ 事故レースのためAI学習対象外です。"
-                            f" 理由: {registration.get('learning_exclusion_reason') or '事故・異常終了'}。"
-                            "結果・払戻金・グランドノートは保存しましたが、選手履歴学習・展開学習・重み更新には使いません。"
+                            "⚠️ 発走後事故のためAI学習対象外です。"
+                            f" 理由: {exclusion_reason}。"
+                            "結果・払戻金・グランドノートだけ保存し、選手履歴・展開・追い抜き相性・開催場・壁補正・重み更新には使いません。"
+                        )
+                        st.info(
+                            "学習監査｜選手履歴: 停止 / 展開・追い抜き: 停止 / "
+                            "開催場・壁補正: 停止 / 重み更新: 停止"
                         )
                     show_v67_result_analysis(ticket_analysis)
                     predicted_trifecta_saved = ""
@@ -5891,8 +5940,15 @@ if selected_main_page == "✅ 結果登録・解析":
                         "predicted_trifecta": predicted_trifecta_saved,
                         "actual_trifecta": actual_trifecta_saved,
                         "mixed_plan_result": mixed_plan_result,
-                        "learning_excluded": bool(registration.get("learning_excluded")),
-                        "learning_exclusion_reason": registration.get("learning_exclusion_reason"),
+                        "learning_excluded": bool(registration.get("learning_excluded") or meta_r.get("学習対象外")),
+                        "learning_exclusion_reason": registration.get("learning_exclusion_reason") or meta_r.get("learning_exclusion_reason"),
+                        "learning_audit": {
+                            "選手履歴": "停止" if meta_r.get("学習対象外") else "実行",
+                            "展開・追い抜き": "停止" if meta_r.get("学習対象外") else "実行",
+                            "開催場・壁補正": "停止" if meta_r.get("学習対象外") else "実行",
+                            "重み更新": "停止" if meta_r.get("学習対象外") else "実行",
+                            "保存時刻": _v228_now_jst_iso(),
+                        },
                     }
                     st.session_state["v41_last_result_view"] = result_view_payload
                     try:
@@ -5900,7 +5956,7 @@ if selected_main_page == "✅ 結果登録・解析":
                     except Exception:
                         pass
                     _v208_render_mixed_plan_result(mixed_plan_result)
-                    if registration.get("learning_excluded"):
+                    if registration.get("learning_excluded") or meta_r.get("学習対象外"):
                         st.info(
                             "このレースの予測順位誤差・TOP3一致・三連単完全一致は成績集計へ加えません。"
                             "発走後の出来事で着順が変わった可能性があるためです。"
@@ -5923,7 +5979,7 @@ if selected_main_page == "✅ 結果登録・解析":
                         st.info("展開解析｜" + " / ".join(lap_items))
 
                     # 三連単は上位3車の順番が完全一致した場合だけ的中。
-                    if not registration.get("learning_excluded") and "message" not in analysis:
+                    if not (registration.get("learning_excluded") or meta_r.get("学習対象外")) and "message" not in analysis:
                         pred_trifecta = "→".join(map(str, comparison.sort_values("predicted_rank")["車番"].head(3).astype(int)))
                         actual_trifecta = "→".join(map(str, rows_r.sort_values("着順")["車番"].head(3).astype(int)))
                         exact_hit = pred_trifecta == actual_trifecta
@@ -5957,7 +6013,7 @@ if selected_main_page == "✅ 結果登録・解析":
                         st.info(adjustment.get("message","重みは変更していません。"))
 
                     st.subheader("選手履歴の更新結果")
-                    if registration.get("learning_excluded"):
+                    if registration.get("learning_excluded") or meta_r.get("学習対象外"):
                         st.caption("発走後事故レースのため、選手履歴・展開・重みは更新していません。")
                     h1, h2, h3 = st.columns(3)
                     h1.metric("新規履歴", analysis.get("履歴追加", 0))
