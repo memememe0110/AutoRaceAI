@@ -67,7 +67,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver218｜HTMLオッズ自動読込・オッズ入力最速表示")
+st.caption("Ver219｜HTMLオッズ読込修正・オッズ入力最速表示")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -1664,97 +1664,131 @@ def v182_parse_four_block_odds(text: str) -> dict:
 
 
 def v218_parse_autorace_odds_html(text: str) -> dict:
-    """AutoRace.JPの保存済みオッズHTMLから4券種の全オッズを読み取る。"""
+    """AutoRace.JPの保存済みオッズHTMLから4券種の全オッズを読み取る。
+
+    BeautifulSoupに依存せず、標準ライブラリだけで保存HTMLを解析する。
+    AutoRace.JPの実ページで使われる、軸ごとに2表へ分割された形式にも対応。
+    """
+    from html.parser import HTMLParser
+
     result = {"3tan": {}, "3fuku": {}, "2tansho": {}, "2fuku": {}}
     raw = str(text or "")
-    if "live-odds-rt3-container" not in raw and "live-odds-pop-container" not in raw:
+    target_ids = {
+        "live-odds-rt3-container",
+        "live-odds-rf3-container",
+        "live-odds-rt2-container",
+        "live-odds-rf2-container",
+        "live-odds-pop-container",
+    }
+    if not any(target_id in raw for target_id in target_ids):
         return result
 
+    class _OddsHTMLParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.current_target = None
+            self.div_target_stack = []
+            self.tables = {target_id: [] for target_id in target_ids}
+            self.current_table = None
+            self.current_row = None
+            self.current_cell = None
+
+        @staticmethod
+        def _attrs(attrs):
+            return {str(k): str(v or "") for k, v in attrs}
+
+        def handle_starttag(self, tag, attrs):
+            attrs_dict = self._attrs(attrs)
+            if tag == "div":
+                self.div_target_stack.append(self.current_target)
+                element_id = attrs_dict.get("id", "")
+                if element_id in target_ids:
+                    self.current_target = element_id
+            if self.current_target is None:
+                return
+            if tag == "table":
+                self.current_table = {
+                    "attrs": attrs_dict,
+                    "classes": set(attrs_dict.get("class", "").split()),
+                    "rows": [],
+                }
+            elif tag == "tr" and self.current_table is not None:
+                self.current_row = []
+            elif tag in {"td", "th"} and self.current_row is not None:
+                self.current_cell = {
+                    "attrs": attrs_dict,
+                    "classes": set(attrs_dict.get("class", "").split()),
+                    "text": [],
+                }
+
+        def handle_data(self, data):
+            if self.current_cell is not None:
+                self.current_cell["text"].append(data)
+
+        def handle_endtag(self, tag):
+            if tag in {"td", "th"} and self.current_cell is not None:
+                self.current_cell["text"] = " ".join(
+                    " ".join(self.current_cell["text"]).split()
+                )
+                if self.current_row is not None:
+                    self.current_row.append(self.current_cell)
+                self.current_cell = None
+            elif tag == "tr" and self.current_row is not None:
+                if self.current_table is not None and self.current_row:
+                    self.current_table["rows"].append(self.current_row)
+                self.current_row = None
+            elif tag == "table" and self.current_table is not None:
+                if self.current_target in self.tables:
+                    self.tables[self.current_target].append(self.current_table)
+                self.current_table = None
+            if tag == "div" and self.div_target_stack:
+                self.current_target = self.div_target_stack.pop()
+
+    parser = _OddsHTMLParser()
     try:
-        from bs4 import BeautifulSoup
+        parser.feed(raw)
+        parser.close()
     except Exception:
         return result
 
-    soup = BeautifulSoup(raw, "html.parser")
-
     def _number(value):
-        match = re.fullmatch(r"\s*(\d+)\s*", str(value or ""))
+        match = re.search(r"(?:^|\s)([1-8])(?:\s|$)", str(value or ""))
         return match.group(1) if match else None
 
     def _odd(value):
+        value = str(value or "").replace(",", "").strip()
+        if not value or value in {"-", "―", "発売なし"}:
+            return None
         try:
-            parsed = float(str(value or "").replace(",", "").strip())
+            parsed = float(value)
             return parsed if parsed > 0 else None
         except Exception:
             return None
 
-    def _parse_three(container_id: str, ordered: bool) -> dict:
-        values = {}
-        container = soup.find(id=container_id)
-        if container is None:
-            return values
-        for block in container.select("[data-odds-rt3-tables-axis]"):
-            axis = _number(block.get("data-odds-rt3-tables-axis"))
-            if not axis:
-                continue
-            for table in block.find_all("table"):
-                rows = table.find_all("tr")
-                if not rows:
-                    continue
-                headers = []
-                for cell in rows[0].find_all("td"):
-                    if "live-oddsTable__name" in (cell.get("class") or []):
-                        continue
-                    candidate = _number(cell.get_text(" ", strip=True))
-                    if candidate:
-                        headers.append(candidate)
-                if not headers:
-                    continue
-                for row in rows[1:]:
-                    cells = row.find_all("td")
-                    pairs = []
-                    for index in range(0, len(cells) - 1, 2):
-                        third = _number(cells[index].get_text(" ", strip=True))
-                        price = _odd(cells[index + 1].get_text(" ", strip=True))
-                        pairs.append((third, price))
-                    for second, (third, price) in zip(headers, pairs):
-                        if not third or not price or len({axis, second, third}) != 3:
-                            continue
-                        combo = (axis, second, third)
-                        if not ordered:
-                            combo = tuple(sorted(combo, key=int))
-                        values["-".join(combo)] = price
-        return values
+    def _usable_tables(container_id: str):
+        return [
+            table for table in parser.tables.get(container_id, [])
+            if "liveTable-Info" not in table.get("classes", set())
+            and table.get("rows")
+        ]
 
     def _parse_two(container_id: str, ordered: bool) -> dict:
         values = {}
-        container = soup.find(id=container_id)
-        if container is None:
-            return values
-        tables = [
-            table for table in container.find_all("table")
-            if "liveTable-Info" not in (table.get("class") or [])
-        ]
-        for table in tables:
-            rows = table.find_all("tr")
-            if not rows:
-                continue
-            headers = []
-            for cell in rows[0].find_all("td"):
-                candidate = _number(cell.get_text(" ", strip=True))
-                if candidate:
-                    headers.append(candidate)
+        for table in _usable_tables(container_id):
+            rows = table["rows"]
+            headers = [_number(cell["text"]) for cell in rows[0]]
+            headers = [value for value in headers if value]
             if not headers:
                 continue
             for row in rows[1:]:
-                cells = row.find_all("td")
-                pairs = []
-                for index in range(0, len(cells) - 1, 2):
-                    opponent = _number(cells[index].get_text(" ", strip=True))
-                    price = _odd(cells[index + 1].get_text(" ", strip=True))
-                    pairs.append((opponent, price))
-                for first, (second, price) in zip(headers, pairs):
-                    if not second or not price or first == second:
+                cells = row
+                for column_index, first in enumerate(headers):
+                    base = column_index * 2
+                    if base + 1 >= len(cells):
+                        continue
+                    second = _number(cells[base]["text"])
+                    price = _odd(cells[base + 1]["text"])
+                    if not second or price is None or first == second:
                         continue
                     combo = (first, second)
                     if not ordered:
@@ -1762,23 +1796,67 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
                     values["-".join(combo)] = price
         return values
 
+    def _parse_three(container_id: str, ordered: bool) -> dict:
+        values = {}
+        tables = _usable_tables(container_id)
+        # 1着軸（3連複では基準車）ごとに、1～4号車側と5～8号車側の2表で構成される。
+        for pair_start in range(0, len(tables), 2):
+            pair = tables[pair_start:pair_start + 2]
+            axis = None
+            for table in pair:
+                first_row = table["rows"][0]
+                for cell in first_row:
+                    if "live-oddsTable__name" in cell.get("classes", set()):
+                        axis = _number(cell["text"])
+                        break
+                if axis:
+                    break
+            if not axis:
+                continue
+
+            for table in pair:
+                rows = table["rows"]
+                first_row = rows[0]
+                header_cells = [
+                    cell for cell in first_row
+                    if "live-oddsTable__name" not in cell.get("classes", set())
+                ]
+                headers = [_number(cell["text"]) for cell in header_cells]
+                headers = [value for value in headers if value]
+                if not headers:
+                    continue
+                for row in rows[1:]:
+                    cells = row
+                    for column_index, second in enumerate(headers):
+                        base = column_index * 2
+                        if base + 1 >= len(cells):
+                            continue
+                        third = _number(cells[base]["text"])
+                        price = _odd(cells[base + 1]["text"])
+                        if not third or price is None or len({axis, second, third}) != 3:
+                            continue
+                        combo = (axis, second, third)
+                        if not ordered:
+                            combo = tuple(sorted(combo, key=int))
+                        values["-".join(combo)] = price
+        return values
+
     result["3tan"] = _parse_three("live-odds-rt3-container", True)
     result["3fuku"] = _parse_three("live-odds-rf3-container", False)
     result["2tansho"] = _parse_two("live-odds-rt2-container", True)
     result["2fuku"] = _parse_two("live-odds-rf2-container", False)
 
-    # 人気表しか含まれない簡易HTMLにも対応する。
+    # 人気表だけが保存された簡易HTMLにも対応する。
     if sum(len(values) for values in result.values()) == 0:
-        popular = soup.select_one("#live-odds-pop-container table.liveTable-ninki")
-        if popular is not None:
+        popular_tables = _usable_tables("live-odds-pop-container")
+        if popular_tables:
             lines = ["3連単人気\t\t\t\t3連複人気\t\t\t\t2連単人気\t\t\t2連複人気"]
-            for row in popular.select("tbody tr"):
-                cols = [cell.get_text(" ", strip=True) for cell in row.find_all("td")]
+            for row in popular_tables[0]["rows"]:
+                cols = [cell["text"] for cell in row]
                 if cols:
                     lines.append("\t".join(cols))
             result = v182_parse_four_block_odds("\n".join(lines))
     return result
-
 
 def v218_store_parsed_odds(namespace: str, parsed: dict) -> int:
     total = sum(len(values) for values in parsed.values())
