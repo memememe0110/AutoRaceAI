@@ -17,6 +17,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -49,6 +50,413 @@ def _v228_format_saved_time(value) -> str:
 # Ver227: 発走前除外と発走後事故を分離。
 # Ver225: 欠車・発走前除外は「事故」ではなく事前除外として扱う。
 # 比較用の行は補うが、事故判定に使われる欄へ「欠車」等の語を残さない。
+
+
+# Ver229: 壁で詰まる時間と前残りを、イベントシミュレーション後の着順分布へ再配分する。
+# Ver230: 6周内蔵型ベータ。過去周回結果と直接対戦履歴を事前学習して各試行へ反映。
+# engine.pyを差し替えずに使えるよう、三連単カウントを穏やかに補正し、他券種も整合再集計する。
+def _v229_num(value, default=0.0) -> float:
+    try:
+        n = float(value)
+        return n if pd.notna(n) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _v229_wall_profile(df: pd.DataFrame, entries: pd.DataFrame) -> dict[int, dict]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {}
+    work = df.copy()
+    car_col = "車" if "車" in work.columns else ("車番" if "車番" in work.columns else None)
+    if not car_col:
+        return {}
+    work["_car"] = pd.to_numeric(work[car_col], errors="coerce")
+    work = work.dropna(subset=["_car"]).copy()
+    work["_car"] = work["_car"].astype(int)
+
+    entry_map = {}
+    if isinstance(entries, pd.DataFrame) and not entries.empty:
+        ec = "車番" if "車番" in entries.columns else ("車" if "車" in entries.columns else None)
+        if ec:
+            for _, r in entries.iterrows():
+                try:
+                    entry_map[int(r[ec])] = r
+                except Exception:
+                    pass
+
+    handicaps = {}
+    for _, r in work.iterrows():
+        car = int(r["_car"])
+        er = entry_map.get(car)
+        h = None
+        for source in (r, er):
+            if source is None:
+                continue
+            for key in ("ハンデ", "H", "handicap"):
+                if key in source.index:
+                    m = re.search(r"-?\d+", str(source.get(key, "")))
+                    if m:
+                        h = int(m.group())
+                        break
+            if h is not None:
+                break
+        handicaps[car] = int(h or 0)
+
+    cars = sorted(handicaps, key=lambda c: (handicaps[c], c))
+    if not cars:
+        return {}
+    min_h, max_h = min(handicaps.values()), max(handicaps.values())
+    spread = max(10.0, float(max_h - min_h))
+    same_counts = {c: sum(1 for x in cars if handicaps[x] == handicaps[c]) for c in cars}
+
+    raw_break = {}
+    for _, r in work.iterrows():
+        car = int(r["_car"])
+        vals = []
+        for key in ("混戦突破適性", "展開適性点", "実戦能力点", "スタート伸び指数"):
+            if key in r.index:
+                vals.append(_v229_num(r.get(key), 0.0))
+        raw_break[car] = sum(vals) / len(vals) if vals else 0.0
+    if raw_break:
+        lo, hi = min(raw_break.values()), max(raw_break.values())
+    else:
+        lo = hi = 0.0
+
+    profile = {}
+    for pos, car in enumerate(cars):
+        h = handicaps[car]
+        same_ahead = sum(1 for x in cars[:pos] if handicaps[x] == h)
+        lower_ahead = sum(1 for x in cars[:pos] if handicaps[x] < h)
+        density = max(0, same_counts[car] - 1) / max(1, len(cars) - 1)
+        # 同ハンデの外枠、前ハンデ車の多さを壁リスクへ。上限を抑え、極端な改変を避ける。
+        wall_risk = min(1.0, 0.16 * same_ahead + 0.085 * lower_ahead + 0.34 * density)
+        bnorm = 0.5 if hi <= lo else (raw_break.get(car, lo) - lo) / (hi - lo)
+        breakthrough = min(1.0, max(0.0, 0.25 + 0.75 * bnorm))
+        frontness = 1.0 - (h - min_h) / spread
+        inner_same = 1.0 - same_ahead / max(1, same_counts[car] - 1) if same_counts[car] > 1 else 0.5
+        escape = max(0.0, min(1.0, 0.62 * frontness + 0.38 * inner_same))
+        effective_loss = wall_risk * (1.0 - 0.68 * breakthrough)
+        profile[car] = {
+            "handicap": h, "wall_risk": wall_risk, "breakthrough": breakthrough,
+            "escape": escape, "effective_loss": effective_loss, "initial_pos": pos + 1,
+        }
+    return profile
+
+
+def _v229_apply_wall_distribution(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, trials: int):
+    if not isinstance(bets, dict) or not isinstance(bets.get("三連単"), dict) or not bets.get("三連単"):
+        return df, bets, {"enabled": False, "reason": "三連単分布なし"}
+    profile = _v229_wall_profile(df, entries)
+    if len(profile) < 3:
+        return df, bets, {"enabled": False, "reason": "壁判定データ不足"}
+
+    tri = bets["三連単"]
+    weighted = {}
+    for combo, count in tri.items():
+        try:
+            a, b, c = map(int, combo)
+            pa, pb, pc = profile[a], profile[b], profile[c]
+        except Exception:
+            weighted[combo] = float(count)
+            continue
+        # 先頭候補は逃げやすさを加点。後方候補は壁ロスを減点。
+        # ただし捌き力が高い選手は減点を大幅に緩和する。
+        factor = 1.0
+        factor *= 1.0 + 0.16 * pa["escape"] - 0.12 * pa["effective_loss"]
+        factor *= 1.0 - 0.11 * pb["effective_loss"]
+        factor *= 1.0 - 0.07 * pc["effective_loss"]
+        # 前ハンデ車が上位に残る自然な展開を少し優遇。
+        if pa["handicap"] < pb["handicap"]:
+            factor *= 1.045
+        if pb["handicap"] <= pc["handicap"]:
+            factor *= 1.015
+        factor = max(0.76, min(1.24, factor))
+        weighted[(a, b, c)] = max(0.0, float(count) * factor)
+
+    total_w = sum(weighted.values())
+    if total_w <= 0:
+        return df, bets, {"enabled": False, "reason": "再配分失敗"}
+    target = max(1, int(trials))
+    scaled = {k: v / total_w * target for k, v in weighted.items()}
+    ints = {k: int(v) for k, v in scaled.items()}
+    remain = target - sum(ints.values())
+    if remain > 0:
+        for k, _ in sorted(scaled.items(), key=lambda kv: kv[1] - int(kv[1]), reverse=True)[:remain]:
+            ints[k] += 1
+
+    new_bets = dict(bets)
+    new_bets["三連単"] = ints
+    trifuku, nitan, nifuku = {}, {}, {}
+    for (a, b, c), cnt in ints.items():
+        trifuku[tuple(sorted((a, b, c)))] = trifuku.get(tuple(sorted((a, b, c))), 0) + cnt
+        nitan[(a, b)] = nitan.get((a, b), 0) + cnt
+        nifuku[tuple(sorted((a, b)))] = nifuku.get(tuple(sorted((a, b))), 0) + cnt
+    new_bets["三連複"] = trifuku
+    new_bets["2連単"] = nitan
+    new_bets["2連複"] = nifuku
+
+    out_df = df.copy()
+    car_col = "車" if "車" in out_df.columns else ("車番" if "車番" in out_df.columns else None)
+    if car_col:
+        out_df["壁リスク"] = out_df[car_col].map(lambda x: profile.get(int(x), {}).get("wall_risk", 0.0) * 100 if pd.notna(x) else 0.0)
+        out_df["壁突破力"] = out_df[car_col].map(lambda x: profile.get(int(x), {}).get("breakthrough", 0.0) * 100 if pd.notna(x) else 0.0)
+        out_df["前残り指数"] = out_df[car_col].map(lambda x: profile.get(int(x), {}).get("escape", 0.0) * 100 if pd.notna(x) else 0.0)
+        out_df["壁ロス推定"] = out_df[car_col].map(lambda x: profile.get(int(x), {}).get("effective_loss", 0.0) * 100 if pd.notna(x) else 0.0)
+    top_risk = sorted(profile.items(), key=lambda kv: kv[1]["effective_loss"], reverse=True)[:3]
+    audit = {
+        "enabled": True,
+        "high_risk": [{"car": c, **v} for c, v in top_risk],
+        "message": "同ハンデ密集・前車数・捌き力から、壁で失う時間と前残りを着順分布へ穏やかに反映",
+    }
+    return out_df, new_bets, audit
+
+
+
+# Ver230 beta: 壁・飛び出し・追い抜きを6周イベント本体に組み込む。
+# 既存の能力シミュレーションを土台として、過去周回結果と直接対戦履歴を事前学習に利用する。
+def _v230_db_path() -> str:
+    try:
+        return str(engine.DB_PATH)
+    except Exception:
+        return "autorace_players.sqlite3"
+
+
+def _v230_norm_name(value) -> str:
+    return re.sub(r"[\s　]+", "", str(value or "")).strip()
+
+
+def _v230_hist_profiles(venue: str, names: list[str]) -> dict[str, dict]:
+    """過去結果から1周目飛び出し・前残り・追い上げ・抜き実績を縮小推定する。"""
+    out = {n: {"starts": 0.0, "first_gain": 0.0, "hold": 0.5, "chase": 0.5, "overtake": 0.5, "sample": 0} for n in names}
+    if not names:
+        return out
+    try:
+        con = sqlite3.connect(_v230_db_path(), timeout=15)
+        placeholders = ",".join("?" for _ in names)
+        rows = con.execute(
+            f"""
+            SELECT re.player_name, lf.first_lap_pos, lf.final_pos, lf.net_gain,
+                   lf.overtakes, lf.passed_by, lf.lead_laps, r.venue
+            FROM lap_features lf
+            JOIN race_entries re ON re.race_id=lf.race_id AND re.car_no=lf.car_no
+            JOIN races r ON r.race_id=lf.race_id
+            WHERE re.player_name IN ({placeholders})
+            """, names
+        ).fetchall()
+        stats = {n: [] for n in names}
+        for name, first, final, gain, overtakes, passed_by, lead_laps, row_venue in rows:
+            key = _v230_norm_name(name)
+            if key not in stats:
+                continue
+            stats[key].append((first, final, gain, overtakes, passed_by, lead_laps, row_venue))
+        for n, vals in stats.items():
+            if not vals:
+                continue
+            # 開催場一致を1.35倍で重み付け。少数データは0.5へ縮小。
+            wsum=0.0; first_gain=0.0; hold=0.0; chase=0.0; over=0.0
+            for first, final, gain, ov, pb, lead, rv in vals:
+                w=1.35 if venue and str(rv)==str(venue) else 1.0
+                first=float(first or 0); final=float(final or first or 0); gain=float(gain or (first-final))
+                ov=float(ov or 0); pb=float(pb or 0); lead=float(lead or 0)
+                wsum += w
+                first_gain += w * max(-4.0, min(4.0, gain))
+                hold += w * (1.0 if first>0 and final<=first else 0.0)
+                chase += w * (1.0 if first>0 and final<first else 0.0)
+                over += w * ((ov+1.0)/(ov+pb+2.0))
+            conf=min(1.0, wsum/18.0)
+            out[n]={
+                "starts": min(1.0, max(0.0, 0.5 + 0.08*(first_gain/max(wsum,1.0)))),
+                "first_gain": first_gain/max(wsum,1.0),
+                "hold": 0.5 + conf*((hold/max(wsum,1.0))-0.5),
+                "chase": 0.5 + conf*((chase/max(wsum,1.0))-0.5),
+                "overtake": 0.5 + conf*((over/max(wsum,1.0))-0.5),
+                "sample": len(vals),
+            }
+        con.close()
+    except Exception:
+        pass
+    return out
+
+
+def _v230_matchup_map(names: list[str]) -> dict[tuple[str,str], tuple[float,float]]:
+    """直接対戦の追い抜き優位を返す。値は(優位度,信頼度)。"""
+    result={}
+    if not names:
+        return result
+    try:
+        con=sqlite3.connect(_v230_db_path(), timeout=15)
+        rows=con.execute(
+            "SELECT player_a_name,player_b_name,shrunk_a_advantage,confidence FROM v152_player_overtake_matchups"
+        ).fetchall()
+        wanted=set(names)
+        for a,b,adv,conf in rows:
+            a=_v230_norm_name(a); b=_v230_norm_name(b)
+            if a in wanted and b in wanted:
+                result[(a,b)]=(float(adv or 0.0), float(conf or 0.0))
+                result[(b,a)]=(-float(adv or 0.0), float(conf or 0.0))
+        con.close()
+    except Exception:
+        pass
+    return result
+
+
+def _v230_col_num(row, keys, default=0.0):
+    for k in keys:
+        try:
+            if k in row.index and pd.notna(row[k]):
+                return float(row[k])
+        except Exception:
+            pass
+    return float(default)
+
+
+def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
+    """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
+    if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(entries,pd.DataFrame) or entries.empty:
+        return df,bets,{"enabled":False,"reason":"入力不足"}
+    car_col="車" if "車" in df.columns else ("車番" if "車番" in df.columns else None)
+    ec="車番" if "車番" in entries.columns else ("車" if "車" in entries.columns else None)
+    if not car_col or not ec:
+        return df,bets,{"enabled":False,"reason":"車番列なし"}
+    work=df.copy(); work["_car"]=pd.to_numeric(work[car_col],errors="coerce")
+    work=work.dropna(subset=["_car"]).copy(); work["_car"]=work["_car"].astype(int)
+    emap={}
+    for _,r in entries.iterrows():
+        try: emap[int(r[ec])]=r
+        except Exception: pass
+    cars=work["_car"].astype(int).tolist()
+    if len(cars)<3: return df,bets,{"enabled":False,"reason":"3車未満"}
+    names=[]; handicap={}; stmean={}; trial={}; strength={}; breakthrough={}
+    # 既存三連単分布の1着周辺確率を基礎能力にする。
+    tri=(bets or {}).get("三連単",{}) or {}
+    win_counts={c:0.0 for c in cars}
+    total=max(1.0,float(sum(tri.values()) or trials or 1))
+    for combo,cnt in tri.items():
+        try: win_counts[int(combo[0])] += float(cnt)
+        except Exception: pass
+    for _,r in work.iterrows():
+        c=int(r["_car"]); er=emap.get(c)
+        name=""
+        for src in (r,er):
+            if src is not None:
+                for k in ("選手名","名前","player_name"):
+                    if k in src.index and str(src.get(k,"")).strip(): name=_v230_norm_name(src.get(k)); break
+            if name: break
+        names.append(name or str(c))
+        h=0
+        if er is not None:
+            m=re.search(r"-?\d+",str(er.get("ハンデ",er.get("H",0))))
+            h=int(m.group()) if m else 0
+        handicap[c]=h
+        st=_v230_col_num(er,("ST","平均ST","st"),0.16) if er is not None else 0.16
+        if st<=0 or st>0.5: st=0.16
+        stmean[c]=st
+        tt=_v230_col_num(er,("試走T","試走タイム","trial_time"),3.40) if er is not None else 3.40
+        if tt<=0: tt=3.40
+        trial[c]=tt
+        base=max(0.01,win_counts.get(c,0.0)/total)
+        # 既存の実戦・展開点も少量混ぜる。
+        bonus=0.0
+        for k,w in (("実戦能力点",0.002),("展開適性点",0.0015),("基礎スピード点",0.001)):
+            if k in r.index: bonus += _v230_num(r.get(k),0.0)*w
+        strength[c]=np.log(base+0.015)+bonus-(tt-3.40)*2.0
+        raw=np.mean([_v230_num(r.get(k),0.0) for k in ("混戦突破適性","展開適性点","実戦能力点") if k in r.index] or [0.0])
+        breakthrough[c]=raw
+    # 正規化
+    vals=np.array(list(strength.values()),dtype=float); mu=float(vals.mean()); sd=float(vals.std() or 1.0)
+    strength={c:(v-mu)/sd for c,v in strength.items()}
+    bvals=np.array(list(breakthrough.values()),dtype=float); blo=float(bvals.min()); bhi=float(bvals.max())
+    breakthrough={c:(0.5 if bhi<=blo else (v-blo)/(bhi-blo)) for c,v in breakthrough.items()}
+    venue=str((meta or {}).get("開催場") or (meta or {}).get("venue") or "")
+    profiles=_v230_hist_profiles(venue,names)
+    matchups=_v230_matchup_map(names)
+    name_by_car={c:n for c,n in zip(cars,names)}
+    rng=np.random.default_rng(int(seed)+230)
+    sim_trials=max(1000,min(int(trials),20000))
+    counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
+    # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
+    base_order=sorted(cars,key=lambda c:(handicap[c],c))
+    for _ in range(sim_trials):
+        # スタート反応はST・履歴・ランダムで毎試行変える。
+        start_score={}
+        for c in cars:
+            hp=profiles.get(name_by_car[c],{})
+            start_score[c]=(-stmean[c]*5.5 + hp.get("first_gain",0.0)*0.10 + rng.normal(0,0.42))
+        # 同ハンデ内だけスタートで並び替え。ハンデ差は初期距離として保持。
+        order=[]
+        for h in sorted(set(handicap.values())):
+            group=[c for c in cars if handicap[c]==h]
+            group.sort(key=lambda c:start_score[c],reverse=True)
+            order.extend(group)
+        start_front[order[0]]+=1
+        gaps=[0.0]
+        for i in range(1,len(order)):
+            prev,cur=order[i-1],order[i]
+            dh=max(0,handicap[cur]-handicap[prev])
+            gaps.append(0.11+0.017*dh+rng.uniform(0.00,0.08))
+        # 6周。後車から前車へ隣接追い抜き判定。
+        for lap in range(1,7):
+            i=1
+            while i<len(order):
+                front=order[i-1]; chaser=order[i]
+                fn=name_by_car[front]; cn=name_by_car[chaser]
+                hp=profiles.get(cn,{}); fprof=profiles.get(fn,{})
+                adv,conf=matchups.get((cn,fn),(0.0,0.0))
+                density=max(0,len(order)-i-1)/max(1,len(order)-1)
+                ability=(strength[chaser]-strength[front])*0.50
+                hist=(hp.get("overtake",0.5)-0.5)*1.0 + (hp.get("chase",0.5)-0.5)*0.55
+                direct=max(-0.5,min(0.5,adv))*min(1.0,conf)*0.85
+                wall=0.46 + 0.18*density + 0.10*(1-breakthrough[chaser])
+                if i+1<len(order) and gaps[i+1]<0.20: wall += 0.10
+                # 前車が履歴上よく粘るほど突破しにくい。終盤は少し追い抜きやすくする。
+                logit=-0.30 + ability + hist + direct + 0.13*(lap-1) - wall - (fprof.get("hold",0.5)-0.5)*0.6
+                p=1/(1+np.exp(-logit))
+                # 差が開きすぎていればまず追いつく必要がある。
+                p*=max(0.08,1.0-min(0.80,gaps[i]*1.25))
+                if rng.random()<p:
+                    order[i-1],order[i]=order[i],order[i-1]
+                    gaps[i]=max(0.07,gaps[i]*0.45)
+                    pass_events[chaser]+=1
+                    i=max(1,i-1)
+                else:
+                    wall_events[chaser]+=1
+                    # 壁で止まった間に先頭側との差が広がる。能力差があれば少し縮む。
+                    delta=0.045+0.030*density-0.018*max(-1.5,min(1.5,ability))
+                    gaps[i]=min(1.8,max(0.05,gaps[i]+delta+rng.normal(0,0.012)))
+                    i+=1
+            # 周回ごとの純粋な伸びで差を更新。位置交換は追い抜き判定だけで行う。
+            for j in range(1,len(order)):
+                front,cur=order[j-1],order[j]
+                rel=(strength[cur]-strength[front])*0.022 + rng.normal(0,0.018)
+                gaps[j]=min(2.0,max(0.04,gaps[j]-rel))
+        combo=tuple(order[:3]); counts[combo]=counts.get(combo,0)+1
+    # 元のtrial数へ整数スケール。
+    target=max(1,int(trials)); scaled={k:v/sim_trials*target for k,v in counts.items()}
+    ints={k:int(v) for k,v in scaled.items()}; remain=target-sum(ints.values())
+    if remain>0:
+        for k,_ in sorted(scaled.items(),key=lambda kv:kv[1]-int(kv[1]),reverse=True)[:remain]: ints[k]+=1
+    new_bets=dict(bets or {}); new_bets["三連単"]=ints
+    tf={}; nt={}; nf={}
+    for (a,b,c),cnt in ints.items():
+        tf[tuple(sorted((a,b,c)))]=tf.get(tuple(sorted((a,b,c))),0)+cnt
+        nt[(a,b)]=nt.get((a,b),0)+cnt
+        nf[tuple(sorted((a,b)))]=nf.get(tuple(sorted((a,b))),0)+cnt
+    new_bets["三連複"]=tf; new_bets["2連単"]=nt; new_bets["2連複"]=nf
+    out=df.copy()
+    out["6周壁遭遇率"]=out[car_col].map(lambda x: wall_events.get(int(x),0)/(sim_trials*6)*100 if pd.notna(x) else 0.0)
+    out["6周追抜成功回数"]=out[car_col].map(lambda x: pass_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
+    out["1周目先頭率"]=out[car_col].map(lambda x: start_front.get(int(x),0)/sim_trials*100 if pd.notna(x) else 0.0)
+    top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
+    audit={
+        "enabled":True,"mode":"6周内蔵ベータ","sim_trials":sim_trials,
+        "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
+        "matchups":len(matchups)//2,
+        "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
+        "message":"スタート抽選→各周の壁形成→直接対戦と過去周回実績による追い抜き判定→差の拡大を6周すべてで試行",
+    }
+    return out,new_bets,audit
+
+
 def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFrame) -> tuple[dict, pd.DataFrame, list[int]]:
     if not isinstance(rows, pd.DataFrame) or rows.empty:
         return meta, rows, []
@@ -5211,6 +5619,11 @@ elif selected_main_page == "🏁 予測":
             with st.spinner("高速6周イベントシミュレーションを実行中…"):
                 _t0 = time_module.perf_counter()
                 df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
+                # Ver230 beta: 壁補正を後掛けせず、スタートから6周すべての展開へ内蔵。
+                meta = dict(meta or {})
+                df, bets, wall_audit = _v230_six_lap_simulation(df, bets, entries, meta, int(trials), int(seed))
+                meta["壁補正監査"] = wall_audit
+                meta["6周展開シミュレーション"] = wall_audit
                 _t1 = time_module.perf_counter()
                 finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
                 df = engine.v196_apply_probability_aligned_ranks(df, finish_prob)
@@ -5365,12 +5778,20 @@ elif selected_main_page == "🏁 予測":
                 "本番1着率", "本番連対率", "本番3着率", "本番3着内率", "順位整合メモ",
                 "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
                 "スタート伸び指数", "ゴール前伸び指数", "安定上位指数",
+                "6周壁遭遇率", "6周追抜成功回数", "1周目先頭率", "壁リスク", "壁突破力", "前残り指数", "壁ロス推定",
                 "混戦突破適性", "逃げ判定", "初周先頭推定", "逃げ残り推定", "逃切り推定", "逃げ履歴件数", "逃げ履歴補正",
                 "展開タイプ_実測", "展開履歴件数", "展開学習補正", "熱走路帯", "高温履歴件数", "熱走路適性", "熱走路学習補正", "Ver60総合補正",
                 "同ハンデ内枠補正", "車中期成績補正", "試走偏差補正", "高温位置補正", "Ver24展開穴補正", "選手別条件適性補正", "条件適性根拠", "条件一致最大件数", "条件適性信頼度",
                 "今回レース種別", "レース種別履歴件数", "レース種別適性信頼度", "レース種別適性差", "レース種別適性補正", "レース種別適性傾向", "改善後総合点",
             ] if c in df.columns]
             result = df[cols].sort_values(["改善後順位", "車"]).reset_index(drop=True)
+            wall_audit = meta.get("壁補正監査") or {}
+            if wall_audit.get("enabled"):
+                risks = wall_audit.get("high_risk") or []
+                risk_text = " / ".join(
+                    f"{int(x['car'])}番 壁ロス{float(x.get('effective_loss',0))*100:.1f}%" for x in risks
+                )
+                st.info(f"🧱 6周内蔵型の壁展開を反映｜{risk_text}\n\n{wall_audit.get('message','')}")
             st.subheader("予測順位")
             st.dataframe(result, use_container_width=True, hide_index=True)
             st.caption("Ver196では最終順位を本シミュレーションの1着率と一致させます。従来の総合点順位は診断列として残し、連対・3着候補は別順位で確認できます。")
