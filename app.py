@@ -364,7 +364,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         bonus=0.0
         for k,w in (("実戦能力点",0.002),("展開適性点",0.0015),("基礎スピード点",0.001)):
             if k in r.index: bonus += _v230_num(r.get(k),0.0)*w
-        strength[c]=np.log(base+0.015)+bonus-(tt-3.40)*2.0
+        # 旧モデルの勝率は土台として使うが、6周展開の結果を自己増幅しないよう圧縮する。
+        # これにより、以前の前残り評価が高い車を新シミュレーションでも過剰固定するのを防ぐ。
+        strength[c]=0.58*np.log(base+0.025)+bonus-(tt-3.40)*2.35
         raw=np.mean([_v230_num(r.get(k),0.0) for k in ("混戦突破適性","展開適性点","実戦能力点") if k in r.index] or [0.0])
         breakthrough[c]=raw
     # 正規化
@@ -411,13 +413,22 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 ability=(strength[chaser]-strength[front])*0.50
                 hist=(hp.get("overtake",0.5)-0.5)*1.0 + (hp.get("chase",0.5)-0.5)*0.55
                 direct=max(-0.5,min(0.5,adv))*min(1.0,conf)*0.85
-                wall=0.46 + 0.18*density + 0.10*(1-breakthrough[chaser])
+                # 壁は残すが、前車が明確に遅い場合まで一律に詰まらせない。
+                speed_edge=max(-2.5,min(2.5,strength[chaser]-strength[front]))
+                wall=0.34 + 0.15*density + 0.10*(1-breakthrough[chaser]) - 0.08*max(0.0,speed_edge)
                 if i+1<len(order) and gaps[i+1]<0.20: wall += 0.10
                 # 前車が履歴上よく粘るほど突破しにくい。終盤は少し追い抜きやすくする。
-                logit=-0.30 + ability + hist + direct + 0.13*(lap-1) - wall - (fprof.get("hold",0.5)-0.5)*0.6
+                # 先頭・前方にいるだけの最低保証は与えない。後車の速度優位と残り周回を強めに反映。
+                front_hold=(fprof.get("hold",0.5)-0.5)*0.48
+                weak_front_bonus=0.34*max(0.0,speed_edge-0.25)
+                late_pressure=0.15*(lap-1)
+                logit=-0.18 + ability*1.18 + hist + direct + late_pressure + weak_front_bonus - wall - front_hold
                 p=1/(1+np.exp(-logit))
                 # 差が開きすぎていればまず追いつく必要がある。
-                p*=max(0.08,1.0-min(0.80,gaps[i]*1.25))
+                # 大差なら即追越しは難しいが、速度優位車はまず差を詰められる。
+                catch_factor=max(0.10,1.0-min(0.78,gaps[i]*1.12))
+                catch_factor=min(1.15,catch_factor+0.10*max(0.0,speed_edge))
+                p*=catch_factor
                 if rng.random()<p:
                     order[i-1],order[i]=order[i],order[i-1]
                     gaps[i]=max(0.07,gaps[i]*0.45)
@@ -426,13 +437,19 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 else:
                     wall_events[chaser]+=1
                     # 壁で止まった間に先頭側との差が広がる。能力差があれば少し縮む。
-                    delta=0.045+0.030*density-0.018*max(-1.5,min(1.5,ability))
+                    delta=0.040+0.026*density-0.024*max(-1.5,min(1.5,ability))
+                    # 前車が遅い場合は「壁で永久に止まる」のではなく、失敗周でも距離を詰める。
+                    if speed_edge>0.45:
+                        delta-=0.020*min(2.0,speed_edge)
                     gaps[i]=min(1.8,max(0.05,gaps[i]+delta+rng.normal(0,0.012)))
                     i+=1
             # 周回ごとの純粋な伸びで差を更新。位置交換は追い抜き判定だけで行う。
             for j in range(1,len(order)):
                 front,cur=order[j-1],order[j]
-                rel=(strength[cur]-strength[front])*0.022 + rng.normal(0,0.018)
+                rel=(strength[cur]-strength[front])*0.030 + rng.normal(0,0.017)
+                # 弱い先頭車が捕まった後に後続も連続して迫る現象を反映。
+                if j==1 and strength[cur]-strength[front]>0.35:
+                    rel += 0.012*(1.0+0.15*lap)
                 gaps[j]=min(2.0,max(0.04,gaps[j]-rel))
         combo=tuple(order[:3]); counts[combo]=counts.get(combo,0)+1
     # 元のtrial数へ整数スケール。
@@ -453,11 +470,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["1周目先頭率"]=out[car_col].map(lambda x: start_front.get(int(x),0)/sim_trials*100 if pd.notna(x) else 0.0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
     audit={
-        "enabled":True,"mode":"6周内蔵ベータ","sim_trials":sim_trials,
+        "enabled":True,"mode":"6周内蔵Ver234・前残り過多調整","sim_trials":sim_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
-        "message":"スタート抽選→各周の壁形成→直接対戦と過去周回実績による追い抜き判定→差の拡大を6周すべてで試行",
+        "message":"スタート抽選→各周の壁形成→対戦履歴・過去周回実績で追い抜き判定。前車が遅い場合の接近、捕捉後の連続後退まで6周内で試行",
     }
     return out,new_bets,audit
 
@@ -681,8 +698,9 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 
 
 
+# Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver233"
+_V231_APP_VERSION = "Ver234"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -967,7 +985,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver233｜保存済み予測・全オッズ・登録済み結果を選択復元し、そのまま上書き編集")
+st.caption("Ver234｜予測・買い目の版履歴を確実に保存し、6周展開の前残り過多を調整")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -3579,7 +3597,7 @@ def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict) -> str:
             float(result.get("cover", 0)), float(result.get("black", 0)), float(result.get("low", 0)),
             float(result.get("hit_average_multiple", 0)), float(result.get("model_expected_multiple", 0)),
             float(result.get("model_return_rate", 0)), len(result.get("grouped", {})), now,
-            "Ver221", "return_plan_v221", meta.get("race_date"), meta.get("venue"), meta.get("race_no"), starter_count,
+            _V231_APP_VERSION, "return_plan_v234", meta.get("race_date"), meta.get("venue"), meta.get("race_no"), starter_count,
         ))
         con.execute("DELETE FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?", (str(race_key), plan_hash))
         for t in result.get("tickets", []):
