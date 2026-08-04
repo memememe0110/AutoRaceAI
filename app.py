@@ -682,7 +682,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 
 
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver232"
+_V231_APP_VERSION = "Ver233"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -832,6 +832,105 @@ def _v232_load_result_view_for_race(db_path: str, race_key: str) -> dict:
         return {}
 
 
+# Ver233: 保存済み結果を結果登録画面から選択し、元本文またはDB再構成本文を復元する。
+def _v233_list_saved_results(db_path: str, limit: int = 200) -> list[dict]:
+    try:
+        with sqlite3.connect(db_path) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                """
+                SELECT r.race_key, r.race_date, r.venue, r.race_no, r.registered_at,
+                       COALESCE(v.updated_at, r.registered_at) AS updated_at
+                FROM result_races r
+                LEFT JOIN v223_result_view_restore v ON v.race_key = r.race_key
+                ORDER BY COALESCE(v.updated_at, r.registered_at) DESC, r.race_key DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(x) for x in rows]
+    except Exception:
+        return []
+
+
+def _v233_load_result_payload(db_path: str, race_key: str) -> dict:
+    view = _v232_load_result_view_for_race(db_path, race_key)
+    return view if isinstance(view, dict) else {}
+
+
+def _v233_fmt_num(value, digits: int = 2) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return ""
+        v = float(value)
+        return f"{v:.{digits}f}"
+    except Exception:
+        return str(value or "")
+
+
+def _v233_build_result_text_from_db(db_path: str, race_key: str) -> str:
+    """旧保存分でも上書き編集できるよう、登録済み構造化データから再解析可能な本文を作る。"""
+    try:
+        with sqlite3.connect(db_path) as con:
+            con.row_factory = sqlite3.Row
+            race = con.execute("SELECT * FROM result_races WHERE race_key=?", (race_key,)).fetchone()
+            entries = con.execute("SELECT * FROM result_entries WHERE race_key=? ORDER BY CASE WHEN finish IS NULL THEN 999 ELSE finish END, car_no", (race_key,)).fetchall()
+            laps = con.execute("SELECT * FROM result_laps WHERE race_key=? ORDER BY COALESCE(lap_no,999), position", (race_key,)).fetchall()
+            payouts = con.execute("SELECT * FROM result_payouts WHERE race_key=? ORDER BY rowid", (race_key,)).fetchall()
+        if not race:
+            return ""
+        race_no = str(race['race_no'] or '').strip()
+        date_text = str(race['race_date'] or '').replace('-', '/')
+        lines = [
+            f"{race_no}R" if race_no else "結果",
+            "確定",
+            date_text,
+            f"{race['venue'] or ''}オート",
+        ]
+        cond=[]
+        if race['surface']:
+            cond.append(str(race['surface']))
+        if race['track_temp'] is not None:
+            cond.append(f"/{_v233_fmt_num(race['track_temp'],0)}℃")
+        if cond:
+            lines.append(' '.join(cond))
+        if race['air_temp'] is not None:
+            lines.append(f"気温：{_v233_fmt_num(race['air_temp'],0)}℃")
+        if race['humidity'] is not None:
+            lines.append(f"湿度：{_v233_fmt_num(race['humidity'],0)}%")
+        lines += ["着順 車番 選手名", "LG/ハンデ/試走T 競走T（人気） ST/事故"]
+        for e in entries:
+            status=str(e['result_status'] or '通常')
+            finish='-' if e['finish'] is None else str(int(e['finish']))
+            trial=_v233_fmt_num(e['trial_time'],2) or '0.00'
+            race_t=_v233_fmt_num(e['race_time'],3) or '0.000'
+            stt=_v233_fmt_num(e['start_time'],2) or '0.00'
+            handicap=str(e['handicap'] or '0').replace('m','')
+            lines += [
+                f"{finish} {int(e['car_no'])}",
+                str(e['player_name'] or ''),
+                f"{race['venue'] or ''}/{handicap}m/{trial}",
+                race_t,
+                f"{stt}" + (f" /{status}" if status and status != '通常' else ''),
+            ]
+        if laps:
+            lines.append('グランドノート')
+            grouped={}
+            for x in laps:
+                grouped.setdefault(str(x['lap_label']), []).append((int(x['position']), int(x['car_no'])))
+            for label, vals in grouped.items():
+                vals=sorted(vals)
+                lines.append(label + '\t' + '\t'.join(str(car) for _,car in vals))
+        if payouts:
+            lines.append('払戻金')
+            for x in payouts:
+                pop = f" {int(x['popularity'])}人気" if x['popularity'] is not None else ''
+                lines.append(f"{x['bet_type']}\t{x['combination']}\t{int(x['payout_yen'] or 0)}円{pop}")
+        return '\n'.join(lines).strip()
+    except Exception:
+        return ""
+
+
 def _v217_deferred_prediction_db_save(meta, bets, trials, df) -> None:
     """全買い目確率・特徴量をバックグラウンド保存する。
 
@@ -868,7 +967,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver232｜保存済み予測・全オッズ・登録済み結果・実回収率をレース単位で同時復元")
+st.caption("Ver233｜保存済み予測・全オッズ・登録済み結果を選択復元し、そのまま上書き編集")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -6271,6 +6370,47 @@ if selected_main_page == "✅ 結果登録・解析":
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
 
+    saved_results = _v233_list_saved_results(engine.DB_PATH, 250)
+    if saved_results:
+        st.markdown("#### ♻️ 保存済み結果を呼び出す")
+        result_options = {
+            0: "選択してください",
+            **{
+                i + 1: f"{row.get('race_date','')}｜{row.get('venue','')} {row.get('race_no','')}R｜保存 {str(row.get('updated_at') or '')[:19]}"
+                for i, row in enumerate(saved_results)
+            },
+        }
+        selected_saved_result = st.selectbox(
+            "登録済み結果",
+            list(result_options.keys()),
+            format_func=lambda idx: result_options[idx],
+            key="v233_saved_result_selector",
+        )
+        if st.button(
+            "📥 選択した結果を入力欄へ復元",
+            use_container_width=True,
+            disabled=not bool(selected_saved_result),
+            key="v233_restore_saved_result",
+        ):
+            row = saved_results[int(selected_saved_result) - 1]
+            race_key_restore = str(row.get("race_key") or "")
+            payload = _v233_load_result_payload(engine.DB_PATH, race_key_restore)
+            restored_text = str(payload.get("raw_result_text") or "").strip()
+            if not restored_text:
+                restored_text = _v233_build_result_text_from_db(engine.DB_PATH, race_key_restore)
+            if restored_text:
+                st.session_state["v163_saved_result_text"] = restored_text
+                st.session_state["v163_saved_result_venue"] = str(row.get("venue") or "")
+                st.session_state["v163_saved_result_race_no"] = str(row.get("race_no") or "")
+                st.session_state["result_input_version"] = int(st.session_state.get("result_input_version", 0)) + 1
+                for key in ["v35_result_meta","v35_result_rows","v35_result_laps","v35_result_payouts"]:
+                    st.session_state.pop(key, None)
+                st.session_state["result_reset_notice"] = f"保存済み結果を復元しました：{race_key_restore}。修正後、そのまま置き換え登録できます。"
+                st.rerun()
+            else:
+                st.warning("保存済み結果の本文を復元できませんでした。")
+        st.caption("Ver233以降は貼り付けた元の結果本文も保存します。旧データは着順・周回・払戻から編集用本文を再構成します。")
+
     def _reset_result_input_only():
         """結果入力関連だけを初期化し、DB・予測・学習キャッシュは維持する。"""
         st.session_state["result_input_version"] = int(st.session_state.get("result_input_version", 0)) + 1
@@ -6518,6 +6658,11 @@ if selected_main_page == "✅ 結果登録・解析":
                         "predicted_trifecta": predicted_trifecta_saved,
                         "actual_trifecta": actual_trifecta_saved,
                         "mixed_plan_result": mixed_plan_result,
+                        "raw_result_text": str(result_text or ""),
+                        "result_meta": dict(meta_r or {}),
+                        "result_rows": rows_r.copy() if isinstance(rows_r, pd.DataFrame) else rows_r,
+                        "result_laps": laps_r.copy() if isinstance(laps_r, pd.DataFrame) else laps_r,
+                        "result_payouts": payouts_r.copy() if isinstance(payouts_r, pd.DataFrame) else payouts_r,
                         "learning_excluded": bool(registration.get("learning_excluded") or meta_r.get("学習対象外")),
                         "learning_exclusion_reason": registration.get("learning_exclusion_reason") or meta_r.get("learning_exclusion_reason"),
                         "learning_audit": {
