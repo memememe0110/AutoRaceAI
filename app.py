@@ -379,7 +379,18 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     matchups=_v230_matchup_map(names)
     name_by_car={c:n for c,n in zip(cars,names)}
     rng=np.random.default_rng(int(seed)+230)
-    sim_trials=max(1000,min(int(trials),20000))
+    requested_trials=max(1000,min(int(trials),20000))
+    # Ver237: 20,000回すべてで重い6周処理を行わず、車立てと旧分布の集中度から
+    # 必要な展開試行数を自動決定する。最終確率は要求試行数へ再スケールするため、
+    # UI・DB上の確率母数は従来設定を維持する。
+    base_budget={6:5000,7:6500,8:8000}.get(len(cars),7000)
+    prior_ranked=sorted((float(v) for v in tri.values()), reverse=True)
+    top_mass=(sum(prior_ranked[:12])/max(1.0,float(sum(prior_ranked)))) if prior_ranked else 0.0
+    if top_mass < 0.35:
+        base_budget += 2000  # 混戦は少し厚く回す
+    elif top_mass > 0.65:
+        base_budget -= 1000  # 強く集中したレースは早めに収束
+    sim_trials=max(3500,min(requested_trials,base_budget))
     counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
@@ -499,12 +510,12 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
     audit={
-        "enabled":True,"mode":"6周内蔵Ver236・壁ロス再設計","sim_trials":sim_trials,
+        "enabled":True,"mode":"6周内蔵Ver237・適応高速化","sim_trials":sim_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
-        "message":"壁を即脱落ではなく時間ロスとして扱い、終盤追走・連続追い抜き・対戦履歴を6周内で試行。全3連単組み合わせを保存",
+        "message":f"壁ロス・終盤追走・連続追い抜きを6周内で試行。要求{requested_trials:,}回に対し展開本体は{sim_trials:,}回の適応計算で高速化し、全3連単組み合わせを保存",
     }
     return out,new_bets,audit
 
@@ -731,7 +742,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver236"
+_V231_APP_VERSION = "Ver237"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -1016,7 +1027,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver234｜予測・買い目の版履歴を確実に保存し、6周展開の前残り過多を調整")
+st.caption("Ver237｜登録済み結果は復元時に閉じて表示。6周展開は車立て・確率集中度に応じた適応試行で高速化")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -5790,7 +5801,7 @@ elif selected_main_page == "🏁 予測":
             )
         restored_result = st.session_state.get("v232_restored_result_view")
         if isinstance(restored_result, dict) and restored_result:
-            with st.expander("✅ このレースの登録済み結果・実回収率", expanded=True):
+            with st.expander("✅ このレースの登録済み結果・実回収率", expanded=False):
                 render_last_result_analysis(restored_result)
         st.caption("同じレースを再予測しても上書きせず、予測時刻・バージョン別に履歴を残します。旧形式の保存も消さずに一覧へ統合し、Version Unknown／旧形式として扱います。")
 
