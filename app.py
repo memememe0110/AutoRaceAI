@@ -278,6 +278,89 @@ def _v230_hist_profiles(venue: str, names: list[str]) -> dict[str, dict]:
     return out
 
 
+
+
+# Ver240: グランドノートから周回別の追い抜き・被追い抜き後失速を学習する。
+def _v240_transition_profiles(venue: str, names: list[str]) -> dict[str, dict]:
+    """player_lap_historyから周回別追抜傾向と、抜かれた直後の連鎖後退を縮小推定。"""
+    base = {n: {
+        "lap_attack": [0.0]*7, "lap_sample": [0]*7,
+        "passed_slowdown": 0.18, "cascade_risk": 0.16,
+        "pass_momentum": 0.14, "sample": 0,
+    } for n in names}
+    if not names:
+        return base
+    try:
+        con = sqlite3.connect(_v230_db_path(), timeout=15)
+        placeholders = ",".join("?" for _ in names)
+        rows = con.execute(
+            f"""
+            SELECT plh.race_key, plh.player_name, plh.lap_no, plh.position,
+                   COALESCE(r.venue, '')
+            FROM player_lap_history plh
+            LEFT JOIN races r ON r.race_key = plh.race_key
+            WHERE REPLACE(REPLACE(plh.player_name,' ',''),'　','') IN ({placeholders})
+              AND plh.lap_no IS NOT NULL
+            ORDER BY plh.player_name, plh.race_key, plh.lap_no
+            """, names
+        ).fetchall()
+        grouped = {}
+        for race_key, name, lap_no, pos, row_venue in rows:
+            key = _v230_norm_name(name)
+            if key not in base:
+                continue
+            grouped.setdefault((key, race_key), []).append((int(lap_no or 0), int(pos or 0), str(row_venue or '')))
+        accum = {n: {"w":0.0,"passed":0.0,"cascade":0.0,"momentum":0.0,"events":0.0,
+                     "lap_gain":[0.0]*7,"lap_w":[0.0]*7} for n in names}
+        for (name, _rk), vals in grouped.items():
+            vals = sorted(vals)
+            if len(vals) < 2:
+                continue
+            venue_w = 1.35 if venue and vals[0][2] == venue else 1.0
+            for idx in range(1, len(vals)):
+                lap, pos, _ = vals[idx]
+                prev_pos = vals[idx-1][1]
+                if prev_pos <= 0 or pos <= 0:
+                    continue
+                delta = prev_pos - pos  # +なら順位上昇
+                li = max(1, min(6, lap))
+                accum[name]["lap_gain"][li] += venue_w * max(-3, min(3, delta))
+                accum[name]["lap_w"][li] += venue_w
+                accum[name]["w"] += venue_w
+                if delta > 0:
+                    accum[name]["momentum"] += venue_w * min(2, delta)
+                elif delta < 0:
+                    accum[name]["passed"] += venue_w * min(2, -delta)
+                    # 抜かれた次の周にも後退したら連鎖失速。
+                    if idx + 1 < len(vals):
+                        next_pos = vals[idx+1][1]
+                        if next_pos > pos:
+                            accum[name]["cascade"] += venue_w * min(2, next_pos-pos)
+                accum[name]["events"] += venue_w
+        for n, a in accum.items():
+            ev = max(1.0, a["events"]); conf = min(1.0, ev/28.0)
+            lap_attack=[0.0]*7; lap_sample=[0]*7
+            for li in range(1,7):
+                lw=a["lap_w"][li]
+                lap_sample[li]=int(round(lw))
+                if lw>0:
+                    # 平均順位上昇を穏やかなlogit加点へ。
+                    lap_attack[li]=max(-0.18,min(0.24,(a["lap_gain"][li]/lw)*0.075))*conf
+            passed_rate=a["passed"]/ev
+            cascade_rate=a["cascade"]/max(1.0,a["passed"])
+            momentum_rate=a["momentum"]/ev
+            base[n]={
+                "lap_attack":lap_attack, "lap_sample":lap_sample,
+                "passed_slowdown":0.12 + conf*max(0.0,min(0.22,passed_rate*0.10)),
+                "cascade_risk":0.08 + conf*max(0.0,min(0.28,cascade_rate*0.16)),
+                "pass_momentum":0.10 + conf*max(0.0,min(0.24,momentum_rate*0.10)),
+                "sample":int(round(ev)),
+            }
+        con.close()
+    except Exception:
+        pass
+    return base
+
 def _v230_matchup_map(names: list[str]) -> dict[tuple[str,str], tuple[float,float]]:
     """直接対戦の追い抜き優位を返す。値は(優位度,信頼度)。"""
     result={}
@@ -366,16 +449,20 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             if k in r.index: bonus += _v230_num(r.get(k),0.0)*w
         # 旧モデルの勝率は土台として使うが、6周展開の結果を自己増幅しないよう圧縮する。
         # これにより、以前の前残り評価が高い車を新シミュレーションでも過剰固定するのを防ぐ。
-        strength[c]=0.58*np.log(base+0.025)+bonus-(tt-3.40)*2.35
+        # 旧予測確率を強く再利用すると、誤った本命が6周すべてで自己増幅する。
+        # Ver239では旧確率を弱い事前分布へ落とし、試走・履歴・各試行の出来で展開を決める。
+        strength[c]=0.30*np.log(base+0.040)+bonus-(tt-3.40)*1.85
         raw=np.mean([_v230_num(r.get(k),0.0) for k in ("混戦突破適性","展開適性点","実戦能力点") if k in r.index] or [0.0])
         breakthrough[c]=raw
     # 正規化
     vals=np.array(list(strength.values()),dtype=float); mu=float(vals.mean()); sd=float(vals.std() or 1.0)
-    strength={c:(v-mu)/sd for c,v in strength.items()}
+    # 少数車の小差を標準化だけで巨大差へしない。縮小して上限を設ける。
+    strength={c:max(-1.55,min(1.55,0.72*((v-mu)/sd))) for c,v in strength.items()}
     bvals=np.array(list(breakthrough.values()),dtype=float); blo=float(bvals.min()); bhi=float(bvals.max())
     breakthrough={c:(0.5 if bhi<=blo else (v-blo)/(bhi-blo)) for c,v in breakthrough.items()}
     venue=str((meta or {}).get("開催場") or (meta or {}).get("venue") or "")
     profiles=_v230_hist_profiles(venue,names)
+    transition_profiles=_v240_transition_profiles(venue,names)
     matchups=_v230_matchup_map(names)
     name_by_car={c:n for c,n in zip(cars,names)}
     rng=np.random.default_rng(int(seed)+230)
@@ -397,11 +484,18 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
     base_order=sorted(cars,key=lambda c:(handicap[c],c))
     for _ in range(sim_trials):
+        # その日の出来・機力発揮度を試行ごとに変える。同じ能力順を20,000回固定しない。
+        # 共通の走路揺らぎと選手別の出来を分け、極端な本命固定を抑える。
+        race_noise=rng.normal(0,0.10)
+        perf={c:max(-2.2,min(2.2,strength[c]+race_noise+rng.normal(0,0.36))) for c in cars}
         # スタート反応はST・履歴・ランダムで毎試行変える。
         start_score={}
         for c in cars:
             hp=profiles.get(name_by_car[c],{})
-            start_score[c]=(-stmean[c]*5.5 + hp.get("first_gain",0.0)*0.10 + rng.normal(0,0.42))
+            # 内枠は同ハンデ時だけ僅かに有利。ただしSTと当試行の出来で十分逆転する。
+            same_group=sorted([x for x in cars if handicap[x]==handicap[c]])
+            lane_bonus=(len(same_group)-same_group.index(c)-1)*0.018 if c in same_group else 0.0
+            start_score[c]=(-stmean[c]*4.7 + hp.get("first_gain",0.0)*0.085 + 0.10*perf[c] + lane_bonus + rng.normal(0,0.48))
         # 同ハンデ内だけスタートで並び替え。ハンデ差は初期距離として保持。
         order=[]
         for h in sorted(set(handicap.values())):
@@ -416,6 +510,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             gaps.append(0.11+0.017*dh+rng.uniform(0.00,0.08))
         # 6周。後車から前車へ隣接追い抜き判定。
         momentum={c:0.0 for c in cars}
+        # ギリギリ横並びで抜かれた車の一時失速。次周以降へ減衰して残す。
+        slowdown={c:0.0 for c in cars}
         for lap in range(1,7):
             i=1
             while i<len(order):
@@ -424,11 +520,15 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 hp=profiles.get(cn,{}); fprof=profiles.get(fn,{})
                 adv,conf=matchups.get((cn,fn),(0.0,0.0))
                 density=max(0,len(order)-i-1)/max(1,len(order)-1)
-                ability=(strength[chaser]-strength[front])*0.50
-                hist=(hp.get("overtake",0.5)-0.5)*1.0 + (hp.get("chase",0.5)-0.5)*0.55
+                # 静的能力ではなく、その試行で発揮された能力差を使う。
+                ability=((perf[chaser]+momentum.get(chaser,0.0))-(perf[front]-slowdown.get(front,0.0)))*0.46
+                tp=transition_profiles.get(cn,{})
+                ftp=transition_profiles.get(fn,{})
+                lap_attack=(tp.get("lap_attack") or [0.0]*7)[lap] if lap < len(tp.get("lap_attack") or []) else 0.0
+                hist=(hp.get("overtake",0.5)-0.5)*1.0 + (hp.get("chase",0.5)-0.5)*0.55 + lap_attack
                 direct=max(-0.5,min(0.5,adv))*min(1.0,conf)*0.85
                 # 壁は残すが、前車が明確に遅い場合まで一律に詰まらせない。
-                speed_edge=max(-2.5,min(2.5,strength[chaser]-strength[front]))
+                speed_edge=max(-2.5,min(2.5,perf[chaser]-perf[front]))
                 wall=0.34 + 0.15*density + 0.10*(1-breakthrough[chaser]) - 0.08*max(0.0,speed_edge)
                 if i+1<len(order) and gaps[i+1]<0.20: wall += 0.10
                 # 前車が履歴上よく粘るほど突破しにくい。終盤は少し追い抜きやすくする。
@@ -438,8 +538,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 late_pressure=0.15*(lap-1)
                 # 直前の追い抜き成功は次の壁突破を少し後押しする。ただし毎周減衰させる。
                 chain_bonus=min(0.42, momentum.get(chaser,0.0))
-                logit=-0.22 + ability*1.12 + hist + direct + late_pressure + weak_front_bonus + chain_bonus - wall - front_hold
+                # 一要素でほぼ確定しないよう係数を縮小し、各周に最低限の不確実性を残す。
+                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + weak_front_bonus + chain_bonus - wall - front_hold
+                logit += rng.normal(0,0.16)
                 p=1/(1+np.exp(-logit))
+                p=max(0.035,min(0.88,p))
                 # 差が開きすぎていればまず追いつく必要がある。
                 # 大差なら即追越しは難しいが、速度優位車はまず差を詰められる。
                 catch_factor=max(0.10,1.0-min(0.78,gaps[i]*1.12))
@@ -451,8 +554,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     pass_events[chaser]+=1
                     if momentum.get(chaser,0.0)>0.02:
                         chain_events[chaser]+=1
-                    momentum[chaser]=min(0.42, momentum.get(chaser,0.0)+0.16)
-                    momentum[front]=max(0.0, momentum.get(front,0.0)-0.08)
+                    # 差が小さい横並びの追越しほど、抜かれた側がラインを外して一時失速しやすい。
+                    close_pass=max(0.0, min(1.0, (0.24-gaps[i])/0.18))
+                    pass_boost=float(tp.get("pass_momentum",0.14))
+                    loss_base=float(ftp.get("passed_slowdown",0.18))
+                    cascade=float(ftp.get("cascade_risk",0.16))
+                    momentum[chaser]=min(0.48, momentum.get(chaser,0.0)+pass_boost*(0.65+0.55*close_pass))
+                    slowdown[front]=min(0.50, slowdown.get(front,0.0)+loss_base*(0.45+0.90*close_pass)+0.08*cascade)
+                    momentum[front]=max(0.0, momentum.get(front,0.0)-0.10*(0.5+close_pass))
                     i=max(1,i-1)
                 else:
                     wall_events[chaser]+=1
@@ -467,11 +576,12 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             # 周回ごとの純粋な伸びで差を更新。位置交換は追い抜き判定だけで行う。
             for c in cars:
                 momentum[c]*=0.72
+                slowdown[c]*=0.58
             for j in range(1,len(order)):
                 front,cur=order[j-1],order[j]
-                rel=(strength[cur]-strength[front])*0.030 + rng.normal(0,0.017)
+                rel=((perf[cur]+momentum.get(cur,0.0))-(perf[front]-slowdown.get(front,0.0)))*0.026 + rng.normal(0,0.022)
                 # 弱い先頭車が捕まった後に後続も連続して迫る現象を反映。
-                if j==1 and strength[cur]-strength[front]>0.35:
+                if j==1 and perf[cur]-perf[front]>0.35:
                     rel += 0.012*(1.0+0.15*lap)
                 gaps[j]=min(2.0,max(0.04,gaps[j]-rel))
         combo=tuple(order[:3]); counts[combo]=counts.get(combo,0)+1
@@ -480,15 +590,17 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     target=max(1,int(trials))
     all_combos=[(a,b,c) for a in cars for b in cars for c in cars if a!=b and a!=c and b!=c]
     prior_total=max(1.0,float(sum(tri.values()) or 1.0))
-    sim_mix=0.93
-    floor_mass=0.02 / max(1,len(all_combos))
+    # Ver240: 失速連鎖を含む6周結果を尊重しつつ、有限試行の偶然と過信を温度校正する。
+    sim_mix=0.88
+    floor_mass=0.03 / max(1,len(all_combos))
     scaled={}
     for combo in all_combos:
         sim_p=float(counts.get(combo,0))/max(1,sim_trials)
         prior_p=float(tri.get(combo,0))/prior_total
         # 7%だけ旧能力分布を残し、未知着順にもごく小さい裾を与える。
         p=max(floor_mass, sim_mix*sim_p + (1.0-sim_mix)*prior_p)
-        scaled[combo]=p
+        # 温度校正。上位の山を少し低くし、現実的な着順違いの裾を残す。
+        scaled[combo]=p**0.86
     norm=sum(scaled.values()) or 1.0
     scaled={k:(v/norm)*target for k,v in scaled.items()}
     ints={k:int(v) for k,v in scaled.items()}
@@ -510,12 +622,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
     audit={
-        "enabled":True,"mode":"6周内蔵Ver237・適応高速化","sim_trials":sim_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver240・失速連鎖","sim_trials":sim_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
+        "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
-        "message":f"壁ロス・終盤追走・連続追い抜きを6周内で試行。要求{requested_trials:,}回に対し展開本体は{sim_trials:,}回の適応計算で高速化し、全3連単組み合わせを保存",
+        "message":f"試走・過去展開・直接対戦に加え、周回別追抜傾向と横並びで抜かれた後の失速連鎖を反映。要求{requested_trials:,}回に対し展開本体は{sim_trials:,}回で計算し、温度校正後の全3連単を保存",
     }
     return out,new_bets,audit
 
@@ -742,7 +855,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver238"
+_V231_APP_VERSION = "Ver240"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -1150,7 +1263,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver238｜保存済み結果の復元・上書きを安全化。元本文がない旧結果は編集復元せず、誤登録を事前検査")
+st.caption("Ver240｜グランドノートの周回変化から、追い抜き後の勢いと横並びで抜かれた車の一時失速・連鎖後退を6周展開へ反映。")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
