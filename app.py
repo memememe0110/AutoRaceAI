@@ -742,7 +742,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver237"
+_V231_APP_VERSION = "Ver238"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -892,6 +892,129 @@ def _v232_load_result_view_for_race(db_path: str, race_key: str) -> dict:
         return {}
 
 
+
+
+# Ver238: 結果の元本文を構造化結果とは別に保管し、再構成本文による誤上書きを防ぐ。
+def _v238_ensure_raw_result_archive(db_path: str) -> None:
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS v238_result_raw_archive (
+                race_key TEXT PRIMARY KEY,
+                raw_result_text TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual',
+                saved_at TEXT NOT NULL
+            )
+            """
+        )
+        con.commit()
+
+
+def _v238_save_exact_raw_result(db_path: str, race_key: str, raw_text: str, source: str = "manual") -> None:
+    raw = str(raw_text or "").strip()
+    if not race_key or not raw:
+        return
+    _v238_ensure_raw_result_archive(db_path)
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            """
+            INSERT INTO v238_result_raw_archive(race_key, raw_result_text, source, saved_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(race_key) DO UPDATE SET
+              raw_result_text=excluded.raw_result_text,
+              source=excluded.source,
+              saved_at=excluded.saved_at
+            """,
+            (race_key, raw, str(source or "manual"), _v228_now_jst_iso()),
+        )
+        con.commit()
+
+
+def _v238_load_exact_raw_result(db_path: str, race_key: str) -> str:
+    try:
+        _v238_ensure_raw_result_archive(db_path)
+        with sqlite3.connect(db_path) as con:
+            row = con.execute(
+                "SELECT raw_result_text FROM v238_result_raw_archive WHERE race_key=? LIMIT 1",
+                (race_key,),
+            ).fetchone()
+        return str(row[0] or "").strip() if row else ""
+    except Exception:
+        return ""
+
+
+def _v238_col(df: pd.DataFrame, *names: str):
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
+
+
+def _v238_result_safety_check(db_path: str, race_key: str, rows: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """置換前に、順位重複・異常車の通常化・詳細値消失を検査する。"""
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not isinstance(rows, pd.DataFrame) or rows.empty:
+        return ["解析済みの着順データがありません。"], warnings
+    car_c = _v238_col(rows, "車番", "car_no")
+    finish_c = _v238_col(rows, "着順", "finish")
+    status_c = _v238_col(rows, "異常", "事故", "result_status")
+    race_c = _v238_col(rows, "競走T", "競走タイム", "race_time")
+    st_c = _v238_col(rows, "ST", "start_time")
+    if not car_c or not finish_c:
+        return ["車番または着順を確認できません。"], warnings
+    work = rows.copy()
+    work[car_c] = pd.to_numeric(work[car_c], errors="coerce")
+    work[finish_c] = pd.to_numeric(work[finish_c], errors="coerce")
+    normal = work.copy()
+    if status_c:
+        s = normal[status_c].fillna("").astype(str)
+        abnormal = s.str.contains(r"欠車|出走取消|発走除外|競走除外|反妨|反則|失格|落車|競走中止|周誤", regex=True)
+        normal = normal[~abnormal]
+    ranked = normal[normal[finish_c].notna()]
+    dup = ranked[ranked.duplicated(subset=[finish_c], keep=False)]
+    if not dup.empty:
+        vals = sorted({int(x) for x in dup[finish_c].dropna().tolist()})
+        errors.append(f"通常車に同じ着順が重複しています：{vals}")
+    if ranked[car_c].duplicated().any():
+        errors.append("同じ車番が複数の通常結果として解析されています。")
+    if not race_key:
+        return errors, warnings
+    try:
+        with sqlite3.connect(db_path) as con:
+            con.row_factory = sqlite3.Row
+            old = [dict(x) for x in con.execute(
+                "SELECT car_no, finish, race_time, start_time, result_status FROM result_entries WHERE race_key=?",
+                (race_key,),
+            ).fetchall()]
+        if old:
+            old_by = {int(x["car_no"]): x for x in old if x.get("car_no") is not None}
+            new_cars = {int(x) for x in work[car_c].dropna().tolist()}
+            old_cars = set(old_by)
+            removed = sorted(old_cars - new_cars)
+            added = sorted(new_cars - old_cars)
+            if removed or added:
+                warnings.append(f"車番構成が変わります（削除 {removed or 'なし'}／追加 {added or 'なし'}）。")
+            for _, r in work.iterrows():
+                if pd.isna(r[car_c]):
+                    continue
+                car = int(r[car_c])
+                old_r = old_by.get(car)
+                if not old_r:
+                    continue
+                if race_c and old_r.get("race_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[race_c]]), errors="coerce").iloc[0]):
+                    errors.append(f"{car}番の競走タイムが既存データから消えます。")
+                if st_c and old_r.get("start_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[st_c]]), errors="coerce").iloc[0]):
+                    errors.append(f"{car}番のSTが既存データから消えます。")
+                old_status = str(old_r.get("result_status") or "通常")
+                new_status = str(r[status_c] if status_c else "通常")
+                if old_status != "通常" and not any(k in new_status for k in ["欠車","取消","除外","反妨","反則","失格","落車","中止","周誤"]):
+                    errors.append(f"{car}番の異常情報「{old_status}」が通常扱いへ変わります。")
+    except Exception as exc:
+        warnings.append(f"既存結果との詳細比較を完了できませんでした：{type(exc).__name__}")
+    return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))
+
+
 # Ver233: 保存済み結果を結果登録画面から選択し、元本文またはDB再構成本文を復元する。
 def _v233_list_saved_results(db_path: str, limit: int = 200) -> list[dict]:
     try:
@@ -1027,7 +1150,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver237｜登録済み結果は復元時に閉じて表示。6周展開は車立て・確率集中度に応じた適応試行で高速化")
+st.caption("Ver238｜保存済み結果の復元・上書きを安全化。元本文がない旧結果は編集復元せず、誤登録を事前検査")
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
@@ -6464,22 +6587,25 @@ if selected_main_page == "✅ 結果登録・解析":
         ):
             row = saved_results[int(selected_saved_result) - 1]
             race_key_restore = str(row.get("race_key") or "")
-            payload = _v233_load_result_payload(engine.DB_PATH, race_key_restore)
-            restored_text = str(payload.get("raw_result_text") or "").strip()
-            if not restored_text:
-                restored_text = _v233_build_result_text_from_db(engine.DB_PATH, race_key_restore)
+            restored_text = _v238_load_exact_raw_result(engine.DB_PATH, race_key_restore)
             if restored_text:
                 st.session_state["v163_saved_result_text"] = restored_text
                 st.session_state["v163_saved_result_venue"] = str(row.get("venue") or "")
                 st.session_state["v163_saved_result_race_no"] = str(row.get("race_no") or "")
+                st.session_state["v238_result_restore_source"] = "exact_archive"
                 st.session_state["result_input_version"] = int(st.session_state.get("result_input_version", 0)) + 1
                 for key in ["v35_result_meta","v35_result_rows","v35_result_laps","v35_result_payouts"]:
                     st.session_state.pop(key, None)
-                st.session_state["result_reset_notice"] = f"保存済み結果を復元しました：{race_key_restore}。修正後、そのまま置き換え登録できます。"
+                st.session_state["result_reset_notice"] = f"元の結果本文を復元しました：{race_key_restore}。内容を確認して置き換えできます。"
                 st.rerun()
             else:
-                st.warning("保存済み結果の本文を復元できませんでした。")
-        st.caption("Ver233以降は貼り付けた元の結果本文も保存します。旧データは着順・周回・払戻から編集用本文を再構成します。")
+                st.session_state["v238_structured_preview_race_key"] = race_key_restore
+                st.warning(
+                    "この旧結果には、貼り付け時の元本文が保存されていません。"
+                    " 不完全な再構成本文による誤上書きを防ぐため、編集欄には復元しません。"
+                    " 公式結果の原文を貼り付けてください。"
+                )
+        st.caption("Ver238以降は元の結果本文を専用保管します。元本文がない旧結果は安全のため編集欄へ再構成復元しません。")
 
     def _reset_result_input_only():
         """結果入力関連だけを初期化し、DB・予測・学習キャッシュは維持する。"""
@@ -6500,6 +6626,8 @@ if selected_main_page == "✅ 結果登録・解析":
         _v163_clear_saved_inputs(
             "v163_saved_result_text", "v163_saved_result_venue", "v163_saved_result_race_no"
         )
+        st.session_state.pop("v238_result_restore_source", None)
+        st.session_state.pop("v238_structured_preview_race_key", None)
         st.session_state["result_reset_notice"] = "結果入力だけをリセットしました。予測結果・DBキャッシュ・重み設定は維持しています。"
 
     st.button(
@@ -6522,6 +6650,8 @@ if selected_main_page == "✅ 結果登録・解析":
         args=(result_text_key, "v163_saved_result_text"),
     )
 
+    if result_text and "v238_result_restore_source" not in st.session_state:
+        st.session_state["v238_result_restore_source"] = "manual"
     detected_result_venue = _detect_result_venue_from_title(result_text)
     c1, c2 = st.columns(2)
     if detected_result_venue:
@@ -6673,8 +6803,17 @@ if selected_main_page == "✅ 結果登録・解析":
             if replace_registered:
                 st.info("再登録では、古い結果データを削除してから今回の内容を登録し直します。")
 
+        safety_errors, safety_warnings = _v238_result_safety_check(
+            engine.DB_PATH, existing_result_key if result_exists else "", rows_r
+        )
+        for msg in safety_warnings:
+            st.warning(f"上書き確認：{msg}")
+        if safety_errors:
+            st.error("安全チェックで登録を停止しました。")
+            for msg in safety_errors:
+                st.caption(f"・{msg}")
         button_label = "登録済み結果を置き換えて再解析" if replace_registered else "DBへ登録して予測差・展開を解析"
-        button_disabled = bool(result_exists and not replace_registered)
+        button_disabled = bool((result_exists and not replace_registered) or safety_errors)
         if st.button(button_label, type="primary", use_container_width=True, disabled=button_disabled):
             try:
                 # 解析後のsession_state復元や再登録でも、発走後事故の学習遮断フラグを再適用する。
@@ -6720,6 +6859,11 @@ if selected_main_page == "✅ 結果登録・解析":
                     if "message" not in analysis:
                         predicted_trifecta_saved = "→".join(map(str, comparison.sort_values("predicted_rank")["車番"].head(3).astype(int)))
                         actual_trifecta_saved = "→".join(map(str, rows_r.sort_values("着順")["車番"].head(3).astype(int)))
+                    try:
+                        source_kind = str(st.session_state.get("v238_result_restore_source") or "manual")
+                        _v238_save_exact_raw_result(engine.DB_PATH, key, str(result_text or ""), source_kind)
+                    except Exception as raw_exc:
+                        st.warning(f"元の結果本文の保管に失敗しました：{type(raw_exc).__name__}")
                     result_view_payload = {
                         "key": key,
                         "comparison": comparison,
@@ -6729,6 +6873,7 @@ if selected_main_page == "✅ 結果登録・解析":
                         "actual_trifecta": actual_trifecta_saved,
                         "mixed_plan_result": mixed_plan_result,
                         "raw_result_text": str(result_text or ""),
+                        "raw_result_source": str(st.session_state.get("v238_result_restore_source") or "manual"),
                         "result_meta": dict(meta_r or {}),
                         "result_rows": rows_r.copy() if isinstance(rows_r, pd.DataFrame) else rows_r,
                         "result_laps": laps_r.copy() if isinstance(laps_r, pd.DataFrame) else laps_r,
