@@ -698,9 +698,10 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 
 
 
+# Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver234"
+_V231_APP_VERSION = "Ver235"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -5691,23 +5692,33 @@ elif selected_main_page == "🏁 予測":
         st.caption("Ver20では10要素（試走・ST・ハンデ・近況・走路適性・前残り・追い込み・周回安定・コース適性・相手耐性）を評価します。三連単は順番まで完全一致した場合だけ的中です。1レースの変更幅は各項目±0.003以内です。")
     # Ver231: 保存済み予測をバージョン履歴から復元。旧Ver222データも救済表示する。
     saved_histories = _v231_list_prediction_histories(engine.DB_PATH)
-    saved_predictions = _v222_list_prediction_restores(engine.DB_PATH) if not saved_histories else []
+    # Ver235: 新履歴が1件でも存在すると旧v222保存が全て隠れる不具合を修正。
+    # 両方を常に読み込み、DBから削除・移行せず一覧上で統合する。
+    saved_predictions = _v222_list_prediction_restores(engine.DB_PATH)
     if saved_histories or saved_predictions:
         st.markdown("### ♻️ 保存済みレース・予測版を復元")
         restore_labels = []
         restore_by_label = {}
-        if saved_histories:
-            for item in saved_histories:
-                when = str(item.get("prediction_time") or "").replace("T", " ")[:19]
-                label = f"{item.get('race_label','保存済み予測')}｜{item.get('app_version','Unknown')}｜{when}"
-                restore_labels.append(label)
-                restore_by_label[label] = {"kind":"history", **item}
-        else:
-            for item in saved_predictions:
-                when = str(item.get("updated_at") or "").replace("T", " ")[:19]
-                label = f"{item.get('race_label','保存済み予測')}｜旧データ Version Unknown｜{when}"
-                restore_labels.append(label)
-                restore_by_label[label] = {"kind":"legacy", **item}
+        for item in saved_histories:
+            when = str(item.get("prediction_time") or "").replace("T", " ")[:19]
+            base_label = f"{item.get('race_label','保存済み予測')}｜{item.get('app_version','Unknown')}｜{when}"
+            label = base_label
+            suffix = 2
+            while label in restore_by_label:
+                label = f"{base_label} ({suffix})"
+                suffix += 1
+            restore_labels.append(label)
+            restore_by_label[label] = {"kind":"history", **item}
+        for item in saved_predictions:
+            when = str(item.get("updated_at") or "").replace("T", " ")[:19]
+            base_label = f"{item.get('race_label','保存済み予測')}｜旧形式・最新保存｜{when}"
+            label = base_label
+            suffix = 2
+            while label in restore_by_label:
+                label = f"{base_label} ({suffix})"
+                suffix += 1
+            restore_labels.append(label)
+            restore_by_label[label] = {"kind":"legacy", **item}
         c_restore, c_button = st.columns([3,1])
         with c_restore:
             restore_label = st.selectbox("保存済み予測", restore_labels, key="v231_prediction_restore_select", label_visibility="collapsed")
@@ -5751,7 +5762,7 @@ elif selected_main_page == "🏁 予測":
         if isinstance(restored_result, dict) and restored_result:
             with st.expander("✅ このレースの登録済み結果・実回収率", expanded=True):
                 render_last_result_analysis(restored_result)
-        st.caption("同じレースを再予測しても上書きせず、予測時刻・バージョン別に履歴を残します。旧データは Version Unknown として扱います。")
+        st.caption("同じレースを再予測しても上書きせず、予測時刻・バージョン別に履歴を残します。旧形式の保存も消さずに一覧へ統合し、Version Unknown／旧形式として扱います。")
 
     st.session_state.setdefault("prediction_input_version", 0)
     if st.button("🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input"):
