@@ -280,7 +280,7 @@ def _v230_hist_profiles(venue: str, names: list[str]) -> dict[str, dict]:
 
 
 
-# Ver240: グランドノートから周回別の追い抜き・被追い抜き後失速を学習する。
+# Ver241: グランドノートから周回別の追い抜き・被追い抜き後失速を学習する。
 def _v240_transition_profiles(venue: str, names: list[str]) -> dict[str, dict]:
     """player_lap_historyから周回別追抜傾向と、抜かれた直後の連鎖後退を縮小推定。"""
     base = {n: {
@@ -590,7 +590,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     target=max(1,int(trials))
     all_combos=[(a,b,c) for a in cars for b in cars for c in cars if a!=b and a!=c and b!=c]
     prior_total=max(1.0,float(sum(tri.values()) or 1.0))
-    # Ver240: 失速連鎖を含む6周結果を尊重しつつ、有限試行の偶然と過信を温度校正する。
+    # Ver241: 失速連鎖を含む6周結果を尊重しつつ、有限試行の偶然と過信を温度校正する。
     sim_mix=0.88
     floor_mass=0.03 / max(1,len(all_combos))
     scaled={}
@@ -622,7 +622,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
     audit={
-        "enabled":True,"mode":"6周内蔵Ver240・失速連鎖","sim_trials":sim_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver241・失速連鎖","sim_trials":sim_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -855,7 +855,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver240"
+_V231_APP_VERSION = "Ver241"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -1263,7 +1263,30 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver240｜グランドノートの周回変化から、追い抜き後の勢いと横並びで抜かれた車の一時失速・連鎖後退を6周展開へ反映。")
+st.caption("Ver241｜グランドノートの周回変化から、追い抜き後の勢いと横並びで抜かれた車の一時失速・連鎖後退を6周展開へ反映。")
+
+# Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
+# 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
+# モバイル時だけプルダウン本体・検索入力・表示値を16px以上に固定する。
+st.markdown(
+    """
+    <style>
+    @media (max-width: 768px) {
+      div[data-baseweb="select"] > div,
+      div[data-baseweb="select"] input,
+      div[data-baseweb="select"] span,
+      div[role="listbox"],
+      div[role="option"] {
+        font-size: 16px !important;
+      }
+      div[data-baseweb="select"] input {
+        min-height: 24px !important;
+      }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.markdown('<div id="page-top"></div>', unsafe_allow_html=True)
 st.markdown(
