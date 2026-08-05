@@ -473,20 +473,27 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     # Ver237: 20,000回すべてで重い6周処理を行わず、車立てと旧分布の集中度から
     # 必要な展開試行数を自動決定する。最終確率は要求試行数へ再スケールするため、
     # UI・DB上の確率母数は従来設定を維持する。
-    base_budget={6:2800,7:3600,8:4500}.get(len(cars),3800)
+    base_budget={6:1900,7:2500,8:3200}.get(len(cars),2700)
     prior_ranked=sorted((float(v) for v in tri.values()), reverse=True)
     top_mass=(sum(prior_ranked[:12])/max(1.0,float(sum(prior_ranked)))) if prior_ranked else 0.0
     if top_mass < 0.35:
-        base_budget += 900  # 混戦だけ追加試行
+        base_budget += 700  # 混戦だけ追加試行
     elif top_mass > 0.65:
-        base_budget -= 500  # 強く集中したレースは早めに収束
-    sim_trials=max(2200,min(requested_trials,base_budget))
+        base_budget -= 350  # 強く集中したレースは早めに収束
+    sim_trials=max(1400,min(requested_trials,base_budget))
     counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
     # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
     base_order=sorted(cars,key=lambda c:(handicap[c],c))
-    for _ in range(sim_trials):
+    
+    # Ver243: 上位展開の分布が十分に安定したら早期終了する。
+    # 本命集中レースを無駄に最後まで回さず、混戦時は設定上限まで継続する。
+    planned_trials = sim_trials
+    convergence_checks = 0
+    previous_signature = None
+    completed_trials = 0
+    for sim_index in range(planned_trials):
         # その日の出来・機力発揮度を試行ごとに変える。同じ能力順を20,000回固定しない。
         # 共通の走路揺らぎと選手別の出来を分け、極端な本命固定を抑える。
         race_noise=rng.normal(0,0.10)
@@ -588,6 +595,21 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     rel += 0.012*(1.0+0.15*lap)
                 gaps[j]=min(2.0,max(0.04,gaps[j]-rel))
         combo=tuple(order[:3]); counts[combo]=counts.get(combo,0)+1
+        completed_trials = sim_index + 1
+        if completed_trials >= 1200 and completed_trials % 400 == 0:
+            ranked_now = sorted(counts.values(), reverse=True)[:12]
+            denom_now = max(1, completed_trials)
+            signature = tuple(round(v / denom_now, 4) for v in ranked_now)
+            if previous_signature is not None and len(signature) == len(previous_signature):
+                drift = sum(abs(a-b) for a,b in zip(signature, previous_signature))
+                if drift < 0.012:
+                    convergence_checks += 1
+                else:
+                    convergence_checks = 0
+            previous_signature = signature
+            if convergence_checks >= 2 and top_mass >= 0.48:
+                break
+    sim_trials=max(1, completed_trials)
     _v242_sim_seconds=time_module.perf_counter()-_v242_sim_started
     # 元のtrial数へ整数スケール。シミュレーションだけで0回になった着順も、
     # 旧モデル分布を少量混ぜて極端な消失を防ぎ、全組み合わせを必ず保存する。
@@ -626,14 +648,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
     audit={
-        "enabled":True,"mode":"6周内蔵Ver241・失速連鎖","sim_trials":sim_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver243・収束監視","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
-        "message":f"試走・過去展開・直接対戦に加え、周回別追抜傾向と横並びで抜かれた後の失速連鎖を反映。要求{requested_trials:,}回に対し展開本体は{sim_trials:,}回で計算。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。温度校正後の全3連単を保存",
+        "message":f"周回別追抜・失速連鎖・直接対戦を維持し、上位展開が収束した場合は早期終了。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
     }
     return out,new_bets,audit
 
@@ -860,7 +882,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver242"
+_V231_APP_VERSION = "Ver243"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -1268,7 +1290,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver242｜復元はボタン式でキーボードを出さず、6周展開は学習値を先読みして軽量試行へ最適化。不成立フォーメーションも最終検査で除外。")
+st.caption("Ver243｜6周展開は収束監視で十分に安定した時点で早期終了。混戦だけ追加計算し、精度ロジックを残したまま待ち時間を短縮。")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
