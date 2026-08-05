@@ -361,89 +361,6 @@ def _v240_transition_profiles(venue: str, names: list[str]) -> dict[str, dict]:
         pass
     return base
 
-
-
-# Ver247: 開催場別の壁の強さ・崩れ方・高温時の前残りを、登録済み結果から自動学習する。
-def _v247_wall_learning_profile(venue: str) -> dict:
-    """周回履歴と結果登録から壁パラメータを縮小推定する。結果登録後は次回予測から自動反映。"""
-    default = {
-        "sample": 0, "race_sample": 0, "wall_scale": 1.0, "double_wall_bonus": 0.12,
-        "lap_decay": [1.0, 1.00, 0.90, 0.78, 0.66, 0.55, 0.46],
-        "hot_wall_scale": 1.0, "hot_sample": 0, "auto_learned": False,
-    }
-    if not venue:
-        return default
-    try:
-        con = sqlite3.connect(_v230_db_path(), timeout=15)
-        # DB89では player_lap_history と result_races が主データ。各選手の周回順位変化を開催場別に集計する。
-        rows = con.execute(
-            """
-            SELECT plh.race_key, plh.player_name, plh.lap_no, plh.position,
-                   COALESCE(rr.track_temp,0)
-            FROM player_lap_history plh
-            JOIN result_races rr ON rr.race_key=plh.race_key
-            WHERE rr.venue=? AND COALESCE(rr.learning_eligible,1)=1
-              AND plh.lap_no IS NOT NULL AND plh.position IS NOT NULL
-            ORDER BY plh.race_key, plh.player_name, plh.lap_no
-            """, (str(venue),)
-        ).fetchall()
-        con.close()
-        if not rows:
-            return default
-        grouped={}
-        race_keys=set()
-        for rk,name,lap,pos,temp in rows:
-            grouped.setdefault((str(rk),_v230_norm_name(name)),[]).append((int(lap),int(pos),float(temp or 0)))
-            race_keys.add(str(rk))
-        gains=[]; holds=[]; late_breaks=[]; hot_holds=[]; normal_holds=[]
-        for (_rk,_name), vals in grouped.items():
-            vals=sorted(vals)
-            if len(vals)<2:
-                continue
-            first=vals[0][1]; final=vals[-1][1]; temp=vals[0][2]
-            deltas=[]
-            for j in range(1,len(vals)):
-                prev=vals[j-1][1]; cur=vals[j][1]
-                deltas.append(prev-cur)
-            gains.extend(deltas)
-            hold=1.0 if final<=first else 0.0
-            holds.append(hold)
-            # 後半で順位が動くほど、壁は終盤に崩れやすい。
-            if len(deltas)>=3:
-                late_breaks.append(sum(abs(x) for x in deltas[len(deltas)//2:]) / max(1,len(deltas[len(deltas)//2:])))
-            if temp>=48.0:
-                hot_holds.append(hold)
-            elif temp>0:
-                normal_holds.append(hold)
-        n=len(holds)
-        if n<4:
-            return default
-        conf=min(1.0,n/260.0)
-        move_rate=sum(1.0 for x in gains if x!=0)/max(1,len(gains))
-        over_rate=sum(max(0,x) for x in gains)/max(1,len(gains))
-        hold_rate=sum(holds)/n
-        # 順位変動が少なく前方維持が多いほど壁を強くする。
-        raw_scale=max(0.84,min(1.20, 1.02 + 0.22*(hold_rate-0.5) - 0.18*(move_rate-0.35) - 0.05*over_rate))
-        wall_scale=1.0+conf*(raw_scale-1.0)
-        double_bonus=max(0.08,min(0.19,0.115 + 0.10*(hold_rate-0.5) - 0.06*(move_rate-0.35)))
-        late=sum(late_breaks)/max(1,len(late_breaks))
-        late_factor=max(0.42,min(0.60,0.53-0.06*(late-0.35)))
-        lap_decay=[1.0,1.00,0.91,0.80,0.69,0.59,late_factor]
-        hot_scale=1.0
-        if len(hot_holds)>=8 and len(normal_holds)>=16:
-            delta=(sum(hot_holds)/len(hot_holds))-(sum(normal_holds)/len(normal_holds))
-            hot_conf=min(1.0,len(hot_holds)/70.0)
-            hot_scale=max(0.88,min(1.12,1.0+hot_conf*delta*0.30))
-        return {
-            "sample":n, "race_sample":len(race_keys), "wall_scale":wall_scale,
-            "double_wall_bonus":double_bonus, "lap_decay":lap_decay,
-            "hot_wall_scale":hot_scale, "hot_sample":len(hot_holds),
-            "auto_learned":True, "hold_rate":hold_rate, "move_rate":move_rate,
-        }
-    except Exception:
-        return default
-
-
 def _v230_matchup_map(names: list[str]) -> dict[tuple[str,str], tuple[float,float]]:
     """直接対戦の追い抜き優位を返す。値は(優位度,信頼度)。"""
     result={}
@@ -548,8 +465,6 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     profiles=_v230_hist_profiles(venue,names)
     transition_profiles=_v240_transition_profiles(venue,names)
     matchups=_v230_matchup_map(names)
-    wall_learning=_v247_wall_learning_profile(venue)
-    track_temp=_v230_num((meta or {}).get("走路温度", (meta or {}).get("track_temp", 0.0)), 0.0)
     _v242_prepare_seconds=time_module.perf_counter()-_v242_prepare_started
     name_by_car={c:n for c,n in zip(cars,names)}
     rng=np.random.default_rng(int(seed)+230)
@@ -620,27 +535,12 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 tp=transition_profiles.get(cn,{})
                 ftp=transition_profiles.get(fn,{})
                 lap_attack=(tp.get("lap_attack") or [0.0]*7)[lap] if lap < len(tp.get("lap_attack") or []) else 0.0
-                # 選手別wall_resistance。追抜実績・追込み・突破適性を縮小して壁耐性へ変換。
-                wall_resistance=max(-0.24,min(0.30,
-                    (hp.get("overtake",0.5)-0.5)*0.70 +
-                    (hp.get("chase",0.5)-0.5)*0.35 +
-                    (breakthrough[chaser]-0.5)*0.18))
-                hist=(hp.get("overtake",0.5)-0.5)*1.0 + (hp.get("chase",0.5)-0.5)*0.55 + lap_attack + wall_resistance
+                hist=(hp.get("overtake",0.5)-0.5)*1.0 + (hp.get("chase",0.5)-0.5)*0.55 + lap_attack
                 direct=max(-0.5,min(0.5,adv))*min(1.0,conf)*0.85
                 # 壁は残すが、前車が明確に遅い場合まで一律に詰まらせない。
                 speed_edge=max(-2.5,min(2.5,perf[chaser]-perf[front]))
-                # Ver247: 開催場別に自動学習した壁強度と、2台以上の密集壁を反映。
-                lap_decay=(wall_learning.get("lap_decay") or [1.0]*7)[lap]
-                venue_wall=float(wall_learning.get("wall_scale",1.0))
-                if track_temp>=48.0:
-                    venue_wall*=float(wall_learning.get("hot_wall_scale",1.0))
-                wall=(0.34 + 0.15*density + 0.10*(1-breakthrough[chaser]) - 0.08*max(0.0,speed_edge))
-                close_behind = i+1<len(order) and gaps[i+1]<0.20
-                close_ahead = i>=2 and gaps[i-1]<0.20
-                wall_pack_count=int(close_behind)+int(close_ahead)
-                if wall_pack_count:
-                    wall += float(wall_learning.get("double_wall_bonus",0.12))*wall_pack_count
-                wall *= venue_wall * lap_decay
+                wall=0.34 + 0.15*density + 0.10*(1-breakthrough[chaser]) - 0.08*max(0.0,speed_edge)
+                if i+1<len(order) and gaps[i+1]<0.20: wall += 0.10
                 # 前車が履歴上よく粘るほど突破しにくい。終盤は少し追い抜きやすくする。
                 # 先頭・前方にいるだけの最低保証は与えない。後車の速度優位と残り周回を強めに反映。
                 front_hold=(fprof.get("hold",0.5)-0.5)*0.48
@@ -748,15 +648,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
     audit={
-        "enabled":True,"mode":"6周内蔵Ver247・自動壁学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver245・収束監視＋展開診断","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
-        "wall_learning": wall_learning,
-        "message":f"2台以上の密集壁・周回ごとの壁崩壊・選手別壁耐性を反映。{venue or '開催場未取得'}の登録済み結果{int(wall_learning.get('sample',0))}件から壁強度を自動学習し、今後の結果登録後は次回予測から自動更新。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。",
+        "message":f"周回別追抜・失速連鎖・直接対戦を維持し、上位展開が収束した場合は早期終了。展開診断と着順入替ペア比較を有効化。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
     }
     return out,new_bets,audit
 
@@ -983,7 +882,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver245"
+_V231_APP_VERSION = "Ver247"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -1391,7 +1290,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver247｜2台以上の密集壁・周回別の壁崩壊・選手別壁耐性を追加。開催場別の壁補正は登録済み結果から自動調整します。")
+st.caption("Ver245｜6周展開診断を見やすくし、同じ1着・同じ3車で2着3着だけ入れ替わる三連単を、確率差が小さい場合にセット比較します。")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
