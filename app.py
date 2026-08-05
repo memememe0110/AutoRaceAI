@@ -648,14 +648,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
     audit={
-        "enabled":True,"mode":"6周内蔵Ver243・収束監視","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver245・収束監視＋展開診断","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
-        "message":f"周回別追抜・失速連鎖・直接対戦を維持し、上位展開が収束した場合は早期終了。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
+        "message":f"周回別追抜・失速連鎖・直接対戦を維持し、上位展開が収束した場合は早期終了。展開診断と着順入替ペア比較を有効化。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
     }
     return out,new_bets,audit
 
@@ -882,7 +882,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver244"
+_V231_APP_VERSION = "Ver245"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -1290,7 +1290,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver244｜単勝・ワイドをHTMLから追加読込。回収率重視の本線とは分け、余裕がある場合の高期待値候補として表示・保存します。")
+st.caption("Ver245｜6周展開診断を見やすくし、同じ1着・同じ3車で2着3着だけ入れ替わる三連単を、確率差が小さい場合にセット比較します。")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
@@ -4884,6 +4884,68 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     except Exception:
         hard_race_info = {"enabled": False}
 
+
+    # Ver245: 同じ1着・同じ3車で2着と3着だけが入れ替わる三連単をセット比較する。
+    # 片側だけ残すことで取りこぼしやすい展開を守るが、何でも折り返して点数を膨らませない。
+    # 確率差が小さく、追加後も単独ガミにならず、全体指標を大きく悪化させない場合だけ最大2点追加。
+    v245_pair_protection_notes = []
+    try:
+        tri_by_combo = {
+            str(t.get("combo", "")): t for t in tri_candidates
+            if str(t.get("type", "")).replace("三", "3") == "3連単"
+        }
+        selected_ids_now = {(str(t.get("type", "")), str(t.get("combo", ""))) for t in selected}
+        pair_candidates = []
+        base_pair_metrics = evaluate(selected)
+        for ticket in list(selected):
+            if str(ticket.get("type", "")).replace("三", "3") != "3連単":
+                continue
+            try:
+                a, b, c = (int(x) for x in str(ticket.get("combo", "")).split("-"))
+            except Exception:
+                continue
+            reverse_combo = f"{a}-{c}-{b}"
+            reverse_ticket = tri_by_combo.get(reverse_combo)
+            if reverse_ticket is None or (str(reverse_ticket.get("type", "")), reverse_combo) in selected_ids_now:
+                continue
+            p1 = float(ticket.get("probability", 0.0) or 0.0)
+            p2 = float(reverse_ticket.get("probability", 0.0) or 0.0)
+            odds2 = float(reverse_ticket.get("odds", 0.0) or 0.0)
+            if p1 <= 0 or p2 < 0.80 or p2 < p1 * 0.62:
+                continue
+            new_points = len(selected) + 1
+            standalone_ev = (p2 / 100.0) * odds2
+            if odds2 < float(new_points) or standalone_ev < 0.72:
+                continue
+            trial_plan = list(selected) + [reverse_ticket]
+            after = evaluate(trial_plan)
+            return_drop = float(base_pair_metrics.get("model_return_rate", 0.0) - after.get("model_return_rate", 0.0))
+            black_drop = float(base_pair_metrics.get("black", 0.0) - after.get("black", 0.0))
+            cover_gain = float(after.get("cover", 0.0) - base_pair_metrics.get("cover", 0.0))
+            low_gain = float(after.get("low", 0.0) - base_pair_metrics.get("low", 0.0))
+            if return_drop > 5.0 or black_drop > 0.55 or low_gain > 1.25:
+                continue
+            score = 1.25 * cover_gain + 0.60 * p2 + 8.0 * standalone_ev - 0.55 * return_drop - 0.40 * low_gain
+            pair_candidates.append((score, ticket, reverse_ticket, after, return_drop, black_drop, cover_gain, standalone_ev))
+
+        for _, source_ticket, reverse_ticket, after, return_drop, black_drop, cover_gain, standalone_ev in sorted(pair_candidates, key=lambda x: x[0], reverse=True)[:2]:
+            key = (str(reverse_ticket.get("type", "")), str(reverse_ticket.get("combo", "")))
+            if key in {(str(t.get("type", "")), str(t.get("combo", ""))) for t in selected}:
+                continue
+            selected.append(reverse_ticket)
+            base_pair_metrics = evaluate(selected)
+            reverse_ticket["protected"] = True
+            v245_pair_protection_notes.append(
+                f"展開入替ペアを保護：{source_ticket.get('combo')} に対し {reverse_ticket.get('combo')} を追加。"
+                f"確率{float(reverse_ticket.get('probability',0)):.2f}%・オッズ{float(reverse_ticket.get('odds',0)):.1f}倍・"
+                f"単体期待値{standalone_ev*100:.1f}%・追加カバー+{cover_gain:.2f}pt"
+            )
+        if v245_pair_protection_notes:
+            metrics = evaluate(selected)
+            replacement_notes.extend(v245_pair_protection_notes)
+    except Exception:
+        v245_pair_protection_notes = []
+
     # Ver206: 低評価でも3着へ残る選手を、無条件で本線へ追加しない。
     # 既存の1・2着軸、3連複、別の3連単から自然に派生し、オッズ込みの期待値がある3連単だけを
     # 「余裕がある場合の追加候補」または「低効率券との入れ替え候補」として提示する。
@@ -6518,6 +6580,21 @@ elif selected_main_page == "🏁 予測":
                     f"{int(x['car'])}番 壁ロス{float(x.get('effective_loss',0))*100:.1f}%" for x in risks
                 )
                 st.info(f"🧱 6周内蔵型の壁展開を反映｜{risk_text}\n\n{wall_audit.get('message','')}")
+                try:
+                    sim_n = int(wall_audit.get("sim_trials", 0) or 0)
+                    planned_n = int(wall_audit.get("planned_trials", 0) or 0)
+                    prep_s = float(wall_audit.get("prepare_seconds", 0.0) or 0.0)
+                    sim_s = float(wall_audit.get("simulation_seconds", 0.0) or 0.0)
+                    top_scenarios = wall_audit.get("top_scenarios") or []
+                    top_text = " / ".join(
+                        f"{x.get('combo')} {float(x.get('prob',0)):.2f}%" for x in top_scenarios[:3]
+                    ) or "候補なし"
+                    st.caption(
+                        f"展開診断｜実行 {sim_n:,}回 / 計画 {planned_n:,}回｜準備 {prep_s:.2f}秒 / 6周計算 {sim_s:.2f}秒｜"
+                        f"上位展開 {top_text}"
+                    )
+                except Exception:
+                    pass
             st.subheader("予測順位")
             st.dataframe(result, use_container_width=True, hide_index=True)
             st.caption("Ver196では最終順位を本シミュレーションの1着率と一致させます。従来の総合点順位は診断列として残し、連対・3着候補は別順位で確認できます。")
@@ -8195,3 +8272,6 @@ if selected_main_page == "🗃️ 登録情報確認":
 # Ver221: 4券種全オッズの時刻別DB保存・最新自動復元・履歴選択復元
 
 # Ver226: 開催場別・ハンデ構成別・日付開催場別の予測成績分析を回収率実績画面へ追加。
+
+
+# Ver245: 6周展開診断表示と、同一1着・同一3車の2着3着入替ペアを条件付きで保護。
