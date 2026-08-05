@@ -882,7 +882,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver243"
+_V231_APP_VERSION = "Ver244"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -1290,7 +1290,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver243｜6周展開は収束監視で十分に安定した時点で早期終了。混戦だけ追加計算し、精度ロジックを残したまま待ち時間を短縮。")
+st.caption("Ver244｜単勝・ワイドをHTMLから追加読込。回収率重視の本線とは分け、余裕がある場合の高期待値候補として表示・保存します。")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
@@ -2870,7 +2870,7 @@ def v182_parse_four_block_odds(text: str) -> dict:
     期待する列は、三連単4列・三連複4列・2連単3列・2連複3列。
     タブ区切りを優先し、空欄を保持する。
     """
-    result = {"3tan": {}, "3fuku": {}, "2tansho": {}, "2fuku": {}}
+    result = {"3tan": {}, "3fuku": {}, "2tansho": {}, "2fuku": {}, "tansho": {}, "wide": {}}
     for raw in str(text or "").splitlines():
         line = raw.rstrip("\r\n")
         if not line.strip() or "3連単人気" in line:
@@ -2925,6 +2925,8 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
         "live-odds-rt2-container",
         "live-odds-rf2-container",
         "live-odds-pop-container",
+        "live-odds-tns-container",
+        "live-odds-wid-container",
     }
     if not any(target_id in raw for target_id in target_ids):
         return result
@@ -3002,11 +3004,15 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
         return match.group(1) if match else None
 
     def _odd(value):
-        value = str(value or "").replace(",", "").strip()
+        value = str(value or "").replace(",", "").replace("〜", "～").strip()
         if not value or value in {"-", "―", "発売なし"}:
             return None
+        # ワイドは「2.2～2.6」の範囲表示。長期回収率判定では安全側の下限を使う。
+        match = re.search(r"(\d+(?:\.\d+)?)", value)
+        if not match:
+            return None
         try:
-            parsed = float(value)
+            parsed = float(match.group(1))
             return parsed if parsed > 0 else None
         except Exception:
             return None
@@ -3087,10 +3093,51 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
                         values["-".join(combo)] = price
         return values
 
+    def _parse_single(container_id: str) -> dict:
+        values = {}
+        for table in _usable_tables(container_id):
+            rows = table.get("rows", [])
+            if len(rows) < 2:
+                continue
+            cars = [_number(cell.get("text")) for cell in rows[0]]
+            odds_cells = rows[1]
+            for idx, car in enumerate(cars):
+                if not car or idx >= len(odds_cells):
+                    continue
+                price = _odd(odds_cells[idx].get("text"))
+                if price is not None:
+                    values[str(car)] = price
+        return values
+
+    def _parse_wide(container_id: str) -> dict:
+        values = {}
+        for table in _usable_tables(container_id):
+            rows = table.get("rows", [])
+            if not rows:
+                continue
+            axes = [_number(cell.get("text")) for cell in rows[0]]
+            axes = [x for x in axes if x]
+            if not axes:
+                continue
+            for row in rows[1:]:
+                for column_index, axis in enumerate(axes):
+                    base = column_index * 2
+                    if base + 1 >= len(row):
+                        continue
+                    other = _number(row[base].get("text"))
+                    price = _odd(row[base + 1].get("text"))
+                    if not other or price is None or other == axis:
+                        continue
+                    combo = "-".join(sorted((axis, other), key=int))
+                    values[combo] = price
+        return values
+
     result["3tan"] = _parse_three("live-odds-rt3-container", True)
     result["3fuku"] = _parse_three("live-odds-rf3-container", False)
     result["2tansho"] = _parse_two("live-odds-rt2-container", True)
     result["2fuku"] = _parse_two("live-odds-rf2-container", False)
+    result["tansho"] = _parse_single("live-odds-tns-container")
+    result["wide"] = _parse_wide("live-odds-wid-container")
 
     # 人気表だけが保存された簡易HTMLにも対応する。
     if sum(len(values) for values in result.values()) == 0:
@@ -3147,7 +3194,7 @@ def _v221_save_all_odds(db_path: str, race_key: str, parsed: dict, source: str) 
     if not race_key:
         return ''
     clean = {}
-    for bet_key in ('3tan', '3fuku', '2tansho', '2fuku'):
+    for bet_key in ('3tan', '3fuku', '2tansho', '2fuku', 'tansho', 'wide'):
         values = parsed.get(bet_key, {}) or {}
         clean[bet_key] = {str(k): float(v) for k, v in values.items() if v is not None and float(v) > 0}
     if sum(len(v) for v in clean.values()) <= 0:
@@ -3179,7 +3226,7 @@ def _v221_save_all_odds(db_path: str, race_key: str, parsed: dict, source: str) 
 
 
 def _v221_load_odds_snapshot(db_path: str, race_key: str, snapshot_id: str = '') -> tuple[dict, dict]:
-    empty = {'3tan': {}, '3fuku': {}, '2tansho': {}, '2fuku': {}}
+    empty = {'3tan': {}, '3fuku': {}, '2tansho': {}, '2fuku': {}, 'tansho': {}, 'wide': {}}
     race_key = str(race_key or '').strip()
     if not race_key:
         return empty, {}
@@ -3230,10 +3277,10 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
     """重い診断より先に、HTMLまたは公式4券種表からオッズを読み込む。"""
     st.markdown('<div id="quick-odds-input"></div>', unsafe_allow_html=True)
     st.subheader("オッズ一括入力")
-    st.caption("AutoRace.JPの保存HTMLなら、3連単・3連複・2連単・2連複の全オッズを自動入力できます。読み込んだ全オッズはDBへ保存されます。")
+    st.caption("AutoRace.JPの保存HTMLなら、3連単・3連複・2連単・2連複に加えて単勝・ワイドも自動入力できます。読み込んだ全オッズはDBへ保存されます。")
 
     # セッションにオッズがない場合は、このレースの最新保存分を自動復元する。
-    odds_store_keys = [f"saved_odds_{namespace}_{k}" for k in ('3tan','3fuku','2tansho','2fuku')]
+    odds_store_keys = [f"saved_odds_{namespace}_{k}" for k in ('3tan','3fuku','2tansho','2fuku','tansho','wide')]
     has_session_odds = any(bool(st.session_state.get(k)) for k in odds_store_keys)
     if race_key and not has_session_odds:
         restored, run = _v221_load_odds_snapshot(engine.DB_PATH, race_key)
@@ -3279,7 +3326,7 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
             placeholder="AutoRace.JPのオッズページHTMLを貼り付け",
         )
 
-    if st.button("HTMLから4券種の全オッズを読み込む", key=f"v218_load_html_odds_{namespace}", use_container_width=True):
+    if st.button("HTMLから6券種の全オッズを読み込む", key=f"v218_load_html_odds_{namespace}", use_container_width=True):
         source = str(html_paste or "")
         if html_file is not None:
             try:
@@ -3524,6 +3571,23 @@ def show_v182_odds_adjusted_tight_recommendation(bets: dict, trials: int, meta: 
         st.caption(adjusted.get("reason", "オッズを読み込むと表示します。"))
         return
     st.subheader(f"{adjusted['icon']} 最終参考：{adjusted['final_points']}点・{adjusted['grade']}")
+    optional_simple = v244_optional_single_wide_candidates(bets, trials, odds_maps)
+    if optional_simple:
+        st.markdown("##### 🪙 余裕がある場合の単勝・ワイド候補")
+        st.caption("回収率重視の本線には自動追加しません。ワイドは表示レンジの下限オッズで安全側に評価しています。")
+        copy_lines = []
+        for row in optional_simple:
+            label = f"{row['type']} {row['combo']}"
+            copy_lines.append(label)
+            st.markdown(f"**{label}（{float(row['odds']):.1f}倍）**")
+            st.caption(f"モデル確率 {float(row['probability']):.2f}%・単体期待値 {float(row['ev']):.1f}%｜{row['reason']}")
+        v73_copy_box(
+            "余裕がある場合の単勝・ワイド候補",
+            "追加候補\n" + "\n".join(copy_lines),
+            f"v244_optional_single_wide_{race_key}_{saved_hash}",
+            height=max(120, 80 + 27 * len(copy_lines)),
+        )
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("基本点数", f"{adjusted['base_points']}点")
     c2.metric("オッズ調整", f"{adjusted['delta']:+d}点")
@@ -5166,6 +5230,49 @@ def v207_build_mixed_formation_sections(result: dict):
     return sections, notes
 
 
+def v244_optional_single_wide_candidates(bets: dict, trials: int, odds_maps: dict) -> list[dict]:
+    """単勝・ワイドは本線へ自動混入せず、余裕がある場合の候補として評価する。"""
+    tri_counter = (bets or {}).get("三連単", {}) or {}
+    if not tri_counter or int(trials or 0) <= 0:
+        return []
+    outcomes = []
+    for combo, count in tri_counter.items():
+        vals = tuple(int(v) for v in (tuple(combo) if isinstance(combo, (tuple, list)) else (combo,)))
+        if len(vals) == 3:
+            outcomes.append((vals, float(count) / max(int(trials), 1) * 100.0))
+    if not outcomes:
+        return []
+    win_prob = {}
+    wide_prob = {}
+    for (a, b, c), prob in outcomes:
+        win_prob[a] = win_prob.get(a, 0.0) + prob
+        for x, y in ((a, b), (a, c), (b, c)):
+            key = "-".join(map(str, sorted((x, y))))
+            wide_prob[key] = wide_prob.get(key, 0.0) + prob
+    rows = []
+    for car_text, odds in (odds_maps.get("tansho", {}) or {}).items():
+        try:
+            car = int(car_text); odd = float(odds); prob = float(win_prob.get(car, 0.0))
+        except Exception:
+            continue
+        ev = prob / 100.0 * odd * 100.0
+        if odd > 0 and prob >= 8.0 and ev >= 100.0:
+            rows.append({"type":"単勝","combo":str(car),"probability":prob,"odds":odd,"ev":ev,
+                         "reason":"1着確率と単勝オッズの組み合わせが100%以上"})
+    for combo, odds in (odds_maps.get("wide", {}) or {}).items():
+        try:
+            odd = float(odds); prob = float(wide_prob.get(str(combo), 0.0))
+        except Exception:
+            continue
+        ev = prob / 100.0 * odd * 100.0
+        # ワイドはHTMLの下限オッズを使うため、判定はやや厳しめ。
+        if odd > 0 and prob >= 18.0 and ev >= 105.0:
+            rows.append({"type":"ワイド","combo":str(combo),"probability":prob,"odds":odd,"ev":ev,
+                         "reason":"3着内ペア確率とワイド下限オッズで期待値105%以上"})
+    rows.sort(key=lambda r:(float(r.get("ev",0)), float(r.get("probability",0))), reverse=True)
+    # 同券種が並びすぎないよう最大3点。
+    return rows[:3]
+
 def show_v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict, race_key: str = "") -> None:
     result = v184_eight_car_mixed_plan(bets, trials, meta, odds_maps)
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH) or 0
@@ -6333,6 +6440,8 @@ elif selected_main_page == "🏁 予測":
                 "3fuku": st.session_state.get(f"saved_odds_{odds_namespace}_3fuku", {}),
                 "2tansho": st.session_state.get(f"saved_odds_{odds_namespace}_2tansho", {}),
                 "2fuku": st.session_state.get(f"saved_odds_{odds_namespace}_2fuku", {}),
+                "tansho": st.session_state.get(f"saved_odds_{odds_namespace}_tansho", {}),
+                "wide": st.session_state.get(f"saved_odds_{odds_namespace}_wide", {}),
             }
             st.markdown('<div id="return-priority-plan"></div>', unsafe_allow_html=True)
             st.markdown("## ⭐ 最優先・回収率重視の推奨買い目")
