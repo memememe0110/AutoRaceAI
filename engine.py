@@ -18453,3 +18453,55 @@ def v197_get_active_day_trend():
 # Ver207: UI側で回収率重視の買い目を最優先表示（予測ロジック変更なし）
 
 # Ver208: result analysis UI displays saved return-focused mixed-plan realized performance.
+
+# ============================================================
+# Ver242: フォーメーション最終安全検査
+# 同一車番を複数着へ置く不成立表記を出力しない。
+# ============================================================
+_V242_BASE_COMPRESS_FORMATIONS = v67_compress_formations
+
+
+def _v242_valid_combo(combo, bet_type):
+    try:
+        vals = tuple(int(x) for x in combo)
+    except Exception:
+        return False
+    if bet_type in ("3連単", "三連単", "3連複", "三連複"):
+        return len(vals) == 3 and len(set(vals)) == 3
+    if bet_type in ("2連単", "二連単", "2連複", "二連複"):
+        return len(vals) == 2 and len(set(vals)) == 2
+    return len(vals) == len(set(vals))
+
+
+def v67_compress_formations(combos, bet_type):
+    valid_target = {
+        tuple(int(x) for x in combo)
+        for combo in (combos or [])
+        if _v242_valid_combo(combo, bet_type)
+    }
+    if not valid_target:
+        return []
+    try:
+        raw_lines = list(_V242_BASE_COMPRESS_FORMATIONS(valid_target, bet_type) or [])
+    except Exception:
+        raw_lines = []
+
+    selected = []
+    covered = set()
+    for line in raw_lines:
+        try:
+            expanded = set(_v165_expand_formation_line(str(line), bet_type))
+        except Exception:
+            expanded = set()
+        # 展開結果に同一車番買い目が1つでも混ざる表記は丸ごと採用しない。
+        if not expanded or any(not _v242_valid_combo(c, bet_type) for c in expanded):
+            continue
+        if not expanded.issubset(valid_target) or expanded & covered:
+            continue
+        selected.append(str(line))
+        covered.update(expanded)
+
+    missing = valid_target - covered
+    if missing:
+        selected.extend(_v165_plain_lines(missing, bet_type))
+    return selected

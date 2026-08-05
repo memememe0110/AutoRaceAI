@@ -461,23 +461,26 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     bvals=np.array(list(breakthrough.values()),dtype=float); blo=float(bvals.min()); bhi=float(bvals.max())
     breakthrough={c:(0.5 if bhi<=blo else (v-blo)/(bhi-blo)) for c,v in breakthrough.items()}
     venue=str((meta or {}).get("開催場") or (meta or {}).get("venue") or "")
+    _v242_prepare_started=time_module.perf_counter()
     profiles=_v230_hist_profiles(venue,names)
     transition_profiles=_v240_transition_profiles(venue,names)
     matchups=_v230_matchup_map(names)
+    _v242_prepare_seconds=time_module.perf_counter()-_v242_prepare_started
     name_by_car={c:n for c,n in zip(cars,names)}
     rng=np.random.default_rng(int(seed)+230)
+    _v242_sim_started=time_module.perf_counter()
     requested_trials=max(1000,min(int(trials),20000))
     # Ver237: 20,000回すべてで重い6周処理を行わず、車立てと旧分布の集中度から
     # 必要な展開試行数を自動決定する。最終確率は要求試行数へ再スケールするため、
     # UI・DB上の確率母数は従来設定を維持する。
-    base_budget={6:5000,7:6500,8:8000}.get(len(cars),7000)
+    base_budget={6:2800,7:3600,8:4500}.get(len(cars),3800)
     prior_ranked=sorted((float(v) for v in tri.values()), reverse=True)
     top_mass=(sum(prior_ranked[:12])/max(1.0,float(sum(prior_ranked)))) if prior_ranked else 0.0
     if top_mass < 0.35:
-        base_budget += 2000  # 混戦は少し厚く回す
+        base_budget += 900  # 混戦だけ追加試行
     elif top_mass > 0.65:
-        base_budget -= 1000  # 強く集中したレースは早めに収束
-    sim_trials=max(3500,min(requested_trials,base_budget))
+        base_budget -= 500  # 強く集中したレースは早めに収束
+    sim_trials=max(2200,min(requested_trials,base_budget))
     counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
@@ -585,6 +588,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     rel += 0.012*(1.0+0.15*lap)
                 gaps[j]=min(2.0,max(0.04,gaps[j]-rel))
         combo=tuple(order[:3]); counts[combo]=counts.get(combo,0)+1
+    _v242_sim_seconds=time_module.perf_counter()-_v242_sim_started
     # 元のtrial数へ整数スケール。シミュレーションだけで0回になった着順も、
     # 旧モデル分布を少量混ぜて極端な消失を防ぎ、全組み合わせを必ず保存する。
     target=max(1,int(trials))
@@ -628,7 +632,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
-        "message":f"試走・過去展開・直接対戦に加え、周回別追抜傾向と横並びで抜かれた後の失速連鎖を反映。要求{requested_trials:,}回に対し展開本体は{sim_trials:,}回で計算し、温度校正後の全3連単を保存",
+        "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
+        "message":f"試走・過去展開・直接対戦に加え、周回別追抜傾向と横並びで抜かれた後の失速連鎖を反映。要求{requested_trials:,}回に対し展開本体は{sim_trials:,}回で計算。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。温度校正後の全3連単を保存",
     }
     return out,new_bets,audit
 
@@ -855,7 +860,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver241"
+_V231_APP_VERSION = "Ver242"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -1263,7 +1268,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver241｜グランドノートの周回変化から、追い抜き後の勢いと横並びで抜かれた車の一時失速・連鎖後退を6周展開へ反映。")
+st.caption("Ver242｜復元はボタン式でキーボードを出さず、6周展開は学習値を先読みして軽量試行へ最適化。不成立フォーメーションも最終検査で除外。")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
@@ -6019,38 +6024,43 @@ elif selected_main_page == "🏁 予測":
                 suffix += 1
             restore_labels.append(label)
             restore_by_label[label] = {"kind":"legacy", **item}
-        c_restore, c_button = st.columns([3,1])
-        with c_restore:
-            restore_label = st.selectbox("保存済み予測", restore_labels, key="v231_prediction_restore_select", label_visibility="collapsed")
-        with c_button:
-            if st.button("復元", key="v231_prediction_restore_button", use_container_width=True):
+        st.caption("最近の保存済み予測をボタンで復元します。文字入力欄ではないため、iPhoneのキーボードは開きません。")
+        visible_labels = restore_labels[:24]
+        with st.expander(f"保存済み予測一覧（最新{len(visible_labels)}件）", expanded=True):
+            for idx, restore_label in enumerate(visible_labels):
                 target = restore_by_label.get(restore_label) or {}
-                if target.get("kind") == "history":
-                    restored_view, restored_text, restored_venue, history_meta = _v231_load_prediction_history(engine.DB_PATH, int(target.get("history_id") or 0))
-                else:
-                    restored_view, restored_text, restored_venue = _v222_load_prediction_restore(engine.DB_PATH, target.get("race_key", ""))
-                    history_meta = {"app_version":"Unknown", "simulation_mode":"旧保存形式"}
-                if restored_view:
-                    st.session_state["last_prediction_view"] = restored_view
-                    st.session_state["v163_saved_prediction_text"] = restored_text
-                    st.session_state["v163_saved_prediction_venue"] = restored_venue
-                    st.session_state["prediction_input_version"] = int(st.session_state.get("prediction_input_version", 0)) + 1
-                    restored_race_key = str(target.get("race_key") or history_meta.get("race_key") or restored_view.get("race_key") or "").strip()
-                    restored_result_view = _v232_load_result_view_for_race(engine.DB_PATH, restored_race_key)
-                    if restored_result_view:
-                        st.session_state["v41_last_result_view"] = restored_result_view
-                        st.session_state["v232_restored_result_view"] = restored_result_view
+                c_info, c_button = st.columns([4,1])
+                with c_info:
+                    st.markdown(f"**{restore_label}**")
+                with c_button:
+                    clicked = st.button("復元", key=f"v242_restore_btn_{idx}_{hashlib.md5(restore_label.encode()).hexdigest()[:8]}", use_container_width=True)
+                if clicked:
+                    if target.get("kind") == "history":
+                        restored_view, restored_text, restored_venue, history_meta = _v231_load_prediction_history(engine.DB_PATH, int(target.get("history_id") or 0))
                     else:
-                        st.session_state.pop("v232_restored_result_view", None)
-                    st.session_state["v231_restore_notice"] = {
-                        "label": target.get("race_label") or "保存済みレース",
-                        "version": history_meta.get("app_version") or "Unknown",
-                        "mode": history_meta.get("simulation_mode") or "不明",
-                        "result_restored": bool(restored_result_view),
-                    }
-                    st.rerun()
-                else:
-                    st.warning("保存済み予測を復元できませんでした。")
+                        restored_view, restored_text, restored_venue = _v222_load_prediction_restore(engine.DB_PATH, target.get("race_key", ""))
+                        history_meta = {"app_version":"Unknown", "simulation_mode":"旧保存形式"}
+                    if restored_view:
+                        st.session_state["last_prediction_view"] = restored_view
+                        st.session_state["v163_saved_prediction_text"] = restored_text
+                        st.session_state["v163_saved_prediction_venue"] = restored_venue
+                        st.session_state["prediction_input_version"] = int(st.session_state.get("prediction_input_version", 0)) + 1
+                        restored_race_key = str(target.get("race_key") or history_meta.get("race_key") or restored_view.get("race_key") or "").strip()
+                        restored_result_view = _v232_load_result_view_for_race(engine.DB_PATH, restored_race_key)
+                        if restored_result_view:
+                            st.session_state["v41_last_result_view"] = restored_result_view
+                            st.session_state["v232_restored_result_view"] = restored_result_view
+                        else:
+                            st.session_state.pop("v232_restored_result_view", None)
+                        st.session_state["v231_restore_notice"] = {
+                            "label": target.get("race_label") or "保存済みレース",
+                            "version": history_meta.get("app_version") or "Unknown",
+                            "mode": history_meta.get("simulation_mode") or "不明",
+                            "result_restored": bool(restored_result_view),
+                        }
+                        st.rerun()
+                    else:
+                        st.warning("保存済み予測を復元できませんでした。")
         notice = st.session_state.pop("v231_restore_notice", None)
         if isinstance(notice, dict):
             result_note = "登録済み結果・的中判定も復元しました。" if notice.get("result_restored") else "この予測版に対応する登録済み結果はまだありません。"
