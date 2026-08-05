@@ -1290,7 +1290,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver245｜6周展開診断を見やすくし、同じ1着・同じ3車で2着3着だけ入れ替わる三連単を、確率差が小さい場合にセット比較します。")
+st.caption("Ver247｜川口の壁展開自動学習と、旧バージョンの回収率記録を保護します。")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
@@ -3965,10 +3965,16 @@ def _v215_race_meta_from_key(race_key: str, db_path: str) -> dict:
 def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict) -> str:
     """回収率重視プランを、予測時点の買い目・オッズ・確率・版情報ごと完全保存する。"""
     _v187_ensure_mixed_learning_tables(db_path)
-    payload = [
-        (t.get("type"), t.get("combo"), round(float(t.get("odds", 0)), 3), round(float(t.get("probability", 0)), 5))
-        for t in result.get("tickets", [])
-    ]
+    # Ver247管理修正: 同じ買い目でもアプリ版が違えば別プランとして保存する。
+    # これにより、旧版の回収率記録を新版の保存で上書きしない。
+    payload = {
+        "app_version": _V231_APP_VERSION,
+        "logic_version": "return_plan_v234",
+        "tickets": [
+            (t.get("type"), t.get("combo"), round(float(t.get("odds", 0)), 3), round(float(t.get("probability", 0)), 5))
+            for t in result.get("tickets", [])
+        ],
+    }
     plan_hash = hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     now = _v228_now_jst_iso()
     meta = _v215_race_meta_from_key(str(race_key), db_path)
@@ -3978,8 +3984,8 @@ def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict) -> str:
     except Exception:
         starter_count = None
     with sqlite3.connect(db_path) as con:
-        con.execute("""
-            INSERT OR REPLACE INTO v187_mixed_plan_runs
+        cur = con.execute("""
+            INSERT OR IGNORE INTO v187_mixed_plan_runs
             (race_key,plan_hash,points,cost_yen,grade,cover,black,low,hit_average_multiple,
              model_expected_multiple,model_return_rate,role_count,created_at,
              app_version,logic_version,race_date,venue,race_no,starter_count)
@@ -3991,15 +3997,16 @@ def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict) -> str:
             float(result.get("model_return_rate", 0)), len(result.get("grouped", {})), now,
             _V231_APP_VERSION, "return_plan_v234", meta.get("race_date"), meta.get("venue"), meta.get("race_no"), starter_count,
         ))
-        con.execute("DELETE FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?", (str(race_key), plan_hash))
-        for t in result.get("tickets", []):
-            con.execute("""
-                INSERT OR REPLACE INTO v187_mixed_plan_tickets
-                (race_key,plan_hash,bet_type,combination,probability,odds,role) VALUES (?,?,?,?,?,?,?)
-            """, (
-                str(race_key), plan_hash, _v212_norm_bet_type(t.get("type")), t.get("combo"),
-                float(t.get("probability", 0)), float(t.get("odds", 0)), t.get("role"),
-            ))
+        # 初回保存時だけ買い目を登録する。既存の同版スナップショットも変更しない。
+        if int(cur.rowcount or 0) > 0:
+            for t in result.get("tickets", []):
+                con.execute("""
+                    INSERT OR IGNORE INTO v187_mixed_plan_tickets
+                    (race_key,plan_hash,bet_type,combination,probability,odds,role) VALUES (?,?,?,?,?,?,?)
+                """, (
+                    str(race_key), plan_hash, _v212_norm_bet_type(t.get("type")), t.get("combo"),
+                    float(t.get("probability", 0)), float(t.get("odds", 0)), t.get("role"),
+                ))
         con.commit()
     _v187_sync_mixed_feedback(db_path)
     return plan_hash
