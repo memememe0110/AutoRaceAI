@@ -5584,15 +5584,16 @@ def secret_value(name: str, default: str = "") -> str:
 
 
 
+# Ver247管理修正2: 同一レースを新版で再予測しても、旧版を回収率比較から消さない。
 def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
-    """各レースの最新プランだけを採用し、結果済み実績を集計用DataFrameで返す。"""
+    """各レース・各バージョンの最新プランを採用し、結果済み実績を集計用DataFrameで返す。"""
     _v187_ensure_mixed_learning_tables(db_path)
     _v187_sync_mixed_feedback(db_path)
     query = """
         WITH latest AS (
             SELECT r.*,
                    ROW_NUMBER() OVER (
-                       PARTITION BY r.race_key
+                       PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''), 'Unknown')
                        ORDER BY datetime(r.created_at) DESC, r.rowid DESC
                    ) AS rn
             FROM v187_mixed_plan_runs r
@@ -5697,7 +5698,7 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
 
 def _v215_render_return_dashboard(db_path: str) -> None:
     st.markdown("## 📊 回収率重視プラン実績")
-    st.caption("各レースで最後に保存されたプランだけを、予測時点の買い目のまま集計します。結果後の差し替えは含みません。")
+    st.caption("各レース・各バージョンで最後に保存されたプランを、予測時点の買い目のまま別々に集計します。新版を再シミュレーションしても旧版の実績は残ります。")
     df = _v215_return_dashboard_rows(db_path)
     if df.empty:
         st.info("結果まで照合済みの回収率重視プランがまだありません。今後の予測では買い目・オッズ・確率・バージョンを自動保存します。")
