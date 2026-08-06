@@ -668,6 +668,11 @@ def _v252_ensure_lap_tables(con: sqlite3.Connection) -> None:
     ON v252_lap_prediction_snapshots(race_date, venue, race_no, lap_no, created_at)
     """)
 
+# Ver253 uses the same snapshot schema introduced in Ver252.
+# Keep a dedicated wrapper so Ver253 maintenance actions do not fail on a missing symbol.
+def _v253_ensure_lap_tables(con: sqlite3.Connection) -> None:
+    _v252_ensure_lap_tables(con)
+
 def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[dict], is_backtest: bool) -> None:
     if not db_path or not Path(db_path).exists() or not modal_laps:
         return
@@ -803,7 +808,7 @@ def _v253_backfill_saved_lap_predictions(db_path: str, limit: int = 80) -> dict:
                 LIMIT ?
             """,(max(1,int(limit)),)).fetchall()
             existing=set((str(a),str(b),str(c)) for a,b,c in con.execute("""
-                SELECT race_date,venue,race_no FROM v253_lap_prediction_snapshots
+                SELECT race_date,venue,race_no FROM v252_lap_prediction_snapshots
                 WHERE app_version='Ver253' AND is_backtest=2 GROUP BY race_date,venue,race_no
             """).fetchall())
         for row in rows:
