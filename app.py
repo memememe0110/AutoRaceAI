@@ -398,6 +398,340 @@ def _v230_col_num(row, keys, default=0.0):
     return float(default)
 
 
+
+
+# Ver248: 実測の周回順位遷移から、開催場・周回別の追い抜き基準を時系列検証して校正する。
+_V248_WALL_CALIBRATION_CACHE = {}
+
+def _v248_logit(p: float) -> float:
+    p = max(1e-5, min(1.0 - 1e-5, float(p)))
+    return float(np.log(p / (1.0 - p)))
+
+def _v248_wall_calibration(db_path: str | None = None) -> dict:
+    path = str(db_path or _v230_db_path())
+    try:
+        stamp = (path, int(Path(path).stat().st_mtime_ns))
+    except Exception:
+        stamp = (path, 0)
+    if stamp in _V248_WALL_CALIBRATION_CACHE:
+        return dict(_V248_WALL_CALIBRATION_CACHE[stamp])
+    result = {
+        "enabled": False, "global_logit": 0.0, "venue_delta": {}, "lap_delta": {},
+        "sample_transitions": 0, "validation_transitions": 0, "baseline_logloss": None,
+        "calibrated_logloss": None, "reason": "周回履歴不足のため固定係数を使用",
+    }
+    try:
+        with sqlite3.connect(path) as con:
+            laps = pd.read_sql_query(
+                "SELECT race_key,lap_no,position,car_no FROM result_laps", con
+            )
+            races = pd.read_sql_query(
+                "SELECT race_key,race_date,venue,race_no FROM result_races "
+                "WHERE COALESCE(learning_eligible,1)=1", con
+            )
+        if laps.empty or races.empty:
+            _V248_WALL_CALIBRATION_CACHE.clear(); _V248_WALL_CALIBRATION_CACHE[stamp] = dict(result); return result
+        for c in ("lap_no", "position", "car_no"):
+            laps[c] = pd.to_numeric(laps[c], errors="coerce")
+        laps = laps.dropna(subset=["lap_no", "position", "car_no"]).copy()
+        laps[["lap_no", "position", "car_no"]] = laps[["lap_no", "position", "car_no"]].astype(int)
+        rows = []
+        for race_key, g in laps.groupby("race_key"):
+            lap_values = sorted(g["lap_no"].unique())
+            for lap in lap_values:
+                cur = g[g["lap_no"] == lap].sort_values("position")
+                nxt = g[g["lap_no"] == lap + 1].sort_values("position")
+                if len(cur) < 3 or nxt.empty:
+                    continue
+                next_pos = dict(zip(nxt["car_no"].astype(int), nxt["position"].astype(int)))
+                order = cur["car_no"].astype(int).tolist()
+                for i in range(1, len(order)):
+                    front, chaser = order[i - 1], order[i]
+                    if front not in next_pos or chaser not in next_pos:
+                        continue
+                    rows.append({
+                        "race_key": str(race_key), "lap": int(lap),
+                        "passed": int(next_pos[chaser] < next_pos[front]),
+                    })
+        data = pd.DataFrame(rows)
+        if data.empty:
+            _V248_WALL_CALIBRATION_CACHE.clear(); _V248_WALL_CALIBRATION_CACHE[stamp] = dict(result); return result
+        data = data.merge(races, on="race_key", how="inner")
+        data["race_date"] = pd.to_datetime(data["race_date"], errors="coerce")
+        data = data.sort_values(["race_date", "race_no", "race_key", "lap"])
+        race_order = data[["race_key", "race_date", "race_no"]].drop_duplicates().sort_values(["race_date", "race_no", "race_key"])
+        if len(race_order) < 40 or len(data) < 1200:
+            result["sample_transitions"] = int(len(data))
+            result["reason"] = "時系列検証に必要な周回履歴が不足"
+            _V248_WALL_CALIBRATION_CACHE.clear(); _V248_WALL_CALIBRATION_CACHE[stamp] = dict(result); return result
+        split = max(25, min(len(race_order) - 12, int(round(len(race_order) * 0.70))))
+        train_keys = set(race_order.iloc[:split]["race_key"].astype(str))
+        valid_keys = set(race_order.iloc[split:]["race_key"].astype(str))
+        train = data[data["race_key"].astype(str).isin(train_keys)].copy()
+        valid = data[data["race_key"].astype(str).isin(valid_keys)].copy()
+        gp = float((train["passed"].sum() + 20.0) / (len(train) + 40.0))
+        gl = _v248_logit(gp)
+        def _group_delta(col: str, alpha: float) -> dict:
+            agg = train.groupby(col)["passed"].agg(["sum", "count"])
+            out = {}
+            for key, row in agg.iterrows():
+                p = float((row["sum"] + alpha * gp) / (row["count"] + alpha))
+                out[key] = float(np.clip(_v248_logit(p) - gl, -0.45, 0.45))
+            return out
+        venue_delta = _group_delta("venue", 80.0)
+        lap_delta = _group_delta("lap", 100.0)
+        y = valid["passed"].to_numpy(dtype=float)
+        base_p = np.full(len(valid), gp, dtype=float)
+        z = np.asarray([gl + venue_delta.get(r["venue"], 0.0) + lap_delta.get(int(r["lap"]), 0.0) for _, r in valid.iterrows()], dtype=float)
+        cal_p = 1.0 / (1.0 + np.exp(-z))
+        def _ll(prob):
+            prob = np.clip(prob, 1e-5, 1 - 1e-5)
+            return float(-np.mean(y * np.log(prob) + (1 - y) * np.log(1 - prob)))
+        base_ll, cal_ll = _ll(base_p), _ll(cal_p)
+        enabled = bool(cal_ll + 0.001 < base_ll)
+        result.update({
+            "enabled": enabled, "global_logit": gl, "venue_delta": venue_delta if enabled else {},
+            "lap_delta": lap_delta if enabled else {}, "sample_transitions": int(len(data)),
+            "validation_transitions": int(len(valid)), "baseline_logloss": base_ll,
+            "calibrated_logloss": cal_ll,
+            "reason": (
+                f"時系列検証でLogLossが{base_ll:.4f}→{cal_ll:.4f}へ改善したため反映"
+                if enabled else f"時系列検証で改善幅不足（{base_ll:.4f}→{cal_ll:.4f}）のため停止"
+            ),
+        })
+    except Exception as exc:
+        result["reason"] = f"校正失敗: {exc}"
+    _V248_WALL_CALIBRATION_CACHE.clear(); _V248_WALL_CALIBRATION_CACHE[stamp] = dict(result)
+    return result
+
+
+
+
+# Ver251: 実際のグランドノートを1周ごとに照合し、開催場・周回・ハンデ差別の
+# 追い抜き発生率を時系列で学習する。予測対象日以降の結果は使わない。
+_V251_LAP_ALIGNMENT_CACHE = {}
+
+def _v251_logit(p: float) -> float:
+    p = max(0.015, min(0.985, float(p)))
+    return float(np.log(p / (1.0 - p)))
+
+def _v251_gap_bucket(gap: int) -> str:
+    g = max(0, int(gap or 0))
+    if g <= 0: return "0m"
+    if g <= 10: return "10m"
+    if g <= 20: return "20m"
+    return "30m+"
+
+def _v251_lap_alignment_calibration(db_path: str | None, venue: str, cutoff_date: str) -> dict:
+    """実測グランドノートの隣接入替を周回・ハンデ差別に縮小推定する。"""
+    result = {
+        "enabled": False, "sample_pairs": 0, "races": 0,
+        "global_pass_rate": 0.0, "lap_bucket_delta": {},
+        "lap_pass_rate": {}, "reason": "グランドノート履歴不足",
+    }
+    if not db_path or not Path(db_path).exists():
+        return result
+    try:
+        stamp=(str(db_path), Path(db_path).stat().st_mtime_ns, str(venue), str(cutoff_date)[:10])
+    except Exception:
+        stamp=(str(db_path), str(venue), str(cutoff_date)[:10])
+    if stamp in _V251_LAP_ALIGNMENT_CACHE:
+        return dict(_V251_LAP_ALIGNMENT_CACHE[stamp])
+    try:
+        con=sqlite3.connect(str(db_path))
+        q="""
+        SELECT rl.race_key, rr.race_date, rr.venue, rl.lap_no, rl.lap_label,
+               rl.position, rl.car_no,
+               COALESCE(CAST(REPLACE(REPLACE(re.handicap,'m',''),'Ｍ','') AS INTEGER),0) AS handicap
+        FROM result_laps rl
+        JOIN result_races rr ON rr.race_key=rl.race_key
+        LEFT JOIN races r ON r.race_key=rl.race_key
+        LEFT JOIN race_entries re ON re.race_id=r.race_id AND re.car_no=rl.car_no
+        WHERE COALESCE(rr.learning_eligible,1)=1
+          AND (?='' OR rr.venue=?)
+          AND (?='' OR substr(rr.race_date,1,10) < substr(?,1,10))
+        ORDER BY rl.race_key, COALESCE(rl.lap_no,999), rl.position
+        """
+        rows=pd.read_sql_query(q, con, params=(venue,venue,cutoff_date,cutoff_date))
+        con.close()
+    except Exception as e:
+        result["reason"]=f"周回履歴読込失敗: {e}"
+        return result
+    if rows.empty:
+        return result
+    events=[]
+    race_count=0
+    for race_key, grp in rows.groupby('race_key'):
+        laps=[]
+        for lap_key, lg in grp.groupby(['lap_no','lap_label'], dropna=False, sort=False):
+            lg=lg.sort_values('position')
+            order=[int(x) for x in lg['car_no'].tolist()]
+            hmap={int(r.car_no): int(r.handicap or 0) for r in lg.itertuples()}
+            lap_no=lap_key[0]
+            try: lap_no=int(lap_no)
+            except Exception: lap_no=len(laps)+1
+            laps.append((lap_no, order, hmap))
+        laps.sort(key=lambda x:x[0])
+        if len(laps)<2: continue
+        race_count += 1
+        for idx in range(1,len(laps)):
+            lap_no, cur, hmap=laps[idx]
+            prev=laps[idx-1][1]
+            cur_pos={c:i for i,c in enumerate(cur)}
+            for j in range(1,len(prev)):
+                front, chaser=prev[j-1],prev[j]
+                if front not in cur_pos or chaser not in cur_pos: continue
+                success=1 if cur_pos[chaser] < cur_pos[front] else 0
+                gap=max(0, int(hmap.get(chaser,0))-int(hmap.get(front,0)))
+                events.append((int(lap_no), _v251_gap_bucket(gap), success))
+    if len(events)<120:
+        result.update({"sample_pairs":len(events),"races":race_count})
+        _V251_LAP_ALIGNMENT_CACHE[stamp]=dict(result)
+        return result
+    ev=pd.DataFrame(events,columns=['lap','bucket','success'])
+    global_rate=float(ev.success.mean())
+    deltas={}; lap_rates={}
+    for lap, lg in ev.groupby('lap'):
+        lap_rates[int(lap)]={"rate":float(lg.success.mean()),"n":int(len(lg))}
+        for bucket,bg in lg.groupby('bucket'):
+            n=len(bg); raw=float(bg.success.mean())
+            # 少数データは全体へ戻す。n=35で半分程度の反映。
+            w=n/(n+35.0)
+            shrunk=global_rate + w*(raw-global_rate)
+            delta=float(np.clip(_v251_logit(shrunk)-_v251_logit(global_rate),-0.42,0.42))
+            deltas[f"{int(lap)}|{bucket}"]={"delta":delta,"rate":raw,"n":int(n),"shrunk_rate":shrunk}
+    result={
+        "enabled":True,"sample_pairs":int(len(ev)),"races":int(race_count),
+        "global_pass_rate":global_rate,"lap_bucket_delta":deltas,
+        "lap_pass_rate":lap_rates,"reason":"開催日前の実測グランドノートから周回別に学習",
+    }
+    _V251_LAP_ALIGNMENT_CACHE.clear(); _V251_LAP_ALIGNMENT_CACHE[stamp]=dict(result)
+    return result
+
+def _v251_actual_lap_orders(db_path: str | None, meta: dict) -> list[tuple[str, tuple[int,...]]]:
+    """同一レースの実測グランドノートが登録済みなら周回順を返す。"""
+    if not db_path or not Path(db_path).exists(): return []
+    race_date=str((meta or {}).get('開催日') or (meta or {}).get('race_date') or '')[:10]
+    venue=str((meta or {}).get('開催場') or (meta or {}).get('venue') or '')
+    race_no=str((meta or {}).get('R') or (meta or {}).get('レース') or (meta or {}).get('race_no') or '').strip().replace('R','')
+    try:
+        con=sqlite3.connect(str(db_path))
+        q="""
+        SELECT rl.lap_label, rl.lap_no, rl.position, rl.car_no
+        FROM result_laps rl JOIN result_races rr ON rr.race_key=rl.race_key
+        WHERE substr(rr.race_date,1,10)=? AND rr.venue=?
+          AND REPLACE(COALESCE(rr.race_no,''),'R','')=?
+        ORDER BY COALESCE(rl.lap_no,999), rl.position
+        """
+        d=pd.read_sql_query(q,con,params=(race_date,venue,race_no)); con.close()
+    except Exception:
+        return []
+    if d.empty:return []
+    out=[]
+    for (label,lap_no),g in d.groupby(['lap_label','lap_no'],dropna=False,sort=False):
+        out.append((str(label),tuple(int(x) for x in g.sort_values('position').car_no.tolist())))
+    return out
+
+def _v251_pairwise_accuracy(pred: tuple[int,...], actual: tuple[int,...]) -> float:
+    common=[c for c in actual if c in pred]
+    if len(common)<2:return 0.0
+    pp={c:i for i,c in enumerate(pred)}; ap={c:i for i,c in enumerate(actual)}
+    ok=tot=0
+    for i,a in enumerate(common):
+        for b in common[i+1:]:
+            tot+=1; ok += int((pp[a]<pp[b])==(ap[a]<ap[b]))
+    return ok/tot if tot else 0.0
+
+
+# Ver250: 前方集団残存・周回内連続追抜制限・ハンデ差別の壁を開催日前実績だけで自動学習する。
+_V250_FLOW_CALIBRATION_CACHE = {}
+
+def _v250_flow_calibration(db_path: str | None = None, venue: str = "", cutoff_date: str = "") -> dict:
+    path = str(db_path or _v230_db_path())
+    venue = str(venue or "").strip()
+    cutoff = str(cutoff_date or "").strip()[:10]
+    try:
+        stamp = (path, int(Path(path).stat().st_mtime_ns), venue, cutoff)
+    except Exception:
+        stamp = (path, 0, venue, cutoff)
+    if stamp in _V250_FLOW_CALIBRATION_CACHE:
+        return dict(_V250_FLOW_CALIBRATION_CACHE[stamp])
+    result = {
+        "enabled": False, "leader_hold_delta": 0.0, "front_survival_delta": 0.0,
+        "queue_wall_delta": 0.0, "races": 0, "venue_races": 0,
+        "reason": "展開学習データ不足のため中立",
+    }
+    try:
+        with sqlite3.connect(path) as con:
+            races = pd.read_sql_query(
+                "SELECT race_key,race_date,venue FROM result_races WHERE COALESCE(learning_eligible,1)=1", con
+            )
+            entries = pd.read_sql_query(
+                "SELECT race_key,car_no,finish,handicap FROM result_entries WHERE finish IS NOT NULL", con
+            )
+            laps = pd.read_sql_query(
+                "SELECT race_key,lap_no,position,car_no FROM result_laps", con
+            )
+        if cutoff:
+            races = races[pd.to_datetime(races["race_date"], errors="coerce") < pd.to_datetime(cutoff, errors="coerce")]
+        if races.empty or entries.empty:
+            _V250_FLOW_CALIBRATION_CACHE[stamp] = dict(result); return result
+        keys = set(races["race_key"].astype(str))
+        entries = entries[entries["race_key"].astype(str).isin(keys)].copy()
+        laps = laps[laps["race_key"].astype(str).isin(keys)].copy()
+        entries["finish"] = pd.to_numeric(entries["finish"], errors="coerce")
+        entries["h"] = pd.to_numeric(entries["handicap"].astype(str).str.extract(r"(-?\d+)")[0], errors="coerce").fillna(0)
+        # 初周先頭が最終3着内へ残る率。少数開催場は全場平均へ強く縮小する。
+        first = laps[pd.to_numeric(laps["lap_no"], errors="coerce") == 1].copy()
+        first["position"] = pd.to_numeric(first["position"], errors="coerce")
+        leaders = first[first["position"] == 1][["race_key","car_no"]].merge(
+            entries[["race_key","car_no","finish"]], on=["race_key","car_no"], how="inner"
+        ).merge(races[["race_key","venue"]], on="race_key", how="left")
+        global_leader = float((leaders["finish"].le(3).sum() + 12) / (len(leaders) + 24)) if len(leaders) else 0.5
+        vlead = leaders[leaders["venue"].astype(str) == venue] if venue else leaders.iloc[0:0]
+        venue_leader = float((vlead["finish"].le(3).sum() + 40*global_leader) / (len(vlead) + 40))
+        # 最前ハンデ群の3着内率。選手単位ではなく車群単位で学習する。
+        front_rows=[]
+        for rk,g in entries.groupby("race_key"):
+            if g.empty: continue
+            mh=float(g["h"].min())
+            z=g[g["h"]==mh]
+            for _,r in z.iterrows(): front_rows.append((str(rk), float(r["finish"]<=3)))
+        front=pd.DataFrame(front_rows, columns=["race_key","top3"]) if front_rows else pd.DataFrame(columns=["race_key","top3"])
+        front=front.merge(races[["race_key","venue"]],on="race_key",how="left") if not front.empty else front
+        global_front=float((front["top3"].sum()+20)/(len(front)+40)) if len(front) else 0.35
+        vf=front[front["venue"].astype(str)==venue] if venue and not front.empty else front.iloc[0:0]
+        venue_front=float((vf["top3"].sum()+60*global_front)/(len(vf)+60))
+        # 周回中の隣接入替率が低い開催場ほど、密集壁を少し強くする。
+        pass_rows=[]
+        for rk,g in laps.groupby("race_key"):
+            for lap in sorted(pd.to_numeric(g["lap_no"],errors="coerce").dropna().astype(int).unique()):
+                a=g[pd.to_numeric(g["lap_no"],errors="coerce")==lap].sort_values("position")
+                b=g[pd.to_numeric(g["lap_no"],errors="coerce")==lap+1]
+                if len(a)<4 or b.empty: continue
+                npmap=dict(zip(pd.to_numeric(b["car_no"],errors="coerce"),pd.to_numeric(b["position"],errors="coerce")))
+                order=pd.to_numeric(a["car_no"],errors="coerce").dropna().astype(int).tolist()
+                for i in range(1,len(order)):
+                    f,c=order[i-1],order[i]
+                    if f in npmap and c in npmap: pass_rows.append((str(rk), float(npmap[c] < npmap[f])))
+        passes=pd.DataFrame(pass_rows,columns=["race_key","passed"]) if pass_rows else pd.DataFrame(columns=["race_key","passed"])
+        passes=passes.merge(races[["race_key","venue"]],on="race_key",how="left") if not passes.empty else passes
+        gp=float((passes["passed"].sum()+30)/(len(passes)+100)) if len(passes) else 0.20
+        vp=passes[passes["venue"].astype(str)==venue] if venue and not passes.empty else passes.iloc[0:0]
+        vpass=float((vp["passed"].sum()+120*gp)/(len(vp)+120))
+        result.update({
+            "enabled": bool(len(races)>=50),
+            "leader_hold_delta": float(np.clip(_v248_logit(venue_leader)-_v248_logit(global_leader),-0.22,0.22)),
+            "front_survival_delta": float(np.clip(_v248_logit(venue_front)-_v248_logit(global_front),-0.18,0.18)),
+            "queue_wall_delta": float(np.clip((gp-vpass)*0.85,-0.12,0.12)),
+            "races": int(races["race_key"].nunique()), "venue_races": int((races["venue"].astype(str)==venue).sum()),
+            "reason": f"{cutoff or '最新'}より前の{int(races['race_key'].nunique())}R（{venue or '全場'} {int((races['venue'].astype(str)==venue).sum())}R）から先頭維持・前ハンデ残り・隣接入替率を縮小学習",
+        })
+    except Exception as exc:
+        result["reason"] = f"展開学習失敗: {exc}"
+    _V250_FLOW_CALIBRATION_CACHE[stamp] = dict(result)
+    return result
+
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
     if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(entries,pd.DataFrame) or entries.empty:
@@ -465,6 +799,17 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     profiles=_v230_hist_profiles(venue,names)
     transition_profiles=_v240_transition_profiles(venue,names)
     matchups=_v230_matchup_map(names)
+    wall_calibration=_v248_wall_calibration(_v230_db_path())
+    venue_wall_delta=float((wall_calibration.get("venue_delta") or {}).get(venue,0.0)) if wall_calibration.get("enabled") else 0.0
+    lap_wall_delta=wall_calibration.get("lap_delta") or {}
+    race_date=str((meta or {}).get("開催日") or (meta or {}).get("race_date") or "")[:10]
+    flow_calibration=_v250_flow_calibration(_v230_db_path(), venue, race_date)
+    leader_hold_delta=float(flow_calibration.get("leader_hold_delta",0.0)) if flow_calibration.get("enabled") else 0.0
+    front_survival_delta=float(flow_calibration.get("front_survival_delta",0.0)) if flow_calibration.get("enabled") else 0.0
+    queue_wall_delta=float(flow_calibration.get("queue_wall_delta",0.0)) if flow_calibration.get("enabled") else 0.0
+    lap_alignment=_v251_lap_alignment_calibration(_v230_db_path(), venue, race_date)
+    lap_bucket_delta=lap_alignment.get("lap_bucket_delta") or {}
+    actual_lap_orders=_v251_actual_lap_orders(_v230_db_path(), meta)
     _v242_prepare_seconds=time_module.perf_counter()-_v242_prepare_started
     name_by_car={c:n for c,n in zip(cars,names)}
     rng=np.random.default_rng(int(seed)+230)
@@ -482,6 +827,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         base_budget -= 350  # 強く集中したレースは早めに収束
     sim_trials=max(1400,min(requested_trials,base_budget))
     counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
+    lap_order_counts={lap:{} for lap in range(1,7)}
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
     # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
@@ -498,6 +844,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         # 共通の走路揺らぎと選手別の出来を分け、極端な本命固定を抑える。
         race_noise=rng.normal(0,0.10)
         perf={c:max(-2.2,min(2.2,strength[c]+race_noise+rng.normal(0,0.36))) for c in cars}
+        min_handicap=min(handicap.values()) if handicap else 0
+        # 前ハンデ残りは開催日前の実績だけを使い、1試行の能力へ小さく反映。
+        for c in cars:
+            if handicap[c] == min_handicap:
+                perf[c]=max(-2.2,min(2.2,perf[c]+0.34*front_survival_delta))
         # スタート反応はST・履歴・ランダムで毎試行変える。
         start_score={}
         for c in cars:
@@ -523,6 +874,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         # ギリギリ横並びで抜かれた車の一時失速。次周以降へ減衰して残す。
         slowdown={c:0.0 for c in cars}
         for lap in range(1,7):
+            # Ver250: 1周で何台も連続して抜く展開を抑える。
+            # 速い車でも進路変更と立て直しが必要なため、周回内の追抜回数を保持する。
+            lap_pass_count={c:0 for c in cars}
             i=1
             while i<len(order):
                 front=order[i-1]; chaser=order[i]
@@ -540,16 +894,38 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 # 壁は残すが、前車が明確に遅い場合まで一律に詰まらせない。
                 speed_edge=max(-2.5,min(2.5,perf[chaser]-perf[front]))
                 wall=0.34 + 0.15*density + 0.10*(1-breakthrough[chaser]) - 0.08*max(0.0,speed_edge)
+                # Ver250: 同ハンデ群が前に重なる隊列と、前後とも間隔が狭い三台密集を強い壁として扱う。
+                same_ahead=sum(1 for x in order[:i] if handicap[x] == handicap[chaser])
+                same_group=sum(1 for x in order if handicap[x] == handicap[chaser])
+                wall += min(0.18, 0.055*same_ahead + (0.045 if same_group >= 3 else 0.0))
                 if i+1<len(order) and gaps[i+1]<0.20: wall += 0.10
+                if gaps[i] < 0.22 and i+1 < len(order) and gaps[i+1] < 0.22:
+                    wall += 0.08 + queue_wall_delta
                 # 前車が履歴上よく粘るほど突破しにくい。終盤は少し追い抜きやすくする。
                 # 先頭・前方にいるだけの最低保証は与えない。後車の速度優位と残り周回を強めに反映。
                 front_hold=(fprof.get("hold",0.5)-0.5)*0.48
+                # 先頭車だけに開催場別の維持補正を反映。終盤ほど効果を弱め、永久壁にはしない。
+                if i == 1:
+                    front_hold += leader_hold_delta * max(0.25, 1.0 - 0.13*(lap-1))
                 weak_front_bonus=0.34*max(0.0,speed_edge-0.25)
-                late_pressure=0.15*(lap-1)
+                late_pressure=0.03*(lap-1)
+                empirical_pass_delta = venue_wall_delta + float(lap_wall_delta.get(lap, 0.0))
                 # 直前の追い抜き成功は次の壁突破を少し後押しする。ただし毎周減衰させる。
                 chain_bonus=min(0.42, momentum.get(chaser,0.0))
+                # Ver250: ハンデ差が大きい追込みほど、追い付いてから抜くまでの余白を必要とする。
+                handicap_gap=max(0, handicap[chaser]-handicap[front])
+                # Ver251: 固定のハンデ壁を弱め、実際の周回順位入替率を主に使う。
+                handicap_wall=min(0.12, 0.0022*handicap_gap)
+                bucket_key=f"{lap}|{_v251_gap_bucket(handicap_gap)}"
+                learned_transition=float((lap_bucket_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_alignment.get("enabled") else 0.0
+                # 2台目までは現実に起こり得るため軽く、3台目以降だけ強く抑える。
+                same_lap_passes=lap_pass_count.get(chaser,0)
+                chain_fatigue=(0.16 if same_lap_passes==1 else (0.52 if same_lap_passes>=2 else 0.0))
+                # 前方3台に最前ハンデ群が複数残る場合、集団全体を一枚の壁として扱う。
+                front_pack=sum(1 for x in order[:min(3,len(order))] if handicap[x]==min_handicap)
+                pack_wall=(0.07*max(0,front_pack-1))*max(0.30,1.0-0.10*(lap-1))
                 # 一要素でほぼ確定しないよう係数を縮小し、各周に最低限の不確実性を残す。
-                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + weak_front_bonus + chain_bonus - wall - front_hold
+                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + weak_front_bonus + chain_bonus - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
                 logit += rng.normal(0,0.16)
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
@@ -562,6 +938,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     order[i-1],order[i]=order[i],order[i-1]
                     gaps[i]=max(0.07,gaps[i]*0.45)
                     pass_events[chaser]+=1
+                    lap_pass_count[chaser]=lap_pass_count.get(chaser,0)+1
                     if momentum.get(chaser,0.0)>0.02:
                         chain_events[chaser]+=1
                     # 差が小さい横並びの追越しほど、抜かれた側がラインを外して一時失速しやすい。
@@ -570,6 +947,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     loss_base=float(ftp.get("passed_slowdown",0.18))
                     cascade=float(ftp.get("cascade_risk",0.16))
                     momentum[chaser]=min(0.48, momentum.get(chaser,0.0)+pass_boost*(0.65+0.55*close_pass))
+                    if lap_pass_count.get(chaser,0)>=2:
+                        momentum[chaser]*=0.58
                     slowdown[front]=min(0.50, slowdown.get(front,0.0)+loss_base*(0.45+0.90*close_pass)+0.08*cascade)
                     momentum[front]=max(0.0, momentum.get(front,0.0)-0.10*(0.5+close_pass))
                     i=max(1,i-1)
@@ -594,6 +973,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 if j==1 and perf[cur]-perf[front]>0.35:
                     rel += 0.012*(1.0+0.15*lap)
                 gaps[j]=min(2.0,max(0.04,gaps[j]-rel))
+            lap_tuple=tuple(order)
+            lap_order_counts[lap][lap_tuple]=lap_order_counts[lap].get(lap_tuple,0)+1
         combo=tuple(order[:3]); counts[combo]=counts.get(combo,0)+1
         completed_trials = sim_index + 1
         if completed_trials >= 1200 and completed_trials % 400 == 0:
@@ -647,15 +1028,32 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["1周目先頭率"]=out[car_col].map(lambda x: start_front.get(int(x),0)/sim_trials*100 if pd.notna(x) else 0.0)
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
+    modal_laps=[]
+    for lap in range(1,7):
+        counter=lap_order_counts.get(lap) or {}
+        if counter:
+            order_mode,n=max(counter.items(),key=lambda kv:kv[1])
+            modal_laps.append({"lap":lap,"order":"-".join(map(str,order_mode)),"support":n/max(1,sim_trials)*100})
+    lap_comparison=[]
+    if actual_lap_orders:
+        for idx,(label,actual) in enumerate(actual_lap_orders[:6],start=1):
+            pred=tuple(int(x) for x in modal_laps[idx-1]["order"].split('-')) if idx<=len(modal_laps) else tuple()
+            pos_acc=(sum(1 for a,b in zip(pred,actual) if a==b)/max(1,len(actual))) if pred else 0.0
+            lap_comparison.append({"lap":idx,"label":label,"actual":"-".join(map(str,actual)),"predicted":"-".join(map(str,pred)),"position_accuracy":pos_acc*100,"pairwise_accuracy":_v251_pairwise_accuracy(pred,actual)*100})
     audit={
-        "enabled":True,"mode":"6周内蔵Ver245・収束監視＋展開診断","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver251・グランドノート周回照合学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
+        "wall_calibration": wall_calibration,
+        "flow_calibration": flow_calibration,
+        "lap_alignment": lap_alignment,
+        "predicted_lap_orders": modal_laps,
+        "actual_lap_comparison": lap_comparison,
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
-        "message":f"周回別追抜・失速連鎖・直接対戦を維持し、上位展開が収束した場合は早期終了。展開診断と着順入替ペア比較を有効化。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
+        "message":f"実際のグランドノートを開催場・周回・ハンデ差別に照合し、開催日前データだけで追い抜き率を自動学習。予測側も1周ごとの代表隊列を保存して実測と比較します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
     }
     return out,new_bets,audit
 
@@ -882,7 +1280,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver247"
+_V231_APP_VERSION = "Ver251"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -1290,7 +1688,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver247｜川口の壁展開自動学習と、旧バージョンの回収率記録を保護します。")
+st.caption("Ver251｜実際のグランドノートと予測隊列を1周ごとに照合し、周回・ハンデ差別の追い抜き率を自動学習します。")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
@@ -6588,6 +6986,14 @@ elif selected_main_page == "🏁 予測":
                     f"{int(x['car'])}番 壁ロス{float(x.get('effective_loss',0))*100:.1f}%" for x in risks
                 )
                 st.info(f"🧱 6周内蔵型の壁展開を反映｜{risk_text}\n\n{wall_audit.get('message','')}")
+                lap_cmp = wall_audit.get("actual_lap_comparison") or []
+                if lap_cmp:
+                    st.markdown("**実測グランドノートとの1周別比較**")
+                    st.dataframe(pd.DataFrame(lap_cmp).rename(columns={"lap":"周回","label":"実測ラベル","actual":"実際隊列","predicted":"予測代表隊列","position_accuracy":"位置一致率%","pairwise_accuracy":"前後関係一致率%"}), use_container_width=True, hide_index=True)
+                else:
+                    pred_laps = wall_audit.get("predicted_lap_orders") or []
+                    if pred_laps:
+                        st.caption("予測対象レースの実結果が登録されると、ここに1周ごとの実測比較が表示されます。")
                 try:
                     sim_n = int(wall_audit.get("sim_trials", 0) or 0)
                     planned_n = int(wall_audit.get("planned_trials", 0) or 0)
