@@ -794,7 +794,7 @@ def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date:
 # 実結果は順位生成に使わず、生成後の周回残差学習だけに低い重みで利用する。
 def _v253_backfill_saved_lap_predictions(db_path: str, limit: int = 80) -> dict:
     global _V253_RECONSTRUCTION_MODE
-    result={"processed":0,"saved":0,"skipped":0,"errors":[],"message":""}
+    result={"processed":0,"saved":0,"skipped":0,"already_done":0,"missing_meta":0,"errors":[],"saved_races":[],"message":""}
     if not db_path or not Path(db_path).exists():
         result["message"]="DBが見つかりません。"; return result
     try:
@@ -826,22 +826,106 @@ def _v253_backfill_saved_lap_predictions(db_path: str, limit: int = 80) -> dict:
                 race_date=str(meta.get('開催日') or meta.get('race_date') or '')[:10]
                 venue=str(meta.get('開催場') or meta.get('venue') or '').strip()
                 race_no=str(meta.get('R') or meta.get('レース') or meta.get('race_no') or '').strip().replace('R','')
-                if not race_date or not venue or not race_no or (race_date,venue,race_no) in existing:
-                    result["skipped"]+=1; continue
+                if not race_date or not venue or not race_no:
+                    result["missing_meta"]+=1
+                    result["skipped"]+=1
+                    continue
+                if (race_date,venue,race_no) in existing:
+                    result["already_done"]+=1
+                    result["skipped"]+=1
+                    continue
                 _V253_RECONSTRUCTION_MODE=True
                 try:
                     _v230_six_lap_simulation(df,bets,entries,meta,max(1000,min(int(trials or 2000),4000)),int(seed or 42))
                 finally:
                     _V253_RECONSTRUCTION_MODE=False
                 existing.add((race_date,venue,race_no)); result["saved"]+=1
+                result["saved_races"].append(f"{race_date} {venue}{race_no}R")
             except Exception as exc:
                 _V253_RECONSTRUCTION_MODE=False
                 if len(result["errors"])<8: result["errors"].append(f"履歴{hid}: {type(exc).__name__}: {exc}")
         _V253_LAP_RESIDUAL_CACHE.clear()
-        result["message"]=f"{result['processed']}履歴を確認し、{result['saved']}レースを周回再構成、{result['skipped']}件をスキップしました。"
+        result["message"]=(
+            f"確認 {result['processed']}件｜新規再構成 {result['saved']}レース｜"
+            f"再構成済み {result['already_done']}件｜材料不足 {result['missing_meta']}件｜"
+            f"処理エラー {len(result['errors'])}件"
+        )
     except Exception as exc:
         result["message"]=f"再構成失敗: {type(exc).__name__}: {exc}"
     return result
+
+
+def _v253_reconstruction_status(db_path: str) -> dict:
+    """Ver253の再構成保存状況と、実測グランドノートとの照合精度を返す。"""
+    out={"races":0,"lap_rows":0,"paired_laps":0,"position_match":None,
+         "pair_match":None,"position_mae":None,"by_lap":[],"race_labels":[],
+         "learning_enabled":False,"learning_samples":0,"learning_races":0,"reason":""}
+    if not db_path or not Path(db_path).exists():
+        out["reason"]="DBが見つかりません。"; return out
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            _v253_ensure_lap_tables(con)
+            pred=pd.read_sql_query("""
+                SELECT race_date,venue,race_no,lap_no,predicted_order,support,created_at
+                FROM v252_lap_prediction_snapshots
+                WHERE app_version='Ver253' AND is_backtest=2
+                ORDER BY race_date,venue,CAST(race_no AS INTEGER),lap_no,created_at
+            """,con)
+            actual=pd.read_sql_query("""
+                SELECT substr(rr.race_date,1,10) AS race_date,rr.venue,
+                       CAST(rr.race_no AS TEXT) AS race_no,rl.lap_no,rl.position,rl.car_no
+                FROM result_laps rl JOIN result_races rr ON rr.race_key=rl.race_key
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                ORDER BY rr.race_date,rr.venue,CAST(rr.race_no AS INTEGER),rl.lap_no,rl.position
+            """,con)
+        if pred.empty:
+            out["reason"]="再構成データはまだありません。"; return out
+        pred=pred.sort_values('created_at').drop_duplicates(
+            ['race_date','venue','race_no','lap_no'],keep='last')
+        race_groups=pred[['race_date','venue','race_no']].drop_duplicates()
+        out['races']=int(len(race_groups)); out['lap_rows']=int(len(pred))
+        out['race_labels']=[f"{r.race_date} {r.venue}{r.race_no}R" for r in race_groups.itertuples()]
+        amap={}
+        for key,g in actual.groupby(['race_date','venue','race_no','lap_no'],dropna=False):
+            amap[(str(key[0])[:10],str(key[1]),str(key[2]),int(key[3]))]=tuple(
+                int(x) for x in g.sort_values('position').car_no.tolist())
+        metrics=[]
+        for row in pred.itertuples():
+            key=(str(row.race_date)[:10],str(row.venue),str(row.race_no),int(row.lap_no))
+            act=amap.get(key)
+            try: prd=tuple(int(x) for x in str(row.predicted_order).split('-') if str(x).strip())
+            except Exception: continue
+            common=sorted(set(act or ()) & set(prd))
+            if not act or len(common)<3: continue
+            ap={c:i for i,c in enumerate(act)}; pp={c:i for i,c in enumerate(prd)}
+            pos_match=sum(1 for i,c in enumerate(act) if i<len(prd) and prd[i]==c)/max(len(act),len(prd))
+            pair_total=pair_ok=0
+            for i in range(len(common)):
+                for j in range(i+1,len(common)):
+                    a,b=common[i],common[j]; pair_total+=1
+                    pair_ok += int((ap[a]<ap[b])==(pp[a]<pp[b]))
+            mae=float(np.mean([abs(ap[c]-pp[c]) for c in common]))
+            metrics.append({'lap':int(row.lap_no),'position_match':pos_match,
+                            'pair_match':pair_ok/pair_total if pair_total else 0.0,
+                            'position_mae':mae})
+        if metrics:
+            md=pd.DataFrame(metrics); out['paired_laps']=int(len(md))
+            out['position_match']=float(md.position_match.mean())
+            out['pair_match']=float(md.pair_match.mean())
+            out['position_mae']=float(md.position_mae.mean())
+            for lap,g in md.groupby('lap'):
+                out['by_lap'].append({'lap':int(lap),'paired':int(len(g)),
+                    'position_match':float(g.position_match.mean()),
+                    'pair_match':float(g.pair_match.mean()),
+                    'position_mae':float(g.position_mae.mean())})
+        learning=_v252_lap_residual_learning(str(db_path))
+        out['learning_enabled']=bool(learning.get('enabled'))
+        out['learning_samples']=int(learning.get('samples',0) or 0)
+        out['learning_races']=int(learning.get('races',0) or 0)
+        out['reason']=str(learning.get('reason',''))
+    except Exception as exc:
+        out['reason']=f"状況確認失敗: {type(exc).__name__}: {exc}"
+    return out
 
 # Ver250: 前方集団残存・周回内連続追抜制限・ハンデ差別の壁を開催日前実績だけで自動学習する。
 _V250_FLOW_CALIBRATION_CACHE = {}
@@ -8794,14 +8878,45 @@ if selected_main_page == "🗃️ 登録情報確認":
                     st.subheader("グランドノート未リンク修復")
                     with st.expander("Ver253 過去予測の周回再構成", expanded=False):
                         st.caption("保存済み予測の出走表を現在の6周モデルで再実行し、実測グランドノートとの差分学習を起動します。再構成値は通常予測の35%重みで使い、過去結果そのものを順位生成には使いません。")
+                        try:
+                            s253=_v253_reconstruction_status(engine.DB_PATH)
+                            c1,c2,c3=st.columns(3)
+                            c1.metric("再構成済み",f"{s253.get('races',0)}レース")
+                            c2.metric("保存周回",f"{s253.get('lap_rows',0)}行")
+                            c3.metric("実測照合",f"{s253.get('paired_laps',0)}周")
+                            if s253.get('position_match') is not None:
+                                st.caption(
+                                    f"全体検証｜位置一致 {s253['position_match']*100:.1f}%｜"
+                                    f"前後関係一致 {s253['pair_match']*100:.1f}%｜"
+                                    f"平均順位誤差 {s253['position_mae']:.2f}台"
+                                )
+                                if s253.get('by_lap'):
+                                    lap_df=pd.DataFrame(s253['by_lap']).rename(columns={
+                                        'lap':'周回','paired':'照合数','position_match':'位置一致率',
+                                        'pair_match':'前後関係一致率','position_mae':'平均順位誤差'})
+                                    lap_df['位置一致率']=(lap_df['位置一致率']*100).round(1).astype(str)+'%'
+                                    lap_df['前後関係一致率']=(lap_df['前後関係一致率']*100).round(1).astype(str)+'%'
+                                    lap_df['平均順位誤差']=lap_df['平均順位誤差'].round(2)
+                                    st.dataframe(lap_df,use_container_width=True,hide_index=True)
+                            if s253.get('learning_enabled'):
+                                st.success(f"差分学習は有効です（{s253.get('learning_races',0)}レース・{s253.get('learning_samples',0)}比較）。")
+                            elif s253.get('reason'):
+                                st.info(f"差分学習: {s253.get('reason')}")
+                            if s253.get('race_labels'):
+                                st.caption("再構成済み: "+" / ".join(s253['race_labels'][:20]))
+                        except Exception as exc:
+                            st.warning(f"再構成状況の表示に失敗しました: {exc}")
                         v253_limit=st.number_input("再構成する保存履歴数",min_value=1,max_value=200,value=80,step=10,key="v253_backfill_limit")
                         if st.button("過去予測を周回再構成",key="v253_backfill_button",use_container_width=True):
                             with st.spinner("保存済み予測を1レースずつ再構成しています…"):
                                 r253=_v253_backfill_saved_lap_predictions(engine.DB_PATH,int(v253_limit))
                             if r253.get("saved",0)>0: st.success(r253.get("message","完了しました。"))
                             else: st.info(r253.get("message","再構成対象がありませんでした。"))
+                            if r253.get('saved_races'):
+                                st.caption("今回再構成: "+" / ".join(r253['saved_races']))
                             if r253.get("errors"):
                                 st.warning(" / ".join(r253["errors"]))
+                            st.rerun()
 
                     st.caption("結果の周回順位はあるのに選手名へ結び付いていないデータを、レース・車番単位で診断して修復します。候補が一意のものだけ自動修復し、曖昧なものは手動で選びます。")
                     try:
