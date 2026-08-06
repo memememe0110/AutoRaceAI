@@ -507,7 +507,7 @@ def _v248_wall_calibration(db_path: str | None = None) -> dict:
 
 
 
-# Ver251: 実際のグランドノートを1周ごとに照合し、開催場・周回・ハンデ差別の
+# Ver253: 実際のグランドノートを1周ごとに照合し、開催場・周回・ハンデ差別の
 # 追い抜き発生率を時系列で学習する。予測対象日以降の結果は使わない。
 _V251_LAP_ALIGNMENT_CACHE = {}
 
@@ -642,6 +642,201 @@ def _v251_pairwise_accuracy(pred: tuple[int,...], actual: tuple[int,...]) -> flo
             tot+=1; ok += int((pp[a]<pp[b])==(ap[a]<ap[b]))
     return ok/tot if tot else 0.0
 
+
+
+# Ver253: 予測時に代表隊列を保存し、後日登録された実測グランドノートとの差を
+# 開催場・周回・ハンデ差別に学習する。結果登録済みレースの再計算はバックテスト扱いで学習除外。
+_V252_LAP_RESIDUAL_CACHE = {}
+
+def _v252_ensure_lap_tables(con: sqlite3.Connection) -> None:
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS v252_lap_prediction_snapshots (
+        snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        race_date TEXT NOT NULL,
+        venue TEXT NOT NULL,
+        race_no TEXT NOT NULL,
+        lap_no INTEGER NOT NULL,
+        predicted_order TEXT NOT NULL,
+        support REAL,
+        app_version TEXT NOT NULL,
+        is_backtest INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    con.execute("""
+    CREATE INDEX IF NOT EXISTS idx_v252_lap_pred_race
+    ON v252_lap_prediction_snapshots(race_date, venue, race_no, lap_no, created_at)
+    """)
+
+def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[dict], is_backtest: bool) -> None:
+    if not db_path or not Path(db_path).exists() or not modal_laps:
+        return
+    race_date=str((meta or {}).get('開催日') or (meta or {}).get('race_date') or '')[:10]
+    venue=str((meta or {}).get('開催場') or (meta or {}).get('venue') or '').strip()
+    race_no=str((meta or {}).get('R') or (meta or {}).get('レース') or (meta or {}).get('race_no') or '').strip().replace('R','')
+    if not race_date or not venue or not race_no:
+        return
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            _v252_ensure_lap_tables(con)
+            # 同じ版・同じレースの再実行は最新スナップショットへ置換する。
+            con.execute("""
+                DELETE FROM v252_lap_prediction_snapshots
+                WHERE race_date=? AND venue=? AND race_no=? AND app_version=?
+            """, (race_date,venue,race_no,'Ver253'))
+            for row in modal_laps:
+                con.execute("""
+                    INSERT INTO v252_lap_prediction_snapshots
+                    (race_date,venue,race_no,lap_no,predicted_order,support,app_version,is_backtest)
+                    VALUES(?,?,?,?,?,?,?,?)
+                """, (race_date,venue,race_no,int(row.get('lap',0)),str(row.get('order','')),
+                      float(row.get('support',0.0)),'Ver253',(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))))
+            con.commit()
+        _V252_LAP_RESIDUAL_CACHE.clear()
+    except Exception:
+        pass
+
+def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date: str) -> dict:
+    """予測代表隊列と後日判明した実測隊列の追越し差を時系列で縮小学習する。"""
+    result={"enabled":False,"samples":0,"races":0,"delta":{},"reason":"予測・実測の周回ペア不足"}
+    if not db_path or not Path(db_path).exists():
+        return result
+    try:
+        stamp=(str(db_path),Path(db_path).stat().st_mtime_ns,str(venue),str(cutoff_date)[:10])
+    except Exception:
+        stamp=(str(db_path),str(venue),str(cutoff_date)[:10])
+    if stamp in _V252_LAP_RESIDUAL_CACHE:
+        return dict(_V252_LAP_RESIDUAL_CACHE[stamp])
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            _v252_ensure_lap_tables(con)
+            pred=pd.read_sql_query("""
+                SELECT p.race_date,p.venue,p.race_no,p.lap_no,p.predicted_order,p.support,p.is_backtest,p.created_at
+                FROM v252_lap_prediction_snapshots p
+                WHERE p.is_backtest IN (0,2) AND p.app_version='Ver253'
+                  AND (?='' OR p.venue=?)
+                  AND (?='' OR substr(p.race_date,1,10)<substr(?,1,10))
+                ORDER BY p.created_at
+            """,con,params=(venue,venue,cutoff_date,cutoff_date))
+            actual=pd.read_sql_query("""
+                SELECT rr.race_date,rr.venue,REPLACE(COALESCE(rr.race_no,''),'R','') AS race_no,
+                       rl.lap_no,rl.position,rl.car_no,
+                       COALESCE(CAST(REPLACE(REPLACE(re.handicap,'m',''),'Ｍ','') AS INTEGER),0) AS handicap
+                FROM result_laps rl
+                JOIN result_races rr ON rr.race_key=rl.race_key
+                LEFT JOIN races r ON r.race_key=rr.race_key
+                LEFT JOIN race_entries re ON re.race_id=r.race_id AND re.car_no=rl.car_no
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                  AND (?='' OR rr.venue=?)
+                  AND (?='' OR substr(rr.race_date,1,10)<substr(?,1,10))
+                ORDER BY rr.race_date,rr.venue,rr.race_no,rl.lap_no,rl.position
+            """,con,params=(venue,venue,cutoff_date,cutoff_date))
+    except Exception as exc:
+        result['reason']=f'周回差分読込失敗: {exc}'
+        return result
+    if pred.empty or actual.empty:
+        return result
+    # 同一レース・周回は最新の予測だけ採用。
+    pred=pred.sort_values('created_at').drop_duplicates(['race_date','venue','race_no','lap_no'],keep='last')
+    amap={}
+    hmaps={}
+    for key,g in actual.groupby(['race_date','venue','race_no','lap_no'],dropna=False):
+        gg=g.sort_values('position')
+        amap[(str(key[0])[:10],str(key[1]),str(key[2]),int(key[3]))]=tuple(int(x) for x in gg.car_no.tolist())
+        hmaps[(str(key[0])[:10],str(key[1]),str(key[2]),int(key[3]))]={int(r.car_no):int(r.handicap or 0) for r in gg.itertuples()}
+    events=[]; race_keys=set()
+    for row in pred.itertuples():
+        key=(str(row.race_date)[:10],str(row.venue),str(row.race_no),int(row.lap_no))
+        actual_order=amap.get(key)
+        try: pred_order=tuple(int(x) for x in str(row.predicted_order).split('-') if str(x).strip())
+        except Exception: continue
+        if not actual_order or len(pred_order)<3: continue
+        race_keys.add(key[:3]); hp=hmaps.get(key,{})
+        # 各隣接ペアで「予測は抜く/実際は抜く」を比較する。
+        # 前周の実測隊列を基準にするため、lap1は初期車列（ハンデ・車番順）を近似。
+        prev_key=(key[0],key[1],key[2],key[3]-1)
+        prev=amap.get(prev_key)
+        if not prev:
+            prev=tuple(sorted(actual_order,key=lambda c:(hp.get(c,0),c)))
+        pp={c:i for i,c in enumerate(pred_order)}; ap={c:i for i,c in enumerate(actual_order)}
+        for j in range(1,len(prev)):
+            front,chaser=prev[j-1],prev[j]
+            if front not in pp or chaser not in pp or front not in ap or chaser not in ap: continue
+            pred_pass=int(pp[chaser]<pp[front]); actual_pass=int(ap[chaser]<ap[front])
+            gap=max(0,hp.get(chaser,0)-hp.get(front,0))
+            events.append((key[3],_v251_gap_bucket(gap),actual_pass-pred_pass,0.35 if int(getattr(row,'is_backtest',0) or 0)==2 else 1.0))
+    if len(events)<60:
+        result.update({'samples':len(events),'races':len(race_keys)})
+        _V252_LAP_RESIDUAL_CACHE[stamp]=dict(result)
+        return result
+    ev=pd.DataFrame(events,columns=['lap','bucket','residual','weight'])
+    deltas={}
+    for (lap,bucket),g in ev.groupby(['lap','bucket']):
+        n=len(g); effective_n=float(g['weight'].sum()); raw=float(np.average(g['residual'],weights=g['weight']))
+        # 再構成データは0.35重み。正なら予測より実際の追越しが多い。
+        shrunk=(effective_n/(effective_n+45.0))*raw
+        deltas[f'{int(lap)}|{bucket}']={
+            'delta':float(np.clip(shrunk*0.70,-0.24,0.24)),
+            'raw_residual':raw,'n':int(n),'effective_n':round(effective_n,2)
+        }
+    result={'enabled':True,'samples':int(len(ev)),'races':int(len(race_keys)),
+            'delta':deltas,'reason':'予測代表隊列と後日実測グランドノートの周回差を縮小学習'}
+    _V252_LAP_RESIDUAL_CACHE.clear(); _V252_LAP_RESIDUAL_CACHE[stamp]=dict(result)
+    return result
+
+
+# Ver253: 保存済み予測履歴の出走表を使い、各レースを現在の6周モデルで再構成する。
+# 実結果は順位生成に使わず、生成後の周回残差学習だけに低い重みで利用する。
+def _v253_backfill_saved_lap_predictions(db_path: str, limit: int = 80) -> dict:
+    global _V253_RECONSTRUCTION_MODE
+    result={"processed":0,"saved":0,"skipped":0,"errors":[],"message":""}
+    if not db_path or not Path(db_path).exists():
+        result["message"]="DBが見つかりません。"; return result
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            _v253_ensure_lap_tables(con)
+            rows=con.execute("""
+                SELECT history_id,race_key,race_label,prediction_time,trials,seed,raw_text,venue_override
+                FROM v231_prediction_history
+                WHERE COALESCE(raw_text,'')<>''
+                ORDER BY prediction_time ASC, history_id ASC
+                LIMIT ?
+            """,(max(1,int(limit)),)).fetchall()
+            existing=set((str(a),str(b),str(c)) for a,b,c in con.execute("""
+                SELECT race_date,venue,race_no FROM v253_lap_prediction_snapshots
+                WHERE app_version='Ver253' AND is_backtest=2 GROUP BY race_date,venue,race_no
+            """).fetchall())
+        for row in rows:
+            result["processed"]+=1
+            hid,race_key,label,pred_time,trials,seed,raw_text,venue_override=row
+            try:
+                prediction_text=str(raw_text or '')
+                if str(venue_override or '').strip():
+                    prediction_text=f"開催場: {str(venue_override).strip()}\n"+prediction_text
+                # パーサーと基礎予測は保存当時の入力だけから再実行。
+                df,bets,output,entries,meta=engine.ver16_run_prediction(
+                    prediction_text,max(1000,min(int(trials or 2000),4000)),int(seed or 42),manual_excluded=[]
+                )
+                meta=dict(meta or {})
+                race_date=str(meta.get('開催日') or meta.get('race_date') or '')[:10]
+                venue=str(meta.get('開催場') or meta.get('venue') or '').strip()
+                race_no=str(meta.get('R') or meta.get('レース') or meta.get('race_no') or '').strip().replace('R','')
+                if not race_date or not venue or not race_no or (race_date,venue,race_no) in existing:
+                    result["skipped"]+=1; continue
+                _V253_RECONSTRUCTION_MODE=True
+                try:
+                    _v230_six_lap_simulation(df,bets,entries,meta,max(1000,min(int(trials or 2000),4000)),int(seed or 42))
+                finally:
+                    _V253_RECONSTRUCTION_MODE=False
+                existing.add((race_date,venue,race_no)); result["saved"]+=1
+            except Exception as exc:
+                _V253_RECONSTRUCTION_MODE=False
+                if len(result["errors"])<8: result["errors"].append(f"履歴{hid}: {type(exc).__name__}: {exc}")
+        _V253_LAP_RESIDUAL_CACHE.clear()
+        result["message"]=f"{result['processed']}履歴を確認し、{result['saved']}レースを周回再構成、{result['skipped']}件をスキップしました。"
+    except Exception as exc:
+        result["message"]=f"再構成失敗: {type(exc).__name__}: {exc}"
+    return result
 
 # Ver250: 前方集団残存・周回内連続追抜制限・ハンデ差別の壁を開催日前実績だけで自動学習する。
 _V250_FLOW_CALIBRATION_CACHE = {}
@@ -809,6 +1004,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     queue_wall_delta=float(flow_calibration.get("queue_wall_delta",0.0)) if flow_calibration.get("enabled") else 0.0
     lap_alignment=_v251_lap_alignment_calibration(_v230_db_path(), venue, race_date)
     lap_bucket_delta=lap_alignment.get("lap_bucket_delta") or {}
+    lap_residual=_v252_lap_residual_calibration(_v230_db_path(), venue, race_date)
+    lap_residual_delta=lap_residual.get("delta") or {}
     actual_lap_orders=_v251_actual_lap_orders(_v230_db_path(), meta)
     _v242_prepare_seconds=time_module.perf_counter()-_v242_prepare_started
     name_by_car={c:n for c,n in zip(cars,names)}
@@ -914,10 +1111,12 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 chain_bonus=min(0.42, momentum.get(chaser,0.0))
                 # Ver250: ハンデ差が大きい追込みほど、追い付いてから抜くまでの余白を必要とする。
                 handicap_gap=max(0, handicap[chaser]-handicap[front])
-                # Ver251: 固定のハンデ壁を弱め、実際の周回順位入替率を主に使う。
+                # Ver253: 固定のハンデ壁を弱め、実際の周回順位入替率を主に使う。
                 handicap_wall=min(0.12, 0.0022*handicap_gap)
                 bucket_key=f"{lap}|{_v251_gap_bucket(handicap_gap)}"
                 learned_transition=float((lap_bucket_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_alignment.get("enabled") else 0.0
+                # Ver253: 過去予測が実測より抜き過ぎ/抜かな過ぎだった残差を直接補正。
+                residual_transition=float((lap_residual_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_residual.get("enabled") else 0.0
                 # 2台目までは現実に起こり得るため軽く、3台目以降だけ強く抑える。
                 same_lap_passes=lap_pass_count.get(chaser,0)
                 chain_fatigue=(0.16 if same_lap_passes==1 else (0.52 if same_lap_passes>=2 else 0.0))
@@ -925,7 +1124,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 front_pack=sum(1 for x in order[:min(3,len(order))] if handicap[x]==min_handicap)
                 pack_wall=(0.07*max(0,front_pack-1))*max(0.30,1.0-0.10*(lap-1))
                 # 一要素でほぼ確定しないよう係数を縮小し、各周に最低限の不確実性を残す。
-                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + weak_front_bonus + chain_bonus - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
+                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + weak_front_bonus + chain_bonus - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
                 logit += rng.normal(0,0.16)
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
@@ -1040,20 +1239,23 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             pred=tuple(int(x) for x in modal_laps[idx-1]["order"].split('-')) if idx<=len(modal_laps) else tuple()
             pos_acc=(sum(1 for a,b in zip(pred,actual) if a==b)/max(1,len(actual))) if pred else 0.0
             lap_comparison.append({"lap":idx,"label":label,"actual":"-".join(map(str,actual)),"predicted":"-".join(map(str,pred)),"position_accuracy":pos_acc*100,"pairwise_accuracy":_v251_pairwise_accuracy(pred,actual)*100})
+    # 実測が既にある再シミュレーションはバックテストとして保存し、未来学習には混ぜない。
+    _v252_save_lap_prediction(_v230_db_path(), meta, modal_laps, bool(actual_lap_orders))
     audit={
-        "enabled":True,"mode":"6周内蔵Ver251・グランドノート周回照合学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver253・グランドノート周回照合学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
         "wall_calibration": wall_calibration,
         "flow_calibration": flow_calibration,
         "lap_alignment": lap_alignment,
+        "lap_residual_learning": lap_residual,
         "predicted_lap_orders": modal_laps,
         "actual_lap_comparison": lap_comparison,
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
-        "message":f"実際のグランドノートを開催場・周回・ハンデ差別に照合し、開催日前データだけで追い抜き率を自動学習。予測側も1周ごとの代表隊列を保存して実測と比較します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
+        "message":f"予測時の代表隊列を保存し、後日判明した実測グランドノートとの差を開催場・周回・ハンデ差別に自動学習。結果登録済みレースの再計算は学習除外します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
     }
     return out,new_bets,audit
 
@@ -1280,7 +1482,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver251"
+_V231_APP_VERSION = "Ver253"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -1688,7 +1890,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver251｜実際のグランドノートと予測隊列を1周ごとに照合し、周回・ハンデ差別の追い抜き率を自動学習します。")
+st.caption("Ver253｜保存済み予測も周回再構成し、実際のグランドノートとの差を周回・ハンデ差別に自動学習します。")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
@@ -8585,6 +8787,17 @@ if selected_main_page == "🗃️ 登録情報確認":
 
                     st.divider()
                     st.subheader("グランドノート未リンク修復")
+                    with st.expander("Ver253 過去予測の周回再構成", expanded=False):
+                        st.caption("保存済み予測の出走表を現在の6周モデルで再実行し、実測グランドノートとの差分学習を起動します。再構成値は通常予測の35%重みで使い、過去結果そのものを順位生成には使いません。")
+                        v253_limit=st.number_input("再構成する保存履歴数",min_value=1,max_value=200,value=80,step=10,key="v253_backfill_limit")
+                        if st.button("過去予測を周回再構成",key="v253_backfill_button",use_container_width=True):
+                            with st.spinner("保存済み予測を1レースずつ再構成しています…"):
+                                r253=_v253_backfill_saved_lap_predictions(engine.DB_PATH,int(v253_limit))
+                            if r253.get("saved",0)>0: st.success(r253.get("message","完了しました。"))
+                            else: st.info(r253.get("message","再構成対象がありませんでした。"))
+                            if r253.get("errors"):
+                                st.warning(" / ".join(r253["errors"]))
+
                     st.caption("結果の周回順位はあるのに選手名へ結び付いていないデータを、レース・車番単位で診断して修復します。候補が一意のものだけ自動修復し、曖昧なものは手動で選びます。")
                     try:
                         health = engine.v63_db_health_report(engine.DB_PATH)
