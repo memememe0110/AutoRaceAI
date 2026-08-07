@@ -689,14 +689,14 @@ def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[
             con.execute("""
                 DELETE FROM v252_lap_prediction_snapshots
                 WHERE race_date=? AND venue=? AND race_no=? AND app_version=?
-            """, (race_date,venue,race_no,'Ver258'))
+            """, (race_date,venue,race_no,'Ver260'))
             for row in modal_laps:
                 con.execute("""
                     INSERT INTO v252_lap_prediction_snapshots
                     (race_date,venue,race_no,lap_no,predicted_order,support,app_version,is_backtest)
                     VALUES(?,?,?,?,?,?,?,?)
                 """, (race_date,venue,race_no,int(row.get('lap',0)),str(row.get('order','')),
-                      float(row.get('support',0.0)),'Ver258',(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))))
+                      float(row.get('support',0.0)),'Ver260',(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))))
             con.commit()
         _V252_LAP_RESIDUAL_CACHE.clear()
     except Exception:
@@ -719,7 +719,7 @@ def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date:
             pred=pd.read_sql_query("""
                 SELECT p.race_date,p.venue,p.race_no,p.lap_no,p.predicted_order,p.support,p.is_backtest,p.created_at
                 FROM v252_lap_prediction_snapshots p
-                WHERE p.is_backtest IN (0,2) AND p.app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver258')
+                WHERE p.is_backtest IN (0,2) AND p.app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver259','Ver260')
                   AND (?='' OR p.venue=?)
                   AND (?='' OR substr(p.race_date,1,10)<substr(?,1,10))
                 ORDER BY p.created_at
@@ -911,7 +911,7 @@ def _v256_refresh_learning_settings(db_path: str | None) -> dict:
                 con.execute("""UPDATE learning_settings
                                SET current_value=?,updated_at=CURRENT_TIMESTAMP,sample_races=?,reason=?
                                WHERE setting_name=?""",
-                            (round(value,6),int(race_count),'Ver258: 全実測グランドノートの周回入替率＋選手別実測追抜学習を利用',name))
+                            (round(value,6),int(race_count),'Ver260: 全実測グランドノートの周回入替率＋選手別実測追抜学習を利用',name))
                 out['updated']+=1
             con.commit()
         out.update({'races':int(race_count),'pairs':int(cal.get('pairs',0))})
@@ -942,7 +942,7 @@ def _v254_player_lap_calibration(db_path: str | None, venue: str, cutoff_date: s
                        p.is_backtest,p.created_at
                 FROM v252_lap_prediction_snapshots p
                 WHERE p.is_backtest IN (0,2)
-                  AND p.app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver258')
+                  AND p.app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver259','Ver260')
                   AND (?='' OR p.venue=?)
                   AND (?='' OR substr(p.race_date,1,10)<substr(?,1,10))
                 ORDER BY p.created_at
@@ -1024,7 +1024,7 @@ def _v254_player_lap_calibration(db_path: str | None, venue: str, cutoff_date: s
 
 
 
-# Ver258: 保存予測がある7レースだけに依存せず、実測グランドノート全体から
+# Ver260: 保存予測がある7レースだけに依存せず、実測グランドノート全体から
 # 選手×周回の「前車を実際に入れ替えた率」を学習する。
 # 開催場データが薄い場合は全場の選手傾向へ縮小し、さらに周回全体平均との差だけを小さく反映する。
 _V258_PLAYER_ACTUAL_CACHE = {}
@@ -1069,7 +1069,7 @@ def _v258_player_actual_lap_calibration(db_path: str | None, venue: str = "", cu
                 ORDER BY rr.race_date,rr.venue,rr.race_no,rl.lap_no,rl.position
             """,con,params=(cutoff_date,cutoff_date))
     except Exception as exc:
-        result['reason']=f'Ver258選手別実測周回読込失敗: {exc}'
+        result['reason']=f'Ver260選手別実測周回読込失敗: {exc}'
         return result
     result['total_laps']=total_laps; result['linked_laps']=linked_laps
     if d.empty:
@@ -1133,7 +1133,7 @@ def _v258_player_actual_lap_calibration(db_path: str | None, venue: str = "", cu
     result.update({
         'enabled':bool(deltas),'races':len(race_keys),'pairs':int(len(local)),
         'players':len(used_players),'player_delta':deltas,
-        'reason':'Ver258: 全実測グランドノートから選手×周回の追抜率を学習し、開催場・全場へ階層縮小'
+        'reason':'Ver260: 全実測グランドノートから選手×周回の追抜率を学習し、開催場・全場へ階層縮小'
     })
     _V258_PLAYER_ACTUAL_CACHE.clear(); _V258_PLAYER_ACTUAL_CACHE[stamp]=dict(result)
     return result
@@ -1157,7 +1157,7 @@ def _v253_backfill_saved_lap_predictions(db_path: str, limit: int = 80) -> dict:
             """,(max(1,int(limit)),)).fetchall()
             existing=set((str(a),str(b),str(c)) for a,b,c in con.execute("""
                 SELECT race_date,venue,race_no FROM v252_lap_prediction_snapshots
-                WHERE app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver258') AND is_backtest=2 GROUP BY race_date,venue,race_no
+                WHERE app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver259','Ver260') AND is_backtest=2 GROUP BY race_date,venue,race_no
             """).fetchall())
         for row in rows:
             result["processed"]+=1
@@ -1216,7 +1216,7 @@ def _v253_reconstruction_status(db_path: str) -> dict:
             pred=pd.read_sql_query("""
                 SELECT race_date,venue,race_no,lap_no,predicted_order,support,created_at
                 FROM v252_lap_prediction_snapshots
-                WHERE app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver258') AND is_backtest=2
+                WHERE app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver259','Ver260') AND is_backtest=2
                 ORDER BY race_date,venue,CAST(race_no AS INTEGER),lap_no,created_at
             """,con)
             actual=pd.read_sql_query("""
@@ -1728,7 +1728,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 # Ver254: 同じ選手が同じ周回で一貫して予測より追い上げる/追い上げない残差を小さく反映。
                 player_lap_key=f"{cn}|{lap}"
                 player_transition=float((player_lap_delta.get(player_lap_key) or {}).get("delta",0.0)) if player_lap_calibration.get("enabled") else 0.0
-                # Ver258: 保存予測の有無に依存しない全実測の選手×周回追抜率。
+                # Ver260: 保存予測の有無に依存しない全実測の選手×周回追抜率。
                 # Ver254残差学習と同時に効き過ぎないよう、合算後も小さく制限する。
                 player_actual_transition=float((player_actual_delta.get(player_lap_key) or {}).get("delta",0.0)) if player_actual_calibration.get("enabled") else 0.0
                 player_total_transition=float(np.clip(player_transition+player_actual_transition,-0.18,0.18))
@@ -2099,7 +2099,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver258"
+_V231_APP_VERSION = "Ver260"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -2507,7 +2507,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver258｜全実測グランドノートから選手×周回の追抜傾向を階層学習し、保存予測が少ない段階でも展開へ反映します。")
+st.caption("Ver260｜全実測グランドノートから選手×周回の追抜傾向を階層学習し、保存予測が少ない段階でも展開へ反映します。")
 try:
     _v256_refresh_learning_settings(_v230_db_path())
 except Exception:
@@ -6406,6 +6406,143 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     residual_candidates.sort(key=lambda x: x["score"], reverse=True)
     residual_candidates = residual_candidates[:3]
 
+    # Ver260: 画面・買い方の構成は従来のまま、券種をまたぐ完全重複だけを最終再評価する。
+    # 例: 3連単で同じ3車の全着順をすでに覆っている場合の同一3連複、
+    #     2連単表裏で同じ2車を覆っている場合の同一2連複。
+    # 一律削除ではなく、100円均等買いの総額を含めたモデル回収率・黒字率・ガミ率を比較し、
+    # 外しても的中範囲を失わず、成績が同等以上になる場合だけ除外する。
+    v259_overlap_prune_notes = []
+    for _ in range(10):
+        before_overlap = evaluate(selected)
+        best_overlap_remove = None
+        for ticket in list(selected):
+            if len(selected) <= 2:
+                break
+            trial_plan = [t for t in selected if t is not ticket]
+            other_matched = set()
+            for other in trial_plan:
+                other_matched.update(other.get("matched", set()))
+            own_matched = set(ticket.get("matched", set()))
+            unique_indexes = own_matched - other_matched
+            unique_prob = sum(float(outcomes[i][1]) for i in unique_indexes)
+            if unique_prob > 0.01:
+                continue
+
+            after_overlap = evaluate(trial_plan)
+            return_delta = float(after_overlap.get("model_return_rate", 0.0) - before_overlap.get("model_return_rate", 0.0))
+            black_delta = float(after_overlap.get("black", 0.0) - before_overlap.get("black", 0.0))
+            gami_delta = float(after_overlap.get("low", 0.0) - before_overlap.get("low", 0.0))
+            cover_delta = float(after_overlap.get("cover", 0.0) - before_overlap.get("cover", 0.0))
+
+            # 完全重複なのでカバーは原則不変。払戻の上乗せ価値が高ければ残す。
+            # 回収率が明確に改善、またはほぼ同等で黒字率・ガミ率が悪化しない時だけ削る。
+            acceptable = (
+                return_delta >= 0.10
+                or (
+                    return_delta >= -0.05
+                    and black_delta >= -0.05
+                    and gami_delta <= 0.05
+                    and cover_delta >= -0.01
+                )
+            )
+            if not acceptable:
+                continue
+
+            prob = float(ticket.get("probability", 0.0) or 0.0)
+            odds = float(ticket.get("odds", 0.0) or 0.0)
+            standalone_ev = (prob / 100.0) * odds
+            key = (
+                return_delta,
+                black_delta,
+                -gami_delta,
+                -standalone_ev,
+                odds,
+            )
+            if best_overlap_remove is None or key > best_overlap_remove[0]:
+                best_overlap_remove = (
+                    key, ticket, trial_plan, after_overlap, standalone_ev,
+                    return_delta, black_delta, gami_delta
+                )
+
+        if best_overlap_remove is None:
+            break
+
+        (_, ticket, selected, after_overlap, standalone_ev,
+         return_delta, black_delta, gami_delta) = best_overlap_remove
+        ticket["protected"] = False
+        v259_overlap_prune_notes.append(
+            f"{ticket['type']} {ticket['combo']}（{float(ticket.get('odds',0)):.1f}倍）は他券で的中範囲を完全包含。"
+            f"100円均等の最終比較で除外（単体期待値{standalone_ev*100:.1f}%、"
+            f"参考回収率{before_overlap['model_return_rate']:.1f}%→{after_overlap['model_return_rate']:.1f}%、"
+            f"黒字率差{black_delta:+.2f}pt、ガミ率差{gami_delta:+.2f}pt）。"
+        )
+
+    # Ver260: 完全重複を削った後は、減った点数を機械的には埋めない。
+    # 未採用候補を1点ずつ100円均等で再評価し、現在構成より参考回収率が改善する候補だけを追加する。
+    # 追加しても改善しない場合は、点数が減ったまま終了する。
+    v260_refill_notes = []
+    v260_removed_points = len(v259_overlap_prune_notes)
+    for _ in range(v260_removed_points):
+        before_refill = evaluate(selected)
+        selected_ids_now = {(str(t.get("type")), str(t.get("combo"))) for t in selected}
+        current_matched = set()
+        for t in selected:
+            current_matched.update(t.get("matched", set()))
+
+        best_refill = None
+        for cand in candidates:
+            cid = (str(cand.get("type")), str(cand.get("combo")))
+            if cid in selected_ids_now:
+                continue
+
+            # 既存構成に完全包含される券は、削除直後に戻さない。
+            own_matched = set(cand.get("matched", set()))
+            unique_indexes = own_matched - current_matched
+            unique_prob = sum(float(outcomes[i][1]) for i in unique_indexes)
+            if unique_prob <= 0.01:
+                continue
+
+            counts = before_refill.get("counts", {}) or {}
+            if counts.get(cand.get("type"), 0) >= int(cand.get("cap", 99)):
+                continue
+
+            after_refill = evaluate(selected + [cand])
+            return_delta = float(after_refill.get("model_return_rate", 0.0) - before_refill.get("model_return_rate", 0.0))
+            black_delta = float(after_refill.get("black", 0.0) - before_refill.get("black", 0.0))
+            gami_delta = float(after_refill.get("low", 0.0) - before_refill.get("low", 0.0))
+            cover_delta = float(after_refill.get("cover", 0.0) - before_refill.get("cover", 0.0))
+            probability = float(cand.get("probability", 0.0) or 0.0)
+            odds = float(cand.get("odds", 0.0) or 0.0)
+            standalone_ev = (probability / 100.0) * odds
+
+            acceptable = (
+                return_delta >= 0.05
+                and black_delta >= -0.05
+                and gami_delta <= 0.10
+                and cover_delta >= 0.0
+                and standalone_ev >= 0.95
+            )
+            if not acceptable:
+                continue
+
+            key = (return_delta, black_delta, cover_delta, -gami_delta, standalone_ev, unique_prob, odds)
+            if best_refill is None or key > best_refill[0]:
+                best_refill = (key, cand, after_refill, standalone_ev, unique_prob,
+                               return_delta, black_delta, gami_delta, cover_delta)
+
+        if best_refill is None:
+            break
+
+        (_, cand, after_refill, standalone_ev, unique_prob,
+         return_delta, black_delta, gami_delta, cover_delta) = best_refill
+        selected.append(cand)
+        v260_refill_notes.append(
+            f"{cand['type']} {cand['combo']}（{float(cand.get('odds',0)):.1f}倍）を次点から追加。"
+            f"参考回収率{before_refill['model_return_rate']:.1f}%→{after_refill['model_return_rate']:.1f}% "
+            f"（{return_delta:+.2f}pt）、黒字率{black_delta:+.2f}pt、ガミ率{gami_delta:+.2f}pt、"
+            f"追加カバー{cover_delta:+.2f}pt、単体期待値{standalone_ev*100:.1f}%・固有カバー{unique_prob:.2f}%。"
+        )
+
     metrics = evaluate(selected)
     calibration = _v195_return_calibration(engine.DB_PATH)
     adjusted_expected_multiple = float(metrics.get("model_expected_multiple", 0.0)) * float(calibration.get("factor", 1.0))
@@ -6472,6 +6609,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "tri_seed_points": int(tri_seed_points),
         "replacement_notes": replacement_notes,
         "gami_prune_notes": gami_prune_notes,
+        "v259_overlap_prune_notes": v259_overlap_prune_notes,
+        "v260_refill_notes": v260_refill_notes,
         "low_odds_floor_notes": low_odds_floor_notes,
         "solo_gami_exclusion_notes": solo_gami_exclusion_notes,
         "protected_add_notes": protected_add_notes,
@@ -6629,6 +6768,16 @@ def show_v184_eight_car_mixed_plan(
     if result.get("solo_gami_exclusion_notes"):
         st.info("長期回収率優先のため、単独的中で購入総額を回収できない買い目を最終構成から除外しました。")
         for note in result.get("solo_gami_exclusion_notes", []):
+            st.caption(f"・{note}")
+
+    if result.get("v259_overlap_prune_notes"):
+        st.caption("券種間の完全重複を100円均等・回収率基準で再評価しました。")
+        for note in result.get("v259_overlap_prune_notes", []):
+            st.caption(f"・{note}")
+
+    if result.get("v260_refill_notes"):
+        st.caption("重複削除後は、100円均等のまま回収率が改善する次点候補だけを再評価して補充しました。")
+        for note in result.get("v260_refill_notes", []):
             st.caption(f"・{note}")
 
     if result.get("gami_prune_notes"):
@@ -9487,7 +9636,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 st.warning(" / ".join(r253["errors"]))
                             st.rerun()
 
-                    with st.expander("Ver258 精度比較・自動バックテストセンター", expanded=False):
+                    with st.expander("Ver260 精度比較・自動バックテストセンター", expanded=False):
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
                         run_v255=st.button("保存済みバージョンを再評価",key="v255_backtest_run",use_container_width=True)
                         try:
