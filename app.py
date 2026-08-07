@@ -688,14 +688,14 @@ def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[
             con.execute("""
                 DELETE FROM v252_lap_prediction_snapshots
                 WHERE race_date=? AND venue=? AND race_no=? AND app_version=?
-            """, (race_date,venue,race_no,'Ver254'))
+            """, (race_date,venue,race_no,'Ver255'))
             for row in modal_laps:
                 con.execute("""
                     INSERT INTO v252_lap_prediction_snapshots
                     (race_date,venue,race_no,lap_no,predicted_order,support,app_version,is_backtest)
                     VALUES(?,?,?,?,?,?,?,?)
                 """, (race_date,venue,race_no,int(row.get('lap',0)),str(row.get('order','')),
-                      float(row.get('support',0.0)),'Ver254',(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))))
+                      float(row.get('support',0.0)),'Ver255',(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))))
             con.commit()
         _V252_LAP_RESIDUAL_CACHE.clear()
     except Exception:
@@ -718,7 +718,7 @@ def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date:
             pred=pd.read_sql_query("""
                 SELECT p.race_date,p.venue,p.race_no,p.lap_no,p.predicted_order,p.support,p.is_backtest,p.created_at
                 FROM v252_lap_prediction_snapshots p
-                WHERE p.is_backtest IN (0,2) AND p.app_version IN ('Ver253','Ver254')
+                WHERE p.is_backtest IN (0,2) AND p.app_version IN ('Ver253','Ver254','Ver255')
                   AND (?='' OR p.venue=?)
                   AND (?='' OR substr(p.race_date,1,10)<substr(?,1,10))
                 ORDER BY p.created_at
@@ -818,7 +818,7 @@ def _v254_player_lap_calibration(db_path: str | None, venue: str, cutoff_date: s
                        p.is_backtest,p.created_at
                 FROM v252_lap_prediction_snapshots p
                 WHERE p.is_backtest IN (0,2)
-                  AND p.app_version IN ('Ver253','Ver254')
+                  AND p.app_version IN ('Ver253','Ver254','Ver255')
                   AND (?='' OR p.venue=?)
                   AND (?='' OR substr(p.race_date,1,10)<substr(?,1,10))
                 ORDER BY p.created_at
@@ -919,7 +919,7 @@ def _v253_backfill_saved_lap_predictions(db_path: str, limit: int = 80) -> dict:
             """,(max(1,int(limit)),)).fetchall()
             existing=set((str(a),str(b),str(c)) for a,b,c in con.execute("""
                 SELECT race_date,venue,race_no FROM v252_lap_prediction_snapshots
-                WHERE app_version IN ('Ver253','Ver254') AND is_backtest=2 GROUP BY race_date,venue,race_no
+                WHERE app_version IN ('Ver253','Ver254','Ver255') AND is_backtest=2 GROUP BY race_date,venue,race_no
             """).fetchall())
         for row in rows:
             result["processed"]+=1
@@ -978,7 +978,7 @@ def _v253_reconstruction_status(db_path: str) -> dict:
             pred=pd.read_sql_query("""
                 SELECT race_date,venue,race_no,lap_no,predicted_order,support,created_at
                 FROM v252_lap_prediction_snapshots
-                WHERE app_version IN ('Ver253','Ver254') AND is_backtest=2
+                WHERE app_version IN ('Ver253','Ver254','Ver255') AND is_backtest=2
                 ORDER BY race_date,venue,CAST(race_no AS INTEGER),lap_no,created_at
             """,con)
             actual=pd.read_sql_query("""
@@ -1109,6 +1109,95 @@ def _v254_saved_version_lap_comparison(db_path: str) -> pd.DataFrame:
             })
     return pd.DataFrame(rows,columns=columns).sort_values(
         ['前後関係一致率','位置一致率','平均順位誤差'],ascending=[False,False,True],ignore_index=True)
+
+
+# Ver255: 保存済みバージョンを同一の実測グランドノートで比較し、
+# データ量と改善幅を加味して「採用候補 / 保留」を自動判定する。
+def _v255_backtest_center(db_path: str) -> dict:
+    out={
+        'comparison':pd.DataFrame(), 'best_version':'', 'decision':'比較データ不足',
+        'decision_reason':'比較可能な保存済み周回予測がありません。',
+        'learning':{}, 'player_learning':{}, 'report_id':None,
+    }
+    cmp_df=_v254_saved_version_lap_comparison(db_path)
+    out['comparison']=cmp_df
+    try:
+        out['learning']=_v252_lap_residual_learning(db_path)
+    except Exception as exc:
+        out['learning']={'enabled':False,'reason':f'{type(exc).__name__}: {exc}'}
+    try:
+        out['player_learning']=_v254_player_lap_calibration(db_path,'','')
+    except Exception as exc:
+        out['player_learning']={'enabled':False,'reason':f'{type(exc).__name__}: {exc}'}
+    if cmp_df.empty:
+        return out
+    scored=cmp_df.copy()
+    mae_score=(100.0-(scored['平均順位誤差'].astype(float)*22.0)).clip(lower=0,upper=100)
+    scored['総合スコア']=(
+        scored['前後関係一致率'].astype(float)*0.45+
+        scored['位置一致率'].astype(float)*0.35+
+        mae_score*0.20
+    ).round(1)
+    scored=scored.sort_values(
+        ['総合スコア','対象レース','照合周回'],ascending=[False,False,False],ignore_index=True)
+    out['comparison']=scored
+    best=scored.iloc[0]
+    out['best_version']=str(best['バージョン'])
+    enough=bool(int(best['対象レース'])>=3 and int(best['照合周回'])>=12)
+    if len(scored)==1:
+        out['decision']='保留'
+        out['decision_reason']='比較できるバージョンが1種類だけです。別バージョンの未来予測を保存してから比較してください。'
+    else:
+        second=scored.iloc[1]
+        margin=float(best['総合スコア'])-float(second['総合スコア'])
+        if enough and margin>=1.0:
+            out['decision']='採用候補'
+            out['decision_reason']=(
+                f"{best['バージョン']}が次点より総合スコアで{margin:.1f}点上回りました。"
+                '保存済みデータ内の比較なので、未来レースでの確認後に正式採用してください。'
+            )
+        elif not enough:
+            out['decision']='保留'
+            out['decision_reason']='対象レースまたは照合周回が少ないため、補正は自動採用しません。'
+        else:
+            out['decision']='保留'
+            out['decision_reason']=f'上位2版の差が{margin:.1f}点で小さいため、追加データを待ちます。'
+    return out
+
+
+def _v255_save_backtest_report(db_path: str, result: dict) -> int | None:
+    """Store only the evaluation summary. Prediction weights are never rewritten here."""
+    if not db_path or not Path(db_path).exists():
+        return None
+    cmp_df=result.get('comparison')
+    payload=[] if not isinstance(cmp_df,pd.DataFrame) else cmp_df.to_dict(orient='records')
+    try:
+        import json as _json
+        with sqlite3.connect(str(db_path)) as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS v255_backtest_reports(
+                    report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    app_version TEXT NOT NULL,
+                    best_version TEXT,
+                    decision TEXT,
+                    decision_reason TEXT,
+                    comparison_json TEXT
+                )
+            """)
+            cur=con.execute("""
+                INSERT INTO v255_backtest_reports(
+                    app_version,best_version,decision,decision_reason,comparison_json
+                ) VALUES(?,?,?,?,?)
+            """,(
+                _V231_APP_VERSION,str(result.get('best_version') or ''),
+                str(result.get('decision') or ''),str(result.get('decision_reason') or ''),
+                _json.dumps(payload,ensure_ascii=False)
+            ))
+            con.commit()
+            return int(cur.lastrowid)
+    except Exception:
+        return None
 
 
 # Ver250: 前方集団残存・周回内連続追抜制限・ハンデ差別の壁を開催日前実績だけで自動学習する。
@@ -1520,7 +1609,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     # 実測が既にある再シミュレーションはバックテストとして保存し、未来学習には混ぜない。
     _v252_save_lap_prediction(_v230_db_path(), meta, modal_laps, bool(actual_lap_orders))
     audit={
-        "enabled":True,"mode":"6周内蔵Ver254・グランドノート周回照合学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver255・自動バックテスト判定","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -1760,7 +1849,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver254"
+_V231_APP_VERSION = "Ver255"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -2168,7 +2257,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver254｜保存済み予測も周回再構成し、実際のグランドノートとの差を周回・ハンデ差別に自動学習します。")
+st.caption("Ver255｜実測グランドノートとの保存版精度比較・学習状態・採用候補を自動判定します。")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
@@ -9065,7 +9154,7 @@ if selected_main_page == "🗃️ 登録情報確認":
 
                     st.divider()
                     st.subheader("グランドノート未リンク修復")
-                    with st.expander("Ver254 過去予測の周回再構成", expanded=False):
+                    with st.expander("Ver255 過去予測の周回再構成", expanded=False):
                         st.caption("保存済み予測の出走表を現在の6周モデルで再実行し、実測グランドノートとの差分学習を起動します。再構成値は通常予測の35%重みで使い、過去結果そのものを順位生成には使いません。")
                         try:
                             s253=_v253_reconstruction_status(engine.DB_PATH)
@@ -9107,25 +9196,40 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 st.warning(" / ".join(r253["errors"]))
                             st.rerun()
 
-                    with st.expander("Ver254 保存済みバージョン精度比較", expanded=False):
-                        st.caption("DBに実際に保存されている周回予測だけを、実測グランドノートと同じ条件で比較します。保存されていない旧版を推測で補完したり、現在コードで旧版を装って再計算したりはしません。")
+                    with st.expander("Ver255 精度比較・自動バックテストセンター", expanded=False):
+                        st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
+                        run_v255=st.button("保存済みバージョンを再評価",key="v255_backtest_run",use_container_width=True)
                         try:
-                            cmp_df=_v254_saved_version_lap_comparison(engine.DB_PATH)
+                            result255=_v255_backtest_center(engine.DB_PATH)
+                            cmp_df=result255.get('comparison',pd.DataFrame())
                             if cmp_df.empty:
                                 st.info("比較できる保存済み周回予測がまだありません。")
                             else:
                                 show=cmp_df.copy()
-                                show['位置一致率']=show['位置一致率'].map(lambda x:f"{x:.1f}%")
-                                show['前後関係一致率']=show['前後関係一致率'].map(lambda x:f"{x:.1f}%")
+                                show['位置一致率']=show['位置一致率'].map(lambda x:f"{float(x):.1f}%")
+                                show['前後関係一致率']=show['前後関係一致率'].map(lambda x:f"{float(x):.1f}%")
                                 st.dataframe(show,use_container_width=True,hide_index=True)
-                                best=cmp_df.iloc[0]
-                                st.success(
-                                    f"保存済みデータ内の最上位: {best['バージョン']}｜"
-                                    f"前後関係一致 {best['前後関係一致率']:.1f}%｜"
-                                    f"位置一致 {best['位置一致率']:.1f}%｜平均順位誤差 {best['平均順位誤差']:.2f}台"
-                                )
-                                if len(cmp_df)<2:
-                                    st.info("現在は比較可能なバージョンが1種類だけです。今後の予測を各バージョンで保存すると比較対象が増えます。")
+                                decision=str(result255.get('decision') or '保留')
+                                reason=str(result255.get('decision_reason') or '')
+                                if decision=='採用候補':
+                                    st.success(f"採用候補: {result255.get('best_version')}｜{reason}")
+                                else:
+                                    st.info(f"判定: {decision}｜{reason}")
+                            learn=result255.get('learning') or {}
+                            player_learn=result255.get('player_learning') or {}
+                            l1,l2=st.columns(2)
+                            l1.metric("場・周回差分学習",f"{int(learn.get('races',0) or 0)}レース / {int(learn.get('samples',0) or 0)}比較")
+                            l2.metric("選手別周回学習",f"{int(player_learn.get('races',0) or 0)}レース / {int(player_learn.get('samples',0) or 0)}比較")
+                            if not learn.get('enabled'):
+                                st.caption("場・周回差分学習: "+str(learn.get('reason') or '未発動'))
+                            if not player_learn.get('enabled'):
+                                st.caption("選手別周回学習: "+str(player_learn.get('reason') or '未発動'))
+                            if run_v255:
+                                rid=_v255_save_backtest_report(engine.DB_PATH,result255)
+                                if rid:
+                                    st.success(f"比較結果をDBへ保存しました（レポートID: {rid}）。")
+                                else:
+                                    st.warning("比較は完了しましたが、レポートのDB保存に失敗しました。")
                         except Exception as exc:
                             st.warning(f"精度比較の表示に失敗しました: {type(exc).__name__}: {exc}")
 
