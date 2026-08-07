@@ -674,7 +674,7 @@ def _v252_ensure_lap_tables(con: sqlite3.Connection) -> None:
 def _v253_ensure_lap_tables(con: sqlite3.Connection) -> None:
     _v252_ensure_lap_tables(con)
 
-def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[dict], is_backtest: bool) -> dict:
+def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[dict], is_backtest: bool, app_version_override: str = '') -> dict:
     """Save one race's representative lap orders and verify that all laps were persisted.
 
     Ver260 storage fix: this used to fail silently, which made the precision screen show
@@ -695,7 +695,7 @@ def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[
     if not race_date or not venue or not race_no:
         status["reason"]=f"レースキー不足: date={race_date or '-'} venue={venue or '-'} R={race_no or '-'}"; return status
     # 再構成は従来どおりVer253の検証材料、通常予測は現在の実行版として保存する。
-    app_version='Ver253' if _V253_RECONSTRUCTION_MODE else str(globals().get('_V231_APP_VERSION') or 'Ver260')
+    app_version=(str(app_version_override or '').strip() or ('Ver253' if _V253_RECONSTRUCTION_MODE else str(globals().get('_V231_APP_VERSION') or 'Ver260')))
     bt=(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))
     status.update({"app_version":app_version,"is_backtest":bt})
     try:
@@ -730,6 +730,68 @@ def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[
     except Exception as exc:
         status["reason"]=f"{type(exc).__name__}: {exc}"
         return status
+
+
+def _v260_snapshot_from_saved_view(db_path: str, view: dict, source_app_version: str = '') -> dict:
+    """Register lap snapshots from an already-saved prediction without rerunning it.
+
+    Important: preserve the source prediction version. Restoring a Ver253 prediction must
+    remain Ver253 and must not create a new Ver260 ROI/prediction record.
+    """
+    status={"ok":False,"saved_laps":0,"reason":"保存済み予測に周回隊列がありません"}
+    if not isinstance(view,dict) or not view:
+        status["reason"]="保存済み予測を読み込めません"; return status
+    meta=dict(view.get("meta") or {})
+    audit=meta.get("6周展開シミュレーション") or meta.get("壁補正監査") or {}
+    laps=list(audit.get("predicted_lap_orders") or []) if isinstance(audit,dict) else []
+    if not laps:
+        return status
+    ver=str(source_app_version or view.get("app_version") or "").strip() or str(globals().get('_V231_APP_VERSION') or 'Ver260')
+    # This is a stored prediction generated at its original time, not a result-aware rerun.
+    return _v252_save_lap_prediction(db_path,meta,laps,False,app_version_override=ver)
+
+
+def _v260_repair_saved_snapshot_history(db_path: str, app_version: str = '', limit: int = 200) -> dict:
+    """Backfill missing lap snapshots directly from saved prediction payloads."""
+    out={"checked":0,"repaired_races":0,"repaired_laps":0,"already_ok":0,"no_laps":0,"errors":[],"labels":[]}
+    histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
+    target=str(app_version or '').strip()
+    for h in histories:
+        if target and str(h.get('app_version') or '') != target:
+            continue
+        out["checked"]+=1
+        try:
+            view,_,_,hm=_v231_load_prediction_history(db_path,int(h.get('history_id') or 0))
+            if not view:
+                out["errors"].append(f"履歴ID{h.get('history_id')}: 読込失敗"); continue
+            meta=view.get('meta') or {}
+            race_date=str(meta.get('開催日') or meta.get('日付') or meta.get('race_date') or meta.get('date') or '')[:10]
+            venue=str(meta.get('開催場') or meta.get('場') or meta.get('venue') or meta.get('track') or '').strip()
+            race_no=str(meta.get('R') or meta.get('レース') or meta.get('レース番号') or meta.get('race_no') or meta.get('race') or '').strip()
+            race_no=re.sub(r'[^0-9]','',race_no) or race_no.replace('R','').replace('r','').strip()
+            ver=str(hm.get('app_version') or h.get('app_version') or view.get('app_version') or target or _V231_APP_VERSION)
+            if race_date and venue and race_no:
+                with sqlite3.connect(str(db_path)) as con:
+                    _v252_ensure_lap_tables(con)
+                    n=int(con.execute("SELECT COUNT(*) FROM v252_lap_prediction_snapshots WHERE race_date=? AND venue=? AND race_no=? AND app_version=?",(race_date,venue,race_no,ver)).fetchone()[0] or 0)
+                if n>=6:
+                    out["already_ok"]+=1; continue
+            audit=(meta.get('6周展開シミュレーション') or meta.get('壁補正監査') or {}) if isinstance(meta,dict) else {}
+            laps=(audit.get('predicted_lap_orders') or []) if isinstance(audit,dict) else []
+            if not laps:
+                out["no_laps"]+=1; continue
+            stt=_v260_snapshot_from_saved_view(db_path,view,ver)
+            if stt.get('ok'):
+                out["repaired_races"]+=1
+                out["repaired_laps"]+=int(stt.get('saved_laps',0) or 0)
+                out["labels"].append(str(h.get('race_label') or f"履歴ID{h.get('history_id')}"))
+            else:
+                out["errors"].append(f"{h.get('race_label')}: {stt.get('reason','保存失敗')}")
+        except Exception as exc:
+            out["errors"].append(f"{h.get('race_label') or h.get('history_id')}: {type(exc).__name__}: {exc}")
+    out["message"]=(f"確認{out['checked']}件 / 修復{out['repaired_races']}レース・{out['repaired_laps']}周 / "
+                    f"既登録{out['already_ok']}件 / 周回材料なし{out['no_laps']}件")
+    return out
 
 def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date: str) -> dict:
     """予測代表隊列と後日判明した実測隊列の追越し差を時系列で縮小学習する。"""
@@ -2155,7 +2217,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver260"
+_V231_APP_VERSION = "Ver261"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -7674,12 +7736,17 @@ elif selected_main_page == "🏁 予測":
                         restored_view, restored_text, restored_venue = _v222_load_prediction_restore(engine.DB_PATH, target.get("race_key", ""))
                         history_meta = {"app_version":"Unknown", "simulation_mode":"旧保存形式"}
                     if restored_view:
-                        # 復元は表示専用。現行版の新規予測・回収率記録としては保存しない。
+                        # Ver261: 復元は完全に「表示＋入力復元」だけ。
+                        # 復元しただけでは、周回スナップショット・回収率・現行版履歴を新規保存しない。
+                        # 下の「復元内容を現在Verで再シミュレーション」を押した時だけ、
+                        # 現在コードのVerとして新規予測・周回スナップショットを保存する。
                         restored_view = dict(restored_view)
                         restored_view["_v231_restored_only"] = True
                         restored_view["_v231_source_app_version"] = str(
                             history_meta.get("app_version") or restored_view.get("app_version") or "Unknown"
                         )
+                        restored_view["_v261_restore_source_history_id"] = int(target.get("history_id") or 0)
+                        restore_lap_status={}
                         st.session_state["last_prediction_view"] = restored_view
                         st.session_state["v163_saved_prediction_text"] = restored_text
                         st.session_state["v163_saved_prediction_venue"] = restored_venue
@@ -7696,6 +7763,7 @@ elif selected_main_page == "🏁 予測":
                             "version": history_meta.get("app_version") or "Unknown",
                             "mode": history_meta.get("simulation_mode") or "不明",
                             "result_restored": bool(restored_result_view),
+                            "lap_snapshot": restore_lap_status,
                         }
                         st.rerun()
                     else:
@@ -7704,8 +7772,12 @@ elif selected_main_page == "🏁 予測":
         if isinstance(notice, dict):
             result_note = "登録済み結果・的中判定も復元しました。" if notice.get("result_restored") else "この予測版に対応する登録済み結果はまだありません。"
             st.success(
-                f"{notice.get('label')}を復元しました。予測版: {notice.get('version')} / {notice.get('mode')}。"
+                f"{notice.get('label')}を復元しました。元の予測版: {notice.get('version')} / {notice.get('mode')}。"
                 f"保存済みオッズも下で自動復元されます。{result_note}"
+            )
+            st.info(
+                f"復元しただけでは新しい実績は登録しません。下の『▶ 復元内容を{_V231_APP_VERSION}で再シミュレーション』を押すと、"
+                f"同じレースを現在コードで再計算し、{_V231_APP_VERSION}の別履歴として保存します。"
             )
         restored_result = st.session_state.get("v232_restored_result_view")
         if isinstance(restored_result, dict) and restored_result:
@@ -7824,7 +7896,25 @@ elif selected_main_page == "🏁 予測":
         else:
             st.caption("自動検出された欠車はありません。必要な車番だけ選択してください。")
 
-    prediction_clicked = st.button("解析して元版設定で予測", type="primary", use_container_width=True)
+    # Ver261: 通常予測と、復元した入力を現在Verで再シミュレーションする操作を明確に分離。
+    _restored_view_for_rerun = st.session_state.get("last_prediction_view") or {}
+    _is_restored_for_rerun = bool(isinstance(_restored_view_for_rerun, dict) and _restored_view_for_rerun.get("_v231_restored_only"))
+    if _is_restored_for_rerun:
+        _src_ver = str(_restored_view_for_rerun.get("_v231_source_app_version") or _restored_view_for_rerun.get("app_version") or "Unknown")
+        st.caption(f"復元元: {_src_ver} → 再シミュレーション保存先: {_V231_APP_VERSION}")
+        _b1, _b2 = st.columns(2)
+        with _b1:
+            prediction_clicked = st.button("通常予測として実行", use_container_width=True, key="v261_normal_prediction")
+        with _b2:
+            rerun_clicked = st.button(
+                f"▶ 復元内容を{_V231_APP_VERSION}で再シミュレーション",
+                type="primary", use_container_width=True, key="v261_rerun_current_version"
+            )
+        prediction_clicked = bool(prediction_clicked or rerun_clicked)
+        st.session_state["v261_rerun_requested"] = bool(rerun_clicked)
+    else:
+        prediction_clicked = st.button("解析して元版設定で予測", type="primary", use_container_width=True)
+        st.session_state["v261_rerun_requested"] = False
     if prediction_clicked:
         if not text.strip():
             st.warning("出走表を貼り付けてください。")
@@ -7888,8 +7978,19 @@ elif selected_main_page == "🏁 予測":
                 "settings_hash": _v231_settings_hash(int(trials), int(seed), [int(x) for x in manual_excluded]),
                 "prediction_time": _v228_now_jst_iso(),
                 "seed": int(seed),
+                "rerun_from_restored": bool(st.session_state.get("v261_rerun_requested", False)),
+                "rerun_source_version": (
+                    str(_restored_view_for_rerun.get("_v231_source_app_version") or _restored_view_for_rerun.get("app_version") or "")
+                    if bool(st.session_state.get("v261_rerun_requested", False)) else ""
+                ),
+                "rerun_source_history_id": (
+                    int(_restored_view_for_rerun.get("_v261_restore_source_history_id") or 0)
+                    if bool(st.session_state.get("v261_rerun_requested", False)) else 0
+                ),
             }
             st.session_state["last_prediction_view"] = prediction_view
+            # 新しい予測が生成された時点で復元専用フラグは解除される。
+            # rerun_requested は保存メッセージ用にこの実行中だけ保持する。
             # 復元に必要な出走表と計算済み結果を同期保存。次回は再シミュレーション不要。
             try:
                 history_id = _v231_save_prediction_history(
@@ -7899,7 +8000,14 @@ elif selected_main_page == "🏁 予測":
                 _v222_save_prediction_restore(
                     engine.DB_PATH, race_key, text, prediction_venue_override, prediction_view
                 )
-                st.success(f"予測が完了しました。{_V231_APP_VERSION}として履歴保存しました（履歴ID: {history_id}）。")
+                if bool(st.session_state.get("v261_rerun_requested", False)):
+                    _from_ver = str(prediction_view.get("rerun_source_version") or "旧版")
+                    st.success(
+                        f"再シミュレーションが完了しました。{_from_ver}の復元入力を現在の{_V231_APP_VERSION}で再計算し、"
+                        f"別履歴として保存しました（履歴ID: {history_id}）。元の{_from_ver}履歴は変更していません。"
+                    )
+                else:
+                    st.success(f"予測が完了しました。{_V231_APP_VERSION}として履歴保存しました（履歴ID: {history_id}）。")
                 try:
                     _lap_save=((meta.get("6周展開シミュレーション") or {}).get("lap_snapshot_save") or {})
                     if _lap_save and not _lap_save.get("ok"):
@@ -7911,6 +8019,7 @@ elif selected_main_page == "🏁 予測":
             except Exception as save_exc:
                 st.success("予測が完了しました。")
                 st.warning(f"復元用保存だけ失敗しました: {type(save_exc).__name__}: {save_exc}")
+            st.session_state["v261_rerun_requested"] = False
             if prediction_timing:
                 st.caption(
                     f"処理時間：イベント計算 {prediction_timing['simulation']:.2f}秒 / "
@@ -9710,7 +9819,19 @@ if selected_main_page == "🗃️ 登録情報確認":
                             ss2.metric("周回スナップショット保存",f"{int(snap_status.get('snapshot_races',0))}レース / {int(snap_status.get('snapshot_laps',0))}周")
                             ss3.metric("照合待ち・保存漏れ候補",f"{int(snap_status.get('waiting_or_missing',0))}レース")
                             if snap_status.get('waiting_or_missing',0):
-                                st.warning("予測履歴数より周回保存数が少ないため、未保存レースがあります。今後の予測では保存失敗理由を監査に残します。")
+                                st.warning("予測履歴数より周回保存数が少ないため、未保存レースがあります。保存済み予測から再計算せずに周回データを補完できます。")
+                                if st.button(f"{_V231_APP_VERSION}予測履歴から周回保存を修復",key="v260_repair_snapshot_history",use_container_width=True):
+                                    with st.spinner("保存済み予測の1〜6周隊列をDBへ補完しています…"):
+                                        _repair=_v260_repair_saved_snapshot_history(engine.DB_PATH,_V231_APP_VERSION,200)
+                                    if _repair.get('repaired_races',0)>0:
+                                        st.success(_repair.get('message','修復しました。'))
+                                    else:
+                                        st.info(_repair.get('message','修復対象がありませんでした。'))
+                                    if _repair.get('labels'):
+                                        st.caption("修復: "+" / ".join(_repair.get('labels',[])[:20]))
+                                    if _repair.get('errors'):
+                                        st.warning(" / ".join(_repair.get('errors',[])[:8]))
+                                    st.rerun()
                             result255=_v255_backtest_center(engine.DB_PATH)
                             cmp_df=result255.get('comparison',pd.DataFrame())
                             if cmp_df.empty:
