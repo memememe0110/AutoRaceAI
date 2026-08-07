@@ -674,33 +674,62 @@ def _v252_ensure_lap_tables(con: sqlite3.Connection) -> None:
 def _v253_ensure_lap_tables(con: sqlite3.Connection) -> None:
     _v252_ensure_lap_tables(con)
 
-def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[dict], is_backtest: bool) -> None:
-    if not db_path or not Path(db_path).exists() or not modal_laps:
-        return
-    race_date=str((meta or {}).get('開催日') or (meta or {}).get('race_date') or '')[:10]
-    venue=str((meta or {}).get('開催場') or (meta or {}).get('venue') or '').strip()
-    race_no=str((meta or {}).get('R') or (meta or {}).get('レース') or (meta or {}).get('race_no') or '').strip().replace('R','')
+def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[dict], is_backtest: bool) -> dict:
+    """Save one race's representative lap orders and verify that all laps were persisted.
+
+    Ver260 storage fix: this used to fail silently, which made the precision screen show
+    fewer races than were actually predicted.  Return a status object so the caller can
+    surface failures instead of quietly losing the comparison snapshot.
+    """
+    status={"ok":False,"saved_laps":0,"expected_laps":len(modal_laps or []),"reason":""}
+    if not db_path or not Path(db_path).exists():
+        status["reason"]="DBファイルが見つかりません"; return status
+    if not modal_laps:
+        status["reason"]="代表周回隊列が0件です"; return status
+    m=meta or {}
+    race_date=str(m.get('開催日') or m.get('日付') or m.get('race_date') or m.get('date') or '')[:10]
+    venue=str(m.get('開催場') or m.get('場') or m.get('venue') or m.get('track') or '').strip()
+    race_no=str(m.get('R') or m.get('レース') or m.get('レース番号') or m.get('race_no') or m.get('race') or '').strip()
+    race_no=re.sub(r'[^0-9]', '', race_no) or race_no.replace('R','').replace('r','').strip()
+    status.update({"race_date":race_date,"venue":venue,"race_no":race_no})
     if not race_date or not venue or not race_no:
-        return
+        status["reason"]=f"レースキー不足: date={race_date or '-'} venue={venue or '-'} R={race_no or '-'}"; return status
+    # 再構成は従来どおりVer253の検証材料、通常予測は現在の実行版として保存する。
+    app_version='Ver253' if _V253_RECONSTRUCTION_MODE else str(globals().get('_V231_APP_VERSION') or 'Ver260')
+    bt=(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))
+    status.update({"app_version":app_version,"is_backtest":bt})
     try:
-        with sqlite3.connect(str(db_path)) as con:
+        with sqlite3.connect(str(db_path), timeout=30) as con:
             _v252_ensure_lap_tables(con)
-            # 同じ版・同じレースの再実行は最新スナップショットへ置換する。
             con.execute("""
                 DELETE FROM v252_lap_prediction_snapshots
                 WHERE race_date=? AND venue=? AND race_no=? AND app_version=?
-            """, (race_date,venue,race_no,'Ver260'))
+            """, (race_date,venue,race_no,app_version))
+            inserted=0
             for row in modal_laps:
+                lap_no=int(row.get('lap',0) or 0)
+                order=str(row.get('order','') or '').strip()
+                if lap_no<=0 or not order:
+                    continue
                 con.execute("""
                     INSERT INTO v252_lap_prediction_snapshots
                     (race_date,venue,race_no,lap_no,predicted_order,support,app_version,is_backtest)
                     VALUES(?,?,?,?,?,?,?,?)
-                """, (race_date,venue,race_no,int(row.get('lap',0)),str(row.get('order','')),
-                      float(row.get('support',0.0)),'Ver260',(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))))
+                """, (race_date,venue,race_no,lap_no,order,float(row.get('support',0.0) or 0.0),app_version,bt))
+                inserted+=1
             con.commit()
+            saved=int(con.execute("""
+                SELECT COUNT(*) FROM v252_lap_prediction_snapshots
+                WHERE race_date=? AND venue=? AND race_no=? AND app_version=?
+            """,(race_date,venue,race_no,app_version)).fetchone()[0])
+        status["saved_laps"]=saved
+        status["ok"]=(saved==inserted and saved>0)
+        status["reason"]=("保存・検証OK" if status["ok"] else f"保存件数不一致: insert={inserted}, db={saved}")
         _V252_LAP_RESIDUAL_CACHE.clear()
-    except Exception:
-        pass
+        return status
+    except Exception as exc:
+        status["reason"]=f"{type(exc).__name__}: {exc}"
+        return status
 
 def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date: str) -> dict:
     """予測代表隊列と後日判明した実測隊列の追越し差を時系列で縮小学習する。"""
@@ -1349,6 +1378,32 @@ def _v254_saved_version_lap_comparison(db_path: str) -> pd.DataFrame:
         ['前後関係一致率','位置一致率','平均順位誤差'],ascending=[False,False,True],ignore_index=True)
 
 
+def _v260_snapshot_storage_status(db_path: str, app_version: str = "") -> dict:
+    """Show prediction-history count separately from lap-snapshot count."""
+    out={"history_races":0,"snapshot_races":0,"snapshot_laps":0,"waiting_or_missing":0,"reason":""}
+    if not db_path or not Path(db_path).exists():
+        out["reason"]="DBなし"; return out
+    ver=str(app_version or globals().get('_V231_APP_VERSION') or '').strip()
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            _v252_ensure_lap_tables(con)
+            try:
+                row=con.execute("SELECT COUNT(DISTINCT race_key) FROM v231_prediction_history WHERE app_version=?",(ver,)).fetchone()
+                out["history_races"]=int(row[0] or 0)
+            except Exception:
+                out["history_races"]=0
+            row=con.execute("""
+                SELECT COUNT(DISTINCT race_date||'|'||venue||'|'||race_no), COUNT(*)
+                FROM v252_lap_prediction_snapshots WHERE app_version=?
+            """,(ver,)).fetchone()
+            out["snapshot_races"]=int(row[0] or 0); out["snapshot_laps"]=int(row[1] or 0)
+        out["waiting_or_missing"]=max(0,out["history_races"]-out["snapshot_races"])
+        out["reason"]="OK"
+    except Exception as exc:
+        out["reason"]=f"{type(exc).__name__}: {exc}"
+    return out
+
+
 # Ver255: 保存済みバージョンを同一の実測グランドノートで比較し、
 # データ量と改善幅を加味して「採用候補 / 保留」を自動判定する。
 def _v255_backtest_center(db_path: str) -> dict:
@@ -1855,7 +1910,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             pos_acc=(sum(1 for a,b in zip(pred,actual) if a==b)/max(1,len(actual))) if pred else 0.0
             lap_comparison.append({"lap":idx,"label":label,"actual":"-".join(map(str,actual)),"predicted":"-".join(map(str,pred)),"position_accuracy":pos_acc*100,"pairwise_accuracy":_v251_pairwise_accuracy(pred,actual)*100})
     # 実測が既にある再シミュレーションはバックテストとして保存し、未来学習には混ぜない。
-    _v252_save_lap_prediction(_v230_db_path(), meta, modal_laps, bool(actual_lap_orders))
+    lap_snapshot_save=_v252_save_lap_prediction(_v230_db_path(), meta, modal_laps, bool(actual_lap_orders))
     audit={
         "enabled":True,"mode":"6周内蔵Ver257・選手別周回学習修正・全実測周回学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
@@ -1869,6 +1924,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "player_actual_learning_v258": player_actual_calibration,
         "predicted_lap_orders": modal_laps,
         "actual_lap_comparison": lap_comparison,
+        "lap_snapshot_save": lap_snapshot_save,
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
@@ -2507,7 +2563,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver260｜全実測グランドノートから選手×周回の追抜傾向を階層学習し、保存予測が少ない段階でも展開へ反映します。")
+st.caption("Ver260｜全実測学習＋精度比較用の周回スナップショット保存をレースごとに検証し、保存漏れを画面表示します。")
 try:
     _v256_refresh_learning_settings(_v230_db_path())
 except Exception:
@@ -7844,6 +7900,14 @@ elif selected_main_page == "🏁 予測":
                     engine.DB_PATH, race_key, text, prediction_venue_override, prediction_view
                 )
                 st.success(f"予測が完了しました。{_V231_APP_VERSION}として履歴保存しました（履歴ID: {history_id}）。")
+                try:
+                    _lap_save=((meta.get("6周展開シミュレーション") or {}).get("lap_snapshot_save") or {})
+                    if _lap_save and not _lap_save.get("ok"):
+                        st.warning("精度比較用の周回保存に失敗しました: "+str(_lap_save.get("reason") or "不明"))
+                    elif _lap_save.get("ok"):
+                        st.caption(f"精度比較用周回保存: {_lap_save.get('saved_laps',0)}周 / {_lap_save.get('app_version',_V231_APP_VERSION)}")
+                except Exception:
+                    pass
             except Exception as save_exc:
                 st.success("予測が完了しました。")
                 st.warning(f"復元用保存だけ失敗しました: {type(save_exc).__name__}: {save_exc}")
@@ -9640,6 +9704,13 @@ if selected_main_page == "🗃️ 登録情報確認":
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
                         run_v255=st.button("保存済みバージョンを再評価",key="v255_backtest_run",use_container_width=True)
                         try:
+                            snap_status=_v260_snapshot_storage_status(engine.DB_PATH,_V231_APP_VERSION)
+                            ss1,ss2,ss3=st.columns(3)
+                            ss1.metric(f"{_V231_APP_VERSION} 予測履歴",f"{int(snap_status.get('history_races',0))}レース")
+                            ss2.metric("周回スナップショット保存",f"{int(snap_status.get('snapshot_races',0))}レース / {int(snap_status.get('snapshot_laps',0))}周")
+                            ss3.metric("照合待ち・保存漏れ候補",f"{int(snap_status.get('waiting_or_missing',0))}レース")
+                            if snap_status.get('waiting_or_missing',0):
+                                st.warning("予測履歴数より周回保存数が少ないため、未保存レースがあります。今後の予測では保存失敗理由を監査に残します。")
                             result255=_v255_backtest_center(engine.DB_PATH)
                             cmp_df=result255.get('comparison',pd.DataFrame())
                             if cmp_df.empty:
