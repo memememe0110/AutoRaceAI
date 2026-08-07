@@ -809,7 +809,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             continue
         seen.add(rk); unique.append(h)
     total=len(unique)
-    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver262')
+    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver263')
     # 現行Verで既に保存済みのレースキーを取得。
     current_keys=set()
     try:
@@ -1724,6 +1724,119 @@ def _v250_flow_calibration(db_path: str | None = None, venue: str = "", cutoff_d
     _V250_FLOW_CALIBRATION_CACHE[stamp] = dict(result)
     return result
 
+
+# Ver263: 実測グランドノートから「展開タイプ」を学習し、
+# シミュレーション内の複数展開ルートを弱く確率校正する。
+_V263_SCENARIO_PRIOR_CACHE = {}
+
+def _v263_scenario_type_from_laps(laps):
+    try:
+        seq=[tuple(int(x) for x in row) for row in (laps or []) if row]
+    except Exception:
+        seq=[]
+    if len(seq)<2:
+        return '不明'
+    leaders=[row[0] for row in seq if row]
+    leader_changes=sum(1 for a,b in zip(leaders,leaders[1:]) if a!=b)
+    first_change=next((i+2 for i,(a,b) in enumerate(zip(leaders,leaders[1:])) if a!=b),99)
+    p0={c:i for i,c in enumerate(seq[0])}
+    plast={c:i for i,c in enumerate(seq[-1])}
+    common=set(p0)&set(plast)
+    avg_move=sum(abs(p0[c]-plast[c]) for c in common)/max(1,len(common))
+    mid=seq[min(2,len(seq)-1)]
+    pmid={c:i for i,c in enumerate(mid)}
+    late_gain=sum(1 for c in set(pmid)&set(plast) if pmid[c]-plast[c]>=2)
+    if leaders[0]==leaders[-1] and leader_changes<=1 and avg_move<1.25:
+        return '前残り型'
+    if leaders[0]!=leaders[-1] and first_change<=2:
+        return '早仕掛け型'
+    if leader_changes>=3 or avg_move>=2.0:
+        return '波乱型'
+    if first_change>=4 or late_gain>=1:
+        return '後半追込型'
+    return '中盤入替型'
+
+def _v263_route_similarity(pred_laps, actual_laps):
+    vals=[]
+    for p,a in zip(pred_laps or [], actual_laps or []):
+        try:
+            pp=tuple(int(x) for x in p); aa=tuple(int(x) for x in a)
+        except Exception:
+            continue
+        if not pp or not aa:
+            continue
+        pos=sum(1 for x,y in zip(pp,aa) if x==y)/max(1,len(aa))
+        vals.append(0.35*pos + 0.65*_v251_pairwise_accuracy(pp,aa))
+    return float(sum(vals)/len(vals)) if vals else 0.0
+
+def _v263_scenario_prior(db_path, venue='', cutoff=''):
+    key=(str(db_path or ''),str(venue or ''),str(cutoff or '')[:10])
+    if key in _V263_SCENARIO_PRIOR_CACHE:
+        return dict(_V263_SCENARIO_PRIOR_CACHE[key])
+    out={'enabled':False,'samples':0,'venue_samples':0,'prior':{},'reason':'実測展開データ不足'}
+    if not db_path or not Path(db_path).exists():
+        return out
+    try:
+        con=sqlite3.connect(db_path)
+        params=[]; wh=['COALESCE(rr.learning_eligible,1)=1']
+        if cutoff:
+            wh.append('substr(rr.race_date,1,10)<substr(?,1,10)'); params.append(str(cutoff)[:10])
+        q=f'''SELECT rr.race_key,rr.venue,rl.lap_no,rl.position,rl.car_no
+              FROM result_laps rl JOIN result_races rr ON rr.race_key=rl.race_key
+              WHERE {' AND '.join(wh)} ORDER BY rr.race_key,rl.lap_no,rl.position'''
+        rows=pd.read_sql_query(q,con,params=params)
+        con.close()
+        if rows.empty:
+            return out
+        all_counts={}; venue_counts={}; n_all=n_venue=0
+        for _,g in rows.groupby('race_key'):
+            laps=[]
+            for _,lg in g.groupby('lap_no',sort=True):
+                order=tuple(int(x) for x in lg.sort_values('position')['car_no'].tolist())
+                if order: laps.append(order)
+            typ=_v263_scenario_type_from_laps(laps)
+            if typ=='不明':
+                continue
+            all_counts[typ]=all_counts.get(typ,0)+1; n_all+=1
+            v=str(g['venue'].iloc[0] or '')
+            if venue and v==venue:
+                venue_counts[typ]=venue_counts.get(typ,0)+1; n_venue+=1
+        if n_all<8:
+            return out
+        types=['前残り型','早仕掛け型','中盤入替型','後半追込型','波乱型']
+        alpha=min(0.80,n_venue/(n_venue+24.0)) if venue else 0.0
+        prior={}
+        for t in types:
+            pg=(all_counts.get(t,0)+1.0)/(n_all+len(types))
+            pv=(venue_counts.get(t,0)+1.0)/(n_venue+len(types)) if n_venue else pg
+            prior[t]=(1-alpha)*pg+alpha*pv
+        z=sum(prior.values()) or 1.0
+        prior={k:v/z for k,v in prior.items()}
+        out={'enabled':True,'samples':n_all,'venue_samples':n_venue,'prior':prior,
+             'reason':f'{cutoff or "最新"}より前の実測{n_all}R（{venue or "全場"} {n_venue}R）から展開タイプ頻度を縮小学習'}
+    except Exception as exc:
+        out['reason']=f'展開タイプ学習失敗: {exc}'
+    _V263_SCENARIO_PRIOR_CACHE[key]=dict(out)
+    return out
+
+def _v263_save_scenario_feedback(db_path, meta, dist, actual_type, closest_similarity, closest_route):
+    if not db_path or not Path(db_path).exists() or not actual_type or actual_type=='不明':
+        return
+    try:
+        con=sqlite3.connect(db_path)
+        con.execute('''CREATE TABLE IF NOT EXISTS v263_scenario_feedback(
+            race_date TEXT,venue TEXT,race_no TEXT,app_version TEXT,actual_scenario TEXT,
+            predicted_json TEXT,closest_similarity REAL,closest_route TEXT,created_at TEXT)''')
+        con.execute('''INSERT INTO v263_scenario_feedback VALUES(?,?,?,?,?,?,?,?,datetime('now','localtime'))''',
+                    (str((meta or {}).get('開催日') or (meta or {}).get('race_date') or '')[:10],
+                     str((meta or {}).get('開催場') or (meta or {}).get('venue') or ''),
+                     str((meta or {}).get('R') or (meta or {}).get('レース') or (meta or {}).get('race_no') or ''),
+                     str(globals().get('_V231_APP_VERSION') or 'Ver263'),actual_type,
+                     json.dumps(dist or {},ensure_ascii=False),float(closest_similarity or 0.0),str(closest_route or '')))
+        con.commit(); con.close()
+    except Exception:
+        pass
+
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
     if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(entries,pd.DataFrame) or entries.empty:
@@ -1810,6 +1923,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     player_actual_calibration=_v258_player_actual_lap_calibration(_v230_db_path(), venue, race_date)
     player_actual_delta=player_actual_calibration.get("player_delta") or {}
     actual_lap_orders=_v251_actual_lap_orders(_v230_db_path(), meta)
+    scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
     _v242_prepare_seconds=time_module.perf_counter()-_v242_prepare_started
     name_by_car={c:n for c,n in zip(cars,names)}
     rng=np.random.default_rng(int(seed)+230)
@@ -1828,6 +1942,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     sim_trials=max(1400,min(requested_trials,base_budget))
     counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
     lap_order_counts={lap:{} for lap in range(1,7)}
+    scenario_counts={}
+    scenario_combo_counts={}
+    route_counts={}
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
     # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
@@ -1870,6 +1987,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             dh=max(0,handicap[cur]-handicap[prev])
             gaps.append(0.11+0.017*dh+rng.uniform(0.00,0.08))
         # 6周。後車から前車へ隣接追い抜き判定。
+        sim_lap_path=[]
         momentum={c:0.0 for c in cars}
         # ギリギリ横並びで抜かれた車の一時失速。次周以降へ減衰して残す。
         slowdown={c:0.0 for c in cars}
@@ -1985,8 +2103,15 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     rel += 0.012*(1.0+0.15*lap)
                 gaps[j]=min(2.0,max(0.04,gaps[j]-rel))
             lap_tuple=tuple(order)
+            sim_lap_path.append(lap_tuple)
             lap_order_counts[lap][lap_tuple]=lap_order_counts[lap].get(lap_tuple,0)+1
         combo=tuple(order[:3]); counts[combo]=counts.get(combo,0)+1
+        scenario_type=_v263_scenario_type_from_laps(sim_lap_path)
+        scenario_counts[scenario_type]=scenario_counts.get(scenario_type,0)+1
+        sc=scenario_combo_counts.setdefault(scenario_type,{})
+        sc[combo]=sc.get(combo,0)+1
+        route_key=tuple(sim_lap_path)
+        route_counts[route_key]=route_counts.get(route_key,0)+1
         completed_trials = sim_index + 1
         if completed_trials >= 1200 and completed_trials % 400 == 0:
             ranked_now = sorted(counts.values(), reverse=True)[:12]
@@ -2003,6 +2128,20 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 break
     sim_trials=max(1, completed_trials)
     _v242_sim_seconds=time_module.perf_counter()-_v242_sim_started
+    # Ver263: 実測から学んだ展開タイプ頻度へ弱く校正。
+    weighted_counts=dict(counts)
+    scenario_weights={}
+    if scenario_prior.get('enabled') and scenario_counts:
+        learned=scenario_prior.get('prior') or {}
+        weighted_counts={k:0.0 for k in counts}
+        for typ,cc in scenario_combo_counts.items():
+            generated=float(scenario_counts.get(typ,0))/max(1,sim_trials)
+            target_prior=float(learned.get(typ,generated or 0.01))
+            ratio=(target_prior/max(0.01,generated))**0.28
+            w=float(np.clip(ratio,0.82,1.22))
+            scenario_weights[typ]=w
+            for combo,n in cc.items():
+                weighted_counts[combo]=weighted_counts.get(combo,0.0)+float(n)*w
     # 元のtrial数へ整数スケール。シミュレーションだけで0回になった着順も、
     # 旧モデル分布を少量混ぜて極端な消失を防ぎ、全組み合わせを必ず保存する。
     target=max(1,int(trials))
@@ -2013,7 +2152,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     floor_mass=0.03 / max(1,len(all_combos))
     scaled={}
     for combo in all_combos:
-        sim_p=float(counts.get(combo,0))/max(1,sim_trials)
+        sim_p=float(weighted_counts.get(combo,0))/max(1.0,float(sum(weighted_counts.values()) or sim_trials))
         prior_p=float(tri.get(combo,0))/prior_total
         # 7%だけ旧能力分布を残し、未知着順にもごく小さい裾を与える。
         p=max(floor_mass, sim_mix*sim_p + (1.0-sim_mix)*prior_p)
@@ -2051,10 +2190,25 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             pred=tuple(int(x) for x in modal_laps[idx-1]["order"].split('-')) if idx<=len(modal_laps) else tuple()
             pos_acc=(sum(1 for a,b in zip(pred,actual) if a==b)/max(1,len(actual))) if pred else 0.0
             lap_comparison.append({"lap":idx,"label":label,"actual":"-".join(map(str,actual)),"predicted":"-".join(map(str,pred)),"position_accuracy":pos_acc*100,"pairwise_accuracy":_v251_pairwise_accuracy(pred,actual)*100})
+    # Ver263: 複数展開ルートと、実測に最も近かったルートを監査。
+    scenario_distribution={k:float(v)/max(1,sim_trials)*100 for k,v in sorted(scenario_counts.items(),key=lambda kv:kv[1],reverse=True)}
+    top_routes=[]
+    actual_scenario='不明'; closest_similarity=0.0; closest_route=''
+    actual_orders_only=[tuple(x[1]) for x in actual_lap_orders[:6]] if actual_lap_orders else []
+    if actual_orders_only:
+        actual_scenario=_v263_scenario_type_from_laps(actual_orders_only)
+    for route,n in sorted(route_counts.items(),key=lambda kv:kv[1],reverse=True)[:12]:
+        sim=float(_v263_route_similarity(route,actual_orders_only)) if actual_orders_only else 0.0
+        route_text=' / '.join('-'.join(map(str,row)) for row in route)
+        top_routes.append({'support':n/max(1,sim_trials)*100,'scenario':_v263_scenario_type_from_laps(route),'similarity':sim*100,'route':route_text})
+        if sim>closest_similarity:
+            closest_similarity=sim; closest_route=route_text
+    if actual_orders_only:
+        _v263_save_scenario_feedback(_v230_db_path(),meta,scenario_distribution,actual_scenario,closest_similarity,closest_route)
     # 実測が既にある再シミュレーションはバックテストとして保存し、未来学習には混ぜない。
     lap_snapshot_save=_v252_save_lap_prediction(_v230_db_path(), meta, modal_laps, bool(actual_lap_orders))
     audit={
-        "enabled":True,"mode":"6周内蔵Ver257・選手別周回学習修正・全実測周回学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver263・複数展開ルート学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -2067,10 +2221,17 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "predicted_lap_orders": modal_laps,
         "actual_lap_comparison": lap_comparison,
         "lap_snapshot_save": lap_snapshot_save,
+        "scenario_prior_v263": scenario_prior,
+        "scenario_distribution_v263": scenario_distribution,
+        "scenario_weights_v263": scenario_weights,
+        "actual_scenario_v263": actual_scenario,
+        "closest_route_similarity_v263": closest_similarity*100,
+        "closest_route_v263": closest_route,
+        "top_routes_v263": top_routes[:5],
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
-        "message":f"予測時の代表隊列を保存し、後日判明した実測グランドノートとの差を開催場・周回・ハンデ差別に自動学習。結果登録済みレースの再計算は学習除外します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
+        "message":f"複数の6周展開ルートを同時に生成し、開催日前の実測グランドノートから展開タイプ確率を弱く校正。結果登録後は実際の展開型と最も近い予測ルートを保存して次回検証に使います。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
     }
     return out,new_bets,audit
 
@@ -2297,7 +2458,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver262"
+_V231_APP_VERSION = "Ver263"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -2705,7 +2866,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver262｜保存済み予測の周回一括補完と、現在Verでの一括再シミュレーション比較に対応。")
+st.caption("Ver263｜複数展開ルートを確率化し、実測グランドノートから展開タイプと近似ルートを学習。")
 try:
     _v256_refresh_learning_settings(_v230_db_path())
 except Exception:
@@ -8237,6 +8398,17 @@ elif selected_main_page == "🏁 予測":
                     pred_laps = wall_audit.get("predicted_lap_orders") or []
                     if pred_laps:
                         st.caption("予測対象レースの実結果が登録されると、ここに1周ごとの実測比較が表示されます。")
+                scen_dist=wall_audit.get("scenario_distribution_v263") or {}
+                if scen_dist:
+                    st.markdown("**Ver263 複数展開シナリオ**")
+                    st.dataframe(pd.DataFrame([{"展開タイプ":k,"予測確率%":round(float(v),2)} for k,v in scen_dist.items()]),use_container_width=True,hide_index=True)
+                    act=wall_audit.get("actual_scenario_v263") or '不明'
+                    if act!='不明':
+                        simv=float(wall_audit.get("closest_route_similarity_v263",0.0) or 0.0)
+                        st.success(f"実際の展開判定: {act}｜予測ルート内の最高近似度 {simv:.1f}%")
+                        routes=wall_audit.get("top_routes_v263") or []
+                        if routes:
+                            st.dataframe(pd.DataFrame(routes).rename(columns={"support":"発生率%","scenario":"展開タイプ","similarity":"実測近似度%","route":"1〜6周ルート"}),use_container_width=True,hide_index=True)
                 try:
                     sim_n = int(wall_audit.get("sim_trials", 0) or 0)
                     planned_n = int(wall_audit.get("planned_trials", 0) or 0)
@@ -9889,7 +10061,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 st.warning(" / ".join(r253["errors"]))
                             st.rerun()
 
-                    with st.expander("Ver262 精度比較・一括再シミュレーションセンター", expanded=False):
+                    with st.expander("Ver263 精度比較・一括再シミュレーションセンター", expanded=False):
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
                         run_v255=st.button("保存済みバージョンを再評価",key="v255_backtest_run",use_container_width=True)
                         try:
