@@ -647,6 +647,8 @@ def _v251_pairwise_accuracy(pred: tuple[int,...], actual: tuple[int,...]) -> flo
 
 # Ver253: 予測時に代表隊列を保存し、後日登録された実測グランドノートとの差を
 # 開催場・周回・ハンデ差別に学習する。結果登録済みレースの再計算はバックテスト扱いで学習除外。
+# Ver262 bugfix: 一括補完から通常保存関数が直接呼ばれても NameError にならないよう初期化。
+_V253_RECONSTRUCTION_MODE = False
 _V252_LAP_RESIDUAL_CACHE = {}
 
 def _v252_ensure_lap_tables(con: sqlite3.Connection) -> None:
