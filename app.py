@@ -697,7 +697,7 @@ def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[
     if not race_date or not venue or not race_no:
         status["reason"]=f"レースキー不足: date={race_date or '-'} venue={venue or '-'} R={race_no or '-'}"; return status
     # 再構成は従来どおりVer253の検証材料、通常予測は現在の実行版として保存する。
-    app_version=(str(app_version_override or '').strip() or ('Ver253' if _V253_RECONSTRUCTION_MODE else str(globals().get('_V231_APP_VERSION') or 'Ver260')))
+    app_version=(str(app_version_override or '').strip() or ('Ver253' if _V253_RECONSTRUCTION_MODE else str(globals().get('_V231_APP_VERSION') or 'Ver264')))
     bt=(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))
     status.update({"app_version":app_version,"is_backtest":bt})
     try:
@@ -796,6 +796,7 @@ def _v260_repair_saved_snapshot_history(db_path: str, app_version: str = '', lim
     return out
 
 
+# Ver264 maintenance: 一括再シミュレーションを現行Ver264でも継承し、周回スナップショットまで原子的に保存する。
 # Ver262: 保存済み予測を現在バージョンで一括再シミュレーションする。
 # 同一レース・現行Verの履歴が既に存在する場合は重複作成せずスキップする。
 def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None) -> dict:
@@ -809,16 +810,38 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             continue
         seen.add(rk); unique.append(h)
     total=len(unique)
-    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver263')
-    # 現行Verで既に保存済みのレースキーを取得。
+    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver264')
+    # 現行Verで「予測履歴＋6周スナップショット」まで揃っているレースだけスキップする。
+    # 履歴だけ存在して周回保存が欠けている場合は、一括再シミュレーションで自動修復する。
     current_keys=set()
+    current_complete_keys=set()
     try:
         _v231_ensure_prediction_history_table(db_path)
         with sqlite3.connect(str(db_path)) as con:
+            _v252_ensure_lap_tables(con)
             rows=con.execute("SELECT DISTINCT race_key FROM v231_prediction_history WHERE app_version=?",(current_ver,)).fetchall()
-        current_keys={str(r[0]) for r in rows if r and r[0]}
+            current_keys={str(r[0]) for r in rows if r and r[0]}
+            # race_keyの表記と周回テーブルのキーが完全一致しない旧データもあるため、
+            # 履歴を読み込んで日付・場・Rで6周保存済みか確認する。
+            cur_hist=_v231_list_prediction_histories(db_path,10000)
+            for ch in cur_hist:
+                if str(ch.get('app_version') or '') != current_ver:
+                    continue
+                try:
+                    cv,_,_,cm=_v231_load_prediction_history(db_path,int(ch.get('history_id') or 0))
+                    mm=(cv or {}).get('meta') or {}
+                    cd=str(mm.get('開催日') or mm.get('日付') or mm.get('race_date') or mm.get('date') or '')[:10]
+                    cvn=str(mm.get('開催場') or mm.get('場') or mm.get('venue') or mm.get('track') or '').strip()
+                    cr=str(mm.get('R') or mm.get('レース') or mm.get('レース番号') or mm.get('race_no') or mm.get('race') or '').strip()
+                    cr=re.sub(r'[^0-9]','',cr) or cr.replace('R','').replace('r','').strip()
+                    if cd and cvn and cr:
+                        n=int(con.execute("SELECT COUNT(*) FROM v252_lap_prediction_snapshots WHERE race_date=? AND venue=? AND race_no=? AND app_version=?",(cd,cvn,cr,current_ver)).fetchone()[0] or 0)
+                        if n>=6:
+                            current_complete_keys.add(str(ch.get('race_key') or ''))
+                except Exception:
+                    pass
     except Exception:
-        current_keys=set()
+        current_keys=set(); current_complete_keys=set()
     for idx,h in enumerate(unique,1):
         out['checked']+=1
         label=str(h.get('race_label') or h.get('race_key') or f'履歴{idx}')
@@ -826,7 +849,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             if callable(progress_cb):
                 progress_cb(idx-1,total,label)
             race_key0=str(h.get('race_key') or '').strip()
-            if race_key0 in current_keys:
+            if race_key0 in current_complete_keys:
                 out['skipped_current']+=1
                 continue
             view, raw_text, venue_override, hm=_v231_load_prediction_history(db_path,int(h.get('history_id') or 0))
@@ -861,9 +884,14 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             }
             hid=_v231_save_prediction_history(db_path,race_key,raw_text,venue_override,prediction_view,trials,seed)
             _v222_save_prediction_restore(db_path,race_key,raw_text,venue_override,prediction_view)
+            # 一括再シミュレーションした予測は、同じ現行Verで1〜6周の代表隊列も必ず保存する。
+            snap=_v260_snapshot_from_saved_view(db_path,prediction_view,current_ver)
+            if not snap.get('ok'):
+                raise RuntimeError(f"周回スナップショット保存失敗: {snap.get('reason','不明')}")
             out['rerun']+=1
-            out['labels'].append(f"{label} → {current_ver} (ID:{hid})")
+            out['labels'].append(f"{label} → {current_ver} (ID:{hid}, {int(snap.get('saved_laps',0) or 0)}周)")
             current_keys.add(str(race_key0 or race_key))
+            current_complete_keys.add(str(race_key0 or race_key))
         except Exception as exc:
             out['errors'].append(f"{label}: {type(exc).__name__}: {exc}")
         finally:
@@ -1827,15 +1855,88 @@ def _v263_save_scenario_feedback(db_path, meta, dist, actual_type, closest_simil
         con.execute('''CREATE TABLE IF NOT EXISTS v263_scenario_feedback(
             race_date TEXT,venue TEXT,race_no TEXT,app_version TEXT,actual_scenario TEXT,
             predicted_json TEXT,closest_similarity REAL,closest_route TEXT,created_at TEXT)''')
+        _rd=str((meta or {}).get('開催日') or (meta or {}).get('race_date') or '')[:10]
+        _vv=str((meta or {}).get('開催場') or (meta or {}).get('venue') or '')
+        _rr=str((meta or {}).get('R') or (meta or {}).get('レース') or (meta or {}).get('race_no') or '')
+        _av=str(globals().get('_V231_APP_VERSION') or 'Ver264')
+        con.execute('DELETE FROM v263_scenario_feedback WHERE race_date=? AND venue=? AND race_no=? AND app_version=?',(_rd,_vv,_rr,_av))
         con.execute('''INSERT INTO v263_scenario_feedback VALUES(?,?,?,?,?,?,?,?,datetime('now','localtime'))''',
-                    (str((meta or {}).get('開催日') or (meta or {}).get('race_date') or '')[:10],
-                     str((meta or {}).get('開催場') or (meta or {}).get('venue') or ''),
-                     str((meta or {}).get('R') or (meta or {}).get('レース') or (meta or {}).get('race_no') or ''),
-                     str(globals().get('_V231_APP_VERSION') or 'Ver263'),actual_type,
-                     json.dumps(dist or {},ensure_ascii=False),float(closest_similarity or 0.0),str(closest_route or '')))
+                    (_rd,_vv,_rr,_av,actual_type,json.dumps(dist or {},ensure_ascii=False),float(closest_similarity or 0.0),str(closest_route or '')))
         con.commit(); con.close()
     except Exception:
         pass
+
+
+# Ver264: Ver258以降で強くなりすぎた補正を縮小し、
+# 実測に近い展開が候補集合へ入りやすくなるよう「展開分岐」自体を弱く校正する。
+_V264_SCENARIO_FEEDBACK_CACHE = {}
+
+def _v264_feedback_scenario_adjustment(db_path, venue='', cutoff=''):
+    key=(str(db_path or ''),str(venue or ''),str(cutoff or '')[:10])
+    if key in _V264_SCENARIO_FEEDBACK_CACHE:
+        return dict(_V264_SCENARIO_FEEDBACK_CACHE[key])
+    out={'enabled':False,'samples':0,'factor':{},'reason':'展開フィードバック不足'}
+    if not db_path or not Path(db_path).exists():
+        return out
+    try:
+        con=sqlite3.connect(db_path)
+        con.execute('''CREATE TABLE IF NOT EXISTS v263_scenario_feedback(
+            race_date TEXT,venue TEXT,race_no TEXT,app_version TEXT,actual_scenario TEXT,
+            predicted_json TEXT,closest_similarity REAL,closest_route TEXT,created_at TEXT)''')
+        con.execute('''DELETE FROM v263_scenario_feedback
+                       WHERE rowid NOT IN (
+                         SELECT MAX(rowid) FROM v263_scenario_feedback
+                         GROUP BY race_date,venue,race_no,app_version
+                       )''')
+        try:
+            con.execute('''CREATE UNIQUE INDEX IF NOT EXISTS ux_v263_scenario_feedback_race_ver
+                           ON v263_scenario_feedback(race_date,venue,race_no,app_version)''')
+        except Exception:
+            pass
+        con.commit()
+        wh=[]; params=[]
+        if venue:
+            wh.append('venue=?'); params.append(str(venue))
+        if cutoff:
+            wh.append('substr(race_date,1,10)<substr(?,1,10)'); params.append(str(cutoff)[:10])
+        q='SELECT actual_scenario,predicted_json,closest_similarity FROM v263_scenario_feedback'
+        if wh: q += ' WHERE ' + ' AND '.join(wh)
+        rows=con.execute(q,params).fetchall(); con.close()
+        if not rows:
+            return out
+        types=['前残り型','早仕掛け型','中盤入替型','後半追込型','波乱型']
+        obs={t:0.0 for t in types}; pred={t:0.0 for t in types}; wsum=0.0
+        for actual,pj,sim in rows:
+            try: dist=json.loads(pj or '{}')
+            except Exception: dist={}
+            ss=float(sim or 0.0); w=float(np.clip(1.0-0.45*ss,0.60,1.00))
+            if actual in obs: obs[actual]+=w
+            for t in types:
+                pred[t]+=w*float(dist.get(t,0.0) or 0.0)/100.0
+            wsum+=w
+        if wsum<=0: return out
+        n=len(rows); shrink=n/(n+28.0)
+        factor={}
+        for t in types:
+            o=obs[t]/wsum; pp=pred[t]/wsum
+            f=float(np.exp(np.clip((o-pp)*0.75*shrink,-0.10,0.10)))
+            factor[t]=float(np.clip(f,0.92,1.08))
+        out={'enabled':n>=4,'samples':n,'factor':factor,
+             'reason':f'過去{n}Rの実測展開と予測展開比率の差を縮小校正'}
+    except Exception as exc:
+        out['reason']=f'展開フィードバック校正失敗: {exc}'
+    _V264_SCENARIO_FEEDBACK_CACHE[key]=dict(out)
+    return out
+
+def _v264_blended_scenario_prior(empirical, feedback):
+    types=['前残り型','早仕掛け型','中盤入替型','後半追込型','波乱型']
+    base=(empirical or {}).get('prior') or {}
+    fac=(feedback or {}).get('factor') or {}
+    if not base:
+        base={t:1.0/len(types) for t in types}
+    raw={t:max(1e-6,float(base.get(t,0.0) or 0.0))*float(fac.get(t,1.0) or 1.0) for t in types}
+    z=sum(raw.values()) or 1.0
+    return {t:v/z for t,v in raw.items()}
 
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
@@ -1924,6 +2025,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     player_actual_delta=player_actual_calibration.get("player_delta") or {}
     actual_lap_orders=_v251_actual_lap_orders(_v230_db_path(), meta)
     scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
+    scenario_feedback_v264=_v264_feedback_scenario_adjustment(_v230_db_path(), venue, race_date)
+    scenario_branch_prior_v264=_v264_blended_scenario_prior(scenario_prior, scenario_feedback_v264)
     _v242_prepare_seconds=time_module.perf_counter()-_v242_prepare_started
     name_by_car={c:n for c,n in zip(cars,names)}
     rng=np.random.default_rng(int(seed)+230)
@@ -1956,16 +2059,21 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     convergence_checks = 0
     previous_signature = None
     completed_trials = 0
+    _scenario_types=list(scenario_branch_prior_v264.keys())
+    _scenario_probs=np.array([scenario_branch_prior_v264[t] for t in _scenario_types],dtype=float)
+    _scenario_probs=_scenario_probs/max(1e-12,_scenario_probs.sum())
     for sim_index in range(planned_trials):
-        # その日の出来・機力発揮度を試行ごとに変える。同じ能力順を20,000回固定しない。
-        # 共通の走路揺らぎと選手別の出来を分け、極端な本命固定を抑える。
-        race_noise=rng.normal(0,0.10)
-        perf={c:max(-2.2,min(2.2,strength[c]+race_noise+rng.normal(0,0.36))) for c in cars}
+        # Ver264: 各試行で展開型を先にサンプルし、その型に応じて各周の分岐確率を小さく変える。
+        target_scenario=str(rng.choice(_scenario_types,p=_scenario_probs)) if _scenario_types else '中盤入替型'
+        race_noise=rng.normal(0,0.12 if target_scenario=='波乱型' else 0.09)
+        indiv_sd=0.42 if target_scenario=='波乱型' else 0.34
+        perf={c:max(-2.2,min(2.2,strength[c]+race_noise+rng.normal(0,indiv_sd))) for c in cars}
         min_handicap=min(handicap.values()) if handicap else 0
         # 前ハンデ残りは開催日前の実績だけを使い、1試行の能力へ小さく反映。
         for c in cars:
             if handicap[c] == min_handicap:
-                perf[c]=max(-2.2,min(2.2,perf[c]+0.34*front_survival_delta))
+                _front_branch = 0.055 if target_scenario=='前残り型' else (-0.025 if target_scenario in ('早仕掛け型','後半追込型') else 0.0)
+                perf[c]=max(-2.2,min(2.2,perf[c]+0.18*front_survival_delta+_front_branch))
         # スタート反応はST・履歴・ランダムで毎試行変える。
         start_score={}
         for c in cars:
@@ -2035,27 +2143,38 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 # Ver253: 固定のハンデ壁を弱め、実際の周回順位入替率を主に使う。
                 handicap_wall=min(0.12, 0.0022*handicap_gap)
                 bucket_key=f"{lap}|{_v251_gap_bucket(handicap_gap)}"
-                learned_transition=float((lap_bucket_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_alignment.get("enabled") else 0.0
+                learned_transition=0.45*float((lap_bucket_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_alignment.get("enabled") else 0.0
                 # Ver253: 過去予測が実測より抜き過ぎ/抜かな過ぎだった残差を直接補正。
-                residual_transition=float((lap_residual_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_residual.get("enabled") else 0.0
+                residual_transition=0.45*float((lap_residual_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_residual.get("enabled") else 0.0
                 # Ver256: 保存予測の有無に依存せず、全実測グランドノートの周回入替率を反映。
-                actual_transition=float(actual_lap_delta.get(lap,0.0)) if actual_lap_calibration.get("enabled") else 0.0
+                actual_transition=0.30*float(actual_lap_delta.get(lap,0.0)) if actual_lap_calibration.get("enabled") else 0.0
                 # Ver254: 同じ選手が同じ周回で一貫して予測より追い上げる/追い上げない残差を小さく反映。
                 player_lap_key=f"{cn}|{lap}"
                 player_transition=float((player_lap_delta.get(player_lap_key) or {}).get("delta",0.0)) if player_lap_calibration.get("enabled") else 0.0
                 # Ver260: 保存予測の有無に依存しない全実測の選手×周回追抜率。
                 # Ver254残差学習と同時に効き過ぎないよう、合算後も小さく制限する。
                 player_actual_transition=float((player_actual_delta.get(player_lap_key) or {}).get("delta",0.0)) if player_actual_calibration.get("enabled") else 0.0
-                player_total_transition=float(np.clip(player_transition+player_actual_transition,-0.18,0.18))
+                player_total_transition=float(np.clip(0.55*player_transition+0.30*player_actual_transition,-0.08,0.08))
                 # 2台目までは現実に起こり得るため軽く、3台目以降だけ強く抑える。
                 same_lap_passes=lap_pass_count.get(chaser,0)
                 chain_fatigue=(0.16 if same_lap_passes==1 else (0.52 if same_lap_passes>=2 else 0.0))
                 # 前方3台に最前ハンデ群が複数残る場合、集団全体を一枚の壁として扱う。
                 front_pack=sum(1 for x in order[:min(3,len(order))] if handicap[x]==min_handicap)
                 pack_wall=(0.07*max(0,front_pack-1))*max(0.30,1.0-0.10*(lap-1))
-                # 一要素でほぼ確定しないよう係数を縮小し、各周に最低限の不確実性を残す。
-                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
-                logit += rng.normal(0,0.16)
+                scenario_branch=0.0
+                if target_scenario=='前残り型':
+                    scenario_branch = -0.10 if lap<=4 else -0.05
+                elif target_scenario=='早仕掛け型':
+                    scenario_branch = 0.12 if lap<=2 else (-0.03 if lap>=5 else 0.0)
+                elif target_scenario=='中盤入替型':
+                    scenario_branch = 0.10 if 3<=lap<=4 else -0.02
+                elif target_scenario=='後半追込型':
+                    scenario_branch = 0.13 if lap>=5 else -0.05
+                elif target_scenario=='波乱型':
+                    scenario_branch = 0.035
+                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus + scenario_branch - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
+                _branch_noise=0.23 if target_scenario=='波乱型' else 0.16
+                logit += rng.normal(0,_branch_noise)
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
                 # 差が開きすぎていればまず追いつく必要がある。
@@ -2137,8 +2256,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for typ,cc in scenario_combo_counts.items():
             generated=float(scenario_counts.get(typ,0))/max(1,sim_trials)
             target_prior=float(learned.get(typ,generated or 0.01))
-            ratio=(target_prior/max(0.01,generated))**0.28
-            w=float(np.clip(ratio,0.82,1.22))
+            ratio=(target_prior/max(0.01,generated))**0.12
+            w=float(np.clip(ratio,0.92,1.08))
             scenario_weights[typ]=w
             for combo,n in cc.items():
                 weighted_counts[combo]=weighted_counts.get(combo,0.0)+float(n)*w
@@ -2208,7 +2327,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     # 実測が既にある再シミュレーションはバックテストとして保存し、未来学習には混ぜない。
     lap_snapshot_save=_v252_save_lap_prediction(_v230_db_path(), meta, modal_laps, bool(actual_lap_orders))
     audit={
-        "enabled":True,"mode":"6周内蔵Ver263・複数展開ルート学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver264・展開分岐＋近似学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -2222,6 +2341,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "actual_lap_comparison": lap_comparison,
         "lap_snapshot_save": lap_snapshot_save,
         "scenario_prior_v263": scenario_prior,
+        "scenario_feedback_v264": scenario_feedback_v264,
+        "scenario_branch_prior_v264": scenario_branch_prior_v264,
         "scenario_distribution_v263": scenario_distribution,
         "scenario_weights_v263": scenario_weights,
         "actual_scenario_v263": actual_scenario,
@@ -2231,7 +2352,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
-        "message":f"複数の6周展開ルートを同時に生成し、開催日前の実測グランドノートから展開タイプ確率を弱く校正。結果登録後は実際の展開型と最も近い予測ルートを保存して次回検証に使います。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
+        "message":f"Ver264では実測展開頻度を各試行の分岐へ直接かつ弱く反映し、Ver258以降で強くなりすぎた周回・選手補正を縮小。実測に近い複数ルートが候補集合へ入りやすいよう校正します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
     }
     return out,new_bets,audit
 
@@ -2458,7 +2579,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver263"
+_V231_APP_VERSION = "Ver264"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -10061,7 +10182,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 st.warning(" / ".join(r253["errors"]))
                             st.rerun()
 
-                    with st.expander("Ver263 精度比較・一括再シミュレーションセンター", expanded=False):
+                    with st.expander(f"{_V231_APP_VERSION} 精度比較・一括再シミュレーションセンター", expanded=False):
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
                         run_v255=st.button("保存済みバージョンを再評価",key="v255_backtest_run",use_container_width=True)
                         try:
@@ -10089,7 +10210,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 st.rerun()
 
                             st.markdown(f"#### ♻️ 保存済み予測を全部{_V231_APP_VERSION}で再シミュレーション")
-                            st.caption("各レースの最新保存入力を現在コードで再計算し、現行Verの別履歴として保存します。既に現行Verがあるレースはスキップします。")
+                            st.caption("各レースの最新保存入力を現在コードで再計算し、現行Verの別履歴＋1〜6周スナップショットを保存します。現行Verでも周回保存が不足しているレースは自動修復し、6周まで揃っているレースだけスキップします。")
                             _v262_batch_limit=st.number_input("一括再シミュレーションする保存レース数",min_value=1,max_value=300,value=80,step=10,key="v262_batch_rerun_limit")
                             if st.button(f"♻️ 保存済み予測を全部{_V231_APP_VERSION}で再シミュレーション",key="v262_batch_rerun",type="primary",use_container_width=True):
                                 _prog=st.progress(0.0,text="一括再シミュレーションを開始します…")
