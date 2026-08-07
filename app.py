@@ -689,14 +689,14 @@ def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[
             con.execute("""
                 DELETE FROM v252_lap_prediction_snapshots
                 WHERE race_date=? AND venue=? AND race_no=? AND app_version=?
-            """, (race_date,venue,race_no,'Ver257'))
+            """, (race_date,venue,race_no,'Ver258'))
             for row in modal_laps:
                 con.execute("""
                     INSERT INTO v252_lap_prediction_snapshots
                     (race_date,venue,race_no,lap_no,predicted_order,support,app_version,is_backtest)
                     VALUES(?,?,?,?,?,?,?,?)
                 """, (race_date,venue,race_no,int(row.get('lap',0)),str(row.get('order','')),
-                      float(row.get('support',0.0)),'Ver257',(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))))
+                      float(row.get('support',0.0)),'Ver258',(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))))
             con.commit()
         _V252_LAP_RESIDUAL_CACHE.clear()
     except Exception:
@@ -719,7 +719,7 @@ def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date:
             pred=pd.read_sql_query("""
                 SELECT p.race_date,p.venue,p.race_no,p.lap_no,p.predicted_order,p.support,p.is_backtest,p.created_at
                 FROM v252_lap_prediction_snapshots p
-                WHERE p.is_backtest IN (0,2) AND p.app_version IN ('Ver253','Ver254','Ver256','Ver257')
+                WHERE p.is_backtest IN (0,2) AND p.app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver258')
                   AND (?='' OR p.venue=?)
                   AND (?='' OR substr(p.race_date,1,10)<substr(?,1,10))
                 ORDER BY p.created_at
@@ -911,7 +911,7 @@ def _v256_refresh_learning_settings(db_path: str | None) -> dict:
                 con.execute("""UPDATE learning_settings
                                SET current_value=?,updated_at=CURRENT_TIMESTAMP,sample_races=?,reason=?
                                WHERE setting_name=?""",
-                            (round(value,6),int(race_count),'Ver257: 選手名JOIN修正＋全実測グランドノートの周回入替率から縮小更新',name))
+                            (round(value,6),int(race_count),'Ver258: 全実測グランドノートの周回入替率＋選手別実測追抜学習を利用',name))
                 out['updated']+=1
             con.commit()
         out.update({'races':int(race_count),'pairs':int(cal.get('pairs',0))})
@@ -942,7 +942,7 @@ def _v254_player_lap_calibration(db_path: str | None, venue: str, cutoff_date: s
                        p.is_backtest,p.created_at
                 FROM v252_lap_prediction_snapshots p
                 WHERE p.is_backtest IN (0,2)
-                  AND p.app_version IN ('Ver253','Ver254','Ver256','Ver257')
+                  AND p.app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver258')
                   AND (?='' OR p.venue=?)
                   AND (?='' OR substr(p.race_date,1,10)<substr(?,1,10))
                 ORDER BY p.created_at
@@ -1023,6 +1023,121 @@ def _v254_player_lap_calibration(db_path: str | None, venue: str, cutoff_date: s
     return result
 
 
+
+# Ver258: 保存予測がある7レースだけに依存せず、実測グランドノート全体から
+# 選手×周回の「前車を実際に入れ替えた率」を学習する。
+# 開催場データが薄い場合は全場の選手傾向へ縮小し、さらに周回全体平均との差だけを小さく反映する。
+_V258_PLAYER_ACTUAL_CACHE = {}
+
+def _v258_player_actual_lap_calibration(db_path: str | None, venue: str = "", cutoff_date: str = "") -> dict:
+    result={"enabled":False,"races":0,"pairs":0,"players":0,"linked_laps":0,"total_laps":0,
+            "player_delta":{},"reason":"実測グランドノートの選手別周回データ不足"}
+    if not db_path or not Path(db_path).exists():
+        return result
+    try:
+        stamp=(str(db_path),Path(db_path).stat().st_mtime_ns,str(venue),str(cutoff_date)[:10])
+    except Exception:
+        stamp=(str(db_path),str(venue),str(cutoff_date)[:10])
+    if stamp in _V258_PLAYER_ACTUAL_CACHE:
+        return dict(_V258_PLAYER_ACTUAL_CACHE[stamp])
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            total_laps=int(con.execute("""
+                SELECT COUNT(*) FROM result_laps rl
+                JOIN result_races rr ON rr.race_key=rl.race_key
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                  AND (?='' OR substr(rr.race_date,1,10)<substr(?,1,10))
+            """,(cutoff_date,cutoff_date)).fetchone()[0] or 0)
+            linked_laps=int(con.execute("""
+                SELECT COUNT(*) FROM result_laps rl
+                JOIN result_races rr ON rr.race_key=rl.race_key
+                JOIN result_entries re ON re.race_key=rr.race_key AND re.car_no=rl.car_no
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                  AND COALESCE(TRIM(re.player_name),'')<>''
+                  AND (?='' OR substr(rr.race_date,1,10)<substr(?,1,10))
+            """,(cutoff_date,cutoff_date)).fetchone()[0] or 0)
+            d=pd.read_sql_query("""
+                SELECT substr(rr.race_date,1,10) AS race_date,rr.venue,
+                       REPLACE(COALESCE(rr.race_no,''),'R','') AS race_no,
+                       rl.lap_no,rl.position,rl.car_no,COALESCE(re.player_name,'') AS player_name
+                FROM result_laps rl
+                JOIN result_races rr ON rr.race_key=rl.race_key
+                LEFT JOIN result_entries re ON re.race_key=rr.race_key AND re.car_no=rl.car_no
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                  AND rl.lap_no BETWEEN 1 AND 6
+                  AND (?='' OR substr(rr.race_date,1,10)<substr(?,1,10))
+                ORDER BY rr.race_date,rr.venue,rr.race_no,rl.lap_no,rl.position
+            """,con,params=(cutoff_date,cutoff_date))
+    except Exception as exc:
+        result['reason']=f'Ver258選手別実測周回読込失敗: {exc}'
+        return result
+    result['total_laps']=total_laps; result['linked_laps']=linked_laps
+    if d.empty:
+        return result
+    events=[]; race_keys=set()
+    for (race_date,v,race_no),g in d.groupby(['race_date','venue','race_no'],dropna=False):
+        orders={int(l):tuple(int(x) for x in xg.sort_values('position').car_no.tolist()) for l,xg in g.groupby('lap_no')}
+        names={int(r.car_no):str(r.player_name or '').strip() for r in g.itertuples() if str(r.player_name or '').strip()}
+        prev=orders.get(1)
+        for lap in range(2,7):
+            cur=orders.get(lap)
+            if not prev or not cur:
+                prev=cur or prev; continue
+            pos={c:i for i,c in enumerate(cur)}
+            for i in range(1,len(prev)):
+                front,chaser=prev[i-1],prev[i]
+                name=names.get(chaser,'')
+                if not name or front not in pos or chaser not in pos:
+                    continue
+                passed=int(pos[chaser] < pos[front])
+                events.append((str(v),name,int(lap),passed))
+                race_keys.add((str(race_date),str(v),str(race_no)))
+            prev=cur
+    if len(events)<100:
+        result.update({'pairs':len(events),'races':len(race_keys)})
+        _V258_PLAYER_ACTUAL_CACHE[stamp]=dict(result)
+        return result
+    ev=pd.DataFrame(events,columns=['venue','player','lap','passed'])
+    # 全場の周回基準率。選手補正はこの基準との差だけを使う。
+    lap_base={int(l):(float(g['passed'].sum())+4.0)/(len(g)+16.0) for l,g in ev.groupby('lap')}
+    global_pg={(str(p),int(l)):(int(len(g)),float(g['passed'].sum())) for (p,l),g in ev.groupby(['player','lap'])}
+    local=ev[ev['venue'].astype(str)==str(venue)] if venue else ev
+    local_pg={(str(p),int(l)):(int(len(g)),float(g['passed'].sum())) for (p,l),g in local.groupby(['player','lap'])}
+    deltas={}; used_players=set(); used_pairs=0
+    for key,(gn,gpass) in global_pg.items():
+        player,lap=key
+        ln,lpass=local_pg.get(key,(0,0.0))
+        # 全場の選手率はBeta平滑化、開催場固有は全場選手率へ縮小。
+        gp=(gpass+2.0)/(gn+8.0)
+        if venue:
+            lp=(lpass+2.0)/(ln+8.0)
+            local_conf=ln/(ln+18.0)
+            player_rate=local_conf*lp+(1.0-local_conf)*gp
+            n_for_conf=ln + 0.35*gn
+        else:
+            player_rate=gp; n_for_conf=gn
+        base=float(lap_base.get(lap,0.20))
+        confidence=float(n_for_conf/(n_for_conf+35.0))
+        if n_for_conf < 2.0:
+            continue
+        # データが増えるほど0.08→0.24程度へ緩やかに強める。最大±0.14logitに制限。
+        gain=0.08+0.16*confidence
+        delta=float(np.clip((_v256_logit(player_rate)-_v256_logit(base))*gain,-0.14,0.14))
+        if abs(delta)<0.004:
+            continue
+        deltas[f'{player}|{lap}']={
+            'delta':delta,'rate':round(player_rate,5),'base_rate':round(base,5),
+            'global_n':int(gn),'venue_n':int(ln),'confidence':round(confidence,4)
+        }
+        used_players.add(player); used_pairs += int(ln if venue else gn)
+    result.update({
+        'enabled':bool(deltas),'races':len(race_keys),'pairs':int(len(local)),
+        'players':len(used_players),'player_delta':deltas,
+        'reason':'Ver258: 全実測グランドノートから選手×周回の追抜率を学習し、開催場・全場へ階層縮小'
+    })
+    _V258_PLAYER_ACTUAL_CACHE.clear(); _V258_PLAYER_ACTUAL_CACHE[stamp]=dict(result)
+    return result
+
 # Ver253: 保存済み予測履歴の出走表を使い、各レースを現在の6周モデルで再構成する。
 # 実結果は順位生成に使わず、生成後の周回残差学習だけに低い重みで利用する。
 def _v253_backfill_saved_lap_predictions(db_path: str, limit: int = 80) -> dict:
@@ -1042,7 +1157,7 @@ def _v253_backfill_saved_lap_predictions(db_path: str, limit: int = 80) -> dict:
             """,(max(1,int(limit)),)).fetchall()
             existing=set((str(a),str(b),str(c)) for a,b,c in con.execute("""
                 SELECT race_date,venue,race_no FROM v252_lap_prediction_snapshots
-                WHERE app_version IN ('Ver253','Ver254','Ver256','Ver257') AND is_backtest=2 GROUP BY race_date,venue,race_no
+                WHERE app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver258') AND is_backtest=2 GROUP BY race_date,venue,race_no
             """).fetchall())
         for row in rows:
             result["processed"]+=1
@@ -1101,7 +1216,7 @@ def _v253_reconstruction_status(db_path: str) -> dict:
             pred=pd.read_sql_query("""
                 SELECT race_date,venue,race_no,lap_no,predicted_order,support,created_at
                 FROM v252_lap_prediction_snapshots
-                WHERE app_version IN ('Ver253','Ver254','Ver256','Ver257') AND is_backtest=2
+                WHERE app_version IN ('Ver253','Ver254','Ver256','Ver257','Ver258') AND is_backtest=2
                 ORDER BY race_date,venue,CAST(race_no AS INTEGER),lap_no,created_at
             """,con)
             actual=pd.read_sql_query("""
@@ -1495,6 +1610,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     actual_lap_delta=actual_lap_calibration.get("lap_delta") or {}
     player_lap_calibration=_v254_player_lap_calibration(_v230_db_path(), venue, race_date)
     player_lap_delta=player_lap_calibration.get("player_delta") or {}
+    player_actual_calibration=_v258_player_actual_lap_calibration(_v230_db_path(), venue, race_date)
+    player_actual_delta=player_actual_calibration.get("player_delta") or {}
     actual_lap_orders=_v251_actual_lap_orders(_v230_db_path(), meta)
     _v242_prepare_seconds=time_module.perf_counter()-_v242_prepare_started
     name_by_car={c:n for c,n in zip(cars,names)}
@@ -1611,6 +1728,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 # Ver254: 同じ選手が同じ周回で一貫して予測より追い上げる/追い上げない残差を小さく反映。
                 player_lap_key=f"{cn}|{lap}"
                 player_transition=float((player_lap_delta.get(player_lap_key) or {}).get("delta",0.0)) if player_lap_calibration.get("enabled") else 0.0
+                # Ver258: 保存予測の有無に依存しない全実測の選手×周回追抜率。
+                # Ver254残差学習と同時に効き過ぎないよう、合算後も小さく制限する。
+                player_actual_transition=float((player_actual_delta.get(player_lap_key) or {}).get("delta",0.0)) if player_actual_calibration.get("enabled") else 0.0
+                player_total_transition=float(np.clip(player_transition+player_actual_transition,-0.18,0.18))
                 # 2台目までは現実に起こり得るため軽く、3台目以降だけ強く抑える。
                 same_lap_passes=lap_pass_count.get(chaser,0)
                 chain_fatigue=(0.16 if same_lap_passes==1 else (0.52 if same_lap_passes>=2 else 0.0))
@@ -1618,7 +1739,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 front_pack=sum(1 for x in order[:min(3,len(order))] if handicap[x]==min_handicap)
                 pack_wall=(0.07*max(0,front_pack-1))*max(0.30,1.0-0.10*(lap-1))
                 # 一要素でほぼ確定しないよう係数を縮小し、各周に最低限の不確実性を残す。
-                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_transition + weak_front_bonus + chain_bonus - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
+                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
                 logit += rng.normal(0,0.16)
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
@@ -1745,6 +1866,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "lap_alignment": lap_alignment,
         "lap_residual_learning": lap_residual,
         "actual_lap_learning_v256": actual_lap_calibration,
+        "player_actual_learning_v258": player_actual_calibration,
         "predicted_lap_orders": modal_laps,
         "actual_lap_comparison": lap_comparison,
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
@@ -1977,7 +2099,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver257"
+_V231_APP_VERSION = "Ver258"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -2385,7 +2507,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver257｜選手別周回学習のDB結合を修正。実測グランドノートとの保存版精度比較・学習状態を表示します。")
+st.caption("Ver258｜全実測グランドノートから選手×周回の追抜傾向を階層学習し、保存予測が少ない段階でも展開へ反映します。")
 try:
     _v256_refresh_learning_settings(_v230_db_path())
 except Exception:
@@ -9365,7 +9487,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 st.warning(" / ".join(r253["errors"]))
                             st.rerun()
 
-                    with st.expander("Ver257 精度比較・自動バックテストセンター", expanded=False):
+                    with st.expander("Ver258 精度比較・自動バックテストセンター", expanded=False):
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
                         run_v255=st.button("保存済みバージョンを再評価",key="v255_backtest_run",use_container_width=True)
                         try:
@@ -9388,7 +9510,15 @@ if selected_main_page == "🗃️ 登録情報確認":
                             player_learn=result255.get('player_learning') or {}
                             l1,l2=st.columns(2)
                             l1.metric("場・周回差分学習",f"{int(learn.get('races',0) or 0)}レース / {int(learn.get('samples',0) or 0)}比較")
-                            l2.metric("選手別周回学習",f"{int(player_learn.get('races',0) or 0)}レース / {int(player_learn.get('samples',0) or 0)}比較")
+                            l2.metric("保存予測×選手残差",f"{int(player_learn.get('races',0) or 0)}レース / {int(player_learn.get('samples',0) or 0)}比較")
+                            full_player=_v258_player_actual_lap_calibration(engine.DB_PATH,'','')
+                            f1,f2,f3=st.columns(3)
+                            f1.metric("全実測・選手学習",f"{int(full_player.get('races',0) or 0)}レース")
+                            f2.metric("追抜比較",f"{int(full_player.get('pairs',0) or 0):,}件")
+                            f3.metric("学習選手",f"{int(full_player.get('players',0) or 0)}人")
+                            total_laps=int(full_player.get('total_laps',0) or 0); linked_laps=int(full_player.get('linked_laps',0) or 0)
+                            if total_laps:
+                                st.caption(f"グランドノート選手リンク: {linked_laps:,}/{total_laps:,}行（{linked_laps/total_laps*100:.1f}%）｜{full_player.get('reason','')}")
                             if not learn.get('enabled'):
                                 st.caption("場・周回差分学習: "+str(learn.get('reason') or '未発動'))
                             if not player_learn.get('enabled'):
