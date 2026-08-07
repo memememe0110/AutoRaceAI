@@ -1192,7 +1192,7 @@ def _v253_backfill_saved_lap_predictions(db_path: str, limit: int = 80) -> dict:
             except Exception as exc:
                 _V253_RECONSTRUCTION_MODE=False
                 if len(result["errors"])<8: result["errors"].append(f"履歴{hid}: {type(exc).__name__}: {exc}")
-        _V253_LAP_RESIDUAL_CACHE.clear()
+        _V252_LAP_RESIDUAL_CACHE.clear()
         result["message"]=(
             f"確認 {result['processed']}件｜新規再構成 {result['saved']}レース｜"
             f"再構成済み {result['already_done']}件｜材料不足 {result['missing_meta']}件｜"
