@@ -697,7 +697,7 @@ def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[
     if not race_date or not venue or not race_no:
         status["reason"]=f"レースキー不足: date={race_date or '-'} venue={venue or '-'} R={race_no or '-'}"; return status
     # 再構成は従来どおりVer253の検証材料、通常予測は現在の実行版として保存する。
-    app_version=(str(app_version_override or '').strip() or ('Ver253' if _V253_RECONSTRUCTION_MODE else str(globals().get('_V231_APP_VERSION') or 'Ver264')))
+    app_version=(str(app_version_override or '').strip() or ('Ver253' if _V253_RECONSTRUCTION_MODE else str(globals().get('_V231_APP_VERSION') or 'Ver265')))
     bt=(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))
     status.update({"app_version":app_version,"is_backtest":bt})
     try:
@@ -748,7 +748,7 @@ def _v260_snapshot_from_saved_view(db_path: str, view: dict, source_app_version:
     laps=list(audit.get("predicted_lap_orders") or []) if isinstance(audit,dict) else []
     if not laps:
         return status
-    ver=str(source_app_version or view.get("app_version") or "").strip() or str(globals().get('_V231_APP_VERSION') or 'Ver260')
+    ver=str(source_app_version or view.get("app_version") or "").strip() or str(globals().get('_V231_APP_VERSION') or 'Ver265')
     # This is a stored prediction generated at its original time, not a result-aware rerun.
     return _v252_save_lap_prediction(db_path,meta,laps,False,app_version_override=ver)
 
@@ -810,7 +810,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             continue
         seen.add(rk); unique.append(h)
     total=len(unique)
-    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver264')
+    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver265')
     # 現行Verで「予測履歴＋6周スナップショット」まで揃っているレースだけスキップする。
     # 履歴だけ存在して周回保存が欠けている場合は、一括再シミュレーションで自動修復する。
     current_keys=set()
@@ -1858,7 +1858,7 @@ def _v263_save_scenario_feedback(db_path, meta, dist, actual_type, closest_simil
         _rd=str((meta or {}).get('開催日') or (meta or {}).get('race_date') or '')[:10]
         _vv=str((meta or {}).get('開催場') or (meta or {}).get('venue') or '')
         _rr=str((meta or {}).get('R') or (meta or {}).get('レース') or (meta or {}).get('race_no') or '')
-        _av=str(globals().get('_V231_APP_VERSION') or 'Ver264')
+        _av=str(globals().get('_V231_APP_VERSION') or 'Ver265')
         con.execute('DELETE FROM v263_scenario_feedback WHERE race_date=? AND venue=? AND race_no=? AND app_version=?',(_rd,_vv,_rr,_av))
         con.execute('''INSERT INTO v263_scenario_feedback VALUES(?,?,?,?,?,?,?,?,datetime('now','localtime'))''',
                     (_rd,_vv,_rr,_av,actual_type,json.dumps(dist or {},ensure_ascii=False),float(closest_similarity or 0.0),str(closest_route or '')))
@@ -1937,6 +1937,98 @@ def _v264_blended_scenario_prior(empirical, feedback):
     raw={t:max(1e-6,float(base.get(t,0.0) or 0.0))*float(fac.get(t,1.0) or 1.0) for t in types}
     z=sum(raw.values()) or 1.0
     return {t:v/z for t,v in raw.items()}
+
+
+# Ver265: 予測タイムの土台を、過去の「競走T－試走T」実測残差で校正する。
+# 同日以降は使わず、開催場→選手→ハンデ帯の順で縮小して過学習を抑える。
+def _v265_time_residual_calibration(db_path: str | None, venue: str = "", cutoff_date: str = "") -> dict:
+    empty={"enabled":False,"venue":str(venue or ""),"samples":0,"player_expected":{},"handicap_expected":{},"venue_expected":None,"global_expected":None}
+    if not db_path or not os.path.exists(str(db_path)):
+        return empty
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            q='''
+                SELECT h.race_date,h.venue,h.handicap,h.trial_time,h.race_time,p.player_name
+                FROM race_history h
+                LEFT JOIN players p ON p.player_id=h.player_id
+                WHERE COALESCE(h.use_for_model,1)=1
+                  AND COALESCE(h.result_status,'通常')='通常'
+                  AND h.trial_time IS NOT NULL AND h.race_time IS NOT NULL
+                  AND h.trial_time BETWEEN 3.20 AND 4.20
+                  AND h.race_time BETWEEN 3.20 AND 4.50
+            '''
+            params=[]
+            if cutoff_date:
+                q+=' AND h.race_date < ?'; params.append(str(cutoff_date)[:10])
+            rows=con.execute(q,params).fetchall()
+    except Exception as e:
+        out=dict(empty); out['error']=str(e); return out
+    vals=[]
+    for rd,v,h,tt,rt,nm in rows:
+        try:
+            d=float(rt)-float(tt)
+            if not (0.015 <= d <= 0.220):
+                continue
+            m=re.search(r'-?\d+',str(h or '0'))
+            hv=int(m.group()) if m else 0
+            bucket=int(round(hv/10.0)*10)
+            vals.append((str(v or ''),_v230_norm_name(nm),bucket,d,str(rd or '')))
+        except Exception:
+            continue
+    if len(vals)<20:
+        out=dict(empty); out['samples']=len(vals); return out
+    import statistics
+    all_d=[x[3] for x in vals]
+    global_med=float(statistics.median(all_d))
+    vv=[x for x in vals if str(x[0])==str(venue)] if venue else vals
+    venue_med=float(statistics.median([x[3] for x in vv])) if vv else global_med
+    venue_n=len(vv)
+    venue_w=venue_n/(venue_n+80.0)
+    venue_expected=global_med+(venue_med-global_med)*venue_w
+    by_player={}; by_h={}
+    for v,n,b,d,rd in vv:
+        if n: by_player.setdefault(n,[]).append(d)
+        by_h.setdefault(b,[]).append(d)
+    player_expected={}
+    for n,ds in by_player.items():
+        if len(ds)<3: continue
+        med=float(statistics.median(ds)); w=len(ds)/(len(ds)+14.0)
+        exp=venue_expected+(med-venue_expected)*w
+        player_expected[n]={"expected_delta":float(exp),"samples":len(ds),"weight":float(w)}
+    handicap_expected={}
+    for b,ds in by_h.items():
+        if len(ds)<8: continue
+        med=float(statistics.median(ds)); w=len(ds)/(len(ds)+35.0)
+        exp=venue_expected+(med-venue_expected)*w
+        handicap_expected[int(b)]={"expected_delta":float(exp),"samples":len(ds),"weight":float(w)}
+    return {"enabled":True,"venue":str(venue or ''),"samples":len(vals),"venue_samples":venue_n,
+            "global_expected":global_med,"venue_expected":venue_expected,
+            "player_expected":player_expected,"handicap_expected":handicap_expected,
+            "note":"過去日の通常結果のみ。競走T−試走Tを中央値＋縮小で校正。"}
+
+
+def _v265_time_adjustment_seconds(cal: dict, player_name: str, handicap_value: float, current_trial: float, current_pred: float) -> tuple[float,float,int]:
+    if not cal or not cal.get('enabled'):
+        return 0.0,0.0,0
+    try:
+        base=float(cal.get('venue_expected') if cal.get('venue_expected') is not None else cal.get('global_expected'))
+        p=(cal.get('player_expected') or {}).get(_v230_norm_name(player_name)) or {}
+        hb=int(round(float(handicap_value or 0)/10.0)*10)
+        h=(cal.get('handicap_expected') or {}).get(hb) or {}
+        expected=base; conf=0.12; samples=0
+        if h:
+            hw=min(0.35,float(h.get('weight',0.0))*0.35)
+            expected=(1-hw)*expected+hw*float(h.get('expected_delta',base)); conf=max(conf,hw); samples+=int(h.get('samples',0))
+        if p:
+            pw=min(0.62,float(p.get('weight',0.0))*0.62)
+            expected=(1-pw)*expected+pw*float(p.get('expected_delta',base)); conf=max(conf,pw); samples+=int(p.get('samples',0))
+        pred_delta=float(current_pred)-float(current_trial)
+        learn_rate=min(0.45,max(0.22,0.20+0.35*conf))
+        adj=(expected-pred_delta)*learn_rate
+        adj=float(max(-0.012,min(0.012,adj)))
+        return adj,float(expected),int(samples)
+    except Exception:
+        return 0.0,0.0,0
 
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
@@ -2023,6 +2115,19 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     player_lap_delta=player_lap_calibration.get("player_delta") or {}
     player_actual_calibration=_v258_player_actual_lap_calibration(_v230_db_path(), venue, race_date)
     player_actual_delta=player_actual_calibration.get("player_delta") or {}
+    time_residual_v265=_v265_time_residual_calibration(_v230_db_path(), venue, race_date)
+    time_adjust_v265={}
+    time_expected_v265={}
+    time_samples_v265={}
+    for _,_rr in work.iterrows():
+        _c=int(_rr["_car"])
+        _nm=next((n for c,n in zip(cars,names) if c==_c),'')
+        _pred=_v230_num(_rr.get("予測競走T"),0.0) if "予測競走T" in _rr.index else 0.0
+        _trial=trial.get(_c,0.0)
+        if _pred>0 and _trial>0:
+            _adj,_exp,_sn=_v265_time_adjustment_seconds(time_residual_v265,_nm,handicap.get(_c,0),_trial,_pred)
+            time_adjust_v265[_c]=_adj; time_expected_v265[_c]=_exp; time_samples_v265[_c]=_sn
+            strength[_c]=max(-1.70,min(1.70,strength[_c]-12.0*_adj))
     actual_lap_orders=_v251_actual_lap_orders(_v230_db_path(), meta)
     scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
     scenario_feedback_v264=_v264_feedback_scenario_adjustment(_v230_db_path(), venue, race_date)
@@ -2059,21 +2164,19 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     convergence_checks = 0
     previous_signature = None
     completed_trials = 0
-    _scenario_types=list(scenario_branch_prior_v264.keys())
-    _scenario_probs=np.array([scenario_branch_prior_v264[t] for t in _scenario_types],dtype=float)
-    _scenario_probs=_scenario_probs/max(1e-12,_scenario_probs.sum())
+    _scenario_types=['標準型']
+    _scenario_probs=np.array([1.0],dtype=float)
     for sim_index in range(planned_trials):
         # Ver264: 各試行で展開型を先にサンプルし、その型に応じて各周の分岐確率を小さく変える。
-        target_scenario=str(rng.choice(_scenario_types,p=_scenario_probs)) if _scenario_types else '中盤入替型'
-        race_noise=rng.normal(0,0.12 if target_scenario=='波乱型' else 0.09)
-        indiv_sd=0.42 if target_scenario=='波乱型' else 0.34
+        target_scenario='標準型'
+        race_noise=rng.normal(0,0.10)
+        indiv_sd=0.36
         perf={c:max(-2.2,min(2.2,strength[c]+race_noise+rng.normal(0,indiv_sd))) for c in cars}
         min_handicap=min(handicap.values()) if handicap else 0
         # 前ハンデ残りは開催日前の実績だけを使い、1試行の能力へ小さく反映。
         for c in cars:
             if handicap[c] == min_handicap:
-                _front_branch = 0.055 if target_scenario=='前残り型' else (-0.025 if target_scenario in ('早仕掛け型','後半追込型') else 0.0)
-                perf[c]=max(-2.2,min(2.2,perf[c]+0.18*front_survival_delta+_front_branch))
+                perf[c]=max(-2.2,min(2.2,perf[c]+0.34*front_survival_delta))
         # スタート反応はST・履歴・ランダムで毎試行変える。
         start_score={}
         for c in cars:
@@ -2143,18 +2246,18 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 # Ver253: 固定のハンデ壁を弱め、実際の周回順位入替率を主に使う。
                 handicap_wall=min(0.12, 0.0022*handicap_gap)
                 bucket_key=f"{lap}|{_v251_gap_bucket(handicap_gap)}"
-                learned_transition=0.45*float((lap_bucket_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_alignment.get("enabled") else 0.0
+                learned_transition=float((lap_bucket_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_alignment.get("enabled") else 0.0
                 # Ver253: 過去予測が実測より抜き過ぎ/抜かな過ぎだった残差を直接補正。
-                residual_transition=0.45*float((lap_residual_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_residual.get("enabled") else 0.0
+                residual_transition=float((lap_residual_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_residual.get("enabled") else 0.0
                 # Ver256: 保存予測の有無に依存せず、全実測グランドノートの周回入替率を反映。
-                actual_transition=0.30*float(actual_lap_delta.get(lap,0.0)) if actual_lap_calibration.get("enabled") else 0.0
+                actual_transition=float(actual_lap_delta.get(lap,0.0)) if actual_lap_calibration.get("enabled") else 0.0
                 # Ver254: 同じ選手が同じ周回で一貫して予測より追い上げる/追い上げない残差を小さく反映。
                 player_lap_key=f"{cn}|{lap}"
                 player_transition=float((player_lap_delta.get(player_lap_key) or {}).get("delta",0.0)) if player_lap_calibration.get("enabled") else 0.0
                 # Ver260: 保存予測の有無に依存しない全実測の選手×周回追抜率。
                 # Ver254残差学習と同時に効き過ぎないよう、合算後も小さく制限する。
                 player_actual_transition=float((player_actual_delta.get(player_lap_key) or {}).get("delta",0.0)) if player_actual_calibration.get("enabled") else 0.0
-                player_total_transition=float(np.clip(0.55*player_transition+0.30*player_actual_transition,-0.08,0.08))
+                player_total_transition=float(np.clip(player_transition,-0.08,0.08))
                 # 2台目までは現実に起こり得るため軽く、3台目以降だけ強く抑える。
                 same_lap_passes=lap_pass_count.get(chaser,0)
                 chain_fatigue=(0.16 if same_lap_passes==1 else (0.52 if same_lap_passes>=2 else 0.0))
@@ -2162,18 +2265,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 front_pack=sum(1 for x in order[:min(3,len(order))] if handicap[x]==min_handicap)
                 pack_wall=(0.07*max(0,front_pack-1))*max(0.30,1.0-0.10*(lap-1))
                 scenario_branch=0.0
-                if target_scenario=='前残り型':
-                    scenario_branch = -0.10 if lap<=4 else -0.05
-                elif target_scenario=='早仕掛け型':
-                    scenario_branch = 0.12 if lap<=2 else (-0.03 if lap>=5 else 0.0)
-                elif target_scenario=='中盤入替型':
-                    scenario_branch = 0.10 if 3<=lap<=4 else -0.02
-                elif target_scenario=='後半追込型':
-                    scenario_branch = 0.13 if lap>=5 else -0.05
-                elif target_scenario=='波乱型':
-                    scenario_branch = 0.035
-                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus + scenario_branch - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
-                _branch_noise=0.23 if target_scenario=='波乱型' else 0.16
+                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
+                _branch_noise=0.16
                 logit += rng.normal(0,_branch_noise)
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
@@ -2296,6 +2389,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["6周追抜成功回数"]=out[car_col].map(lambda x: pass_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     out["1周目先頭率"]=out[car_col].map(lambda x: start_front.get(int(x),0)/sim_trials*100 if pd.notna(x) else 0.0)
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
+    out["Ver265タイム残差補正秒"]=out[car_col].map(lambda x: time_adjust_v265.get(int(x),0.0) if pd.notna(x) else 0.0)
+    if "予測競走T" in out.columns:
+        out["Ver265補正後予測競走T"]=pd.to_numeric(out["予測競走T"],errors="coerce") + out["Ver265タイム残差補正秒"]
+    out["Ver265タイム学習件数"]=out[car_col].map(lambda x: time_samples_v265.get(int(x),0) if pd.notna(x) else 0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
     modal_laps=[]
     for lap in range(1,7):
@@ -2323,11 +2420,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         if sim>closest_similarity:
             closest_similarity=sim; closest_route=route_text
     if actual_orders_only:
-        _v263_save_scenario_feedback(_v230_db_path(),meta,scenario_distribution,actual_scenario,closest_similarity,closest_route)
+        pass  # Ver265: 展開フィードバックは評価表示のみ
     # 実測が既にある再シミュレーションはバックテストとして保存し、未来学習には混ぜない。
     lap_snapshot_save=_v252_save_lap_prediction(_v230_db_path(), meta, modal_laps, bool(actual_lap_orders))
     audit={
-        "enabled":True,"mode":"6周内蔵Ver264・展開分岐＋近似学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"6周内蔵Ver265・Ver257基準＋タイム残差学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -2336,7 +2433,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "lap_alignment": lap_alignment,
         "lap_residual_learning": lap_residual,
         "actual_lap_learning_v256": actual_lap_calibration,
-        "player_actual_learning_v258": player_actual_calibration,
+        "player_actual_learning_v258": {"enabled":False,"reason":"Ver265ではVer257基準へ戻すため予測反映停止"},
+        "time_residual_learning_v265": time_residual_v265,
+        "time_adjustments_v265": {str(k):round(float(v),5) for k,v in time_adjust_v265.items()},
         "predicted_lap_orders": modal_laps,
         "actual_lap_comparison": lap_comparison,
         "lap_snapshot_save": lap_snapshot_save,
@@ -2352,7 +2451,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
-        "message":f"Ver264では実測展開頻度を各試行の分岐へ直接かつ弱く反映し、Ver258以降で強くなりすぎた周回・選手補正を縮小。実測に近い複数ルートが候補集合へ入りやすいよう校正します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
+        "message":f"Ver265ではVer257相当の展開係数へ戻し、実測の試走→競走タイム変換残差を開催場・選手・ハンデ帯で縮小学習して基礎能力へ小さく反映します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
     }
     return out,new_bets,audit
 
@@ -2579,7 +2678,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver264"
+_V231_APP_VERSION = "Ver265"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
