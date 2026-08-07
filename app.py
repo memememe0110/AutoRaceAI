@@ -793,6 +793,84 @@ def _v260_repair_saved_snapshot_history(db_path: str, app_version: str = '', lim
                     f"既登録{out['already_ok']}件 / 周回材料なし{out['no_laps']}件")
     return out
 
+
+# Ver262: 保存済み予測を現在バージョンで一括再シミュレーションする。
+# 同一レース・現行Verの履歴が既に存在する場合は重複作成せずスキップする。
+def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None) -> dict:
+    out={"checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[]}
+    histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
+    # 同じレースの旧バージョンが複数あっても、入力復元元は最新1件だけ使う。
+    unique=[]; seen=set()
+    for h in histories:
+        rk=str(h.get('race_key') or '').strip()
+        if not rk or rk in seen:
+            continue
+        seen.add(rk); unique.append(h)
+    total=len(unique)
+    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver262')
+    # 現行Verで既に保存済みのレースキーを取得。
+    current_keys=set()
+    try:
+        _v231_ensure_prediction_history_table(db_path)
+        with sqlite3.connect(str(db_path)) as con:
+            rows=con.execute("SELECT DISTINCT race_key FROM v231_prediction_history WHERE app_version=?",(current_ver,)).fetchall()
+        current_keys={str(r[0]) for r in rows if r and r[0]}
+    except Exception:
+        current_keys=set()
+    for idx,h in enumerate(unique,1):
+        out['checked']+=1
+        label=str(h.get('race_label') or h.get('race_key') or f'履歴{idx}')
+        try:
+            if callable(progress_cb):
+                progress_cb(idx-1,total,label)
+            race_key0=str(h.get('race_key') or '').strip()
+            if race_key0 in current_keys:
+                out['skipped_current']+=1
+                continue
+            view, raw_text, venue_override, hm=_v231_load_prediction_history(db_path,int(h.get('history_id') or 0))
+            if not view or not str(raw_text or '').strip():
+                out['no_text']+=1
+                continue
+            src_ver=str((hm or {}).get('app_version') or h.get('app_version') or view.get('app_version') or 'Unknown')
+            trials=int(h.get('trials') or view.get('trials') or 20000)
+            seed=int(h.get('seed') or view.get('seed') or 42)
+            excluded=[int(x) for x in (view.get('excluded') or [])]
+            prediction_text=str(raw_text)
+            if str(venue_override or '').strip():
+                prediction_text=f"開催場: {str(venue_override).strip()}\n"+prediction_text
+            df,bets,output,entries,meta=engine.ver16_run_prediction(prediction_text,trials,seed,manual_excluded=excluded)
+            meta=dict(meta or {})
+            df,bets,wall_audit=_v230_six_lap_simulation(df,bets,entries,meta,trials,seed)
+            meta['壁補正監査']=wall_audit
+            meta['6周展開シミュレーション']=wall_audit
+            finish_prob=engine.v30_finish_probabilities(df,bets,trials)
+            df=engine.v196_apply_probability_aligned_ranks(df,finish_prob)
+            race_key=engine.v34_save_prediction_snapshot(meta,df,finish_prob,engine.DB_PATH)
+            prediction_view={
+                'df':df,'bets':bets,'output':output,'entries':entries,'meta':meta,
+                'finish_prob':finish_prob,'race_key':race_key,'trials':trials,'excluded':excluded,
+                'learning_boundary':{},'future_audit':{},'day_trend':{},'prediction_timing':{},
+                'app_version':current_ver,'simulation_mode':_V231_SIMULATION_MODE,
+                'settings_hash':_v231_settings_hash(trials,seed,excluded),
+                'prediction_time':_v228_now_jst_iso(),'seed':seed,
+                'rerun_from_restored':True,'rerun_source_version':src_ver,
+                'rerun_source_history_id':int(h.get('history_id') or 0),
+                'batch_rerun':True,
+            }
+            hid=_v231_save_prediction_history(db_path,race_key,raw_text,venue_override,prediction_view,trials,seed)
+            _v222_save_prediction_restore(db_path,race_key,raw_text,venue_override,prediction_view)
+            out['rerun']+=1
+            out['labels'].append(f"{label} → {current_ver} (ID:{hid})")
+            current_keys.add(str(race_key0 or race_key))
+        except Exception as exc:
+            out['errors'].append(f"{label}: {type(exc).__name__}: {exc}")
+        finally:
+            if callable(progress_cb):
+                progress_cb(idx,total,label)
+    out['message']=(f"確認{out['checked']}レース / {current_ver}再シミュレーション{out['rerun']} / "
+                    f"現行版済み{out['skipped_current']} / 入力材料なし{out['no_text']} / エラー{len(out['errors'])}")
+    return out
+
 def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date: str) -> dict:
     """予測代表隊列と後日判明した実測隊列の追越し差を時系列で縮小学習する。"""
     result={"enabled":False,"samples":0,"races":0,"delta":{},"reason":"予測・実測の周回ペア不足"}
@@ -2217,7 +2295,7 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver261"
+_V231_APP_VERSION = "Ver262"
 _V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
@@ -2625,7 +2703,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver260｜全実測学習＋精度比較用の周回スナップショット保存をレースごとに検証し、保存漏れを画面表示します。")
+st.caption("Ver262｜保存済み予測の周回一括補完と、現在Verでの一括再シミュレーション比較に対応。")
 try:
     _v256_refresh_learning_settings(_v230_db_path())
 except Exception:
@@ -9809,7 +9887,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 st.warning(" / ".join(r253["errors"]))
                             st.rerun()
 
-                    with st.expander("Ver260 精度比較・自動バックテストセンター", expanded=False):
+                    with st.expander("Ver262 精度比較・一括再シミュレーションセンター", expanded=False):
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
                         run_v255=st.button("保存済みバージョンを再評価",key="v255_backtest_run",use_container_width=True)
                         try:
@@ -9820,18 +9898,41 @@ if selected_main_page == "🗃️ 登録情報確認":
                             ss3.metric("照合待ち・保存漏れ候補",f"{int(snap_status.get('waiting_or_missing',0))}レース")
                             if snap_status.get('waiting_or_missing',0):
                                 st.warning("予測履歴数より周回保存数が少ないため、未保存レースがあります。保存済み予測から再計算せずに周回データを補完できます。")
-                                if st.button(f"{_V231_APP_VERSION}予測履歴から周回保存を修復",key="v260_repair_snapshot_history",use_container_width=True):
-                                    with st.spinner("保存済み予測の1〜6周隊列をDBへ補完しています…"):
-                                        _repair=_v260_repair_saved_snapshot_history(engine.DB_PATH,_V231_APP_VERSION,200)
-                                    if _repair.get('repaired_races',0)>0:
-                                        st.success(_repair.get('message','修復しました。'))
-                                    else:
-                                        st.info(_repair.get('message','修復対象がありませんでした。'))
-                                    if _repair.get('labels'):
-                                        st.caption("修復: "+" / ".join(_repair.get('labels',[])[:20]))
-                                    if _repair.get('errors'):
-                                        st.warning(" / ".join(_repair.get('errors',[])[:8]))
-                                    st.rerun()
+                            st.markdown("#### 🔧 周回スナップショット一括補完")
+                            st.caption("保存済みの全バージョンを対象に、周回データが無い履歴だけ補完します。元のバージョンは変更しません。")
+                            _v262_repair_limit=st.number_input("一括補完する履歴数",min_value=1,max_value=500,value=120,step=20,key="v262_repair_limit")
+                            if st.button("🔧 全バージョンの周回スナップショットを一括補完",key="v262_repair_all_snapshots",use_container_width=True):
+                                with st.spinner("保存済み予測の周回データを一括補完しています…"):
+                                    _repair=_v260_repair_saved_snapshot_history(engine.DB_PATH,'',int(_v262_repair_limit))
+                                if _repair.get('repaired_races',0)>0:
+                                    st.success(_repair.get('message','修復しました。'))
+                                else:
+                                    st.info(_repair.get('message','修復対象がありませんでした。'))
+                                if _repair.get('labels'):
+                                    st.caption("修復: "+" / ".join(_repair.get('labels',[])[:30]))
+                                if _repair.get('errors'):
+                                    st.warning(" / ".join(_repair.get('errors',[])[:12]))
+                                st.rerun()
+
+                            st.markdown(f"#### ♻️ 保存済み予測を全部{_V231_APP_VERSION}で再シミュレーション")
+                            st.caption("各レースの最新保存入力を現在コードで再計算し、現行Verの別履歴として保存します。既に現行Verがあるレースはスキップします。")
+                            _v262_batch_limit=st.number_input("一括再シミュレーションする保存レース数",min_value=1,max_value=300,value=80,step=10,key="v262_batch_rerun_limit")
+                            if st.button(f"♻️ 保存済み予測を全部{_V231_APP_VERSION}で再シミュレーション",key="v262_batch_rerun",type="primary",use_container_width=True):
+                                _prog=st.progress(0.0,text="一括再シミュレーションを開始します…")
+                                def _v262_progress(done,total,label):
+                                    frac=(float(done)/float(total)) if total else 1.0
+                                    _prog.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}｜{label}")
+                                _batch=_v262_batch_rerun_saved_histories(engine.DB_PATH,int(_v262_batch_limit),_v262_progress)
+                                _prog.progress(1.0,text="一括再シミュレーション完了")
+                                if _batch.get('rerun',0)>0:
+                                    st.success(_batch.get('message','完了しました。'))
+                                else:
+                                    st.info(_batch.get('message','追加対象がありませんでした。'))
+                                if _batch.get('labels'):
+                                    st.caption("新規保存: "+" / ".join(_batch.get('labels',[])[:30]))
+                                if _batch.get('errors'):
+                                    st.warning(" / ".join(_batch.get('errors',[])[:12]))
+                                st.rerun()
                             result255=_v255_backtest_center(engine.DB_PATH)
                             cmp_df=result255.get('comparison',pd.DataFrame())
                             if cmp_df.empty:
