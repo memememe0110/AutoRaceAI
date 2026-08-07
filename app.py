@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import base64
+import glob
 import hashlib
 import json
 import os
 import pickle
 import re
-import zlib
+import shutil
 import sqlite3
-import time as time_module
+import tempfile
 import threading
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
+import time as time_module
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -24,7 +28,305 @@ import streamlit.components.v1 as components
 
 import engine
 
+# ---------------------------------------------------------------------------
+# AutoRaceAI runtime configuration / state
+# Ver265 refactor: version, modes and mutable caches are initialized in one
+# place so maintenance/reconstruction paths cannot fail from definition order.
+# Prediction formulas are intentionally unchanged by this refactor.
+# ---------------------------------------------------------------------------
+APP_VERSION = "Ver266"
+SIMULATION_MODE = "6周内蔵型壁展開"
+
+# Backward-compatible aliases used throughout the existing code.
+_V231_APP_VERSION = APP_VERSION
+_V231_SIMULATION_MODE = SIMULATION_MODE
+
+# Mutable runtime state.  Keep initialization centralized.
+
+def _runtime_current_version() -> str:
+    """Return the single source of truth for the current app version."""
+    return APP_VERSION
+
+def _runtime_clear_prediction_caches() -> None:
+    """Clear model/calibration caches after DB-changing maintenance."""
+    for cache in (
+        _V248_WALL_CALIBRATION_CACHE,
+        _V251_LAP_ALIGNMENT_CACHE,
+        _V252_LAP_RESIDUAL_CACHE,
+        _V256_ACTUAL_LAP_CACHE,
+        _V254_PLAYER_LAP_CACHE,
+        _V258_PLAYER_ACTUAL_CACHE,
+        _V250_FLOW_CALIBRATION_CACHE,
+        _V263_SCENARIO_PRIOR_CACHE,
+        _V264_SCENARIO_FEEDBACK_CACHE,
+    ):
+        try:
+            cache.clear()
+        except Exception:
+            pass
+    try:
+        _V256_SETTINGS_SYNC_CACHE.clear()
+    except Exception:
+        pass
+
+def _runtime_exception_text(exc: BaseException) -> str:
+    """Compact, consistent error text for Streamlit maintenance actions."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Ver266: 基礎予測 誤差解析モード
+# 目的:
+#   - 実結果があるレースについて、予測競走Tと実競走Tのズレを可視化
+#   - ST / ハンデ / 試走 / 熱走路 / 開催場 / 選手別の偏りを候補原因として集計
+#   - 予測ロジック自体はこの画面では変更しない
+# ---------------------------------------------------------------------------
+
+def _v266_num(v):
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+def _v266_guess_col(cols, *names):
+    low = {str(c).strip().lower(): c for c in cols}
+    for n in names:
+        k = str(n).strip().lower()
+        if k in low:
+            return low[k]
+    return None
+
+def _v266_table_columns(conn, table):
+    try:
+        return [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+    except Exception:
+        return []
+
+def _v266_find_table(conn, preferred):
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    for t in preferred:
+        if t in tables:
+            return t
+    return None
+
+def _v266_load_error_rows(db_path, limit_rows=5000):
+    """
+    DBスキーマ差を吸収しながら、予測履歴と実結果を同一レース・車番で結合する。
+    完全一致できないDBでは空DataFrameを返し、UI側で理由を表示する。
+    """
+    import pandas as pd
+    if not db_path or not os.path.exists(str(db_path)):
+        return pd.DataFrame(), "DBファイルが見つかりません"
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        pred_t = _v266_find_table(conn, [
+            "v231_prediction_history", "prediction_history", "predictions"
+        ])
+        result_t = _v266_find_table(conn, [
+            "result_entries", "race_history", "results"
+        ])
+        if not pred_t or not result_t:
+            return pd.DataFrame(), f"必要テーブル不足: prediction={pred_t}, result={result_t}"
+
+        pcols = _v266_table_columns(conn, pred_t)
+        rcols = _v266_table_columns(conn, result_t)
+
+        # Prediction-history schemas vary. Prefer JSON/payload rows if present.
+        p_date = _v266_guess_col(pcols, "race_date", "date", "開催日", "日付")
+        p_venue = _v266_guess_col(pcols, "venue", "track", "開催場", "場")
+        p_race = _v266_guess_col(pcols, "race_no", "race", "r", "レース")
+        p_ver = _v266_guess_col(pcols, "version", "app_version")
+        p_payload = _v266_guess_col(pcols, "payload_json", "prediction_json", "data_json", "payload", "json_data")
+
+        r_date = _v266_guess_col(rcols, "race_date", "date", "開催日", "日付")
+        r_venue = _v266_guess_col(rcols, "venue", "track", "開催場", "場")
+        r_race = _v266_guess_col(rcols, "race_no", "race", "r", "レース")
+        r_car = _v266_guess_col(rcols, "car_no", "車番", "number")
+        r_name = _v266_guess_col(rcols, "player_name", "選手名", "name")
+        r_trial = _v266_guess_col(rcols, "trial_time", "試走t", "試走T", "試走")
+        r_race_time = _v266_guess_col(rcols, "race_time", "競走t", "競走T", "競走")
+        r_st = _v266_guess_col(rcols, "st", "ST", "start_time")
+        r_handicap = _v266_guess_col(rcols, "handicap", "ハンデ")
+        r_track_temp = _v266_guess_col(rcols, "track_temp", "走路温度")
+        r_weather = _v266_guess_col(rcols, "weather", "天候")
+        r_condition = _v266_guess_col(rcols, "track_condition", "走路", "走路状況")
+
+        if not (r_date and r_venue and r_race and r_car and r_race_time):
+            return pd.DataFrame(), "実結果側の結合キー/競走Tカラムを特定できません"
+
+        # Read result rows.
+        rsel = [r_date, r_venue, r_race, r_car]
+        for c in [r_name, r_trial, r_race_time, r_st, r_handicap, r_track_temp, r_weather, r_condition]:
+            if c and c not in rsel:
+                rsel.append(c)
+        rq = "SELECT " + ",".join([f'"{c}"' for c in rsel]) + f' FROM "{result_t}" LIMIT {int(limit_rows)}'
+        rdf = pd.read_sql_query(rq, conn)
+
+        # Normalize result column names.
+        rename = {r_date:"date", r_venue:"venue", r_race:"race_no", r_car:"car_no", r_race_time:"actual_race_time"}
+        if r_name: rename[r_name]="player_name"
+        if r_trial: rename[r_trial]="trial_time"
+        if r_st: rename[r_st]="st"
+        if r_handicap: rename[r_handicap]="handicap"
+        if r_track_temp: rename[r_track_temp]="track_temp"
+        if r_weather: rename[r_weather]="weather"
+        if r_condition: rename[r_condition]="track_condition"
+        rdf = rdf.rename(columns=rename)
+
+        # Prediction rows: payload JSON is the most common durable representation.
+        if not (p_date and p_venue and p_race):
+            return pd.DataFrame(), "予測履歴側の開催日/開催場/Rを特定できません"
+
+        psel = [p_date, p_venue, p_race]
+        if p_ver: psel.append(p_ver)
+        if p_payload: psel.append(p_payload)
+        pq = "SELECT " + ",".join([f'"{c}"' for c in psel]) + f' FROM "{pred_t}" ORDER BY rowid DESC LIMIT 1000'
+        pdf = pd.read_sql_query(pq, conn)
+        prename = {p_date:"date", p_venue:"venue", p_race:"race_no"}
+        if p_ver: prename[p_ver]="version"
+        if p_payload: prename[p_payload]="payload"
+        pdf = pdf.rename(columns=prename)
+
+        exploded = []
+        if "payload" in pdf.columns:
+            for _, row in pdf.iterrows():
+                raw = row.get("payload")
+                try:
+                    obj = json.loads(raw) if isinstance(raw, str) else raw
+                except Exception:
+                    continue
+                # Search likely lists containing per-car predictions.
+                candidate_lists = []
+                if isinstance(obj, list):
+                    candidate_lists.append(obj)
+                elif isinstance(obj, dict):
+                    for k in ["players","entries","rows","prediction_rows","result_rows","df","data"]:
+                        v = obj.get(k)
+                        if isinstance(v, list):
+                            candidate_lists.append(v)
+                for items in candidate_lists:
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        car = it.get("車番", it.get("car_no", it.get("number")))
+                        pred = None
+                        for k in ["予測競走T","予測競走タイム","pred_race_time","predicted_race_time",
+                                  "Ver265補正後予測競走T","Ver266補正後予測競走T"]:
+                            if k in it and _v266_num(it.get(k)) is not None:
+                                pred = _v266_num(it.get(k))
+                                break
+                        if car is None or pred is None:
+                            continue
+                        exploded.append({
+                            "date": row.get("date"),
+                            "venue": row.get("venue"),
+                            "race_no": row.get("race_no"),
+                            "version": row.get("version", ""),
+                            "car_no": car,
+                            "pred_race_time": pred,
+                        })
+
+        if not exploded:
+            return pd.DataFrame(), "保存済み予測から車番別の予測競走Tを抽出できません"
+
+        epdf = pd.DataFrame(exploded)
+        for df in [epdf, rdf]:
+            df["date"] = df["date"].astype(str)
+            df["venue"] = df["venue"].astype(str)
+            df["race_no"] = df["race_no"].astype(str).str.replace("R","", regex=False)
+            df["car_no"] = df["car_no"].astype(str).str.replace(".0","", regex=False)
+
+        m = epdf.merge(rdf, on=["date","venue","race_no","car_no"], how="inner")
+        if m.empty:
+            return m, "予測履歴と実結果を同一レース・車番で結合できません"
+
+        m["pred_race_time"] = pd.to_numeric(m["pred_race_time"], errors="coerce")
+        m["actual_race_time"] = pd.to_numeric(m["actual_race_time"], errors="coerce")
+        m = m.dropna(subset=["pred_race_time","actual_race_time"])
+        m["error_sec"] = m["actual_race_time"] - m["pred_race_time"]
+        m["abs_error_sec"] = m["error_sec"].abs()
+        return m, ""
+    finally:
+        conn.close()
+
+def _v266_render_error_analysis(db_path):
+    import pandas as pd
+    st.subheader("🔬 Ver266 基礎予測・誤差解析")
+    st.caption("最終着順ではなく、予測競走Tと実競走Tのズレを分解して確認します。ここでは補正値を自動変更しません。")
+    rows, err = _v266_load_error_rows(db_path)
+    if err:
+        st.info(f"誤差解析データ未準備: {err}")
+        return
+    if rows.empty:
+        st.info("比較できる予測×実結果がありません。")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("比較走数", f"{len(rows):,}")
+    c2.metric("平均絶対誤差", f"{rows['abs_error_sec'].mean():.4f}秒")
+    c3.metric("平均誤差", f"{rows['error_sec'].mean():+.4f}秒")
+    c4.metric("90%誤差", f"{rows['abs_error_sec'].quantile(0.90):.4f}秒")
+
+    group_cols = []
+    for c in ["venue","player_name","handicap","track_condition"]:
+        if c in rows.columns:
+            group_cols.append(c)
+
+    if "venue" in rows.columns:
+        g = rows.groupby("venue").agg(
+            走数=("error_sec","size"),
+            平均誤差秒=("error_sec","mean"),
+            平均絶対誤差秒=("abs_error_sec","mean"),
+        ).reset_index().sort_values("平均絶対誤差秒", ascending=False)
+        st.markdown("**開催場別**")
+        st.dataframe(g, use_container_width=True, hide_index=True)
+
+    if "player_name" in rows.columns:
+        pg = rows.groupby("player_name").agg(
+            走数=("error_sec","size"),
+            平均誤差秒=("error_sec","mean"),
+            平均絶対誤差秒=("abs_error_sec","mean"),
+        ).reset_index()
+        pg = pg[pg["走数"] >= 3].sort_values("平均絶対誤差秒", ascending=False).head(50)
+        if not pg.empty:
+            st.markdown("**選手別 誤差大きめ（3走以上）**")
+            st.dataframe(pg, use_container_width=True, hide_index=True)
+
+    # Candidate-factor correlations are diagnostic only.
+    factors = []
+    for col, label in [("trial_time","試走T"),("st","ST"),("handicap","ハンデ"),("track_temp","走路温度")]:
+        if col in rows.columns:
+            x = pd.to_numeric(rows[col], errors="coerce")
+            y = pd.to_numeric(rows["error_sec"], errors="coerce")
+            valid = x.notna() & y.notna()
+            if valid.sum() >= 10 and x[valid].nunique() > 1:
+                factors.append({
+                    "候補要因": label,
+                    "比較数": int(valid.sum()),
+                    "誤差との相関": float(x[valid].corr(y[valid])),
+                })
+    if factors:
+        fdf = pd.DataFrame(factors)
+        fdf["絶対相関"] = fdf["誤差との相関"].abs()
+        fdf = fdf.sort_values("絶対相関", ascending=False).drop(columns=["絶対相関"])
+        st.markdown("**誤差原因候補（相関は因果ではありません）**")
+        st.dataframe(fdf, use_container_width=True, hide_index=True)
+
+    st.markdown("**誤差が大きかった走り TOP30**")
+    show_cols = [c for c in [
+        "date","venue","race_no","car_no","player_name","version",
+        "pred_race_time","actual_race_time","error_sec","abs_error_sec",
+        "trial_time","st","handicap","track_temp","track_condition"
+    ] if c in rows.columns]
+    st.dataframe(rows.sort_values("abs_error_sec", ascending=False)[show_cols].head(30),
+                 use_container_width=True, hide_index=True)
+
+
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
+# Ver266 refactor: runtime-state-centralized
 
 
 # Ver228: DB保存時刻・画面表示時刻を日本時間へ統一。
@@ -2679,8 +2981,6 @@ def _v222_load_prediction_restore(db_path: str, race_key: str) -> tuple[dict, st
 # Ver235: 新旧の保存済み予測を常に統合表示し、旧予測が一覧から消えないよう修正。
 # Ver234: 回収率プランにも現在版を保存し、6周展開の先頭残り過多を調整。
 # Ver231: 予測をレース単位で上書きせず、バージョン別履歴として保存する。
-_V231_APP_VERSION = "Ver265"
-_V231_SIMULATION_MODE = "6周内蔵型壁展開"
 
 def _v231_settings_hash(trials: int, seed: int, excluded: list[int] | None = None) -> str:
     payload = {
@@ -10473,3 +10773,11 @@ if selected_main_page == "🗃️ 登録情報確認":
 
 
 # Ver245: 6周展開診断表示と、同一1着・同一3車の2着3着入替ペアを条件付きで保護。
+
+
+# Ver266 diagnostic panel
+try:
+    with st.expander("🔬 Ver266 基礎予測・誤差解析", expanded=False):
+        _v266_render_error_analysis(db_path)
+except Exception as _v266_exc:
+    st.warning("Ver266誤差解析の表示に失敗しました: " + _runtime_exception_text(_v266_exc))
