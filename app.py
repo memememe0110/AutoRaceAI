@@ -1780,6 +1780,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
     # 履歴だけ存在して周回保存が欠けている場合は、一括再シミュレーションで自動修復する。
     current_keys=set()
     current_complete_keys=set()
+    current_audit_complete_keys=set()
     try:
         _v231_ensure_prediction_history_table(db_path)
         with sqlite3.connect(str(db_path)) as con:
@@ -1802,11 +1803,31 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                     if cd and cvn and cr:
                         n=int(con.execute("SELECT COUNT(*) FROM v252_lap_prediction_snapshots WHERE race_date=? AND venue=? AND race_no=? AND app_version=?",(cd,cvn,cr,current_ver)).fetchone()[0] or 0)
                         if n>=6:
-                            current_complete_keys.add(str(ch.get('race_key') or ''))
+                            _rk273=str(ch.get('race_key') or '')
+                            current_complete_keys.add(_rk273)
+
+                            # Ver273監査版:
+                            # 6周スナップショットが揃っていても、詳細監査列が履歴DataFrameに無ければ
+                            # 「現行版済み」としてスキップせず、再シミュレーションして監査列を補完する。
+                            _df273=(cv or {}).get('df')
+                            _audit_required273=[
+                                "Ver273_5周目ループ到達",
+                                "Ver273_5周目関数呼出",
+                                "Ver273_5周目再加速発動数",
+                                "Ver273_6周目ループ到達",
+                                "Ver273_6周目関数呼出",
+                                "Ver273_6周目再加速発動数",
+                            ]
+                            if (
+                                _df273 is not None
+                                and hasattr(_df273,'columns')
+                                and all(c in _df273.columns for c in _audit_required273)
+                            ):
+                                current_audit_complete_keys.add(_rk273)
                 except Exception:
                     pass
     except Exception:
-        current_keys=set(); current_complete_keys=set()
+        current_keys=set(); current_complete_keys=set(); current_audit_complete_keys=set()
     for idx,h in enumerate(unique,1):
         out['checked']+=1
         label=str(h.get('race_label') or h.get('race_key') or f'履歴{idx}')
@@ -1814,7 +1835,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             if callable(progress_cb):
                 progress_cb(idx-1,total,label)
             race_key0=str(h.get('race_key') or '').strip()
-            if race_key0 in current_complete_keys:
+            if race_key0 in current_complete_keys and race_key0 in current_audit_complete_keys:
                 out['skipped_current']+=1
                 continue
             view, raw_text, venue_override, hm=_v231_load_prediction_history(db_path,int(h.get('history_id') or 0))
@@ -1906,7 +1927,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
     else:
         out["roi_return_rate"]=None
     out['message']=(f"確認{out['checked']}レース / {current_ver}再シミュレーション{out['rerun']} / "
-                    f"現行版済み{out['skipped_current']} / 入力材料なし{out['no_text']} / エラー{len(out['errors'])}")
+                    f"監査列まで保存済み{out['skipped_current']} / 入力材料なし{out['no_text']} / エラー{len(out['errors'])}")
     return out
 
 def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date: str) -> dict:
