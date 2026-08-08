@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver273"
+APP_VERSION = "Ver274"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -3527,42 +3527,118 @@ def _v271_mid_lap_pass_factor(
 
 
 
-def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_trial_median, residual_adjust_sec, residual_samples):
-    """5～6周目だけ、追える根拠が複数ある後方車へ小さな再加速を許す。"""
+def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_trial_median, residual_adjust_sec, residual_samples, return_diag=False):
+    """Ver274: Ver273係数を維持しつつ、内部判定理由を返せる監査対応版。"""
     try:
-        lap=int(lap_no); h=float(handicap_m or 0); gate=float(chase_gate or 1)
-        adj=float(residual_adjust_sec or 0); sn=int(residual_samples or 0)
+        lap_i = int(lap)
     except Exception:
-        return 1.0
-    if lap not in (5,6) or h < 30:
-        return 1.0
-    score=0
-    if sn>=5 and adj<=-0.012: score+=2
-    elif sn>=5 and adj<=-0.006: score+=1
-    if gate>=0.90: score+=2
-    elif gate>=0.80: score+=1
+        lap_i = -1
     try:
-        tt=float(trial_time); med=float(field_trial_median)
-        if np.isfinite(tt) and np.isfinite(med):
-            adv=med-tt
-            if adv>=0.035: score+=1
-            elif adv<=-0.040: score-=1
+        h = float(handicap_m or 0)
     except Exception:
-        pass
-    threshold=4 if h>=60 else 3
-    if score<threshold:
-        return 1.0
+        h = 0.0
+    try:
+        gate = float(chase_gate if chase_gate is not None else 0.75)
+    except Exception:
+        gate = 0.75
+    try:
+        tadj = float(time_adjust or 0.0)
+    except Exception:
+        tadj = 0.0
+    try:
+        samples = int(time_samples or 0)
+    except Exception:
+        samples = 0
+    try:
+        trial = float(trial_time) if trial_time is not None else None
+    except Exception:
+        trial = None
+    try:
+        tmed = float(trial_median) if trial_median is not None else None
+    except Exception:
+        tmed = None
 
-    # Ver273: 5周目は「一度並びが固まりやすい」前提で採用条件を1段厳しくする。
-    # 6周目は従来条件を維持。
-    if lap==5 and score < threshold+1:
-        return 1.0
-    # Ver273:
-    # 5周目はVer272で悪化が見えたため、再加速をかなり弱める。
-    # 6周目はVer272で改善していたため、そのまま維持する。
-    if score>=threshold+2:
-        return 1.08 if lap==6 else 1.025
-    return 1.05 if lap==6 else 1.015
+    score = 0
+    reasons = []
+
+    if lap_i not in (5, 6):
+        diag = {"eligible": False, "reason": "lap_not_5_6", "score": 0, "threshold": None, "factor": 1.0}
+        return (1.0, diag) if return_diag else 1.0
+
+    if h < 30.0:
+        diag = {"eligible": False, "reason": "handicap_lt_30", "score": 0, "threshold": None, "factor": 1.0}
+        return (1.0, diag) if return_diag else 1.0
+
+    if samples >= 5:
+        if tadj <= -0.030:
+            score += 2
+            reasons.append("residual_strong")
+        elif tadj <= -0.015:
+            score += 1
+            reasons.append("residual_mild")
+    else:
+        reasons.append("residual_samples_lt5")
+
+    if gate >= 0.90:
+        score += 2
+        reasons.append("gate_ge_090")
+    elif gate >= 0.80:
+        score += 1
+        reasons.append("gate_ge_080")
+    else:
+        reasons.append("gate_lt_080")
+
+    if trial is not None and tmed is not None:
+        if trial <= tmed - 0.035:
+            score += 1
+            reasons.append("trial_fast")
+    else:
+        reasons.append("trial_missing")
+
+    base_threshold = 4 if h >= 60.0 else 3
+    required = base_threshold + (1 if lap_i == 5 else 0)
+
+    if score < required:
+        diag = {
+            "eligible": True,
+            "reason": "score_below_required",
+            "score": score,
+            "threshold": required,
+            "base_threshold": base_threshold,
+            "factor": 1.0,
+            "reasons": reasons,
+            "gate": gate,
+            "samples": samples,
+            "time_adjust": tadj,
+            "trial": trial,
+            "trial_median": tmed,
+            "handicap": h,
+            "lap": lap_i,
+        }
+        return (1.0, diag) if return_diag else 1.0
+
+    if score >= base_threshold + 2:
+        factor = 1.08 if lap_i == 6 else 1.025
+    else:
+        factor = 1.05 if lap_i == 6 else 1.015
+
+    diag = {
+        "eligible": True,
+        "reason": "triggered",
+        "score": score,
+        "threshold": required,
+        "base_threshold": base_threshold,
+        "factor": factor,
+        "reasons": reasons,
+        "gate": gate,
+        "samples": samples,
+        "time_adjust": tadj,
+        "trial": trial,
+        "trial_median": tmed,
+        "handicap": h,
+        "lap": lap_i,
+    }
+    return (factor, diag) if return_diag else factor
 
 
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
@@ -3667,9 +3743,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     chase_reason_v270={}
     late_release_audit_v273={
         5: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
-            "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0},
+            "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
+            "score_below_required":0,"residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0},
         6: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
-            "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0},
+            "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
+            "score_below_required":0,"residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0},
     }
     try:
         _trial_vals_v270 = [
@@ -3853,7 +3931,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 # Ver272: Ver271の3～4周目補正を実際の追い抜き確率へ接続。
                 try:
                     _mid_factor272,_=_v271_mid_lap_pass_factor(
-                        lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,1.0),
+                        lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,0.75),
                         trial_map.get(chaser), _trial_median_v270)
                     p=float(np.clip(p*_mid_factor272,0.035,0.88))
                 except Exception:
@@ -3866,20 +3944,26 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                             late_release_audit_v273[_lap_call273]["function_called"]+=1
                     except Exception:
                         pass
-                    _late_factor272=_v272_late_chase_release(
-                        lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,1.0),
+                    _late_factor272,_late_diag274=_v272_late_chase_release(
+                        lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,0.75),
                         trial_map.get(chaser), _trial_median_v270,
-                        time_adjust_v265.get(chaser,0.0), time_samples_v265.get(chaser,0))
-                    p=float(np.clip(p*_late_factor272,0.035,0.88))
+                        time_adjust_v265.get(chaser,0.0), time_samples_v265.get(chaser,0), return_diag=True)
                     try:
-                        _lap_audit273=int(lap)
-                        if _lap_audit273 in (5,6) and float(handicap.get(chaser,0) or 0)>=30.0:
-                            late_release_audit_v273[_lap_audit273]["eligible"]+=1
-                            if float(_late_factor272)>1.0000001:
-                                late_release_audit_v273[_lap_audit273]["triggered"]+=1
-                                late_release_audit_v273[_lap_audit273]["factor_sum"]+=float(_late_factor272)
+                        _lap_diag274=int(lap)
+                        if _lap_diag274 in (5,6):
+                            if bool(_late_diag274.get('eligible')):
+                                late_release_audit_v273[_lap_diag274]['eligible']+=1
+                            if str(_late_diag274.get('reason') or '')=='triggered':
+                                late_release_audit_v273[_lap_diag274]['triggered']+=1
+                                late_release_audit_v273[_lap_diag274]['factor_sum']+=float(_late_factor272)
+                            elif str(_late_diag274.get('reason') or '')=='score_below_required':
+                                late_release_audit_v273[_lap_diag274]['score_below_required']+=1
+                            for _rr274 in (_late_diag274.get('reasons') or []):
+                                if _rr274 in ('residual_samples_lt5','gate_lt_080','trial_missing'):
+                                    late_release_audit_v273[_lap_diag274][_rr274]+=1
                     except Exception:
                         pass
+                    p=float(np.clip(p*_late_factor272,0.035,0.88))
                 except Exception:
                     pass
                 # 差が開きすぎていればまず追いつく必要がある。
@@ -4023,6 +4107,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["Ver273_6周目追走車判定"]=int(late_release_audit_v273[6]["chaser_seen"])
     out["Ver273_6周目30m以上判定"]=int(late_release_audit_v273[6]["rear30_seen"])
     out["Ver273_6周目関数呼出"]=int(late_release_audit_v273[6]["function_called"])
+    out["Ver273_5周目スコア不足"]=int(late_release_audit_v273[5]["score_below_required"])
+    out["Ver273_5周目残差不足"]=int(late_release_audit_v273[5]["residual_samples_lt5"])
+    out["Ver273_5周目ゲート不足"]=int(late_release_audit_v273[5]["gate_lt_080"])
+    out["Ver273_5周目試走不足"]=int(late_release_audit_v273[5]["trial_missing"])
+    out["Ver273_6周目スコア不足"]=int(late_release_audit_v273[6]["score_below_required"])
+    out["Ver273_6周目残差不足"]=int(late_release_audit_v273[6]["residual_samples_lt5"])
+    out["Ver273_6周目ゲート不足"]=int(late_release_audit_v273[6]["gate_lt_080"])
+    out["Ver273_6周目試走不足"]=int(late_release_audit_v273[6]["trial_missing"])
     if "予測競走T" in out.columns:
         out["Ver265補正後予測競走T"]=pd.to_numeric(out["予測競走T"],errors="coerce") + out["Ver265タイム残差補正秒"]
         out["Ver268補正後予測競走T"]=(
@@ -12153,7 +12245,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
 
 
-                        with st.expander("🧪 Ver273 終盤再加速・詳細経路ログ", expanded=False):
+                        with st.expander("🧪 Ver274 終盤再加速・詳細経路ログ", expanded=False):
                             st.caption(
                                 "5・6周目について、周回ループ → ペア判定 → chaser → 30m以上 → "
                                 "再加速関数呼出 → 対象 → 発動、のどこで止まっているか確認します。"
@@ -12161,7 +12253,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                             try:
                                 _hist273 = [
                                     h for h in _v231_list_prediction_histories(engine.DB_PATH, 500)
-                                    if str(h.get("app_version") or "") == "Ver273"
+                                    if str(h.get("app_version") or "") == _V231_APP_VERSION
                                 ]
                                 _rows273 = []
                                 for _h273 in _hist273:
@@ -12200,6 +12292,14 @@ if selected_main_page == "🗃️ 登録情報確認":
                                             "6周関数": int(_f.get("Ver273_6周目関数呼出",0) or 0),
                                             "6周対象": int(_f.get("Ver273_6周目再加速対象数",0) or 0),
                                             "6周発動": int(_f.get("Ver273_6周目再加速発動数",0) or 0),
+                                            "5周スコア不足": int(_f.get("Ver273_5周目スコア不足",0) or 0),
+                                            "5周残差不足": int(_f.get("Ver273_5周目残差不足",0) or 0),
+                                            "5周ゲート不足": int(_f.get("Ver273_5周目ゲート不足",0) or 0),
+                                            "5周試走不足": int(_f.get("Ver273_5周目試走不足",0) or 0),
+                                            "6周スコア不足": int(_f.get("Ver273_6周目スコア不足",0) or 0),
+                                            "6周残差不足": int(_f.get("Ver273_6周目残差不足",0) or 0),
+                                            "6周ゲート不足": int(_f.get("Ver273_6周目ゲート不足",0) or 0),
+                                            "6周試走不足": int(_f.get("Ver273_6周目試走不足",0) or 0),
                                         })
                                     except Exception:
                                         continue
