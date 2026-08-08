@@ -4290,10 +4290,19 @@ def _v276_mark_retrial_from_prediction_text(entries, raw_text):
         out = entries.copy()
         flags = {}
         text = str(raw_text or "")
-        # 車番行から次の車番行までを選手ブロックとして確認。
-        # 公式コピペでは「1\t▲九門...」だけでなく「1 ▲九門...」のように
-        # 車番の直後へ選手名が続くことがあるため、タブ限定にしない。
-        starts = list(re.finditer(r"(?m)^\s*([1-8])(?=\s+\S)", text))
+        # 本物の選手見出し行だけを起点にブロック化する。
+        # 「2\t着順 2-1-0-15」のような車級/着順行を車番見出しと誤認しないよう、
+        # 行内に所属場の括弧表記があることを必須にする。
+        header_pat = re.compile(
+            r"(?m)^\s*([1-8])[\t \u3000]+[^\r\n]*\((?:川口|伊勢崎|浜松|山陽|飯塚)\)[^\r\n]*$"
+        )
+        starts = list(header_pat.finditer(text))
+
+        # まれに所属場表記が欠けた貼り付けでも判定できるよう、
+        # パーサーで得た車番と選手名を使って見出しを補完する。
+        if not starts:
+            starts = list(re.finditer(r"(?m)^\s*([1-8])[\t \u3000]+[^\r\n]+$", text))
+
         for i, m in enumerate(starts):
             car = int(m.group(1))
             end = starts[i + 1].start() if i + 1 < len(starts) else len(text)
@@ -4304,6 +4313,14 @@ def _v276_mark_retrial_from_prediction_text(entries, raw_text):
                 block, re.I
             ))
             flags[car] = is_retrial
+
+        # 念のため、原文に再試走表記があるのに上で紐付かなかった場合は、
+        # その位置より直前にある本物の選手見出しへ紐付ける。
+        if re.search(r"(?:再試|再)\s*[3-9]\.\d{2,3}", text) and not any(flags.values()):
+            for rm in re.finditer(r"(?:再試|再)\s*[3-9]\.\d{2,3}", text):
+                prev = [hm for hm in header_pat.finditer(text, 0, rm.start())]
+                if prev:
+                    flags[int(prev[-1].group(1))] = True
         car_col = next((c for c in ("車番", "car_no", "car") if c in out.columns), None)
         if car_col is None:
             return out
