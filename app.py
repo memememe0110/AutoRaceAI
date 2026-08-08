@@ -111,6 +111,115 @@ def _v266_find_table(conn, preferred):
             return t
     return None
 
+
+def _v266_repair_missing_result_player_names(db_path: str) -> dict:
+    """
+    result_entries.player_name が NULL/None/空文字の行を、
+    v238_result_raw_archive の公式結果テキストから race_key+car_no で補完する。
+    欠車/欠責等でも選手名だけは補完し、競走T=0などの結果値は変更しない。
+    """
+    out = {"checked": 0, "repaired": 0, "unresolved": 0, "errors": []}
+    if not db_path or not os.path.exists(str(db_path)):
+        return out
+
+    def _norm_name(s):
+        s = str(s or "")
+        s = re.sub(r"[　\s]+", " ", s).strip()
+        return s
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT re.race_key, re.car_no, re.player_name, a.raw_result_text
+              FROM result_entries re
+              LEFT JOIN v238_result_raw_archive a ON a.race_key=re.race_key
+             WHERE re.player_name IS NULL
+                OR TRIM(CAST(re.player_name AS TEXT))=''
+                OR LOWER(TRIM(CAST(re.player_name AS TEXT)))='none'
+        """).fetchall()
+
+        for row in rows:
+            out["checked"] += 1
+            try:
+                raw = str(row["raw_result_text"] or "")
+                car_no = int(row["car_no"])
+                if not raw:
+                    out["unresolved"] += 1
+                    continue
+
+                # Official result block:
+                # <finish>\t<car_no>\n<player name>\n<LG/handicap/...>
+                # finish can also be '-' for scratches.
+                pat = re.compile(
+                    rf"(?m)^(?:\d+|-)\s*\t\s*{car_no}\s*$\s*\n([^\n]+)",
+                    re.MULTILINE,
+                )
+                m = pat.search(raw)
+                if not m:
+                    # More tolerant fallback around the car number.
+                    pat2 = re.compile(
+                        rf"(?m)^(?:\d+|-)\s+{car_no}\s*$\s*\n([^\n]+)",
+                        re.MULTILINE,
+                    )
+                    m = pat2.search(raw)
+
+                name = _norm_name(m.group(1)) if m else ""
+                if not name or name.lower() == "none":
+                    out["unresolved"] += 1
+                    continue
+
+                con.execute("""
+                    UPDATE result_entries
+                       SET player_name=?
+                     WHERE race_key=? AND car_no=?
+                       AND (
+                            player_name IS NULL
+                         OR TRIM(CAST(player_name AS TEXT))=''
+                         OR LOWER(TRIM(CAST(player_name AS TEXT)))='none'
+                       )
+                """, (name, str(row["race_key"]), car_no))
+                out["repaired"] += 1
+            except Exception as exc:
+                out["errors"].append(
+                    f"{row['race_key']} {row['car_no']}号車: {type(exc).__name__}: {exc}"
+                )
+        con.commit()
+    return out
+
+
+def _v266_coalesce_player_name_columns(df):
+    """Merge後の player_name を予測保存値→実結果値の順で補完する。"""
+    if df is None or getattr(df, "empty", True):
+        return df
+    import pandas as pd
+    candidates = [
+        c for c in ("player_name", "player_name_pred", "player_name_x", "player_name_y")
+        if c in df.columns
+    ]
+    if not candidates:
+        return df
+
+    def valid(v):
+        if pd.isna(v):
+            return False
+        s = str(v).strip()
+        return bool(s and s.lower() != "none")
+
+    vals = []
+    # Prefer the prediction snapshot's saved name when available, then actual result.
+    preferred = [c for c in ("player_name_pred", "player_name_x", "player_name", "player_name_y") if c in df.columns]
+    for _, row in df.iterrows():
+        chosen = ""
+        for c in preferred:
+            v = row.get(c)
+            if valid(v):
+                chosen = str(v).strip()
+                break
+        vals.append(chosen if chosen else None)
+    df["player_name"] = vals
+    return df
+
+
 def _v266_load_error_rows(db_path, limit_rows=20000):
     """
     AutoRaceAIの実DB構造に合わせて、保存済み予測と実結果を結合する。
@@ -187,6 +296,11 @@ def _v266_load_error_rows(db_path, limit_rows=20000):
               FROM result_races rr
               JOIN result_entries re ON re.race_key = rr.race_key
              WHERE re.race_time IS NOT NULL
+               AND CAST(re.race_time AS REAL) BETWEEN 3.20 AND 4.50
+               AND COALESCE(re.result_status, '通常') NOT IN (
+                   '欠車','出走取消','発走除外','競走除外',
+                   '落車','競走中止','失格','反則','反妨','周誤','周回誤認'
+               )
              LIMIT {int(limit_rows)}
         """
         rdf = pd.read_sql_query(result_sql, con)
@@ -209,6 +323,7 @@ def _v266_load_error_rows(db_path, limit_rows=20000):
             rdf2["car_no"] = rdf2["car_no"].astype(str).str.replace(".0","",regex=False).str.strip()
             m = sdf.merge(rdf2, on=["race_key","car_no"], how="inner", suffixes=("_pred",""))
             if not m.empty:
+                m = _v266_coalesce_player_name_columns(m)
                 m["pred_race_time"] = pd.to_numeric(m["pred_race_time"], errors="coerce")
                 m["actual_race_time"] = pd.to_numeric(m["actual_race_time"], errors="coerce")
                 m = m.dropna(subset=["pred_race_time","actual_race_time"])
@@ -388,6 +503,7 @@ def _v266_load_error_rows(db_path, limit_rows=20000):
         if m.empty:
             return m, "予測履歴と実結果を同一レース・車番で結合できません"
 
+        m = _v266_coalesce_player_name_columns(m)
         m["pred_race_time"] = pd.to_numeric(m["pred_race_time"], errors="coerce")
         m["actual_race_time"] = pd.to_numeric(m["actual_race_time"], errors="coerce")
         m = m.dropna(subset=["pred_race_time","actual_race_time"])
@@ -406,7 +522,7 @@ def _v266_load_error_rows(db_path, limit_rows=20000):
 def _v266_render_error_analysis(db_path):
     import pandas as pd
     st.subheader("🔬 Ver266 基礎予測・誤差解析")
-    st.caption("最終着順ではなく、予測競走Tと実競走Tのズレを分解して確認します。ここでは補正値を自動変更しません。")
+    st.caption("最終着順ではなく、予測競走Tと実競走Tのズレを分解して確認します。欠車・取消・落車・中止・失格・周誤などの異常結果は分析対象から除外します。ここでは補正値を自動変更しません。")
     rows, err = _v266_load_error_rows(db_path)
     if err:
         st.info(f"誤差解析データ未準備: {err}")
@@ -11140,6 +11256,34 @@ try:
                 st.warning(" / ".join(_bf["errors"][:10]))
 except Exception as _v266_snap_exc:
     st.warning("Ver266予測Tスナップショット管理エラー: " + _runtime_exception_text(_v266_snap_exc))
+
+
+# Ver266: None選手名の診断・補修
+try:
+    with st.expander("🧩 Ver266 選手名None補修", expanded=False):
+        with sqlite3.connect(str(engine.DB_PATH)) as _v266_name_con:
+            _v266_missing_names = int(_v266_name_con.execute("""
+                SELECT COUNT(*)
+                  FROM result_entries
+                 WHERE player_name IS NULL
+                    OR TRIM(CAST(player_name AS TEXT))=''
+                    OR LOWER(TRIM(CAST(player_name AS TEXT)))='none'
+            """).fetchone()[0] or 0)
+        st.metric("実結果の選手名未登録", f"{_v266_missing_names}件")
+        st.caption(
+            "公式結果の保存原文(v238_result_raw_archive)から、同じレース・車番の選手名だけを補完します。"
+            "競走Tや着順など他の結果値は変更しません。"
+        )
+        if st.button("🔧 Noneの選手名を公式結果原文から補修", key="v266_repair_none_player_names"):
+            _v266_name_result = _v266_repair_missing_result_player_names(engine.DB_PATH)
+            st.success(
+                f"確認{_v266_name_result['checked']}件 / 補修{_v266_name_result['repaired']}件 / "
+                f"未解決{_v266_name_result['unresolved']}件 / エラー{len(_v266_name_result['errors'])}件"
+            )
+            if _v266_name_result["errors"]:
+                st.warning(" / ".join(_v266_name_result["errors"][:10]))
+except Exception as _v266_name_exc:
+    st.warning("Ver266選手名補修エラー: " + _runtime_exception_text(_v266_name_exc))
 
 # Ver266 diagnostic panel
 try:
