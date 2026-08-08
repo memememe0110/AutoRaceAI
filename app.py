@@ -4291,7 +4291,9 @@ def _v276_mark_retrial_from_prediction_text(entries, raw_text):
         flags = {}
         text = str(raw_text or "")
         # 車番行から次の車番行までを選手ブロックとして確認。
-        starts = list(re.finditer(r"(?m)^\s*([1-8])\s*(?:\t|$)", text))
+        # 公式コピペでは「1\t▲九門...」だけでなく「1 ▲九門...」のように
+        # 車番の直後へ選手名が続くことがあるため、タブ限定にしない。
+        starts = list(re.finditer(r"(?m)^\s*([1-8])(?=\s+\S)", text))
         for i, m in enumerate(starts):
             car = int(m.group(1))
             end = starts[i + 1].start() if i + 1 < len(starts) else len(text)
