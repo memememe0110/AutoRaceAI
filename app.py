@@ -220,6 +220,177 @@ def _v266_coalesce_player_name_columns(df):
     return df
 
 
+def _v266_ensure_pred_time_snapshot_table(db_path: str) -> None:
+    """Ver266: 車番別の予測競走Tを履歴ID単位で永続保存する。"""
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v266_pred_time_snapshots (
+                snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                history_id INTEGER NOT NULL,
+                race_key TEXT,
+                app_version TEXT NOT NULL,
+                car_no INTEGER NOT NULL,
+                player_name TEXT,
+                predicted_race_time REAL NOT NULL,
+                source_kind TEXT NOT NULL DEFAULT 'saved_view',
+                created_at TEXT NOT NULL,
+                UNIQUE(history_id, car_no)
+            )
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_v266_pred_time_race
+            ON v266_pred_time_snapshots(race_key, app_version, car_no)
+        """)
+        con.commit()
+
+
+def _v266_extract_pred_time_rows_from_view(view: dict) -> list[dict]:
+    """保存済みprediction_viewのdfから、その時点の予測競走Tを取り出す。再計算はしない。"""
+    out = []
+    if not isinstance(view, dict):
+        return out
+    df = view.get("df")
+    if df is None:
+        return out
+    try:
+        rows = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
+    except Exception:
+        return out
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        car = row.get("車", row.get("車番", row.get("car_no")))
+        name = row.get("選手名", row.get("player_name", ""))
+        pred = None
+        # その履歴に実際に保存されている列を優先。
+        for key in (
+            "Ver266補正後予測競走T",
+            "Ver265補正後予測競走T",
+            "予測競走T",
+            "予測競走タイム",
+            "pred_race_time",
+            "predicted_race_time",
+        ):
+            if key not in row:
+                continue
+            try:
+                val = float(row.get(key))
+                if np.isfinite(val):
+                    pred = val
+                    break
+            except Exception:
+                pass
+        if car is None or pred is None:
+            continue
+        try:
+            car = int(float(car))
+        except Exception:
+            continue
+        out.append({
+            "car_no": car,
+            "player_name": str(name or ""),
+            "predicted_race_time": float(pred),
+        })
+    return out
+
+
+def _v266_save_pred_time_snapshot(
+    db_path: str,
+    history_id: int,
+    race_key: str,
+    app_version: str,
+    view: dict,
+    source_kind: str = "saved_view",
+) -> int:
+    """prediction_viewに保存されている値を、そのまま車番別スナップショットへ保存する。"""
+    if not history_id:
+        return 0
+    rows = _v266_extract_pred_time_rows_from_view(view)
+    if not rows:
+        return 0
+    _v266_ensure_pred_time_snapshot_table(db_path)
+    now = _v228_now_jst_iso()
+    saved = 0
+    with sqlite3.connect(str(db_path)) as con:
+        for row in rows:
+            con.execute("""
+                INSERT INTO v266_pred_time_snapshots
+                (history_id,race_key,app_version,car_no,player_name,predicted_race_time,source_kind,created_at)
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(history_id,car_no) DO UPDATE SET
+                    race_key=excluded.race_key,
+                    app_version=excluded.app_version,
+                    player_name=excluded.player_name,
+                    predicted_race_time=excluded.predicted_race_time,
+                    source_kind=excluded.source_kind,
+                    created_at=excluded.created_at
+            """, (
+                int(history_id), str(race_key or ""), str(app_version or ""),
+                int(row["car_no"]), str(row["player_name"]),
+                float(row["predicted_race_time"]), str(source_kind), now,
+            ))
+            saved += 1
+        con.commit()
+    return saved
+
+
+def _v266_backfill_pred_time_snapshots(db_path: str, limit: int = 500) -> dict:
+    """
+    過去のv231_prediction_history payloadを展開し、
+    当時保存されたview['df']の予測競走Tをそのまま補完する。
+    現在コードで再計算しないため、旧Verの値を偽装しない。
+    """
+    out = {"checked": 0, "histories_saved": 0, "cars_saved": 0, "already": 0, "no_time": 0, "errors": []}
+    _v231_ensure_prediction_history_table(db_path)
+    _v266_ensure_pred_time_snapshot_table(db_path)
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        histories = con.execute("""
+            SELECT history_id,race_key,app_version,payload
+            FROM v231_prediction_history
+            ORDER BY history_id DESC
+            LIMIT ?
+        """, (int(limit),)).fetchall()
+
+    for h in histories:
+        out["checked"] += 1
+        hid = int(h["history_id"])
+        try:
+            with sqlite3.connect(str(db_path)) as con:
+                existing = int(con.execute(
+                    "SELECT COUNT(*) FROM v266_pred_time_snapshots WHERE history_id=?",
+                    (hid,)
+                ).fetchone()[0] or 0)
+            if existing > 0:
+                out["already"] += 1
+                continue
+
+            view = pickle.loads(zlib.decompress(bytes(h["payload"])))
+            if not isinstance(view, dict):
+                out["no_time"] += 1
+                continue
+
+            n = _v266_save_pred_time_snapshot(
+                db_path=db_path,
+                history_id=hid,
+                race_key=str(h["race_key"] or ""),
+                app_version=str(h["app_version"] or view.get("app_version") or ""),
+                view=view,
+                source_kind="historical_saved_view",
+            )
+            if n > 0:
+                out["histories_saved"] += 1
+                out["cars_saved"] += int(n)
+            else:
+                out["no_time"] += 1
+        except Exception as exc:
+            out["errors"].append(f"履歴ID{hid}: {type(exc).__name__}: {exc}")
+    return out
+
+
+
 def _v266_load_error_rows(db_path, limit_rows=20000):
     """
     AutoRaceAIの実DB構造に合わせて、保存済み予測と実結果を結合する。
@@ -692,23 +863,31 @@ def _v266_render_error_analysis(db_path):
         )
 
 
-# Ver266: 予測競走Tスナップショット管理
-try:
-    with st.expander("💾 Ver266 予測競走Tスナップショット", expanded=False):
-        _v266_ensure_pred_time_snapshot_table(engine.DB_PATH)
-        with sqlite3.connect(str(engine.DB_PATH)) as _c:
-            _v266_snap_count = int(_c.execute("SELECT COUNT(*) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
-            _v266_hist_count = int(_c.execute("SELECT COUNT(*) FROM v231_prediction_history").fetchone()[0] or 0)
-            _v266_snap_histories = int(_c.execute("SELECT COUNT(DISTINCT history_id) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
-        a,b,c = st.columns(3)
-        a.metric("予測履歴", f"{_v266_hist_count}件")
-        b.metric("予測T保存済み履歴", f"{_v266_snap_histories}件")
-        c.metric("車番別予測T", f"{_v266_snap_count}走")
-        st.caption(
-            "過去履歴のprediction_viewに保存されているdfから、当時の予測競走Tをそのまま補完します。"
-            "現在Verでの再計算値ではありません。"
-        )
-        if st.button("🔧 過去の保存済み予測Tを一括補完", key="v266_backfill_pred_time"):
+
+# ---------------------------------------------------------------------------
+# Ver267 安定化統合
+# Streamlitのexpanderは閉じていても中のコードを毎回実行するため、
+# DB確認・補修・誤差解析はボタン押下時だけ実行する。
+# ---------------------------------------------------------------------------
+
+with st.expander("💾 Ver267 予測競走Tスナップショット", expanded=False):
+    st.caption("DBへの確認・補完はボタンを押した時だけ実行します。")
+    if st.button("🔎 予測T保存状況を確認", key="v267_check_pred_time"):
+        try:
+            _v266_ensure_pred_time_snapshot_table(engine.DB_PATH)
+            with sqlite3.connect(str(engine.DB_PATH)) as _c:
+                _h = int(_c.execute("SELECT COUNT(*) FROM v231_prediction_history").fetchone()[0] or 0)
+                _sh = int(_c.execute("SELECT COUNT(DISTINCT history_id) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
+                _sc = int(_c.execute("SELECT COUNT(*) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
+            a,b,c = st.columns(3)
+            a.metric("予測履歴", f"{_h}件")
+            b.metric("予測T保存済み履歴", f"{_sh}件")
+            c.metric("車番別予測T", f"{_sc}走")
+        except Exception as exc:
+            st.error("予測T保存状況の確認に失敗: " + _runtime_exception_text(exc))
+
+    if st.button("🔧 過去の保存済み予測Tを一括補完", key="v267_backfill_pred_time"):
+        try:
             with st.spinner("保存済み履歴から予測競走Tを補完しています..."):
                 _bf = _v266_backfill_pred_time_snapshots(engine.DB_PATH, 1000)
             st.success(
@@ -717,40 +896,57 @@ try:
             )
             if _bf["errors"]:
                 st.warning(" / ".join(_bf["errors"][:10]))
-except Exception as _v266_snap_exc:
-    st.warning("Ver266予測Tスナップショット管理エラー: " + _runtime_exception_text(_v266_snap_exc))
+        except Exception as exc:
+            st.error("予測T一括補完に失敗: " + _runtime_exception_text(exc))
 
 
-# Ver266: None選手名の診断・補修
-try:
-    with st.expander("🧩 Ver266 選手名None補修", expanded=False):
-        with sqlite3.connect(str(engine.DB_PATH)) as _v266_name_con:
-            _v266_missing_names = int(_v266_name_con.execute("""
-                SELECT COUNT(*)
-                  FROM result_entries
-                 WHERE player_name IS NULL
-                    OR TRIM(CAST(player_name AS TEXT))=''
-                    OR LOWER(TRIM(CAST(player_name AS TEXT)))='none'
-            """).fetchone()[0] or 0)
-        st.metric("実結果の選手名未登録", f"{_v266_missing_names}件")
-        st.caption(
-            "公式結果の保存原文(v238_result_raw_archive)から、同じレース・車番の選手名だけを補完します。"
-            "競走Tや着順など他の結果値は変更しません。"
-        )
-        if st.button("🔧 Noneの選手名を公式結果原文から補修", key="v266_repair_none_player_names"):
-            _v266_name_result = _v266_repair_missing_result_player_names(engine.DB_PATH)
+with st.expander("🧩 Ver267 選手名None補修", expanded=False):
+    st.caption("確認・補修はボタンを押した時だけDBへアクセスします。")
+    if st.button("🔎 None件数を確認", key="v267_check_none_names"):
+        try:
+            with sqlite3.connect(str(engine.DB_PATH)) as _c:
+                _missing = int(_c.execute("""
+                    SELECT COUNT(*)
+                      FROM result_entries
+                     WHERE player_name IS NULL
+                        OR TRIM(CAST(player_name AS TEXT))=''
+                        OR LOWER(TRIM(CAST(player_name AS TEXT)))='none'
+                """).fetchone()[0] or 0)
+            st.metric("実結果の選手名未登録", f"{_missing}件")
+        except Exception as exc:
+            st.error("None件数の確認に失敗: " + _runtime_exception_text(exc))
+
+    if st.button("🔧 Noneの選手名を公式結果原文から補修", key="v267_repair_none_player_names"):
+        try:
+            _r = _v266_repair_missing_result_player_names(engine.DB_PATH)
             st.success(
-                f"確認{_v266_name_result['checked']}件 / 補修{_v266_name_result['repaired']}件 / "
-                f"未解決{_v266_name_result['unresolved']}件 / エラー{len(_v266_name_result['errors'])}件"
+                f"確認{_r['checked']}件 / 補修{_r['repaired']}件 / "
+                f"未解決{_r['unresolved']}件 / エラー{len(_r['errors'])}件"
             )
-            if _v266_name_result["errors"]:
-                st.warning(" / ".join(_v266_name_result["errors"][:10]))
-except Exception as _v266_name_exc:
-    st.warning("Ver266選手名補修エラー: " + _runtime_exception_text(_v266_name_exc))
+            if _r["errors"]:
+                st.warning(" / ".join(_r["errors"][:10]))
+        except Exception as exc:
+            st.error("選手名補修に失敗: " + _runtime_exception_text(exc))
 
-# Ver266 diagnostic panel
-try:
-    with st.expander("🔬 Ver266 基礎予測・誤差解析", expanded=False):
-        _v266_render_error_analysis(db_path)
-except Exception as _v266_exc:
-    st.warning("Ver266誤差解析の表示に失敗しました: " + _runtime_exception_text(_v266_exc))
+
+with st.expander("🔬 Ver267 基礎予測・誤差解析", expanded=False):
+    st.caption("解析はボタンを押した時だけDBを読み込みます。")
+    if st.button("▶ 誤差解析を実行", key="v267_run_error_analysis"):
+        try:
+            _v266_render_error_analysis(engine.DB_PATH)
+        except Exception as exc:
+            st.error("誤差解析の実行に失敗: " + _runtime_exception_text(exc))
+
+    if st.button("🩺 DB簡易チェック", key="v267_db_quick_check"):
+        try:
+            with sqlite3.connect(str(engine.DB_PATH)) as _c:
+                _qc = _c.execute("PRAGMA quick_check").fetchone()
+            _msg = str(_qc[0]) if _qc else "結果なし"
+            if _msg.lower() == "ok":
+                st.success("DB quick_check: OK")
+            else:
+                st.error("DB quick_check: " + _msg)
+                st.caption("DB異常時は書き込みを止め、正常なバックアップDBへ差し替えてください。")
+        except Exception as exc:
+            st.error("DB quick_check実行失敗: " + _runtime_exception_text(exc))
+
