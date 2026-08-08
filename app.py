@@ -5129,6 +5129,13 @@ _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 # Ver217: 予測後の重いDB保存を待たず、オッズ入力を先に表示する。
 _v217_db_save_lock = threading.Lock()
+# Ver276: 通常予測と詳細DB保存の競合を防ぐ。
+# 予測を連続実行した際に詳細保存スレッドが列を作り、SQLite/CPUを奪って
+# 基礎予測が 7秒台→20秒台へ膨らむのを防止する。
+_v276_foreground_prediction_event = threading.Event()
+_v276_deferred_save_state_lock = threading.Lock()
+_v276_deferred_save_pending = None
+_v276_deferred_save_worker = None
 
 
 # Ver222: 一度実行した予測を、出走表・計算結果ごとDBへ保存して再利用する。
@@ -5770,18 +5777,50 @@ def _v233_build_result_text_from_db(db_path: str, race_key: str) -> str:
 
 
 def _v217_deferred_prediction_db_save(meta, bets, trials, df) -> None:
-    """全買い目確率・特徴量をバックグラウンド保存する。
+    """全買い目確率・特徴量をバックグラウンド保存する（Ver276競合抑制）。
 
-    予測スナップショットは呼び出し元で先に保存済み。SQLiteの同時書込を避けるため
-    この処理内は単一ロックで直列化する。
+    通常予測中はDB詳細保存を開始しない。連続予測時は保存要求を無制限に
+    スレッド化せず、単一ワーカーへ集約する。これにより古い保存待ちが
+    SQLite/CPUを占有して次の基礎予測を遅くする現象を防ぐ。
     """
-    try:
-        with _v217_db_save_lock:
-            engine.v67_save_ticket_snapshot(meta, bets, int(trials), engine.DB_PATH)
-            engine.v40_save_prediction_features(meta, df, engine.DB_PATH)
-    except Exception:
-        # 表示を止めないことを最優先。次回予測・結果分析で再保存できる。
-        return
+    global _v276_deferred_save_pending, _v276_deferred_save_worker
+    with _v276_deferred_save_state_lock:
+        _v276_deferred_save_pending = (dict(meta or {}), bets, int(trials), df.copy(deep=True))
+        if _v276_deferred_save_worker is not None and _v276_deferred_save_worker.is_alive():
+            return
+
+        def _worker():
+            global _v276_deferred_save_pending, _v276_deferred_save_worker
+            try:
+                while True:
+                    # フォアグラウンド予測が終わるまで詳細保存を開始しない。
+                    while _v276_foreground_prediction_event.is_set():
+                        time_module.sleep(0.10)
+                    with _v276_deferred_save_state_lock:
+                        job = _v276_deferred_save_pending
+                        _v276_deferred_save_pending = None
+                    if job is None:
+                        break
+                    _meta, _bets, _trials, _df = job
+                    try:
+                        with _v217_db_save_lock:
+                            # ロック取得待ちの間に次予測が始まった場合も譲る。
+                            if _v276_foreground_prediction_event.is_set():
+                                with _v276_deferred_save_state_lock:
+                                    _v276_deferred_save_pending = job
+                                continue
+                            engine.v67_save_ticket_snapshot(_meta, _bets, int(_trials), engine.DB_PATH)
+                            engine.v40_save_prediction_features(_meta, _df, engine.DB_PATH)
+                    except Exception:
+                        pass
+            finally:
+                with _v276_deferred_save_state_lock:
+                    _v276_deferred_save_worker = None
+
+        _v276_deferred_save_worker = threading.Thread(
+            target=_worker, daemon=True, name="autorace-deferred-db-save-single"
+        )
+        _v276_deferred_save_worker.start()
 
 
 # Ver164: 全開催場条件別補正と中止・全返還形式対応。
@@ -11404,9 +11443,11 @@ elif selected_main_page == "🏁 予測":
     _restored_view_for_rerun = st.session_state.get("last_prediction_view") or {}
     _is_restored_for_rerun = bool(isinstance(_restored_view_for_rerun, dict) and _restored_view_for_rerun.get("_v231_restored_only"))
     prediction_clicked = bool(_v276_run_request)
+    _v276_running_notice = None
     if prediction_clicked:
         st.session_state["v261_rerun_requested"] = bool((_v276_run_request or {}).get("rerun_requested", False))
-        st.info("⏳ 予測を実行しています。完了までこのままお待ちください。")
+        _v276_running_notice = st.empty()
+        _v276_running_notice.info("⏳ 予測を実行しています。完了までこのままお待ちください。")
     elif _is_restored_for_rerun:
         _src_ver = str(_restored_view_for_rerun.get("_v231_source_app_version") or _restored_view_for_rerun.get("app_version") or "Unknown")
         st.caption(f"復元元: {_src_ver} → 再シミュレーション保存先: {_V231_APP_VERSION}")
@@ -11439,6 +11480,7 @@ elif selected_main_page == "🏁 予測":
             if prediction_venue_override:
                 prediction_text = f"開催場: {prediction_venue_override}\n" + text
             prediction_timing = {}
+            _v276_foreground_prediction_event.set()
             with _V276ForegroundPredictionPriority(engine.DB_PATH):
                 with st.spinner("高速6周イベントシミュレーションを実行中…"):
                     _t0 = time_module.perf_counter()
@@ -11466,17 +11508,15 @@ elif selected_main_page == "🏁 予測":
                         except Exception:
                             pass
                     _t2 = time_module.perf_counter()
+            _v276_foreground_prediction_event.clear()
             # オッズ欄の表示に必要なレースキーだけ同期保存。
             _t_save0 = time_module.perf_counter()
             race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
             _t_save1 = time_module.perf_counter()
             # 全買い目確率と特徴量は待たずにバックグラウンド保存する。
-            threading.Thread(
-                target=_v217_deferred_prediction_db_save,
-                args=(meta, bets, int(trials), df),
-                daemon=True,
-                name="autorace-deferred-db-save",
-            ).start()
+            # Ver276: 詳細保存は単一ワーカーへ投入。予測のたびに保存スレッドを
+            # 増殖させないため、連続予測でもCPU/SQLite競合を蓄積しない。
+            _v217_deferred_prediction_db_save(meta, bets, int(trials), df)
             prediction_timing = {
                 "base_prediction": _t_base - _t0,
                 "six_lap": _t1 - _t_base,
@@ -11550,6 +11590,8 @@ elif selected_main_page == "🏁 予測":
             except Exception as save_exc:
                 st.success("予測が完了しました。")
                 st.warning(f"復元用保存だけ失敗しました: {type(save_exc).__name__}: {save_exc}")
+            if _v276_running_notice is not None:
+                _v276_running_notice.empty()
             st.session_state["v261_rerun_requested"] = False
             if prediction_timing:
                 st.caption(
@@ -11560,6 +11602,9 @@ elif selected_main_page == "🏁 予測":
                     f"最小DB保存 {prediction_timing['db_save']:.2f}秒 / 表示まで {prediction_timing['total']:.2f}秒"
                 )
         except Exception as exc:
+            _v276_foreground_prediction_event.clear()
+            if _v276_running_notice is not None:
+                _v276_running_notice.empty()
             st.error(f"予測エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
 
