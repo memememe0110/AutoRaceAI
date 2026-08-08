@@ -2183,6 +2183,42 @@ def _v278_resume_background_after_foreground(db_path: str, pause_info: dict) -> 
     except Exception:
         pass
 
+
+class _V276ForegroundPredictionPriority:
+    """通常予測中はバックグラウンド再シミュレーションへ一時停止要求を出す。
+
+    停止完了を待たないため通常予測の開始は遅らせない。バックグラウンド側は
+    現在レース終了後の境界で停止し、通常予測終了後に自動再開する。
+    """
+    def __init__(self, db_path):
+        self.db_path = str(db_path)
+        self.job_id = 0
+
+    def __enter__(self):
+        try:
+            job = _v278_bg_get_job(self.db_path)
+            if job and str(job.get("status") or "") in ("queued", "running", "pause_requested", "paused"):
+                self.job_id = int(job.get("job_id") or 0)
+                if self.job_id:
+                    _v278_bg_set_pause(
+                        self.db_path, self.job_id, True,
+                        "通常予測を優先するため、現在レース終了後に一時停止します。"
+                    )
+        except Exception:
+            self.job_id = 0
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.job_id:
+                _v278_bg_set_pause(
+                    self.db_path, self.job_id, False,
+                    "通常予測完了。バックグラウンド再シミュレーションを再開します。"
+                )
+        except Exception:
+            pass
+        return False
+
 def _v276_send_rerun_complete_notification(result: dict) -> None:
     """バックグラウンド再シミュレーション正常完了時だけntfyへ即時通知する。
 
@@ -11362,24 +11398,35 @@ elif selected_main_page == "🏁 予測":
             st.caption("自動検出された欠車はありません。必要な車番だけ選択してください。")
 
     # Ver261: 通常予測と、復元した入力を現在Verで再シミュレーションする操作を明確に分離。
+    # Ver276 UI改善: ボタン押下直後に1回rerunして、実行中はボタン群を再描画しない。
+    # iPhone/Streamlitで「同じボタンが上下に二重表示される」残像を防ぐ。
+    _v276_run_request = st.session_state.pop("_v276_prediction_run_request", None)
     _restored_view_for_rerun = st.session_state.get("last_prediction_view") or {}
     _is_restored_for_rerun = bool(isinstance(_restored_view_for_rerun, dict) and _restored_view_for_rerun.get("_v231_restored_only"))
-    if _is_restored_for_rerun:
+    prediction_clicked = bool(_v276_run_request)
+    if prediction_clicked:
+        st.session_state["v261_rerun_requested"] = bool((_v276_run_request or {}).get("rerun_requested", False))
+        st.info("⏳ 予測を実行しています。完了までこのままお待ちください。")
+    elif _is_restored_for_rerun:
         _src_ver = str(_restored_view_for_rerun.get("_v231_source_app_version") or _restored_view_for_rerun.get("app_version") or "Unknown")
         st.caption(f"復元元: {_src_ver} → 再シミュレーション保存先: {_V231_APP_VERSION}")
         _b1, _b2 = st.columns(2)
         with _b1:
-            prediction_clicked = st.button("通常予測として実行", use_container_width=True, key="v261_normal_prediction")
+            _normal_clicked = st.button("通常予測として実行", use_container_width=True, key="v261_normal_prediction")
         with _b2:
-            rerun_clicked = st.button(
+            _rerun_clicked = st.button(
                 f"▶ 復元内容を{_V231_APP_VERSION}で再シミュレーション",
                 type="primary", use_container_width=True, key="v261_rerun_current_version"
             )
-        prediction_clicked = bool(prediction_clicked or rerun_clicked)
-        st.session_state["v261_rerun_requested"] = bool(rerun_clicked)
+        if _normal_clicked or _rerun_clicked:
+            st.session_state["_v276_prediction_run_request"] = {"rerun_requested": bool(_rerun_clicked)}
+            st.rerun()
     else:
-        prediction_clicked = st.button("解析して元版設定で予測", type="primary", use_container_width=True)
+        _normal_clicked = st.button("解析して元版設定で予測", type="primary", use_container_width=True)
         st.session_state["v261_rerun_requested"] = False
+        if _normal_clicked:
+            st.session_state["_v276_prediction_run_request"] = {"rerun_requested": False}
+            st.rerun()
     if prediction_clicked:
         if not text.strip():
             st.warning("出走表を貼り付けてください。")
@@ -11392,32 +11439,33 @@ elif selected_main_page == "🏁 予測":
             if prediction_venue_override:
                 prediction_text = f"開催場: {prediction_venue_override}\n" + text
             prediction_timing = {}
-            with st.spinner("高速6周イベントシミュレーションを実行中…"):
-                _t0 = time_module.perf_counter()
-                df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
-                entries = _v276_mark_retrial_from_prediction_text(entries, prediction_text)
-                df = _v276_copy_retrial_to_prediction_df(df, entries)
-                _t_base = time_module.perf_counter()
-                # Ver230 beta: 壁補正を後掛けせず、スタートから6周すべての展開へ内蔵。
-                meta = dict(meta or {})
-                df, bets, wall_audit = _v230_six_lap_simulation(df, bets, entries, meta, int(trials), int(seed))
-                meta["壁補正監査"] = wall_audit
-                meta["6周展開シミュレーション"] = wall_audit
-                _t1 = time_module.perf_counter()
-                finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
-                _v273_audit_keep = {
-                    c: df[c].copy()
-                    for c in df.columns
-                    if str(c).startswith("Ver273_")
-                }
-                df = engine.v196_apply_probability_aligned_ranks(df, finish_prob)
-                for _c273, _s273 in _v273_audit_keep.items():
-                    try:
-                        if len(_s273) == len(df):
-                            df[_c273] = list(_s273)
-                    except Exception:
-                        pass
-                _t2 = time_module.perf_counter()
+            with _V276ForegroundPredictionPriority(engine.DB_PATH):
+                with st.spinner("高速6周イベントシミュレーションを実行中…"):
+                    _t0 = time_module.perf_counter()
+                    df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
+                    entries = _v276_mark_retrial_from_prediction_text(entries, prediction_text)
+                    df = _v276_copy_retrial_to_prediction_df(df, entries)
+                    _t_base = time_module.perf_counter()
+                    # Ver230 beta: 壁補正を後掛けせず、スタートから6周すべての展開へ内蔵。
+                    meta = dict(meta or {})
+                    df, bets, wall_audit = _v230_six_lap_simulation(df, bets, entries, meta, int(trials), int(seed))
+                    meta["壁補正監査"] = wall_audit
+                    meta["6周展開シミュレーション"] = wall_audit
+                    _t1 = time_module.perf_counter()
+                    finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
+                    _v273_audit_keep = {
+                        c: df[c].copy()
+                        for c in df.columns
+                        if str(c).startswith("Ver273_")
+                    }
+                    df = engine.v196_apply_probability_aligned_ranks(df, finish_prob)
+                    for _c273, _s273 in _v273_audit_keep.items():
+                        try:
+                            if len(_s273) == len(df):
+                                df[_c273] = list(_s273)
+                        except Exception:
+                            pass
+                    _t2 = time_module.perf_counter()
             # オッズ欄の表示に必要なレースキーだけ同期保存。
             _t_save0 = time_module.perf_counter()
             race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
