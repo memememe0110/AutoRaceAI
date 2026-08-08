@@ -7857,23 +7857,6 @@ def show_v182_odds_adjusted_tight_recommendation(bets: dict, trials: int, meta: 
         st.caption(adjusted.get("reason", "オッズを読み込むと表示します。"))
         return
     st.subheader(f"{adjusted['icon']} 最終参考：{adjusted['final_points']}点・{adjusted['grade']}")
-    optional_simple = v244_optional_single_wide_candidates(bets, trials, odds_maps)
-    if optional_simple:
-        st.markdown("##### 🪙 余裕がある場合の単勝・ワイド候補")
-        st.caption("回収率重視の本線には自動追加しません。ワイドは表示レンジの下限オッズで安全側に評価しています。")
-        copy_lines = []
-        for row in optional_simple:
-            label = f"{row['type']} {row['combo']}"
-            copy_lines.append(label)
-            st.markdown(f"**{label}（{float(row['odds']):.1f}倍）**")
-            st.caption(f"モデル確率 {float(row['probability']):.2f}%・単体期待値 {float(row['ev']):.1f}%｜{row['reason']}")
-        v73_copy_box(
-            "余裕がある場合の単勝・ワイド候補",
-            "追加候補\n" + "\n".join(copy_lines),
-            f"v244_optional_single_wide_{race_key}_{saved_hash}",
-            height=max(120, 80 + 27 * len(copy_lines)),
-        )
-
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("基本点数", f"{adjusted['base_points']}点")
     c2.metric("オッズ調整", f"{adjusted['delta']:+d}点")
@@ -10762,6 +10745,53 @@ def _v278_render_background_quick_page(db_path: str) -> None:
             st.info(str(job.get("message") or "停止しました。"))
         else:
             st.error(str(job.get("message") or "")+" "+str(job.get("error_text") or ""))
+
+        result=(job.get("result") or {}) if isinstance(job,dict) else {}
+        if status=="completed" and result:
+            roi_n=int(result.get("roi_evaluated",0) or 0)
+            if roi_n>0:
+                st.markdown("### 📊 バックテスト結果")
+                base_cost=int(result.get("roi_cost_yen",0) or 0)
+                base_payout=int(result.get("roi_payout_yen",0) or 0)
+                base_rate=(base_payout/base_cost*100.0) if base_cost>0 else None
+                plus_cost=int(result.get("roi_plus_cost_yen",0) or 0)
+                plus_payout=int(result.get("roi_plus_payout_yen",0) or 0)
+                plus_points=int(result.get("roi_plus_extra_points",0) or 0)
+                plus_rate=(plus_payout/plus_cost*100.0) if plus_cost>0 else None
+
+                a,b,c=st.columns(3)
+                a.metric("従来4券種", "—" if base_rate is None else f"{base_rate:.1f}%")
+                b.metric(
+                    "全オッズ券種追加後",
+                    "追加なし" if plus_points<=0 or plus_rate is None else f"{plus_rate:.1f}%"
+                )
+                if base_rate is not None and plus_rate is not None and plus_points>0:
+                    c.metric("差",f"{plus_rate-base_rate:+.1f}pt")
+                else:
+                    c.metric("仮想追加","0点")
+
+                if plus_points>0:
+                    st.success(
+                        f"全オッズ券種から、合成モデル期待回収率を上げる候補を"
+                        f"仮想で合計{plus_points}点追加しました。"
+                    )
+                else:
+                    st.info("今回の対象レースでは、合成モデル期待回収率を上げる追加候補はありませんでした。")
+
+                rows=pd.DataFrame(result.get("roi_rows") or [])
+                if not rows.empty:
+                    show_cols=[c for c in [
+                        "race","points","cost_yen","payout_yen","return_rate",
+                        "virtual_extra_points","virtual_extra_cost_yen",
+                        "virtual_extra_payout_yen","virtual_combined_return_rate",
+                        "odds_created_at","reason"
+                    ] if c in rows.columns]
+                    with st.expander("レース別・全オッズ仮想評価",expanded=False):
+                        st.dataframe(rows[show_cols],use_container_width=True,hide_index=True)
+                st.caption(
+                    "対象: 3連単・3連複・2連単・2連複・単勝・ワイド。"
+                    "保存済み最古オッズと当時のモデル確率で選び、実結果は採点にだけ使います。"
+                )
 
 
 if selected_main_page == "⏱️ 再シミュレーション":
