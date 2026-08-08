@@ -1470,6 +1470,162 @@ def _v260_repair_saved_snapshot_history(db_path: str, app_version: str = '', lim
 # オッズは同一レースに保存されている最古スナップショットを全Ver共通で使う。
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Ver272評価機能: バージョン横並び・共通レース回収率比較
+# 予測ロジックは変更しない。
+# 全選択Verに保存予測がある共通race_keyだけを使い、
+# 同一レースでは同一の最古オッズスナップショットで買い目を再生成して採点する。
+# ---------------------------------------------------------------------------
+
+def _v272_version_race_histories(db_path: str, versions: list[str]) -> dict:
+    out = {str(v): {} for v in versions}
+    if not versions:
+        return out
+    _v231_ensure_prediction_history_table(db_path)
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        qs = ",".join(["?"] * len(versions))
+        rows = con.execute(f"""
+            SELECT history_id, race_key, app_version, prediction_time
+            FROM v231_prediction_history
+            WHERE app_version IN ({qs})
+            ORDER BY datetime(prediction_time) ASC, history_id ASC
+        """, tuple(str(v) for v in versions)).fetchall()
+    for r in rows:
+        ver = str(r["app_version"] or "")
+        rk = str(r["race_key"] or "")
+        if ver in out and rk:
+            out[ver][rk] = int(r["history_id"])
+    return out
+
+
+def _v272_score_saved_history_same_odds(
+    db_path: str,
+    history_id: int,
+    race_key: str,
+    version: str,
+    shared_odds_maps: dict,
+    shared_odds_run: dict,
+) -> dict:
+    out = {
+        "version": str(version), "race_key": str(race_key), "history_id": int(history_id),
+        "evaluated": False, "points": 0, "cost_yen": 0, "payout_yen": 0,
+        "return_rate": None, "hit": False, "reason": "",
+        "odds_created_at": str((shared_odds_run or {}).get("created_at") or ""),
+        "odds_snapshot_id": str((shared_odds_run or {}).get("snapshot_id") or ""),
+    }
+    try:
+        view, raw_text, venue_override, hist_meta = _v231_load_prediction_history(db_path, int(history_id))
+        if not isinstance(view, dict):
+            out["reason"] = "保存予測を復元できません"
+            return out
+
+        bets = view.get("bets")
+        meta = view.get("meta") or {}
+        trials = int(view.get("trials") or 0)
+        if not isinstance(bets, dict) or not bets:
+            out["reason"] = "保存予測にbetsなし"
+            return out
+        if sum(len(v) for v in (shared_odds_maps or {}).values()) <= 0:
+            out["reason"] = "共通オッズなし"
+            return out
+
+        result = v184_eight_car_mixed_plan(bets, trials, meta, shared_odds_maps)
+        if not isinstance(result, dict) or not result.get("available"):
+            out["reason"] = str((result or {}).get("reason") or "買い目再生成不可")
+            return out
+
+        plan_hash = _v187_save_mixed_plan(
+            db_path, str(race_key), result, app_version=str(version)
+        )
+        if not plan_hash:
+            out["reason"] = "プラン保存失敗"
+            return out
+
+        _v212_recalculate_plan_feedback(db_path, str(race_key), str(plan_hash))
+
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute("""
+                SELECT r.points, r.cost_yen,
+                       f.hit, f.payout_yen, f.return_rate
+                FROM v187_mixed_plan_runs r
+                LEFT JOIN v187_mixed_plan_feedback f
+                  ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                WHERE r.race_key=? AND r.plan_hash=?
+                LIMIT 1
+            """, (str(race_key), str(plan_hash))).fetchone()
+
+        if row is None:
+            out["reason"] = "採点レコードなし"
+            return out
+
+        out["points"] = int(row["points"] or 0)
+        out["cost_yen"] = int(row["cost_yen"] or out["points"] * 100)
+        if row["return_rate"] is None:
+            out["reason"] = "払戻未登録"
+            return out
+
+        out["evaluated"] = True
+        out["hit"] = bool(int(row["hit"] or 0))
+        out["payout_yen"] = int(row["payout_yen"] or 0)
+        out["return_rate"] = float(row["return_rate"] or 0.0)
+        out["reason"] = "採点済み"
+        return out
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+
+def _v272_common_race_roi_compare(db_path: str, versions: list[str]) -> dict:
+    versions = [str(v) for v in versions if str(v)]
+    out = {
+        "versions": versions, "common_races": [], "rows": [], "summary": [],
+        "missing_odds": 0, "missing_payout": 0,
+    }
+    if len(versions) < 2:
+        return out
+
+    hist = _v272_version_race_histories(db_path, versions)
+    sets = [set(hist[v].keys()) for v in versions]
+    common = sorted(set.intersection(*sets)) if sets else []
+    out["common_races"] = common
+
+    for race_key in common:
+        odds_maps, odds_run = _v273_load_earliest_saved_odds(db_path, race_key)
+        if sum(len(v) for v in odds_maps.values()) <= 0:
+            out["missing_odds"] += 1
+            continue
+
+        for ver in versions:
+            hid = hist[ver].get(race_key)
+            if not hid:
+                continue
+            row = _v272_score_saved_history_same_odds(
+                db_path, hid, race_key, ver, odds_maps, odds_run
+            )
+            out["rows"].append(row)
+            if (not row.get("evaluated")) and "払戻" in str(row.get("reason") or ""):
+                out["missing_payout"] += 1
+
+    for ver in versions:
+        vr = [r for r in out["rows"] if r.get("version") == ver and r.get("evaluated")]
+        cost = sum(int(r.get("cost_yen",0) or 0) for r in vr)
+        payout = sum(int(r.get("payout_yen",0) or 0) for r in vr)
+        hits = sum(int(bool(r.get("hit"))) for r in vr)
+        rate = (payout / cost * 100.0) if cost > 0 else None
+        out["summary"].append({
+            "version": ver,
+            "対象R": len(vr),
+            "的中R": hits,
+            "投資円": cost,
+            "払戻円": payout,
+            "回収率": rate,
+        })
+    return out
+
+
 def _v273_load_earliest_saved_odds(db_path: str, race_key: str) -> tuple[dict, dict]:
     empty = {'3tan': {}, '3fuku': {}, '2tansho': {}, '2fuku': {}, 'tansho': {}, 'wide': {}}
     try:
@@ -9645,6 +9801,36 @@ elif selected_main_page == "🏁 予測":
             restore_by_label[label] = {"kind":"legacy", **item}
         st.caption("最近の保存済み予測をボタンで復元します。文字入力欄ではないため、iPhoneのキーボードは開きません。")
         visible_labels = restore_labels[:24]
+        with st.expander("⚖️ Ver横並び・共通レース回収率比較", expanded=False):
+            st.caption("選択した全Verに保存予測がある共通レースだけを使い、各レースの同じ最古オッズで買い目を再生成して比較します。1点100円の仮想評価です。")
+            try:
+                _v272_hist_for_options = _v231_list_prediction_histories(engine.DB_PATH, 1000)
+                _v272_versions_all = sorted({str(x.get("app_version") or "") for x in _v272_hist_for_options if str(x.get("app_version") or "")})
+            except Exception:
+                _v272_versions_all = []
+            _v272_default = [v for v in ("Ver270","Ver271","Ver272") if v in _v272_versions_all]
+            _v272_selected = st.multiselect("比較するVer", options=_v272_versions_all, default=_v272_default if len(_v272_default)>=2 else _v272_versions_all[-3:], key="v272_common_roi_versions")
+            if st.button("⚖️ 同じレース・同じオッズで回収率比較", key="v272_common_roi_run", use_container_width=True):
+                if len(_v272_selected) < 2:
+                    st.warning("2つ以上のVerを選んでください。")
+                else:
+                    with st.spinner("共通レースを抽出し、同じオッズ条件で採点しています..."):
+                        _cmp272 = _v272_common_race_roi_compare(engine.DB_PATH, _v272_selected)
+                    _common_n = len(_cmp272.get("common_races") or [])
+                    st.info(f"全選択Verに共通する保存済みレース: {_common_n}R")
+                    _sum272 = pd.DataFrame(_cmp272.get("summary") or [])
+                    if not _sum272.empty:
+                        st.dataframe(_sum272, use_container_width=True, hide_index=True, column_config={"投資円":st.column_config.NumberColumn(format="%d円"),"払戻円":st.column_config.NumberColumn(format="%d円"),"回収率":st.column_config.NumberColumn(format="%.1f%%")})
+                    _rows272 = pd.DataFrame(_cmp272.get("rows") or [])
+                    if not _rows272.empty:
+                        _show272 = [c for c in ["race_key","version","points","cost_yen","payout_yen","return_rate","hit","odds_created_at","reason"] if c in _rows272.columns]
+                        with st.expander("レース別の横並び結果", expanded=False):
+                            st.dataframe(_rows272[_show272], use_container_width=True, hide_index=True, column_config={"cost_yen":st.column_config.NumberColumn("投資",format="%d円"),"payout_yen":st.column_config.NumberColumn("払戻",format="%d円"),"return_rate":st.column_config.NumberColumn("回収率",format="%.1f%%")})
+                    if _cmp272.get("missing_odds"):
+                        st.caption(f"共通レースのうち保存オッズなし: {_cmp272['missing_odds']}R")
+                    if _cmp272.get("missing_payout"):
+                        st.caption(f"払戻未登録で採点不可: {_cmp272['missing_payout']}件")
+                    st.caption("共通レースの交差集合だけで比較するため、Verごとの対象R数の違いによる見かけの回収率差を減らせます。")
         with st.expander(f"保存済み予測一覧（最新{len(visible_labels)}件）", expanded=False):
             for idx, restore_label in enumerate(visible_labels):
                 target = restore_by_label.get(restore_label) or {}
