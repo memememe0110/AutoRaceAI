@@ -10018,6 +10018,102 @@ def show_v184_eight_car_mixed_plan(
         st.caption(f"💾 この合成プランはDB保存済み（ID: {saved_hash}）。結果登録後に自動評価されます。")
     st.caption("同じ結果で複数券種が同時的中する場合は払戻を合算しています。確率とオッズによる参考構成です。")
 
+def _v276_sqlite_sidecar_paths(db_path: Path) -> list[Path]:
+    """SQLite本体に紐づくWAL/SHM/journalを列挙する。DB本体差し替え時の旧WAL混入を防ぐ。"""
+    return [
+        Path(str(db_path) + "-wal"),
+        Path(str(db_path) + "-shm"),
+        Path(str(db_path) + "-journal"),
+    ]
+
+
+def _v276_remove_sqlite_sidecars(db_path: Path) -> None:
+    for sidecar in _v276_sqlite_sidecar_paths(db_path):
+        try:
+            sidecar.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _v276_checkpoint_existing_db(db_path: Path) -> None:
+    """既存DBのWALを本体へ戻してから接続を閉じる。失敗しても差し替え前検証は継続する。"""
+    if not db_path.exists():
+        return
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+    except Exception:
+        pass
+
+
+def _v276_postcheck_db_file(db_path: Path) -> None:
+    """実際に採用したDB本体を新規接続で再検証する。"""
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        # stale WALが混ざった場合はここでsqlite_master読取時に検出できる。
+        con.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").fetchall()
+        quick = con.execute("PRAGMA quick_check").fetchone()
+        quick_text = str(quick[0] if quick else "").strip()
+        if quick_text.lower() != "ok":
+            raise sqlite3.DatabaseError(f"quick_check: {quick_text}")
+
+
+def _v276_atomic_install_db_bytes(data: bytes, source_label: str = "DB") -> tuple[bool, str]:
+    """検証済みSQLiteを旧WAL/SHMを残さず原子的に差し替える。"""
+    valid, valid_msg = _v276_validate_db_bytes(data, source_label)
+    if not valid:
+        return False, valid_msg
+
+    try:
+        if "_v278_bg_has_running_job" in globals() and _v278_bg_has_running_job(engine.DB_PATH):
+            return False, "バックグラウンド再シミュレーション中はDB差し替えを停止しています。完了後にもう一度実行してください。"
+    except Exception:
+        pass
+
+    target = Path(engine.DB_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(target.name + ".installing")
+    backup = target.with_name(target.name + ".before_replace")
+
+    try:
+        temp.write_bytes(data)
+        _v276_postcheck_db_file(temp)
+
+        # 旧DBのWALをまず本体へ反映。コピー後に旧sidecarを必ず破棄する。
+        _v276_checkpoint_existing_db(target)
+        if target.exists():
+            try:
+                shutil.copy2(target, backup)
+            except Exception:
+                backup.write_bytes(target.read_bytes())
+
+        _v276_remove_sqlite_sidecars(target)
+        os.replace(str(temp), str(target))
+        _v276_remove_sqlite_sidecars(target)
+
+        # 新しいファイルに対して完全に新規接続で検証してから初期化する。
+        _v276_postcheck_db_file(target)
+        engine.mount_and_init_db()
+        _v276_postcheck_db_file(target)
+        return True, "ok"
+    except Exception as exc:
+        _v276_remove_sqlite_sidecars(target)
+        try:
+            if backup.exists():
+                os.replace(str(backup), str(target))
+                _v276_remove_sqlite_sidecars(target)
+                try:
+                    engine.mount_and_init_db()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False, f"{source_label}の差し替えに失敗しました: {type(exc).__name__}: {exc}"
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def install_uploaded_db(uploaded) -> tuple[bool, str]:
     data = uploaded.getvalue()
     if not data.startswith(b"SQLite format 3\x00"):
@@ -10027,33 +10123,12 @@ def install_uploaded_db(uploaded) -> tuple[bool, str]:
     if st.session_state.get("loaded_db_hash") == digest:
         return True, "このDBは読み込み済みです。"
 
-    target = Path(engine.DB_PATH)
-    temp = target.with_suffix(target.suffix + ".uploading")
-    backup = target.with_suffix(target.suffix + ".backup")
-    try:
-        temp.write_bytes(data)
-        with sqlite3.connect(temp) as con:
-            check = con.execute("PRAGMA integrity_check").fetchone()[0]
-            if str(check).lower() != "ok":
-                raise ValueError(f"DB整合性チェック: {check}")
-            tables = [r[0] for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            ).fetchall()]
-            if not tables:
-                raise ValueError("テーブルがありません")
+    ok, msg = _v276_atomic_install_db_bytes(data, "アップロードDB")
+    if not ok:
+        return False, "DBを読み込めませんでした: " + msg
 
-        if target.exists():
-            backup.write_bytes(target.read_bytes())
-        target.write_bytes(temp.read_bytes())
-        engine.mount_and_init_db()
-        st.session_state["loaded_db_hash"] = digest
-        return True, f"DBを読み込みました（{len(data) / 1024 / 1024:.1f} MB）"
-    except Exception as exc:
-        if backup.exists():
-            target.write_bytes(backup.read_bytes())
-        return False, f"DBを読み込めませんでした: {type(exc).__name__}: {exc}"
-    finally:
-        temp.unlink(missing_ok=True)
+    st.session_state["loaded_db_hash"] = digest
+    return True, f"DBを安全に読み込みました（{len(data) / 1024 / 1024:.1f} MB / 旧WAL・SHM除去済み）"
 
 
 def secret_value(name: str, default: str = "") -> str:
@@ -10487,31 +10562,11 @@ def pull_db_from_github() -> tuple[bool, str]:
         return False, f"GitHubからDBを取得できませんでした: {body.get('message', status)}"
     try:
         data = base64.b64decode(body["content"].replace("\n", ""))
-        valid, valid_msg = _v276_validate_db_bytes(data, "GitHub上のDB")
-        if not valid:
-            return False, "GitHub上のDBが破損しているため再読込を中止しました。現在のDBは変更していません。\n" + valid_msg
-        target = Path(engine.DB_PATH)
-        backup = target.with_suffix(target.suffix + ".before_github_pull")
-        if target.exists():
-            backup.write_bytes(target.read_bytes())
-        try:
-            target.write_bytes(data)
-            engine.mount_and_init_db()
-            # 採用後にも実ファイルを確認。失敗時は直前DBへ戻す。
-            with sqlite3.connect(str(target), timeout=30.0) as con:
-                con.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").fetchall()
-                check = con.execute("PRAGMA quick_check").fetchone()[0]
-                if str(check).lower() != "ok":
-                    raise sqlite3.DatabaseError(f"quick_check: {check}")
-        except Exception:
-            if backup.exists():
-                target.write_bytes(backup.read_bytes())
-                try:
-                    engine.mount_and_init_db()
-                except Exception:
-                    pass
-            raise
-        return True, f"GitHubから正常DBを取得しました（{len(data) / 1024 / 1024:.2f} MB）"
+        ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上のDB")
+        if not ok:
+            return False, "GitHub上のDBは採用しませんでした。現在のDBは保護されています。\n" + msg
+        st.session_state.pop("loaded_db_hash", None)
+        return True, f"GitHubから正常DBを安全に取得しました（{len(data) / 1024 / 1024:.2f} MB / 旧WAL・SHM除去済み）"
     except Exception as exc:
         return False, f"GitHub DB取得エラー: {type(exc).__name__}: {exc}"
 
