@@ -2474,6 +2474,127 @@ def _v253_reconstruction_status(db_path: str) -> dict:
     return out
 
 
+
+def _v272_common_race_precision_compare(db_path: str, versions: list[str]) -> tuple[pd.DataFrame, list[tuple]]:
+    """
+    選択した全Verに周回スナップショットがある共通レースだけで精度比較する。
+    総合3指標に加え、1～6周目の平均順位誤差も横並びにする。
+    """
+    cols = [
+        "バージョン","共通R","照合周回","位置一致率","前後関係一致率","平均順位誤差",
+        "1周目誤差","2周目誤差","3周目誤差","4周目誤差","5周目誤差","6周目誤差",
+    ]
+    versions = [str(v) for v in versions if str(v)]
+    if not db_path or not Path(db_path).exists() or len(versions) < 2:
+        return pd.DataFrame(columns=cols), []
+
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            _v252_ensure_lap_tables(con)
+            qs = ",".join(["?"] * len(versions))
+            pred = pd.read_sql_query(f"""
+                SELECT race_date,venue,race_no,lap_no,predicted_order,app_version,created_at
+                FROM v252_lap_prediction_snapshots
+                WHERE app_version IN ({qs})
+                ORDER BY created_at
+            """, con, params=tuple(versions))
+            actual = pd.read_sql_query("""
+                SELECT substr(rr.race_date,1,10) AS race_date,rr.venue,
+                       REPLACE(CAST(COALESCE(rr.race_no,'') AS TEXT),'R','') AS race_no,
+                       rl.lap_no,rl.position,rl.car_no
+                FROM result_laps rl
+                JOIN result_races rr ON rr.race_key=rl.race_key
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                ORDER BY rr.race_date,rr.venue,rr.race_no,rl.lap_no,rl.position
+            """, con)
+    except Exception:
+        return pd.DataFrame(columns=cols), []
+
+    if pred.empty or actual.empty:
+        return pd.DataFrame(columns=cols), []
+
+    pred["race_date"] = pred["race_date"].astype(str).str[:10]
+    pred["race_no"] = pred["race_no"].astype(str).str.replace("R","",regex=False)
+    pred = pred.sort_values("created_at").drop_duplicates(
+        ["app_version","race_date","venue","race_no","lap_no"], keep="last"
+    )
+
+    # All selected versions must have at least one saved lap for the race.
+    race_sets = []
+    for ver in versions:
+        gv = pred[pred["app_version"].astype(str) == ver]
+        race_sets.append(set(
+            (str(r.race_date)[:10], str(r.venue), str(r.race_no))
+            for r in gv.itertuples()
+        ))
+    common_races = sorted(set.intersection(*race_sets)) if race_sets else []
+    if not common_races:
+        return pd.DataFrame(columns=cols), []
+
+    common_set = set(common_races)
+    pred = pred[pred.apply(
+        lambda r: (str(r["race_date"])[:10], str(r["venue"]), str(r["race_no"])) in common_set,
+        axis=1
+    )]
+
+    amap = {}
+    for key,g in actual.groupby(["race_date","venue","race_no","lap_no"], dropna=False):
+        amap[(str(key[0])[:10],str(key[1]),str(key[2]),int(key[3]))] = tuple(
+            int(x) for x in g.sort_values("position").car_no.tolist()
+        )
+
+    rows = []
+    for ver in versions:
+        gv = pred[pred["app_version"].astype(str) == ver]
+        metrics = []
+        lap_mae = {i: [] for i in range(1,7)}
+        used_races = set()
+        for row in gv.itertuples():
+            key = (str(row.race_date)[:10], str(row.venue), str(row.race_no), int(row.lap_no))
+            act = amap.get(key)
+            try:
+                prd = tuple(int(x) for x in str(row.predicted_order).split("-") if str(x).strip())
+            except Exception:
+                continue
+            common = sorted(set(act or ()) & set(prd))
+            if not act or len(common) < 3:
+                continue
+            ap = {c:i for i,c in enumerate(act)}
+            pp = {c:i for i,c in enumerate(prd)}
+            pos_match = sum(
+                1 for i,c in enumerate(act) if i < len(prd) and prd[i] == c
+            ) / max(len(act),len(prd))
+            pair_total = pair_ok = 0
+            for i in range(len(common)):
+                for j in range(i+1,len(common)):
+                    a,b = common[i],common[j]
+                    pair_total += 1
+                    pair_ok += int((ap[a] < ap[b]) == (pp[a] < pp[b]))
+            mae = float(np.mean([abs(ap[c]-pp[c]) for c in common]))
+            metrics.append((pos_match, pair_ok/pair_total if pair_total else 0.0, mae))
+            if 1 <= int(row.lap_no) <= 6:
+                lap_mae[int(row.lap_no)].append(mae)
+            used_races.add(key[:3])
+
+        if metrics:
+            arr = np.asarray(metrics, dtype=float)
+            rec = {
+                "バージョン": ver,
+                "共通R": len(used_races),
+                "照合周回": len(metrics),
+                "位置一致率": round(float(arr[:,0].mean())*100,1),
+                "前後関係一致率": round(float(arr[:,1].mean())*100,1),
+                "平均順位誤差": round(float(arr[:,2].mean()),2),
+            }
+            for lap in range(1,7):
+                rec[f"{lap}周目誤差"] = (
+                    round(float(np.mean(lap_mae[lap])),2) if lap_mae[lap] else None
+                )
+            rows.append(rec)
+
+    return pd.DataFrame(rows, columns=cols), common_races
+
+
 def _v254_saved_version_lap_comparison(db_path: str) -> pd.DataFrame:
     """Compare saved lap snapshots by app_version against actual grand-note laps.
 
@@ -9801,36 +9922,6 @@ elif selected_main_page == "🏁 予測":
             restore_by_label[label] = {"kind":"legacy", **item}
         st.caption("最近の保存済み予測をボタンで復元します。文字入力欄ではないため、iPhoneのキーボードは開きません。")
         visible_labels = restore_labels[:24]
-        with st.expander("⚖️ Ver横並び・共通レース回収率比較", expanded=False):
-            st.caption("選択した全Verに保存予測がある共通レースだけを使い、各レースの同じ最古オッズで買い目を再生成して比較します。1点100円の仮想評価です。")
-            try:
-                _v272_hist_for_options = _v231_list_prediction_histories(engine.DB_PATH, 1000)
-                _v272_versions_all = sorted({str(x.get("app_version") or "") for x in _v272_hist_for_options if str(x.get("app_version") or "")})
-            except Exception:
-                _v272_versions_all = []
-            _v272_default = [v for v in ("Ver270","Ver271","Ver272") if v in _v272_versions_all]
-            _v272_selected = st.multiselect("比較するVer", options=_v272_versions_all, default=_v272_default if len(_v272_default)>=2 else _v272_versions_all[-3:], key="v272_common_roi_versions")
-            if st.button("⚖️ 同じレース・同じオッズで回収率比較", key="v272_common_roi_run", use_container_width=True):
-                if len(_v272_selected) < 2:
-                    st.warning("2つ以上のVerを選んでください。")
-                else:
-                    with st.spinner("共通レースを抽出し、同じオッズ条件で採点しています..."):
-                        _cmp272 = _v272_common_race_roi_compare(engine.DB_PATH, _v272_selected)
-                    _common_n = len(_cmp272.get("common_races") or [])
-                    st.info(f"全選択Verに共通する保存済みレース: {_common_n}R")
-                    _sum272 = pd.DataFrame(_cmp272.get("summary") or [])
-                    if not _sum272.empty:
-                        st.dataframe(_sum272, use_container_width=True, hide_index=True, column_config={"投資円":st.column_config.NumberColumn(format="%d円"),"払戻円":st.column_config.NumberColumn(format="%d円"),"回収率":st.column_config.NumberColumn(format="%.1f%%")})
-                    _rows272 = pd.DataFrame(_cmp272.get("rows") or [])
-                    if not _rows272.empty:
-                        _show272 = [c for c in ["race_key","version","points","cost_yen","payout_yen","return_rate","hit","odds_created_at","reason"] if c in _rows272.columns]
-                        with st.expander("レース別の横並び結果", expanded=False):
-                            st.dataframe(_rows272[_show272], use_container_width=True, hide_index=True, column_config={"cost_yen":st.column_config.NumberColumn("投資",format="%d円"),"payout_yen":st.column_config.NumberColumn("払戻",format="%d円"),"return_rate":st.column_config.NumberColumn("回収率",format="%.1f%%")})
-                    if _cmp272.get("missing_odds"):
-                        st.caption(f"共通レースのうち保存オッズなし: {_cmp272['missing_odds']}R")
-                    if _cmp272.get("missing_payout"):
-                        st.caption(f"払戻未登録で採点不可: {_cmp272['missing_payout']}件")
-                    st.caption("共通レースの交差集合だけで比較するため、Verごとの対象R数の違いによる見かけの回収率差を減らせます。")
         with st.expander(f"保存済み予測一覧（最新{len(visible_labels)}件）", expanded=False):
             for idx, restore_label in enumerate(visible_labels):
                 target = restore_by_label.get(restore_label) or {}
@@ -11961,6 +12052,114 @@ if selected_main_page == "🗃️ 登録情報確認":
 
                     with st.expander(f"{_V231_APP_VERSION} 精度比較・一括再シミュレーションセンター", expanded=False):
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
+
+                        st.markdown("#### ⚖️ Ver別 精度・回収率 共通レース比較")
+                        st.caption(
+                            "選択した全Verに共通する保存済みレースだけで、"
+                            "①周回予測精度 と ②同じ最古オッズを使った仮想100円均等回収率 を横並び比較します。"
+                        )
+                        try:
+                            _v272_all_hist = _v231_list_prediction_histories(engine.DB_PATH, 1000)
+                            _v272_compare_versions = sorted({
+                                str(x.get("app_version") or "")
+                                for x in _v272_all_hist
+                                if str(x.get("app_version") or "")
+                            })
+                        except Exception:
+                            _v272_compare_versions = []
+                        _v272_compare_default = [
+                            v for v in ("Ver270","Ver271","Ver272")
+                            if v in _v272_compare_versions
+                        ]
+                        _v272_compare_selected = st.multiselect(
+                            "横並び比較するVer",
+                            options=_v272_compare_versions,
+                            default=_v272_compare_default if len(_v272_compare_default)>=2 else _v272_compare_versions[-3:],
+                            key="v272_precision_roi_common_versions",
+                        )
+                        if st.button(
+                            "⚖️ 共通レースで精度＋回収率を比較",
+                            key="v272_precision_roi_common_run",
+                            use_container_width=True,
+                        ):
+                            if len(_v272_compare_selected) < 2:
+                                st.warning("2つ以上のVerを選んでください。")
+                            else:
+                                with st.spinner("共通レースを揃えて、精度と回収率を比較しています..."):
+                                    _prec272,_prec_common272 = _v272_common_race_precision_compare(
+                                        engine.DB_PATH, _v272_compare_selected
+                                    )
+                                    _roi272 = _v272_common_race_roi_compare(
+                                        engine.DB_PATH, _v272_compare_selected
+                                    )
+
+                                _precision_races = set(_prec_common272 or [])
+                                _roi_races = set(_roi272.get("common_races") or [])
+                                _both_common = sorted(_precision_races & _roi_races)
+                                st.info(
+                                    f"周回精度の共通レース: {len(_precision_races)}R / "
+                                    f"回収率の共通レース: {len(_roi_races)}R"
+                                )
+
+                                st.markdown("**① 予測精度**")
+                                if _prec272.empty:
+                                    st.warning("選択Verで共通比較できる周回スナップショットがありません。")
+                                else:
+                                    st.dataframe(
+                                        _prec272,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            "位置一致率": st.column_config.NumberColumn(format="%.1f%%"),
+                                            "前後関係一致率": st.column_config.NumberColumn(format="%.1f%%"),
+                                            "平均順位誤差": st.column_config.NumberColumn(format="%.2f"),
+                                            "1周目誤差": st.column_config.NumberColumn(format="%.2f"),
+                                            "2周目誤差": st.column_config.NumberColumn(format="%.2f"),
+                                            "3周目誤差": st.column_config.NumberColumn(format="%.2f"),
+                                            "4周目誤差": st.column_config.NumberColumn(format="%.2f"),
+                                            "5周目誤差": st.column_config.NumberColumn(format="%.2f"),
+                                            "6周目誤差": st.column_config.NumberColumn(format="%.2f"),
+                                        },
+                                    )
+
+                                st.markdown("**② 仮想100円均等・回収率**")
+                                _roi_sum272 = pd.DataFrame(_roi272.get("summary") or [])
+                                if _roi_sum272.empty:
+                                    st.warning("同条件で回収率採点できる共通レースがありません。")
+                                else:
+                                    st.dataframe(
+                                        _roi_sum272,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            "投資円": st.column_config.NumberColumn(format="%d円"),
+                                            "払戻円": st.column_config.NumberColumn(format="%d円"),
+                                            "回収率": st.column_config.NumberColumn(format="%.1f%%"),
+                                        },
+                                    )
+
+                                _roi_rows272 = pd.DataFrame(_roi272.get("rows") or [])
+                                if not _roi_rows272.empty:
+                                    with st.expander("回収率のレース別詳細", expanded=False):
+                                        _cols272 = [c for c in [
+                                            "race_key","version","points","cost_yen","payout_yen",
+                                            "return_rate","hit","odds_created_at","reason"
+                                        ] if c in _roi_rows272.columns]
+                                        st.dataframe(
+                                            _roi_rows272[_cols272],
+                                            use_container_width=True,
+                                            hide_index=True,
+                                            column_config={
+                                                "cost_yen": st.column_config.NumberColumn("投資",format="%d円"),
+                                                "payout_yen": st.column_config.NumberColumn("払戻",format="%d円"),
+                                                "return_rate": st.column_config.NumberColumn("回収率",format="%.1f%%"),
+                                            },
+                                        )
+                                st.caption(
+                                    "精度は同じ実測グランドノート、回収率は同じレース・同じ最古保存オッズで評価します。"
+                                    "予測ロジックは変更しません。"
+                                )
+
                         run_v255=st.button("保存済みバージョンを再評価",key="v255_backtest_run",use_container_width=True)
                         try:
                             snap_status=_v260_snapshot_storage_status(engine.DB_PATH,_V231_APP_VERSION)
