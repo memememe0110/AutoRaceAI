@@ -2041,6 +2041,11 @@ def _v256_actual_lap_calibration(db_path: str | None, venue: str = "", cutoff_da
                 for l,xg in g.groupby('lap_no')}
         prev=None
         for lap in range(1,7):
+            try:
+                if int(lap) in (5,6):
+                    late_release_audit_v273[int(lap)]["lap_seen"]+=1
+            except Exception:
+                pass
             cur=orders.get(lap)
             if not cur: continue
             if prev and len(prev)>=3 and len(cur)>=3:
@@ -3631,8 +3636,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     chase_gate_v270={}
     chase_reason_v270={}
     late_release_audit_v273={
-        5: {"eligible":0,"triggered":0,"factor_sum":0.0},
-        6: {"eligible":0,"triggered":0,"factor_sum":0.0},
+        5: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
+            "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0},
+        6: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
+            "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0},
     }
     try:
         _trial_vals_v270 = [
@@ -3802,6 +3809,15 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
                 _branch_noise=0.16
                 logit += rng.normal(0,_branch_noise)
+                try:
+                    _lap_dbg273=int(lap)
+                    if _lap_dbg273 in (5,6):
+                        late_release_audit_v273[_lap_dbg273]["pair_checks"]+=1
+                        late_release_audit_v273[_lap_dbg273]["chaser_seen"]+=1
+                        if float(handicap.get(chaser,0) or 0)>=30.0:
+                            late_release_audit_v273[_lap_dbg273]["rear30_seen"]+=1
+                except Exception:
+                    pass
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
                 # Ver272: Ver271の3～4周目補正を実際の追い抜き確率へ接続。
@@ -3814,6 +3830,12 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     pass
                 # Ver272: 5～6周目は追える根拠が複数ある後方車だけ再加速。
                 try:
+                    try:
+                        _lap_call273=int(lap)
+                        if _lap_call273 in (5,6):
+                            late_release_audit_v273[_lap_call273]["function_called"]+=1
+                    except Exception:
+                        pass
                     _late_factor272=_v272_late_chase_release(
                         lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,1.0),
                         trial_map.get(chaser), _trial_median_v270,
@@ -3961,6 +3983,16 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["Ver273_5周目再加速発動数"]=int(late_release_audit_v273[5]["triggered"])
     out["Ver273_6周目再加速対象数"]=int(late_release_audit_v273[6]["eligible"])
     out["Ver273_6周目再加速発動数"]=int(late_release_audit_v273[6]["triggered"])
+    out["Ver273_5周目ループ到達"]=int(late_release_audit_v273[5]["lap_seen"])
+    out["Ver273_5周目ペア判定"]=int(late_release_audit_v273[5]["pair_checks"])
+    out["Ver273_5周目追走車判定"]=int(late_release_audit_v273[5]["chaser_seen"])
+    out["Ver273_5周目30m以上判定"]=int(late_release_audit_v273[5]["rear30_seen"])
+    out["Ver273_5周目関数呼出"]=int(late_release_audit_v273[5]["function_called"])
+    out["Ver273_6周目ループ到達"]=int(late_release_audit_v273[6]["lap_seen"])
+    out["Ver273_6周目ペア判定"]=int(late_release_audit_v273[6]["pair_checks"])
+    out["Ver273_6周目追走車判定"]=int(late_release_audit_v273[6]["chaser_seen"])
+    out["Ver273_6周目30m以上判定"]=int(late_release_audit_v273[6]["rear30_seen"])
+    out["Ver273_6周目関数呼出"]=int(late_release_audit_v273[6]["function_called"])
     if "予測競走T" in out.columns:
         out["Ver265補正後予測競走T"]=pd.to_numeric(out["予測競走T"],errors="coerce") + out["Ver265タイム残差補正秒"]
         out["Ver268補正後予測競走T"]=(
@@ -12080,10 +12112,10 @@ if selected_main_page == "🗃️ 登録情報確認":
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
 
 
-                        with st.expander("🧪 Ver273 終盤再加速・発動ログ", expanded=False):
+                        with st.expander("🧪 Ver273 終盤再加速・詳細経路ログ", expanded=False):
                             st.caption(
-                                "5周目・6周目の再加速が、実際に何回対象になり何回発動したかを確認します。"
-                                "予測ロジックは変えず、監査表示だけ追加しています。"
+                                "5・6周目について、周回ループ → ペア判定 → chaser → 30m以上 → "
+                                "再加速関数呼出 → 対象 → 発動、のどこで止まっているか確認します。"
                             )
                             try:
                                 _hist273 = [
@@ -12099,29 +12131,52 @@ if selected_main_page == "🗃️ 登録情報確認":
                                         _df273 = (_v273 or {}).get("df")
                                         if _df273 is None or getattr(_df273, "empty", True):
                                             continue
-                                        _first273 = _df273.iloc[0]
+                                        _f = _df273.iloc[0]
                                         _rows273.append({
                                             "history_id": int(_h273.get("history_id") or 0),
                                             "race": str(_h273.get("display_label") or _h273.get("race_key") or ""),
-                                            "5周対象": int(_first273.get("Ver273_5周目再加速対象数",0) or 0),
-                                            "5周発動": int(_first273.get("Ver273_5周目再加速発動数",0) or 0),
-                                            "6周対象": int(_first273.get("Ver273_6周目再加速対象数",0) or 0),
-                                            "6周発動": int(_first273.get("Ver273_6周目再加速発動数",0) or 0),
+                                            "5周ループ": int(_f.get("Ver273_5周目ループ到達",0) or 0),
+                                            "5周ペア": int(_f.get("Ver273_5周目ペア判定",0) or 0),
+                                            "5周chaser": int(_f.get("Ver273_5周目追走車判定",0) or 0),
+                                            "5周30m+": int(_f.get("Ver273_5周目30m以上判定",0) or 0),
+                                            "5周関数": int(_f.get("Ver273_5周目関数呼出",0) or 0),
+                                            "5周対象": int(_f.get("Ver273_5周目再加速対象数",0) or 0),
+                                            "5周発動": int(_f.get("Ver273_5周目再加速発動数",0) or 0),
+                                            "6周ループ": int(_f.get("Ver273_6周目ループ到達",0) or 0),
+                                            "6周ペア": int(_f.get("Ver273_6周目ペア判定",0) or 0),
+                                            "6周chaser": int(_f.get("Ver273_6周目追走車判定",0) or 0),
+                                            "6周30m+": int(_f.get("Ver273_6周目30m以上判定",0) or 0),
+                                            "6周関数": int(_f.get("Ver273_6周目関数呼出",0) or 0),
+                                            "6周対象": int(_f.get("Ver273_6周目再加速対象数",0) or 0),
+                                            "6周発動": int(_f.get("Ver273_6周目再加速発動数",0) or 0),
                                         })
                                     except Exception:
                                         continue
                                 _log273 = pd.DataFrame(_rows273)
                                 if _log273.empty:
-                                    st.info("まだ発動ログ付きVer273予測がありません。Ver273で再シミュレーション後に表示されます。")
+                                    st.info("まだ詳細ログ付きVer273予測がありません。再シミュレーション後に表示されます。")
                                 else:
-                                    _c1,_c2,_c3,_c4 = st.columns(4)
-                                    _c1.metric("5周対象", int(_log273["5周対象"].sum()))
-                                    _c2.metric("5周発動", int(_log273["5周発動"].sum()))
-                                    _c3.metric("6周対象", int(_log273["6周対象"].sum()))
-                                    _c4.metric("6周発動", int(_log273["6周発動"].sum()))
                                     st.dataframe(_log273, use_container_width=True, hide_index=True)
+                                    st.caption(
+                                        "5周目合計: "
+                                        f"ループ{int(_log273['5周ループ'].sum())} / "
+                                        f"ペア{int(_log273['5周ペア'].sum())} / "
+                                        f"30m+{int(_log273['5周30m+'].sum())} / "
+                                        f"関数{int(_log273['5周関数'].sum())} / "
+                                        f"対象{int(_log273['5周対象'].sum())} / "
+                                        f"発動{int(_log273['5周発動'].sum())}"
+                                    )
+                                    st.caption(
+                                        "6周目合計: "
+                                        f"ループ{int(_log273['6周ループ'].sum())} / "
+                                        f"ペア{int(_log273['6周ペア'].sum())} / "
+                                        f"30m+{int(_log273['6周30m+'].sum())} / "
+                                        f"関数{int(_log273['6周関数'].sum())} / "
+                                        f"対象{int(_log273['6周対象'].sum())} / "
+                                        f"発動{int(_log273['6周発動'].sum())}"
+                                    )
                             except Exception as _e273log:
-                                st.warning("終盤再加速ログの読込に失敗: " + _runtime_exception_text(_e273log))
+                                st.warning("終盤詳細ログの読込に失敗: " + _runtime_exception_text(_e273log))
 
                         st.markdown("#### ⚖️ Ver別 精度・回収率 共通レース比較")
                         st.caption(
