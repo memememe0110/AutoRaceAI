@@ -194,6 +194,29 @@ def _v266_load_error_rows(db_path, limit_rows=20000):
             return pd.DataFrame(), "競走T付きの実結果がありません"
 
         # ---------- 保存済み予測 ----------
+        # Ver266専用テーブルに保存された「当時の予測T」を最優先する。
+        _v266_ensure_pred_time_snapshot_table(db_path)
+        sdf = pd.read_sql_query("""
+            SELECT s.history_id,s.race_key,s.app_version AS version,s.car_no,
+                   s.player_name,s.predicted_race_time AS pred_race_time,
+                   s.source_kind,h.prediction_time
+            FROM v266_pred_time_snapshots s
+            LEFT JOIN v231_prediction_history h ON h.history_id=s.history_id
+        """, con)
+        if not sdf.empty:
+            sdf["car_no"] = sdf["car_no"].astype(str).str.replace(".0","",regex=False).str.strip()
+            rdf2 = rdf.copy()
+            rdf2["car_no"] = rdf2["car_no"].astype(str).str.replace(".0","",regex=False).str.strip()
+            m = sdf.merge(rdf2, on=["race_key","car_no"], how="inner", suffixes=("_pred",""))
+            if not m.empty:
+                m["pred_race_time"] = pd.to_numeric(m["pred_race_time"], errors="coerce")
+                m["actual_race_time"] = pd.to_numeric(m["actual_race_time"], errors="coerce")
+                m = m.dropna(subset=["pred_race_time","actual_race_time"])
+                m["error_sec"] = m["actual_race_time"] - m["pred_race_time"]
+                m["abs_error_sec"] = m["error_sec"].abs()
+                return m, ""
+
+        # 専用テーブルが空なら、旧履歴payloadから直接抽出を試す。
         pred_table = None
         for t in ("v231_prediction_history", "prediction_history", "predictions"):
             if t in tables:
@@ -3142,6 +3165,177 @@ def _v231_ensure_prediction_history_table(db_path: str) -> None:
         con.execute("CREATE INDEX IF NOT EXISTS idx_v231_prediction_history_latest ON v231_prediction_history(prediction_time DESC, history_id DESC)")
         con.commit()
 
+
+def _v266_ensure_pred_time_snapshot_table(db_path: str) -> None:
+    """Ver266: 車番別の予測競走Tを履歴ID単位で永続保存する。"""
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v266_pred_time_snapshots (
+                snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                history_id INTEGER NOT NULL,
+                race_key TEXT,
+                app_version TEXT NOT NULL,
+                car_no INTEGER NOT NULL,
+                player_name TEXT,
+                predicted_race_time REAL NOT NULL,
+                source_kind TEXT NOT NULL DEFAULT 'saved_view',
+                created_at TEXT NOT NULL,
+                UNIQUE(history_id, car_no)
+            )
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_v266_pred_time_race
+            ON v266_pred_time_snapshots(race_key, app_version, car_no)
+        """)
+        con.commit()
+
+
+def _v266_extract_pred_time_rows_from_view(view: dict) -> list[dict]:
+    """保存済みprediction_viewのdfから、その時点の予測競走Tを取り出す。再計算はしない。"""
+    out = []
+    if not isinstance(view, dict):
+        return out
+    df = view.get("df")
+    if df is None:
+        return out
+    try:
+        rows = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
+    except Exception:
+        return out
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        car = row.get("車", row.get("車番", row.get("car_no")))
+        name = row.get("選手名", row.get("player_name", ""))
+        pred = None
+        # その履歴に実際に保存されている列を優先。
+        for key in (
+            "Ver266補正後予測競走T",
+            "Ver265補正後予測競走T",
+            "予測競走T",
+            "予測競走タイム",
+            "pred_race_time",
+            "predicted_race_time",
+        ):
+            if key not in row:
+                continue
+            try:
+                val = float(row.get(key))
+                if np.isfinite(val):
+                    pred = val
+                    break
+            except Exception:
+                pass
+        if car is None or pred is None:
+            continue
+        try:
+            car = int(float(car))
+        except Exception:
+            continue
+        out.append({
+            "car_no": car,
+            "player_name": str(name or ""),
+            "predicted_race_time": float(pred),
+        })
+    return out
+
+
+def _v266_save_pred_time_snapshot(
+    db_path: str,
+    history_id: int,
+    race_key: str,
+    app_version: str,
+    view: dict,
+    source_kind: str = "saved_view",
+) -> int:
+    """prediction_viewに保存されている値を、そのまま車番別スナップショットへ保存する。"""
+    if not history_id:
+        return 0
+    rows = _v266_extract_pred_time_rows_from_view(view)
+    if not rows:
+        return 0
+    _v266_ensure_pred_time_snapshot_table(db_path)
+    now = _v228_now_jst_iso()
+    saved = 0
+    with sqlite3.connect(str(db_path)) as con:
+        for row in rows:
+            con.execute("""
+                INSERT INTO v266_pred_time_snapshots
+                (history_id,race_key,app_version,car_no,player_name,predicted_race_time,source_kind,created_at)
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(history_id,car_no) DO UPDATE SET
+                    race_key=excluded.race_key,
+                    app_version=excluded.app_version,
+                    player_name=excluded.player_name,
+                    predicted_race_time=excluded.predicted_race_time,
+                    source_kind=excluded.source_kind,
+                    created_at=excluded.created_at
+            """, (
+                int(history_id), str(race_key or ""), str(app_version or ""),
+                int(row["car_no"]), str(row["player_name"]),
+                float(row["predicted_race_time"]), str(source_kind), now,
+            ))
+            saved += 1
+        con.commit()
+    return saved
+
+
+def _v266_backfill_pred_time_snapshots(db_path: str, limit: int = 500) -> dict:
+    """
+    過去のv231_prediction_history payloadを展開し、
+    当時保存されたview['df']の予測競走Tをそのまま補完する。
+    現在コードで再計算しないため、旧Verの値を偽装しない。
+    """
+    out = {"checked": 0, "histories_saved": 0, "cars_saved": 0, "already": 0, "no_time": 0, "errors": []}
+    _v231_ensure_prediction_history_table(db_path)
+    _v266_ensure_pred_time_snapshot_table(db_path)
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        histories = con.execute("""
+            SELECT history_id,race_key,app_version,payload
+            FROM v231_prediction_history
+            ORDER BY history_id DESC
+            LIMIT ?
+        """, (int(limit),)).fetchall()
+
+    for h in histories:
+        out["checked"] += 1
+        hid = int(h["history_id"])
+        try:
+            with sqlite3.connect(str(db_path)) as con:
+                existing = int(con.execute(
+                    "SELECT COUNT(*) FROM v266_pred_time_snapshots WHERE history_id=?",
+                    (hid,)
+                ).fetchone()[0] or 0)
+            if existing > 0:
+                out["already"] += 1
+                continue
+
+            view = pickle.loads(zlib.decompress(bytes(h["payload"])))
+            if not isinstance(view, dict):
+                out["no_time"] += 1
+                continue
+
+            n = _v266_save_pred_time_snapshot(
+                db_path=db_path,
+                history_id=hid,
+                race_key=str(h["race_key"] or ""),
+                app_version=str(h["app_version"] or view.get("app_version") or ""),
+                view=view,
+                source_kind="historical_saved_view",
+            )
+            if n > 0:
+                out["histories_saved"] += 1
+                out["cars_saved"] += int(n)
+            else:
+                out["no_time"] += 1
+        except Exception as exc:
+            out["errors"].append(f"履歴ID{hid}: {type(exc).__name__}: {exc}")
+    return out
+
+
 def _v231_save_prediction_history(db_path: str, race_key: str, raw_text: str, venue_override: str, view: dict, trials: int, seed: int) -> int:
     race_key = str(race_key or "").strip()
     if not race_key or not isinstance(view, dict):
@@ -3160,7 +3354,22 @@ def _v231_save_prediction_history(db_path: str, race_key: str, raw_text: str, ve
             VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (race_key,label,app_version,simulation_mode,settings_hash,now,int(trials or 0),int(seed or 0),str(raw_text or ""),str(venue_override or ""),sqlite3.Binary(payload)))
         con.commit()
-        return int(cur.lastrowid or 0)
+        history_id = int(cur.lastrowid or 0)
+
+    # Ver266: 履歴保存時点のdfから車番別予測競走Tを同時保存。
+    # 失敗しても本体予測履歴の保存は成功扱いにする。
+    try:
+        _v266_save_pred_time_snapshot(
+            db_path=db_path,
+            history_id=history_id,
+            race_key=race_key,
+            app_version=app_version,
+            view=view,
+            source_kind="saved_view",
+        )
+    except Exception:
+        pass
+    return history_id
 
 def _v231_list_prediction_histories(db_path: str, limit: int = 120) -> list[dict]:
     try:
@@ -10902,6 +11111,35 @@ if selected_main_page == "🗃️ 登録情報確認":
 
 # Ver245: 6周展開診断表示と、同一1着・同一3車の2着3着入替ペアを条件付きで保護。
 
+
+
+# Ver266: 予測競走Tスナップショット管理
+try:
+    with st.expander("💾 Ver266 予測競走Tスナップショット", expanded=False):
+        _v266_ensure_pred_time_snapshot_table(engine.DB_PATH)
+        with sqlite3.connect(str(engine.DB_PATH)) as _c:
+            _v266_snap_count = int(_c.execute("SELECT COUNT(*) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
+            _v266_hist_count = int(_c.execute("SELECT COUNT(*) FROM v231_prediction_history").fetchone()[0] or 0)
+            _v266_snap_histories = int(_c.execute("SELECT COUNT(DISTINCT history_id) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
+        a,b,c = st.columns(3)
+        a.metric("予測履歴", f"{_v266_hist_count}件")
+        b.metric("予測T保存済み履歴", f"{_v266_snap_histories}件")
+        c.metric("車番別予測T", f"{_v266_snap_count}走")
+        st.caption(
+            "過去履歴のprediction_viewに保存されているdfから、当時の予測競走Tをそのまま補完します。"
+            "現在Verでの再計算値ではありません。"
+        )
+        if st.button("🔧 過去の保存済み予測Tを一括補完", key="v266_backfill_pred_time"):
+            with st.spinner("保存済み履歴から予測競走Tを補完しています..."):
+                _bf = _v266_backfill_pred_time_snapshots(engine.DB_PATH, 1000)
+            st.success(
+                f"確認{_bf['checked']}件 / 補完{_bf['histories_saved']}履歴・{_bf['cars_saved']}走 / "
+                f"既登録{_bf['already']}件 / 予測Tなし{_bf['no_time']}件 / エラー{len(_bf['errors'])}件"
+            )
+            if _bf["errors"]:
+                st.warning(" / ".join(_bf["errors"][:10]))
+except Exception as _v266_snap_exc:
+    st.warning("Ver266予測Tスナップショット管理エラー: " + _runtime_exception_text(_v266_snap_exc))
 
 # Ver266 diagnostic panel
 try:
