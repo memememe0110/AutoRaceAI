@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver268"
+APP_VERSION = "Ver269"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -1473,8 +1473,26 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         if not rk or rk in seen:
             continue
         seen.add(rk); unique.append(h)
+    # Ver269: 本来の時系列順で再シミュレーションする。
+    # 各保存履歴から開催日・場・Rを読み、古いレース→新しいレースへ並べる。
+    chronological=[]
+    for h in unique:
+        try:
+            _v, _raw, _vo, _hm = _v231_load_prediction_history(db_path, int(h.get('history_id') or 0))
+            _mm = (_v or {}).get('meta') or {}
+            _date = str(_mm.get('開催日') or _mm.get('日付') or _mm.get('race_date') or _mm.get('date') or '')[:10]
+            _venue = str(_mm.get('開催場') or _mm.get('場') or _mm.get('venue') or _mm.get('track') or '')
+            _rraw = str(_mm.get('R') or _mm.get('レース') or _mm.get('レース番号') or _mm.get('race_no') or _mm.get('race') or '')
+            _rm = re.search(r'\d+', _rraw)
+            _rno = int(_rm.group()) if _rm else 999
+            chronological.append((_date, _venue, _rno, int(h.get('history_id') or 0), h))
+        except Exception:
+            chronological.append(('9999-99-99','',999,int(h.get('history_id') or 0),h))
+    chronological.sort(key=lambda x:(x[0],x[1],x[2],x[3]))
+    unique=[x[4] for x in chronological]
+
     total=len(unique)
-    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver265')
+    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver269')
     # 現行Verで「予測履歴＋6周スナップショット」まで揃っているレースだけスキップする。
     # 履歴だけ存在して周回保存が欠けている場合は、一括再シミュレーションで自動修復する。
     current_keys=set()
@@ -1544,7 +1562,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 'prediction_time':_v228_now_jst_iso(),'seed':seed,
                 'rerun_from_restored':True,'rerun_source_version':src_ver,
                 'rerun_source_history_id':int(h.get('history_id') or 0),
-                'batch_rerun':True,
+                'batch_rerun':True,'walk_forward_v269':True,
             }
             hid=_v231_save_prediction_history(db_path,race_key,raw_text,venue_override,prediction_view,trials,seed)
             _v222_save_prediction_restore(db_path,race_key,raw_text,venue_override,prediction_view)
@@ -2704,7 +2722,7 @@ def _v265_time_adjustment_seconds(cal: dict, player_name: str, handicap_value: f
 
 _V268_HANDICAP_MODEL_CACHE = {}
 
-def _v268_handicap_bias_model(db_path: str | None, venue: str = "", cutoff_date: str = "") -> dict:
+def _v268_handicap_bias_model(db_path: str | None, venue: str = "", cutoff_date: str = "", cutoff_race_no: int = 0) -> dict:
     empty = {
         "enabled": False, "samples": 0, "venue": str(venue or ""),
         "slope": 0.0, "intercept": 0.0, "shrink": 0.0,
@@ -2714,7 +2732,7 @@ def _v268_handicap_bias_model(db_path: str | None, venue: str = "", cutoff_date:
     if not db_path or not os.path.exists(str(db_path)):
         return empty
 
-    key = (str(db_path), str(venue or ""), str(cutoff_date or "")[:10])
+    key = (str(db_path), str(venue or ""), str(cutoff_date or "")[:10], int(cutoff_race_no or 0))
     if key in _V268_HANDICAP_MODEL_CACHE:
         return dict(_V268_HANDICAP_MODEL_CACHE[key])
 
@@ -2739,8 +2757,18 @@ def _v268_handicap_bias_model(db_path: str | None, venue: str = "", cutoff_date:
             """
             params = []
             if cutoff_date:
-                q += " AND rr.race_date < ?"
-                params.append(str(cutoff_date)[:10])
+                if int(cutoff_race_no or 0) > 0:
+                    q += """ AND (
+                        substr(rr.race_date,1,10) < substr(?,1,10)
+                        OR (
+                            substr(rr.race_date,1,10) = substr(?,1,10)
+                            AND CAST(REPLACE(REPLACE(COALESCE(rr.race_no,''),'R',''),'r','') AS INTEGER) < ?
+                        )
+                    )"""
+                    params.extend([str(cutoff_date)[:10], str(cutoff_date)[:10], int(cutoff_race_no)])
+                else:
+                    q += " AND substr(rr.race_date,1,10) < substr(?,1,10)"
+                    params.append(str(cutoff_date)[:10])
             if venue:
                 q += " AND rr.venue = ?"
                 params.append(str(venue))
@@ -2960,7 +2988,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     player_actual_calibration=_v258_player_actual_lap_calibration(_v230_db_path(), venue, race_date)
     player_actual_delta=player_actual_calibration.get("player_delta") or {}
     time_residual_v265=_v265_time_residual_calibration(_v230_db_path(), venue, race_date)
-    handicap_bias_v268=_v268_handicap_bias_model(_v230_db_path(), venue, race_date)
+    _race_no_v269 = 0
+    try:
+        _race_no_raw = str(meta.get("R") or meta.get("レース") or meta.get("レース番号") or meta.get("race_no") or meta.get("race") or "")
+        _race_no_m = re.search(r"\d+", _race_no_raw)
+        _race_no_v269 = int(_race_no_m.group()) if _race_no_m else 0
+    except Exception:
+        _race_no_v269 = 0
+    handicap_bias_v268=_v268_handicap_bias_model(_v230_db_path(), venue, race_date, _race_no_v269)
     time_adjust_v265={}
     time_expected_v265={}
     time_samples_v265={}
@@ -3292,6 +3327,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "player_actual_learning_v258": {"enabled":False,"reason":"Ver265ではVer257基準へ戻すため予測反映停止"},
         "time_residual_learning_v265": time_residual_v265,
         "handicap_bias_v268": handicap_bias_v268,
+        "walk_forward_cutoff_v269": {"date": race_date, "race_no": _race_no_v269},
         "time_adjustments_v265": {str(k):round(float(v),5) for k,v in time_adjust_v265.items()},
         "predicted_lap_orders": modal_laps,
         "actual_lap_comparison": lap_comparison,
@@ -11349,10 +11385,10 @@ if selected_main_page == "🗃️ 登録情報確認":
                                     st.warning(" / ".join(_repair.get('errors',[])[:12]))
                                 st.rerun()
 
-                            st.markdown(f"#### ♻️ 保存済み予測を全部{_V231_APP_VERSION}で再シミュレーション")
-                            st.caption("各レースの最新保存入力を現在コードで再計算し、現行Verの別履歴＋1〜6周スナップショットを保存します。現行Verでも周回保存が不足しているレースは自動修復し、6周まで揃っているレースだけスキップします。")
+                            st.markdown(f"#### ⏱️ 保存済み予測を時系列順に{_V231_APP_VERSION}で再シミュレーション")
+                            st.caption("保存レースを開催日→開催場→Rの順に並べ、当時その時点より前に判明していた結果だけで再計算します。同日も1R→2R→3R…の順で、後のRから前のRへ情報が逆流しないウォークフォワード方式です。")
                             _v262_batch_limit=st.number_input("一括再シミュレーションする保存レース数",min_value=1,max_value=300,value=80,step=10,key="v262_batch_rerun_limit")
-                            if st.button(f"♻️ 保存済み予測を全部{_V231_APP_VERSION}で再シミュレーション",key="v262_batch_rerun",type="primary",use_container_width=True):
+                            if st.button(f"⏱️ 時系列順に{_V231_APP_VERSION}で一括再シミュレーション",key="v262_batch_rerun",type="primary",use_container_width=True):
                                 _prog=st.progress(0.0,text="一括再シミュレーションを開始します…")
                                 def _v262_progress(done,total,label):
                                     frac=(float(done)/float(total)) if total else 1.0
