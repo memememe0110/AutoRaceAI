@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver277"
+APP_VERSION = "Ver278"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -3936,7 +3936,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 try:
                     _mid_factor272,_=_v271_mid_lap_pass_factor(
                         lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,1.0),
-                        trial.get(chaser), _trial_median_v270)
+                        trial.get(chaser), None)
                     p=float(np.clip(p*_mid_factor272,0.035,0.88))
                 except Exception:
                     pass
@@ -3948,9 +3948,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                             late_release_audit_v273[_lap_call273]["function_called"]+=1
                     except Exception:
                         pass
+                    _late_trial_median_v278 = _trial_median_v270 if int(lap)==6 else None
                     _late_factor272,_late_diag274=_v272_late_chase_release(
                         lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,0.75),
-                        trial.get(chaser), _trial_median_v270,
+                        trial.get(chaser), _late_trial_median_v278,
                         time_adjust_v265.get(chaser,0.0), time_samples_v265.get(chaser,0), return_diag=True)
                     try:
                         _lap_diag274=int(lap)
@@ -4181,6 +4182,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "chase_gate_v270": chase_gate_v270,
         "chase_reason_v270": chase_reason_v270,
         "late_release_audit_v273": late_release_audit_v273,
+        "v278_trial_scope": {"lap3_4_trial_median":False,"lap5_trial_median":False,"lap6_trial_median":True},
         "time_adjustments_v265": {str(k):round(float(v),5) for k,v in time_adjust_v265.items()},
         "predicted_lap_orders": modal_laps,
         "actual_lap_comparison": lap_comparison,
@@ -12255,7 +12257,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
 
 
-                        with st.expander("🧪 Ver277 終盤再加速・詳細経路ログ", expanded=False):
+                        with st.expander("🧪 Ver278 終盤再加速・詳細経路ログ", expanded=False):
                             st.caption(
                                 "保存済み予測DataFrameではなく、シミュレーション直後にmetaへ保存した監査辞書を直接表示します。"
                                 "これで列の欠落・上書きの影響を受けません。"
