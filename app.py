@@ -1742,7 +1742,7 @@ def _v273_virtual_roi_score(
         return out
 
 
-def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None) -> dict:
+def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False) -> dict:
     out={
         "checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[],
         "roi_evaluated":0,"roi_no_odds":0,"roi_no_payout":0,
@@ -1835,7 +1835,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             if callable(progress_cb):
                 progress_cb(idx-1,total,label)
             race_key0=str(h.get('race_key') or '').strip()
-            if race_key0 in current_complete_keys and race_key0 in current_audit_complete_keys:
+            if (not force_current) and race_key0 in current_complete_keys and race_key0 in current_audit_complete_keys:
                 out['skipped_current']+=1
                 continue
             view, raw_text, venue_override, hm=_v231_load_prediction_history(db_path,int(h.get('history_id') or 0))
@@ -1926,8 +1926,10 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         out["roi_return_rate"]=float(out["roi_payout_yen"])/float(out["roi_cost_yen"])*100.0
     else:
         out["roi_return_rate"]=None
+    _force_note = " / 強制再計算ON" if force_current else ""
     out['message']=(f"確認{out['checked']}レース / {current_ver}再シミュレーション{out['rerun']} / "
-                    f"監査列まで保存済み{out['skipped_current']} / 入力材料なし{out['no_text']} / エラー{len(out['errors'])}")
+                    f"監査列まで保存済み{out['skipped_current']} / 入力材料なし{out['no_text']} / エラー{len(out['errors'])}"
+                    f"{_force_note}")
     return out
 
 def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date: str) -> dict:
@@ -3744,10 +3746,12 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     late_release_audit_v273={
         5: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
             "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
-            "score_below_required":0,"residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0},
+            "score_below_required":0,"residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0,
+            "errors":0,"last_error":""},
         6: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
             "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
-            "score_below_required":0,"residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0},
+            "score_below_required":0,"residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0,
+            "errors":0,"last_error":""},
     }
     try:
         _trial_vals_v270 = [
@@ -3964,8 +3968,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     except Exception:
                         pass
                     p=float(np.clip(p*_late_factor272,0.035,0.88))
-                except Exception:
-                    pass
+                except Exception as _e_late275:
+                    try:
+                        _lap_err275=int(lap)
+                        if _lap_err275 in (5,6):
+                            late_release_audit_v273[_lap_err275]["errors"]+=1
+                            late_release_audit_v273[_lap_err275]["last_error"]=f"{type(_e_late275).__name__}: {_e_late275}"
+                    except Exception:
+                        pass
                 # 差が開きすぎていればまず追いつく必要がある。
                 # 大差なら即追越しは難しいが、速度優位車はまず差を詰められる。
                 catch_factor=max(0.10,1.0-min(0.78,gaps[i]*1.12))
@@ -12247,87 +12257,87 @@ if selected_main_page == "🗃️ 登録情報確認":
 
                         with st.expander("🧪 Ver275 終盤再加速・詳細経路ログ", expanded=False):
                             st.caption(
-                                "5・6周目について、周回ループ → ペア判定 → chaser → 30m以上 → "
-                                "再加速関数呼出 → 対象 → 発動、のどこで止まっているか確認します。"
+                                "保存済み予測DataFrameではなく、シミュレーション直後にmetaへ保存した監査辞書を直接表示します。"
+                                "これで列の欠落・上書きの影響を受けません。"
                             )
                             try:
-                                _hist273 = [
-                                    h for h in _v231_list_prediction_histories(engine.DB_PATH, 500)
+                                _hist275 = [
+                                    h for h in _v231_list_prediction_histories(engine.DB_PATH, 1000)
                                     if str(h.get("app_version") or "") == _V231_APP_VERSION
                                 ]
-                                _rows273 = []
-                                for _h273 in _hist273:
+                                # 同じレースに複数履歴がある場合は最新1件だけ表示
+                                _seen_races275=set()
+                                _rows275=[]
+                                for _h275 in _hist275:
+                                    _rk275=str(_h275.get("race_key") or "")
+                                    if not _rk275 or _rk275 in _seen_races275:
+                                        continue
                                     try:
-                                        _v273, _raw273, _vo273, _hm273 = _v231_load_prediction_history(
-                                            engine.DB_PATH, int(_h273.get("history_id") or 0)
+                                        _view275, _raw275, _vo275, _hm275 = _v231_load_prediction_history(
+                                            engine.DB_PATH, int(_h275.get("history_id") or 0)
                                         )
-                                        _df273 = (_v273 or {}).get("df")
-                                        if _df273 is None or getattr(_df273, "empty", True):
+                                        _meta275=(_view275 or {}).get("meta") or {}
+                                        _wa275=(
+                                            _meta275.get("6周展開シミュレーション")
+                                            or _meta275.get("壁補正監査")
+                                            or {}
+                                        )
+                                        _late275=(_wa275 or {}).get("late_release_audit_v273") or {}
+                                        _a5=_late275.get(5) or _late275.get("5") or {}
+                                        _a6=_late275.get(6) or _late275.get("6") or {}
+                                        if not _a5 and not _a6:
                                             continue
-                                        _required273 = [
-                                            "Ver273_5周目ループ到達",
-                                            "Ver273_5周目関数呼出",
-                                            "Ver273_5周目再加速発動数",
-                                            "Ver273_6周目ループ到達",
-                                            "Ver273_6周目関数呼出",
-                                            "Ver273_6周目再加速発動数",
-                                        ]
-                                        if not all(c in _df273.columns for c in _required273):
-                                            continue
-                                        _f = _df273.iloc[0]
-                                        _rows273.append({
-                                            "history_id": int(_h273.get("history_id") or 0),
-                                            "race": str(_h273.get("display_label") or _h273.get("race_key") or ""),
-                                            "5周ループ": int(_f.get("Ver273_5周目ループ到達",0) or 0),
-                                            "5周ペア": int(_f.get("Ver273_5周目ペア判定",0) or 0),
-                                            "5周chaser": int(_f.get("Ver273_5周目追走車判定",0) or 0),
-                                            "5周30m+": int(_f.get("Ver273_5周目30m以上判定",0) or 0),
-                                            "5周関数": int(_f.get("Ver273_5周目関数呼出",0) or 0),
-                                            "5周対象": int(_f.get("Ver273_5周目再加速対象数",0) or 0),
-                                            "5周発動": int(_f.get("Ver273_5周目再加速発動数",0) or 0),
-                                            "6周ループ": int(_f.get("Ver273_6周目ループ到達",0) or 0),
-                                            "6周ペア": int(_f.get("Ver273_6周目ペア判定",0) or 0),
-                                            "6周chaser": int(_f.get("Ver273_6周目追走車判定",0) or 0),
-                                            "6周30m+": int(_f.get("Ver273_6周目30m以上判定",0) or 0),
-                                            "6周関数": int(_f.get("Ver273_6周目関数呼出",0) or 0),
-                                            "6周対象": int(_f.get("Ver273_6周目再加速対象数",0) or 0),
-                                            "6周発動": int(_f.get("Ver273_6周目再加速発動数",0) or 0),
-                                            "5周スコア不足": int(_f.get("Ver273_5周目スコア不足",0) or 0),
-                                            "5周残差不足": int(_f.get("Ver273_5周目残差不足",0) or 0),
-                                            "5周ゲート不足": int(_f.get("Ver273_5周目ゲート不足",0) or 0),
-                                            "5周試走不足": int(_f.get("Ver273_5周目試走不足",0) or 0),
-                                            "6周スコア不足": int(_f.get("Ver273_6周目スコア不足",0) or 0),
-                                            "6周残差不足": int(_f.get("Ver273_6周目残差不足",0) or 0),
-                                            "6周ゲート不足": int(_f.get("Ver273_6周目ゲート不足",0) or 0),
-                                            "6周試走不足": int(_f.get("Ver273_6周目試走不足",0) or 0),
+                                        _seen_races275.add(_rk275)
+                                        _rows275.append({
+                                            "history_id": int(_h275.get("history_id") or 0),
+                                            "race": _rk275,
+                                            "5周ペア": int(_a5.get("pair_checks",0) or 0),
+                                            "5周30m+": int(_a5.get("rear30_seen",0) or 0),
+                                            "5周関数": int(_a5.get("function_called",0) or 0),
+                                            "5周対象": int(_a5.get("eligible",0) or 0),
+                                            "5周発動": int(_a5.get("triggered",0) or 0),
+                                            "5周スコア不足": int(_a5.get("score_below_required",0) or 0),
+                                            "5周残差不足": int(_a5.get("residual_samples_lt5",0) or 0),
+                                            "5周ゲート不足": int(_a5.get("gate_lt_080",0) or 0),
+                                            "5周試走不足": int(_a5.get("trial_missing",0) or 0),
+                                            "5周エラー": int(_a5.get("errors",0) or 0),
+                                            "5周最終エラー": str(_a5.get("last_error","") or ""),
+                                            "6周ペア": int(_a6.get("pair_checks",0) or 0),
+                                            "6周30m+": int(_a6.get("rear30_seen",0) or 0),
+                                            "6周関数": int(_a6.get("function_called",0) or 0),
+                                            "6周対象": int(_a6.get("eligible",0) or 0),
+                                            "6周発動": int(_a6.get("triggered",0) or 0),
+                                            "6周スコア不足": int(_a6.get("score_below_required",0) or 0),
+                                            "6周残差不足": int(_a6.get("residual_samples_lt5",0) or 0),
+                                            "6周ゲート不足": int(_a6.get("gate_lt_080",0) or 0),
+                                            "6周試走不足": int(_a6.get("trial_missing",0) or 0),
+                                            "6周エラー": int(_a6.get("errors",0) or 0),
+                                            "6周最終エラー": str(_a6.get("last_error","") or ""),
                                         })
                                     except Exception:
                                         continue
-                                _log273 = pd.DataFrame(_rows273)
-                                if _log273.empty:
-                                    st.info("まだ監査列が保存されたVer273予測がありません。この修正版で再シミュレーションすると表示されます。")
+
+                                _log275=pd.DataFrame(_rows275)
+                                if _log275.empty:
+                                    st.info("まだVer275のmeta監査ログが保存されていません。再シミュレーション後に表示されます。")
                                 else:
-                                    st.dataframe(_log273, use_container_width=True, hide_index=True)
+                                    st.dataframe(_log275,use_container_width=True,hide_index=True)
                                     st.caption(
                                         "5周目合計: "
-                                        f"ループ{int(_log273['5周ループ'].sum())} / "
-                                        f"ペア{int(_log273['5周ペア'].sum())} / "
-                                        f"30m+{int(_log273['5周30m+'].sum())} / "
-                                        f"関数{int(_log273['5周関数'].sum())} / "
-                                        f"対象{int(_log273['5周対象'].sum())} / "
-                                        f"発動{int(_log273['5周発動'].sum())}"
+                                        f"関数{int(_log275['5周関数'].sum())} / "
+                                        f"対象{int(_log275['5周対象'].sum())} / "
+                                        f"発動{int(_log275['5周発動'].sum())} / "
+                                        f"エラー{int(_log275['5周エラー'].sum())}"
                                     )
                                     st.caption(
                                         "6周目合計: "
-                                        f"ループ{int(_log273['6周ループ'].sum())} / "
-                                        f"ペア{int(_log273['6周ペア'].sum())} / "
-                                        f"30m+{int(_log273['6周30m+'].sum())} / "
-                                        f"関数{int(_log273['6周関数'].sum())} / "
-                                        f"対象{int(_log273['6周対象'].sum())} / "
-                                        f"発動{int(_log273['6周発動'].sum())}"
+                                        f"関数{int(_log275['6周関数'].sum())} / "
+                                        f"対象{int(_log275['6周対象'].sum())} / "
+                                        f"発動{int(_log275['6周発動'].sum())} / "
+                                        f"エラー{int(_log275['6周エラー'].sum())}"
                                     )
-                            except Exception as _e273log:
-                                st.warning("終盤詳細ログの読込に失敗: " + _runtime_exception_text(_e273log))
+                            except Exception as _e275log:
+                                st.warning("終盤詳細ログの読込に失敗: " + _runtime_exception_text(_e275log))
 
                         st.markdown("#### ⚖️ Ver別 精度・回収率 共通レース比較")
                         st.caption(
@@ -12462,14 +12472,20 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 st.rerun()
 
                             st.markdown(f"#### ⏱️ 保存済み予測を時系列順に{_V231_APP_VERSION}で再シミュレーション＋回収率採点")
-                            st.caption("保存レースを開催日→開催場→Rの順に並べ、当時その時点より前に判明していた結果だけで再計算します。同日も1R→2R→3R…の順です。再計算後、保存済み最古オッズと登録済み払戻があるレースだけ、1点100円の仮想回収率を自動採点します。")
+                            st.caption("保存レースを開催日→開催場→Rの順に並べ、当時その時点より前に判明していた結果だけで再計算します。同日も1R→2R→3R…の順です。強制再シミュレーションONなら、同じVerの既存履歴があっても新しい履歴として再保存します。")
                             _v262_batch_limit=st.number_input("一括再シミュレーションする保存レース数",min_value=1,max_value=300,value=80,step=10,key="v262_batch_rerun_limit")
+                            _v262_force_current=st.checkbox(
+                                f"{_V231_APP_VERSION}保存済みレースも強制再シミュレーション",
+                                value=True,
+                                key="v262_force_current_rerun",
+                                help="ONの場合、同じVerの保存履歴が既にあっても再計算して新しい履歴を保存します。"
+                            )
                             if st.button(f"⏱️ 時系列順に{_V231_APP_VERSION}で一括再シミュレーション",key="v262_batch_rerun",type="primary",use_container_width=True):
                                 _prog=st.progress(0.0,text="一括再シミュレーションを開始します…")
                                 def _v262_progress(done,total,label):
                                     frac=(float(done)/float(total)) if total else 1.0
                                     _prog.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}｜{label}")
-                                _batch=_v262_batch_rerun_saved_histories(engine.DB_PATH,int(_v262_batch_limit),_v262_progress)
+                                _batch=_v262_batch_rerun_saved_histories(engine.DB_PATH,int(_v262_batch_limit),_v262_progress,force_current=bool(_v262_force_current))
                                 _prog.progress(1.0,text="一括再シミュレーション完了")
                                 if _batch.get('rerun',0)>0:
                                     st.success(_batch.get('message','完了しました。'))
