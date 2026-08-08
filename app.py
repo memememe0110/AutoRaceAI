@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver274"
+APP_VERSION = "Ver275"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -3530,7 +3530,7 @@ def _v271_mid_lap_pass_factor(
 def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_trial_median, residual_adjust_sec, residual_samples, return_diag=False):
     """Ver274: Ver273係数を維持しつつ、内部判定理由を返せる監査対応版。"""
     try:
-        lap_i = int(lap)
+        lap_i = int(lap_no)
     except Exception:
         lap_i = -1
     try:
@@ -3542,11 +3542,11 @@ def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_t
     except Exception:
         gate = 0.75
     try:
-        tadj = float(time_adjust or 0.0)
+        tadj = float(residual_adjust_sec or 0.0)
     except Exception:
         tadj = 0.0
     try:
-        samples = int(time_samples or 0)
+        samples = int(residual_samples or 0)
     except Exception:
         samples = 0
     try:
@@ -3554,7 +3554,7 @@ def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_t
     except Exception:
         trial = None
     try:
-        tmed = float(trial_median) if trial_median is not None else None
+        tmed = float(field_trial_median) if field_trial_median is not None else None
     except Exception:
         tmed = None
 
@@ -3931,7 +3931,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 # Ver272: Ver271の3～4周目補正を実際の追い抜き確率へ接続。
                 try:
                     _mid_factor272,_=_v271_mid_lap_pass_factor(
-                        lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,0.75),
+                        lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,1.0),
                         trial_map.get(chaser), _trial_median_v270)
                     p=float(np.clip(p*_mid_factor272,0.035,0.88))
                 except Exception:
@@ -12245,7 +12245,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
 
 
-                        with st.expander("🧪 Ver274 終盤再加速・詳細経路ログ", expanded=False):
+                        with st.expander("🧪 Ver275 終盤再加速・詳細経路ログ", expanded=False):
                             st.caption(
                                 "5・6周目について、周回ループ → ペア判定 → chaser → 30m以上 → "
                                 "再加速関数呼出 → 対象 → 発動、のどこで止まっているか確認します。"
