@@ -1649,7 +1649,7 @@ def _v272_common_race_roi_compare(db_path: str, versions: list[str]) -> dict:
 
 
 def _v273_load_earliest_saved_odds(db_path: str, race_key: str) -> tuple[dict, dict]:
-    empty = {'3tan': {}, '3fuku': {}, '2tansho': {}, '2fuku': {}, 'tansho': {}, 'wide': {}}
+    empty = {'3tan': {}, '3fuku': {}, '2tansho': {}, '2fuku': {}, 'tansho': {}, 'fukusho': {}, 'wide': {}}
     try:
         _v221_ensure_odds_tables(db_path)
         with sqlite3.connect(str(db_path)) as con:
@@ -2470,6 +2470,8 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             if str(venue_override or '').strip():
                 prediction_text=f"開催場: {str(venue_override).strip()}\n"+prediction_text
             df,bets,output,entries,meta=engine.ver16_run_prediction(prediction_text,trials,seed,manual_excluded=excluded)
+            entries=_v276_mark_retrial_from_prediction_text(entries,prediction_text)
+            df=_v276_copy_retrial_to_prediction_df(df,entries)
             meta=dict(meta or {})
             df,bets,wall_audit=_v230_six_lap_simulation(df,bets,entries,meta,trials,seed)
             meta['壁補正監査']=wall_audit
@@ -3037,6 +3039,8 @@ def _v253_backfill_saved_lap_predictions(db_path: str, limit: int = 80) -> dict:
                 df,bets,output,entries,meta=engine.ver16_run_prediction(
                     prediction_text,max(1000,min(int(trials or 2000),4000)),int(seed or 42),manual_excluded=[]
                 )
+                entries=_v276_mark_retrial_from_prediction_text(entries,prediction_text)
+                df=_v276_copy_retrial_to_prediction_df(df,entries)
                 meta=dict(meta or {})
                 race_date=str(meta.get('開催日') or meta.get('race_date') or '')[:10]
                 venue=str(meta.get('開催場') or meta.get('venue') or '').strip()
@@ -4274,6 +4278,59 @@ def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_t
     }
     return (factor, diag) if return_diag else factor
 
+
+
+
+# Ver276 UI/data fix: 予測入力でも再試走表記を識別・保持する。
+# 予測値への補正は行わず、入力情報の保持だけを行うため予測ロジックは不変。
+def _v276_mark_retrial_from_prediction_text(entries, raw_text):
+    try:
+        if entries is None or not isinstance(entries, pd.DataFrame) or entries.empty:
+            return entries
+        out = entries.copy()
+        flags = {}
+        text = str(raw_text or "")
+        # 車番行から次の車番行までを選手ブロックとして確認。
+        starts = list(re.finditer(r"(?m)^\s*([1-8])\s*(?:\t|$)", text))
+        for i, m in enumerate(starts):
+            car = int(m.group(1))
+            end = starts[i + 1].start() if i + 1 < len(starts) else len(text)
+            block = text[m.start():end]
+            # ST直後または試走T直後に「再」「再試」が付く公式表記。
+            is_retrial = bool(re.search(
+                r"(?:ST\s*(?:[+-]?\d?\.\d{2,3}|-)\s*|(?:試走T|試)\s*)(?:再試|再)\s*[3-9]\.\d{2,3}",
+                block, re.I
+            ))
+            flags[car] = is_retrial
+        car_col = next((c for c in ("車番", "car_no", "car") if c in out.columns), None)
+        if car_col is None:
+            return out
+        out["再試走"] = [bool(flags.get(int(float(v)), False)) if pd.notna(v) else False for v in out[car_col]]
+        out["試走種別"] = ["再試走" if x else "通常試走" for x in out["再試走"]]
+        return out
+    except Exception:
+        return entries
+
+def _v276_copy_retrial_to_prediction_df(df, entries):
+    try:
+        if df is None or entries is None or not isinstance(df, pd.DataFrame) or not isinstance(entries, pd.DataFrame):
+            return df
+        if "再試走" not in entries.columns:
+            return df
+        d = df.copy()
+        dcar = next((c for c in ("車番", "car_no", "car") if c in d.columns), None)
+        ecar = next((c for c in ("車番", "car_no", "car") if c in entries.columns), None)
+        if dcar is None or ecar is None:
+            return d
+        fmap = {}
+        for _, r in entries.iterrows():
+            try: fmap[int(float(r[ecar]))] = bool(r.get("再試走", False))
+            except Exception: pass
+        d["再試走"] = [bool(fmap.get(int(float(v)), False)) if pd.notna(v) else False for v in d[dcar]]
+        d["試走種別"] = ["再試走" if x else "通常試走" for x in d["再試走"]]
+        return d
+    except Exception:
+        return df
 
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
@@ -7203,7 +7260,8 @@ def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_k
                         st.session_state[f"saved_odds_{namespace}_{parsed_key}"] = values
                     st.success(
                         f"読込完了：三連単{len(parsed['3tan'])}件、三連複{len(parsed['3fuku'])}件、"
-                        f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
+                        f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件、"
+                f"ワイド{len(parsed.get('wide',{}))}件、単勝{len(parsed.get('tansho',{}))}件、複勝{len(parsed.get('fukusho',{}))}件"
                     )
                     st.rerun()
 
@@ -7324,7 +7382,7 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
     """
     from html.parser import HTMLParser
 
-    result = {"3tan": {}, "3fuku": {}, "2tansho": {}, "2fuku": {}}
+    result = {"3tan": {}, "3fuku": {}, "2tansho": {}, "2fuku": {}, "tansho": {}, "fukusho": {}, "wide": {}}
     raw = str(text or "")
     target_ids = {
         "live-odds-rt3-container",
@@ -7333,6 +7391,7 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
         "live-odds-rf2-container",
         "live-odds-pop-container",
         "live-odds-tns-container",
+        "live-odds-fns-container",
         "live-odds-wid-container",
     }
     if not any(target_id in raw for target_id in target_ids):
@@ -7544,6 +7603,8 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
     result["2tansho"] = _parse_two("live-odds-rt2-container", True)
     result["2fuku"] = _parse_two("live-odds-rf2-container", False)
     result["tansho"] = _parse_single("live-odds-tns-container")
+    # 複勝は公式HTMLでは範囲オッズ。_odd() が安全側の下限を採用する。
+    result["fukusho"] = _parse_single("live-odds-fns-container")
     result["wide"] = _parse_wide("live-odds-wid-container")
 
     # 人気表だけが保存された簡易HTMLにも対応する。
@@ -7601,7 +7662,7 @@ def _v221_save_all_odds(db_path: str, race_key: str, parsed: dict, source: str) 
     if not race_key:
         return ''
     clean = {}
-    for bet_key in ('3tan', '3fuku', '2tansho', '2fuku', 'tansho', 'wide'):
+    for bet_key in ('3tan', '3fuku', '2tansho', '2fuku', 'tansho', 'fukusho', 'wide'):
         values = parsed.get(bet_key, {}) or {}
         clean[bet_key] = {str(k): float(v) for k, v in values.items() if v is not None and float(v) > 0}
     if sum(len(v) for v in clean.values()) <= 0:
@@ -7681,13 +7742,13 @@ def _v221_list_odds_snapshots(db_path: str, race_key: str, limit: int = 8) -> li
 
 
 def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
-    """重い診断より先に、HTMLまたは公式4券種表からオッズを読み込む。"""
+    """重い診断より先に、HTMLまたは公式オッズ表から全券種オッズを読み込む。"""
     st.markdown('<div id="quick-odds-input"></div>', unsafe_allow_html=True)
     st.subheader("オッズ一括入力")
-    st.caption("AutoRace.JPの保存HTMLなら、3連単・3連複・2連単・2連複に加えて単勝・ワイドも自動入力できます。読み込んだ全オッズはDBへ保存されます。")
+    st.caption("AutoRace.JPの保存HTMLなら、3連単・3連複・2連単・2連複・ワイド・単勝・複勝の7券種を自動入力できます。読み込んだ全オッズはDBへ保存されます。")
 
     # セッションにオッズがない場合は、このレースの最新保存分を自動復元する。
-    odds_store_keys = [f"saved_odds_{namespace}_{k}" for k in ('3tan','3fuku','2tansho','2fuku','tansho','wide')]
+    odds_store_keys = [f"saved_odds_{namespace}_{k}" for k in ('3tan','3fuku','2tansho','2fuku','tansho','fukusho','wide')]
     has_session_odds = any(bool(st.session_state.get(k)) for k in odds_store_keys)
     if race_key and not has_session_odds:
         restored, run = _v221_load_odds_snapshot(engine.DB_PATH, race_key)
@@ -7733,7 +7794,7 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
             placeholder="AutoRace.JPのオッズページHTMLを貼り付け",
         )
 
-    if st.button("HTMLから6券種の全オッズを読み込む", key=f"v218_load_html_odds_{namespace}", use_container_width=True):
+    if st.button("HTMLから7券種の全オッズを読み込む", key=f"v218_load_html_odds_{namespace}", use_container_width=True):
         source = str(html_paste or "")
         if html_file is not None:
             try:
@@ -9830,7 +9891,7 @@ def v207_build_mixed_formation_sections(result: dict):
 
 
 def v244_optional_single_wide_candidates(bets: dict, trials: int, odds_maps: dict) -> list[dict]:
-    """単勝・ワイドは本線へ自動混入せず、余裕がある場合の候補として評価する。"""
+    """単勝・複勝・ワイドは本線へ自動混入せず、余裕がある場合の候補として評価する。"""
     tri_counter = (bets or {}).get("三連単", {}) or {}
     if not tri_counter or int(trials or 0) <= 0:
         return []
@@ -9842,9 +9903,13 @@ def v244_optional_single_wide_candidates(bets: dict, trials: int, odds_maps: dic
     if not outcomes:
         return []
     win_prob = {}
+    place_prob = {}
     wide_prob = {}
     for (a, b, c), prob in outcomes:
         win_prob[a] = win_prob.get(a, 0.0) + prob
+        # オートレースの複勝は1着または2着。三連単分布からそのまま集計する。
+        place_prob[a] = place_prob.get(a, 0.0) + prob
+        place_prob[b] = place_prob.get(b, 0.0) + prob
         for x, y in ((a, b), (a, c), (b, c)):
             key = "-".join(map(str, sorted((x, y))))
             wide_prob[key] = wide_prob.get(key, 0.0) + prob
@@ -9858,6 +9923,16 @@ def v244_optional_single_wide_candidates(bets: dict, trials: int, odds_maps: dic
         if odd > 0 and prob >= 8.0 and ev >= 100.0:
             rows.append({"type":"単勝","combo":str(car),"probability":prob,"odds":odd,"ev":ev,
                          "reason":"1着確率と単勝オッズの組み合わせが100%以上"})
+    for car_text, odds in (odds_maps.get("fukusho", {}) or {}).items():
+        try:
+            car = int(car_text); odd = float(odds); prob = float(place_prob.get(car, 0.0))
+        except Exception:
+            continue
+        ev = prob / 100.0 * odd * 100.0
+        # 複勝も範囲オッズの下限で安全側評価。
+        if odd > 0 and prob >= 20.0 and ev >= 103.0:
+            rows.append({"type":"複勝","combo":str(car),"probability":prob,"odds":odd,"ev":ev,
+                         "reason":"2着内確率と複勝下限オッズで期待値103%以上"})
     for combo, odds in (odds_maps.get("wide", {}) or {}).items():
         try:
             odd = float(odds); prob = float(wide_prob.get(str(combo), 0.0))
@@ -11017,7 +11092,7 @@ def _v278_render_background_quick_page(db_path: str) -> None:
                     with st.expander("レース別・全オッズ仮想評価",expanded=False):
                         st.dataframe(rows[show_cols],use_container_width=True,hide_index=True)
                 st.caption(
-                    "対象: 3連単・3連複・2連単・2連複・単勝・ワイド。"
+                    "対象: 3連単・3連複・2連単・2連複・ワイド・単勝・複勝。"
                     "保存済み最古オッズと当時のモデル確率で選び、実結果は採点にだけ使います。"
                 )
 
@@ -11280,6 +11355,8 @@ elif selected_main_page == "🏁 予測":
             with st.spinner("高速6周イベントシミュレーションを実行中…"):
                 _t0 = time_module.perf_counter()
                 df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
+                entries = _v276_mark_retrial_from_prediction_text(entries, prediction_text)
+                df = _v276_copy_retrial_to_prediction_df(df, entries)
                 _t_base = time_module.perf_counter()
                 # Ver230 beta: 壁補正を後掛けせず、スタートから6周すべての展開へ内蔵。
                 meta = dict(meta or {})
@@ -11437,6 +11514,7 @@ elif selected_main_page == "🏁 予測":
                 "2tansho": st.session_state.get(f"saved_odds_{odds_namespace}_2tansho", {}),
                 "2fuku": st.session_state.get(f"saved_odds_{odds_namespace}_2fuku", {}),
                 "tansho": st.session_state.get(f"saved_odds_{odds_namespace}_tansho", {}),
+                "fukusho": st.session_state.get(f"saved_odds_{odds_namespace}_fukusho", {}),
                 "wide": st.session_state.get(f"saved_odds_{odds_namespace}_wide", {}),
             }
             st.markdown('<div id="return-priority-plan"></div>', unsafe_allow_html=True)
@@ -11831,11 +11909,32 @@ elif selected_main_page == "🏁 予測":
             odds_namespace = re.sub(r"[^0-9A-Za-z_-]+", "_", str(race_key))[-80:] or "current"
             st.markdown('<div id="ticket-probability"></div>', unsafe_allow_html=True)
             st.subheader("券種別確率・オッズ比較")
+            # 三連単の同一試行分布から単勝・複勝・ワイドを再集計。追加シミュレーションは行わない。
+            view_bets = dict(bets or {})
+            tri_counter = (view_bets.get("三連単", {}) or {})
+            tansho_counter, fukusho_counter, wide_counter = {}, {}, {}
+            for combo, count in tri_counter.items():
+                vals = tuple(int(v) for v in (tuple(combo) if isinstance(combo, (tuple, list)) else (combo,)))
+                if len(vals) != 3:
+                    continue
+                a, b, c = vals; count = int(count)
+                tansho_counter[(a,)] = tansho_counter.get((a,), 0) + count
+                fukusho_counter[(a,)] = fukusho_counter.get((a,), 0) + count
+                fukusho_counter[(b,)] = fukusho_counter.get((b,), 0) + count
+                for x, y in ((a,b),(a,c),(b,c)):
+                    key = tuple(sorted((x,y)))
+                    wide_counter[key] = wide_counter.get(key, 0) + count
+            view_bets["単勝"] = tansho_counter
+            view_bets["複勝"] = fukusho_counter
+            view_bets["ワイド"] = wide_counter
             ticket_options = {
                 "2連単": ("2車単", "2tansho", False),
                 "2連複": ("2車複", "2fuku", True),
                 "3連複": ("三連複", "3fuku", True),
                 "3連単": ("三連単", "3tan", False),
+                "ワイド": ("ワイド", "wide", True),
+                "単勝": ("単勝", "tansho", False),
+                "複勝": ("複勝", "fukusho", False),
             }
             selected_ticket = st.radio(
                 "表示する券種", list(ticket_options), horizontal=True,
@@ -11843,9 +11942,9 @@ elif selected_main_page == "🏁 予測":
                 help="選択した券種だけを集計・表示します。ほかの券種は切り替えた時に計算します。",
             )
             ticket_key, odds_key, unordered = ticket_options[selected_ticket]
-            show_ticket_table(selected_ticket, bets, ticket_key, view_trials, 20)
+            show_ticket_table(selected_ticket, view_bets, ticket_key, view_trials, 20)
             show_odds_comparison(
-                selected_ticket, bets, ticket_key, view_trials, odds_key,
+                selected_ticket, view_bets, ticket_key, view_trials, odds_key,
                 unordered=unordered, namespace=odds_namespace, show_bulk=False,
             )
             trifecta_odds = st.session_state.get(f"saved_odds_{odds_namespace}_3tan", {})
