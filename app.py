@@ -1773,9 +1773,16 @@ def _v278_bg_ensure_table(db_path: str) -> None:
                 message TEXT DEFAULT '',
                 result_blob BLOB,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
+                pause_requested INTEGER NOT NULL DEFAULT 0,
                 error_text TEXT DEFAULT ''
             )
         """)
+        try:
+            cols={str(r[1]) for r in con.execute("PRAGMA table_info(v278_background_jobs)").fetchall()}
+            if "pause_requested" not in cols:
+                con.execute("ALTER TABLE v278_background_jobs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
         con.commit()
 
 def _v278_bg_update(db_path: str, job_id: int, **fields) -> None:
@@ -1784,7 +1791,7 @@ def _v278_bg_update(db_path: str, job_id: int, **fields) -> None:
     _v278_bg_ensure_table(db_path)
     allowed={
         "status","started_at","updated_at","finished_at","done_count","total_count",
-        "current_label","message","result_blob","cancel_requested","error_text"
+        "current_label","message","result_blob","cancel_requested","pause_requested","error_text"
     }
     fields={k:v for k,v in fields.items() if k in allowed}
     if not fields:
@@ -1837,7 +1844,7 @@ def _v278_bg_has_running_job(db_path: str) -> bool:
             con.execute("PRAGMA busy_timeout=30000")
             row=con.execute("""
                 SELECT COUNT(*) FROM v278_background_jobs
-                WHERE job_type='batch_rerun' AND status IN ('queued','running','cancel_requested')
+                WHERE job_type='batch_rerun' AND status IN ('queued','running','pause_requested','paused','cancel_requested')
             """).fetchone()
         return bool(int(row[0] or 0))
     except Exception:
@@ -1863,6 +1870,66 @@ def _v278_bg_request_cancel(db_path: str, job_id: int) -> None:
         message="現在のレース処理が終わり次第停止します。"
     )
 
+def _v278_bg_pause_requested(db_path: str, job_id: int) -> bool:
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            row=con.execute(
+                "SELECT pause_requested FROM v278_background_jobs WHERE job_id=?",
+                (int(job_id),)
+            ).fetchone()
+        return bool(row and int(row[0] or 0))
+    except Exception:
+        return False
+
+def _v278_bg_set_pause(db_path: str, job_id: int, paused: bool, message: str = "") -> None:
+    _v278_bg_update(
+        db_path, job_id,
+        pause_requested=1 if paused else 0,
+        status="pause_requested" if paused else "running",
+        message=message or ("他のDB登録を待っています。" if paused else "再シミュレーションを再開しました。"),
+    )
+
+def _v278_bg_pause_loop(db_path: str, job_id: int) -> None:
+    if not _v278_bg_pause_requested(db_path, job_id):
+        return
+    _v278_bg_update(
+        db_path, job_id,
+        status="paused",
+        message="選手履歴・結果などのDB登録を優先するため一時停止中です。"
+    )
+    while _v278_bg_pause_requested(db_path, job_id):
+        if _v278_bg_cancel_requested(db_path, job_id):
+            return
+        time_module.sleep(0.25)
+    _v278_bg_update(db_path, job_id, status="running", message="バックグラウンド再シミュレーションを再開しました。")
+
+def _v278_pause_background_for_foreground(db_path: str, timeout_sec: float = 90.0) -> dict:
+    """DB登録前にバックグラウンド処理をレース境界で止める。"""
+    job=_v278_bg_get_job(db_path)
+    if not job or str(job.get("status") or "") not in ("queued","running","pause_requested","paused"):
+        return {"paused":False,"job_id":0,"reason":"no_running_job"}
+    job_id=int(job.get("job_id") or 0)
+    _v278_bg_set_pause(db_path,job_id,True,"DB登録を優先するため、現在レース終了後に一時停止します。")
+    deadline=time_module.time()+float(timeout_sec)
+    while time_module.time()<deadline:
+        cur=_v278_bg_get_job(db_path,job_id)
+        status=str(cur.get("status") or "")
+        if status=="paused":
+            return {"paused":True,"job_id":job_id}
+        if status in ("completed","cancelled","failed"):
+            return {"paused":False,"job_id":job_id,"reason":status}
+        time_module.sleep(0.25)
+    # タイムアウト時は無理に同時書込せず、登録側に明示する
+    return {"paused":False,"job_id":job_id,"reason":"timeout"}
+
+def _v278_resume_background_after_foreground(db_path: str, pause_info: dict) -> None:
+    try:
+        if pause_info and pause_info.get("job_id"):
+            _v278_bg_set_pause(db_path,int(pause_info["job_id"]),False,"DB登録完了。再シミュレーションを再開します。")
+    except Exception:
+        pass
+
 def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool) -> None:
     try:
         _v278_bg_update(
@@ -1886,6 +1953,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             _progress,
             force_current=bool(force_current),
             cancel_cb=lambda: _v278_bg_cancel_requested(db_path,job_id),
+            pause_cb=lambda: _v278_bg_pause_loop(db_path,job_id),
         )
         cancelled=bool(result.get("cancelled")) or _v278_bg_cancel_requested(db_path,job_id)
         blob=zlib.compress(pickle.dumps(result,protocol=pickle.HIGHEST_PROTOCOL),level=6)
@@ -1946,7 +2014,7 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
     return {"ok":True,"job_id":job_id}
 
 
-def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None) -> dict:
+def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None, pause_cb=None) -> dict:
     out={
         "checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[],
         "roi_evaluated":0,"roi_no_odds":0,"roi_no_payout":0,
@@ -2033,6 +2101,18 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
     except Exception:
         current_keys=set(); current_complete_keys=set(); current_audit_complete_keys=set()
     for idx,h in enumerate(unique,1):
+        if callable(cancel_cb):
+            try:
+                if bool(cancel_cb()):
+                    out["cancelled"]=True
+                    break
+            except Exception:
+                pass
+        if callable(pause_cb):
+            try:
+                pause_cb()
+            except Exception:
+                pass
         if callable(cancel_cb):
             try:
                 if bool(cancel_cb()):
@@ -10066,6 +10146,11 @@ def github_ready() -> tuple[bool, str]:
 
 
 def pull_db_from_github() -> tuple[bool, str]:
+    try:
+        if "_v278_bg_has_running_job" in globals() and _v278_bg_has_running_job(engine.DB_PATH):
+            return False, "バックグラウンド再シミュレーション中はDB上書きを防ぐため、GitHub再読込を停止しています。"
+    except Exception:
+        pass
     ready, message = github_ready()
     if not ready:
         return False, message
@@ -10085,6 +10170,26 @@ def pull_db_from_github() -> tuple[bool, str]:
         return False, f"GitHub DB取得エラー: {type(exc).__name__}: {exc}"
 
 
+def _v278_consistent_db_snapshot_bytes(db_path: str) -> bytes:
+    """WAL利用中でも最新コミットを含む整合SQLiteスナップショットを返す。"""
+    src_path=Path(db_path)
+    if not src_path.exists():
+        raise FileNotFoundError(str(src_path))
+    tmp_dir=Path(tempfile.mkdtemp(prefix="autorace_db_snapshot_"))
+    snap_path=tmp_dir/"autorace_players_snapshot.sqlite3"
+    try:
+        with sqlite3.connect(str(src_path), timeout=60.0) as src:
+            src.execute("PRAGMA busy_timeout=60000")
+            with sqlite3.connect(str(snap_path), timeout=60.0) as dst:
+                src.backup(dst)
+                dst.commit()
+        data=snap_path.read_bytes()
+        if not data.startswith(b"SQLite format 3\x00"):
+            raise RuntimeError("SQLiteスナップショットの生成に失敗しました")
+        return data
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     ready, message = github_ready()
     if not ready:
@@ -10092,6 +10197,11 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     db_path = Path(engine.DB_PATH)
     if not db_path.exists():
         return False, "保存するDBがありません。"
+
+    try:
+        snapshot_bytes=_v278_consistent_db_snapshot_bytes(str(db_path))
+    except Exception as exc:
+        return False, f"DB整合スナップショット作成エラー: {type(exc).__name__}: {exc}"
 
     cfg = github_config()
     url = github_api_url()
@@ -10103,7 +10213,7 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
 
     payload = {
         "message": commit_message,
-        "content": base64.b64encode(db_path.read_bytes()).decode("ascii"),
+        "content": base64.b64encode(snapshot_bytes).decode("ascii"),
         "branch": cfg["branch"],
     }
     if sha:
@@ -10111,7 +10221,8 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     put_status, result = github_request(url, method="PUT", payload=payload)
     if put_status not in (200, 201):
         return False, f"GitHub保存に失敗しました: {result.get('message', put_status)}"
-    return True, "DBをGitHubへ保存しました。再起動・再デプロイ後も復元できます。"
+    return True, "最新コミットを含む整合DBをGitHubへ保存しました。"
+
 
 
 # 起動後の最初の1回だけ、GitHub上の最新DBを取得
@@ -10122,7 +10233,50 @@ if "github_pull_done" not in st.session_state:
         ok, msg = pull_db_from_github()
         st.session_state["github_pull_message"] = (ok, msg)
 
+
+def _v278_render_bg_compact(location: str = "main") -> None:
+    """どの画面でも軽く確認できるバックグラウンド進捗。自動ポーリングはしない。"""
+    try:
+        job=_v278_bg_get_job(engine.DB_PATH)
+    except Exception:
+        job={}
+    if not job:
+        return
+    status=str(job.get("status") or "")
+    if status not in ("queued","running","pause_requested","paused","cancel_requested","completed","failed","cancelled"):
+        return
+    done=int(job.get("done_count",0) or 0)
+    total=int(job.get("total_count",0) or 0)
+    label=str(job.get("current_label") or "")
+    frac=(float(done)/float(total)) if total else 0.0
+
+    if location=="sidebar":
+        if status in ("queued","running","pause_requested","paused","cancel_requested"):
+            st.markdown("#### ⏱️ 再シミュレーション")
+            st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}")
+            if label:
+                st.caption(label)
+            if status=="paused":
+                st.caption("⏸ DB登録を優先して一時停止中")
+            elif status=="pause_requested":
+                st.caption("⏳ 現在レース後に一時停止")
+        return
+
+    if status in ("queued","running","pause_requested","paused","cancel_requested"):
+        icon="⏸️" if status in ("paused","pause_requested") else "⏱️"
+        st.info(
+            f"{icon} 再シミュレーション {done}/{total}"
+            + (f"｜{label}" if label else "")
+            + ("｜DB登録優先で一時停止中" if status=="paused" else "")
+        )
+    elif status=="completed":
+        st.success(f"✅ 再シミュレーション完了 {done}/{total}")
+    elif status=="failed":
+        st.warning("⚠️ バックグラウンド再シミュレーションでエラーがあります。再シミュレーション画面で確認してください。")
+
+
 with st.sidebar:
+    _v278_render_bg_compact("sidebar")
     st.header("予測設定")
     trials = st.selectbox("試行回数", [3000, 10000, 20000], index=2)
     seed = st.number_input("乱数シード", min_value=0, value=20260719, step=1)
@@ -10139,7 +10293,17 @@ with st.sidebar:
 
     ready, ready_msg = github_ready()
     (st.success if ready else st.warning)(ready_msg)
-    if st.button("GitHubからDBを再読込", use_container_width=True, disabled=not ready):
+    _bg_busy_sidebar=False
+    try:
+        _bg_busy_sidebar=_v278_bg_has_running_job(engine.DB_PATH)
+    except Exception:
+        _bg_busy_sidebar=False
+    if st.button(
+        "GitHubからDBを再読込",
+        use_container_width=True,
+        disabled=(not ready) or _bg_busy_sidebar,
+        help="バックグラウンド再シミュレーション中はDB上書き防止のため無効です。" if _bg_busy_sidebar else None,
+    ):
         ok, msg = pull_db_from_github()
         (st.success if ok else st.error)(msg)
         if ok:
@@ -10251,7 +10415,8 @@ _v132_general_reminder_launcher()
 
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
-_main_pages = ["🏁 予測", "📊 回収率実績", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"]
+_v278_render_bg_compact("main")
+_main_pages = ["🏁 予測", "⏱️ 再シミュレーション", "📊 回収率実績", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"]
 if st.session_state.get("v155_main_page") not in _main_pages:
     st.session_state["v155_main_page"] = _main_pages[0]
 
@@ -10278,7 +10443,67 @@ st.session_state["v155_main_page"] = _selected_from_nav
 
 selected_main_page = st.session_state.get("v155_main_page", _main_pages[0])
 
-if selected_main_page == "📊 回収率実績":
+
+def _v278_render_background_quick_page(db_path: str) -> None:
+    st.subheader("⏱️ 再シミュレーション")
+    st.caption("長い精度比較センターまでスクロールせず、ここから開始・進捗確認・停止ができます。")
+    limit_count=st.number_input(
+        "再シミュレーションする保存レース数",
+        min_value=1,max_value=300,value=80,step=10,
+        key="v278_quick_limit"
+    )
+    force_current=st.checkbox(
+        f"{_V231_APP_VERSION}保存済みレースも再計算",
+        value=True,key="v278_quick_force"
+    )
+    job=_v278_bg_get_job(db_path)
+    running=bool(job and str(job.get("status") or "") in ("queued","running","pause_requested","paused","cancel_requested"))
+    if running:
+        done=int(job.get("done_count",0) or 0)
+        total=int(job.get("total_count",0) or 0)
+        frac=(float(done)/float(total)) if total else 0.0
+        st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}｜{str(job.get('current_label') or '')}")
+        a,b=st.columns(2)
+        if a.button("🔄 進捗を更新",key="v278_quick_refresh",use_container_width=True):
+            st.rerun()
+        if b.button(
+            "⏹ 現在レース後に停止",
+            key="v278_quick_stop",
+            use_container_width=True,
+            disabled=str(job.get("status") or "")=="cancel_requested",
+        ):
+            _v278_bg_request_cancel(db_path,int(job.get("job_id") or 0))
+            st.rerun()
+        if str(job.get("status") or "") in ("paused","pause_requested"):
+            st.info("選手履歴・結果などのDB登録を優先するため、一時停止または停止待ちです。")
+    else:
+        if st.button(
+            f"▶ バックグラウンドで{_V231_APP_VERSION}再シミュレーション開始",
+            key="v278_quick_start",
+            type="primary",
+            use_container_width=True,
+        ):
+            r=_v278_bg_start(db_path,int(limit_count),bool(force_current))
+            if r.get("ok"):
+                st.success(f"開始しました（ジョブID: {r.get('job_id')}）。他の画面へ移動して作業できます。")
+                st.rerun()
+            else:
+                st.warning(str(r.get("reason") or "開始できませんでした。"))
+
+    job=_v278_bg_get_job(db_path)
+    if job and str(job.get("status") or "") in ("completed","failed","cancelled"):
+        status=str(job.get("status") or "")
+        if status=="completed":
+            st.success(str(job.get("message") or "完了しました。"))
+        elif status=="cancelled":
+            st.info(str(job.get("message") or "停止しました。"))
+        else:
+            st.error(str(job.get("message") or "")+" "+str(job.get("error_text") or ""))
+
+
+if selected_main_page == "⏱️ 再シミュレーション":
+    _v278_render_background_quick_page(engine.DB_PATH)
+elif selected_main_page == "📊 回収率実績":
     _v215_render_return_dashboard(engine.DB_PATH)
 
 elif selected_main_page == "🏁 予測":
@@ -11743,7 +11968,12 @@ if selected_main_page == "👤 選手情報登録":
         st.dataframe(parsed[preview_cols], use_container_width=True, hide_index=True, height=420)
 
         if st.button("DBへ登録してGitHubに保存", type="primary", use_container_width=True):
+            _pause278={}
             try:
+                with st.spinner("バックグラウンド処理とのDB競合を確認しています…"):
+                    _pause278=_v278_pause_background_for_foreground(engine.DB_PATH)
+                if _pause278.get("reason")=="timeout":
+                    raise RuntimeError("再シミュレーションの現在レースがまだ処理中です。DB競合防止のため登録を中断しました。少し待ってもう一度登録してください。")
                 with st.spinner("① SQLiteへ選手履歴を保存しています…"):
                     report = engine.v47_save_player_history(parsed, db_path=engine.DB_PATH)
                 st.session_state["pending_player_history"] = report["pending"]
@@ -11777,6 +12007,8 @@ if selected_main_page == "👤 選手情報登録":
                 _set_sticky_notice("player_register_notice", "error", error_message)
                 st.error(error_message)
                 st.exception(exc)
+            finally:
+                _v278_resume_background_after_foreground(engine.DB_PATH,_pause278)
 
     pending_notice = st.session_state.pop("pending_save_notice", None)
     if isinstance(pending_notice, dict):
@@ -11843,11 +12075,19 @@ if selected_main_page == "👤 選手情報登録":
                         }
                         st.warning(message)
                     else:
-                        _stage = "SQLiteへの保存"
-                        pending_status.write("③ SQLiteへ不足行を保存しています")
-                        report2 = engine.v131_save_pending_player_history(
-                            repaired, db_path=engine.DB_PATH
-                        )
+                        _stage = "バックグラウンド処理の一時停止"
+                        pending_status.write("③ 再シミュレーションとのDB競合を避けるため書込タイミングを調整しています")
+                        _pending_pause278=_v278_pause_background_for_foreground(engine.DB_PATH)
+                        if _pending_pause278.get("reason")=="timeout":
+                            raise RuntimeError("再シミュレーションの現在レースが処理中のため、DB競合防止で不足行登録を中断しました。")
+                        try:
+                            _stage = "SQLiteへの保存"
+                            pending_status.write("④ SQLiteへ不足行を保存しています")
+                            report2 = engine.v131_save_pending_player_history(
+                                repaired, db_path=engine.DB_PATH
+                            )
+                        finally:
+                            _v278_resume_background_after_foreground(engine.DB_PATH,_pending_pause278)
 
                         _stage = "保存結果の再照合"
                         pending_status.write("④ SQLiteを再検索し、実際に保存された件数を確認しています")
