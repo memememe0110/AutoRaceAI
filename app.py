@@ -9358,7 +9358,7 @@ elif selected_main_page == "🏁 予測":
             restore_by_label[label] = {"kind":"legacy", **item}
         st.caption("最近の保存済み予測をボタンで復元します。文字入力欄ではないため、iPhoneのキーボードは開きません。")
         visible_labels = restore_labels[:24]
-        with st.expander(f"保存済み予測一覧（最新{len(visible_labels, expanded=False)}件）", expanded=False):
+        with st.expander(f"保存済み予測一覧（最新{len(visible_labels)}件）", expanded=False):
             for idx, restore_label in enumerate(visible_labels):
                 target = restore_by_label.get(restore_label) or {}
                 c_info, c_button = st.columns([4,1])
