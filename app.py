@@ -1742,7 +1742,211 @@ def _v273_virtual_roi_score(
         return out
 
 
-def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False) -> dict:
+
+# Ver278: Streamlit画面を占有しない再シミュレーション用バックグラウンドジョブ。
+# 状態はst.session_stateではなくSQLiteへ保存するため、画面移動・再描画後も確認できる。
+_V278_BG_THREADS = globals().get("_V278_BG_THREADS", {})
+_V278_BG_LOCK = globals().get("_V278_BG_LOCK", threading.Lock())
+
+def _v278_bg_ensure_table(db_path: str) -> None:
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v278_background_jobs(
+                job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type TEXT NOT NULL,
+                app_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                updated_at TEXT,
+                finished_at TEXT,
+                limit_count INTEGER NOT NULL DEFAULT 0,
+                force_current INTEGER NOT NULL DEFAULT 0,
+                done_count INTEGER NOT NULL DEFAULT 0,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                current_label TEXT DEFAULT '',
+                message TEXT DEFAULT '',
+                result_blob BLOB,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                error_text TEXT DEFAULT ''
+            )
+        """)
+        con.commit()
+
+def _v278_bg_update(db_path: str, job_id: int, **fields) -> None:
+    if not fields:
+        return
+    _v278_bg_ensure_table(db_path)
+    allowed={
+        "status","started_at","updated_at","finished_at","done_count","total_count",
+        "current_label","message","result_blob","cancel_requested","error_text"
+    }
+    fields={k:v for k,v in fields.items() if k in allowed}
+    if not fields:
+        return
+    fields["updated_at"]=_v228_now_jst_iso()
+    keys=list(fields.keys())
+    sql="UPDATE v278_background_jobs SET "+",".join(f"{k}=?" for k in keys)+" WHERE job_id=?"
+    vals=[fields[k] for k in keys]+[int(job_id)]
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute(sql, vals)
+        con.commit()
+
+def _v278_bg_get_job(db_path: str, job_id: int | None = None) -> dict:
+    try:
+        _v278_bg_ensure_table(db_path)
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.row_factory=sqlite3.Row
+            con.execute("PRAGMA busy_timeout=30000")
+            if job_id:
+                row=con.execute(
+                    "SELECT * FROM v278_background_jobs WHERE job_id=?",
+                    (int(job_id),)
+                ).fetchone()
+            else:
+                row=con.execute("""
+                    SELECT * FROM v278_background_jobs
+                    WHERE job_type='batch_rerun'
+                    ORDER BY job_id DESC LIMIT 1
+                """).fetchone()
+        if not row:
+            return {}
+        d=dict(row)
+        blob=d.get("result_blob")
+        if blob:
+            try:
+                d["result"]=pickle.loads(zlib.decompress(bytes(blob)))
+            except Exception:
+                d["result"]={}
+        else:
+            d["result"]={}
+        return d
+    except Exception:
+        return {}
+
+def _v278_bg_has_running_job(db_path: str) -> bool:
+    try:
+        _v278_bg_ensure_table(db_path)
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            row=con.execute("""
+                SELECT COUNT(*) FROM v278_background_jobs
+                WHERE job_type='batch_rerun' AND status IN ('queued','running','cancel_requested')
+            """).fetchone()
+        return bool(int(row[0] or 0))
+    except Exception:
+        return False
+
+def _v278_bg_cancel_requested(db_path: str, job_id: int) -> bool:
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            row=con.execute(
+                "SELECT cancel_requested FROM v278_background_jobs WHERE job_id=?",
+                (int(job_id),)
+            ).fetchone()
+        return bool(row and int(row[0] or 0))
+    except Exception:
+        return False
+
+def _v278_bg_request_cancel(db_path: str, job_id: int) -> None:
+    _v278_bg_update(
+        db_path, job_id,
+        status="cancel_requested",
+        cancel_requested=1,
+        message="現在のレース処理が終わり次第停止します。"
+    )
+
+def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool) -> None:
+    try:
+        _v278_bg_update(
+            db_path, job_id,
+            status="running",
+            started_at=_v228_now_jst_iso(),
+            message="バックグラウンド再シミュレーションを開始しました。"
+        )
+        def _progress(done,total,label):
+            _v278_bg_update(
+                db_path, job_id,
+                done_count=int(done or 0),
+                total_count=int(total or 0),
+                current_label=str(label or ""),
+                message=f"{int(done or 0)}/{int(total or 0)}｜{str(label or '')}"
+            )
+
+        result=_v262_batch_rerun_saved_histories(
+            db_path,
+            int(limit_count),
+            _progress,
+            force_current=bool(force_current),
+            cancel_cb=lambda: _v278_bg_cancel_requested(db_path,job_id),
+        )
+        cancelled=bool(result.get("cancelled")) or _v278_bg_cancel_requested(db_path,job_id)
+        blob=zlib.compress(pickle.dumps(result,protocol=pickle.HIGHEST_PROTOCOL),level=6)
+        _v278_bg_update(
+            db_path, job_id,
+            status="cancelled" if cancelled else "completed",
+            finished_at=_v228_now_jst_iso(),
+            current_label="",
+            message=(
+                "停止しました。処理済みレースは保存されています。"
+                if cancelled else str(result.get("message") or "完了しました。")
+            ),
+            result_blob=sqlite3.Binary(blob),
+        )
+    except Exception as exc:
+        _v278_bg_update(
+            db_path, job_id,
+            status="failed",
+            finished_at=_v228_now_jst_iso(),
+            current_label="",
+            message="バックグラウンド再シミュレーションでエラーが発生しました。",
+            error_text=f"{type(exc).__name__}: {exc}",
+        )
+    finally:
+        try:
+            with _V278_BG_LOCK:
+                _V278_BG_THREADS.pop(int(job_id),None)
+        except Exception:
+            pass
+
+def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
+    _v278_bg_ensure_table(db_path)
+    if _v278_bg_has_running_job(db_path):
+        return {"ok":False,"reason":"すでにバックグラウンド再シミュレーションが動いています。"}
+    now=_v228_now_jst_iso()
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        cur=con.execute("""
+            INSERT INTO v278_background_jobs(
+                job_type,app_version,status,created_at,updated_at,limit_count,force_current,message
+            ) VALUES ('batch_rerun',?,?,?,?,?,?,?)
+        """,(
+            str(_V231_APP_VERSION),"queued",now,now,
+            int(limit_count),1 if force_current else 0,
+            "開始待ち"
+        ))
+        con.commit()
+        job_id=int(cur.lastrowid or 0)
+    th=threading.Thread(
+        target=_v278_bg_worker,
+        args=(str(db_path),job_id,int(limit_count),bool(force_current)),
+        daemon=True,
+        name=f"autorace-bg-rerun-{job_id}",
+    )
+    with _V278_BG_LOCK:
+        _V278_BG_THREADS[job_id]=th
+    th.start()
+    return {"ok":True,"job_id":job_id}
+
+
+def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None) -> dict:
     out={
         "checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[],
         "roi_evaluated":0,"roi_no_odds":0,"roi_no_payout":0,
@@ -1829,6 +2033,13 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
     except Exception:
         current_keys=set(); current_complete_keys=set(); current_audit_complete_keys=set()
     for idx,h in enumerate(unique,1):
+        if callable(cancel_cb):
+            try:
+                if bool(cancel_cb()):
+                    out["cancelled"]=True
+                    break
+            except Exception:
+                pass
         out['checked']+=1
         label=str(h.get('race_label') or h.get('race_key') or f'履歴{idx}')
         try:
@@ -12482,23 +12693,76 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 key="v262_force_current_rerun",
                                 help="ONの場合、同じVerの保存履歴が既にあっても再計算して新しい履歴を保存します。"
                             )
-                            if st.button(f"⏱️ 時系列順に{_V231_APP_VERSION}で一括再シミュレーション",key="v262_batch_rerun",type="primary",use_container_width=True):
-                                _prog=st.progress(0.0,text="一括再シミュレーションを開始します…")
-                                def _v262_progress(done,total,label):
-                                    frac=(float(done)/float(total)) if total else 1.0
-                                    _prog.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}｜{label}")
-                                _batch=_v262_batch_rerun_saved_histories(engine.DB_PATH,int(_v262_batch_limit),_v262_progress,force_current=bool(_v262_force_current))
-                                _prog.progress(1.0,text="一括再シミュレーション完了")
-                                if _batch.get('rerun',0)>0:
-                                    st.success(_batch.get('message','完了しました。'))
-                                else:
-                                    st.info(_batch.get('message','追加対象がありませんでした。'))
-                                if _batch.get('labels'):
-                                    st.caption("新規保存: "+" / ".join(_batch.get('labels',[])[:30]))
-                                if _batch.get('errors'):
-                                    st.warning(" / ".join(_batch.get('errors',[])[:12]))
+                            _bg278=_v278_bg_get_job(engine.DB_PATH)
+                            _bg278_running=bool(_bg278 and str(_bg278.get("status") or "") in ("queued","running","cancel_requested"))
 
-                                # Ver272: 自動再シミュレーションの仮想回収率をその場で表示。
+                            if _bg278_running:
+                                _done278=int(_bg278.get("done_count",0) or 0)
+                                _total278=int(_bg278.get("total_count",0) or 0)
+                                _frac278=(float(_done278)/float(_total278)) if _total278 else 0.0
+                                st.progress(
+                                    min(1.0,max(0.0,_frac278)),
+                                    text=f"バックグラウンド実行中 {_done278}/{_total278}｜{str(_bg278.get('current_label') or '')}"
+                                )
+                                _bga,_bgb,_bgc=st.columns(3)
+                                _bga.metric("状態",str(_bg278.get("status") or "running"))
+                                _bgb.metric("完了",f"{_done278}/{_total278}")
+                                _bgc.metric("ジョブID",str(_bg278.get("job_id") or ""))
+                                st.caption(
+                                    "この処理はバックグラウンドで継続します。"
+                                    "選手履歴登録・結果登録・登録情報確認など、別の画面へ移動して作業できます。"
+                                )
+                                _c278a,_c278b=st.columns(2)
+                                if _c278a.button("🔄 進捗を更新",key="v278_bg_refresh",use_container_width=True):
+                                    st.rerun()
+                                if _c278b.button(
+                                    "⏹ 現在のレース後に停止",
+                                    key="v278_bg_cancel",
+                                    use_container_width=True,
+                                    disabled=str(_bg278.get("status") or "")=="cancel_requested",
+                                ):
+                                    _v278_bg_request_cancel(engine.DB_PATH,int(_bg278.get("job_id") or 0))
+                                    st.rerun()
+                            else:
+                                if st.button(
+                                    f"▶ バックグラウンドで{_V231_APP_VERSION}再シミュレーション開始",
+                                    key="v278_bg_batch_rerun",
+                                    type="primary",
+                                    use_container_width=True,
+                                ):
+                                    _started278=_v278_bg_start(
+                                        engine.DB_PATH,
+                                        int(_v262_batch_limit),
+                                        bool(_v262_force_current),
+                                    )
+                                    if _started278.get("ok"):
+                                        st.success(
+                                            f"バックグラウンド再シミュレーションを開始しました（ジョブID: {_started278.get('job_id')}）。"
+                                            "このまま別の画面へ移動できます。"
+                                        )
+                                        st.rerun()
+                                    else:
+                                        st.warning(str(_started278.get("reason") or "開始できませんでした。"))
+
+                            if _bg278 and str(_bg278.get("status") or "") in ("completed","cancelled","failed"):
+                                _status278=str(_bg278.get("status") or "")
+                                if _status278=="completed":
+                                    st.success(str(_bg278.get("message") or "バックグラウンド再シミュレーションが完了しました。"))
+                                elif _status278=="cancelled":
+                                    st.info(str(_bg278.get("message") or "停止しました。"))
+                                else:
+                                    st.error(
+                                        str(_bg278.get("message") or "バックグラウンド再シミュレーションでエラーが発生しました。")
+                                        +" "+str(_bg278.get("error_text") or "")
+                                    )
+
+                                _batch=(_bg278.get("result") or {})
+                                if _batch.get("labels"):
+                                    st.caption("新規保存: "+" / ".join(_batch.get("labels",[])[:30]))
+                                if _batch.get("errors"):
+                                    st.warning(" / ".join(_batch.get("errors",[])[:12]))
+
+                                # 過去データの仮想評価だけを表示。実購入処理は行わない。
                                 _roi_n=int(_batch.get("roi_evaluated",0) or 0)
                                 if _roi_n>0:
                                     st.markdown("#### 📊 仮想100円均等・回収率バックテスト")
@@ -12512,34 +12776,9 @@ if selected_main_page == "🗃️ 登録情報確認":
                                         f"的中 {_batch.get('roi_hits',0)}R / "
                                         f"保存オッズなし {_batch.get('roi_no_odds',0)}R / "
                                         f"払戻未登録 {_batch.get('roi_no_payout',0)}R。"
-                                        "各買い目は1点100円の仮想評価です。"
+                                        "過去データの検証用です。"
                                     )
-                                    _roi_df=pd.DataFrame(_batch.get("roi_rows") or [])
-                                    if not _roi_df.empty:
-                                        _show_cols=[c for c in [
-                                            "race","points","cost_yen","payout_yen","return_rate","hit",
-                                            "odds_created_at","reason"
-                                        ] if c in _roi_df.columns]
-                                        st.dataframe(
-                                            _roi_df[_show_cols],
-                                            use_container_width=True,
-                                            hide_index=True,
-                                            column_config={
-                                                "cost_yen":st.column_config.NumberColumn("仮想投資",format="%d円"),
-                                                "payout_yen":st.column_config.NumberColumn("仮想払戻",format="%d円"),
-                                                "return_rate":st.column_config.NumberColumn("回収率",format="%.1f%%"),
-                                            },
-                                        )
-                                    st.caption(
-                                        "比較の公平性を優先し、各レースに保存されている最古のオッズスナップショットを使用します。"
-                                        "これは過去データの検証用で、実購入処理は行いません。"
-                                    )
-                                elif int(_batch.get("rerun",0) or 0)>0:
-                                    st.info(
-                                        "回収率採点できるレースがありませんでした。"
-                                        "保存済みオッズと払戻の両方がある過去レースだけが対象です。"
-                                    )
-                                st.rerun()
+
                             result255=_v255_backtest_center(engine.DB_PATH)
                             cmp_df=result255.get('comparison',pd.DataFrame())
                             if cmp_df.empty:
