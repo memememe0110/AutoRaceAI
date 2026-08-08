@@ -10446,6 +10446,31 @@ def github_ready() -> tuple[bool, str]:
     return True, "GitHub保存設定済み"
 
 
+def _v276_validate_db_bytes(data: bytes, label: str = "DB") -> tuple[bool, str]:
+    """DBを採用する前に一時ファイル上で完全性とsqlite_master読取を確認する。"""
+    if not data.startswith(b"SQLite format 3\x00"):
+        return False, f"{label}がSQLite形式ではありません。"
+    tmp_path = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix="autorace_db_validate_", suffix=".sqlite3")
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        tmp_path.write_bytes(data)
+        with sqlite3.connect(str(tmp_path), timeout=30.0) as con:
+            check = con.execute("PRAGMA integrity_check").fetchone()
+            check_text = str(check[0] if check else "").strip()
+            if check_text.lower() != "ok":
+                return False, f"{label}の整合性チェックに失敗しました: {check_text}"
+            # malformed database schema は integrity_check より先/別経路で出る場合があるため明示的に全スキーマを読む
+            con.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").fetchall()
+        return True, "ok"
+    except Exception as exc:
+        return False, f"{label}を安全確認できませんでした: {type(exc).__name__}: {exc}"
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
 def pull_db_from_github() -> tuple[bool, str]:
     try:
         if "_v278_bg_has_running_job" in globals() and _v278_bg_has_running_job(engine.DB_PATH):
@@ -10462,11 +10487,31 @@ def pull_db_from_github() -> tuple[bool, str]:
         return False, f"GitHubからDBを取得できませんでした: {body.get('message', status)}"
     try:
         data = base64.b64decode(body["content"].replace("\n", ""))
-        if not data.startswith(b"SQLite format 3\x00"):
-            return False, "GitHub上のファイルがSQLiteではありません。"
-        Path(engine.DB_PATH).write_bytes(data)
-        engine.mount_and_init_db()
-        return True, f"GitHubからDBを取得しました（{len(data) / 1024 / 1024:.2f} MB）"
+        valid, valid_msg = _v276_validate_db_bytes(data, "GitHub上のDB")
+        if not valid:
+            return False, "GitHub上のDBが破損しているため再読込を中止しました。現在のDBは変更していません。\n" + valid_msg
+        target = Path(engine.DB_PATH)
+        backup = target.with_suffix(target.suffix + ".before_github_pull")
+        if target.exists():
+            backup.write_bytes(target.read_bytes())
+        try:
+            target.write_bytes(data)
+            engine.mount_and_init_db()
+            # 採用後にも実ファイルを確認。失敗時は直前DBへ戻す。
+            with sqlite3.connect(str(target), timeout=30.0) as con:
+                con.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").fetchall()
+                check = con.execute("PRAGMA quick_check").fetchone()[0]
+                if str(check).lower() != "ok":
+                    raise sqlite3.DatabaseError(f"quick_check: {check}")
+        except Exception:
+            if backup.exists():
+                target.write_bytes(backup.read_bytes())
+                try:
+                    engine.mount_and_init_db()
+                except Exception:
+                    pass
+            raise
+        return True, f"GitHubから正常DBを取得しました（{len(data) / 1024 / 1024:.2f} MB）"
     except Exception as exc:
         return False, f"GitHub DB取得エラー: {type(exc).__name__}: {exc}"
 
@@ -10526,13 +10571,11 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
 
 
 
-# 起動後の最初の1回だけ、GitHub上の最新DBを取得
+# Ver276 DB安全化: 起動時にGitHub DBで現在DBを自動上書きしない。
+# GitHub側が古い/破損DBでも、アップロード済みの正常DBを保持する。
 if "github_pull_done" not in st.session_state:
     st.session_state["github_pull_done"] = True
-    ready, _ = github_ready()
-    if ready:
-        ok, msg = pull_db_from_github()
-        st.session_state["github_pull_message"] = (ok, msg)
+    st.session_state["github_pull_message"] = (True, "起動時のGitHub DB自動読込は安全のため停止中です。必要な場合だけ『GitHubからDBを再読込』を押してください。")
 
 
 def _v278_render_bg_compact(location: str = "main") -> None:
