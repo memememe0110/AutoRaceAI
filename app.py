@@ -11572,13 +11572,35 @@ elif selected_main_page == "🏁 予測":
                 detail = "、".join(f"{car}番（{status}）" for car, status in sorted(excluded.items()))
                 st.warning(f"解析対象外: {detail}。確率・順位・買い目の組み合わせから完全に除外しました。")
             st.caption(f"実出走数: {len(entries)}車 / 三連単組み合わせ数: {len(entries)*(len(entries)-1)*(len(entries)-2)}通り")
+
+            # Ver276 表示改善: 予測入力で再試走を認識できたか、解析直後に確認できるようにする。
+            # 表示のみで予測計算値には影響しない。
+            try:
+                _retrial_cols = [c for c in ["車番", "選手名", "試走T", "試走", "試走種別", "再試走"] if c in entries.columns]
+                if "再試走" in entries.columns and bool(entries["再試走"].fillna(False).astype(bool).any()):
+                    _retrial_cars = []
+                    _car_col = next((c for c in ("車番", "車") if c in entries.columns), None)
+                    _name_col = next((c for c in ("選手名", "選手") if c in entries.columns), None)
+                    for _, _rr in entries[entries["再試走"].fillna(False).astype(bool)].iterrows():
+                        _car_txt = f"{int(float(_rr[_car_col]))}番" if _car_col and pd.notna(_rr.get(_car_col)) else ""
+                        _name_txt = str(_rr.get(_name_col, "")) if _name_col else ""
+                        _retrial_cars.append(f"{_car_txt}{' '+_name_txt if _name_txt else ''}")
+                    st.info("🔁 再試走を認識：" + " / ".join(_retrial_cars))
+                else:
+                    st.caption("🔁 再試走：なし")
+                if _retrial_cols:
+                    with st.expander("🔁 試走種別・再試走の読取確認", expanded=False):
+                        st.dataframe(entries[_retrial_cols], use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
             with st.expander("解析入力と登録データ量を再確認", expanded=False):
                 st.dataframe(entries.drop(columns=["_raw"], errors="ignore"), use_container_width=True, hide_index=True)
                 show_player_data_coverage(entries)
 
             cols = [c for c in [
                 "改善後順位", "1着候補順位", "連対候補順位", "3着候補順位", "総合点順位_従来",
-                "車", "選手名", "ハンデ", "試走換算", "予測競走T", "レース信頼度",
+                "車", "選手名", "ハンデ", "試走換算", "試走種別", "再試走", "予測競走T", "レース信頼度",
                 "本番1着率", "本番連対率", "本番3着率", "本番3着内率", "順位整合メモ",
                 "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
                 "スタート伸び指数", "ゴール前伸び指数", "安定上位指数",
