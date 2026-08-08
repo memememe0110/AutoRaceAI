@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver270"
+APP_VERSION = "Ver271"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -1473,7 +1473,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         if not rk or rk in seen:
             continue
         seen.add(rk); unique.append(h)
-    # Ver270: 本来の時系列順で再シミュレーションする。
+    # Ver271: 本来の時系列順で再シミュレーションする。
     # 各保存履歴から開催日・場・Rを読み、古いレース→新しいレースへ並べる。
     chronological=[]
     for h in unique:
@@ -1492,7 +1492,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
     unique=[x[4] for x in chronological]
 
     total=len(unique)
-    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver270')
+    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver271')
     # 現行Verで「予測履歴＋6周スナップショット」まで揃っているレースだけスキップする。
     # 履歴だけ存在して周回保存が欠けている場合は、一括再シミュレーションで自動修復する。
     current_keys=set()
@@ -2980,6 +2980,79 @@ def _v268_handicap_bias_seconds(model: dict, handicap_value: float) -> float:
         return 0.0
 
 
+
+# ---------------------------------------------------------------------------
+# Ver271: 3～4周目の追い抜き・壁突破を保守的に調整
+# Ver271の「追い切りゲート」を利用し、後方ハンデ勢の中盤だけを微調整する。
+# 新しい大きな独立補正は作らず、序盤1～2周と終盤5～6周は原則そのまま。
+# ---------------------------------------------------------------------------
+
+def _v271_mid_lap_pass_factor(
+    lap_no: int,
+    handicap_m: float,
+    chase_gate: float,
+    trial_time: float | None,
+    field_trial_median: float | None,
+) -> tuple[float, str]:
+    try:
+        lap = int(lap_no)
+    except Exception:
+        lap = 0
+    if lap not in (3, 4):
+        return 1.0, "outside_mid_lap"
+
+    try:
+        h = float(handicap_m or 0.0)
+    except Exception:
+        h = 0.0
+    try:
+        gate = float(chase_gate or 1.0)
+    except Exception:
+        gate = 1.0
+
+    # 0～20mは中盤捌き補正の対象外。
+    if h < 30.0:
+        return 1.0, "front_or_mid"
+
+    factor = 1.0
+    reasons = []
+
+    # Ver271で「追える根拠」が弱い後方車は3～4周目の追い抜きを抑える。
+    if gate < 0.60:
+        factor *= 0.84
+        reasons.append("weak_chase_gate")
+    elif gate < 0.75:
+        factor *= 0.92
+        reasons.append("moderate_chase_gate")
+    elif gate >= 0.92:
+        factor *= 1.05
+        reasons.append("strong_chase_gate")
+
+    # 当日の試走が良い場合だけ、中盤の捌き成功率を小さく上乗せ。
+    try:
+        tt = float(trial_time)
+        med = float(field_trial_median)
+        if np.isfinite(tt) and np.isfinite(med):
+            adv = med - tt
+            if adv >= 0.040:
+                factor *= 1.05
+                reasons.append("strong_trial")
+            elif adv <= -0.035:
+                factor *= 0.94
+                reasons.append("weak_trial")
+    except Exception:
+        pass
+
+    # 60m以上は中盤の渋滞・複数捌き不確実性を追加で抑える。
+    if h >= 60.0 and gate < 0.90:
+        factor *= 0.93
+        reasons.append("deep_handicap")
+
+    # 過学習防止。±18%以内。
+    factor = float(np.clip(factor, 0.82, 1.08))
+    return factor, ",".join(reasons) if reasons else "neutral"
+
+
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
     if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(entries,pd.DataFrame) or entries.empty:
@@ -3107,6 +3180,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             chase_reason_v270[_c]=str(_gate_meta270.get("reason",""))
             _total_adj=float(_adj)+float(_h_adj_gated)
             strength[_c]=max(-1.70,min(1.70,strength[_c]-12.0*_total_adj))
+            # Ver271の中盤補正値は周回イベント側で参照するため保持。
     actual_lap_orders=_v251_actual_lap_orders(_v230_db_path(), meta)
     scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
     scenario_feedback_v264=_v264_feedback_scenario_adjustment(_v230_db_path(), venue, race_date)
@@ -3370,8 +3444,12 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     out["Ver265タイム残差補正秒"]=out[car_col].map(lambda x: time_adjust_v265.get(int(x),0.0) if pd.notna(x) else 0.0)
     out["Ver268ハンデ残差補正秒"]=out[car_col].map(lambda x: handicap_adjust_v268.get(int(x),0.0) if pd.notna(x) else 0.0)
-    out["Ver270追い切りゲート"]=out[car_col].map(lambda x: chase_gate_v270.get(int(x),1.0) if pd.notna(x) else 1.0)
-    out["Ver270追い切り根拠"]=out[car_col].map(lambda x: chase_reason_v270.get(int(x),"") if pd.notna(x) else "")
+    out["Ver271追い切りゲート"]=out[car_col].map(lambda x: chase_gate_v270.get(int(x),1.0) if pd.notna(x) else 1.0)
+    out["Ver271追い切り根拠"]=out[car_col].map(lambda x: chase_reason_v270.get(int(x),"") if pd.notna(x) else "")
+
+    out["Ver271中盤補正対象"]=out[car_col].map(
+        lambda x: "3-4周目" if (pd.notna(x) and float(handicap.get(int(x),0) or 0)>=30.0) else "対象外"
+    )
     if "予測競走T" in out.columns:
         out["Ver265補正後予測競走T"]=pd.to_numeric(out["予測競走T"],errors="coerce") + out["Ver265タイム残差補正秒"]
         out["Ver268補正後予測競走T"]=(
@@ -10630,20 +10708,49 @@ if selected_main_page == "🗃️ 登録情報確認":
                 if ok:
                     st.session_state.pop("v74_optimization",None)
                     st.rerun()
-    hist74=engine.v74_optimization_history(engine.DB_PATH,20)
-    if not hist74.empty:
-        with st.expander("過去の最適化履歴", expanded=False):
-            st.dataframe(hist74,use_container_width=True,hide_index=True)
+    # Ver271安定化: 学習テーブルの読込失敗でアプリ全体を落とさない。
+    # DB本体の予測・結果テーブルと、重み学習の補助テーブルは切り離して扱う。
+    try:
+        hist74=engine.v74_optimization_history(engine.DB_PATH,20)
+        if not hist74.empty:
+            with st.expander("過去の最適化履歴", expanded=False):
+                st.dataframe(hist74,use_container_width=True,hide_index=True)
+    except sqlite3.DatabaseError as exc:
+        st.warning(
+            "最適化履歴テーブルを読み込めませんでした。"
+            "予測DB全体が壊れているとは限りません。"
+            f"（{type(exc).__name__}: {exc}）"
+        )
+    except Exception as exc:
+        st.warning(f"最適化履歴の読込をスキップしました: {type(exc).__name__}: {exc}")
 
     st.divider()
     st.subheader("学習重み・変更履歴")
-    st.dataframe(engine.v40_current_weights(engine.DB_PATH), use_container_width=True, hide_index=True,
-        column_config={"現在の重み":st.column_config.NumberColumn(format="%.4f"),"初期値":st.column_config.NumberColumn(format="%.4f"),"初期値からの差":st.column_config.NumberColumn(format="%+.4f")})
-    history_df=engine.v39_weight_history(engine.DB_PATH,100)
-    if history_df.empty:
-        st.caption("重み変更履歴はまだありません。")
-    else:
-        st.dataframe(history_df,use_container_width=True,hide_index=True)
+    try:
+        _v270_weights_df=engine.v40_current_weights(engine.DB_PATH)
+        st.dataframe(_v270_weights_df, use_container_width=True, hide_index=True,
+            column_config={"現在の重み":st.column_config.NumberColumn(format="%.4f"),"初期値":st.column_config.NumberColumn(format="%.4f"),"初期値からの差":st.column_config.NumberColumn(format="%+.4f")})
+    except sqlite3.DatabaseError as exc:
+        st.warning(
+            "学習重みテーブルを読み込めないため、この表示だけスキップしました。"
+            f"（{type(exc).__name__}: {exc}）"
+        )
+    except Exception as exc:
+        st.warning(f"学習重み表示をスキップしました: {type(exc).__name__}: {exc}")
+
+    try:
+        history_df=engine.v39_weight_history(engine.DB_PATH,100)
+        if history_df.empty:
+            st.caption("重み変更履歴はまだありません。")
+        else:
+            st.dataframe(history_df,use_container_width=True,hide_index=True)
+    except sqlite3.DatabaseError as exc:
+        st.warning(
+            "重み変更履歴テーブルを読み込めないため、この表示だけスキップしました。"
+            f"（{type(exc).__name__}: {exc}）"
+        )
+    except Exception as exc:
+        st.warning(f"重み変更履歴の表示をスキップしました: {type(exc).__name__}: {exc}")
     st.subheader("結果登録履歴・取り消し")
     reg_history = engine.v41_registration_history(engine.DB_PATH, 50)
     if reg_history.empty:
