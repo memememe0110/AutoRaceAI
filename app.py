@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver267"
+APP_VERSION = "Ver268"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -402,6 +402,7 @@ def _v266_load_error_rows(db_path, limit_rows=20000):
 
         car_keys = ("車番", "car_no", "number", "car", "枠番")
         pred_keys = (
+            "Ver268補正後予測競走T",
             "Ver266補正後予測競走T",
             "Ver265補正後予測競走T",
             "予測競走T",
@@ -591,7 +592,7 @@ def _v267_handicap_error_curve(unique_rows):
 
 def _v266_render_error_analysis(db_path):
     import pandas as pd
-    st.subheader("🔬 Ver267 基礎予測・誤差解析")
+    st.subheader("🔬 Ver268 基礎予測・誤差解析")
     st.caption(
         "原因分析では同一レース×車番を1実走として扱い、Ver違いの重複を除外します。"
         "バージョン評価は別枠で集計します。"
@@ -2693,6 +2694,186 @@ def _v265_time_adjustment_seconds(cal: dict, player_name: str, handicap_value: f
     except Exception:
         return 0.0,0.0,0
 
+
+# ---------------------------------------------------------------------------
+# Ver268: ハンデ残差学習
+# 保存済み予測Tと実競走Tの actual-predicted 残差を、ハンデに対する
+# 滑らかな線形カーブとして学習する。未来日の結果は使わず、
+# 5-fold CVでMAEが3%以上改善した場合のみ予測へ自動採用する。
+# ---------------------------------------------------------------------------
+
+_V268_HANDICAP_MODEL_CACHE = {}
+
+def _v268_handicap_bias_model(db_path: str | None, venue: str = "", cutoff_date: str = "") -> dict:
+    empty = {
+        "enabled": False, "samples": 0, "venue": str(venue or ""),
+        "slope": 0.0, "intercept": 0.0, "shrink": 0.0,
+        "mae_before": None, "mae_after_cv": None, "improvement_pct": 0.0,
+        "reason": "データ不足",
+    }
+    if not db_path or not os.path.exists(str(db_path)):
+        return empty
+
+    key = (str(db_path), str(venue or ""), str(cutoff_date or "")[:10])
+    if key in _V268_HANDICAP_MODEL_CACHE:
+        return dict(_V268_HANDICAP_MODEL_CACHE[key])
+
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            needed = {"v266_pred_time_snapshots","result_races","result_entries"}
+            if not needed.issubset(tables):
+                out = dict(empty)
+                out["reason"] = "予測Tスナップショット未準備"
+                _V268_HANDICAP_MODEL_CACHE[key] = dict(out)
+                return out
+
+            q = """
+                WITH latest AS (
+                    SELECT s.race_key, s.car_no, MAX(s.history_id) AS history_id
+                    FROM v266_pred_time_snapshots s
+                    JOIN result_races rr ON rr.race_key=s.race_key
+                    WHERE 1=1
+            """
+            params = []
+            if cutoff_date:
+                q += " AND rr.race_date < ?"
+                params.append(str(cutoff_date)[:10])
+            if venue:
+                q += " AND rr.venue = ?"
+                params.append(str(venue))
+            q += """
+                    GROUP BY s.race_key, s.car_no
+                )
+                SELECT rr.race_date, rr.venue, re.car_no, re.handicap,
+                       CAST(re.race_time AS REAL) AS actual_time,
+                       CAST(s.predicted_race_time AS REAL) AS pred_time,
+                       COALESCE(re.result_status,'通常') AS result_status,
+                       rr.race_key
+                FROM latest l
+                JOIN v266_pred_time_snapshots s
+                  ON s.history_id=l.history_id
+                 AND s.race_key=l.race_key
+                 AND s.car_no=l.car_no
+                JOIN result_races rr ON rr.race_key=s.race_key
+                JOIN result_entries re
+                  ON re.race_key=s.race_key
+                 AND CAST(re.car_no AS INTEGER)=CAST(s.car_no AS INTEGER)
+                WHERE re.race_time IS NOT NULL
+                  AND CAST(re.race_time AS REAL) BETWEEN 3.20 AND 4.50
+                  AND COALESCE(re.result_status,'通常') NOT IN (
+                      '欠車','出走取消','発走除外','競走除外',
+                      '落車','競走中止','失格','反則','反妨','周誤','周回誤認'
+                  )
+            """
+            rows = con.execute(q, params).fetchall()
+    except Exception as exc:
+        out = dict(empty)
+        out["reason"] = f"読込失敗: {type(exc).__name__}: {exc}"
+        _V268_HANDICAP_MODEL_CACHE[key] = dict(out)
+        return out
+
+    xs, ys, group_keys = [], [], []
+    for rd, vv, car, h, actual, pred, status, race_key in rows:
+        try:
+            m = re.search(r"-?\d+", str(h if h is not None else "0"))
+            hv = float(m.group()) if m else 0.0
+            a = float(actual)
+            p = float(pred)
+            err = a - p
+            if not np.isfinite(hv) or not np.isfinite(err) or abs(err) > 0.20:
+                continue
+            xs.append(hv)
+            ys.append(err)
+            group_keys.append(str(race_key or f"{rd}|{vv}"))
+        except Exception:
+            continue
+
+    n = len(xs)
+    if n < 30 or len(set(xs)) < 3:
+        out = dict(empty)
+        out["samples"] = n
+        out["reason"] = f"学習対象{n}走（30走未満またはハンデ種類不足）"
+        _V268_HANDICAP_MODEL_CACHE[key] = dict(out)
+        return out
+
+    x = np.asarray(xs, dtype=float)
+    y = np.asarray(ys, dtype=float)
+
+    def _fit(xtr, ytr):
+        xm = float(np.mean(xtr))
+        ym = float(np.mean(ytr))
+        den = float(np.sum((xtr-xm)**2))
+        raw_slope = float(np.sum((xtr-xm)*(ytr-ym))/den) if den > 1e-12 else 0.0
+        raw_intercept = ym - raw_slope*xm
+        shrink = float(min(0.78, max(0.35, len(xtr)/(len(xtr)+40.0))))
+        slope = raw_slope * shrink
+        intercept = raw_intercept * min(0.55, shrink)
+        return slope, intercept, raw_slope, raw_intercept, shrink
+
+    slope, intercept, raw_slope, raw_intercept, shrink = _fit(x, y)
+
+    # Stable deterministic 5-fold grouped by race_key.
+    import hashlib as _hashlib
+    folds = np.asarray(
+        [int(_hashlib.md5(g.encode("utf-8")).hexdigest()[:8], 16) % 5 for g in group_keys],
+        dtype=int
+    )
+    before, after = [], []
+    for f in range(5):
+        tr = folds != f
+        te = folds == f
+        if int(np.sum(tr)) < 20 or int(np.sum(te)) < 3:
+            continue
+        ss, ii, _, _, _ = _fit(x[tr], y[tr])
+        pred_err = np.clip(ii + ss*x[te], -0.032, 0.018)
+        before.extend(np.abs(y[te]).tolist())
+        after.extend(np.abs(y[te] - pred_err).tolist())
+
+    mae_before = float(np.mean(before)) if before else float(np.mean(np.abs(y)))
+    mae_after = float(np.mean(after)) if after else None
+    improvement = (
+        (mae_before - mae_after) / mae_before * 100.0
+        if mae_after is not None and mae_before > 1e-12 else 0.0
+    )
+    enabled = bool(mae_after is not None and improvement >= 3.0)
+
+    out = {
+        "enabled": enabled,
+        "samples": n,
+        "venue": str(venue or ""),
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "raw_slope": float(raw_slope),
+        "raw_intercept": float(raw_intercept),
+        "shrink": float(shrink),
+        "mae_before": float(mae_before),
+        "mae_after_cv": float(mae_after) if mae_after is not None else None,
+        "improvement_pct": float(improvement),
+        "reason": (
+            f"CV改善{improvement:.1f}%で採用"
+            if enabled else
+            f"CV改善{improvement:.1f}%のため保留"
+        ),
+    }
+    _V268_HANDICAP_MODEL_CACHE[key] = dict(out)
+    return out
+
+
+def _v268_handicap_bias_seconds(model: dict, handicap_value: float) -> float:
+    if not model or not model.get("enabled"):
+        return 0.0
+    try:
+        h = float(handicap_value or 0.0)
+        # error = actual - predicted。これを予測Tへそのまま加える。
+        adj = float(model.get("intercept",0.0)) + float(model.get("slope",0.0))*h
+        return float(np.clip(adj, -0.032, 0.018))
+    except Exception:
+        return 0.0
+
+
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
     if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(entries,pd.DataFrame) or entries.empty:
@@ -2779,9 +2960,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     player_actual_calibration=_v258_player_actual_lap_calibration(_v230_db_path(), venue, race_date)
     player_actual_delta=player_actual_calibration.get("player_delta") or {}
     time_residual_v265=_v265_time_residual_calibration(_v230_db_path(), venue, race_date)
+    handicap_bias_v268=_v268_handicap_bias_model(_v230_db_path(), venue, race_date)
     time_adjust_v265={}
     time_expected_v265={}
     time_samples_v265={}
+    handicap_adjust_v268={}
     for _,_rr in work.iterrows():
         _c=int(_rr["_car"])
         _nm=next((n for c,n in zip(cars,names) if c==_c),'')
@@ -2790,7 +2973,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         if _pred>0 and _trial>0:
             _adj,_exp,_sn=_v265_time_adjustment_seconds(time_residual_v265,_nm,handicap.get(_c,0),_trial,_pred)
             time_adjust_v265[_c]=_adj; time_expected_v265[_c]=_exp; time_samples_v265[_c]=_sn
-            strength[_c]=max(-1.70,min(1.70,strength[_c]-12.0*_adj))
+            _h_adj=_v268_handicap_bias_seconds(handicap_bias_v268, handicap.get(_c,0))
+            handicap_adjust_v268[_c]=_h_adj
+            _total_adj=float(_adj)+float(_h_adj)
+            strength[_c]=max(-1.70,min(1.70,strength[_c]-12.0*_total_adj))
     actual_lap_orders=_v251_actual_lap_orders(_v230_db_path(), meta)
     scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
     scenario_feedback_v264=_v264_feedback_scenario_adjustment(_v230_db_path(), venue, race_date)
@@ -3053,9 +3239,16 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["1周目先頭率"]=out[car_col].map(lambda x: start_front.get(int(x),0)/sim_trials*100 if pd.notna(x) else 0.0)
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     out["Ver265タイム残差補正秒"]=out[car_col].map(lambda x: time_adjust_v265.get(int(x),0.0) if pd.notna(x) else 0.0)
+    out["Ver268ハンデ残差補正秒"]=out[car_col].map(lambda x: handicap_adjust_v268.get(int(x),0.0) if pd.notna(x) else 0.0)
     if "予測競走T" in out.columns:
         out["Ver265補正後予測競走T"]=pd.to_numeric(out["予測競走T"],errors="coerce") + out["Ver265タイム残差補正秒"]
+        out["Ver268補正後予測競走T"]=(
+            pd.to_numeric(out["予測競走T"],errors="coerce")
+            + out["Ver265タイム残差補正秒"]
+            + out["Ver268ハンデ残差補正秒"]
+        )
     out["Ver265タイム学習件数"]=out[car_col].map(lambda x: time_samples_v265.get(int(x),0) if pd.notna(x) else 0)
+    out["Ver268ハンデ学習件数"]=int(handicap_bias_v268.get("samples",0) or 0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
     modal_laps=[]
     for lap in range(1,7):
@@ -3098,6 +3291,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "actual_lap_learning_v256": actual_lap_calibration,
         "player_actual_learning_v258": {"enabled":False,"reason":"Ver265ではVer257基準へ戻すため予測反映停止"},
         "time_residual_learning_v265": time_residual_v265,
+        "handicap_bias_v268": handicap_bias_v268,
         "time_adjustments_v265": {str(k):round(float(v),5) for k,v in time_adjust_v265.items()},
         "predicted_lap_orders": modal_laps,
         "actual_lap_comparison": lap_comparison,
@@ -11322,9 +11516,36 @@ if selected_main_page == "🗃️ 登録情報確認":
 
 
 
+
+# Ver268: ハンデ残差補正・安全判定
+try:
+    with st.expander("🎯 Ver268 ハンデ残差補正・安全判定", expanded=False):
+        st.caption(
+            "保存済み予測Tと実結果の残差からハンデ補正を学習します。"
+            "同一実走のVer重複を除外し、5-fold CVでMAEが3%以上改善した時だけ自動採用します。"
+        )
+        _m268 = _v268_handicap_bias_model(engine.DB_PATH, "", "")
+        a,b,c,d = st.columns(4)
+        a.metric("学習走数", f"{int(_m268.get('samples',0) or 0)}")
+        b.metric("CV補正前MAE", "—" if _m268.get("mae_before") is None else f"{_m268['mae_before']:.4f}秒")
+        c.metric("CV補正後MAE", "—" if _m268.get("mae_after_cv") is None else f"{_m268['mae_after_cv']:.4f}秒")
+        d.metric("改善率", f"{float(_m268.get('improvement_pct',0.0)):+.1f}%")
+        if _m268.get("enabled"):
+            st.success("ハンデ残差補正: 自動採用")
+        else:
+            st.info("ハンデ残差補正: 自動保留")
+        st.caption(
+            f"傾き {float(_m268.get('slope',0.0)):+.6f}秒/m / "
+            f"切片 {float(_m268.get('intercept',0.0)):+.4f}秒 / "
+            f"{_m268.get('reason','')}"
+        )
+except Exception as _v268_ui_exc:
+    st.warning("Ver268ハンデ安全判定エラー: " + _runtime_exception_text(_v268_ui_exc))
+
+
 # Ver266: 予測競走Tスナップショット管理
 try:
-    with st.expander("💾 Ver267 予測競走Tスナップショット", expanded=False):
+    with st.expander("💾 Ver268 予測競走Tスナップショット", expanded=False):
         _v266_ensure_pred_time_snapshot_table(engine.DB_PATH)
         with sqlite3.connect(str(engine.DB_PATH)) as _c:
             _v266_snap_count = int(_c.execute("SELECT COUNT(*) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
@@ -11353,7 +11574,7 @@ except Exception as _v266_snap_exc:
 
 # Ver266: None選手名の診断・補修
 try:
-    with st.expander("🧩 Ver267 選手名None補修", expanded=False):
+    with st.expander("🧩 Ver268 選手名None補修", expanded=False):
         with sqlite3.connect(str(engine.DB_PATH)) as _v266_name_con:
             _v266_missing_names = int(_v266_name_con.execute("""
                 SELECT COUNT(*)
@@ -11380,7 +11601,7 @@ except Exception as _v266_name_exc:
 
 # Ver266 diagnostic panel
 try:
-    with st.expander("🔬 Ver267 基礎予測・誤差解析", expanded=False):
-        _v266_render_error_analysis(db_path)
+    with st.expander("🔬 Ver268 基礎予測・誤差解析", expanded=False):
+        _v266_render_error_analysis(engine.DB_PATH)
 except Exception as _v266_exc:
     st.warning("Ver266誤差解析の表示に失敗しました: " + _runtime_exception_text(_v266_exc))
