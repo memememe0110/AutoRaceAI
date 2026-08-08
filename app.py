@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver275"
+APP_VERSION = "Ver276"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -3936,7 +3936,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 try:
                     _mid_factor272,_=_v271_mid_lap_pass_factor(
                         lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,1.0),
-                        trial_map.get(chaser), _trial_median_v270)
+                        trial.get(chaser), _trial_median_v270)
                     p=float(np.clip(p*_mid_factor272,0.035,0.88))
                 except Exception:
                     pass
@@ -3950,7 +3950,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                         pass
                     _late_factor272,_late_diag274=_v272_late_chase_release(
                         lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,0.75),
-                        trial_map.get(chaser), _trial_median_v270,
+                        trial.get(chaser), _trial_median_v270,
                         time_adjust_v265.get(chaser,0.0), time_samples_v265.get(chaser,0), return_diag=True)
                     try:
                         _lap_diag274=int(lap)
@@ -12255,7 +12255,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
 
 
-                        with st.expander("🧪 Ver275 終盤再加速・詳細経路ログ", expanded=False):
+                        with st.expander("🧪 Ver276 終盤再加速・詳細経路ログ", expanded=False):
                             st.caption(
                                 "保存済み予測DataFrameではなく、シミュレーション直後にmetaへ保存した監査辞書を直接表示します。"
                                 "これで列の欠落・上書きの影響を受けません。"
