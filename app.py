@@ -2183,40 +2183,38 @@ def _v278_resume_background_after_foreground(db_path: str, pause_info: dict) -> 
     except Exception:
         pass
 
-def _v278_send_completion_notification(job_id: int, result: dict) -> None:
-    """バックグラウンド再シミュレーション完了時にntfyへ即時通知する。
+def _v276_send_rerun_complete_notification(result: dict) -> None:
+    """バックグラウンド再シミュレーション正常完了時だけntfyへ即時通知する。
 
-    通知は予測ロジックから独立しており、失敗してもシミュレーション結果には影響しない。
-    トピックは環境変数 AUTORACE_NTFY_TOPIC を優先し、未設定時は既存の一般予定通知と同じ notify を使う。
+    通知失敗は再シミュレーション結果へ影響させない。
+    通知先は既存の一般予定通知と同じ既定トピック notify を使用し、
+    Streamlit Cloud等では AUTORACE_NTFY_TOPIC 環境変数で上書きできる。
     """
     try:
-        topic=str(os.environ.get("AUTORACE_NTFY_TOPIC", "notify") or "notify").strip()
-        if not topic:
+        topic = str(os.environ.get("AUTORACE_NTFY_TOPIC", "notify") or "notify").strip()
+        if not topic or any(ch in topic for ch in "/?# "):
             return
-        checked=int((result or {}).get("checked",0) or 0)
-        rerun=int((result or {}).get("rerun",0) or 0)
-        errors=len((result or {}).get("errors",[]) or [])
-        payload={
+        rerun = int((result or {}).get("rerun") or 0)
+        checked = int((result or {}).get("checked") or 0)
+        message = f"再シミュレーションが完了しました。再計算 {rerun}R / 確認 {checked}R"
+        payload = {
             "topic": topic,
             "title": "AutoRaceAI 再シミュレーション完了",
-            "message": f"ジョブID {int(job_id)} が完了しました。確認 {checked}レース / 再シミュレーション {rerun}レース / エラー {errors}件",
+            "message": message,
             "priority": 4,
-            "tags": ["checkered_flag","bell"],
+            "tags": ["bell"],
         }
-        request=urllib.request.Request(
-            GENERAL_REMINDER_NTFY_BASE,
-            data=json.dumps(payload,ensure_ascii=False).encode("utf-8",errors="strict"),
+        request = urllib.request.Request(
+            "https://ntfy.sh",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="strict"),
             method="POST",
-            headers={"Content-Type":"application/json; charset=utf-8"},
+            headers={"Content-Type": "application/json; charset=utf-8"},
         )
-        with urllib.request.urlopen(request,timeout=8) as response:
+        with urllib.request.urlopen(request, timeout=8) as response:
             response.read()
-    except Exception as exc:
-        # 通知障害で完了済みジョブを failed にしない。ログだけ残す。
-        try:
-            print(f"[AutoRaceAI] 完了通知の送信に失敗しました: {type(exc).__name__}: {exc}")
-        except Exception:
-            pass
+    except Exception:
+        # 通知経路の一時障害で、完了済みジョブをfailed扱いにしない。
+        pass
 
 
 def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool) -> None:
@@ -2225,7 +2223,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             db_path, job_id,
             status="running",
             started_at=_v228_now_jst_iso(),
-            message="バックグラウンド再シミュレーションを開始しました。"
+            message="対象レースを整理しています。"
         )
         def _progress(done,total,label):
             _v278_bg_update(
@@ -2257,9 +2255,8 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             ),
             result_blob=sqlite3.Binary(blob),
         )
-        # 正常完了した時だけ、処理終了直後にプッシュ通知する。
         if not cancelled:
-            _v278_send_completion_notification(job_id,result)
+            _v276_send_rerun_complete_notification(result)
     except Exception as exc:
         _v278_bg_update(
             db_path, job_id,
@@ -2281,6 +2278,18 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
     if _v278_bg_has_running_job(db_path):
         return {"ok":False,"reason":"すでにバックグラウンド再シミュレーションが動いています。"}
     now=_v228_now_jst_iso()
+    try:
+        _hist278=_v231_list_prediction_histories(db_path,max(1,int(limit_count)))
+        _seen278=set()
+        _approx_total278=0
+        for _h278 in _hist278:
+            _rk278=str(_h278.get("race_key") or "").strip()
+            if not _rk278 or _rk278 in _seen278:
+                continue
+            _seen278.add(_rk278)
+            _approx_total278+=1
+    except Exception:
+        _approx_total278=0
     with sqlite3.connect(str(db_path), timeout=30.0) as con:
         con.execute("PRAGMA busy_timeout=30000")
         cur=con.execute("""
@@ -2290,8 +2299,15 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
         """,(
             str(_V231_APP_VERSION),"queued",now,now,
             int(limit_count),1 if force_current else 0,
-            "開始待ち"
+            "準備中"
         ))
+        try:
+            con.execute(
+                "UPDATE v278_background_jobs SET total_count=?, message=? WHERE job_id=?",
+                (int(_approx_total278), "対象レースを確認中" if _approx_total278<=0 else f"対象 約{int(_approx_total278)}R を確認", int(cur.lastrowid or 0))
+            )
+        except Exception:
+            pass
         con.commit()
         job_id=int(cur.lastrowid or 0)
     th=threading.Thread(
@@ -10538,7 +10554,10 @@ def _v278_render_bg_compact(location: str = "main") -> None:
     if location=="sidebar":
         if status in ("queued","running","pause_requested","paused","cancel_requested"):
             st.markdown("#### ⏱️ 再シミュレーション")
-            st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}")
+            if total>0:
+                st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}")
+            else:
+                st.info("準備中… 対象レースを確認しています")
             if label:
                 st.caption(label)
             if status=="paused":
@@ -10549,11 +10568,14 @@ def _v278_render_bg_compact(location: str = "main") -> None:
 
     if status in ("queued","running","pause_requested","paused","cancel_requested"):
         icon="⏸️" if status in ("paused","pause_requested") else "⏱️"
-        st.info(
-            f"{icon} 再シミュレーション {done}/{total}"
-            + (f"｜{label}" if label else "")
-            + ("｜DB登録優先で一時停止中" if status=="paused" else "")
-        )
+        if total>0:
+            st.info(
+                f"{icon} 再シミュレーション {done}/{total}"
+                + (f"｜{label}" if label else "")
+                + ("｜DB登録優先で一時停止中" if status=="paused" else "")
+            )
+        else:
+            st.info(f"{icon} 再シミュレーション準備中｜対象レースを確認しています")
     elif status=="completed":
         st.success(f"✅ 再シミュレーション完了 {done}/{total}")
     elif status=="failed":
@@ -10747,7 +10769,10 @@ def _v278_render_background_quick_page(db_path: str) -> None:
         done=int(job.get("done_count",0) or 0)
         total=int(job.get("total_count",0) or 0)
         frac=(float(done)/float(total)) if total else 0.0
-        st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}｜{str(job.get('current_label') or '')}")
+        if total>0:
+            st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}｜{str(job.get('current_label') or '')}")
+        else:
+            st.info("準備中… 対象レースを確認しています")
         a,b=st.columns(2)
         if a.button("🔄 進捗を更新",key="v278_quick_refresh",use_container_width=True):
             st.rerun()
@@ -13272,10 +13297,13 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 _done278=int(_bg278.get("done_count",0) or 0)
                                 _total278=int(_bg278.get("total_count",0) or 0)
                                 _frac278=(float(_done278)/float(_total278)) if _total278 else 0.0
-                                st.progress(
-                                    min(1.0,max(0.0,_frac278)),
-                                    text=f"バックグラウンド実行中 {_done278}/{_total278}｜{str(_bg278.get('current_label') or '')}"
-                                )
+                                if _total278>0:
+                                    st.progress(
+                                        min(1.0,max(0.0,_frac278)),
+                                        text=f"バックグラウンド実行中 {_done278}/{_total278}｜{str(_bg278.get('current_label') or '')}"
+                                    )
+                                else:
+                                    st.info("バックグラウンド準備中… 対象レースを確認しています")
                                 _bga,_bgb,_bgc=st.columns(3)
                                 _bga.metric("状態",str(_bg278.get("status") or "running"))
                                 _bgb.metric("完了",f"{_done278}/{_total278}")
