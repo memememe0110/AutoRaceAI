@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver272"
+APP_VERSION = "Ver273"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -3517,9 +3517,17 @@ def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_t
     threshold=4 if h>=60 else 3
     if score<threshold:
         return 1.0
+
+    # Ver273: 5周目は「一度並びが固まりやすい」前提で採用条件を1段厳しくする。
+    # 6周目は従来条件を維持。
+    if lap==5 and score < threshold+1:
+        return 1.0
+    # Ver273:
+    # 5周目はVer272で悪化が見えたため、再加速をかなり弱める。
+    # 6周目はVer272で改善していたため、そのまま維持する。
     if score>=threshold+2:
-        return 1.08 if lap==6 else 1.06
-    return 1.05 if lap==6 else 1.035
+        return 1.08 if lap==6 else 1.025
+    return 1.05 if lap==6 else 1.015
 
 
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
