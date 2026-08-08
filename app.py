@@ -863,31 +863,23 @@ def _v266_render_error_analysis(db_path):
         )
 
 
-
-# ---------------------------------------------------------------------------
-# Ver267 安定化統合
-# Streamlitのexpanderは閉じていても中のコードを毎回実行するため、
-# DB確認・補修・誤差解析はボタン押下時だけ実行する。
-# ---------------------------------------------------------------------------
-
-with st.expander("💾 Ver267 予測競走Tスナップショット", expanded=False):
-    st.caption("DBへの確認・補完はボタンを押した時だけ実行します。")
-    if st.button("🔎 予測T保存状況を確認", key="v267_check_pred_time"):
-        try:
-            _v266_ensure_pred_time_snapshot_table(engine.DB_PATH)
-            with sqlite3.connect(str(engine.DB_PATH)) as _c:
-                _h = int(_c.execute("SELECT COUNT(*) FROM v231_prediction_history").fetchone()[0] or 0)
-                _sh = int(_c.execute("SELECT COUNT(DISTINCT history_id) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
-                _sc = int(_c.execute("SELECT COUNT(*) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
-            a,b,c = st.columns(3)
-            a.metric("予測履歴", f"{_h}件")
-            b.metric("予測T保存済み履歴", f"{_sh}件")
-            c.metric("車番別予測T", f"{_sc}走")
-        except Exception as exc:
-            st.error("予測T保存状況の確認に失敗: " + _runtime_exception_text(exc))
-
-    if st.button("🔧 過去の保存済み予測Tを一括補完", key="v267_backfill_pred_time"):
-        try:
+# Ver266: 予測競走Tスナップショット管理
+try:
+    with st.expander("💾 Ver266 予測競走Tスナップショット", expanded=False):
+        _v266_ensure_pred_time_snapshot_table(engine.DB_PATH)
+        with sqlite3.connect(str(engine.DB_PATH)) as _c:
+            _v266_snap_count = int(_c.execute("SELECT COUNT(*) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
+            _v266_hist_count = int(_c.execute("SELECT COUNT(*) FROM v231_prediction_history").fetchone()[0] or 0)
+            _v266_snap_histories = int(_c.execute("SELECT COUNT(DISTINCT history_id) FROM v266_pred_time_snapshots").fetchone()[0] or 0)
+        a,b,c = st.columns(3)
+        a.metric("予測履歴", f"{_v266_hist_count}件")
+        b.metric("予測T保存済み履歴", f"{_v266_snap_histories}件")
+        c.metric("車番別予測T", f"{_v266_snap_count}走")
+        st.caption(
+            "過去履歴のprediction_viewに保存されているdfから、当時の予測競走Tをそのまま補完します。"
+            "現在Verでの再計算値ではありません。"
+        )
+        if st.button("🔧 過去の保存済み予測Tを一括補完", key="v266_backfill_pred_time"):
             with st.spinner("保存済み履歴から予測競走Tを補完しています..."):
                 _bf = _v266_backfill_pred_time_snapshots(engine.DB_PATH, 1000)
             st.success(
@@ -896,57 +888,40 @@ with st.expander("💾 Ver267 予測競走Tスナップショット", expanded=F
             )
             if _bf["errors"]:
                 st.warning(" / ".join(_bf["errors"][:10]))
-        except Exception as exc:
-            st.error("予測T一括補完に失敗: " + _runtime_exception_text(exc))
+except Exception as _v266_snap_exc:
+    st.warning("Ver266予測Tスナップショット管理エラー: " + _runtime_exception_text(_v266_snap_exc))
 
 
-with st.expander("🧩 Ver267 選手名None補修", expanded=False):
-    st.caption("確認・補修はボタンを押した時だけDBへアクセスします。")
-    if st.button("🔎 None件数を確認", key="v267_check_none_names"):
-        try:
-            with sqlite3.connect(str(engine.DB_PATH)) as _c:
-                _missing = int(_c.execute("""
-                    SELECT COUNT(*)
-                      FROM result_entries
-                     WHERE player_name IS NULL
-                        OR TRIM(CAST(player_name AS TEXT))=''
-                        OR LOWER(TRIM(CAST(player_name AS TEXT)))='none'
-                """).fetchone()[0] or 0)
-            st.metric("実結果の選手名未登録", f"{_missing}件")
-        except Exception as exc:
-            st.error("None件数の確認に失敗: " + _runtime_exception_text(exc))
-
-    if st.button("🔧 Noneの選手名を公式結果原文から補修", key="v267_repair_none_player_names"):
-        try:
-            _r = _v266_repair_missing_result_player_names(engine.DB_PATH)
+# Ver266: None選手名の診断・補修
+try:
+    with st.expander("🧩 Ver266 選手名None補修", expanded=False):
+        with sqlite3.connect(str(engine.DB_PATH)) as _v266_name_con:
+            _v266_missing_names = int(_v266_name_con.execute("""
+                SELECT COUNT(*)
+                  FROM result_entries
+                 WHERE player_name IS NULL
+                    OR TRIM(CAST(player_name AS TEXT))=''
+                    OR LOWER(TRIM(CAST(player_name AS TEXT)))='none'
+            """).fetchone()[0] or 0)
+        st.metric("実結果の選手名未登録", f"{_v266_missing_names}件")
+        st.caption(
+            "公式結果の保存原文(v238_result_raw_archive)から、同じレース・車番の選手名だけを補完します。"
+            "競走Tや着順など他の結果値は変更しません。"
+        )
+        if st.button("🔧 Noneの選手名を公式結果原文から補修", key="v266_repair_none_player_names"):
+            _v266_name_result = _v266_repair_missing_result_player_names(engine.DB_PATH)
             st.success(
-                f"確認{_r['checked']}件 / 補修{_r['repaired']}件 / "
-                f"未解決{_r['unresolved']}件 / エラー{len(_r['errors'])}件"
+                f"確認{_v266_name_result['checked']}件 / 補修{_v266_name_result['repaired']}件 / "
+                f"未解決{_v266_name_result['unresolved']}件 / エラー{len(_v266_name_result['errors'])}件"
             )
-            if _r["errors"]:
-                st.warning(" / ".join(_r["errors"][:10]))
-        except Exception as exc:
-            st.error("選手名補修に失敗: " + _runtime_exception_text(exc))
+            if _v266_name_result["errors"]:
+                st.warning(" / ".join(_v266_name_result["errors"][:10]))
+except Exception as _v266_name_exc:
+    st.warning("Ver266選手名補修エラー: " + _runtime_exception_text(_v266_name_exc))
 
-
-with st.expander("🔬 Ver267 基礎予測・誤差解析", expanded=False):
-    st.caption("解析はボタンを押した時だけDBを読み込みます。")
-    if st.button("▶ 誤差解析を実行", key="v267_run_error_analysis"):
-        try:
-            _v266_render_error_analysis(engine.DB_PATH)
-        except Exception as exc:
-            st.error("誤差解析の実行に失敗: " + _runtime_exception_text(exc))
-
-    if st.button("🩺 DB簡易チェック", key="v267_db_quick_check"):
-        try:
-            with sqlite3.connect(str(engine.DB_PATH)) as _c:
-                _qc = _c.execute("PRAGMA quick_check").fetchone()
-            _msg = str(_qc[0]) if _qc else "結果なし"
-            if _msg.lower() == "ok":
-                st.success("DB quick_check: OK")
-            else:
-                st.error("DB quick_check: " + _msg)
-                st.caption("DB異常時は書き込みを止め、正常なバックアップDBへ差し替えてください。")
-        except Exception as exc:
-            st.error("DB quick_check実行失敗: " + _runtime_exception_text(exc))
-
+# Ver266 diagnostic panel
+try:
+    with st.expander("🔬 Ver266 基礎予測・誤差解析", expanded=False):
+        _v266_render_error_analysis(engine.DB_PATH)
+except Exception as _v266_exc:
+    st.warning("Ver266誤差解析の表示に失敗しました: " + _runtime_exception_text(_v266_exc))
