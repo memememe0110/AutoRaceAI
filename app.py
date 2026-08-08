@@ -2337,78 +2337,98 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         if not rk or rk in seen:
             continue
         seen.add(rk); unique.append(h)
-    # Ver271: 本来の時系列順で再シミュレーションする。
-    # 各保存履歴から開催日・場・Rを読み、古いレース→新しいレースへ並べる。
+    # Ver276 speed: race_key から日付・場・Rを直接読める通常ケースでは、
+    # 並び替えのためだけに圧縮payloadを展開しない。旧形式だけ従来処理へフォールバックする。
+    _prep_t0_v276=time_module.perf_counter()
     chronological=[]
     for h in unique:
+        _hid=int(h.get('history_id') or 0)
+        _rk=str(h.get('race_key') or '').strip()
+        _m276=re.match(r'^(\d{8})_(.+?)_(\d+)R$',_rk)
+        if _m276:
+            _d8,_venue,_rno_s=_m276.groups()
+            _date=f"{_d8[:4]}-{_d8[4:6]}-{_d8[6:8]}"
+            chronological.append((_date,_venue,int(_rno_s),_hid,h))
+            continue
         try:
-            _v, _raw, _vo, _hm = _v231_load_prediction_history(db_path, int(h.get('history_id') or 0))
+            _v, _raw, _vo, _hm = _v231_load_prediction_history(db_path, _hid)
             _mm = (_v or {}).get('meta') or {}
             _date = str(_mm.get('開催日') or _mm.get('日付') or _mm.get('race_date') or _mm.get('date') or '')[:10]
             _venue = str(_mm.get('開催場') or _mm.get('場') or _mm.get('venue') or _mm.get('track') or '')
             _rraw = str(_mm.get('R') or _mm.get('レース') or _mm.get('レース番号') or _mm.get('race_no') or _mm.get('race') or '')
             _rm = re.search(r'\d+', _rraw)
             _rno = int(_rm.group()) if _rm else 999
-            chronological.append((_date, _venue, _rno, int(h.get('history_id') or 0), h))
+            chronological.append((_date, _venue, _rno, _hid, h))
         except Exception:
-            chronological.append(('9999-99-99','',999,int(h.get('history_id') or 0),h))
+            chronological.append(('9999-99-99','',999,_hid,h))
     chronological.sort(key=lambda x:(x[0],x[1],x[2],x[3]))
     unique=[x[4] for x in chronological]
 
     total=len(unique)
     current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver271')
-    # 現行Verで「予測履歴＋6周スナップショット」まで揃っているレースだけスキップする。
-    # 履歴だけ存在して周回保存が欠けている場合は、一括再シミュレーションで自動修復する。
+    # Ver276 speed: 現行Ver済み判定を N件のpayload展開 + N回COUNT から、
+    # まとめSQL + 対象レースの最新payloadだけの確認へ変更。予測値・スキップ条件は変更しない。
     current_keys=set()
     current_complete_keys=set()
     current_audit_complete_keys=set()
     try:
         _v231_ensure_prediction_history_table(db_path)
+        _target_keys276={str(x.get('race_key') or '').strip() for x in unique if str(x.get('race_key') or '').strip()}
+        _latest_current276={}
         with sqlite3.connect(str(db_path)) as con:
             _v252_ensure_lap_tables(con)
-            rows=con.execute("SELECT DISTINCT race_key FROM v231_prediction_history WHERE app_version=?",(current_ver,)).fetchall()
+            rows=con.execute(
+                "SELECT race_key, MAX(history_id) FROM v231_prediction_history WHERE app_version=? GROUP BY race_key",
+                (current_ver,)
+            ).fetchall()
             current_keys={str(r[0]) for r in rows if r and r[0]}
-            # race_keyの表記と周回テーブルのキーが完全一致しない旧データもあるため、
-            # 履歴を読み込んで日付・場・Rで6周保存済みか確認する。
-            cur_hist=_v231_list_prediction_histories(db_path,10000)
-            for ch in cur_hist:
-                if str(ch.get('app_version') or '') != current_ver:
-                    continue
-                try:
-                    cv,_,_,cm=_v231_load_prediction_history(db_path,int(ch.get('history_id') or 0))
-                    mm=(cv or {}).get('meta') or {}
-                    cd=str(mm.get('開催日') or mm.get('日付') or mm.get('race_date') or mm.get('date') or '')[:10]
-                    cvn=str(mm.get('開催場') or mm.get('場') or mm.get('venue') or mm.get('track') or '').strip()
-                    cr=str(mm.get('R') or mm.get('レース') or mm.get('レース番号') or mm.get('race_no') or mm.get('race') or '').strip()
-                    cr=re.sub(r'[^0-9]','',cr) or cr.replace('R','').replace('r','').strip()
-                    if cd and cvn and cr:
-                        n=int(con.execute("SELECT COUNT(*) FROM v252_lap_prediction_snapshots WHERE race_date=? AND venue=? AND race_no=? AND app_version=?",(cd,cvn,cr,current_ver)).fetchone()[0] or 0)
-                        if n>=6:
-                            _rk273=str(ch.get('race_key') or '')
-                            current_complete_keys.add(_rk273)
+            _latest_current276={str(r[0]):int(r[1]) for r in rows if r and r[0] and r[1]}
 
-                            # Ver273監査版:
-                            # 6周スナップショットが揃っていても、詳細監査列が履歴DataFrameに無ければ
-                            # 「現行版済み」としてスキップせず、再シミュレーションして監査列を補完する。
-                            _df273=(cv or {}).get('df')
-                            _audit_required273=[
-                                "Ver273_5周目ループ到達",
-                                "Ver273_5周目関数呼出",
-                                "Ver273_5周目再加速発動数",
-                                "Ver273_6周目ループ到達",
-                                "Ver273_6周目関数呼出",
-                                "Ver273_6周目再加速発動数",
-                            ]
-                            if (
-                                _df273 is not None
-                                and hasattr(_df273,'columns')
-                                and all(c in _df273.columns for c in _audit_required273)
-                            ):
-                                current_audit_complete_keys.add(_rk273)
-                except Exception:
-                    pass
+            # 6周保存済み判定も1レースずつCOUNTせず一括取得。
+            lap_rows=con.execute(
+                """SELECT race_date,venue,race_no,COUNT(DISTINCT lap_no)
+                   FROM v252_lap_prediction_snapshots
+                   WHERE app_version=?
+                   GROUP BY race_date,venue,race_no
+                   HAVING COUNT(DISTINCT lap_no)>=6""",
+                (current_ver,)
+            ).fetchall()
+            _lap_complete276=set()
+            for _d,_v,_r,_n in lap_rows:
+                _d8=re.sub(r'[^0-9]','',str(_d or ''))[:8]
+                _rn=re.sub(r'[^0-9]','',str(_r or ''))
+                if _d8 and str(_v or '').strip() and _rn:
+                    _lap_complete276.add(f"{_d8}_{str(_v).strip()}_{_rn}R")
+            current_complete_keys=(_target_keys276 & current_keys & _lap_complete276)
+
+        _audit_required273=[
+            "Ver273_5周目ループ到達",
+            "Ver273_5周目関数呼出",
+            "Ver273_5周目再加速発動数",
+            "Ver273_6周目ループ到達",
+            "Ver273_6周目関数呼出",
+            "Ver273_6周目再加速発動数",
+        ]
+        # 実際に今回スキップ候補になったレースだけpayloadを確認する。
+        for _rk273 in current_complete_keys:
+            _hid273=_latest_current276.get(_rk273)
+            if not _hid273:
+                continue
+            try:
+                cv,_,_,_cm=_v231_load_prediction_history(db_path,_hid273)
+                _df273=(cv or {}).get('df')
+                if (
+                    _df273 is not None
+                    and hasattr(_df273,'columns')
+                    and all(c in _df273.columns for c in _audit_required273)
+                ):
+                    current_audit_complete_keys.add(_rk273)
+            except Exception:
+                pass
     except Exception:
         current_keys=set(); current_complete_keys=set(); current_audit_complete_keys=set()
+    out['prepare_seconds_v276']=round(time_module.perf_counter()-_prep_t0_v276,3)
+    _run_t0_v276=time_module.perf_counter()
     for idx,h in enumerate(unique,1):
         if callable(cancel_cb):
             try:
@@ -2533,6 +2553,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         finally:
             if callable(progress_cb):
                 progress_cb(idx,total,label)
+    out['race_processing_seconds_v276']=round(time_module.perf_counter()-_run_t0_v276,3)
     if int(out.get("roi_cost_yen",0) or 0) > 0:
         out["roi_return_rate"]=float(out["roi_payout_yen"])/float(out["roi_cost_yen"])*100.0
     else:
@@ -2540,7 +2561,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
     _force_note = " / 強制再計算ON" if force_current else ""
     out['message']=(f"確認{out['checked']}レース / {current_ver}再シミュレーション{out['rerun']} / "
                     f"監査列まで保存済み{out['skipped_current']} / 入力材料なし{out['no_text']} / エラー{len(out['errors'])}"
-                    f"{_force_note}")
+                    f"{_force_note} / 準備{float(out.get('prepare_seconds_v276',0) or 0):.2f}秒")
     return out
 
 def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date: str) -> dict:
@@ -4398,6 +4419,72 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     scenario_branch_prior_v264=_v264_blended_scenario_prior(scenario_prior, scenario_feedback_v264)
     _v242_prepare_seconds=time_module.perf_counter()-_v242_prepare_started
     name_by_car={c:n for c,n in zip(cars,names)}
+    # Ver276 speed: 試行中に変わらない値を数千回作り直さない。
+    # RNGの呼出順・確率式・試行数は一切変えないため、同じseedなら予測結果も同一。
+    _min_handicap276=min(handicap.values()) if handicap else 0
+    _handicap_groups276={
+        h:[c for c in cars if handicap[c]==h]
+        for h in sorted(set(handicap.values()))
+    }
+    _lane_bonus276={}
+    for _h276,_grp276 in _handicap_groups276.items():
+        _sg276=sorted(_grp276)
+        _n276=len(_sg276)
+        for _i276,_c276 in enumerate(_sg276):
+            _lane_bonus276[_c276]=(_n276-_i276-1)*0.018
+    _profile_by_car276={c:profiles.get(name_by_car[c],{}) for c in cars}
+    _transition_by_car276={c:transition_profiles.get(name_by_car[c],{}) for c in cars}
+    # Ver276 normal prediction speed: 車ペア×周回で不変の値を事前計算。
+    # RNG呼出順、確率式、試行数は変えず、辞書検索・文字列生成・集計の重複だけを削る。
+    _same_group_count276={c:sum(1 for x in cars if handicap[x]==handicap[c]) for c in cars}
+    _hold_base276={c:(_profile_by_car276.get(c,{}).get("hold",0.5)-0.5)*0.48 for c in cars}
+    _pass_momentum276={c:float(_transition_by_car276.get(c,{}).get("pass_momentum",0.14)) for c in cars}
+    _passed_slowdown276={c:float(_transition_by_car276.get(c,{}).get("passed_slowdown",0.18)) for c in cars}
+    _cascade_risk276={c:float(_transition_by_car276.get(c,{}).get("cascade_risk",0.16)) for c in cars}
+    _pair_static276={}
+    for _front276 in cars:
+        for _chaser276 in cars:
+            if _front276==_chaser276:
+                continue
+            _cn276=name_by_car[_chaser276]; _fn276=name_by_car[_front276]
+            _hp276=_profile_by_car276.get(_chaser276,{})
+            _adv276,_conf276=matchups.get((_cn276,_fn276),(0.0,0.0))
+            _direct276=max(-0.5,min(0.5,_adv276))*min(1.0,_conf276)*0.85
+            _hgap276=max(0,handicap[_chaser276]-handicap[_front276])
+            _hwall276=min(0.12,0.0022*_hgap276)
+            for _lap276 in range(1,7):
+                _tp276=_transition_by_car276.get(_chaser276,{})
+                _la276=(_tp276.get("lap_attack") or [0.0]*7)
+                _lap_attack276=_la276[_lap276] if _lap276 < len(_la276) else 0.0
+                _hist276=(_hp276.get("overtake",0.5)-0.5)*1.0 + (_hp276.get("chase",0.5)-0.5)*0.55 + _lap_attack276
+                _bucket276=f"{_lap276}|{_v251_gap_bucket(_hgap276)}"
+                _learned276=float((lap_bucket_delta.get(_bucket276) or {}).get("delta",0.0)) if lap_alignment.get("enabled") else 0.0
+                _resid276=float((lap_residual_delta.get(_bucket276) or {}).get("delta",0.0)) if lap_residual.get("enabled") else 0.0
+                _actual276=float(actual_lap_delta.get(_lap276,0.0)) if actual_lap_calibration.get("enabled") else 0.0
+                _plkey276=f"{_cn276}|{_lap276}"
+                _player276=float((player_lap_delta.get(_plkey276) or {}).get("delta",0.0)) if player_lap_calibration.get("enabled") else 0.0
+                _player_total276=float(np.clip(_player276,-0.08,0.08))
+                _pair_static276[(_front276,_chaser276,_lap276)]=(_direct276,_hist276,_hwall276,_learned276,_resid276,_actual276,_player_total276)
+    _mid_factor_cache276={}
+    _late_release_cache276={}
+    for _c276 in cars:
+        for _lap276 in (3,4):
+            try:
+                _mid_factor_cache276[(_c276,_lap276)]=_v271_mid_lap_pass_factor(
+                    _lap276, handicap.get(_c276,0), chase_gate_v270.get(_c276,1.0),
+                    trial.get(_c276), _trial_median_v270
+                )[0]
+            except Exception:
+                _mid_factor_cache276[(_c276,_lap276)]=1.0
+        for _lap276 in (5,6):
+            try:
+                _late_release_cache276[(_c276,_lap276)]=_v272_late_chase_release(
+                    _lap276, handicap.get(_c276,0), chase_gate_v270.get(_c276,0.75),
+                    trial.get(_c276), _trial_median_v270,
+                    time_adjust_v265.get(_c276,0.0), time_samples_v265.get(_c276,0), return_diag=True
+                )
+            except Exception as _e276:
+                _late_release_cache276[(_c276,_lap276)]=(1.0,{"eligible":False,"reason":"cache_error","reasons":[],"_error":f"{type(_e276).__name__}: {_e276}"})
     rng=np.random.default_rng(int(seed)+230)
     _v242_sim_started=time_module.perf_counter()
     requested_trials=max(1000,min(int(trials),20000))
@@ -4436,7 +4523,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         race_noise=rng.normal(0,0.10)
         indiv_sd=0.36
         perf={c:max(-2.2,min(2.2,strength[c]+race_noise+rng.normal(0,indiv_sd))) for c in cars}
-        min_handicap=min(handicap.values()) if handicap else 0
+        min_handicap=_min_handicap276
         # 前ハンデ残りは開催日前の実績だけを使い、1試行の能力へ小さく反映。
         for c in cars:
             if handicap[c] == min_handicap:
@@ -4444,16 +4531,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         # スタート反応はST・履歴・ランダムで毎試行変える。
         start_score={}
         for c in cars:
-            hp=profiles.get(name_by_car[c],{})
-            # 内枠は同ハンデ時だけ僅かに有利。ただしSTと当試行の出来で十分逆転する。
-            same_group=sorted([x for x in cars if handicap[x]==handicap[c]])
-            lane_bonus=(len(same_group)-same_group.index(c)-1)*0.018 if c in same_group else 0.0
+            hp=_profile_by_car276.get(c,{})
+            # 内枠補正は試行間で不変なので事前計算済み。
+            lane_bonus=_lane_bonus276.get(c,0.0)
             start_score[c]=(-stmean[c]*4.7 + hp.get("first_gain",0.0)*0.085 + 0.10*perf[c] + lane_bonus + rng.normal(0,0.48))
         # 同ハンデ内だけスタートで並び替え。ハンデ差は初期距離として保持。
         order=[]
-        for h in sorted(set(handicap.values())):
-            group=[c for c in cars if handicap[c]==h]
-            group.sort(key=lambda c:start_score[c],reverse=True)
+        for h, _base_group276 in _handicap_groups276.items():
+            group=sorted(_base_group276,key=lambda c:start_score[c],reverse=True)
             order.extend(group)
         start_front[order[0]]+=1
         gaps=[0.0]
@@ -4474,29 +4559,24 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             while i<len(order):
                 front=order[i-1]; chaser=order[i]
                 fn=name_by_car[front]; cn=name_by_car[chaser]
-                hp=profiles.get(cn,{}); fprof=profiles.get(fn,{})
-                adv,conf=matchups.get((cn,fn),(0.0,0.0))
+                hp=_profile_by_car276.get(chaser,{}); fprof=_profile_by_car276.get(front,{})
                 density=max(0,len(order)-i-1)/max(1,len(order)-1)
                 # 静的能力ではなく、その試行で発揮された能力差を使う。
                 ability=((perf[chaser]+momentum.get(chaser,0.0))-(perf[front]-slowdown.get(front,0.0)))*0.46
-                tp=transition_profiles.get(cn,{})
-                ftp=transition_profiles.get(fn,{})
-                lap_attack=(tp.get("lap_attack") or [0.0]*7)[lap] if lap < len(tp.get("lap_attack") or []) else 0.0
-                hist=(hp.get("overtake",0.5)-0.5)*1.0 + (hp.get("chase",0.5)-0.5)*0.55 + lap_attack
-                direct=max(-0.5,min(0.5,adv))*min(1.0,conf)*0.85
+                direct,hist,handicap_wall,learned_transition,residual_transition,actual_transition,player_total_transition = _pair_static276[(front,chaser,lap)]
                 # 壁は残すが、前車が明確に遅い場合まで一律に詰まらせない。
                 speed_edge=max(-2.5,min(2.5,perf[chaser]-perf[front]))
                 wall=0.34 + 0.15*density + 0.10*(1-breakthrough[chaser]) - 0.08*max(0.0,speed_edge)
                 # Ver250: 同ハンデ群が前に重なる隊列と、前後とも間隔が狭い三台密集を強い壁として扱う。
                 same_ahead=sum(1 for x in order[:i] if handicap[x] == handicap[chaser])
-                same_group=sum(1 for x in order if handicap[x] == handicap[chaser])
+                same_group=_same_group_count276[chaser]
                 wall += min(0.18, 0.055*same_ahead + (0.045 if same_group >= 3 else 0.0))
                 if i+1<len(order) and gaps[i+1]<0.20: wall += 0.10
                 if gaps[i] < 0.22 and i+1 < len(order) and gaps[i+1] < 0.22:
                     wall += 0.08 + queue_wall_delta
                 # 前車が履歴上よく粘るほど突破しにくい。終盤は少し追い抜きやすくする。
                 # 先頭・前方にいるだけの最低保証は与えない。後車の速度優位と残り周回を強めに反映。
-                front_hold=(fprof.get("hold",0.5)-0.5)*0.48
+                front_hold=_hold_base276[front]
                 # 先頭車だけに開催場別の維持補正を反映。終盤ほど効果を弱め、永久壁にはしない。
                 if i == 1:
                     front_hold += leader_hold_delta * max(0.25, 1.0 - 0.13*(lap-1))
@@ -4506,22 +4586,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 # 直前の追い抜き成功は次の壁突破を少し後押しする。ただし毎周減衰させる。
                 chain_bonus=min(0.42, momentum.get(chaser,0.0))
                 # Ver250: ハンデ差が大きい追込みほど、追い付いてから抜くまでの余白を必要とする。
-                handicap_gap=max(0, handicap[chaser]-handicap[front])
-                # Ver253: 固定のハンデ壁を弱め、実際の周回順位入替率を主に使う。
-                handicap_wall=min(0.12, 0.0022*handicap_gap)
-                bucket_key=f"{lap}|{_v251_gap_bucket(handicap_gap)}"
-                learned_transition=float((lap_bucket_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_alignment.get("enabled") else 0.0
-                # Ver253: 過去予測が実測より抜き過ぎ/抜かな過ぎだった残差を直接補正。
-                residual_transition=float((lap_residual_delta.get(bucket_key) or {}).get("delta",0.0)) if lap_residual.get("enabled") else 0.0
-                # Ver256: 保存予測の有無に依存せず、全実測グランドノートの周回入替率を反映。
-                actual_transition=float(actual_lap_delta.get(lap,0.0)) if actual_lap_calibration.get("enabled") else 0.0
-                # Ver254: 同じ選手が同じ周回で一貫して予測より追い上げる/追い上げない残差を小さく反映。
-                player_lap_key=f"{cn}|{lap}"
-                player_transition=float((player_lap_delta.get(player_lap_key) or {}).get("delta",0.0)) if player_lap_calibration.get("enabled") else 0.0
-                # Ver260: 保存予測の有無に依存しない全実測の選手×周回追抜率。
-                # Ver254残差学習と同時に効き過ぎないよう、合算後も小さく制限する。
-                player_actual_transition=float((player_actual_delta.get(player_lap_key) or {}).get("delta",0.0)) if player_actual_calibration.get("enabled") else 0.0
-                player_total_transition=float(np.clip(player_transition,-0.08,0.08))
+                # ペア×周回で固定の補正は試行前に計算済み。
                 # 2台目までは現実に起こり得るため軽く、3台目以降だけ強く抑える。
                 same_lap_passes=lap_pass_count.get(chaser,0)
                 chain_fatigue=(0.16 if same_lap_passes==1 else (0.52 if same_lap_passes>=2 else 0.0))
@@ -4545,9 +4610,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 p=max(0.035,min(0.88,p))
                 # Ver272: Ver271の3～4周目補正を実際の追い抜き確率へ接続。
                 try:
-                    _mid_factor272,_=_v271_mid_lap_pass_factor(
-                        lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,1.0),
-                        trial.get(chaser), _trial_median_v270)
+                    _mid_factor272=_mid_factor_cache276.get((chaser,lap),1.0)
                     p=float(np.clip(p*_mid_factor272,0.035,0.88))
                 except Exception:
                     pass
@@ -4559,10 +4622,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                             late_release_audit_v273[_lap_call273]["function_called"]+=1
                     except Exception:
                         pass
-                    _late_factor272,_late_diag274=_v272_late_chase_release(
-                        lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,0.75),
-                        trial.get(chaser), _trial_median_v270,
-                        time_adjust_v265.get(chaser,0.0), time_samples_v265.get(chaser,0), return_diag=True)
+                    _late_factor272,_late_diag274=_late_release_cache276.get(
+                        (chaser,lap),(1.0,{"eligible":False,"reason":"outside_late_lap","reasons":[]})
+                    )
+                    if str(_late_diag274.get('_error') or ''):
+                        raise RuntimeError(str(_late_diag274.get('_error')))
                     try:
                         _lap_diag274=int(lap)
                         if _lap_diag274 in (5,6):
@@ -4601,9 +4665,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                         chain_events[chaser]+=1
                     # 差が小さい横並びの追越しほど、抜かれた側がラインを外して一時失速しやすい。
                     close_pass=max(0.0, min(1.0, (0.24-gaps[i])/0.18))
-                    pass_boost=float(tp.get("pass_momentum",0.14))
-                    loss_base=float(ftp.get("passed_slowdown",0.18))
-                    cascade=float(ftp.get("cascade_risk",0.16))
+                    pass_boost=_pass_momentum276[chaser]
+                    loss_base=_passed_slowdown276[front]
+                    cascade=_cascade_risk276[front]
                     momentum[chaser]=min(0.48, momentum.get(chaser,0.0)+pass_boost*(0.65+0.55*close_pass))
                     if lap_pass_count.get(chaser,0)>=2:
                         momentum[chaser]*=0.58
@@ -5428,7 +5492,7 @@ def _v238_col(df: pd.DataFrame, *names: str):
 
 
 def _v238_result_safety_check(db_path: str, race_key: str, rows: pd.DataFrame) -> tuple[list[str], list[str]]:
-    """置換前に、順位重複・異常車の通常化・詳細値消失を検査する。"""
+    """置換前に、車番重複・異常車の通常化・詳細値消失を検査する。同着は許可する。"""
     errors: list[str] = []
     warnings: list[str] = []
     if not isinstance(rows, pd.DataFrame) or rows.empty:
@@ -5452,7 +5516,9 @@ def _v238_result_safety_check(db_path: str, race_key: str, rows: pd.DataFrame) -
     dup = ranked[ranked.duplicated(subset=[finish_c], keep=False)]
     if not dup.empty:
         vals = sorted({int(x) for x in dup[finish_c].dropna().tolist()})
-        errors.append(f"通常車に同じ着順が重複しています：{vals}")
+        # Ver276: オートレースでは同着が成立するため、着順重複だけでは登録停止しない。
+        # 車番重複は従来どおりエラーにし、同着は監査用の警告だけ残す。
+        warnings.append(f"同着として扱う着順があります：{vals}")
     if ranked[car_c].duplicated().any():
         errors.append("同じ車番が複数の通常結果として解析されています。")
     if not race_key:
@@ -11214,6 +11280,7 @@ elif selected_main_page == "🏁 予測":
             with st.spinner("高速6周イベントシミュレーションを実行中…"):
                 _t0 = time_module.perf_counter()
                 df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
+                _t_base = time_module.perf_counter()
                 # Ver230 beta: 壁補正を後掛けせず、スタートから6周すべての展開へ内蔵。
                 meta = dict(meta or {})
                 df, bets, wall_audit = _v230_six_lap_simulation(df, bets, entries, meta, int(trials), int(seed))
@@ -11246,6 +11313,10 @@ elif selected_main_page == "🏁 予測":
                 name="autorace-deferred-db-save",
             ).start()
             prediction_timing = {
+                "base_prediction": _t_base - _t0,
+                "six_lap": _t1 - _t_base,
+                "six_lap_prepare": float((wall_audit or {}).get("prepare_seconds", 0.0) or 0.0),
+                "six_lap_simulation": float((wall_audit or {}).get("simulation_seconds", 0.0) or 0.0),
                 "simulation": _t1 - _t0,
                 "aggregation": _t2 - _t1,
                 "db_save": _t_save1 - _t_save0,
@@ -11317,7 +11388,9 @@ elif selected_main_page == "🏁 予測":
             st.session_state["v261_rerun_requested"] = False
             if prediction_timing:
                 st.caption(
-                    f"処理時間：イベント計算 {prediction_timing['simulation']:.2f}秒 / "
+                    f"処理時間：基礎予測 {prediction_timing['base_prediction']:.2f}秒 / "
+                    f"6周展開 {prediction_timing['six_lap']:.2f}秒"
+                    f"（準備 {prediction_timing['six_lap_prepare']:.2f}秒・本体 {prediction_timing['six_lap_simulation']:.2f}秒） / "
                     f"確率集計 {prediction_timing['aggregation']:.2f}秒 / "
                     f"最小DB保存 {prediction_timing['db_save']:.2f}秒 / 表示まで {prediction_timing['total']:.2f}秒"
                 )
@@ -11337,7 +11410,8 @@ elif selected_main_page == "🏁 予測":
         timing = view.get("prediction_timing") or {}
         if timing:
             st.caption(
-                f"前回処理時間：イベント計算 {float(timing.get('simulation',0)):.2f}秒 / "
+                f"前回処理時間：基礎予測 {float(timing.get('base_prediction',timing.get('simulation',0))):.2f}秒 / "
+                f"6周展開 {float(timing.get('six_lap',0)):.2f}秒 / "
                 f"確率集計 {float(timing.get('aggregation',0)):.2f}秒 / "
                 f"最小DB保存 {float(timing.get('db_save',0)):.2f}秒（詳細保存はバックグラウンド）"
             )
