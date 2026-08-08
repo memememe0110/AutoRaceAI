@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver276"
+APP_VERSION = "Ver277"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -3755,7 +3755,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     }
     try:
         _trial_vals_v270 = [
-            float(v) for v in trial_map.values()
+            float(v) for v in trial.values()
             if v is not None and np.isfinite(float(v))
         ]
         _trial_median_v270 = float(np.median(_trial_vals_v270)) if _trial_vals_v270 else None
@@ -12255,7 +12255,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
 
 
-                        with st.expander("🧪 Ver276 終盤再加速・詳細経路ログ", expanded=False):
+                        with st.expander("🧪 Ver277 終盤再加速・詳細経路ログ", expanded=False):
                             st.caption(
                                 "保存済み予測DataFrameではなく、シミュレーション直後にmetaへ保存した監査辞書を直接表示します。"
                                 "これで列の欠落・上書きの影響を受けません。"
