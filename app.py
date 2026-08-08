@@ -11259,6 +11259,9 @@ elif selected_main_page == "🏁 予測":
     if text.strip() and st.button("📋 出走表の読み取りを確認", use_container_width=True, key=f"v138_preview_{prediction_version}"):
         try:
             preview_entries = engine.v15_parse_entries(text)
+            # Ver276: シミュレーション実行前の確認時点で再試走を識別する。
+            # 表示・入力保持のみで、予測値への補正は行わない。
+            preview_entries = _v276_mark_retrial_from_prediction_text(preview_entries, text)
             preview_meta = engine.v15_parse_race_meta(text) or {}
             st.session_state["v138_prediction_preview"] = {
                 "key": preview_key, "entries": preview_entries, "meta": preview_meta
@@ -11275,7 +11278,7 @@ elif selected_main_page == "🏁 予測":
             preview_meta = preview_state.get("meta") or {}
             if isinstance(preview_entries, pd.DataFrame) and not preview_entries.empty:
                 preview_cols = [c for c in [
-                    "車番", "選手名", "所属", "ハンデ", "試走T", "ST", "試走偏差",
+                    "車番", "選手名", "所属", "ハンデ", "試走T", "試走種別", "再試走", "ST", "試走偏差",
                     "現ランク", "平均競走T", "最高競走T", "近10走着順", "近10走2連",
                     "近10走3連", "車名"
                 ] if c in preview_entries.columns]
@@ -11283,6 +11286,24 @@ elif selected_main_page == "🏁 予測":
                 actual_entries = int(preview_entries["車番"].nunique())
                 # Ver209: シミュレーション前に入力内容とDB量を確認できるよう、2表を最上部へ常時表示する。
                 st.markdown("## 🔎 シミュレーション前の確認")
+                # 再試走はここだけで確認できるよう、予測後の重複表示は行わない。
+                if "再試走" in preview_entries.columns and bool(preview_entries["再試走"].fillna(False).astype(bool).any()):
+                    _pre_retrial = []
+                    for _, _rr in preview_entries[preview_entries["再試走"].fillna(False).astype(bool)].iterrows():
+                        try:
+                            _car = f"{int(float(_rr.get('車番')))}番"
+                        except Exception:
+                            _car = ""
+                        _name = str(_rr.get("選手名", "") or "")
+                        _trial = _rr.get("試走T", _rr.get("試走", ""))
+                        try:
+                            _trial_txt = f"{float(_trial):.2f}"
+                        except Exception:
+                            _trial_txt = str(_trial or "")
+                        _pre_retrial.append(f"{_car} {_name} {_trial_txt}".strip())
+                    st.info("🔁 再試走あり：" + " / ".join(_pre_retrial) + "｜再試走として認識済み（専用補正なし）")
+                else:
+                    st.caption("🔁 再試走：なし")
                 st.subheader(f"解析した出走表（{actual_entries}名）")
                 st.dataframe(preview_entries[preview_cols], use_container_width=True, hide_index=True)
                 if expected_entries and actual_entries < expected_entries:
@@ -11573,34 +11594,13 @@ elif selected_main_page == "🏁 予測":
                 st.warning(f"解析対象外: {detail}。確率・順位・買い目の組み合わせから完全に除外しました。")
             st.caption(f"実出走数: {len(entries)}車 / 三連単組み合わせ数: {len(entries)*(len(entries)-1)*(len(entries)-2)}通り")
 
-            # Ver276 表示改善: 予測入力で再試走を認識できたか、解析直後に確認できるようにする。
-            # 表示のみで予測計算値には影響しない。
-            try:
-                _retrial_cols = [c for c in ["車番", "選手名", "試走T", "試走", "試走種別", "再試走"] if c in entries.columns]
-                if "再試走" in entries.columns and bool(entries["再試走"].fillna(False).astype(bool).any()):
-                    _retrial_cars = []
-                    _car_col = next((c for c in ("車番", "車") if c in entries.columns), None)
-                    _name_col = next((c for c in ("選手名", "選手") if c in entries.columns), None)
-                    for _, _rr in entries[entries["再試走"].fillna(False).astype(bool)].iterrows():
-                        _car_txt = f"{int(float(_rr[_car_col]))}番" if _car_col and pd.notna(_rr.get(_car_col)) else ""
-                        _name_txt = str(_rr.get(_name_col, "")) if _name_col else ""
-                        _retrial_cars.append(f"{_car_txt}{' '+_name_txt if _name_txt else ''}")
-                    st.info("🔁 再試走を認識：" + " / ".join(_retrial_cars))
-                else:
-                    st.caption("🔁 再試走：なし")
-                if _retrial_cols:
-                    with st.expander("🔁 試走種別・再試走の読取確認", expanded=False):
-                        st.dataframe(entries[_retrial_cols], use_container_width=True, hide_index=True)
-            except Exception:
-                pass
-
             with st.expander("解析入力と登録データ量を再確認", expanded=False):
                 st.dataframe(entries.drop(columns=["_raw"], errors="ignore"), use_container_width=True, hide_index=True)
                 show_player_data_coverage(entries)
 
             cols = [c for c in [
                 "改善後順位", "1着候補順位", "連対候補順位", "3着候補順位", "総合点順位_従来",
-                "車", "選手名", "ハンデ", "試走換算", "試走種別", "再試走", "予測競走T", "レース信頼度",
+                "車", "選手名", "ハンデ", "試走換算", "予測競走T", "レース信頼度",
                 "本番1着率", "本番連対率", "本番3着率", "本番3着内率", "順位整合メモ",
                 "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
                 "スタート伸び指数", "ゴール前伸び指数", "安定上位指数",
