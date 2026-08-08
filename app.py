@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver269"
+APP_VERSION = "Ver270"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -1473,7 +1473,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         if not rk or rk in seen:
             continue
         seen.add(rk); unique.append(h)
-    # Ver269: 本来の時系列順で再シミュレーションする。
+    # Ver270: 本来の時系列順で再シミュレーションする。
     # 各保存履歴から開催日・場・Rを読み、古いレース→新しいレースへ並べる。
     chronological=[]
     for h in unique:
@@ -1492,7 +1492,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
     unique=[x[4] for x in chronological]
 
     total=len(unique)
-    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver269')
+    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver270')
     # 現行Verで「予測履歴＋6周スナップショット」まで揃っているレースだけスキップする。
     # 履歴だけ存在して周回保存が欠けている場合は、一括再シミュレーションで自動修復する。
     current_keys=set()
@@ -2890,6 +2890,84 @@ def _v268_handicap_bias_model(db_path: str | None, venue: str = "", cutoff_date:
     return out
 
 
+
+def _v270_chase_gate(
+    handicap_m: float,
+    trial_time: float | None,
+    field_trial_median: float | None,
+    v265_adjust_sec: float,
+    v265_samples: int,
+) -> tuple[float, dict]:
+    """
+    後方ハンデの一律持ち上げを抑えるゲート。
+    Ver268ハンデ補正のうち「速くする方向(負秒)」だけを0.45～1.00倍する。
+
+    判断材料:
+      1) Ver265の選手別/条件別残差補正
+         - 過去に予測より速く走る傾向が十分あれば追い切り側
+         - 逆なら後方ハンデ補正を弱める
+      2) 当日の試走Tがメンバー中央値より良いか
+         - 後方から追う根拠として小さく加点
+
+    未来結果は使わず、既存の時系列cutoffをそのまま利用する。
+    """
+    try:
+        h = float(handicap_m or 0.0)
+    except Exception:
+        h = 0.0
+
+    # 20m以下は従来補正をほぼそのまま。問題になりやすい30m以上を主対象。
+    if h < 30.0:
+        return 1.0, {"gate": 1.0, "reason": "front_or_mid"}
+
+    gate = 0.72
+    reasons = []
+
+    try:
+        adj = float(v265_adjust_sec or 0.0)
+    except Exception:
+        adj = 0.0
+    try:
+        sn = int(v265_samples or 0)
+    except Exception:
+        sn = 0
+
+    # 十分な履歴がある時だけ個人残差を使う。
+    if sn >= 5:
+        # 負の残差補正 = 過去に予測より速く走る傾向。
+        if adj <= -0.018:
+            gate += 0.18; reasons.append("strong_chaser_history")
+        elif adj <= -0.008:
+            gate += 0.10; reasons.append("chaser_history")
+        elif adj >= 0.012:
+            gate -= 0.15; reasons.append("weak_chase_history")
+        elif adj >= 0.006:
+            gate -= 0.08; reasons.append("slightly_weak_history")
+
+    # 当日の試走優位は補助材料。極端に効かせない。
+    try:
+        tt = float(trial_time)
+        med = float(field_trial_median)
+        if np.isfinite(tt) and np.isfinite(med):
+            adv = med - tt  # positive = faster trial
+            if adv >= 0.045:
+                gate += 0.10; reasons.append("strong_trial")
+            elif adv >= 0.025:
+                gate += 0.06; reasons.append("good_trial")
+            elif adv <= -0.035:
+                gate -= 0.08; reasons.append("weak_trial")
+    except Exception:
+        pass
+
+    # 60m+は渋滞・捌きの不確実性が大きいので、根拠なしの全開補正を抑える。
+    if h >= 60.0 and not any(r in reasons for r in ("strong_chaser_history","chaser_history")):
+        gate -= 0.08
+        reasons.append("deep_handicap_uncertainty")
+
+    gate = float(np.clip(gate, 0.45, 1.00))
+    return gate, {"gate": gate, "reason": ",".join(reasons) if reasons else "neutral"}
+
+
 def _v268_handicap_bias_seconds(model: dict, handicap_value: float) -> float:
     if not model or not model.get("enabled"):
         return 0.0
@@ -3000,6 +3078,16 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     time_expected_v265={}
     time_samples_v265={}
     handicap_adjust_v268={}
+    chase_gate_v270={}
+    chase_reason_v270={}
+    try:
+        _trial_vals_v270 = [
+            float(v) for v in trial_map.values()
+            if v is not None and np.isfinite(float(v))
+        ]
+        _trial_median_v270 = float(np.median(_trial_vals_v270)) if _trial_vals_v270 else None
+    except Exception:
+        _trial_median_v270 = None
     for _,_rr in work.iterrows():
         _c=int(_rr["_car"])
         _nm=next((n for c,n in zip(cars,names) if c==_c),'')
@@ -3009,8 +3097,15 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             _adj,_exp,_sn=_v265_time_adjustment_seconds(time_residual_v265,_nm,handicap.get(_c,0),_trial,_pred)
             time_adjust_v265[_c]=_adj; time_expected_v265[_c]=_exp; time_samples_v265[_c]=_sn
             _h_adj=_v268_handicap_bias_seconds(handicap_bias_v268, handicap.get(_c,0))
-            handicap_adjust_v268[_c]=_h_adj
-            _total_adj=float(_adj)+float(_h_adj)
+            _gate270,_gate_meta270=_v270_chase_gate(
+                handicap.get(_c,0), _trial, _trial_median_v270, _adj, _sn
+            )
+            # 後方ハンデを速くする補正だけゲート。遅くする補正はそのまま。
+            _h_adj_gated = float(_h_adj) * float(_gate270) if float(_h_adj) < 0 else float(_h_adj)
+            handicap_adjust_v268[_c]=_h_adj_gated
+            chase_gate_v270[_c]=float(_gate270)
+            chase_reason_v270[_c]=str(_gate_meta270.get("reason",""))
+            _total_adj=float(_adj)+float(_h_adj_gated)
             strength[_c]=max(-1.70,min(1.70,strength[_c]-12.0*_total_adj))
     actual_lap_orders=_v251_actual_lap_orders(_v230_db_path(), meta)
     scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
@@ -3275,6 +3370,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["連続追抜発生回数"]=out[car_col].map(lambda x: chain_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
     out["Ver265タイム残差補正秒"]=out[car_col].map(lambda x: time_adjust_v265.get(int(x),0.0) if pd.notna(x) else 0.0)
     out["Ver268ハンデ残差補正秒"]=out[car_col].map(lambda x: handicap_adjust_v268.get(int(x),0.0) if pd.notna(x) else 0.0)
+    out["Ver270追い切りゲート"]=out[car_col].map(lambda x: chase_gate_v270.get(int(x),1.0) if pd.notna(x) else 1.0)
+    out["Ver270追い切り根拠"]=out[car_col].map(lambda x: chase_reason_v270.get(int(x),"") if pd.notna(x) else "")
     if "予測競走T" in out.columns:
         out["Ver265補正後予測競走T"]=pd.to_numeric(out["予測競走T"],errors="coerce") + out["Ver265タイム残差補正秒"]
         out["Ver268補正後予測競走T"]=(
@@ -3328,6 +3425,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "time_residual_learning_v265": time_residual_v265,
         "handicap_bias_v268": handicap_bias_v268,
         "walk_forward_cutoff_v269": {"date": race_date, "race_no": _race_no_v269},
+        "chase_gate_v270": chase_gate_v270,
+        "chase_reason_v270": chase_reason_v270,
         "time_adjustments_v265": {str(k):round(float(v),5) for k,v in time_adjust_v265.items()},
         "predicted_lap_orders": modal_laps,
         "actual_lap_comparison": lap_comparison,
