@@ -1572,6 +1572,28 @@ def _v272_score_saved_history_same_odds(
         out["payout_yen"] = int(row["payout_yen"] or 0)
         out["return_rate"] = float(row["return_rate"] or 0.0)
         out["reason"] = "採点済み"
+
+        try:
+            _extra276=_v276_virtual_extra_all_odds_score(
+                db_path,str(race_key),bets,int(trials or 0),odds_maps,result or {},
+            )
+            if _extra276.get("available"):
+                out["virtual_extra_points"]=int(_extra276.get("points",0) or 0)
+                out["virtual_extra_cost_yen"]=int(_extra276.get("cost_yen",0) or 0)
+                out["virtual_extra_payout_yen"]=int(_extra276.get("payout_yen",0) or 0)
+                out["virtual_extra_hits"]=int(_extra276.get("hits",0) or 0)
+                out["virtual_extra_rows"]=list(_extra276.get("rows") or [])
+                out["virtual_combined_model_return_rate"]=_extra276.get("combined_model_return_rate")
+            out["virtual_combined_cost_yen"]=int(out["cost_yen"])+int(out["virtual_extra_cost_yen"])
+            out["virtual_combined_payout_yen"]=int(out["payout_yen"])+int(out["virtual_extra_payout_yen"])
+            out["virtual_combined_return_rate"]=(
+                float(out["virtual_combined_payout_yen"])/float(out["virtual_combined_cost_yen"])*100.0
+                if int(out["virtual_combined_cost_yen"])>0 else None
+            )
+        except Exception:
+            out["virtual_combined_cost_yen"]=int(out["cost_yen"])
+            out["virtual_combined_payout_yen"]=int(out["payout_yen"])
+            out["virtual_combined_return_rate"]=out["return_rate"]
         return out
     except Exception as exc:
         out["reason"] = f"{type(exc).__name__}: {exc}"
@@ -1660,6 +1682,228 @@ def _v273_load_earliest_saved_odds(db_path: str, race_key: str) -> tuple[dict, d
         return empty, {}
 
 
+
+def _v276_virtual_all_odds_candidates(
+    bets: dict,
+    trials: int,
+    odds_maps: dict,
+) -> list[dict]:
+    """
+    過去バックテスト専用。
+    保存オッズにある全対応券種
+    3連単 / 3連複 / 2連単 / 2連複 / 単勝 / ワイド
+    を同じ基準でモデル確率・単体期待値へ変換する。
+    """
+    tri_counter=(bets or {}).get("三連単",{}) or {}
+    if not tri_counter or int(trials or 0)<=0:
+        return []
+
+    outcomes=[]
+    for combo,count in tri_counter.items():
+        vals=tuple(int(v) for v in (tuple(combo) if isinstance(combo,(tuple,list)) else (combo,)))
+        if len(vals)==3:
+            outcomes.append((vals,float(count)/max(int(trials),1)*100.0))
+    if not outcomes:
+        return []
+
+    probs={
+        "三連単":{},
+        "三連複":{},
+        "2連単":{},
+        "2連複":{},
+        "単勝":{},
+        "ワイド":{},
+    }
+    for (a,b,c),prob in outcomes:
+        k3=f"{a}-{b}-{c}"
+        probs["三連単"][k3]=probs["三連単"].get(k3,0.0)+prob
+
+        k3f="-".join(map(str,sorted((a,b,c))))
+        probs["三連複"][k3f]=probs["三連複"].get(k3f,0.0)+prob
+
+        k2=f"{a}-{b}"
+        probs["2連単"][k2]=probs["2連単"].get(k2,0.0)+prob
+
+        k2f="-".join(map(str,sorted((a,b))))
+        probs["2連複"][k2f]=probs["2連複"].get(k2f,0.0)+prob
+
+        probs["単勝"][str(a)]=probs["単勝"].get(str(a),0.0)+prob
+
+        for x,y in ((a,b),(a,c),(b,c)):
+            kw="-".join(map(str,sorted((x,y))))
+            probs["ワイド"][kw]=probs["ワイド"].get(kw,0.0)+prob
+
+    key_map={
+        "三連単":"3tan",
+        "三連複":"3fuku",
+        "2連単":"2tansho",
+        "2連複":"2fuku",
+        "単勝":"tansho",
+        "ワイド":"wide",
+    }
+
+    rows=[]
+    for typ,odd_key in key_map.items():
+        for combo,odds in (odds_maps.get(odd_key,{}) or {}).items():
+            try:
+                odd=float(odds)
+                combo_text=str(combo).strip()
+                if typ in ("三連複","2連複","ワイド"):
+                    nums=[int(x) for x in re.findall(r"\d+",combo_text)]
+                    if nums:
+                        combo_text="-".join(map(str,sorted(nums)))
+                prob=float(probs[typ].get(combo_text,0.0))
+            except Exception:
+                continue
+            if odd<=0 or prob<=0:
+                continue
+            ev=prob/100.0*odd*100.0
+            rows.append({
+                "type":typ,
+                "combo":combo_text,
+                "probability":prob,
+                "odds":odd,
+                "ev":ev,
+            })
+
+    rows.sort(
+        key=lambda r:(float(r.get("ev",0)),float(r.get("probability",0))),
+        reverse=True,
+    )
+    return rows
+
+
+def _v276_virtual_extra_all_odds_score(
+    db_path: str,
+    race_key: str,
+    bets: dict,
+    trials: int,
+    odds_maps: dict,
+    base_result: dict,
+) -> dict:
+    """
+    過去バックテスト専用。
+    既存4券種合成プランを基準に、保存オッズに存在する全対応券種から、
+    追加後の合成モデル期待回収率が上昇する候補だけを仮想追加する。
+    現在レースの候補表示・実購入処理には使用しない。
+    """
+    out={
+        "available":False,"points":0,"cost_yen":0,"payout_yen":0,"hits":0,
+        "rows":[],"base_model_return_rate":None,"combined_model_return_rate":None,
+        "reason":"",
+    }
+
+    try:
+        base_n=int((base_result or {}).get("points",0) or 0)
+        base_rate=float((base_result or {}).get("model_return_rate"))
+    except Exception:
+        base_n=0
+        base_rate=None
+    if base_n<=0 or base_rate is None or not np.isfinite(base_rate):
+        out["reason"]="基準プランのモデル期待回収率なし"
+        return out
+
+    candidates=_v276_virtual_all_odds_candidates(bets,int(trials or 0),odds_maps or {})
+    if not candidates:
+        out["reason"]="保存オッズから仮想候補を作れませんでした"
+        return out
+
+    # 既存プランにすでに含まれる券は追加対象から除外。
+    base_ids=set()
+    for t in (base_result or {}).get("tickets",[]) or []:
+        typ=str(t.get("type") or "")
+        combo=str(t.get("combo") or "").strip()
+        if typ in ("三連複","2連複","ワイド"):
+            nums=[int(x) for x in re.findall(r"\d+",combo)]
+            if nums:
+                combo="-".join(map(str,sorted(nums)))
+        base_ids.add((typ,combo))
+
+    base_cost=float(base_n*100)
+    expected_payout=base_cost*base_rate/100.0
+    current_cost=base_cost
+    current_rate=base_rate
+    selected=[]
+
+    for cand in candidates:
+        ident=(str(cand.get("type") or ""),str(cand.get("combo") or ""))
+        if ident in base_ids:
+            continue
+        try:
+            ev=float(cand.get("ev",0) or 0)
+        except Exception:
+            continue
+        if ev<=0:
+            continue
+        next_expected=expected_payout+ev
+        next_cost=current_cost+100.0
+        next_rate=next_expected/next_cost*100.0 if next_cost>0 else 0.0
+        # 追加後の合成モデル期待回収率が上がるものだけ。
+        if next_rate>current_rate+1e-9:
+            selected.append(dict(cand))
+            expected_payout=next_expected
+            current_cost=next_cost
+            current_rate=next_rate
+
+    if not selected:
+        out["reason"]="全券種を比較したが合成モデル期待回収率を上げる追加候補なし"
+        return out
+
+    # 候補選択後にだけ実払戻で採点する。
+    try:
+        with sqlite3.connect(str(db_path),timeout=30.0) as con:
+            con.row_factory=sqlite3.Row
+            payout_rows=con.execute("""
+                SELECT bet_type, combination, payout_yen
+                FROM result_payouts
+                WHERE race_key=?
+            """,(str(race_key or ""),)).fetchall()
+        payout_map={}
+        for r in payout_rows:
+            typ=_v212_norm_bet_type(str(r["bet_type"] or ""))
+            combo=_v187_norm_combo(str(r["bet_type"] or ""),str(r["combination"] or ""))
+            payout_map[(typ,combo)]=int(r["payout_yen"] or 0)
+    except Exception as exc:
+        out["reason"]=f"払戻読込失敗: {type(exc).__name__}: {exc}"
+        return out
+
+    actual_payout=0
+    hit_count=0
+    detail=[]
+    for cand in selected:
+        typ=str(cand.get("type") or "")
+        combo=str(cand.get("combo") or "").strip()
+        norm_typ=_v212_norm_bet_type(typ)
+        norm_combo=_v187_norm_combo(typ,combo)
+        payout=int(payout_map.get((norm_typ,norm_combo),0) or 0)
+        hit=bool(payout>0)
+        actual_payout+=payout
+        hit_count+=int(hit)
+        detail.append({
+            "type":typ,
+            "combo":combo,
+            "model_probability":float(cand.get("probability",0) or 0),
+            "saved_odds":float(cand.get("odds",0) or 0),
+            "model_ev":float(cand.get("ev",0) or 0),
+            "hit":hit,
+            "payout_yen":payout,
+        })
+
+    out.update({
+        "available":True,
+        "points":len(selected),
+        "cost_yen":len(selected)*100,
+        "payout_yen":int(actual_payout),
+        "hits":int(hit_count),
+        "rows":detail,
+        "base_model_return_rate":float(base_rate),
+        "combined_model_return_rate":float(current_rate),
+        "reason":"全対応券種から合成モデル期待回収率が上がる候補だけ仮想追加",
+    })
+    return out
+
+
+
 def _v273_virtual_roi_score(
     db_path: str,
     race_key: str,
@@ -1677,6 +1921,15 @@ def _v273_virtual_roi_score(
         "cost_yen": 0, "payout_yen": 0, "return_rate": None,
         "points": 0, "hit": False, "odds_snapshot_id": "", "odds_created_at": "",
         "reason": "",
+        "virtual_extra_points":0,
+        "virtual_extra_cost_yen":0,
+        "virtual_extra_payout_yen":0,
+        "virtual_extra_hits":0,
+        "virtual_extra_rows":[],
+        "virtual_combined_cost_yen":0,
+        "virtual_combined_payout_yen":0,
+        "virtual_combined_return_rate":None,
+        "virtual_combined_model_return_rate":None,
     }
     if not race_key:
         out["reason"] = "race_keyなし"
@@ -2019,6 +2272,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         "checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[],
         "roi_evaluated":0,"roi_no_odds":0,"roi_no_payout":0,
         "roi_cost_yen":0,"roi_payout_yen":0,"roi_hits":0,"roi_rows":[],
+        "roi_plus_cost_yen":0,"roi_plus_payout_yen":0,"roi_plus_extra_points":0,
     }
     histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
     # 同じレースの旧バージョンが複数あっても、入力復元元は最新1件だけ使う。
@@ -2185,6 +2439,13 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 out["roi_cost_yen"]+=int(_roi273.get("cost_yen",0) or 0)
                 out["roi_payout_yen"]+=int(_roi273.get("payout_yen",0) or 0)
                 out["roi_hits"]+=int(bool(_roi273.get("hit")))
+                out["roi_plus_cost_yen"]+=int(
+                    _roi273.get("virtual_combined_cost_yen",_roi273.get("cost_yen",0)) or 0
+                )
+                out["roi_plus_payout_yen"]+=int(
+                    _roi273.get("virtual_combined_payout_yen",_roi273.get("payout_yen",0)) or 0
+                )
+                out["roi_plus_extra_points"]+=int(_roi273.get("virtual_extra_points",0) or 0)
             else:
                 _reason273=str(_roi273.get("reason") or "")
                 if "オッズ" in _reason273:
@@ -2200,6 +2461,10 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 "payout_yen": int(_roi273.get("payout_yen",0) or 0),
                 "return_rate": _roi273.get("return_rate"),
                 "hit": bool(_roi273.get("hit")),
+                "virtual_extra_points":int(_roi273.get("virtual_extra_points",0) or 0),
+                "virtual_extra_cost_yen":int(_roi273.get("virtual_extra_cost_yen",0) or 0),
+                "virtual_extra_payout_yen":int(_roi273.get("virtual_extra_payout_yen",0) or 0),
+                "virtual_combined_return_rate":_roi273.get("virtual_combined_return_rate"),
                 "reason": str(_roi273.get("reason") or ""),
                 "odds_created_at": str(_roi273.get("odds_created_at") or ""),
             })
@@ -13016,6 +13281,27 @@ if selected_main_page == "🗃️ 登録情報確認":
                                         f"払戻未登録 {_batch.get('roi_no_payout',0)}R。"
                                         "過去データの検証用です。"
                                     )
+                                    _plus_cost276=int(_batch.get("roi_plus_cost_yen",0) or 0)
+                                    _plus_payout276=int(_batch.get("roi_plus_payout_yen",0) or 0)
+                                    _plus_points276=int(_batch.get("roi_plus_extra_points",0) or 0)
+                                    if _plus_cost276>0 and _plus_points276>0:
+                                        _plus_rate276=_plus_payout276/_plus_cost276*100.0
+                                        _base_cost276=int(_batch.get("roi_cost_yen",0) or 0)
+                                        _base_payout276=int(_batch.get("roi_payout_yen",0) or 0)
+                                        _base_rate276=(
+                                            _base_payout276/_base_cost276*100.0
+                                            if _base_cost276>0 else 0.0
+                                        )
+                                        st.markdown("##### 🧪 全オッズ券種・仮想追加の検証")
+                                        _x1,_x2,_x3=st.columns(3)
+                                        _x1.metric("仮想追加点数",f"{_plus_points276}点")
+                                        _x2.metric("追加後仮想回収率",f"{_plus_rate276:.1f}%")
+                                        _x3.metric("従来との差",f"{_plus_rate276-_base_rate276:+.1f}pt")
+                                        st.caption(
+                                            "保存済み最古オッズと当時のモデル確率だけで判定し、"
+                                            "保存オッズにある全対応券種を比較し、合成モデル期待回収率が上がる候補だけを100円相当で仮想追加した過去検証です。"
+                                            "現在レースの候補表示や実購入処理には追加しません。"
+                                        )
 
                             result255=_v255_backtest_center(engine.DB_PATH)
                             cmp_df=result255.get('comparison',pd.DataFrame())
