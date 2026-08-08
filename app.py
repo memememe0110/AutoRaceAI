@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver271"
+APP_VERSION = "Ver272"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -1463,8 +1463,135 @@ def _v260_repair_saved_snapshot_history(db_path: str, app_version: str = '', lim
 # Ver264 maintenance: 一括再シミュレーションを現行Ver264でも継承し、周回スナップショットまで原子的に保存する。
 # Ver262: 保存済み予測を現在バージョンで一括再シミュレーションする。
 # 同一レース・現行Verの履歴が既に存在する場合は重複作成せずスキップする。
+
+# ---------------------------------------------------------------------------
+# Ver272: 時系列再シミュレーション後の「仮想100円均等」回収率バックテスト
+# 実購入処理ではなく、保存済み過去レースの評価専用。
+# オッズは同一レースに保存されている最古スナップショットを全Ver共通で使う。
+# ---------------------------------------------------------------------------
+
+def _v273_load_earliest_saved_odds(db_path: str, race_key: str) -> tuple[dict, dict]:
+    empty = {'3tan': {}, '3fuku': {}, '2tansho': {}, '2fuku': {}, 'tansho': {}, 'wide': {}}
+    try:
+        _v221_ensure_odds_tables(db_path)
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory = sqlite3.Row
+            run = con.execute("""
+                SELECT * FROM v221_odds_runs
+                WHERE race_key=?
+                ORDER BY datetime(created_at) ASC, rowid ASC
+                LIMIT 1
+            """, (str(race_key or ''),)).fetchone()
+            if not run:
+                return empty, {}
+            rows = con.execute("""
+                SELECT bet_key, combination, odds
+                FROM v221_odds_values
+                WHERE race_key=? AND snapshot_id=?
+            """, (str(race_key or ''), str(run["snapshot_id"]))).fetchall()
+        out = {k: {} for k in empty}
+        for r in rows:
+            k = str(r["bet_key"] or "")
+            if k in out:
+                try:
+                    odd = float(r["odds"])
+                    if odd > 0:
+                        out[k][str(r["combination"])] = odd
+                except Exception:
+                    pass
+        return out, dict(run)
+    except Exception:
+        return empty, {}
+
+
+def _v273_virtual_roi_score(
+    db_path: str,
+    race_key: str,
+    bets: dict,
+    trials: int,
+    meta: dict,
+    app_version: str,
+) -> dict:
+    """
+    保存済みの最古オッズ + 登録済み払戻で、再シミュレーション結果を仮想採点する。
+    1点100円均等。オッズ未保存/払戻未登録なら対象外。
+    """
+    out = {
+        "available": False, "evaluated": False, "race_key": str(race_key or ""),
+        "cost_yen": 0, "payout_yen": 0, "return_rate": None,
+        "points": 0, "hit": False, "odds_snapshot_id": "", "odds_created_at": "",
+        "reason": "",
+    }
+    if not race_key:
+        out["reason"] = "race_keyなし"
+        return out
+
+    odds_maps, odds_run = _v273_load_earliest_saved_odds(db_path, race_key)
+    if sum(len(v) for v in odds_maps.values()) <= 0:
+        out["reason"] = "保存オッズなし"
+        return out
+
+    try:
+        result = v184_eight_car_mixed_plan(bets, int(trials or 0), meta or {}, odds_maps)
+    except Exception as exc:
+        out["reason"] = f"プラン生成失敗: {type(exc).__name__}: {exc}"
+        return out
+
+    if not isinstance(result, dict) or not result.get("available"):
+        out["reason"] = str((result or {}).get("reason") or "回収率プラン生成不可")
+        return out
+
+    out["available"] = True
+    out["odds_snapshot_id"] = str(odds_run.get("snapshot_id") or "")
+    out["odds_created_at"] = str(odds_run.get("created_at") or "")
+    try:
+        plan_hash = _v187_save_mixed_plan(
+            db_path, str(race_key), result, app_version=str(app_version or APP_VERSION)
+        )
+        if not plan_hash:
+            out["reason"] = "プラン保存失敗"
+            return out
+        _v212_recalculate_plan_feedback(db_path, str(race_key), str(plan_hash))
+
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute("""
+                SELECT r.points, r.cost_yen,
+                       f.hit, f.payout_yen, f.return_rate
+                FROM v187_mixed_plan_runs r
+                LEFT JOIN v187_mixed_plan_feedback f
+                  ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                WHERE r.race_key=? AND r.plan_hash=?
+                LIMIT 1
+            """, (str(race_key), str(plan_hash))).fetchone()
+
+        if row is None:
+            out["reason"] = "採点レコードなし"
+            return out
+
+        out["points"] = int(row["points"] or 0)
+        out["cost_yen"] = int(row["cost_yen"] or out["points"] * 100)
+        if row["return_rate"] is None:
+            out["reason"] = "払戻未登録"
+            return out
+
+        out["evaluated"] = True
+        out["hit"] = bool(int(row["hit"] or 0))
+        out["payout_yen"] = int(row["payout_yen"] or 0)
+        out["return_rate"] = float(row["return_rate"] or 0.0)
+        out["reason"] = "採点済み"
+        return out
+    except Exception as exc:
+        out["reason"] = f"採点失敗: {type(exc).__name__}: {exc}"
+        return out
+
+
 def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None) -> dict:
-    out={"checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[]}
+    out={
+        "checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[],
+        "roi_evaluated":0,"roi_no_odds":0,"roi_no_payout":0,
+        "roi_cost_yen":0,"roi_payout_yen":0,"roi_hits":0,"roi_rows":[],
+    }
     histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
     # 同じレースの旧バージョンが複数あっても、入力復元元は最新1件だけ使う。
     unique=[]; seen=set()
@@ -1570,6 +1697,36 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             snap=_v260_snapshot_from_saved_view(db_path,prediction_view,current_ver)
             if not snap.get('ok'):
                 raise RuntimeError(f"周回スナップショット保存失敗: {snap.get('reason','不明')}")
+
+            # Ver272: 過去レースの仮想100円均等・回収率採点。
+            # 保存済み最古オッズを全バージョン共通で使い、結果/払戻は採点にだけ使用する。
+            _roi273=_v273_virtual_roi_score(
+                db_path, race_key, bets, trials, meta, current_ver
+            )
+            if _roi273.get("evaluated"):
+                out["roi_evaluated"]+=1
+                out["roi_cost_yen"]+=int(_roi273.get("cost_yen",0) or 0)
+                out["roi_payout_yen"]+=int(_roi273.get("payout_yen",0) or 0)
+                out["roi_hits"]+=int(bool(_roi273.get("hit")))
+            else:
+                _reason273=str(_roi273.get("reason") or "")
+                if "オッズ" in _reason273:
+                    out["roi_no_odds"]+=1
+                elif "払戻" in _reason273:
+                    out["roi_no_payout"]+=1
+            out["roi_rows"].append({
+                "race": label,
+                "race_key": race_key,
+                "evaluated": bool(_roi273.get("evaluated")),
+                "points": int(_roi273.get("points",0) or 0),
+                "cost_yen": int(_roi273.get("cost_yen",0) or 0),
+                "payout_yen": int(_roi273.get("payout_yen",0) or 0),
+                "return_rate": _roi273.get("return_rate"),
+                "hit": bool(_roi273.get("hit")),
+                "reason": str(_roi273.get("reason") or ""),
+                "odds_created_at": str(_roi273.get("odds_created_at") or ""),
+            })
+
             out['rerun']+=1
             out['labels'].append(f"{label} → {current_ver} (ID:{hid}, {int(snap.get('saved_laps',0) or 0)}周)")
             current_keys.add(str(race_key0 or race_key))
@@ -1579,6 +1736,10 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         finally:
             if callable(progress_cb):
                 progress_cb(idx,total,label)
+    if int(out.get("roi_cost_yen",0) or 0) > 0:
+        out["roi_return_rate"]=float(out["roi_payout_yen"])/float(out["roi_cost_yen"])*100.0
+    else:
+        out["roi_return_rate"]=None
     out['message']=(f"確認{out['checked']}レース / {current_ver}再シミュレーション{out['rerun']} / "
                     f"現行版済み{out['skipped_current']} / 入力材料なし{out['no_text']} / エラー{len(out['errors'])}")
     return out
@@ -3053,6 +3214,37 @@ def _v271_mid_lap_pass_factor(
     return factor, ",".join(reasons) if reasons else "neutral"
 
 
+
+def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_trial_median, residual_adjust_sec, residual_samples):
+    """5～6周目だけ、追える根拠が複数ある後方車へ小さな再加速を許す。"""
+    try:
+        lap=int(lap_no); h=float(handicap_m or 0); gate=float(chase_gate or 1)
+        adj=float(residual_adjust_sec or 0); sn=int(residual_samples or 0)
+    except Exception:
+        return 1.0
+    if lap not in (5,6) or h < 30:
+        return 1.0
+    score=0
+    if sn>=5 and adj<=-0.012: score+=2
+    elif sn>=5 and adj<=-0.006: score+=1
+    if gate>=0.90: score+=2
+    elif gate>=0.80: score+=1
+    try:
+        tt=float(trial_time); med=float(field_trial_median)
+        if np.isfinite(tt) and np.isfinite(med):
+            adv=med-tt
+            if adv>=0.035: score+=1
+            elif adv<=-0.040: score-=1
+    except Exception:
+        pass
+    threshold=4 if h>=60 else 3
+    if score<threshold:
+        return 1.0
+    if score>=threshold+2:
+        return 1.08 if lap==6 else 1.06
+    return 1.05 if lap==6 else 1.035
+
+
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
     if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(entries,pd.DataFrame) or entries.empty:
@@ -3323,6 +3515,23 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 logit += rng.normal(0,_branch_noise)
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
+                # Ver272: Ver271の3～4周目補正を実際の追い抜き確率へ接続。
+                try:
+                    _mid_factor272,_=_v271_mid_lap_pass_factor(
+                        lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,1.0),
+                        trial_map.get(chaser), _trial_median_v270)
+                    p=float(np.clip(p*_mid_factor272,0.035,0.88))
+                except Exception:
+                    pass
+                # Ver272: 5～6周目は追える根拠が複数ある後方車だけ再加速。
+                try:
+                    _late_factor272=_v272_late_chase_release(
+                        lap, handicap.get(chaser,0), chase_gate_v270.get(chaser,1.0),
+                        trial_map.get(chaser), _trial_median_v270,
+                        time_adjust_v265.get(chaser,0.0), time_samples_v265.get(chaser,0))
+                    p=float(np.clip(p*_late_factor272,0.035,0.88))
+                except Exception:
+                    pass
                 # 差が開きすぎていればまず追いつく必要がある。
                 # 大差なら即追越しは難しいが、速度優位車はまず差を詰められる。
                 catch_factor=max(0.10,1.0-min(0.78,gaps[i]*1.12))
@@ -11591,8 +11800,8 @@ if selected_main_page == "🗃️ 登録情報確認":
                                     st.warning(" / ".join(_repair.get('errors',[])[:12]))
                                 st.rerun()
 
-                            st.markdown(f"#### ⏱️ 保存済み予測を時系列順に{_V231_APP_VERSION}で再シミュレーション")
-                            st.caption("保存レースを開催日→開催場→Rの順に並べ、当時その時点より前に判明していた結果だけで再計算します。同日も1R→2R→3R…の順で、後のRから前のRへ情報が逆流しないウォークフォワード方式です。")
+                            st.markdown(f"#### ⏱️ 保存済み予測を時系列順に{_V231_APP_VERSION}で再シミュレーション＋回収率採点")
+                            st.caption("保存レースを開催日→開催場→Rの順に並べ、当時その時点より前に判明していた結果だけで再計算します。同日も1R→2R→3R…の順です。再計算後、保存済み最古オッズと登録済み払戻があるレースだけ、1点100円の仮想回収率を自動採点します。")
                             _v262_batch_limit=st.number_input("一括再シミュレーションする保存レース数",min_value=1,max_value=300,value=80,step=10,key="v262_batch_rerun_limit")
                             if st.button(f"⏱️ 時系列順に{_V231_APP_VERSION}で一括再シミュレーション",key="v262_batch_rerun",type="primary",use_container_width=True):
                                 _prog=st.progress(0.0,text="一括再シミュレーションを開始します…")
@@ -11609,6 +11818,48 @@ if selected_main_page == "🗃️ 登録情報確認":
                                     st.caption("新規保存: "+" / ".join(_batch.get('labels',[])[:30]))
                                 if _batch.get('errors'):
                                     st.warning(" / ".join(_batch.get('errors',[])[:12]))
+
+                                # Ver272: 自動再シミュレーションの仮想回収率をその場で表示。
+                                _roi_n=int(_batch.get("roi_evaluated",0) or 0)
+                                if _roi_n>0:
+                                    st.markdown("#### 📊 仮想100円均等・回収率バックテスト")
+                                    _r1,_r2,_r3,_r4=st.columns(4)
+                                    _r1.metric("採点対象",f"{_roi_n}R")
+                                    _r2.metric("仮想投資",f"{int(_batch.get('roi_cost_yen',0) or 0):,}円")
+                                    _r3.metric("仮想払戻",f"{int(_batch.get('roi_payout_yen',0) or 0):,}円")
+                                    _rr=_batch.get("roi_return_rate")
+                                    _r4.metric("参考回収率","—" if _rr is None else f"{float(_rr):.1f}%")
+                                    st.caption(
+                                        f"的中 {_batch.get('roi_hits',0)}R / "
+                                        f"保存オッズなし {_batch.get('roi_no_odds',0)}R / "
+                                        f"払戻未登録 {_batch.get('roi_no_payout',0)}R。"
+                                        "各買い目は1点100円の仮想評価です。"
+                                    )
+                                    _roi_df=pd.DataFrame(_batch.get("roi_rows") or [])
+                                    if not _roi_df.empty:
+                                        _show_cols=[c for c in [
+                                            "race","points","cost_yen","payout_yen","return_rate","hit",
+                                            "odds_created_at","reason"
+                                        ] if c in _roi_df.columns]
+                                        st.dataframe(
+                                            _roi_df[_show_cols],
+                                            use_container_width=True,
+                                            hide_index=True,
+                                            column_config={
+                                                "cost_yen":st.column_config.NumberColumn("仮想投資",format="%d円"),
+                                                "payout_yen":st.column_config.NumberColumn("仮想払戻",format="%d円"),
+                                                "return_rate":st.column_config.NumberColumn("回収率",format="%.1f%%"),
+                                            },
+                                        )
+                                    st.caption(
+                                        "比較の公平性を優先し、各レースに保存されている最古のオッズスナップショットを使用します。"
+                                        "これは過去データの検証用で、実購入処理は行いません。"
+                                    )
+                                elif int(_batch.get("rerun",0) or 0)>0:
+                                    st.info(
+                                        "回収率採点できるレースがありませんでした。"
+                                        "保存済みオッズと払戻の両方がある過去レースだけが対象です。"
+                                    )
                                 st.rerun()
                             result255=_v255_backtest_center(engine.DB_PATH)
                             cmp_df=result255.get('comparison',pd.DataFrame())
