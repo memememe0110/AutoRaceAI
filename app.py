@@ -2183,6 +2183,42 @@ def _v278_resume_background_after_foreground(db_path: str, pause_info: dict) -> 
     except Exception:
         pass
 
+def _v278_send_completion_notification(job_id: int, result: dict) -> None:
+    """バックグラウンド再シミュレーション完了時にntfyへ即時通知する。
+
+    通知は予測ロジックから独立しており、失敗してもシミュレーション結果には影響しない。
+    トピックは環境変数 AUTORACE_NTFY_TOPIC を優先し、未設定時は既存の一般予定通知と同じ notify を使う。
+    """
+    try:
+        topic=str(os.environ.get("AUTORACE_NTFY_TOPIC", "notify") or "notify").strip()
+        if not topic:
+            return
+        checked=int((result or {}).get("checked",0) or 0)
+        rerun=int((result or {}).get("rerun",0) or 0)
+        errors=len((result or {}).get("errors",[]) or [])
+        payload={
+            "topic": topic,
+            "title": "AutoRaceAI 再シミュレーション完了",
+            "message": f"ジョブID {int(job_id)} が完了しました。確認 {checked}レース / 再シミュレーション {rerun}レース / エラー {errors}件",
+            "priority": 4,
+            "tags": ["checkered_flag","bell"],
+        }
+        request=urllib.request.Request(
+            GENERAL_REMINDER_NTFY_BASE,
+            data=json.dumps(payload,ensure_ascii=False).encode("utf-8",errors="strict"),
+            method="POST",
+            headers={"Content-Type":"application/json; charset=utf-8"},
+        )
+        with urllib.request.urlopen(request,timeout=8) as response:
+            response.read()
+    except Exception as exc:
+        # 通知障害で完了済みジョブを failed にしない。ログだけ残す。
+        try:
+            print(f"[AutoRaceAI] 完了通知の送信に失敗しました: {type(exc).__name__}: {exc}")
+        except Exception:
+            pass
+
+
 def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool) -> None:
     try:
         _v278_bg_update(
@@ -2221,6 +2257,9 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             ),
             result_blob=sqlite3.Binary(blob),
         )
+        # 正常完了した時だけ、処理終了直後にプッシュ通知する。
+        if not cancelled:
+            _v278_send_completion_notification(job_id,result)
     except Exception as exc:
         _v278_bg_update(
             db_path, job_id,
