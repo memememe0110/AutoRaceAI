@@ -111,146 +111,274 @@ def _v266_find_table(conn, preferred):
             return t
     return None
 
-def _v266_load_error_rows(db_path, limit_rows=5000):
+def _v266_load_error_rows(db_path, limit_rows=20000):
     """
-    DBスキーマ差を吸収しながら、予測履歴と実結果を同一レース・車番で結合する。
-    完全一致できないDBでは空DataFrameを返し、UI側で理由を表示する。
+    AutoRaceAIの実DB構造に合わせて、保存済み予測と実結果を結合する。
+    実結果:
+      result_races(race_key, race_date, venue, race_no, ...)
+        JOIN result_entries(race_key, car_no, player_name, handicap,
+                            trial_time, race_time, start_time, ...)
+    予測:
+      v231_prediction_history を優先し、JSON内の車番別予測競走Tを展開する。
     """
     import pandas as pd
+
     if not db_path or not os.path.exists(str(db_path)):
         return pd.DataFrame(), "DBファイルが見つかりません"
 
-    conn = sqlite3.connect(str(db_path))
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
     try:
-        pred_t = _v266_find_table(conn, [
-            "v231_prediction_history", "prediction_history", "predictions"
-        ])
-        result_t = _v266_find_table(conn, [
-            "result_entries", "race_history", "results"
-        ])
-        if not pred_t or not result_t:
-            return pd.DataFrame(), f"必要テーブル不足: prediction={pred_t}, result={result_t}"
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
 
-        pcols = _v266_table_columns(conn, pred_t)
-        rcols = _v266_table_columns(conn, result_t)
+        # ---------- 実結果 ----------
+        if "result_races" not in tables or "result_entries" not in tables:
+            return pd.DataFrame(), "result_races / result_entries が見つかりません"
 
-        # Prediction-history schemas vary. Prefer JSON/payload rows if present.
+        rr_cols = _v266_table_columns(con, "result_races")
+        re_cols = _v266_table_columns(con, "result_entries")
+
+        # AutoRaceAIの標準スキーマ
+        required_rr = {"race_key", "race_date", "venue", "race_no"}
+        required_re = {"race_key", "car_no", "race_time"}
+        if not required_rr.issubset(set(rr_cols)) or not required_re.issubset(set(re_cols)):
+            return pd.DataFrame(), (
+                "実結果テーブルの必要カラム不足: "
+                f"result_races={rr_cols} / result_entries={re_cols}"
+            )
+
+        select_parts = [
+            "rr.race_key AS race_key",
+            "rr.race_date AS date",
+            "rr.venue AS venue",
+            "rr.race_no AS race_no",
+            "re.car_no AS car_no",
+            "re.race_time AS actual_race_time",
+        ]
+        optional_map = {
+            "player_name": "re.player_name AS player_name",
+            "trial_time": "re.trial_time AS trial_time",
+            "start_time": "re.start_time AS st",
+            "handicap": "re.handicap AS handicap",
+            "finish": "re.finish AS finish",
+            "result_status": "re.result_status AS result_status",
+        }
+        for c, sql in optional_map.items():
+            if c in re_cols:
+                select_parts.append(sql)
+
+        # 開催条件はresult_races側にあれば拾う
+        rr_optional = {
+            "track_temp": "rr.track_temp AS track_temp",
+            "weather": "rr.weather AS weather",
+            "track_condition": "rr.track_condition AS track_condition",
+            "temperature": "rr.temperature AS temperature",
+            "humidity": "rr.humidity AS humidity",
+            "start_time": "rr.start_time AS race_start_time",
+        }
+        for c, sql in rr_optional.items():
+            if c in rr_cols:
+                select_parts.append(sql)
+
+        result_sql = f"""
+            SELECT {", ".join(select_parts)}
+              FROM result_races rr
+              JOIN result_entries re ON re.race_key = rr.race_key
+             WHERE re.race_time IS NOT NULL
+             LIMIT {int(limit_rows)}
+        """
+        rdf = pd.read_sql_query(result_sql, con)
+        if rdf.empty:
+            return pd.DataFrame(), "競走T付きの実結果がありません"
+
+        # ---------- 保存済み予測 ----------
+        pred_table = None
+        for t in ("v231_prediction_history", "prediction_history", "predictions"):
+            if t in tables:
+                pred_table = t
+                break
+        if not pred_table:
+            return pd.DataFrame(), "保存済み予測テーブルが見つかりません"
+
+        pcols = _v266_table_columns(con, pred_table)
+
+        # 既存DBで使われている候補名を幅広く許容
         p_date = _v266_guess_col(pcols, "race_date", "date", "開催日", "日付")
         p_venue = _v266_guess_col(pcols, "venue", "track", "開催場", "場")
         p_race = _v266_guess_col(pcols, "race_no", "race", "r", "レース")
-        p_ver = _v266_guess_col(pcols, "version", "app_version")
-        p_payload = _v266_guess_col(pcols, "payload_json", "prediction_json", "data_json", "payload", "json_data")
+        p_ver = _v266_guess_col(pcols, "version", "app_version", "ver")
+        p_payload = _v266_guess_col(
+            pcols,
+            "payload_json", "prediction_json", "data_json", "payload",
+            "json_data", "snapshot_json", "state_json", "prediction_state"
+        )
 
-        r_date = _v266_guess_col(rcols, "race_date", "date", "開催日", "日付")
-        r_venue = _v266_guess_col(rcols, "venue", "track", "開催場", "場")
-        r_race = _v266_guess_col(rcols, "race_no", "race", "r", "レース")
-        r_car = _v266_guess_col(rcols, "car_no", "車番", "number")
-        r_name = _v266_guess_col(rcols, "player_name", "選手名", "name")
-        r_trial = _v266_guess_col(rcols, "trial_time", "試走t", "試走T", "試走")
-        r_race_time = _v266_guess_col(rcols, "race_time", "競走t", "競走T", "競走")
-        r_st = _v266_guess_col(rcols, "st", "ST", "start_time")
-        r_handicap = _v266_guess_col(rcols, "handicap", "ハンデ")
-        r_track_temp = _v266_guess_col(rcols, "track_temp", "走路温度")
-        r_weather = _v266_guess_col(rcols, "weather", "天候")
-        r_condition = _v266_guess_col(rcols, "track_condition", "走路", "走路状況")
+        # race_keyがある履歴なら開催キーの復元にも使う
+        p_race_key = _v266_guess_col(pcols, "race_key")
 
-        if not (r_date and r_venue and r_race and r_car and r_race_time):
-            return pd.DataFrame(), "実結果側の結合キー/競走Tカラムを特定できません"
+        cols = []
+        for c in (p_date, p_venue, p_race, p_ver, p_payload, p_race_key):
+            if c and c not in cols:
+                cols.append(c)
 
-        # Read result rows.
-        rsel = [r_date, r_venue, r_race, r_car]
-        for c in [r_name, r_trial, r_race_time, r_st, r_handicap, r_track_temp, r_weather, r_condition]:
-            if c and c not in rsel:
-                rsel.append(c)
-        rq = "SELECT " + ",".join([f'"{c}"' for c in rsel]) + f' FROM "{result_t}" LIMIT {int(limit_rows)}'
-        rdf = pd.read_sql_query(rq, conn)
+        if not cols:
+            return pd.DataFrame(), f"{pred_table} の予測保存カラムを特定できません: {pcols}"
 
-        # Normalize result column names.
-        rename = {r_date:"date", r_venue:"venue", r_race:"race_no", r_car:"car_no", r_race_time:"actual_race_time"}
-        if r_name: rename[r_name]="player_name"
-        if r_trial: rename[r_trial]="trial_time"
-        if r_st: rename[r_st]="st"
-        if r_handicap: rename[r_handicap]="handicap"
-        if r_track_temp: rename[r_track_temp]="track_temp"
-        if r_weather: rename[r_weather]="weather"
-        if r_condition: rename[r_condition]="track_condition"
-        rdf = rdf.rename(columns=rename)
+        pq = (
+            "SELECT rowid AS _rowid, "
+            + ", ".join([f'"{c}"' for c in cols])
+            + f' FROM "{pred_table}" ORDER BY rowid DESC LIMIT 3000'
+        )
+        pdf = pd.read_sql_query(pq, con)
+        rename = {}
+        if p_date: rename[p_date] = "date"
+        if p_venue: rename[p_venue] = "venue"
+        if p_race: rename[p_race] = "race_no"
+        if p_ver: rename[p_ver] = "version"
+        if p_payload: rename[p_payload] = "payload"
+        if p_race_key: rename[p_race_key] = "race_key"
+        pdf = pdf.rename(columns=rename)
 
-        # Prediction rows: payload JSON is the most common durable representation.
-        if not (p_date and p_venue and p_race):
-            return pd.DataFrame(), "予測履歴側の開催日/開催場/Rを特定できません"
+        # race_keyしか無い場合はresult_racesから開催情報を補完
+        if "race_key" in pdf.columns and any(c not in pdf.columns for c in ("date","venue","race_no")):
+            key_map = pd.read_sql_query(
+                "SELECT race_key, race_date AS date, venue, race_no FROM result_races",
+                con,
+            )
+            pdf = pdf.merge(key_map, on="race_key", how="left", suffixes=("", "_rr"))
+            for c in ("date","venue","race_no"):
+                if c not in pdf.columns and f"{c}_rr" in pdf.columns:
+                    pdf[c] = pdf[f"{c}_rr"]
 
-        psel = [p_date, p_venue, p_race]
-        if p_ver: psel.append(p_ver)
-        if p_payload: psel.append(p_payload)
-        pq = "SELECT " + ",".join([f'"{c}"' for c in psel]) + f' FROM "{pred_t}" ORDER BY rowid DESC LIMIT 1000'
-        pdf = pd.read_sql_query(pq, conn)
-        prename = {p_date:"date", p_venue:"venue", p_race:"race_no"}
-        if p_ver: prename[p_ver]="version"
-        if p_payload: prename[p_payload]="payload"
-        pdf = pdf.rename(columns=prename)
+        # JSONの中から車番別予測Tを再帰的に探索
+        def _walk(obj):
+            if isinstance(obj, dict):
+                yield obj
+                for v in obj.values():
+                    yield from _walk(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    yield from _walk(v)
+
+        car_keys = ("車番", "car_no", "number", "car", "枠番")
+        pred_keys = (
+            "Ver266補正後予測競走T",
+            "Ver265補正後予測競走T",
+            "予測競走T",
+            "予測競走タイム",
+            "pred_race_time",
+            "predicted_race_time",
+            "prediction_time",
+            "pred_time",
+        )
 
         exploded = []
         if "payload" in pdf.columns:
             for _, row in pdf.iterrows():
                 raw = row.get("payload")
-                try:
-                    obj = json.loads(raw) if isinstance(raw, str) else raw
-                except Exception:
+                if raw is None:
                     continue
-                # Search likely lists containing per-car predictions.
-                candidate_lists = []
-                if isinstance(obj, list):
-                    candidate_lists.append(obj)
-                elif isinstance(obj, dict):
-                    for k in ["players","entries","rows","prediction_rows","result_rows","df","data"]:
-                        v = obj.get(k)
-                        if isinstance(v, list):
-                            candidate_lists.append(v)
-                for items in candidate_lists:
-                    for it in items:
-                        if not isinstance(it, dict):
-                            continue
-                        car = it.get("車番", it.get("car_no", it.get("number")))
-                        pred = None
-                        for k in ["予測競走T","予測競走タイム","pred_race_time","predicted_race_time",
-                                  "Ver265補正後予測競走T","Ver266補正後予測競走T"]:
-                            if k in it and _v266_num(it.get(k)) is not None:
-                                pred = _v266_num(it.get(k))
-                                break
-                        if car is None or pred is None:
-                            continue
-                        exploded.append({
-                            "date": row.get("date"),
-                            "venue": row.get("venue"),
-                            "race_no": row.get("race_no"),
-                            "version": row.get("version", ""),
-                            "car_no": car,
-                            "pred_race_time": pred,
-                        })
+                obj = raw
+                if isinstance(raw, (bytes, bytearray)):
+                    try:
+                        raw = raw.decode("utf-8")
+                    except Exception:
+                        continue
+                if isinstance(raw, str):
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        continue
+
+                seen = set()
+                for d in _walk(obj):
+                    car = None
+                    pred = None
+                    for k in car_keys:
+                        if k in d:
+                            car = d.get(k)
+                            break
+                    for k in pred_keys:
+                        if k in d and _v266_num(d.get(k)) is not None:
+                            pred = _v266_num(d.get(k))
+                            break
+                    if car is None or pred is None:
+                        continue
+                    key = (str(car), float(pred))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    exploded.append({
+                        "date": row.get("date"),
+                        "venue": row.get("venue"),
+                        "race_no": row.get("race_no"),
+                        "race_key": row.get("race_key"),
+                        "version": row.get("version", ""),
+                        "car_no": car,
+                        "pred_race_time": pred,
+                        "_rowid": row.get("_rowid"),
+                    })
 
         if not exploded:
-            return pd.DataFrame(), "保存済み予測から車番別の予測競走Tを抽出できません"
+            return pd.DataFrame(), (
+                "保存済み予測はありますが、車番別の予測競走Tが履歴JSONに保存されていません。"
+                " 今後の予測保存時にVer266の予測競走Tスナップショットを保存する必要があります。"
+            )
 
         epdf = pd.DataFrame(exploded)
-        for df in [epdf, rdf]:
-            df["date"] = df["date"].astype(str)
-            df["venue"] = df["venue"].astype(str)
-            df["race_no"] = df["race_no"].astype(str).str.replace("R","", regex=False)
-            df["car_no"] = df["car_no"].astype(str).str.replace(".0","", regex=False)
 
-        m = epdf.merge(rdf, on=["date","venue","race_no","car_no"], how="inner")
+        # 正規化
+        for df in (epdf, rdf):
+            if "date" in df.columns:
+                df["date"] = df["date"].astype(str).str.slice(0, 10)
+            if "venue" in df.columns:
+                df["venue"] = df["venue"].astype(str).str.strip()
+            if "race_no" in df.columns:
+                df["race_no"] = (
+                    df["race_no"].astype(str)
+                    .str.replace("R", "", regex=False)
+                    .str.replace(".0", "", regex=False)
+                    .str.strip()
+                )
+            df["car_no"] = (
+                df["car_no"].astype(str)
+                .str.replace(".0", "", regex=False)
+                .str.strip()
+            )
+
+        # race_key優先、無ければ日付+場+R+車番
+        if "race_key" in epdf.columns and epdf["race_key"].notna().any():
+            m = epdf.merge(rdf, on=["race_key","car_no"], how="inner", suffixes=("_pred",""))
+            # 表示用キーを実結果側に統一
+            for c in ("date","venue","race_no"):
+                pc = f"{c}_pred"
+                if pc in m.columns and c in m.columns:
+                    m.drop(columns=[pc], inplace=True)
+        else:
+            needed = {"date","venue","race_no","car_no"}
+            if not needed.issubset(epdf.columns):
+                return pd.DataFrame(), "予測履歴からレース結合キーを復元できません"
+            m = epdf.merge(rdf, on=["date","venue","race_no","car_no"], how="inner")
+
         if m.empty:
             return m, "予測履歴と実結果を同一レース・車番で結合できません"
 
         m["pred_race_time"] = pd.to_numeric(m["pred_race_time"], errors="coerce")
         m["actual_race_time"] = pd.to_numeric(m["actual_race_time"], errors="coerce")
         m = m.dropna(subset=["pred_race_time","actual_race_time"])
+
+        # 同じVer・同じレース・同じ車番の重複は最新予測だけ残す
+        dedup_cols = [c for c in ("version","race_key","date","venue","race_no","car_no") if c in m.columns]
+        if "_rowid" in m.columns and dedup_cols:
+            m = m.sort_values("_rowid").drop_duplicates(dedup_cols, keep="last")
+
         m["error_sec"] = m["actual_race_time"] - m["pred_race_time"]
         m["abs_error_sec"] = m["error_sec"].abs()
         return m, ""
     finally:
-        conn.close()
+        con.close()
 
 def _v266_render_error_analysis(db_path):
     import pandas as pd
