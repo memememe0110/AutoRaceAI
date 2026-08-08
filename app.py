@@ -1834,7 +1834,16 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             meta['壁補正監査']=wall_audit
             meta['6周展開シミュレーション']=wall_audit
             finish_prob=engine.v30_finish_probabilities(df,bets,trials)
+            _v273_audit_keep={
+                c:df[c].copy() for c in df.columns if str(c).startswith("Ver273_")
+            }
             df=engine.v196_apply_probability_aligned_ranks(df,finish_prob)
+            for _c273,_s273 in _v273_audit_keep.items():
+                try:
+                    if len(_s273)==len(df):
+                        df[_c273]=list(_s273)
+                except Exception:
+                    pass
             race_key=engine.v34_save_prediction_snapshot(meta,df,finish_prob,engine.DB_PATH)
             prediction_view={
                 'df':df,'bets':bets,'output':output,'entries':entries,'meta':meta,
@@ -10196,7 +10205,18 @@ elif selected_main_page == "🏁 予測":
                 meta["6周展開シミュレーション"] = wall_audit
                 _t1 = time_module.perf_counter()
                 finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
+                _v273_audit_keep = {
+                    c: df[c].copy()
+                    for c in df.columns
+                    if str(c).startswith("Ver273_")
+                }
                 df = engine.v196_apply_probability_aligned_ranks(df, finish_prob)
+                for _c273, _s273 in _v273_audit_keep.items():
+                    try:
+                        if len(_s273) == len(df):
+                            df[_c273] = list(_s273)
+                    except Exception:
+                        pass
                 _t2 = time_module.perf_counter()
             # オッズ欄の表示に必要なレースキーだけ同期保存。
             _t_save0 = time_module.perf_counter()
@@ -12131,6 +12151,16 @@ if selected_main_page == "🗃️ 登録情報確認":
                                         _df273 = (_v273 or {}).get("df")
                                         if _df273 is None or getattr(_df273, "empty", True):
                                             continue
+                                        _required273 = [
+                                            "Ver273_5周目ループ到達",
+                                            "Ver273_5周目関数呼出",
+                                            "Ver273_5周目再加速発動数",
+                                            "Ver273_6周目ループ到達",
+                                            "Ver273_6周目関数呼出",
+                                            "Ver273_6周目再加速発動数",
+                                        ]
+                                        if not all(c in _df273.columns for c in _required273):
+                                            continue
                                         _f = _df273.iloc[0]
                                         _rows273.append({
                                             "history_id": int(_h273.get("history_id") or 0),
@@ -12154,7 +12184,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                         continue
                                 _log273 = pd.DataFrame(_rows273)
                                 if _log273.empty:
-                                    st.info("まだ詳細ログ付きVer273予測がありません。再シミュレーション後に表示されます。")
+                                    st.info("まだ監査列が保存されたVer273予測がありません。この修正版で再シミュレーションすると表示されます。")
                                 else:
                                     st.dataframe(_log273, use_container_width=True, hide_index=True)
                                     st.caption(
