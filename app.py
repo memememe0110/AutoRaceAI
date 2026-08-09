@@ -11758,6 +11758,9 @@ def github_config() -> dict:
         "token": secret_value("GITHUB_TOKEN"),
         "repo": secret_value("GITHUB_REPO"),
         "branch": secret_value("GITHUB_BRANCH", "main") or "main",
+        # Ver282: DB更新でStreamlit本体が再デプロイされないよう、DBは専用branchへ保存する。
+        # SecretsにGITHUB_DB_BRANCHが無ければ autorace-db を自動利用。
+        "db_branch": secret_value("GITHUB_DB_BRANCH", "autorace-db") or "autorace-db",
         "path": secret_value("GITHUB_DB_PATH", "autorace_players.sqlite3") or "autorace_players.sqlite3",
     }
 
@@ -11786,6 +11789,48 @@ def github_request(url: str, method: str = "GET", payload: dict | None = None) -
         return int(exc.code), parsed
 
 
+
+def _v282_ensure_db_branch() -> tuple[bool, str]:
+    """DB専用branchを用意する。main等のデプロイbranchにはDB更新commitを積まない。"""
+    cfg = github_config()
+    repo_api = f"https://api.github.com/repos/{cfg['repo']}"
+    db_branch = str(cfg.get("db_branch") or "autorace-db")
+    app_branch = str(cfg.get("branch") or "main")
+    db_q = urllib.parse.quote(db_branch, safe="")
+    status, body = github_request(f"{repo_api}/git/ref/heads/{db_q}")
+    if status == 200:
+        return True, db_branch
+    if status != 404:
+        return False, f"DB専用branch確認失敗: {body.get('message', status)}"
+
+    app_q = urllib.parse.quote(app_branch, safe="")
+    s2, src = github_request(f"{repo_api}/git/ref/heads/{app_q}")
+    if s2 != 200:
+        return False, f"元branch確認失敗: {src.get('message', s2)}"
+    sha = str(((src.get("object") or {}).get("sha") or "")).strip()
+    if not sha:
+        return False, "DB専用branch作成元SHAを取得できませんでした。"
+
+    s3, created = github_request(
+        f"{repo_api}/git/refs",
+        method="POST",
+        payload={"ref": f"refs/heads/{db_branch}", "sha": sha},
+    )
+    if s3 not in (200, 201):
+        return False, f"DB専用branch作成失敗: {created.get('message', s3)}"
+    return True, db_branch
+
+
+def _v282_db_read_branch() -> str:
+    """DB専用branchが存在すればそこを読む。未作成時だけ従来branchへフォールバック。"""
+    cfg = github_config()
+    repo_api = f"https://api.github.com/repos/{cfg['repo']}"
+    db_branch = str(cfg.get("db_branch") or "autorace-db")
+    q = urllib.parse.quote(db_branch, safe="")
+    status, _ = github_request(f"{repo_api}/git/ref/heads/{q}")
+    return db_branch if status == 200 else str(cfg.get("branch") or "main")
+
+
 def github_api_url() -> str:
     cfg = github_config()
     encoded_path = urllib.parse.quote(cfg["path"], safe="/")
@@ -11797,7 +11842,8 @@ def github_ready() -> tuple[bool, str]:
     missing = [k for k in ("token", "repo") if not cfg[k]]
     if missing:
         return False, "Streamlit Secretsに GITHUB_TOKEN と GITHUB_REPO を設定してください。"
-    return True, "GitHub保存設定済み"
+    cfg = github_config()
+    return True, f"GitHub保存設定済み（DB専用branch: {cfg.get('db_branch','autorace-db')}）"
 
 
 def _v276_validate_db_bytes(data: bytes, label: str = "DB") -> tuple[bool, str]:
@@ -11834,7 +11880,10 @@ def _v282_push_chunked_db(snapshot_bytes: bytes, commit_message: str, chunk_size
     """大容量DBを小分けしてContents APIへ保存。APIの単発リクエスト肥大化を避ける。"""
     cfg = github_config()
     repo_api = f"https://api.github.com/repos/{cfg['repo']}/contents/"
-    branch = cfg["branch"]
+    ok_branch, branch_msg = _v282_ensure_db_branch()
+    if not ok_branch:
+        return False, branch_msg
+    branch = branch_msg
     base_path = str(cfg["path"]).lstrip("/")
     chunks = [snapshot_bytes[i:i + chunk_size] for i in range(0, len(snapshot_bytes), chunk_size)]
     import hashlib
@@ -11885,7 +11934,8 @@ def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
     cfg = github_config()
     repo_api = f"https://api.github.com/repos/{cfg['repo']}/contents/"
     mp = _v282_chunk_manifest_path()
-    url = repo_api + urllib.parse.quote(mp, safe="/") + "?ref=" + urllib.parse.quote(cfg["branch"])
+    read_branch = _v282_db_read_branch()
+    url = repo_api + urllib.parse.quote(mp, safe="/") + "?ref=" + urllib.parse.quote(read_branch)
     status, body = github_request(url)
     if status == 404:
         return False, None, "manifestなし"
@@ -11895,7 +11945,7 @@ def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
         manifest = json.loads(base64.b64decode(body["content"].replace("\n", "")).decode("utf-8"))
         data_parts = []
         for idx, cp in enumerate(manifest.get("parts") or []):
-            u = repo_api + urllib.parse.quote(cp, safe="/") + "?ref=" + urllib.parse.quote(cfg["branch"])
+            u = repo_api + urllib.parse.quote(cp, safe="/") + "?ref=" + urllib.parse.quote(read_branch)
             s, b = github_request(u)
             if s != 200:
                 return False, None, f"分割DB part {idx+1}取得失敗: {b.get('message', s)}"
@@ -11935,7 +11985,8 @@ def pull_db_from_github() -> tuple[bool, str]:
     elif chunk_msg != "manifestなし":
         return False, chunk_msg
 
-    url = github_api_url() + "?ref=" + urllib.parse.quote(cfg["branch"])
+    read_branch = _v282_db_read_branch()
+    url = github_api_url() + "?ref=" + urllib.parse.quote(read_branch)
     status, body = github_request(url)
     if status != 200:
         return False, f"GitHubからDBを取得できませんでした: {body.get('message', status)}"
@@ -11975,7 +12026,10 @@ def _v281_push_large_file_via_git_data_api(snapshot_bytes: bytes, commit_message
     """GitHub Contents APIのサイズ制限を避け、Git Data APIでDBを保存する。"""
     cfg = github_config()
     repo_api = f"https://api.github.com/repos/{cfg['repo']}"
-    branch_q = urllib.parse.quote(str(cfg["branch"]), safe="")
+    ok_branch, db_branch = _v282_ensure_db_branch()
+    if not ok_branch:
+        return False, db_branch
+    branch_q = urllib.parse.quote(str(db_branch), safe="")
     path = str(cfg["path"]).lstrip("/")
 
     # 現在ブランチ先頭を取得
@@ -12049,8 +12103,11 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
         return False, f"DB整合スナップショット作成エラー: {type(exc).__name__}: {exc}"
 
     cfg = github_config()
+    ok_branch, db_branch = _v282_ensure_db_branch()
+    if not ok_branch:
+        return False, db_branch
     url = github_api_url()
-    query_url = url + "?ref=" + urllib.parse.quote(cfg["branch"])
+    query_url = url + "?ref=" + urllib.parse.quote(db_branch)
     status, existing = github_request(query_url)
     sha = existing.get("sha") if status == 200 else None
     if status not in (200, 404):
@@ -12059,7 +12116,7 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     payload = {
         "message": commit_message,
         "content": base64.b64encode(snapshot_bytes).decode("ascii"),
-        "branch": cfg["branch"],
+        "branch": db_branch,
     }
     if sha:
         payload["sha"] = sha
@@ -12167,7 +12224,8 @@ with st.sidebar:
         (st.success if ok else st.error)(msg)
         if ok:
             st.rerun()
-    if st.button("現在のDBをGitHubへ保存", use_container_width=True, disabled=not ready):
+    if st.button("現在のDBをGitHubへ保存", use_container_width=True, disabled=not ready,
+                 help="DB専用branchへ保存するため、Streamlit本体の再デプロイは発生しません。"):
         ok, msg = push_db_to_github("AutoRaceAI: DBを手動保存")
         (st.success if ok else st.error)(msg)
 
