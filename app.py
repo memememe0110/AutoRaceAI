@@ -34,7 +34,7 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver276"
+APP_VERSION = "Ver279"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -5122,6 +5122,111 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
     return meta_out, unique
 
 
+
+# Ver279: 発走後事故・反則は予測学習から除外したまま、選手別の事故履歴として別保存する。
+# 将来の特徴量候補として集計できるようにするが、現時点では予測値への補正には使用しない。
+def _v279_ensure_player_incident_history_table(db_path: str) -> None:
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v279_player_incident_history (
+                race_key TEXT NOT NULL,
+                car_no INTEGER NOT NULL,
+                player_name TEXT,
+                incident_type TEXT NOT NULL,
+                race_date TEXT,
+                venue TEXT,
+                race_no TEXT,
+                registered_at TEXT NOT NULL,
+                PRIMARY KEY (race_key, car_no, incident_type)
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_v279_incident_player ON v279_player_incident_history(player_name, race_date)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_v279_incident_type ON v279_player_incident_history(incident_type, race_date)")
+        con.commit()
+
+
+def _v279_save_player_incident_history(
+    db_path: str, race_key: str, meta: dict, rows, incidents: list[dict]
+) -> int:
+    if not race_key or not incidents:
+        return 0
+    _v279_ensure_player_incident_history_table(db_path)
+    name_by_car = {}
+    try:
+        if isinstance(rows, pd.DataFrame) and not rows.empty:
+            car_col = _v238_col(rows, "車番", "car_no")
+            name_col = _v238_col(rows, "選手名", "player_name", "選手")
+            if car_col and name_col:
+                for _, r in rows.iterrows():
+                    try:
+                        name_by_car[int(float(r[car_col]))] = str(r[name_col] or "").strip()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    # result_entries保存後なら、解析表で名前が取れない場合もDBから補完する。
+    try:
+        with sqlite3.connect(db_path) as con:
+            for car, name in con.execute(
+                "SELECT car_no, player_name FROM result_entries WHERE race_key=?", (str(race_key),)
+            ).fetchall():
+                if name:
+                    name_by_car.setdefault(int(car), str(name).strip())
+    except Exception:
+        pass
+    race_date = str((meta or {}).get("開催日") or (meta or {}).get("日付") or "").strip()
+    venue = str((meta or {}).get("開催場") or "").strip()
+    race_no = str((meta or {}).get("R") or (meta or {}).get("レース") or (meta or {}).get("レース番号") or "").strip()
+    now = _v228_now_jst_iso()
+    saved = 0
+    with sqlite3.connect(db_path) as con:
+        for item in incidents:
+            try:
+                car = int(item.get("車番"))
+                kind = str(item.get("理由") or "").strip()
+                if not kind:
+                    continue
+                con.execute("""
+                    INSERT INTO v279_player_incident_history
+                    (race_key,car_no,player_name,incident_type,race_date,venue,race_no,registered_at)
+                    VALUES (?,?,?,?,?,?,?,?)
+                    ON CONFLICT(race_key,car_no,incident_type) DO UPDATE SET
+                        player_name=COALESCE(NULLIF(excluded.player_name,''),v279_player_incident_history.player_name),
+                        race_date=COALESCE(NULLIF(excluded.race_date,''),v279_player_incident_history.race_date),
+                        venue=COALESCE(NULLIF(excluded.venue,''),v279_player_incident_history.venue),
+                        race_no=COALESCE(NULLIF(excluded.race_no,''),v279_player_incident_history.race_no),
+                        registered_at=excluded.registered_at
+                """, (str(race_key), car, name_by_car.get(car, ""), kind, race_date, venue, race_no, now))
+                saved += 1
+            except Exception:
+                continue
+        con.commit()
+    return saved
+
+
+def _v279_incident_summary(db_path: str, player_name: str = "") -> dict:
+    """表示・将来検証用。予測ロジックには接続しない。"""
+    _v279_ensure_player_incident_history_table(db_path)
+    out = {"total": 0, "by_type": {}}
+    try:
+        with sqlite3.connect(db_path) as con:
+            if player_name:
+                rows = con.execute("""
+                    SELECT incident_type, COUNT(*) FROM v279_player_incident_history
+                    WHERE player_name=? GROUP BY incident_type ORDER BY COUNT(*) DESC
+                """, (str(player_name).strip(),)).fetchall()
+            else:
+                rows = con.execute("""
+                    SELECT incident_type, COUNT(*) FROM v279_player_incident_history
+                    GROUP BY incident_type ORDER BY COUNT(*) DESC
+                """).fetchall()
+        out["by_type"] = {str(k): int(n) for k,n in rows}
+        out["total"] = sum(out["by_type"].values())
+    except Exception:
+        pass
+    return out
+
+
 # Ver148: Streamlit fragment互換デコレーター
 # st.fragment が利用できる環境では部分再実行、未対応環境では通常関数として動作します。
 _v146_fragment = getattr(st, "fragment", lambda func: func)
@@ -8215,6 +8320,11 @@ def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
             ("venue", "TEXT"),
             ("race_no", "TEXT"),
             ("starter_count", "INTEGER"),
+            # Ver279: 復元後に入力したオッズから作ったプランは保存するが、
+            # リアルタイム実績・学習とは明確に分離する。
+            ("plan_origin", "TEXT DEFAULT 'live'"),
+            ("source_prediction_version", "TEXT"),
+            ("include_in_live_stats", "INTEGER DEFAULT 1"),
         ]:
             if col_name not in existing_cols:
                 con.execute(f"ALTER TABLE v187_mixed_plan_runs ADD COLUMN {col_name} {col_type}")
@@ -8236,7 +8346,7 @@ def _v212_norm_bet_type(bet_type: str) -> str:
 def _v187_norm_combo(bet_type: str, combo: str) -> str:
     bet_type = _v212_norm_bet_type(bet_type)
     nums = re.findall(r"\d+", str(combo))
-    if bet_type in ("3連複", "2連複"):
+    if bet_type in ("3連複", "2連複", "ワイド"):
         nums = sorted(nums, key=int)
     return "-".join(nums)
 
@@ -8390,7 +8500,7 @@ def _v208_latest_mixed_plan_result(race_key: str, db_path: str) -> dict:
               ON f.race_key=t.race_key AND f.plan_hash=t.plan_hash
              AND f.bet_type=t.bet_type AND f.combination=t.combination
             WHERE t.race_key=? AND t.plan_hash=?
-            ORDER BY CASE t.bet_type WHEN '3連単' THEN 1 WHEN '3連複' THEN 2 WHEN '2連単' THEN 3 WHEN '2連複' THEN 4 ELSE 9 END, t.combination
+            ORDER BY CASE t.bet_type WHEN '3連単' THEN 1 WHEN '3連複' THEN 2 WHEN '2連単' THEN 3 WHEN '2連複' THEN 4 WHEN 'ワイド' THEN 5 WHEN '単勝' THEN 6 WHEN '複勝' THEN 7 ELSE 9 END, t.combination
         """, (race_key, plan["plan_hash"])).fetchall()
     evaluated = plan["return_rate"] is not None
     hit_tickets = [dict(t) for t in tickets if int(t["hit"] or 0) == 1]
@@ -8402,6 +8512,9 @@ def _v208_latest_mixed_plan_result(race_key: str, db_path: str) -> dict:
         "race_key": race_key,
         "plan_hash": plan["plan_hash"],
         "created_at": plan["created_at"],
+        "plan_origin": str(plan["plan_origin"] or "live") if "plan_origin" in plan.keys() else "live",
+        "source_prediction_version": str(plan["source_prediction_version"] or "") if "source_prediction_version" in plan.keys() else "",
+        "include_in_live_stats": bool(int(plan["include_in_live_stats"] if "include_in_live_stats" in plan.keys() and plan["include_in_live_stats"] is not None else 1)),
         "points": int(plan["points"] or len(tickets)),
         "cost_yen": cost,
         "payout_yen": payout,
@@ -8421,6 +8534,9 @@ def _v208_render_mixed_plan_result(result: dict) -> None:
     if not isinstance(result, dict) or not result.get("available"):
         st.info((result or {}).get("reason", "保存された回収率重視プランがありません。"))
         return
+    if str(result.get("plan_origin") or "live") == "restored_after_odds":
+        srcv = str(result.get("source_prediction_version") or "不明")
+        st.info(f"♻️ 復元・後付け評価プランです（復元元予測: {srcv}）。通常のリアルタイム回収率実績・学習には含めません。")
     if not result.get("evaluated"):
         st.warning("プランは保存されていますが、払戻金との照合がまだ完了していません。")
         return
@@ -8456,7 +8572,10 @@ def _v208_render_mixed_plan_result(result: dict) -> None:
         st.caption("複数券種が同時的中した場合は、100円購入時の払戻を合算しています。")
     else:
         st.caption("保存された推奨買い目に的中券はありませんでした。")
-    st.caption(f"予測時に保存された最新プラン（{int(result.get('points',0))}点）だけで判定しています。結果確認後の買い目差し替えは行いません。")
+    if str(result.get("plan_origin") or "live") == "restored_after_odds":
+        st.caption(f"復元予測へ後から入力したオッズで保存したプラン（{int(result.get('points',0))}点）を参考採点しています。リアルタイム実績には加算しません。")
+    else:
+        st.caption(f"予測時に保存された最新プラン（{int(result.get('points',0))}点）だけで判定しています。結果確認後の買い目差し替えは行いません。")
 
 
 def _v187_learning_profile(db_path: str) -> dict:
@@ -8465,15 +8584,22 @@ def _v187_learning_profile(db_path: str) -> dict:
     out = {"samples":0, "hit_rate":None, "black_rate":None, "gami_rate":None, "return_rate":None, "type_weights":{}}
     with sqlite3.connect(db_path) as con:
         row = con.execute("""
-            SELECT COUNT(*), AVG(hit)*100.0, AVG(black_hit)*100.0, AVG(gami_hit)*100.0, AVG(return_rate)
-            FROM v187_mixed_plan_feedback
+            SELECT COUNT(*), AVG(f.hit)*100.0, AVG(f.black_hit)*100.0, AVG(f.gami_hit)*100.0, AVG(f.return_rate)
+            FROM v187_mixed_plan_feedback f
+            JOIN v187_mixed_plan_runs r
+              ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+            WHERE COALESCE(r.include_in_live_stats,1)=1
         """).fetchone()
         if row and int(row[0] or 0)>0:
             out.update(samples=int(row[0]), hit_rate=float(row[1] or 0), black_rate=float(row[2] or 0),
                        gami_rate=float(row[3] or 0), return_rate=float(row[4] or 0))
         rows = con.execute("""
-            SELECT bet_type, COUNT(*) n, AVG(hit)*100.0 hit_rate, AVG(payout_yen) avg_payout
-            FROM v187_mixed_ticket_feedback GROUP BY bet_type
+            SELECT tf.bet_type, COUNT(*) n, AVG(tf.hit)*100.0 hit_rate, AVG(tf.payout_yen) avg_payout
+            FROM v187_mixed_ticket_feedback tf
+            JOIN v187_mixed_plan_runs r
+              ON r.race_key=tf.race_key AND r.plan_hash=tf.plan_hash
+            WHERE COALESCE(r.include_in_live_stats,1)=1
+            GROUP BY tf.bet_type
         """).fetchall()
         for bet_type,n,hit_rate,avg_payout in rows:
             # 少数データは1.0へ縮小。実績が増えるほど0.80～1.20の範囲で効かせる。
@@ -8507,15 +8633,27 @@ def _v215_race_meta_from_key(race_key: str, db_path: str) -> dict:
     return out
 
 
-def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict, app_version: str | None = None) -> str:
-    """回収率重視プランを、予測時点の買い目・オッズ・確率・版情報ごと完全保存する。"""
+def _v187_save_mixed_plan(
+    db_path: str, race_key: str, result: dict, app_version: str | None = None,
+    plan_origin: str = "live", source_prediction_version: str | None = None,
+    include_in_live_stats: bool = True,
+) -> str:
+    """回収率重視プランを買い目・オッズ・確率・版情報・生成経路ごと完全保存する。
+
+    Ver279: 復元表示に保存オッズを適用して作るプランも、現在版の正式プランとして保存する。
+    復元元の予測版は source_prediction_version に保持し、現在版の回収率実績・学習へ含める。
+    """
     source_version = str(app_version or _V231_APP_VERSION or "Unknown").strip() or "Unknown"
+    origin = str(plan_origin or "live").strip() or "live"
+    src_pred_ver = str(source_prediction_version or source_version or "Unknown").strip() or "Unknown"
+    live_flag = 1 if bool(include_in_live_stats) else 0
     _v187_ensure_mixed_learning_tables(db_path)
-    # Ver247管理修正: 同じ買い目でもアプリ版が違えば別プランとして保存する。
-    # これにより、旧版の回収率記録を新版の保存で上書きしない。
     payload = {
         "app_version": source_version,
-        "logic_version": "return_plan_v234",
+        "logic_version": "return_plan_v279_7types_trial",
+        "plan_origin": origin,
+        "source_prediction_version": src_pred_ver,
+        "include_in_live_stats": live_flag,
         "tickets": [
             (t.get("type"), t.get("combo"), round(float(t.get("odds", 0)), 3), round(float(t.get("probability", 0)), 5))
             for t in result.get("tickets", [])
@@ -8534,16 +8672,17 @@ def _v187_save_mixed_plan(db_path: str, race_key: str, result: dict, app_version
             INSERT OR IGNORE INTO v187_mixed_plan_runs
             (race_key,plan_hash,points,cost_yen,grade,cover,black,low,hit_average_multiple,
              model_expected_multiple,model_return_rate,role_count,created_at,
-             app_version,logic_version,race_date,venue,race_no,starter_count)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             app_version,logic_version,race_date,venue,race_no,starter_count,
+             plan_origin,source_prediction_version,include_in_live_stats)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             str(race_key), plan_hash, int(result.get("points", 0)), int(result.get("cost", 0)), result.get("grade"),
             float(result.get("cover", 0)), float(result.get("black", 0)), float(result.get("low", 0)),
             float(result.get("hit_average_multiple", 0)), float(result.get("model_expected_multiple", 0)),
             float(result.get("model_return_rate", 0)), len(result.get("grouped", {})), now,
-            source_version, "return_plan_v234", meta.get("race_date"), meta.get("venue"), meta.get("race_no"), starter_count,
+            source_version, "return_plan_v279_7types_trial", meta.get("race_date"), meta.get("venue"), meta.get("race_no"), starter_count,
+            origin, src_pred_ver, live_flag,
         ))
-        # 初回保存時だけ買い目を登録する。既存の同版スナップショットも変更しない。
         if int(cur.rowcount or 0) > 0:
             for t in result.get("tickets", []):
                 con.execute("""
@@ -8571,6 +8710,7 @@ def _v195_return_calibration(db_path: str) -> dict:
                 FROM v187_mixed_plan_feedback f
                 JOIN v187_mixed_plan_runs r
                   ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+                WHERE COALESCE(r.include_in_live_stats,1)=1
             """).fetchone()
         n, payout, cost, model_payout = row if row else (0,0,0,0)
         n=int(n or 0); payout=float(payout or 0); cost=float(cost or 0); model_payout=float(model_payout or 0)
@@ -9955,6 +10095,9 @@ def v205_ticket_display_name(ticket_type: str) -> str:
         "三連複": "3連複",
         "2連単": "2連単",
         "2連複": "2連複",
+        "ワイド": "ワイド",
+        "単勝": "単勝",
+        "複勝": "複勝",
     }.get(str(ticket_type), str(ticket_type))
 
 
@@ -9963,21 +10106,24 @@ def v207_build_mixed_formation_sections(result: dict):
     """回収率重視の最終買い目を、画面最上段で使えるコピー形式へ整形する。"""
     sections = []
     notes = []
-    for ticket_type in ("三連単", "三連複", "2連単", "2連複"):
+    for ticket_type in ("三連単", "三連複", "2連単", "2連複", "ワイド", "単勝", "複勝"):
         rows = result.get("grouped", {}).get(ticket_type, []) or []
         combos = [str(r.get("combo", "")).strip() for r in rows if str(r.get("combo", "")).strip()]
         if not combos:
             continue
-        try:
-            formations = engine.v67_compress_formations(combos, ticket_type)
-            if ticket_type == "三連単":
-                formations = v203_standard_trifecta_formations(formations, combos)
-        except Exception as exc:
-            formations = []
-            notes.append(f"{v205_ticket_display_name(ticket_type)}: フォーメーション変換に失敗したため個別表記を使用（{exc}）")
-        if not formations:
+        if ticket_type in ("ワイド", "単勝", "複勝"):
             formations = combos
-            notes.append(f"{v205_ticket_display_name(ticket_type)}: 圧縮できない組み合わせは個別表記のまま出力")
+        else:
+            try:
+                formations = engine.v67_compress_formations(combos, ticket_type)
+                if ticket_type == "三連単":
+                    formations = v203_standard_trifecta_formations(formations, combos)
+            except Exception as exc:
+                formations = []
+                notes.append(f"{v205_ticket_display_name(ticket_type)}: フォーメーション変換に失敗したため個別表記を使用（{exc}）")
+            if not formations:
+                formations = combos
+                notes.append(f"{v205_ticket_display_name(ticket_type)}: 圧縮できない組み合わせは個別表記のまま出力")
         sections.append(
             f"{v205_ticket_display_name(ticket_type)} {len(combos)}点\n" + "\n".join(str(x) for x in formations)
         )
@@ -10041,23 +10187,161 @@ def v244_optional_single_wide_candidates(bets: dict, trials: int, odds_maps: dic
     # 同券種が並びすぎないよう最大3点。
     return rows[:3]
 
+def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_maps: dict) -> dict:
+    """Ver279: 単勝・複勝・ワイドを回収率重視プランへ暫定統合する。
+
+    既存4券種の最適化結果を土台に、追加3券種は厳しめのEV条件を通過し、
+    100円均等買いで合成モデル回収率を実際に改善する場合だけ最大2点追加する。
+    予測確率そのものは変更しない。
+    """
+    if not isinstance(result, dict) or not result.get("available"):
+        return result
+    tri_counter = (bets or {}).get("三連単", {}) or {}
+    if not tri_counter or int(trials or 0) <= 0:
+        return result
+    optional = v244_optional_single_wide_candidates(bets, trials, odds_maps)
+    if not optional:
+        result["provisional_7type_candidates"] = []
+        result["provisional_7type_added"] = []
+        return result
+
+    outcomes = []
+    total_trials = max(int(trials), 1)
+    for combo, count in tri_counter.items():
+        try:
+            vals = tuple(int(v) for v in (tuple(combo) if isinstance(combo, (tuple, list)) else (combo,)))
+        except Exception:
+            continue
+        if len(vals) == 3:
+            outcomes.append((vals, float(count) / total_trials * 100.0))
+    if not outcomes:
+        return result
+
+    def _nums(combo):
+        return tuple(int(x) for x in re.findall(r"\d+", str(combo)))
+
+    def _match(ticket, outcome):
+        a, b, c = outcome
+        typ = str(ticket.get("type") or "")
+        nums = _nums(ticket.get("combo", ""))
+        if typ in ("三連単", "3連単"):
+            return nums == (a, b, c)
+        if typ in ("三連複", "3連複"):
+            return tuple(sorted(nums)) == tuple(sorted((a, b, c)))
+        if typ in ("2連単", "二連単"):
+            return nums == (a, b)
+        if typ in ("2連複", "二連複"):
+            return tuple(sorted(nums)) == tuple(sorted((a, b)))
+        if typ == "単勝":
+            return len(nums) == 1 and nums[0] == a
+        if typ == "複勝":
+            return len(nums) == 1 and nums[0] in (a, b)
+        if typ == "ワイド":
+            return len(nums) == 2 and set(nums).issubset({a, b, c})
+        return False
+
+    def _evaluate(plan):
+        cost = len(plan) * 100.0
+        cover = black = low = expected = 0.0
+        hit_rows = []
+        for outcome, prob in outcomes:
+            payout = 0.0
+            for t in plan:
+                if _match(t, outcome):
+                    payout += float(t.get("odds", 0.0) or 0.0) * 100.0
+            if payout > 0:
+                cover += prob
+                expected += prob / 100.0 * payout
+                hit_rows.append((payout, prob))
+                if payout >= cost:
+                    black += prob
+                else:
+                    low += prob
+        if hit_rows and cost > 0 and cover > 0:
+            avg_payout = expected / (cover / 100.0)
+            avg_multiple = avg_payout / cost
+            min_multiple = min(p / cost for p, _ in hit_rows)
+            max_multiple = max(p / cost for p, _ in hit_rows)
+        else:
+            avg_payout = avg_multiple = min_multiple = max_multiple = 0.0
+        expected_multiple = expected / cost if cost else 0.0
+        return {
+            "points": len(plan), "cost": cost, "cover": cover, "black": black, "low": low,
+            "miss": max(0.0, 100.0-cover), "expected_return": expected,
+            "model_return_rate": expected_multiple*100.0, "model_expected_multiple": expected_multiple,
+            "hit_average_payout": avg_payout, "hit_average_multiple": avg_multiple,
+            "hit_min_multiple": min_multiple, "hit_max_multiple": max_multiple,
+            "black_share_of_hits": (black/cover*100.0 if cover>0 else 0.0),
+            "gami_share_of_hits": (low/cover*100.0 if cover>0 else 0.0),
+        }
+
+    plan = [dict(t) for t in (result.get("tickets", []) or [])]
+    before = _evaluate(plan)
+    added = []
+    used_types = set()
+    for cand in optional:
+        if len(added) >= 2:
+            break
+        typ = str(cand.get("type") or "")
+        if typ in used_types:
+            continue
+        ticket = dict(cand)
+        ticket["role"] = "暫定7券種・高EV補助"
+        after = _evaluate(plan + [ticket])
+        # 追加コスト込みで回収率が改善し、黒字的中率を大きく壊さない候補だけ採用。
+        if (after["model_return_rate"] >= before["model_return_rate"] + 0.50
+                and after["black"] >= before["black"] - 0.20):
+            plan.append(ticket)
+            added.append(ticket)
+            used_types.add(typ)
+            before = after
+
+    result["provisional_7type_candidates"] = optional
+    result["provisional_7type_added"] = added
+    if not added:
+        return result
+
+    metrics = _evaluate(plan)
+    result["tickets"] = plan
+    grouped = {}
+    for t in plan:
+        grouped.setdefault(t.get("type"), []).append(t)
+    result["grouped"] = grouped
+    result.update(metrics)
+    cal = result.get("return_calibration", {}) or {}
+    factor = float(cal.get("factor", 1.0) or 1.0)
+    result["adjusted_return_rate"] = float(metrics["model_return_rate"]) * factor
+    role_lines = []
+    for typ in ("三連単", "三連複", "2連単", "2連複", "ワイド", "単勝", "複勝"):
+        rows = grouped.get(typ, []) or []
+        if rows:
+            role_lines.append(f"{v205_ticket_display_name(typ)}{len(rows)}点：{rows[0].get('role','')}")
+    result["role_lines"] = role_lines
+    return result
+
 def show_v184_eight_car_mixed_plan(
     bets: dict, trials: int, meta: dict, odds_maps: dict, race_key: str = "",
     app_version: str | None = None, save_enabled: bool = True,
+    plan_origin: str = "live", source_prediction_version: str | None = None,
+    include_in_live_stats: bool = True,
 ) -> None:
     result = v184_eight_car_mixed_plan(bets, trials, meta, odds_maps)
+    result = v277_provisional_merge_7types(result, bets, trials, odds_maps)
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH) or 0
     st.markdown(f"#### 🧩 {int(starter_count)}車向け・黒字的中重視の回収率合成")
     if not result.get("available"):
-        st.caption(result.get("reason", "4券種オッズを読み込むと表示します。"))
+        st.caption(result.get("reason", "オッズを読み込むと表示します。"))
         return
     saved_hash = ""
     try:
-        # 復元表示では回収率プランを新規保存しない。
-        # 保存済み予測の版を現行版として誤登録する事故を防ぐ。
+        # Ver279: 復元表示でも後から入力したオッズのプランを保存する。
+        # ただし plan_origin / include_in_live_stats でリアルタイム実績とは分離する。
         if save_enabled and race_key and str(race_key) != "current":
             saved_hash = _v187_save_mixed_plan(
-                engine.DB_PATH, str(race_key), result, app_version=app_version
+                engine.DB_PATH, str(race_key), result, app_version=app_version,
+                plan_origin=plan_origin,
+                source_prediction_version=source_prediction_version,
+                include_in_live_stats=include_in_live_stats,
             )
     except Exception as exc:
         st.warning(f"合成プランをDBへ保存できませんでした: {exc}")
@@ -10077,6 +10361,16 @@ def show_v184_eight_car_mixed_plan(
             )
     formation_sections, formation_notes = v207_build_mixed_formation_sections(result)
     st.subheader(f"{result['icon']} 回収率重視：{result['points']}点・{result['grade']}")
+    _v277_added = result.get("provisional_7type_added", []) or []
+    _v277_candidates = result.get("provisional_7type_candidates", []) or []
+    if _v277_added:
+        _txt = " / ".join(f"{x.get('type')} {x.get('combo')}（EV{float(x.get('ev',0)):.1f}%）" for x in _v277_added)
+        st.success(f"🧪 Ver279暫定7券種：追加採用 {_txt}")
+        st.caption("単勝・複勝・ワイドは、追加100円込みで合成モデル回収率が改善し、黒字的中率を大きく悪化させない場合だけ最大2点採用します。")
+    elif _v277_candidates:
+        st.caption("🧪 Ver279暫定7券種：単勝・複勝・ワイド候補はありましたが、追加コスト込みで回収率が改善しないため本線へは追加しませんでした。")
+    else:
+        st.caption("🧪 Ver279暫定7券種：単勝・複勝・ワイドは条件未達またはオッズ未入力のため追加なし。")
     if formation_sections:
         formation_copy_text = "\n\n".join(formation_sections)
         v73_copy_box(
@@ -10202,7 +10496,7 @@ def show_v184_eight_car_mixed_plan(
         st.info(result["reason"])
     st.caption(" / ".join(result.get("role_lines", [])))
     st.markdown("##### 買い目ごとの詳細")
-    order = ("三連単", "三連複", "2連単", "2連複")
+    order = ("三連単", "三連複", "2連単", "2連複", "ワイド", "単勝", "複勝")
     for ticket_type in order:
         rows = result["grouped"].get(ticket_type, [])
         if not rows:
@@ -10388,6 +10682,7 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                        ORDER BY datetime(r.created_at) DESC, r.rowid DESC
                    ) AS rn
             FROM v187_mixed_plan_runs r
+            WHERE COALESCE(r.include_in_live_stats,1)=1
         )
         SELECT l.race_key,
                COALESCE(NULLIF(l.race_date,''), rr.race_date) AS race_date,
@@ -11295,8 +11590,8 @@ elif selected_main_page == "🏁 予測":
                 f"保存済みオッズも下で自動復元されます。{result_note}"
             )
             st.info(
-                f"復元しただけでは新しい実績は登録しません。下の『▶ 復元内容を{_V231_APP_VERSION}で再シミュレーション』を押すと、"
-                f"同じレースを現在コードで再計算し、{_V231_APP_VERSION}の別履歴として保存します。"
+                f"復元しただけでは予測履歴は増やしません。復元後にオッズを入力した場合は、回収率重視プランを{_V231_APP_VERSION}の正式プランとして保存します。"
+                f"予測本体も現在版へ更新したい場合は、下の『▶ 復元内容を{_V231_APP_VERSION}で再シミュレーション』を押すと、同じレースを現在コードで再計算して別履歴として保存します。"
             )
         restored_result = st.session_state.get("v232_restored_result_view")
         if isinstance(restored_result, dict) and restored_result:
@@ -11653,13 +11948,21 @@ elif selected_main_page == "🏁 予測":
             st.markdown('<div id="return-priority-plan"></div>', unsafe_allow_html=True)
             st.markdown("## ⭐ 最優先・回収率重視の推奨買い目")
             st.caption("オッズ読込後、監査・確率表・展開表などの詳細表示より先に計算して表示します。")
+            _restored_plan_mode = bool(view.get("_v231_restored_only", False))
+            _restored_source_ver = str(view.get("app_version") or view.get("_v231_source_app_version") or "Unknown")
             show_v184_eight_car_mixed_plan(
                 bets, view_trials, meta, fast_odds_maps, race_key=race_key,
-                app_version=str(view.get("app_version") or view.get("_v231_source_app_version") or "Unknown"),
-                save_enabled=not bool(view.get("_v231_restored_only", False)),
+                app_version=str(_V231_APP_VERSION),
+                save_enabled=True,
+                plan_origin=("current_version_restore" if _restored_plan_mode else "live"),
+                source_prediction_version=_restored_source_ver,
+                include_in_live_stats=True,
             )
-            if bool(view.get("_v231_restored_only", False)):
-                st.caption("復元表示中のため、回収率実績へ新しいプランは保存していません。再解析した場合だけ現行版として保存します。")
+            if _restored_plan_mode:
+                st.caption(
+                    f"♻️ 復元した予測に現在の保存オッズを適用し、{_V231_APP_VERSION}の回収率重視プランとして正式保存しました。"
+                    f"復元元の予測版（{_restored_source_ver}）は参照情報として保持します。"
+                )
             st.divider()
             st.markdown("### 詳細予測・診断")
             if day_trend:
@@ -12377,6 +12680,11 @@ if selected_main_page == "✅ 結果登録・解析":
                     # Ver255管理修正: 予測時に保存済みのプランだけを、結果登録後に払戻と照合する。
                     # 復元表示だけでは新規保存せず、結果登録時点で元バージョンのまま回収率へ反映する。
                     _v187_sync_mixed_feedback(engine.DB_PATH)
+                    # Ver279: 反妨・反則妨害・落車・周誤などは学習除外を維持しつつ、
+                    # 選手別事故履歴へ種類別に保存する。予測補正にはまだ使わない。
+                    incident_saved_count = _v279_save_player_incident_history(
+                        engine.DB_PATH, key, meta_r, rows_r, poststart_incidents
+                    )
                     mixed_plan_result = _v208_latest_mixed_plan_result(key, engine.DB_PATH)
                 if registration.get("duplicate"):
                     duplicate_message = analysis.get("message", "このレースは登録済みです。")
@@ -12389,6 +12697,11 @@ if selected_main_page == "✅ 結果登録・解析":
                         result_message = f"結果を登録しました: {key}"
                     _set_sticky_notice("result_register_notice", "success", result_message)
                     st.success(result_message)
+                    if int(locals().get("incident_saved_count", 0) or 0) > 0:
+                        st.caption(
+                            f"🧾 発走後事故・反則を{int(incident_saved_count)}件、選手別事故履歴へ種類別保存しました。"
+                            "予測学習からの除外は従来どおりで、現時点では予測補正には使用しません。"
+                        )
                     if isinstance(mixed_plan_result, dict) and mixed_plan_result.get("available"):
                         if mixed_plan_result.get("evaluated"):
                             st.success(
@@ -13470,7 +13783,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                         st.caption("DBに実際に保存された周回予測だけを、同じ実測グランドノートで比較します。旧版を現在コードで再現したふりはせず、補正値の自動書換えも行いません。")
 
 
-                        with st.expander("🧪 Ver276 終盤再加速・詳細経路ログ", expanded=False):
+                        with st.expander("🧪 Ver277 終盤再加速・詳細経路ログ", expanded=False):
                             st.caption(
                                 "保存済み予測DataFrameではなく、シミュレーション直後にmetaへ保存した監査辞書を直接表示します。"
                                 "これで列の欠落・上書きの影響を受けません。"
