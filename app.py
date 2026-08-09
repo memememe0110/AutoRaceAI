@@ -49,6 +49,7 @@ _V284_UPLOAD_MASTER_PIN_PATCH = "2026-08-09-v1"
 _V284_GITHUB_READBACK_VERIFY_PATCH = "2026-08-09-v1"
 _V284_GITHUB_RAW_READBACK_PATCH = "2026-08-09-v1"
 _V284_GITHUB_RAW_TOKEN_FIX = "2026-08-09-v1"
+_V284_GITHUB_RELOAD_UNIFIED_VERIFY = "2026-08-09-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -12619,36 +12620,104 @@ def _v282_push_chunked_db(
 
 
 def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
-    """分割保存されたDBがあれば復元する。manifest無しなら従来方式へ戻す。"""
+    """Ver284: 保存時と同じ3段取得で分割DBを復元し、part単位+全体を厳密検証する。"""
     cfg = github_config()
     repo_api = f"https://api.github.com/repos/{cfg['repo']}/contents/"
     mp = _v282_chunk_manifest_path()
     read_branch = _v282_db_read_branch()
-    url = repo_api + urllib.parse.quote(mp, safe="/") + "?ref=" + urllib.parse.quote(read_branch)
-    status, body = github_request(url)
-    if status == 404:
-        return False, None, "manifestなし"
-    if status != 200:
-        return False, None, f"分割DB manifest取得失敗: {body.get('message', status)}"
-    try:
-        manifest = json.loads(base64.b64decode(body["content"].replace("\n", "")).decode("utf-8"))
-        data_parts = []
-        for idx, cp in enumerate(manifest.get("parts") or []):
-            u = repo_api + urllib.parse.quote(cp, safe="/") + "?ref=" + urllib.parse.quote(read_branch)
-            s, b = github_request(u)
-            if s != 200:
-                return False, None, f"分割DB part {idx+1}取得失敗: {b.get('message', s)}"
-            data_parts.append(base64.b64decode(b["content"].replace("\n", "")))
-        data = b"".join(data_parts)
-        import hashlib
-        if len(data) != int(manifest.get("size", -1)):
-            return False, None, "分割DBのサイズ検証に失敗しました。"
-        if hashlib.sha256(data).hexdigest() != str(manifest.get("sha256", "")):
-            return False, None, "分割DBのSHA256検証に失敗しました。"
-        return True, data, "ok"
-    except Exception as exc:
-        return False, None, f"分割DB復元エラー: {type(exc).__name__}: {exc}"
 
+    def _fetch284(path284: str) -> tuple[bool, bytes | None, str]:
+        enc284=urllib.parse.quote(path284,safe="/")
+        url284=repo_api+enc284+"?ref="+urllib.parse.quote(read_branch)
+        status284,obj284=github_request(url284)
+        if status284 != 200 or not isinstance(obj284,dict):
+            msg284=obj284.get("message",status284) if isinstance(obj284,dict) else status284
+            return False,None,f"Contents API: {msg284}"
+
+        content284=obj284.get("content")
+        if content284:
+            try:
+                return True,base64.b64decode(str(content284).replace("\n","")),"contents-base64"
+            except Exception:
+                pass
+
+        dl284=obj284.get("download_url")
+        if dl284:
+            try:
+                headers284={"Accept":"application/octet-stream","User-Agent":"AutoRaceAI"}
+                if cfg.get("token"):
+                    headers284["Authorization"]=f"Bearer {cfg.get('token')}"
+                req284=urllib.request.Request(str(dl284),headers=headers284)
+                with urllib.request.urlopen(req284,timeout=45) as resp284:
+                    return True,resp284.read(),"download_url"
+            except Exception:
+                pass
+
+        try:
+            headers284={"Accept":"application/vnd.github.raw+json","User-Agent":"AutoRaceAI"}
+            if cfg.get("token"):
+                headers284["Authorization"]=f"Bearer {cfg.get('token')}"
+            req284=urllib.request.Request(url284,headers=headers284)
+            with urllib.request.urlopen(req284,timeout=45) as resp284:
+                return True,resp284.read(),"github-raw"
+        except Exception as exc284:
+            return False,None,f"raw {type(exc284).__name__}: {exc284}"
+
+    okm284,mbytes284,mmethod284=_fetch284(mp)
+    if not okm284 or mbytes284 is None:
+        # 旧挙動との互換: manifestそのものが無い場合だけ従来方式へフォールバック可能にする。
+        urlm284=repo_api+urllib.parse.quote(mp,safe="/")+"?ref="+urllib.parse.quote(read_branch)
+        sm284,bm284=github_request(urlm284)
+        if sm284==404:
+            return False,None,"manifestなし"
+        return False,None,f"分割DB manifest取得失敗: {mmethod284}"
+
+    try:
+        manifest=json.loads(mbytes284.decode("utf-8"))
+    except Exception as exc284:
+        return False,None,f"分割DB manifest解析失敗: {type(exc284).__name__}: {exc284}"
+
+    parts284=list(manifest.get("parts") or [])
+    sizes284=list(manifest.get("part_sizes") or [])
+    shas284=list(manifest.get("part_sha256") or [])
+    data_parts284=[]
+
+    for idx284,cp284 in enumerate(parts284):
+        ok284,pdata284,method284=_fetch284(str(cp284))
+        if not ok284 or pdata284 is None:
+            return False,None,f"分割DB part {idx284+1}/{len(parts284)}取得失敗: {method284}"
+
+        if idx284 < len(sizes284):
+            try:
+                if len(pdata284) != int(sizes284[idx284]):
+                    return False,None,(
+                        f"分割DB part {idx284+1}/{len(parts284)}サイズ検証失敗 "
+                        f"({method284}: {len(pdata284)} != {int(sizes284[idx284])})"
+                    )
+            except Exception as exc284:
+                return False,None,f"分割DB partサイズ情報不正: {type(exc284).__name__}: {exc284}"
+
+        if idx284 < len(shas284) and str(shas284[idx284]):
+            if hashlib.sha256(pdata284).hexdigest() != str(shas284[idx284]):
+                return False,None,f"分割DB part {idx284+1}/{len(parts284)} SHA256検証失敗 ({method284})"
+
+        data_parts284.append(pdata284)
+
+    data284=b"".join(data_parts284)
+    try:
+        expected_size284=int(manifest.get("size",-1))
+    except Exception:
+        expected_size284=-1
+    if len(data284) != expected_size284:
+        return False,None,f"分割DB全体サイズ検証失敗 ({len(data284)} != {expected_size284})"
+    if hashlib.sha256(data284).hexdigest() != str(manifest.get("sha256","")):
+        return False,None,"分割DB全体SHA256検証失敗"
+
+    fp284=_v283_db_fingerprint_bytes(data284)
+    if not fp284.get("ok"):
+        return False,None,"分割DBのSQLite整合性検証に失敗しました。"
+
+    return True,data284,"全part読み戻し・SHA256・SQLite整合性検証済み"
 
 def pull_db_from_github() -> tuple[bool, str]:
     try:
