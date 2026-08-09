@@ -2358,6 +2358,233 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
     return {"ok":True,"job_id":job_id}
 
 
+
+# Ver279: 通常1R予測をStreamlit描画スレッドから分離してバックグラウンド実行する。
+# 計算式・seed・試行回数・6周展開は通常予測と同一。画面操作だけを解放する。
+_V279_BG_PRED_THREADS = globals().get("_V279_BG_PRED_THREADS", {})
+_V279_BG_PRED_LOCK = globals().get("_V279_BG_PRED_LOCK", threading.Lock())
+
+
+def _v279_bg_prediction_get_latest(db_path: str) -> dict:
+    try:
+        _v278_bg_ensure_table(db_path)
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.row_factory=sqlite3.Row
+            con.execute("PRAGMA busy_timeout=30000")
+            row=con.execute("""
+                SELECT * FROM v278_background_jobs
+                WHERE job_type='normal_prediction'
+                ORDER BY job_id DESC LIMIT 1
+            """).fetchone()
+        if not row:
+            return {}
+        d=dict(row)
+        blob=d.get("result_blob")
+        if blob:
+            try:
+                d["result"]=pickle.loads(zlib.decompress(bytes(blob)))
+            except Exception:
+                d["result"]={}
+        else:
+            d["result"]={}
+        return d
+    except Exception:
+        return {}
+
+
+def _v279_bg_prediction_any_active(db_path: str) -> bool:
+    try:
+        _v278_bg_ensure_table(db_path)
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            row=con.execute("""
+                SELECT COUNT(*) FROM v278_background_jobs
+                WHERE job_type IN ('normal_prediction','batch_rerun')
+                  AND status IN ('queued','running','pause_requested','paused','cancel_requested')
+            """).fetchone()
+        return bool(int(row[0] or 0))
+    except Exception:
+        return False
+
+
+def _v279_send_bg_prediction_complete_notification(result: dict) -> None:
+    try:
+        topic=str(os.environ.get("AUTORACE_NTFY_TOPIC", "notify") or "notify").strip()
+        if not topic or any(ch in topic for ch in "/?# "):
+            return
+        label=str((result or {}).get("race_label") or (result or {}).get("race_key") or "1R予測")
+        payload={
+            "topic":topic,
+            "title":"AutoRaceAI 予測完了",
+            "message":f"{label} のバックグラウンド予測が完了しました。",
+            "priority":4,
+            "tags":["checkered_flag"],
+        }
+        request=urllib.request.Request(
+            "https://ntfy.sh",
+            data=json.dumps(payload,ensure_ascii=False).encode("utf-8",errors="strict"),
+            method="POST",
+            headers={"Content-Type":"application/json; charset=utf-8"},
+        )
+        with urllib.request.urlopen(request,timeout=8) as response:
+            response.read()
+    except Exception:
+        pass
+
+
+def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) -> None:
+    try:
+        _v278_bg_update(
+            db_path,job_id,status="running",started_at=_v228_now_jst_iso(),
+            done_count=0,total_count=4,current_label="基礎予測",message="基礎予測を実行しています。"
+        )
+        raw_text=str(request_data.get("raw_text") or "")
+        venue_override=str(request_data.get("venue_override") or "")
+        trials=int(request_data.get("trials") or 20000)
+        seed=int(request_data.get("seed") or 42)
+        excluded=[int(x) for x in (request_data.get("excluded") or [])]
+        prediction_text=raw_text
+        if venue_override:
+            prediction_text=f"開催場: {venue_override}\n"+raw_text
+
+        timing={}
+        _v276_foreground_prediction_event.set()
+        with _V276ForegroundPredictionPriority(db_path):
+            _t0=time_module.perf_counter()
+            df,bets,output,entries,meta=engine.ver16_run_prediction(
+                prediction_text,trials,seed,manual_excluded=excluded
+            )
+            entries=_v276_mark_retrial_from_prediction_text(entries,prediction_text)
+            df=_v276_copy_retrial_to_prediction_df(df,entries)
+            _t_base=time_module.perf_counter()
+            _v278_bg_update(db_path,job_id,done_count=1,current_label="6周展開",message="6周展開を計算しています。")
+
+            meta=dict(meta or {})
+            df,bets,wall_audit=_v230_six_lap_simulation(df,bets,entries,meta,trials,seed)
+            meta["壁補正監査"]=wall_audit
+            meta["6周展開シミュレーション"]=wall_audit
+            _t1=time_module.perf_counter()
+            _v278_bg_update(db_path,job_id,done_count=2,current_label="確率集計",message="着順・券種別確率を集計しています。")
+
+            finish_prob=engine.v30_finish_probabilities(df,bets,trials)
+            _v273_audit_keep={c:df[c].copy() for c in df.columns if str(c).startswith("Ver273_")}
+            df=engine.v196_apply_probability_aligned_ranks(df,finish_prob)
+            for _c273,_s273 in _v273_audit_keep.items():
+                try:
+                    if len(_s273)==len(df):
+                        df[_c273]=list(_s273)
+                except Exception:
+                    pass
+            _t2=time_module.perf_counter()
+
+        _v276_foreground_prediction_event.clear()
+        _v278_bg_update(db_path,job_id,done_count=3,current_label="保存",message="予測履歴を保存しています。")
+        _t_save0=time_module.perf_counter()
+        race_key=engine.v34_save_prediction_snapshot(meta,df,finish_prob,engine.DB_PATH)
+        _t_save1=time_module.perf_counter()
+        _v217_deferred_prediction_db_save(meta,bets,trials,df)
+        timing={
+            "base_prediction":_t_base-_t0,
+            "six_lap":_t1-_t_base,
+            "six_lap_prepare":float((wall_audit or {}).get("prepare_seconds",0.0) or 0.0),
+            "six_lap_simulation":float((wall_audit or {}).get("simulation_seconds",0.0) or 0.0),
+            "simulation":_t1-_t0,
+            "aggregation":_t2-_t1,
+            "db_save":_t_save1-_t_save0,
+            "deferred_db_save":True,
+            "total":_t_save1-_t0,
+        }
+        prediction_view={
+            "df":df,"bets":bets,"output":output,"entries":entries,"meta":meta,
+            "finish_prob":finish_prob,"race_key":race_key,"trials":trials,"excluded":excluded,
+            "learning_boundary":{},"future_audit":{},"day_trend":{},"prediction_timing":timing,
+            "app_version":_V231_APP_VERSION,"simulation_mode":_V231_SIMULATION_MODE,
+            "settings_hash":_v231_settings_hash(trials,seed,excluded),
+            "prediction_time":_v228_now_jst_iso(),"seed":seed,
+            "rerun_from_restored":False,"rerun_source_version":"","rerun_source_history_id":0,
+            "background_prediction":True,
+        }
+        history_id=_v231_save_prediction_history(
+            db_path,race_key,raw_text,venue_override,prediction_view,trials,seed
+        )
+        _v222_save_prediction_restore(db_path,race_key,raw_text,venue_override,prediction_view)
+        try:
+            meta0=prediction_view.get("meta") or {}
+            label=_v222_race_label(meta0,race_key)
+        except Exception:
+            label=str(race_key)
+        result={
+            "history_id":int(history_id or 0),"race_key":str(race_key),"race_label":str(label),
+            "app_version":str(_V231_APP_VERSION),"timing":timing,
+        }
+        blob=zlib.compress(pickle.dumps(result,protocol=pickle.HIGHEST_PROTOCOL),level=6)
+        _v278_bg_update(
+            db_path,job_id,status="completed",finished_at=_v228_now_jst_iso(),done_count=4,total_count=4,
+            current_label="",message=f"予測完了：{label}",result_blob=sqlite3.Binary(blob)
+        )
+        _v279_send_bg_prediction_complete_notification(result)
+    except Exception as exc:
+        _v276_foreground_prediction_event.clear()
+        _v278_bg_update(
+            db_path,job_id,status="failed",finished_at=_v228_now_jst_iso(),current_label="",
+            message="バックグラウンド予測でエラーが発生しました。",
+            error_text=f"{type(exc).__name__}: {exc}",
+        )
+    finally:
+        _v276_foreground_prediction_event.clear()
+        try:
+            with _V279_BG_PRED_LOCK:
+                _V279_BG_PRED_THREADS.pop(int(job_id),None)
+        except Exception:
+            pass
+
+
+def _v279_bg_prediction_start(
+    db_path: str, raw_text: str, venue_override: str, trials: int, seed: int, excluded: list[int]
+) -> dict:
+    _v278_bg_ensure_table(db_path)
+    if _v279_bg_prediction_any_active(db_path):
+        return {"ok":False,"reason":"別の予測または再シミュレーションが動いています。完了後に開始してください。"}
+    if not str(raw_text or "").strip():
+        return {"ok":False,"reason":"出走表が空です。"}
+    now=_v228_now_jst_iso()
+    with sqlite3.connect(str(db_path),timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        cur=con.execute("""
+            INSERT INTO v278_background_jobs(
+                job_type,app_version,status,created_at,updated_at,limit_count,force_current,
+                done_count,total_count,current_label,message
+            ) VALUES ('normal_prediction',?,?,?,?,?,?,?,?,?,?)
+        """,(
+            str(_V231_APP_VERSION),"queued",now,now,1,0,0,4,"準備中","バックグラウンド予測を開始します。"
+        ))
+        con.commit(); job_id=int(cur.lastrowid or 0)
+    request_data={
+        "raw_text":str(raw_text),"venue_override":str(venue_override or ""),"trials":int(trials),
+        "seed":int(seed),"excluded":[int(x) for x in (excluded or [])],
+    }
+    th=threading.Thread(
+        target=_v279_bg_prediction_worker,args=(str(db_path),job_id,request_data),daemon=True,
+        name=f"autorace-bg-prediction-{job_id}",
+    )
+    with _V279_BG_PRED_LOCK:
+        _V279_BG_PRED_THREADS[job_id]=th
+    th.start()
+    return {"ok":True,"job_id":job_id}
+
+
+def _v279_bg_prediction_load_completed(db_path: str, job: dict) -> tuple[dict,str,str]:
+    try:
+        result=(job or {}).get("result") or {}
+        hid=int(result.get("history_id") or 0)
+        if not hid:
+            return {},"",""
+        view,raw_text,venue_override,_meta=_v231_load_prediction_history(db_path,hid)
+        return (view if isinstance(view,dict) else {}),str(raw_text or ""),str(venue_override or "")
+    except Exception:
+        return {},"",""
+
+
 def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None, pause_cb=None) -> dict:
     out={
         "checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[],
@@ -11847,6 +12074,36 @@ elif selected_main_page == "🏁 予測":
         else:
             st.caption("自動検出された欠車はありません。必要な車番だけ選択してください。")
 
+    # Ver279: 通常1R予測は、従来の前面実行に加えてバックグラウンド実行も選べる。
+    # バックグラウンド側はStreamlit描画やsession_stateを触らず、計算・DB保存だけを行う。
+    _v279_bg_job = _v279_bg_prediction_get_latest(engine.DB_PATH)
+    _v279_bg_status = str((_v279_bg_job or {}).get("status") or "")
+    _v279_bg_active = _v279_bg_status in ("queued","running","pause_requested","paused","cancel_requested")
+    if _v279_bg_active:
+        _bdone=int((_v279_bg_job or {}).get("done_count") or 0)
+        _btotal=int((_v279_bg_job or {}).get("total_count") or 4)
+        _blabel=str((_v279_bg_job or {}).get("current_label") or "予測中")
+        st.info(f"⏳ バックグラウンド予測を実行中：{_bdone}/{_btotal}｜{_blabel}。この画面を離れても処理は続きます。")
+        st.progress(min(1.0,max(0.0,float(_bdone)/float(_btotal or 1))),text=f"{_bdone}/{_btotal}｜{_blabel}")
+        if st.button("🔄 バックグラウンド予測の進捗を更新",use_container_width=True,key="v279_bg_pred_refresh"):
+            st.rerun()
+    elif _v279_bg_status == "completed":
+        _bres=(_v279_bg_job or {}).get("result") or {}
+        _bjobid=int((_v279_bg_job or {}).get("job_id") or 0)
+        if int(st.session_state.get("v279_bg_loaded_job_id",0) or 0) != _bjobid:
+            st.success(f"✅ バックグラウンド予測が完了しました：{str(_bres.get('race_label') or _bres.get('race_key') or '')}")
+            if st.button("📂 完了した予測を表示",type="primary",use_container_width=True,key=f"v279_bg_pred_load_{_bjobid}"):
+                _bview,_braw,_bvenue=_v279_bg_prediction_load_completed(engine.DB_PATH,_v279_bg_job)
+                if _bview:
+                    st.session_state["last_prediction_view"]=_bview
+                    st.session_state["v279_bg_loaded_job_id"]=_bjobid
+                    st.session_state.pop("v232_restored_result_view",None)
+                    st.rerun()
+                else:
+                    st.warning("完了した予測履歴を読み込めませんでした。")
+    elif _v279_bg_status == "failed":
+        st.warning("バックグラウンド予測に失敗しました："+str((_v279_bg_job or {}).get("error_text") or (_v279_bg_job or {}).get("message") or "不明"))
+
     # Ver261: 通常予測と、復元した入力を現在Verで再シミュレーションする操作を明確に分離。
     # Ver276 UI改善: ボタン押下直後に1回rerunして、実行中はボタン群を再描画しない。
     # iPhone/Streamlitで「同じボタンが上下に二重表示される」残像を防ぐ。
@@ -11864,18 +12121,43 @@ elif selected_main_page == "🏁 予測":
         st.caption(f"復元元: {_src_ver} → 再シミュレーション保存先: {_V231_APP_VERSION}")
         _b1, _b2 = st.columns(2)
         with _b1:
-            _normal_clicked = st.button("通常予測として実行", use_container_width=True, key="v261_normal_prediction")
+            _normal_clicked = st.button("通常予測として実行", use_container_width=True, key="v261_normal_prediction", disabled=bool(_v279_bg_active))
         with _b2:
             _rerun_clicked = st.button(
                 f"▶ 復元内容を{_V231_APP_VERSION}で再シミュレーション",
-                type="primary", use_container_width=True, key="v261_rerun_current_version"
+                type="primary", use_container_width=True, key="v261_rerun_current_version", disabled=bool(_v279_bg_active)
             )
         if _normal_clicked or _rerun_clicked:
             st.session_state["_v276_prediction_run_request"] = {"rerun_requested": bool(_rerun_clicked)}
             st.rerun()
     else:
-        _normal_clicked = st.button("解析して元版設定で予測", type="primary", use_container_width=True)
+        _fg_col,_bg_col=st.columns(2)
+        with _fg_col:
+            _normal_clicked = st.button(
+                "解析して元版設定で予測", type="primary", use_container_width=True,
+                disabled=bool(_v279_bg_active), key="v279_foreground_prediction"
+            )
+        with _bg_col:
+            _background_clicked = st.button(
+                "⏳ バックグラウンドで予測", use_container_width=True,
+                disabled=bool(_v279_bg_active), key="v279_background_prediction"
+            )
         st.session_state["v261_rerun_requested"] = False
+        if _background_clicked:
+            if not text.strip():
+                st.warning("出走表を貼り付けてください。")
+            elif not detected_prediction_venue and not prediction_venue_override:
+                st.warning("開催場を選択してください。")
+            else:
+                _bgstart=_v279_bg_prediction_start(
+                    engine.DB_PATH,text,prediction_venue_override,int(trials),int(seed),[int(x) for x in manual_excluded]
+                )
+                if _bgstart.get("ok"):
+                    st.session_state["v279_bg_loaded_job_id"]=0
+                    st.success(f"バックグラウンド予測を開始しました（ジョブID: {_bgstart.get('job_id')}）。他の画面へ移動できます。")
+                    st.rerun()
+                else:
+                    st.warning(str(_bgstart.get("reason") or "バックグラウンド予測を開始できませんでした。"))
         if _normal_clicked:
             st.session_state["_v276_prediction_run_request"] = {"rerun_requested": False}
             st.rerun()
