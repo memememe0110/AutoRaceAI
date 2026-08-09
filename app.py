@@ -41,7 +41,8 @@ SIMULATION_MODE = "6周内蔵型壁展開"
 _V231_APP_VERSION = "Ver284"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
-_V284_DB_GUARD_PATCH = "2026-08-09-v4-path-identity-lock"
+_V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
+_V284_TRANSITION_AUDIT_PATCH = "2026-08-09-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -5182,6 +5183,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     scenario_counts={}
     scenario_combo_counts={}
     route_counts={}
+    # Ver284 詳細監査。予測判定には一切使わず、再シミュレーション後の原因分析専用。
+    transition_audit={lap:{"attempts":0,"successes":0,"p_sum":0.0,
+                           "wall_attempts":0,"wall_successes":0,
+                           "momentum_attempts":0,"momentum_successes":0,
+                           "slowdown_attempts":0,"slowdown_successes":0,
+                           "top3_entries":0,"top3_exits":0} for lap in range(1,7)}
+    transition_pair_audit={}
+    top3_order_audit={}
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
     # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
@@ -5230,6 +5239,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         # ギリギリ横並びで抜かれた車の一時失速。次周以降へ減衰して残す。
         slowdown={c:0.0 for c in cars}
         for lap in range(1,7):
+            _prev_top3_audit=set(order[:3])
             # Ver250: 1周で何台も連続して抜く展開を抑える。
             # 速い車でも進路変更と立て直しが必要なため、周回内の追抜回数を保持する。
             lap_pass_count={c:0 for c in cars}
@@ -5337,7 +5347,26 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 catch_factor=max(0.10,1.0-min(0.78,gaps[i]*1.12))
                 catch_factor=min(1.15,catch_factor+0.10*max(0.0,speed_edge))
                 p*=catch_factor
+                _ta=transition_audit[lap]
+                _ta["attempts"]+=1; _ta["p_sum"]+=float(p)
+                _wall_audit=bool(wall>=2)
+                _mom_audit=bool(momentum.get(chaser,0.0)>0.02)
+                _slow_audit=bool(slowdown.get(front,0.0)>0.02)
+                if _wall_audit: _ta["wall_attempts"]+=1
+                if _mom_audit: _ta["momentum_attempts"]+=1
+                if _slow_audit: _ta["slowdown_attempts"]+=1
+                _pair_key=(int(lap),int(chaser),int(front))
+                _pa=transition_pair_audit.setdefault(_pair_key,{"attempts":0,"successes":0,"p_sum":0.0,
+                                                                 "wall_attempts":0,"momentum_attempts":0,"slowdown_attempts":0})
+                _pa["attempts"]+=1; _pa["p_sum"]+=float(p)
+                if _wall_audit: _pa["wall_attempts"]+=1
+                if _mom_audit: _pa["momentum_attempts"]+=1
+                if _slow_audit: _pa["slowdown_attempts"]+=1
                 if rng.random()<p:
+                    _ta["successes"]+=1; _pa["successes"]+=1
+                    if _wall_audit: _ta["wall_successes"]+=1
+                    if _mom_audit: _ta["momentum_successes"]+=1
+                    if _slow_audit: _ta["slowdown_successes"]+=1
                     order[i-1],order[i]=order[i],order[i-1]
                     gaps[i]=max(0.07,gaps[i]*0.45)
                     pass_events[chaser]+=1
@@ -5376,6 +5405,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 if j==1 and perf[cur]-perf[front]>0.35:
                     rel += 0.012*(1.0+0.15*lap)
                 gaps[j]=min(2.0,max(0.04,gaps[j]-rel))
+            _new_top3_audit=set(order[:3])
+            transition_audit[lap]["top3_entries"]+=len(_new_top3_audit-_prev_top3_audit)
+            transition_audit[lap]["top3_exits"]+=len(_prev_top3_audit-_new_top3_audit)
             lap_tuple=tuple(order)
             sim_lap_path.append(lap_tuple)
             lap_order_counts[lap][lap_tuple]=lap_order_counts[lap].get(lap_tuple,0)+1
@@ -5383,7 +5415,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         final_order_counts[final_tuple]=final_order_counts.get(final_tuple,0)+1
         for _pos284,_car284 in enumerate(order,start=1):
             finish_position_counts[_car284][_pos284]=finish_position_counts[_car284].get(_pos284,0)+1
-        combo=tuple(order[:3]); counts[combo]=counts.get(combo,0)+1
+        combo=tuple(order[:3])
+        top3_order_audit[combo]=top3_order_audit.get(combo,0)+1
+        counts[combo]=counts.get(combo,0)+1
         scenario_type=_v263_scenario_type_from_laps(sim_lap_path)
         scenario_counts[scenario_type]=scenario_counts.get(scenario_type,0)+1
         sc=scenario_combo_counts.setdefault(scenario_type,{})
@@ -5562,6 +5596,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "top_full_orders_v284":top_full_orders,
         "v284_post_simulation_correction":False,
         "v284_ticket_sources":["単勝","複勝","ワイド","2連単","2連複","三連複","三連単"],
+        "v284_transition_audit":{
+            "trials":int(sim_trials),
+            "lap_stats":transition_audit,
+            "pair_stats":{"|".join(map(str,k)):v for k,v in transition_pair_audit.items()},
+            "top3_orders":{"-".join(map(str,k)):int(v) for k,v in top3_order_audit.items()},
+            "purpose":"原因分析専用。予測値への後補正なし",
+        },
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
         "message":f"Ver265ではVer257相当の展開係数へ戻し、実測の試走→競走タイム変換残差を開催場・選手・ハンデ帯で縮小学習して基礎能力へ小さく反映します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
@@ -12162,6 +12203,162 @@ def _v283_db_fingerprint_bytes(data: bytes) -> dict:
             tmp_path.unlink(missing_ok=True)
 
 
+
+def _v284_db_row_keysets_from_bytes(data: bytes) -> dict:
+    """主要保存テーブルを自然キーで比較できる形へ変換する。
+
+    件数だけではなく「どちらにしか存在しない行があるか」を判定するために使う。
+    ID再採番の影響を避けるため、可能な限りrace_key等の自然キーを使う。
+    """
+    out={"ok":False,"tables":{},"reason":""}
+    tmp_path=None
+    try:
+        if not data.startswith(b"SQLite format 3\x00"):
+            out["reason"]="SQLite形式ではありません"
+            return out
+        fd,tmp_name=tempfile.mkstemp(prefix="autorace_rowset_",suffix=".sqlite3")
+        os.close(fd)
+        tmp_path=Path(tmp_name)
+        tmp_path.write_bytes(data)
+
+        keymap={
+            "players":("player_id",),
+            "race_history":("record_key",),
+            "player_lap_history":("race_key","car_no","lap_label"),
+            "result_races":("race_key",),
+            "result_entries":("race_key","car_no"),
+            "result_laps":("race_key","lap_label","position"),
+            "result_payouts":("race_key","bet_type","combination"),
+            "prediction_feedback":("race_key",),
+            "prediction_snapshots":("race_key","car_no"),
+            "v40_prediction_feature_snapshots":("race_key","car_no"),
+            "v41_registration_batches":("race_key",),
+            "v67_prediction_tickets":("race_key","bet_type","combination"),
+            "v67_ticket_feedback":("race_key","bet_type"),
+            "v141_heat_feature_snapshots":("race_key","car_no"),
+            "v142_aux_feature_snapshots":("race_key","car_no"),
+            "v151_race_context_feature_snapshots":("race_key","car_no"),
+            "v152_overtake_feature_snapshots":("race_key","car_no"),
+            "v187_mixed_plan_runs":("race_key","plan_hash"),
+            "v187_mixed_plan_tickets":("race_key","plan_hash","bet_type","combination"),
+            "v187_mixed_plan_feedback":("race_key","plan_hash"),
+            "v187_mixed_ticket_feedback":("race_key","plan_hash","bet_type","combination"),
+            "v221_odds_runs":("race_key","snapshot_id"),
+            "v221_odds_values":("race_key","snapshot_id","bet_key","combination"),
+            "v222_prediction_restore":("race_key",),
+            "v223_result_view_restore":("race_key",),
+            "v238_result_raw_archive":("race_key",),
+            "v279_player_incident_history":("race_key","car_no","incident_type"),
+        }
+        with sqlite3.connect(str(tmp_path),timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            tables={str(r[0]) for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            result={}
+            for t,keys in keymap.items():
+                if t not in tables:
+                    continue
+                cols={str(r[1]) for r in con.execute(f'PRAGMA table_info("{t}")').fetchall()}
+                if not all(k in cols for k in keys):
+                    continue
+                qcols=",".join('"'+k.replace('"','""')+'"' for k in keys)
+                result[t]={tuple(r) for r in con.execute(f'SELECT {qcols} FROM "{t}"').fetchall()}
+
+            # 予測履歴はhistory_idではなく意味キーで比較
+            if "v231_prediction_history" in tables:
+                cols={str(r[1]) for r in con.execute('PRAGMA table_info("v231_prediction_history")').fetchall()}
+                keys=("race_key","app_version","prediction_time")
+                if all(k in cols for k in keys):
+                    result["v231_prediction_history"]={
+                        tuple(r) for r in con.execute(
+                            'SELECT race_key,app_version,prediction_time FROM v231_prediction_history'
+                        ).fetchall()
+                    }
+
+            # 周回予測もsnapshot_idではなく内容キーで比較
+            if "v252_lap_prediction_snapshots" in tables:
+                cols={str(r[1]) for r in con.execute('PRAGMA table_info("v252_lap_prediction_snapshots")').fetchall()}
+                keys=("race_date","venue","race_no","lap_no","app_version","predicted_order","created_at")
+                if all(k in cols for k in keys):
+                    result["v252_lap_prediction_snapshots"]={
+                        tuple(r) for r in con.execute(
+                            'SELECT race_date,venue,race_no,lap_no,app_version,predicted_order,created_at '
+                            'FROM v252_lap_prediction_snapshots'
+                        ).fetchall()
+                    }
+
+            # 予測タイムはhistory_idが枝で変わるため、race情報が直接無ければ比較対象から外す。
+            out["tables"]=result
+            out["ok"]=True
+            return out
+    except Exception as exc:
+        out["reason"]=f"{type(exc).__name__}: {exc}"
+        return out
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _v284_db_containment(candidate_bytes: bytes, baseline_bytes: bytes) -> dict:
+    """candidateとbaselineの行単位包含関係を返す。
+
+    relation:
+      equal                 完全一致
+      candidate_contains    candidateがbaselineを完全包含
+      baseline_contains     baselineがcandidateを完全包含
+      diverged              双方に固有行あり
+      unknown               判定不能
+    """
+    c=_v284_db_row_keysets_from_bytes(candidate_bytes)
+    b=_v284_db_row_keysets_from_bytes(baseline_bytes)
+    if not c.get("ok") or not b.get("ok"):
+        return {
+            "relation":"unknown",
+            "candidate_only":{},
+            "baseline_only":{},
+            "reason":f"candidate={c.get('reason','')} / baseline={b.get('reason','')}",
+        }
+
+    c_only={}
+    b_only={}
+    all_tables=sorted(set(c.get("tables",{})) | set(b.get("tables",{})))
+    for t in all_tables:
+        cs=set((c.get("tables") or {}).get(t,set()))
+        bs=set((b.get("tables") or {}).get(t,set()))
+        co=cs-bs
+        bo=bs-cs
+        if co: c_only[t]=len(co)
+        if bo: b_only[t]=len(bo)
+
+    if not c_only and not b_only:
+        relation="equal"
+    elif c_only and not b_only:
+        relation="candidate_contains"
+    elif b_only and not c_only:
+        relation="baseline_contains"
+    else:
+        relation="diverged"
+
+    return {
+        "relation":relation,
+        "candidate_only":c_only,
+        "baseline_only":b_only,
+        "reason":"ok",
+    }
+
+
+def _v284_containment_message(rel: dict, candidate_label: str, baseline_label: str) -> str:
+    co=rel.get("candidate_only") or {}
+    bo=rel.get("baseline_only") or {}
+    parts=[f"包含判定: {rel.get('relation','unknown')}"]
+    if co:
+        parts.append(candidate_label+"のみ: "+", ".join(f"{k}+{v}" for k,v in sorted(co.items())))
+    if bo:
+        parts.append(baseline_label+"のみ: "+", ".join(f"{k}+{v}" for k,v in sorted(bo.items())))
+    return " / ".join(parts)
+
+
 def _v283_compare_db_fingerprints(candidate: dict, baseline: dict) -> dict:
     """candidateがbaselineより欠損していないか確認する。欠損が1件でもあれば停止。"""
     result={"safe":True,"regressions":[],"warnings":[]}
@@ -12375,14 +12572,21 @@ def pull_db_from_github() -> tuple[bool, str]:
                 _local_fp283=_v283_db_fingerprint_bytes(_local_bytes283)
             except Exception:
                 _local_fp283={"ok":False,"reason":"ローカル指紋取得失敗"}
-            _pull_cmp283=_v283_compare_db_fingerprints(_remote_fp283,_local_fp283)
-            if not _pull_cmp283.get("safe"):
+            _rel284=_v284_db_containment(data,_local_bytes283)
+            _relation284=str(_rel284.get("relation") or "unknown")
+            if _relation284=="baseline_contains":
                 return False,(
-                    "GitHub DBの再読込を中止しました。GitHub側は正常SQLiteですが、"
-                    "現在のローカルDBより不足している項目があります。統合が必要です。\n- "
-                    +"\n- ".join(_pull_cmp283.get("regressions") or [])
+                    "GitHub DBは現在の端末DBの古い部分集合です。端末DBを維持してください。\n"+
+                    _v284_containment_message(_rel284,"GitHub","端末")
                 )
-
+            if _relation284=="diverged":
+                return False,(
+                    "GitHub DBと端末DBの双方に固有データがあります。自動上書きせず統合が必要です。\n"+
+                    _v284_containment_message(_rel284,"GitHub","端末")
+                )
+            if _relation284=="unknown":
+                return False,"GitHub DBの包含関係を安全確認できないため再読込を中止しました。"
+            # equal または GitHubが端末を完全包含する場合のみ採用
             ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上の分割DB")
             if not ok:
                 return False, "GitHub上の分割DBは採用しませんでした。現在のDBは保護されています。\n" + msg
@@ -12406,12 +12610,14 @@ def pull_db_from_github() -> tuple[bool, str]:
             _local_fp283=_v283_db_fingerprint_bytes(_local_bytes283)
         except Exception:
             _local_fp283={"ok":False,"reason":"ローカル指紋取得失敗"}
-        _pull_cmp283=_v283_compare_db_fingerprints(_remote_fp283,_local_fp283)
-        if not _pull_cmp283.get("safe"):
-            return False,(
-                "GitHub DBの再読込を中止しました。現在DBより不足しています。\n- "
-                +"\n- ".join(_pull_cmp283.get("regressions") or [])
-            )
+        _rel284=_v284_db_containment(data,_local_bytes283)
+        _relation284=str(_rel284.get("relation") or "unknown")
+        if _relation284=="baseline_contains":
+            return False,"GitHub DBは端末DBの古い部分集合です。端末DBを維持してください。\n"+_v284_containment_message(_rel284,"GitHub","端末")
+        if _relation284=="diverged":
+            return False,"GitHub DBと端末DBの双方に固有データがあります。統合が必要です。\n"+_v284_containment_message(_rel284,"GitHub","端末")
+        if _relation284=="unknown":
+            return False,"GitHub DBの包含関係を安全確認できないため再読込を中止しました。"
         ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上のDB")
         if not ok:
             return False, "GitHub上のDBは採用しませんでした。現在のDBは保護されています。\n" + msg
@@ -12541,29 +12747,38 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     if not ok_branch:
         return False,db_branch
 
-    # GitHub current manifestの主要件数と比較。
+    # GitHub current DBと行単位の包含関係を比較。
+    # 件数だけではなく、どちらにしか存在しない自然キーがあるかで判断する。
+    _remote_chunk_ok284,_remote_bytes284,_remote_chunk_msg284=_v282_pull_chunked_db()
+    if _remote_chunk_ok284 and _remote_bytes284 is not None:
+        _relpush284=_v284_db_containment(snapshot_bytes,_remote_bytes284)
+        _rpush284=str(_relpush284.get("relation") or "unknown")
+        if _rpush284=="baseline_contains":
+            return False,(
+                "GitHub保存を中止しました。GitHub DBが現在の端末DBを完全包含しています。"
+                " 先にGitHub DBを採用してください。\n"+
+                _v284_containment_message(_relpush284,"端末","GitHub")
+            )
+        if _rpush284=="diverged":
+            return False,(
+                "GitHub保存を中止しました。端末DBとGitHub DBの双方に固有データがあります。"
+                " 自動上書きせず統合が必要です。\n"+
+                _v284_containment_message(_relpush284,"端末","GitHub")
+            )
+        if _rpush284=="unknown":
+            return False,"GitHub保存を中止しました。端末DBとGitHub DBの包含関係を安全確認できません。"
+        # equal / 端末がGitHubを完全包含 の場合のみ保存可能
+    elif _remote_chunk_msg284!="manifestなし":
+        return False,"GitHub保存前のcurrent DB取得に失敗しました: "+str(_remote_chunk_msg284)
+
+    # manifest件数ガードも補助的に残す。
     remote_ok,remote_manifest,remote_msg=_v283_get_chunk_manifest(branch=db_branch,previous=False)
     if remote_ok:
         remote_fp=(remote_manifest or {}).get("stats") or {}
         if not remote_fp.get("ok"):
             return False,"GitHub保存を中止しました。current manifestのDB指紋が不完全です。"
-        _baseline_fps284=[("current",remote_fp)]
-        _prev_ok284,_prev_manifest284,_prev_msg284=_v283_get_chunk_manifest(branch=db_branch,previous=True)
-        if _prev_ok284:
-            _prev_fp284=(_prev_manifest284 or {}).get("stats") or {}
-            if _prev_fp284.get("ok"):
-                _baseline_fps284.append(("previous",_prev_fp284))
-        _reg284=[]
-        for _label284,_basefp284 in _baseline_fps284:
-            _cmp284=_v283_compare_db_fingerprints(local_fp,_basefp284)
-            if not _cmp284.get("safe"):
-                _reg284.extend([f"{_label284}: {x}" for x in (_cmp284.get("regressions") or [])])
-        if _reg284:
-            return False,(
-                "GitHub保存を中止しました。現在DBはGitHubの保護世代よりデータが減っています。"
-                " 不足DBを新しい世代へ昇格させません。まずDB統合を行ってください。\\n- "
-                +"\\n- ".join(_reg284)
-            )
+        # previous世代は事故復旧用。currentとの行包含判定を主判定とし、
+        # previousの単純件数だけで正常な追加DBを拒否しない。
     elif remote_msg!="manifestなし":
         return False,"GitHub保存前の世代確認に失敗しました: "+str(remote_msg)
 
@@ -12737,7 +12952,7 @@ with st.sidebar:
             if _gm_ok283:
                 _g283=int((_gm283 or {}).get("generation") or 0)
                 _s283=str((_gm283 or {}).get("slot") or "?")
-                st.caption(f"GitHub DB世代: {_g283} / 保管slot: {_s283}（欠損ガード有効）")
+                st.caption(f"GitHub DB世代: {_g283} / 保管slot: {_s283}（行単位包含判定 有効）")
         except Exception:
             pass
         db_path = Path(engine.DB_PATH)
