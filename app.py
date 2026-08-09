@@ -8798,7 +8798,15 @@ def show_v182_odds_adjusted_tight_recommendation(bets: dict, trials: int, meta: 
 
 # Ver187: 8車合成プランをDB保存し、結果登録後に自動照合して次回判定へ反映する。
 def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
-    with sqlite3.connect(db_path) as con:
+    """回収率学習テーブルの存在だけを保証する安全版。
+
+    Ver282:
+    予測表示・復元表示のたびに孤立データのINSERT/DELETEやTRIGGER作成を行うと、
+    同時読込・バックグラウンド処理中にSQLiteへ不要な書込が発生する。
+    ここではDDLの最小保証だけに限定し、孤立データ処理は監査/メンテナンス側へ分離する。
+    """
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
         con.executescript("""
         CREATE TABLE IF NOT EXISTS v187_mixed_plan_runs (
             race_key TEXT NOT NULL,
@@ -8849,27 +8857,6 @@ def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
             payout_yen INTEGER NOT NULL,
             PRIMARY KEY (race_key, plan_hash, bet_type, combination)
         );
-        """)
-        # Ver215: 予測時点のプランを後から完全に切り分けられるよう、メタ情報を保持する。
-        existing_cols = {row[1] for row in con.execute("PRAGMA table_info(v187_mixed_plan_runs)").fetchall()}
-        for col_name, col_type in [
-            ("app_version", "TEXT"),
-            ("logic_version", "TEXT"),
-            ("race_date", "TEXT"),
-            ("venue", "TEXT"),
-            ("race_no", "TEXT"),
-            ("starter_count", "INTEGER"),
-            # Ver279: 復元後に入力したオッズから作ったプランは保存するが、
-            # リアルタイム実績・学習とは明確に分離する。
-            ("plan_origin", "TEXT DEFAULT 'live'"),
-            ("source_prediction_version", "TEXT"),
-            ("include_in_live_stats", "INTEGER DEFAULT 1"),
-        ]:
-            if col_name not in existing_cols:
-                con.execute(f"ALTER TABLE v187_mixed_plan_runs ADD COLUMN {col_name} {col_type}")
-        # Ver280: 比較・再評価処理の途中失敗で run が無い feedback が残るのを防ぐ。
-        # 既存の孤立データは削除前に退避し、正式な回収率集計からだけ外す。
-        con.executescript("""
         CREATE TABLE IF NOT EXISTS v280_orphan_plan_feedback_archive (
             race_key TEXT NOT NULL,
             plan_hash TEXT NOT NULL,
@@ -8910,98 +8897,85 @@ def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
             PRIMARY KEY (race_key, plan_hash, bet_type, combination)
         );
         """)
-        _archive_now = _v228_now_jst_iso()
-        # plan feedback
-        con.execute("""
-            INSERT OR IGNORE INTO v280_orphan_plan_feedback_archive
-            SELECT f.race_key,f.plan_hash,f.hit,f.black_hit,f.gami_hit,
-                   f.payout_yen,f.cost_yen,f.realized_multiple,f.return_rate,
-                   f.winning_types,f.evaluated_at,?,?
-            FROM v187_mixed_plan_feedback f
-            LEFT JOIN v187_mixed_plan_runs r
-              ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
-            WHERE r.race_key IS NULL
-        """, (_archive_now, "runなしの孤立feedback"))
-        # ticket feedback
-        con.execute("""
-            INSERT OR IGNORE INTO v280_orphan_ticket_feedback_archive
-            SELECT f.race_key,f.plan_hash,f.bet_type,f.combination,
-                   f.hit,f.payout_yen,?,?
-            FROM v187_mixed_ticket_feedback f
-            LEFT JOIN v187_mixed_plan_runs r
-              ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
-            WHERE r.race_key IS NULL
-        """, (_archive_now, "runなしの孤立ticket feedback"))
-        # plan tickets
-        con.execute("""
-            INSERT OR IGNORE INTO v280_orphan_plan_tickets_archive
-            SELECT t.race_key,t.plan_hash,t.bet_type,t.combination,
-                   t.probability,t.odds,t.role,?,?
-            FROM v187_mixed_plan_tickets t
-            LEFT JOIN v187_mixed_plan_runs r
-              ON r.race_key=t.race_key AND r.plan_hash=t.plan_hash
-            WHERE r.race_key IS NULL
-        """, (_archive_now, "runなしの孤立ticket"))
 
-        # 元データはアーカイブ済みなので、正式集計テーブルからのみ除外する。
-        con.execute("""
-            DELETE FROM v187_mixed_ticket_feedback
-            WHERE NOT EXISTS (
-                SELECT 1 FROM v187_mixed_plan_runs r
-                WHERE r.race_key=v187_mixed_ticket_feedback.race_key
-                  AND r.plan_hash=v187_mixed_ticket_feedback.plan_hash
-            )
-        """)
-        con.execute("""
-            DELETE FROM v187_mixed_plan_feedback
-            WHERE NOT EXISTS (
-                SELECT 1 FROM v187_mixed_plan_runs r
-                WHERE r.race_key=v187_mixed_plan_feedback.race_key
-                  AND r.plan_hash=v187_mixed_plan_feedback.plan_hash
-            )
-        """)
-        con.execute("""
-            DELETE FROM v187_mixed_plan_tickets
-            WHERE NOT EXISTS (
-                SELECT 1 FROM v187_mixed_plan_runs r
-                WHERE r.race_key=v187_mixed_plan_tickets.race_key
-                  AND r.plan_hash=v187_mixed_plan_tickets.plan_hash
-            )
-        """)
+        existing_cols = {row[1] for row in con.execute("PRAGMA table_info(v187_mixed_plan_runs)").fetchall()}
+        for col_name, col_type in [
+            ("app_version", "TEXT"),
+            ("logic_version", "TEXT"),
+            ("race_date", "TEXT"),
+            ("venue", "TEXT"),
+            ("race_no", "TEXT"),
+            ("starter_count", "INTEGER"),
+            ("plan_origin", "TEXT DEFAULT 'live'"),
+            ("source_prediction_version", "TEXT"),
+            ("include_in_live_stats", "INTEGER DEFAULT 1"),
+        ]:
+            if col_name not in existing_cols:
+                con.execute(f"ALTER TABLE v187_mixed_plan_runs ADD COLUMN {col_name} {col_type}")
 
-        # 今後はrunが存在しない単独保存をDBレベルで拒否する。
+        # 旧Ver280で作った書込TRIGGERは、予測中のDB状態を複雑化させるため解除。
         con.executescript("""
-        CREATE TRIGGER IF NOT EXISTS v280_guard_plan_feedback_insert
-        BEFORE INSERT ON v187_mixed_plan_feedback
-        WHEN NOT EXISTS (
-            SELECT 1 FROM v187_mixed_plan_runs r
-            WHERE r.race_key=NEW.race_key AND r.plan_hash=NEW.plan_hash
-        )
-        BEGIN
-            SELECT RAISE(IGNORE);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS v280_guard_ticket_feedback_insert
-        BEFORE INSERT ON v187_mixed_ticket_feedback
-        WHEN NOT EXISTS (
-            SELECT 1 FROM v187_mixed_plan_runs r
-            WHERE r.race_key=NEW.race_key AND r.plan_hash=NEW.plan_hash
-        )
-        BEGIN
-            SELECT RAISE(IGNORE);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS v280_guard_plan_ticket_insert
-        BEFORE INSERT ON v187_mixed_plan_tickets
-        WHEN NOT EXISTS (
-            SELECT 1 FROM v187_mixed_plan_runs r
-            WHERE r.race_key=NEW.race_key AND r.plan_hash=NEW.plan_hash
-        )
-        BEGIN
-            SELECT RAISE(IGNORE);
-        END;
+        DROP TRIGGER IF EXISTS v280_guard_plan_feedback_insert;
+        DROP TRIGGER IF EXISTS v280_guard_ticket_feedback_insert;
+        DROP TRIGGER IF EXISTS v280_guard_plan_ticket_insert;
         """)
         con.commit()
+
+
+def _v282_archive_orphan_mixed_plan_rows(db_path: str) -> dict:
+    """明示的メンテナンス時だけ孤立行を退避する。通常の予測/復元表示からは呼ばない。"""
+    out={"archived_plan_feedback":0,"archived_ticket_feedback":0,"archived_plan_tickets":0,"ok":False,"error":""}
+    try:
+        _v187_ensure_mixed_learning_tables(db_path)
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            con.row_factory=sqlite3.Row
+            now=_v228_now_jst_iso()
+
+            before=int(con.execute("SELECT COUNT(*) FROM v280_orphan_plan_feedback_archive").fetchone()[0] or 0)
+            con.execute("""
+                INSERT OR IGNORE INTO v280_orphan_plan_feedback_archive
+                SELECT f.race_key,f.plan_hash,f.hit,f.black_hit,f.gami_hit,
+                       f.payout_yen,f.cost_yen,f.realized_multiple,f.return_rate,
+                       f.winning_types,f.evaluated_at,?,?
+                FROM v187_mixed_plan_feedback f
+                LEFT JOIN v187_mixed_plan_runs r
+                  ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+                WHERE r.race_key IS NULL
+            """,(now,"runなしの孤立feedback"))
+            after=int(con.execute("SELECT COUNT(*) FROM v280_orphan_plan_feedback_archive").fetchone()[0] or 0)
+            out["archived_plan_feedback"]=max(0,after-before)
+
+            before=int(con.execute("SELECT COUNT(*) FROM v280_orphan_ticket_feedback_archive").fetchone()[0] or 0)
+            con.execute("""
+                INSERT OR IGNORE INTO v280_orphan_ticket_feedback_archive
+                SELECT f.race_key,f.plan_hash,f.bet_type,f.combination,
+                       f.hit,f.payout_yen,?,?
+                FROM v187_mixed_ticket_feedback f
+                LEFT JOIN v187_mixed_plan_runs r
+                  ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+                WHERE r.race_key IS NULL
+            """,(now,"runなしの孤立ticket feedback"))
+            after=int(con.execute("SELECT COUNT(*) FROM v280_orphan_ticket_feedback_archive").fetchone()[0] or 0)
+            out["archived_ticket_feedback"]=max(0,after-before)
+
+            before=int(con.execute("SELECT COUNT(*) FROM v280_orphan_plan_tickets_archive").fetchone()[0] or 0)
+            con.execute("""
+                INSERT OR IGNORE INTO v280_orphan_plan_tickets_archive
+                SELECT t.race_key,t.plan_hash,t.bet_type,t.combination,
+                       t.probability,t.odds,t.role,?,?
+                FROM v187_mixed_plan_tickets t
+                LEFT JOIN v187_mixed_plan_runs r
+                  ON r.race_key=t.race_key AND r.plan_hash=t.plan_hash
+                WHERE r.race_key IS NULL
+            """,(now,"runなしの孤立ticket"))
+            after=int(con.execute("SELECT COUNT(*) FROM v280_orphan_plan_tickets_archive").fetchone()[0] or 0)
+            out["archived_plan_tickets"]=max(0,after-before)
+            con.commit()
+            out["ok"]=True
+    except Exception as exc:
+        out["error"]=f"{type(exc).__name__}: {exc}"
+    return out
 
 
 def _v280_orphan_mixed_plan_audit(db_path: str) -> dict:
@@ -9356,7 +9330,15 @@ def _v208_render_mixed_plan_result(result: dict) -> None:
 
 
 def _v187_learning_profile(db_path: str) -> dict:
-    _v187_ensure_mixed_learning_tables(db_path)
+    try:
+        _v187_ensure_mixed_learning_tables(db_path)
+    except sqlite3.DatabaseError as _db187:
+        # 回収率学習領域のDB不調で予測本体まで落とさない。
+        return {
+            "races":0, "return_rate":None, "hit_rate":None, "black_rate":None,
+            "gami_rate":None, "ticket_stats":{}, "enabled":False,
+            "reason":f"回収率学習DBを一時スキップ: {type(_db187).__name__}: {_db187}"
+        }
     _v187_sync_mixed_feedback(db_path)
     out = {"samples":0, "hit_rate":None, "black_rate":None, "gami_rate":None, "return_rate":None, "type_weights":{}}
     with sqlite3.connect(db_path) as con:
@@ -9523,6 +9505,11 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         return {"available": False, "reason": "三連単シミュレーションがありません。"}
 
     learning = _v187_learning_profile(engine.DB_PATH)
+    if isinstance(learning,dict) and learning.get("enabled") is False and learning.get("reason"):
+        try:
+            st.caption("回収率学習: " + str(learning.get("reason")))
+        except Exception:
+            pass
     type_weights = learning.get("type_weights", {})
 
     # 車立て別に役割を変更。6車は三連単中心、7車は準中心、8車は複数券種の補完を厚くする。
