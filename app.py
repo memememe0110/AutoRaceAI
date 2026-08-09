@@ -38,7 +38,7 @@ APP_VERSION = "Ver280"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver280"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver281"  # Ver280: 川口4日実測ベースの予測改善
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -4594,7 +4594,7 @@ def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_t
         reasons.append("trial_missing")
 
     base_threshold = 4 if h >= 60.0 else 3
-    required = base_threshold + (1 if lap_i == 5 else 0)
+    required = base_threshold  # Ver281: 5周目だけに課していた追加+1条件を撤廃。6周目条件は不変。
 
     if score < required:
         diag = {
