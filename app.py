@@ -38,7 +38,7 @@ APP_VERSION = "Ver280"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver282"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver283"  # Ver280: 川口4日実測ベースの予測改善
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -2484,6 +2484,104 @@ def _v279_bg_prediction_any_active(db_path: str) -> bool:
         return False
 
 
+
+def _v283_apply_top3_priority_ranks(df: pd.DataFrame) -> pd.DataFrame:
+    """1～3着を目的にしたVer283最終順位整合。
+
+    - 1位はVer196の本番1着率1位を固定（勝者予測を壊さない）
+    - 2・3位候補は本番3着内率の上位から選ぶ
+    - 2位/3位の順序は推定2着率（本番連対率-本番1着率）を優先
+    - 4位以下は従来の改善後順位の相対順を維持
+    """
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        required = {"車", "改善後順位", "本番1着率", "本番3着内率"}
+        if not required.issubset(set(df.columns)):
+            return df
+
+        out = df.copy()
+        _cars = pd.to_numeric(out["車"], errors="coerce")
+        _rank = pd.to_numeric(out["改善後順位"], errors="coerce")
+        _win = pd.to_numeric(out["本番1着率"], errors="coerce").fillna(-1.0)
+        _top3 = pd.to_numeric(out["本番3着内率"], errors="coerce").fillna(-1.0)
+        if "本番連対率" in out.columns:
+            _place2 = (
+                pd.to_numeric(out["本番連対率"], errors="coerce").fillna(0.0)
+                - pd.to_numeric(out["本番1着率"], errors="coerce").fillna(0.0)
+            ).clip(lower=0.0)
+        else:
+            _place2 = _top3.clip(lower=0.0) - _win.clip(lower=0.0)
+
+        valid_idx = [
+            i for i in out.index
+            if pd.notna(_cars.loc[i]) and pd.notna(_rank.loc[i])
+        ]
+        if len(valid_idx) < 3:
+            return out
+
+        # Ver196の1位を維持。万一rank=1が無ければ本番1着率最大。
+        rank1 = [i for i in valid_idx if int(_rank.loc[i]) == 1]
+        if rank1:
+            winner_idx = rank1[0]
+        else:
+            winner_idx = max(valid_idx, key=lambda i: (float(_win.loc[i]), float(_top3.loc[i]), -int(_cars.loc[i])))
+
+        # 2・3着候補は3着内率を主軸に2台だけ選ぶ。
+        remaining = [i for i in valid_idx if i != winner_idx]
+        top3_candidates = sorted(
+            remaining,
+            key=lambda i: (
+                -float(_top3.loc[i]),
+                -float(_place2.loc[i]),
+                -float(_win.loc[i]),
+                int(_cars.loc[i]),
+            )
+        )[:2]
+
+        # 2着率を優先して2位/3位を並べる。
+        top3_candidates = sorted(
+            top3_candidates,
+            key=lambda i: (
+                -float(_place2.loc[i]),
+                -float(_win.loc[i]),
+                -float(_top3.loc[i]),
+                int(_cars.loc[i]),
+            )
+        )
+
+        first3 = [winner_idx] + top3_candidates
+
+        # 4着以下はVer196の既存順位をそのまま相対維持。
+        rest = sorted(
+            [i for i in valid_idx if i not in set(first3)],
+            key=lambda i: (float(_rank.loc[i]), int(_cars.loc[i]))
+        )
+        ordered = first3 + rest
+
+        new_rank = {idx: pos + 1 for pos, idx in enumerate(ordered)}
+        out["Ver283_TOP3優先前順位"] = _rank
+        out["Ver283_推定2着率"] = _place2.round(3)
+        out["Ver283_TOP3候補"] = False
+        for idx in first3:
+            out.loc[idx, "Ver283_TOP3候補"] = True
+        for idx, rank_no in new_rank.items():
+            out.loc[idx, "改善後順位"] = int(rank_no)
+
+        if "順位整合メモ" in out.columns:
+            old_note = out["順位整合メモ"].fillna("").astype(str)
+            out["順位整合メモ"] = old_note.apply(
+                lambda x: (x + " / " if x else "") + "Ver283:1着固定＋TOP3優先"
+            )
+        else:
+            out["順位整合メモ"] = "Ver283:1着固定＋TOP3優先"
+
+        return out
+    except Exception:
+        # 安全側: 何かあればVer196順位をそのまま使う。
+        return df
+
+
 def _v279_send_bg_prediction_complete_notification(result: dict) -> None:
     try:
         topic=str(os.environ.get("AUTORACE_NTFY_TOPIC", "notify") or "notify").strip()
@@ -2546,6 +2644,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             finish_prob=engine.v30_finish_probabilities(df,bets,trials)
             _v273_audit_keep={c:df[c].copy() for c in df.columns if str(c).startswith("Ver273_")}
             df=engine.v196_apply_probability_aligned_ranks(df,finish_prob)
+            df=_v283_apply_top3_priority_ranks(df)
             for _c273,_s273 in _v273_audit_keep.items():
                 try:
                     if len(_s273)==len(df):
@@ -2841,6 +2940,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 c:df[c].copy() for c in df.columns if str(c).startswith("Ver273_")
             }
             df=engine.v196_apply_probability_aligned_ranks(df,finish_prob)
+            df=_v283_apply_top3_priority_ranks(df)
             for _c273,_s273 in _v273_audit_keep.items():
                 try:
                     if len(_s273)==len(df):
@@ -12935,6 +13035,7 @@ elif selected_main_page == "🏁 予測":
                         if str(c).startswith("Ver273_")
                     }
                     df = engine.v196_apply_probability_aligned_ranks(df, finish_prob)
+                    df = _v283_apply_top3_priority_ranks(df)
                     for _c273, _s273 in _v273_audit_keep.items():
                         try:
                             if len(_s273) == len(df):
@@ -13155,7 +13256,8 @@ elif selected_main_page == "🏁 予測":
             cols = [c for c in [
                 "改善後順位", "1着候補順位", "連対候補順位", "3着候補順位", "総合点順位_従来",
                 "車", "選手名", "ハンデ", "試走換算", "予測競走T", "レース信頼度",
-                "本番1着率", "本番連対率", "本番3着率", "本番3着内率", "順位整合メモ",
+                "本番1着率", "本番連対率", "本番3着率", "本番3着内率",
+                "Ver283_TOP3優先前順位", "Ver283_推定2着率", "Ver283_TOP3候補", "順位整合メモ",
                 "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
                 "スタート伸び指数", "ゴール前伸び指数", "安定上位指数",
                 "6周壁遭遇率", "6周追抜成功回数", "連続追抜発生回数", "1周目先頭率", "壁リスク", "壁突破力", "前残り指数", "壁ロス推定",
@@ -13208,7 +13310,7 @@ elif selected_main_page == "🏁 予測":
                     pass
             st.subheader("予測順位")
             st.dataframe(result, use_container_width=True, hide_index=True)
-            st.caption("Ver196では最終順位を本シミュレーションの1着率と一致させます。従来の総合点順位は診断列として残し、連対・3着候補は別順位で確認できます。")
+            st.caption("Ver283では1位は本シミュレーションの1着率1位を固定し、2・3位候補だけ3着内率を優先して選抜します。2位/3位の順序は推定2着率を優先し、4位以下は従来順位の相対順を維持します。")
             try:
                 v196_val = v202_cached_probability_rank_validation(str(engine.DB_PATH), Path(engine.DB_PATH).stat().st_mtime)
                 if int(v196_val.get("race_count", 0)):
