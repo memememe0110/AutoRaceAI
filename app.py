@@ -12042,61 +12042,207 @@ def _v276_validate_db_bytes(data: bytes, label: str = "DB") -> tuple[bool, str]:
 
 
 
+
+def _v283_db_fingerprint_bytes(data: bytes) -> dict:
+    """DBの『中身の世代』を容量ではなく主要件数＋最新時刻で指紋化する。"""
+    out={"ok":False,"counts":{},"latest":"","size":len(data),"reason":""}
+    tmp_path=None
+    try:
+        if not data.startswith(b"SQLite format 3\x00"):
+            out["reason"]="SQLite形式ではありません"
+            return out
+        fd,tmp_name=tempfile.mkstemp(prefix="autorace_db_fingerprint_",suffix=".sqlite3")
+        os.close(fd)
+        tmp_path=Path(tmp_name)
+        tmp_path.write_bytes(data)
+        with sqlite3.connect(str(tmp_path),timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            tables={str(r[0]) for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+
+            protected=[
+                "players","race_history","result_races","result_entries","result_laps",
+                "result_payouts","v231_prediction_history","v252_lap_prediction_snapshots",
+                "v221_odds_runs","v221_odds_values","v67_prediction_tickets",
+                "v187_mixed_plan_runs","v187_mixed_plan_feedback",
+            ]
+            counts={}
+            for t in protected:
+                if t in tables:
+                    q='"'+t.replace('"','""')+'"'
+                    counts[t]=int(con.execute(f"SELECT COUNT(*) FROM {q}").fetchone()[0] or 0)
+            out["counts"]=counts
+
+            latest_candidates=[]
+            latest_specs=[
+                ("race_history","race_date"),
+                ("result_races","registered_at"),
+                ("v231_prediction_history","prediction_time"),
+                ("v221_odds_runs","created_at"),
+                ("v187_mixed_plan_runs","created_at"),
+            ]
+            for t,c in latest_specs:
+                if t in tables:
+                    cols={str(r[1]) for r in con.execute(f'PRAGMA table_info("{t}")').fetchall()}
+                    if c in cols:
+                        v=con.execute(f'SELECT MAX(COALESCE("{c}", "")) FROM "{t}"').fetchone()[0]
+                        if v:
+                            latest_candidates.append(str(v))
+            out["latest"]=max(latest_candidates) if latest_candidates else ""
+            out["ok"]=True
+            return out
+    except Exception as exc:
+        out["reason"]=f"{type(exc).__name__}: {exc}"
+        return out
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _v283_compare_db_fingerprints(candidate: dict, baseline: dict) -> dict:
+    """candidateがbaselineより欠損していないか確認する。欠損が1件でもあれば停止。"""
+    result={"safe":True,"regressions":[],"warnings":[]}
+    if not candidate.get("ok"):
+        return {"safe":False,"regressions":[f"候補DBの指紋取得失敗: {candidate.get('reason','')}"],"warnings":[]}
+    if not baseline or not baseline.get("ok"):
+        result["warnings"].append("比較元の指紋が無いため件数ガードは初回登録扱いです")
+        return result
+
+    cc=candidate.get("counts") or {}
+    bc=baseline.get("counts") or {}
+    for t,bv in bc.items():
+        if t not in cc:
+            result["regressions"].append(f"{t}: 比較元{int(bv):,}件 → 候補テーブルなし")
+            continue
+        cv=int(cc.get(t,0) or 0)
+        bv=int(bv or 0)
+        if cv < bv:
+            result["regressions"].append(f"{t}: {bv:,} → {cv:,}（-{bv-cv:,}）")
+
+    cand_latest=str(candidate.get("latest") or "")
+    base_latest=str(baseline.get("latest") or "")
+    if cand_latest and base_latest and cand_latest < base_latest:
+        result["regressions"].append(f"最新データ時刻: {base_latest} → {cand_latest}")
+
+    result["safe"]=not result["regressions"]
+    return result
+
+
+def _v283_get_chunk_manifest(branch: str | None = None, previous: bool = False) -> tuple[bool, dict, str]:
+    cfg=github_config()
+    repo_api=f"https://api.github.com/repos/{cfg['repo']}/contents/"
+    path=(
+        str(cfg["path"]).lstrip("/") + ".chunks.previous.json"
+        if previous else _v282_chunk_manifest_path()
+    )
+    read_branch=str(branch or _v282_db_read_branch())
+    url=repo_api+urllib.parse.quote(path,safe="/")+"?ref="+urllib.parse.quote(read_branch)
+    status,body=github_request(url)
+    if status==404:
+        return False,{},"manifestなし"
+    if status!=200:
+        return False,{},f"manifest取得失敗: {body.get('message',status)}"
+    try:
+        raw=base64.b64decode(str(body.get("content") or "").replace("\n",""))
+        return True,json.loads(raw.decode("utf-8")), "ok"
+    except Exception as exc:
+        return False,{},f"manifest解析失敗: {type(exc).__name__}: {exc}"
+
+
 def _v282_chunk_manifest_path() -> str:
     return str(github_config()["path"]).lstrip("/") + ".chunks.json"
 
 
-def _v282_push_chunked_db(snapshot_bytes: bytes, commit_message: str, chunk_size: int = 4 * 1024 * 1024) -> tuple[bool, str]:
-    """大容量DBを小分けしてContents APIへ保存。APIの単発リクエスト肥大化を避ける。"""
-    cfg = github_config()
-    repo_api = f"https://api.github.com/repos/{cfg['repo']}/contents/"
-    ok_branch, branch_msg = _v282_ensure_db_branch()
+def _v282_push_chunked_db(
+    snapshot_bytes: bytes, commit_message: str,
+    chunk_size: int = 4 * 1024 * 1024,
+    fingerprint: dict | None = None,
+) -> tuple[bool, str]:
+    """Ver283: DBをA/B二世代スロットで分割保存する。
+
+    現在manifestがAなら次はBへ全partを書き終えてからmanifestを切替える。
+    途中失敗しても現在manifestが指す旧世代は壊さない。
+    """
+    cfg=github_config()
+    repo_api=f"https://api.github.com/repos/{cfg['repo']}/contents/"
+    ok_branch,branch_msg=_v282_ensure_db_branch()
     if not ok_branch:
-        return False, branch_msg
-    branch = branch_msg
-    base_path = str(cfg["path"]).lstrip("/")
-    chunks = [snapshot_bytes[i:i + chunk_size] for i in range(0, len(snapshot_bytes), chunk_size)]
+        return False,branch_msg
+    branch=branch_msg
+    base_path=str(cfg["path"]).lstrip("/")
+
+    current_ok,current_manifest,_=_v283_get_chunk_manifest(branch=branch,previous=False)
+    current_slot=str((current_manifest or {}).get("slot") or "")
+    next_slot="B" if current_slot=="A" else "A"
+    generation=int((current_manifest or {}).get("generation") or 0)+1
+
+    chunks=[snapshot_bytes[i:i+chunk_size] for i in range(0,len(snapshot_bytes),chunk_size)]
     import hashlib
-    digest = hashlib.sha256(snapshot_bytes).hexdigest()
+    digest=hashlib.sha256(snapshot_bytes).hexdigest()
 
-    def put_file(path: str, data: bytes, message: str) -> tuple[bool, str]:
-        encoded = urllib.parse.quote(path, safe="/")
-        url = repo_api + encoded
-        q = url + "?ref=" + urllib.parse.quote(branch)
-        s, old = github_request(q)
-        payload = {
-            "message": message,
-            "content": base64.b64encode(data).decode("ascii"),
-            "branch": branch,
+    def put_file(path: str, data: bytes, message: str) -> tuple[bool,str]:
+        encoded=urllib.parse.quote(path,safe="/")
+        url=repo_api+encoded
+        q=url+"?ref="+urllib.parse.quote(branch)
+        s,old=github_request(q)
+        payload={
+            "message":message,
+            "content":base64.b64encode(data).decode("ascii"),
+            "branch":branch,
         }
-        if s == 200 and old.get("sha"):
-            payload["sha"] = old["sha"]
-        elif s != 404:
-            return False, str(old.get("message", s))
-        ps, body = github_request(url, method="PUT", payload=payload)
-        if ps not in (200, 201):
-            return False, str(body.get("message", ps))
-        return True, "ok"
+        if s==200 and old.get("sha"):
+            payload["sha"]=old["sha"]
+        elif s!=404:
+            return False,str(old.get("message",s))
+        ps,body=github_request(url,method="PUT",payload=payload)
+        if ps not in (200,201):
+            return False,str(body.get("message",ps))
+        return True,"ok"
 
-    chunk_paths = []
-    for idx, chunk in enumerate(chunks):
-        cp = f"{base_path}.part{idx:03d}"
-        ok, msg = put_file(cp, chunk, f"{commit_message} [part {idx+1}/{len(chunks)}]")
+    # inactive slotへ先に全partを書き込む。manifestはまだ切り替えない。
+    chunk_paths=[]
+    for idx,chunk in enumerate(chunks):
+        cp=f"{base_path}.slot{next_slot}.part{idx:03d}"
+        ok,msg=put_file(cp,chunk,f"{commit_message} [DB世代{generation} slot{next_slot} part {idx+1}/{len(chunks)}]")
         if not ok:
-            return False, f"分割DB part {idx+1}/{len(chunks)} 保存失敗: {msg}"
+            return False,f"分割DB slot{next_slot} part {idx+1}/{len(chunks)} 保存失敗: {msg}"
         chunk_paths.append(cp)
 
-    manifest = {
-        "format": "AutoRaceAI-sqlite-chunks-v1",
-        "size": len(snapshot_bytes),
-        "sha256": digest,
-        "parts": chunk_paths,
+    fp=fingerprint if isinstance(fingerprint,dict) and fingerprint.get("ok") else _v283_db_fingerprint_bytes(snapshot_bytes)
+    manifest={
+        "format":"AutoRaceAI-sqlite-chunks-v2",
+        "generation":generation,
+        "slot":next_slot,
+        "size":len(snapshot_bytes),
+        "sha256":digest,
+        "parts":chunk_paths,
+        "stats":fp,
+        "app_version":str(_V231_APP_VERSION),
+        "saved_at":_v228_now_jst_iso(),
+        "commit_message":str(commit_message),
     }
-    manifest_bytes = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
-    ok, msg = put_file(_v282_chunk_manifest_path(), manifest_bytes, f"{commit_message} [manifest]")
+
+    # 現在世代をpreviousへ退避してから、最後にcurrent manifestを切り替える。
+    if current_ok and current_manifest:
+        prev_bytes=json.dumps(current_manifest,ensure_ascii=False,sort_keys=True).encode("utf-8")
+        ok,msg=put_file(
+            base_path+".chunks.previous.json",prev_bytes,
+            f"{commit_message} [previous manifest 世代{current_manifest.get('generation','旧')}]"
+        )
+        if not ok:
+            return False,f"previous manifest保存失敗: {msg}"
+
+    manifest_bytes=json.dumps(manifest,ensure_ascii=False,sort_keys=True).encode("utf-8")
+    ok,msg=put_file(_v282_chunk_manifest_path(),manifest_bytes,f"{commit_message} [manifest 世代{generation}]")
     if not ok:
-        return False, f"分割DB manifest保存失敗: {msg}"
-    return True, f"DB登録成功｜GitHub分割保存成功（{len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割）"
+        return False,f"分割DB manifest保存失敗: {msg}"
+
+    return True,(
+        f"DB登録成功｜GitHub分割保存成功 "
+        f"（DB世代{generation} / slot{next_slot} / {len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割）"
+    )
+
 
 
 def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
@@ -12145,6 +12291,21 @@ def pull_db_from_github() -> tuple[bool, str]:
     if chunk_ok and chunk_data is not None:
         data = chunk_data
         try:
+            # Ver283世代ガード: GitHub側が正常SQLiteでも、ローカルより欠損していれば巻き戻さない。
+            _remote_fp283=_v283_db_fingerprint_bytes(data)
+            try:
+                _local_bytes283=_v278_consistent_db_snapshot_bytes(str(engine.DB_PATH))
+                _local_fp283=_v283_db_fingerprint_bytes(_local_bytes283)
+            except Exception:
+                _local_fp283={"ok":False,"reason":"ローカル指紋取得失敗"}
+            _pull_cmp283=_v283_compare_db_fingerprints(_remote_fp283,_local_fp283)
+            if not _pull_cmp283.get("safe"):
+                return False,(
+                    "GitHub DBの再読込を中止しました。GitHub側は正常SQLiteですが、"
+                    "現在のローカルDBより不足している項目があります。統合が必要です。\n- "
+                    +"\n- ".join(_pull_cmp283.get("regressions") or [])
+                )
+
             ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上の分割DB")
             if not ok:
                 return False, "GitHub上の分割DBは採用しませんでした。現在のDBは保護されています。\n" + msg
@@ -12162,6 +12323,18 @@ def pull_db_from_github() -> tuple[bool, str]:
         return False, f"GitHubからDBを取得できませんでした: {body.get('message', status)}"
     try:
         data = base64.b64decode(body["content"].replace("\n", ""))
+        _remote_fp283=_v283_db_fingerprint_bytes(data)
+        try:
+            _local_bytes283=_v278_consistent_db_snapshot_bytes(str(engine.DB_PATH))
+            _local_fp283=_v283_db_fingerprint_bytes(_local_bytes283)
+        except Exception:
+            _local_fp283={"ok":False,"reason":"ローカル指紋取得失敗"}
+        _pull_cmp283=_v283_compare_db_fingerprints(_remote_fp283,_local_fp283)
+        if not _pull_cmp283.get("safe"):
+            return False,(
+                "GitHub DBの再読込を中止しました。現在DBより不足しています。\n- "
+                +"\n- ".join(_pull_cmp283.get("regressions") or [])
+            )
         ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上のDB")
         if not ok:
             return False, "GitHub上のDBは採用しませんでした。現在のDBは保護されています。\n" + msg
@@ -12260,60 +12433,54 @@ def _v281_push_large_file_via_git_data_api(snapshot_bytes: bytes, commit_message
 
 
 def push_db_to_github(commit_message: str) -> tuple[bool, str]:
-    ready, message = github_ready()
+    ready,message=github_ready()
     if not ready:
-        return False, message
-    db_path = Path(engine.DB_PATH)
+        return False,message
+    db_path=Path(engine.DB_PATH)
     if not db_path.exists():
-        return False, "保存するDBがありません。"
+        return False,"保存するDBがありません。"
 
     try:
         snapshot_bytes=_v278_consistent_db_snapshot_bytes(str(db_path))
     except Exception as exc:
-        return False, f"DB整合スナップショット作成エラー: {type(exc).__name__}: {exc}"
+        return False,f"DB整合スナップショット作成エラー: {type(exc).__name__}: {exc}"
 
-    # Ver283安全ガード: 壊れたSQLiteをGitHubへ上書きしない。
-    # integrity_checkだけでなくsqlite_master全件読取まで行う既存validatorを必須化。
-    _v283_ok, _v283_msg = _v276_validate_db_bytes(snapshot_bytes, "GitHub保存前DB")
-    if not _v283_ok:
-        return False, (
-            "GitHub保存を中止しました。現在のDBにSQLite異常があります。"
-            " GitHub上の正常DBは上書きしていません。\n" + str(_v283_msg)
+    # 破損DBは絶対に保存しない。
+    ok_validate,msg_validate=_v276_validate_db_bytes(snapshot_bytes,"GitHub保存前DB")
+    if not ok_validate:
+        return False,(
+            "GitHub保存を中止しました。現在DBにSQLite異常があります。"
+            " GitHub上の正常DBは上書きしていません。\\n"+str(msg_validate)
         )
 
-    cfg = github_config()
-    ok_branch, db_branch = _v282_ensure_db_branch()
+    local_fp=_v283_db_fingerprint_bytes(snapshot_bytes)
+    if not local_fp.get("ok"):
+        return False,"GitHub保存を中止しました。DB内容の世代確認に失敗しました: "+str(local_fp.get("reason") or "")
+
+    ok_branch,db_branch=_v282_ensure_db_branch()
     if not ok_branch:
-        return False, db_branch
-    url = github_api_url()
-    query_url = url + "?ref=" + urllib.parse.quote(db_branch)
-    status, existing = github_request(query_url)
-    sha = existing.get("sha") if status == 200 else None
-    if status not in (200, 404):
-        return False, f"GitHub上のDB確認に失敗しました: {existing.get('message', status)}"
+        return False,db_branch
 
-    payload = {
-        "message": commit_message,
-        "content": base64.b64encode(snapshot_bytes).decode("ascii"),
-        "branch": db_branch,
-    }
-    if sha:
-        payload["sha"] = sha
-    put_status, result = github_request(url, method="PUT", payload=payload)
-    if put_status not in (200, 201):
-        # 大容量SQLiteではContents APIが "file is too large to be processed" になる。
-        # DB登録自体は既に完了しているため、Git Data APIへ自動フォールバックする。
-        err = str(result.get("message", put_status))
-        ok2, msg2 = _v281_push_large_file_via_git_data_api(snapshot_bytes, commit_message)
-        if ok2:
-            return True, msg2
-        # Git Data APIでもbase64化した単発payloadが大き過ぎる環境では、4MB単位の分割保存へ退避。
-        ok3, msg3 = _v282_push_chunked_db(snapshot_bytes, commit_message)
-        if ok3:
-            return True, msg3
-        return False, f"DB登録成功｜GitHub保存失敗: {err}｜大容量保存も失敗: {msg2}｜分割保存も失敗: {msg3}"
-    return True, f"DB登録成功｜GitHub保存成功（{len(snapshot_bytes)/1024/1024:.1f}MB）"
+    # GitHub current manifestの主要件数と比較。
+    remote_ok,remote_manifest,remote_msg=_v283_get_chunk_manifest(branch=db_branch,previous=False)
+    if remote_ok:
+        remote_fp=(remote_manifest or {}).get("stats") or {}
+        cmp=_v283_compare_db_fingerprints(local_fp,remote_fp)
+        if not cmp.get("safe"):
+            return False,(
+                "GitHub保存を中止しました。現在DBはGitHub上の最新DBよりデータが減っています。"
+                " 巻き戻り防止のため自動上書きしません。まずDB統合を行ってください。\\n- "
+                +"\\n- ".join(cmp.get("regressions") or [])
+            )
+    elif remote_msg!="manifestなし":
+        return False,"GitHub保存前の世代確認に失敗しました: "+str(remote_msg)
 
+    # Ver283ではDB保存経路をmanifest付きA/B分割保存へ一本化。
+    # main DBファイル・Git Data APIの別経路を使わず、current manifestとのズレを防ぐ。
+    return _v282_push_chunked_db(
+        snapshot_bytes,commit_message,
+        fingerprint=local_fp,
+    )
 
 
 # Ver276 DB安全化: 起動時にGitHub DBで現在DBを自動上書きしない。
@@ -12416,6 +12583,14 @@ with st.sidebar:
         c1.metric("登録選手", display_players)
         c2.metric("登録履歴", display_history)
         st.caption(f"DB容量: {summary.get('size', 0) / 1024 / 1024:.2f} MB")
+        try:
+            _gm_ok283,_gm283,_=_v283_get_chunk_manifest(previous=False)
+            if _gm_ok283:
+                _g283=int((_gm283 or {}).get("generation") or 0)
+                _s283=str((_gm283 or {}).get("slot") or "?")
+                st.caption(f"GitHub DB世代: {_g283} / 保管slot: {_s283}（欠損ガード有効）")
+        except Exception:
+            pass
         db_path = Path(engine.DB_PATH)
         if db_path.exists():
             st.download_button(
