@@ -12272,6 +12272,15 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"DB整合スナップショット作成エラー: {type(exc).__name__}: {exc}"
 
+    # Ver283安全ガード: 壊れたSQLiteをGitHubへ上書きしない。
+    # integrity_checkだけでなくsqlite_master全件読取まで行う既存validatorを必須化。
+    _v283_ok, _v283_msg = _v276_validate_db_bytes(snapshot_bytes, "GitHub保存前DB")
+    if not _v283_ok:
+        return False, (
+            "GitHub保存を中止しました。現在のDBにSQLite異常があります。"
+            " GitHub上の正常DBは上書きしていません。\n" + str(_v283_msg)
+        )
+
     cfg = github_config()
     ok_branch, db_branch = _v282_ensure_db_branch()
     if not ok_branch:
