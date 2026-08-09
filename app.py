@@ -2501,7 +2501,9 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             "app_version":_V231_APP_VERSION,"simulation_mode":_V231_SIMULATION_MODE,
             "settings_hash":_v231_settings_hash(trials,seed,excluded),
             "prediction_time":_v228_now_jst_iso(),"seed":seed,
-            "rerun_from_restored":False,"rerun_source_version":"","rerun_source_history_id":0,
+            "rerun_from_restored":bool(request_data.get("rerun_from_restored", False)),
+            "rerun_source_version":str(request_data.get("rerun_source_version") or ""),
+            "rerun_source_history_id":int(request_data.get("rerun_source_history_id") or 0),
             "background_prediction":True,
         }
         history_id=_v231_save_prediction_history(
@@ -2516,11 +2518,20 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
         result={
             "history_id":int(history_id or 0),"race_key":str(race_key),"race_label":str(label),
             "app_version":str(_V231_APP_VERSION),"timing":timing,
+            "rerun_from_restored":bool(request_data.get("rerun_from_restored", False)),
+            "rerun_source_version":str(request_data.get("rerun_source_version") or ""),
+            "rerun_source_history_id":int(request_data.get("rerun_source_history_id") or 0),
         }
         blob=zlib.compress(pickle.dumps(result,protocol=pickle.HIGHEST_PROTOCOL),level=6)
         _v278_bg_update(
             db_path,job_id,status="completed",finished_at=_v228_now_jst_iso(),done_count=4,total_count=4,
-            current_label="",message=f"予測完了：{label}",result_blob=sqlite3.Binary(blob)
+            current_label="",
+            message=(
+                f"復元内容の再シミュレーション完了：{label}"
+                if bool(request_data.get("rerun_from_restored", False))
+                else f"予測完了：{label}"
+            ),
+            result_blob=sqlite3.Binary(blob)
         )
         _v279_send_bg_prediction_complete_notification(result)
     except Exception as exc:
@@ -2540,7 +2551,8 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
 
 
 def _v279_bg_prediction_start(
-    db_path: str, raw_text: str, venue_override: str, trials: int, seed: int, excluded: list[int]
+    db_path: str, raw_text: str, venue_override: str, trials: int, seed: int, excluded: list[int],
+    rerun_from_restored: bool = False, rerun_source_version: str = "", rerun_source_history_id: int = 0,
 ) -> dict:
     _v278_bg_ensure_table(db_path)
     if _v279_bg_prediction_any_active(db_path):
@@ -2548,20 +2560,28 @@ def _v279_bg_prediction_start(
     if not str(raw_text or "").strip():
         return {"ok":False,"reason":"出走表が空です。"}
     now=_v228_now_jst_iso()
+    job_type = "restored_rerun_prediction" if bool(rerun_from_restored) else "normal_prediction"
+    start_message = (
+        "復元内容のバックグラウンド再シミュレーションを開始します。"
+        if bool(rerun_from_restored) else "バックグラウンド予測を開始します。"
+    )
     with sqlite3.connect(str(db_path),timeout=30.0) as con:
         con.execute("PRAGMA busy_timeout=30000")
         cur=con.execute("""
             INSERT INTO v278_background_jobs(
                 job_type,app_version,status,created_at,updated_at,limit_count,force_current,
                 done_count,total_count,current_label,message
-            ) VALUES ('normal_prediction',?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """,(
-            str(_V231_APP_VERSION),"queued",now,now,1,0,0,4,"準備中","バックグラウンド予測を開始します。"
+            job_type,str(_V231_APP_VERSION),"queued",now,now,1,0,0,4,"準備中",start_message
         ))
         con.commit(); job_id=int(cur.lastrowid or 0)
     request_data={
         "raw_text":str(raw_text),"venue_override":str(venue_override or ""),"trials":int(trials),
         "seed":int(seed),"excluded":[int(x) for x in (excluded or [])],
+        "rerun_from_restored":bool(rerun_from_restored),
+        "rerun_source_version":str(rerun_source_version or ""),
+        "rerun_source_history_id":int(rerun_source_history_id or 0),
     }
     th=threading.Thread(
         target=_v279_bg_prediction_worker,args=(str(db_path),job_id,request_data),daemon=True,
@@ -11045,7 +11065,67 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
         with sqlite3.connect(db_path) as con:
             df = pd.read_sql_query(query, con)
     except Exception:
-        return pd.DataFrame()
+        # Ver280: 旧DB・途中移行DBでも回収率実績を消さない。
+        fallback_query = """
+            WITH latest AS (
+                SELECT r.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''), 'Unknown')
+                           ORDER BY datetime(r.created_at) DESC, r.rowid DESC
+                       ) AS rn
+                FROM v187_mixed_plan_runs r
+            )
+            SELECT l.race_key,
+                   COALESCE(NULLIF(l.race_date,''), rr.race_date) AS race_date,
+                   COALESCE(NULLIF(l.venue,''), rr.venue) AS venue,
+                   COALESCE(NULLIF(l.race_no,''), rr.race_no) AS race_no,
+                   l.app_version, l.logic_version, l.points, l.cost_yen,
+                   l.grade, l.model_return_rate, l.created_at,
+                   f.hit, f.black_hit, f.gami_hit, f.payout_yen,
+                   f.return_rate, f.evaluated_at
+            FROM latest l
+            LEFT JOIN result_races rr ON rr.race_key=l.race_key
+            JOIN v187_mixed_plan_feedback f
+              ON f.race_key=l.race_key AND f.plan_hash=l.plan_hash
+            WHERE l.rn=1 AND f.return_rate IS NOT NULL
+        """
+        try:
+            with sqlite3.connect(db_path) as con:
+                df = pd.read_sql_query(fallback_query, con)
+        except Exception:
+            return pd.DataFrame()
+    if df.empty:
+        evaluated_latest_query = """
+            WITH evaluated AS (
+                SELECT r.*, f.hit, f.black_hit, f.gami_hit,
+                       f.payout_yen, f.return_rate, f.evaluated_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''), 'Unknown')
+                           ORDER BY datetime(f.evaluated_at) DESC, datetime(r.created_at) DESC, r.rowid DESC
+                       ) AS rn
+                FROM v187_mixed_plan_runs r
+                JOIN v187_mixed_plan_feedback f
+                  ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                WHERE f.return_rate IS NOT NULL
+                  AND COALESCE(r.include_in_live_stats,1)=1
+            )
+            SELECT e.race_key,
+                   COALESCE(NULLIF(e.race_date,''), rr.race_date) AS race_date,
+                   COALESCE(NULLIF(e.venue,''), rr.venue) AS venue,
+                   COALESCE(NULLIF(e.race_no,''), rr.race_no) AS race_no,
+                   e.app_version, e.logic_version, e.points, e.cost_yen,
+                   e.grade, e.model_return_rate, e.created_at,
+                   e.hit, e.black_hit, e.gami_hit, e.payout_yen,
+                   e.return_rate, e.evaluated_at
+            FROM evaluated e
+            LEFT JOIN result_races rr ON rr.race_key=e.race_key
+            WHERE e.rn=1
+        """
+        try:
+            with sqlite3.connect(db_path) as con:
+                df = pd.read_sql_query(evaluated_latest_query, con)
+        except Exception:
+            pass
     if df.empty:
         return df
     df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
@@ -11127,7 +11207,21 @@ def _v215_render_return_dashboard(db_path: str) -> None:
     st.caption("各レース・各バージョンで最後に保存されたプランを、予測時点の買い目のまま別々に集計します。新版を再シミュレーションしても旧版の実績は残ります。")
     df = _v215_return_dashboard_rows(db_path)
     if df.empty:
-        st.info("結果まで照合済みの回収率重視プランがまだありません。今後の予測では買い目・オッズ・確率・バージョンを自動保存します。")
+        _plans280=_feedback280=0
+        try:
+            with sqlite3.connect(db_path) as _c280:
+                _plans280=int(_c280.execute("SELECT COUNT(*) FROM v187_mixed_plan_runs").fetchone()[0] or 0)
+                _feedback280=int(_c280.execute("SELECT COUNT(*) FROM v187_mixed_plan_feedback WHERE return_rate IS NOT NULL").fetchone()[0] or 0)
+        except Exception:
+            pass
+        if _feedback280 > 0:
+            st.warning(
+                f"照合済み実績はDBに{_feedback280}件ありますが、集計表示に一致しませんでした。データ自体は消していません。"
+            )
+        else:
+            st.info(
+                f"回収率プラン保存 {_plans280}件 / 結果照合済み {_feedback280}件。照合済みプランができるとここに実績を表示します。"
+            )
         return
 
     venues = sorted([str(v) for v in df["venue"].dropna().unique() if str(v)])
@@ -12133,6 +12227,29 @@ elif selected_main_page == "🏁 予測":
                 f"▶ 復元内容を{_V231_APP_VERSION}で再シミュレーション",
                 type="primary", use_container_width=True, key="v261_rerun_current_version", disabled=bool(_v279_bg_active)
             )
+        _bg_rerun_clicked = st.button(
+            f"⏳ 復元内容を{_V231_APP_VERSION}でバックグラウンド再シミュレーション",
+            use_container_width=True, key="v280_bg_rerun_current_version", disabled=bool(_v279_bg_active)
+        )
+        if _bg_rerun_clicked:
+            _src_ver_bg = str(_restored_view_for_rerun.get("_v231_source_app_version") or _restored_view_for_rerun.get("app_version") or "Unknown")
+            _src_hid_bg = int(_restored_view_for_rerun.get("_v261_restore_source_history_id") or 0)
+            _bgstart = _v279_bg_prediction_start(
+                engine.DB_PATH, text, prediction_venue_override, int(trials), int(seed),
+                [int(x) for x in manual_excluded],
+                rerun_from_restored=True,
+                rerun_source_version=_src_ver_bg,
+                rerun_source_history_id=_src_hid_bg,
+            )
+            if _bgstart.get("ok"):
+                st.session_state["v279_bg_loaded_job_id"] = 0
+                st.success(
+                    f"{_src_ver_bg}の復元内容を{_V231_APP_VERSION}でバックグラウンド再シミュレーション開始しました"
+                    f"（ジョブID: {_bgstart.get('job_id')}）。他の画面へ移動できます。"
+                )
+                st.rerun()
+            else:
+                st.warning(str(_bgstart.get("reason") or "バックグラウンド再シミュレーションを開始できませんでした。"))
         if _normal_clicked or _rerun_clicked:
             st.session_state["_v276_prediction_run_request"] = {"rerun_requested": bool(_rerun_clicked)}
             st.rerun()
