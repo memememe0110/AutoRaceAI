@@ -9060,6 +9060,48 @@ def _v187_norm_combo(bet_type: str, combo: str) -> str:
     return "-".join(nums)
 
 
+
+def _v282_is_full_refund_race(con, race_key: str) -> bool:
+    """結果DB上で全券種が『全返還』になっているレースを判定する。"""
+    try:
+        rows = con.execute(
+            "SELECT bet_type, combination, payout_yen FROM result_payouts WHERE race_key=?",
+            (str(race_key),),
+        ).fetchall()
+        if not rows:
+            return False
+        combos = [str(r["combination"] if hasattr(r, "keys") else r[1] or "").strip() for r in rows]
+        return bool(combos) and all("全返還" in x for x in combos if x) and all(bool(x) for x in combos)
+    except Exception:
+        return False
+
+
+def _v282_write_full_refund_feedback(con, plan) -> None:
+    """全返還は投資額=払戻額、回収率100%。的中/外れ判定には加えない。"""
+    tickets = con.execute(
+        "SELECT * FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?",
+        (plan["race_key"], plan["plan_hash"]),
+    ).fetchall()
+    cost = int(plan["cost_yen"] or len(tickets) * 100)
+    unit = int(round(cost / len(tickets))) if tickets else 0
+    for t in tickets:
+        con.execute("""
+            INSERT OR REPLACE INTO v187_mixed_ticket_feedback
+            (race_key,plan_hash,bet_type,combination,hit,payout_yen)
+            VALUES (?,?,?,?,?,?)
+        """, (plan["race_key"], plan["plan_hash"], t["bet_type"], t["combination"], 0, unit))
+    con.execute("""
+        INSERT OR REPLACE INTO v187_mixed_plan_feedback
+        (race_key,plan_hash,hit,black_hit,gami_hit,payout_yen,cost_yen,
+         realized_multiple,return_rate,winning_types,evaluated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        plan["race_key"], plan["plan_hash"], 0, 0, 0,
+        cost, cost, 1.0, 100.0,
+        json.dumps(["全返還"], ensure_ascii=False), _v228_now_jst_iso()
+    ))
+
+
 def _v187_sync_mixed_feedback(db_path: str) -> int:
     """結果登録済みプランを照合。戻り値は今回新しく評価した件数。"""
     _v187_ensure_mixed_learning_tables(db_path)
@@ -9071,10 +9113,24 @@ def _v187_sync_mixed_feedback(db_path: str) -> int:
             LEFT JOIN v187_mixed_plan_feedback f
               ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
             WHERE f.race_key IS NULL
-              AND EXISTS (SELECT 1 FROM result_races rr WHERE rr.race_key=r.race_key
-                          AND COALESCE(rr.learning_eligible,1)=1)
+              AND EXISTS (
+                    SELECT 1 FROM result_races rr
+                    WHERE rr.race_key=r.race_key
+                      AND (
+                            COALESCE(rr.learning_eligible,1)=1
+                            OR EXISTS (
+                                SELECT 1 FROM result_payouts rp
+                                WHERE rp.race_key=r.race_key
+                                  AND COALESCE(rp.combination,'') LIKE '%全返還%'
+                            )
+                      )
+              )
         """).fetchall()
         for plan in plans:
+            if _v282_is_full_refund_race(con, plan["race_key"]):
+                _v282_write_full_refund_feedback(con, plan)
+                done += 1
+                continue
             payouts = con.execute(
                 "SELECT bet_type, combination, payout_yen FROM result_payouts WHERE race_key=?",
                 (plan["race_key"],),
@@ -9126,6 +9182,10 @@ def _v212_recalculate_plan_feedback(db_path: str, race_key: str, plan_hash: str)
             (race_key, plan_hash),
         ).fetchone()
         if plan is None:
+            return
+        if _v282_is_full_refund_race(con, race_key):
+            _v282_write_full_refund_feedback(con, plan)
+            con.commit()
             return
         payouts = con.execute(
             "SELECT bet_type, combination, payout_yen FROM result_payouts WHERE race_key=?",
@@ -9212,6 +9272,8 @@ def _v208_latest_mixed_plan_result(race_key: str, db_path: str) -> dict:
             ORDER BY CASE t.bet_type WHEN '3連単' THEN 1 WHEN '3連複' THEN 2 WHEN '2連単' THEN 3 WHEN '2連複' THEN 4 WHEN 'ワイド' THEN 5 WHEN '単勝' THEN 6 WHEN '複勝' THEN 7 ELSE 9 END, t.combination
         """, (race_key, plan["plan_hash"])).fetchall()
     evaluated = plan["return_rate"] is not None
+    _winning_types_text = str(plan["winning_types"] or "") if "winning_types" in plan.keys() else ""
+    full_refund = "全返還" in _winning_types_text
     hit_tickets = [dict(t) for t in tickets if int(t["hit"] or 0) == 1]
     cost = int(plan["cost_yen"] or len(tickets) * 100)
     payout = int(plan["payout_yen"] or 0) if evaluated else 0
@@ -9230,6 +9292,7 @@ def _v208_latest_mixed_plan_result(race_key: str, db_path: str) -> dict:
         "profit_yen": payout - cost if evaluated else None,
         "return_rate": float(plan["return_rate"] or 0.0) if evaluated else None,
         "hit": bool(plan["hit"]) if evaluated else False,
+        "full_refund": bool(full_refund),
         "black_hit": bool(plan["black_hit"]) if evaluated else False,
         "gami_hit": bool(plan["gami_hit"]) if evaluated else False,
         "hit_tickets": hit_tickets,
@@ -9249,10 +9312,13 @@ def _v208_render_mixed_plan_result(result: dict) -> None:
     if not result.get("evaluated"):
         st.warning("プランは保存されていますが、払戻金との照合がまだ完了していません。")
         return
+    full_refund = bool(result.get("full_refund"))
     hit = bool(result.get("hit"))
     black = bool(result.get("black_hit"))
     gami = bool(result.get("gami_hit"))
-    if not hit:
+    if full_refund:
+        verdict = "↩ 全返還"
+    elif not hit:
         verdict = "× 外れ"
     elif black:
         verdict = "◎ 的中・黒字"
@@ -9268,7 +9334,9 @@ def _v208_render_mixed_plan_result(result: dict) -> None:
     profit = int(result.get("profit_yen") or 0)
     st.metric("収支", f"{profit:+,}円")
     hit_tickets = result.get("hit_tickets") or []
-    if hit_tickets:
+    if full_refund:
+        st.caption("このレースは全返還です。投資額と同額を返還し、回収率100%として記録します。的中率・買い目学習には使用しません。")
+    elif hit_tickets:
         rows=[]
         for t in hit_tickets:
             rows.append({
@@ -9298,6 +9366,7 @@ def _v187_learning_profile(db_path: str) -> dict:
             JOIN v187_mixed_plan_runs r
               ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
             WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
         """).fetchone()
         if row and int(row[0] or 0)>0:
             out.update(samples=int(row[0]), hit_rate=float(row[1] or 0), black_rate=float(row[2] or 0),
@@ -9307,7 +9376,10 @@ def _v187_learning_profile(db_path: str) -> dict:
             FROM v187_mixed_ticket_feedback tf
             JOIN v187_mixed_plan_runs r
               ON r.race_key=tf.race_key AND r.plan_hash=tf.plan_hash
+            JOIN v187_mixed_plan_feedback pf
+              ON pf.race_key=tf.race_key AND pf.plan_hash=tf.plan_hash
             WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND COALESCE(pf.winning_types,'') NOT LIKE '%全返還%'
             GROUP BY tf.bet_type
         """).fetchall()
         for bet_type,n,hit_rate,avg_payout in rows:
@@ -11404,7 +11476,7 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                     r.logic_version, r.points, r.cost_yen, r.grade,
                     r.model_return_rate, r.created_at,
                     f.hit, f.black_hit, f.gami_hit, f.payout_yen,
-                    f.return_rate, f.evaluated_at,
+                    f.return_rate, f.winning_types, f.evaluated_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''),'Unknown')
                         ORDER BY datetime(f.evaluated_at) DESC,
@@ -11420,7 +11492,7 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
             )
             SELECT race_key,race_date,venue,race_no,app_version,logic_version,
                    points,cost_yen,grade,model_return_rate,created_at,
-                   hit,black_hit,gami_hit,payout_yen,return_rate,evaluated_at
+                   hit,black_hit,gami_hit,payout_yen,return_rate,winning_types,evaluated_at
             FROM evaluated
             WHERE rn=1
             ORDER BY race_date,venue,CAST(race_no AS INTEGER),app_version
@@ -11442,6 +11514,7 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
     df["推奨区分"] = df["grade"].fillna("").astype(str).apply(
         lambda x: "非推奨" if ("非推奨" in x or "⛔" in x) else "推奨"
     )
+    df["全返還"] = df.get("winning_types", "").fillna("").astype(str).str.contains("全返還", regex=False)
     return df
 
 
@@ -11453,12 +11526,13 @@ def _v216_summary_values(df: pd.DataFrame) -> dict:
                     "hit_rate": None, "black_rate": None, "gami_rate": None}
         cost = float(pd.to_numeric(part["cost_yen"], errors="coerce").fillna(0).sum())
         payout = float(pd.to_numeric(part["payout_yen"], errors="coerce").fillna(0).sum())
+        judged = part[~part.get("全返還", pd.Series(False, index=part.index)).fillna(False).astype(bool)]
         return {
             "races": int(len(part)), "cost": int(cost), "payout": int(payout),
             "profit": int(payout - cost), "return": (payout / cost * 100.0) if cost > 0 else None,
-            "hit_rate": float(pd.to_numeric(part["hit"], errors="coerce").fillna(0).mean() * 100.0),
-            "black_rate": float(pd.to_numeric(part["black_hit"], errors="coerce").fillna(0).mean() * 100.0),
-            "gami_rate": float(pd.to_numeric(part["gami_hit"], errors="coerce").fillna(0).mean() * 100.0),
+            "hit_rate": (float(pd.to_numeric(judged["hit"], errors="coerce").fillna(0).mean() * 100.0) if not judged.empty else None),
+            "black_rate": (float(pd.to_numeric(judged["black_hit"], errors="coerce").fillna(0).mean() * 100.0) if not judged.empty else None),
+            "gami_rate": (float(pd.to_numeric(judged["gami_hit"], errors="coerce").fillna(0).mean() * 100.0) if not judged.empty else None),
         }
     return {
         "全レース": one(df),
@@ -11471,8 +11545,10 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
     if df.empty:
         return pd.DataFrame()
     work = df.copy()
+    work["判定対象"] = (~work.get("全返還", pd.Series(False, index=work.index)).fillna(False).astype(bool)).astype(int)
     grouped = work.groupby(group_cols, dropna=False).agg(
         レース数=("race_key", "count"),
+        判定対象レース数=("判定対象", "sum"),
         的中数=("hit", "sum"),
         黒字数=("black_hit", "sum"),
         ガミ数=("gami_hit", "sum"),
@@ -11480,8 +11556,8 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
         払戻額=("payout_yen", "sum"),
         収支=("収支", "sum"),
     ).reset_index()
-    grouped["的中率"] = grouped["的中数"] / grouped["レース数"].clip(lower=1) * 100.0
-    grouped["黒字率"] = grouped["黒字数"] / grouped["レース数"].clip(lower=1) * 100.0
+    grouped["的中率"] = grouped["的中数"] / grouped["判定対象レース数"].replace(0, pd.NA) * 100.0
+    grouped["黒字率"] = grouped["黒字数"] / grouped["判定対象レース数"].replace(0, pd.NA) * 100.0
     grouped["回収率"] = grouped["払戻額"] / grouped["購入額"].replace(0, pd.NA) * 100.0
 
     # 同じ集計単位について、非推奨を除いた成績を横並びにする。
@@ -11489,6 +11565,7 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
     if not recommended.empty:
         rec = recommended.groupby(group_cols, dropna=False).agg(
             推奨レース数=("race_key", "count"),
+            推奨判定対象レース数=("判定対象", "sum"),
             推奨的中数=("hit", "sum"),
             推奨黒字数=("black_hit", "sum"),
             推奨ガミ数=("gami_hit", "sum"),
@@ -11497,8 +11574,8 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
             推奨収支=("収支", "sum"),
         ).reset_index()
         rec["非推奨除外回収率"] = rec["推奨払戻額"] / rec["推奨購入額"].replace(0, pd.NA) * 100.0
-        rec["非推奨除外的中率"] = rec["推奨的中数"] / rec["推奨レース数"].clip(lower=1) * 100.0
-        rec["非推奨除外黒字率"] = rec["推奨黒字数"] / rec["推奨レース数"].clip(lower=1) * 100.0
+        rec["非推奨除外的中率"] = rec["推奨的中数"] / rec["推奨判定対象レース数"].replace(0, pd.NA) * 100.0
+        rec["非推奨除外黒字率"] = rec["推奨黒字数"] / rec["推奨判定対象レース数"].replace(0, pd.NA) * 100.0
         keep = group_cols + ["推奨レース数", "非推奨除外回収率", "非推奨除外的中率", "非推奨除外黒字率", "推奨収支"]
         grouped = grouped.merge(rec[keep], on=group_cols, how="left")
     else:
@@ -11570,11 +11647,17 @@ def _v215_render_return_dashboard(db_path: str) -> None:
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("**全レース**")
-        st.caption(f"的中率 {all_s['hit_rate']:.1f}% / 黒字率 {all_s['black_rate']:.1f}% / ガミ率 {all_s['gami_rate']:.1f}% / 収支 {all_s['profit']:+,}円")
+        st.caption(
+            f"的中率 {all_s['hit_rate']:.1f}% / 黒字率 {all_s['black_rate']:.1f}% / ガミ率 {all_s['gami_rate']:.1f}% / 収支 {all_s['profit']:+,}円"
+            if all_s['hit_rate'] is not None else f"的中判定対象なし / 収支 {all_s['profit']:+,}円"
+        )
     with c2:
         st.markdown("**推奨のみ（非推奨除外）**")
         if rec_s['races']:
-            st.caption(f"{rec_s['races']}R・的中率 {rec_s['hit_rate']:.1f}% / 黒字率 {rec_s['black_rate']:.1f}% / ガミ率 {rec_s['gami_rate']:.1f}% / 収支 {rec_s['profit']:+,}円")
+            st.caption(
+                f"{rec_s['races']}R・的中率 {rec_s['hit_rate']:.1f}% / 黒字率 {rec_s['black_rate']:.1f}% / ガミ率 {rec_s['gami_rate']:.1f}% / 収支 {rec_s['profit']:+,}円"
+                if rec_s['hit_rate'] is not None else f"{rec_s['races']}R・的中判定対象なし / 収支 {rec_s['profit']:+,}円"
+            )
         else:
             st.caption("該当なし")
     with c3:
@@ -13625,7 +13708,7 @@ if selected_main_page == "✅ 結果登録・解析":
     if no_contest_r:
         st.write("解析したレース情報", meta_r)
         st.error("🚫 レース不成立・全返還")
-        st.info("着順・競走タイム・STは登録せず、選手履歴・予測評価・重み学習の対象外として保存します。")
+        st.info("着順・競走タイム・STは登録せず、選手履歴・予測評価・重み学習の対象外として保存します。回収率は投資額=返還額の100%で記録します。")
         if isinstance(payouts_r, pd.DataFrame) and not payouts_r.empty:
             st.subheader("全返還")
             st.dataframe(payouts_r, use_container_width=True, hide_index=True)
