@@ -48,6 +48,7 @@ _V284_GITHUB_RECOVERY_PUSH_PATCH = "2026-08-09-v1"
 _V284_UPLOAD_MASTER_PIN_PATCH = "2026-08-09-v1"
 _V284_GITHUB_READBACK_VERIFY_PATCH = "2026-08-09-v1"
 _V284_GITHUB_RAW_READBACK_PATCH = "2026-08-09-v1"
+_V284_GITHUB_RAW_TOKEN_FIX = "2026-08-09-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -12519,7 +12520,11 @@ def _v282_push_chunked_db(
                         try:
                             _req284=urllib.request.Request(
                                 str(_dl284),
-                                headers={"Authorization":f"Bearer {token}","Accept":"application/octet-stream","User-Agent":"AutoRaceAI"}
+                                headers={
+                                    **({"Authorization":f"Bearer {cfg.get('token')}"} if cfg.get("token") else {}),
+                                    "Accept":"application/octet-stream",
+                                    "User-Agent":"AutoRaceAI",
+                                }
                             )
                             with urllib.request.urlopen(_req284,timeout=45) as _r284:
                                 _got284=_r284.read()
@@ -12532,7 +12537,11 @@ def _v282_push_chunked_db(
                         _raw284=repo_api+_enc284+"?ref="+urllib.parse.quote(branch)
                         _req284=urllib.request.Request(
                             _raw284,
-                            headers={"Authorization":f"Bearer {token}","Accept":"application/vnd.github.raw+json","User-Agent":"AutoRaceAI"}
+                            headers={
+                                **({"Authorization":f"Bearer {cfg.get('token')}"} if cfg.get("token") else {}),
+                                "Accept":"application/vnd.github.raw+json",
+                                "User-Agent":"AutoRaceAI",
+                            }
                         )
                         with urllib.request.urlopen(_req284,timeout=45) as _r284:
                             _got284=_r284.read()
