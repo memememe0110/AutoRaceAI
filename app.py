@@ -47,6 +47,7 @@ _V284_DOWNLOAD_SNAPSHOT_PATCH = "2026-08-09-v1"
 _V284_GITHUB_RECOVERY_PUSH_PATCH = "2026-08-09-v1"
 _V284_UPLOAD_MASTER_PIN_PATCH = "2026-08-09-v1"
 _V284_GITHUB_READBACK_VERIFY_PATCH = "2026-08-09-v1"
+_V284_GITHUB_RAW_READBACK_PATCH = "2026-08-09-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -12498,20 +12499,57 @@ def _v282_push_chunked_db(
             _enc284=urllib.parse.quote(_cp284,safe="/")
             _url284=repo_api+_enc284+"?ref="+urllib.parse.quote(branch)
             _s284,_obj284=github_request(_url284)
-            if _s284==200 and isinstance(_obj284,dict) and _obj284.get("content"):
-                try:
-                    _got284=base64.b64decode(str(_obj284.get("content") or "").replace("\n",""))
-                    _same_size284=len(_got284)==len(_expected284)
-                    _same_sha284=hashlib.sha256(_got284).hexdigest()==hashlib.sha256(_expected284).hexdigest()
-                    if _same_size284 and _same_sha284:
-                        _verified_chunks284.append(_got284)
-                        _verified284=True
-                        break
-                    _last284=f"size {len(_got284)}/{len(_expected284)}, sha一致={_same_sha284}"
-                except Exception as _exc284:
-                    _last284=f"{type(_exc284).__name__}: {_exc284}"
+            _got284=None
+            _method284=""
+
+            # Contents APIは大きいファイルでHTTP 200でも content が空/省略されることがある。
+            # contentが実在する時だけbase64を使い、無い場合は download_url → raw API の順で取得する。
+            if _s284==200 and isinstance(_obj284,dict):
+                _content284=_obj284.get("content")
+                if _content284:
+                    try:
+                        _got284=base64.b64decode(str(_content284).replace("\n",""))
+                        _method284="contents-base64"
+                    except Exception as _exc284:
+                        _last284=f"contents decode {type(_exc284).__name__}: {_exc284}"
+
+                if _got284 is None:
+                    _dl284=_obj284.get("download_url")
+                    if _dl284:
+                        try:
+                            _req284=urllib.request.Request(
+                                str(_dl284),
+                                headers={"Authorization":f"Bearer {token}","Accept":"application/octet-stream","User-Agent":"AutoRaceAI"}
+                            )
+                            with urllib.request.urlopen(_req284,timeout=45) as _r284:
+                                _got284=_r284.read()
+                            _method284="download_url"
+                        except Exception as _exc284:
+                            _last284=f"download_url {type(_exc284).__name__}: {_exc284}"
+
+                if _got284 is None:
+                    try:
+                        _raw284=repo_api+_enc284+"?ref="+urllib.parse.quote(branch)
+                        _req284=urllib.request.Request(
+                            _raw284,
+                            headers={"Authorization":f"Bearer {token}","Accept":"application/vnd.github.raw+json","User-Agent":"AutoRaceAI"}
+                        )
+                        with urllib.request.urlopen(_req284,timeout=45) as _r284:
+                            _got284=_r284.read()
+                        _method284="github-raw"
+                    except Exception as _exc284:
+                        _last284=f"raw {type(_exc284).__name__}: {_exc284}"
             else:
                 _last284=str((_obj284 or {}).get("message",_s284)) if isinstance(_obj284,dict) else str(_s284)
+
+            if _got284 is not None:
+                _same_size284=len(_got284)==len(_expected284)
+                _same_sha284=hashlib.sha256(_got284).hexdigest()==hashlib.sha256(_expected284).hexdigest()
+                if _same_size284 and _same_sha284:
+                    _verified_chunks284.append(_got284)
+                    _verified284=True
+                    break
+                _last284=f"{_method284}: size {len(_got284)}/{len(_expected284)}, sha一致={_same_sha284}"
             _time284.sleep(0.35)
         if not _verified284:
             return False,(
