@@ -44,6 +44,7 @@ _V231_APP_VERSION = "Ver284"  # Ver280: 川口4日実測ベースの予測改善
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
 _V284_TRANSITION_AUDIT_PATCH = "2026-08-09-v1"
 _V284_DOWNLOAD_SNAPSHOT_PATCH = "2026-08-09-v1"
+_V284_GITHUB_RECOVERY_PUSH_PATCH = "2026-08-09-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -12421,6 +12422,7 @@ def _v282_push_chunked_db(
     snapshot_bytes: bytes, commit_message: str,
     chunk_size: int = 4 * 1024 * 1024,
     fingerprint: dict | None = None,
+    preserve_previous_manifest: bool = False,
 ) -> tuple[bool, str]:
     """Ver283: DBをA/B二世代スロットで分割保存する。
 
@@ -12490,8 +12492,9 @@ def _v282_push_chunked_db(
         "commit_message":str(commit_message),
     }
 
-    # 現在世代をpreviousへ退避してから、最後にcurrent manifestを切り替える。
-    if current_ok and current_manifest:
+    # 通常時は現在世代をpreviousへ退避。
+    # Ver284復旧保存時はcurrent分割実体が壊れているため、正常なprevious manifestを上書きしない。
+    if current_ok and current_manifest and not preserve_previous_manifest:
         prev_bytes=json.dumps(current_manifest,ensure_ascii=False,sort_keys=True).encode("utf-8")
         ok,msg=put_file(
             base_path+".chunks.previous.json",prev_bytes,
@@ -12769,8 +12772,37 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
         if _rpush284=="unknown":
             return False,"GitHub保存を中止しました。端末DBとGitHub DBの包含関係を安全確認できません。"
         # equal / 端末がGitHubを完全包含 の場合のみ保存可能
-    elif _remote_chunk_msg284!="manifestなし":
-        return False,"GitHub保存前のcurrent DB取得に失敗しました: "+str(_remote_chunk_msg284)
+    _recovery_push284=False
+    _recovery_reason284=""
+    if not _remote_chunk_ok284 and _remote_chunk_msg284!="manifestなし":
+        # Ver284: current分割実体が壊れていても、manifestの保護件数とprevious世代を使って
+        # ローカルDBが後退していないことを二重確認できる場合だけ復旧保存を許可する。
+        _cur_ok284,_cur_manifest284,_cur_msg284=_v283_get_chunk_manifest(branch=db_branch,previous=False)
+        _prev_ok284,_prev_manifest284,_prev_msg284=_v283_get_chunk_manifest(branch=db_branch,previous=True)
+        if not _cur_ok284:
+            return False,"GitHub保存前のcurrent DB取得に失敗し、current manifestも確認できません: "+str(_remote_chunk_msg284)
+        _cur_fp284=(_cur_manifest284 or {}).get("stats") or {}
+        if not _cur_fp284.get("ok"):
+            return False,"GitHub保存を中止しました。壊れたcurrent DBのmanifest指紋が不完全で復旧判定できません。"
+        _cmp_cur284=_v283_compare_db_fingerprints(local_fp,_cur_fp284)
+        if not _cmp_cur284.get("safe"):
+            return False,(
+                "GitHub保存を中止しました。current分割DBは復元できず、"
+                "さらに現在DBがcurrent manifestの保護件数を満たしていません。\n- "
+                +"\n- ".join(map(str,_cmp_cur284.get("regressions") or []))
+            )
+        if _prev_ok284:
+            _prev_fp284=(_prev_manifest284 or {}).get("stats") or {}
+            if not _prev_fp284.get("ok"):
+                return False,"GitHub保存を中止しました。previous manifestのDB指紋が不完全です。"
+            _cmp_prev284=_v283_compare_db_fingerprints(local_fp,_prev_fp284)
+            if not _cmp_prev284.get("safe"):
+                return False,(
+                    "GitHub保存を中止しました。現在DBがprevious正常世代の保護件数を満たしていません。\n- "
+                    +"\n- ".join(map(str,_cmp_prev284.get("regressions") or []))
+                )
+        _recovery_push284=True
+        _recovery_reason284=str(_remote_chunk_msg284)
 
     # manifest件数ガードも補助的に残す。
     remote_ok,remote_manifest,remote_msg=_v283_get_chunk_manifest(branch=db_branch,previous=False)
@@ -12778,17 +12810,19 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
         remote_fp=(remote_manifest or {}).get("stats") or {}
         if not remote_fp.get("ok"):
             return False,"GitHub保存を中止しました。current manifestのDB指紋が不完全です。"
-        # previous世代は事故復旧用。currentとの行包含判定を主判定とし、
-        # previousの単純件数だけで正常な追加DBを拒否しない。
     elif remote_msg!="manifestなし":
         return False,"GitHub保存前の世代確認に失敗しました: "+str(remote_msg)
 
     # Ver283ではDB保存経路をmanifest付きA/B分割保存へ一本化。
-    # main DBファイル・Git Data APIの別経路を使わず、current manifestとのズレを防ぐ。
-    return _v282_push_chunked_db(
+    # 復旧時は壊れたcurrent manifestをpreviousへ退避せず、既存previousを温存する。
+    _ok_push284,_msg_push284=_v282_push_chunked_db(
         snapshot_bytes,commit_message,
         fingerprint=local_fp,
+        preserve_previous_manifest=bool(_recovery_push284),
     )
+    if _ok_push284 and _recovery_push284:
+        _msg_push284 += "｜current分割DB不整合から復旧保存（previous世代は温存）"
+    return _ok_push284,_msg_push284
 
 
 # Ver276 DB安全化: 起動時にGitHub DBで現在DBを自動上書きしない。
