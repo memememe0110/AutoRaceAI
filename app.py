@@ -34,11 +34,11 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver279"
+APP_VERSION = "Ver280"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = APP_VERSION
+_V231_APP_VERSION = "Ver280"  # Ver280: 川口4日実測ベースの予測改善
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -4349,7 +4349,7 @@ def _v268_handicap_bias_seconds(model: dict, handicap_value: float) -> float:
         h = float(handicap_value or 0.0)
         # error = actual - predicted。これを予測Tへそのまま加える。
         adj = float(model.get("intercept",0.0)) + float(model.get("slope",0.0))*h
-        return float(np.clip(adj, -0.032, 0.018))
+        return float(np.clip(adj, -0.050, 0.018))
     except Exception:
         return 0.0
 
@@ -4667,7 +4667,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         # これにより、以前の前残り評価が高い車を新シミュレーションでも過剰固定するのを防ぐ。
         # 旧予測確率を強く再利用すると、誤った本命が6周すべてで自己増幅する。
         # Ver239では旧確率を弱い事前分布へ落とし、試走・履歴・各試行の出来で展開を決める。
-        strength[c]=0.30*np.log(base+0.040)+bonus-(tt-3.40)*1.85
+        try:
+            _rn280_m=re.search(r"\d+", str((meta or {}).get("R") or (meta or {}).get("レース") or (meta or {}).get("race_no") or ""))
+            _rn280=int(_rn280_m.group()) if _rn280_m else 0
+        except Exception:
+            _rn280=0
+        _trial_weight280=1.55 if 1 <= _rn280 <= 8 else 1.85
+        strength[c]=0.30*np.log(base+0.040)+bonus-(tt-3.40)*_trial_weight280
         raw=np.mean([_v230_num(r.get(k),0.0) for k in ("混戦突破適性","展開適性点","実戦能力点") if k in r.index] or [0.0])
         breakthrough[c]=raw
     # 正規化
@@ -4726,7 +4732,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     }
     try:
         _trial_vals_v270 = [
-            float(v) for v in trial_map.values()
+            float(v) for v in trial.values()
             if v is not None and np.isfinite(float(v))
         ]
         _trial_median_v270 = float(np.median(_trial_vals_v270)) if _trial_vals_v270 else None
