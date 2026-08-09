@@ -1500,6 +1500,76 @@ def _v272_version_race_histories(db_path: str, versions: list[str]) -> dict:
     return out
 
 
+def _v280_saved_plan_exact_same_odds_score(
+    db_path: str, race_key: str, version: str,
+    shared_odds_maps: dict, shared_odds_run: dict,
+) -> dict:
+    """同レース・同Verに、共通最古オッズと完全一致する照合済みプランがあればそのまま採点値を返す。"""
+    out = {}
+    bet_key_map = {
+        "三連単":"3tan", "三連複":"3fuku",
+        "2連単":"2tansho", "2車単":"2tansho",
+        "2連複":"2fuku", "2車複":"2fuku",
+        "単勝":"tansho", "複勝":"fukusho", "ワイド":"wide",
+    }
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.row_factory = sqlite3.Row
+            plans = con.execute("""
+                SELECT r.plan_hash,r.points,r.cost_yen,
+                       f.hit,f.payout_yen,f.return_rate,
+                       f.evaluated_at,r.created_at
+                FROM v187_mixed_plan_runs r
+                JOIN v187_mixed_plan_feedback f
+                  ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                WHERE r.race_key=?
+                  AND COALESCE(NULLIF(r.app_version,''),'Unknown')=?
+                  AND f.return_rate IS NOT NULL
+                ORDER BY datetime(f.evaluated_at) DESC,
+                         datetime(r.created_at) DESC
+            """, (str(race_key), str(version))).fetchall()
+
+            for p in plans:
+                tickets = con.execute("""
+                    SELECT bet_type,combination,odds
+                    FROM v187_mixed_plan_tickets
+                    WHERE race_key=? AND plan_hash=?
+                """, (str(race_key), str(p["plan_hash"]))).fetchall()
+                if not tickets:
+                    continue
+                same = True
+                for tk in tickets:
+                    key = bet_key_map.get(str(tk["bet_type"] or ""))
+                    if not key:
+                        same = False
+                        break
+                    combo = str(tk["combination"] or "").strip()
+                    saved = (shared_odds_maps.get(key,{}) or {}).get(combo)
+                    try:
+                        if saved is None or abs(float(saved)-float(tk["odds"] or 0)) > 1e-6:
+                            same = False
+                            break
+                    except Exception:
+                        same = False
+                        break
+                if same:
+                    cost = int(p["cost_yen"] or int(p["points"] or 0)*100)
+                    payout = int(p["payout_yen"] or 0)
+                    return {
+                        "version": str(version), "race_key": str(race_key),
+                        "evaluated": True, "points": int(p["points"] or 0),
+                        "cost_yen": cost, "payout_yen": payout,
+                        "return_rate": float(p["return_rate"] or 0.0),
+                        "hit": bool(int(p["hit"] or 0)),
+                        "reason": "同一最古オッズの保存済み照合プラン",
+                        "odds_created_at": str((shared_odds_run or {}).get("created_at") or ""),
+                        "odds_snapshot_id": str((shared_odds_run or {}).get("snapshot_id") or ""),
+                    }
+    except Exception:
+        pass
+    return out
+
+
 def _v272_score_saved_history_same_odds(
     db_path: str,
     history_id: int,
@@ -1516,6 +1586,13 @@ def _v272_score_saved_history_same_odds(
         "odds_snapshot_id": str((shared_odds_run or {}).get("snapshot_id") or ""),
     }
     try:
+        _saved_same280 = _v280_saved_plan_exact_same_odds_score(
+            db_path, str(race_key), str(version), shared_odds_maps or {}, shared_odds_run or {}
+        )
+        if _saved_same280.get("evaluated"):
+            _saved_same280["history_id"] = int(history_id)
+            return _saved_same280
+
         view, raw_text, venue_override, hist_meta = _v231_load_prediction_history(db_path, int(history_id))
         if not isinstance(view, dict):
             out["reason"] = "保存予測を復元できません"
@@ -1575,7 +1652,7 @@ def _v272_score_saved_history_same_odds(
 
         try:
             _extra276=_v276_virtual_extra_all_odds_score(
-                db_path,str(race_key),bets,int(trials or 0),odds_maps,result or {},
+                db_path,str(race_key),bets,int(trials or 0),shared_odds_maps,result or {},
             )
             if _extra276.get("available"):
                 out["virtual_extra_points"]=int(_extra276.get("points",0) or 0)
@@ -8688,7 +8765,177 @@ def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
         ]:
             if col_name not in existing_cols:
                 con.execute(f"ALTER TABLE v187_mixed_plan_runs ADD COLUMN {col_name} {col_type}")
+        # Ver280: 比較・再評価処理の途中失敗で run が無い feedback が残るのを防ぐ。
+        # 既存の孤立データは削除前に退避し、正式な回収率集計からだけ外す。
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS v280_orphan_plan_feedback_archive (
+            race_key TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            hit INTEGER,
+            black_hit INTEGER,
+            gami_hit INTEGER,
+            payout_yen INTEGER,
+            cost_yen INTEGER,
+            realized_multiple REAL,
+            return_rate REAL,
+            winning_types TEXT,
+            evaluated_at TEXT,
+            archived_at TEXT NOT NULL,
+            archive_reason TEXT NOT NULL,
+            PRIMARY KEY (race_key, plan_hash)
+        );
+        CREATE TABLE IF NOT EXISTS v280_orphan_ticket_feedback_archive (
+            race_key TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            bet_type TEXT NOT NULL,
+            combination TEXT NOT NULL,
+            hit INTEGER,
+            payout_yen INTEGER,
+            archived_at TEXT NOT NULL,
+            archive_reason TEXT NOT NULL,
+            PRIMARY KEY (race_key, plan_hash, bet_type, combination)
+        );
+        CREATE TABLE IF NOT EXISTS v280_orphan_plan_tickets_archive (
+            race_key TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            bet_type TEXT NOT NULL,
+            combination TEXT NOT NULL,
+            probability REAL,
+            odds REAL,
+            role TEXT,
+            archived_at TEXT NOT NULL,
+            archive_reason TEXT NOT NULL,
+            PRIMARY KEY (race_key, plan_hash, bet_type, combination)
+        );
+        """)
+        _archive_now = _v228_now_jst_iso()
+        # plan feedback
+        con.execute("""
+            INSERT OR IGNORE INTO v280_orphan_plan_feedback_archive
+            SELECT f.race_key,f.plan_hash,f.hit,f.black_hit,f.gami_hit,
+                   f.payout_yen,f.cost_yen,f.realized_multiple,f.return_rate,
+                   f.winning_types,f.evaluated_at,?,?
+            FROM v187_mixed_plan_feedback f
+            LEFT JOIN v187_mixed_plan_runs r
+              ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+            WHERE r.race_key IS NULL
+        """, (_archive_now, "runなしの孤立feedback"))
+        # ticket feedback
+        con.execute("""
+            INSERT OR IGNORE INTO v280_orphan_ticket_feedback_archive
+            SELECT f.race_key,f.plan_hash,f.bet_type,f.combination,
+                   f.hit,f.payout_yen,?,?
+            FROM v187_mixed_ticket_feedback f
+            LEFT JOIN v187_mixed_plan_runs r
+              ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+            WHERE r.race_key IS NULL
+        """, (_archive_now, "runなしの孤立ticket feedback"))
+        # plan tickets
+        con.execute("""
+            INSERT OR IGNORE INTO v280_orphan_plan_tickets_archive
+            SELECT t.race_key,t.plan_hash,t.bet_type,t.combination,
+                   t.probability,t.odds,t.role,?,?
+            FROM v187_mixed_plan_tickets t
+            LEFT JOIN v187_mixed_plan_runs r
+              ON r.race_key=t.race_key AND r.plan_hash=t.plan_hash
+            WHERE r.race_key IS NULL
+        """, (_archive_now, "runなしの孤立ticket"))
+
+        # 元データはアーカイブ済みなので、正式集計テーブルからのみ除外する。
+        con.execute("""
+            DELETE FROM v187_mixed_ticket_feedback
+            WHERE NOT EXISTS (
+                SELECT 1 FROM v187_mixed_plan_runs r
+                WHERE r.race_key=v187_mixed_ticket_feedback.race_key
+                  AND r.plan_hash=v187_mixed_ticket_feedback.plan_hash
+            )
+        """)
+        con.execute("""
+            DELETE FROM v187_mixed_plan_feedback
+            WHERE NOT EXISTS (
+                SELECT 1 FROM v187_mixed_plan_runs r
+                WHERE r.race_key=v187_mixed_plan_feedback.race_key
+                  AND r.plan_hash=v187_mixed_plan_feedback.plan_hash
+            )
+        """)
+        con.execute("""
+            DELETE FROM v187_mixed_plan_tickets
+            WHERE NOT EXISTS (
+                SELECT 1 FROM v187_mixed_plan_runs r
+                WHERE r.race_key=v187_mixed_plan_tickets.race_key
+                  AND r.plan_hash=v187_mixed_plan_tickets.plan_hash
+            )
+        """)
+
+        # 今後はrunが存在しない単独保存をDBレベルで拒否する。
+        con.executescript("""
+        CREATE TRIGGER IF NOT EXISTS v280_guard_plan_feedback_insert
+        BEFORE INSERT ON v187_mixed_plan_feedback
+        WHEN NOT EXISTS (
+            SELECT 1 FROM v187_mixed_plan_runs r
+            WHERE r.race_key=NEW.race_key AND r.plan_hash=NEW.plan_hash
+        )
+        BEGIN
+            SELECT RAISE(IGNORE);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS v280_guard_ticket_feedback_insert
+        BEFORE INSERT ON v187_mixed_ticket_feedback
+        WHEN NOT EXISTS (
+            SELECT 1 FROM v187_mixed_plan_runs r
+            WHERE r.race_key=NEW.race_key AND r.plan_hash=NEW.plan_hash
+        )
+        BEGIN
+            SELECT RAISE(IGNORE);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS v280_guard_plan_ticket_insert
+        BEFORE INSERT ON v187_mixed_plan_tickets
+        WHEN NOT EXISTS (
+            SELECT 1 FROM v187_mixed_plan_runs r
+            WHERE r.race_key=NEW.race_key AND r.plan_hash=NEW.plan_hash
+        )
+        BEGIN
+            SELECT RAISE(IGNORE);
+        END;
+        """)
         con.commit()
+
+
+def _v280_orphan_mixed_plan_audit(db_path: str) -> dict:
+    """回収率プランのrun/feedback整合性を表示用に確認する。"""
+    out={"orphan_plan_feedback":0,"orphan_ticket_feedback":0,"orphan_plan_tickets":0,
+         "archived_plan_feedback":0,"archived_ticket_feedback":0,"archived_plan_tickets":0}
+    try:
+        _v187_ensure_mixed_learning_tables(db_path)
+        with sqlite3.connect(str(db_path)) as con:
+            out["orphan_plan_feedback"]=int(con.execute("""
+                SELECT COUNT(*) FROM v187_mixed_plan_feedback f
+                LEFT JOIN v187_mixed_plan_runs r
+                  ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+                WHERE r.race_key IS NULL
+            """).fetchone()[0] or 0)
+            out["orphan_ticket_feedback"]=int(con.execute("""
+                SELECT COUNT(*) FROM v187_mixed_ticket_feedback f
+                LEFT JOIN v187_mixed_plan_runs r
+                  ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+                WHERE r.race_key IS NULL
+            """).fetchone()[0] or 0)
+            out["orphan_plan_tickets"]=int(con.execute("""
+                SELECT COUNT(*) FROM v187_mixed_plan_tickets t
+                LEFT JOIN v187_mixed_plan_runs r
+                  ON r.race_key=t.race_key AND r.plan_hash=t.plan_hash
+                WHERE r.race_key IS NULL
+            """).fetchone()[0] or 0)
+            for key,table in [
+                ("archived_plan_feedback","v280_orphan_plan_feedback_archive"),
+                ("archived_ticket_feedback","v280_orphan_ticket_feedback_archive"),
+                ("archived_plan_tickets","v280_orphan_plan_tickets_archive"),
+            ]:
+                out[key]=int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+    except Exception:
+        pass
+    return out
 
 
 def _v212_norm_bet_type(bet_type: str) -> str:
@@ -11031,106 +11278,65 @@ def secret_value(name: str, default: str = "") -> str:
 
 # Ver247管理修正2: 同一レースを新版で再予測しても、旧版を回収率比較から消さない。
 def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
-    """各レース・各バージョンの最新プランを採用し、結果済み実績を集計用DataFrameで返す。"""
-    _v187_ensure_mixed_learning_tables(db_path)
-    _v187_sync_mixed_feedback(db_path)
-    query = """
-        WITH latest AS (
-            SELECT r.*,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''), 'Unknown')
-                       ORDER BY datetime(r.created_at) DESC, r.rowid DESC
-                   ) AS rn
-            FROM v187_mixed_plan_runs r
-            WHERE COALESCE(r.include_in_live_stats,1)=1
-        )
-        SELECT l.race_key,
-               COALESCE(NULLIF(l.race_date,''), rr.race_date) AS race_date,
-               COALESCE(NULLIF(l.venue,''), rr.venue) AS venue,
-               COALESCE(NULLIF(l.race_no,''), rr.race_no) AS race_no,
-               l.app_version, l.logic_version, l.points, l.cost_yen,
-               l.grade, l.model_return_rate, l.created_at,
-               f.hit, f.black_hit, f.gami_hit, f.payout_yen,
-               f.return_rate, f.evaluated_at
-        FROM latest l
-        LEFT JOIN result_races rr ON rr.race_key=l.race_key
-        LEFT JOIN v187_mixed_plan_feedback f
-          ON f.race_key=l.race_key AND f.plan_hash=l.plan_hash
-        WHERE l.rn=1 AND f.return_rate IS NOT NULL
-        ORDER BY COALESCE(NULLIF(l.race_date,''), rr.race_date),
-                 COALESCE(NULLIF(l.venue,''), rr.venue),
-                 CAST(COALESCE(NULLIF(l.race_no,''), rr.race_no) AS INTEGER)
+    """各レース・各バージョンの最新「照合済み」プランを集計用DataFrameで返す。
+
+    Ver280表示修正:
+    最新保存プランが未照合でも、それ以前の同レース・同Verの照合済み実績を消さない。
+    feedback単独の孤立レコードは集計せず、runと結合できる正式プランだけを使う。
     """
     try:
-        with sqlite3.connect(db_path) as con:
-            df = pd.read_sql_query(query, con)
-    except Exception:
-        # Ver280: 旧DB・途中移行DBでも回収率実績を消さない。
-        fallback_query = """
-            WITH latest AS (
-                SELECT r.*,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''), 'Unknown')
-                           ORDER BY datetime(r.created_at) DESC, r.rowid DESC
-                       ) AS rn
-                FROM v187_mixed_plan_runs r
-            )
-            SELECT l.race_key,
-                   COALESCE(NULLIF(l.race_date,''), rr.race_date) AS race_date,
-                   COALESCE(NULLIF(l.venue,''), rr.venue) AS venue,
-                   COALESCE(NULLIF(l.race_no,''), rr.race_no) AS race_no,
-                   l.app_version, l.logic_version, l.points, l.cost_yen,
-                   l.grade, l.model_return_rate, l.created_at,
-                   f.hit, f.black_hit, f.gami_hit, f.payout_yen,
-                   f.return_rate, f.evaluated_at
-            FROM latest l
-            LEFT JOIN result_races rr ON rr.race_key=l.race_key
-            JOIN v187_mixed_plan_feedback f
-              ON f.race_key=l.race_key AND f.plan_hash=l.plan_hash
-            WHERE l.rn=1 AND f.return_rate IS NOT NULL
-        """
+        _v187_ensure_mixed_learning_tables(db_path)
         try:
-            with sqlite3.connect(db_path) as con:
-                df = pd.read_sql_query(fallback_query, con)
+            _v187_sync_mixed_feedback(db_path)
         except Exception:
-            return pd.DataFrame()
-    if df.empty:
-        evaluated_latest_query = """
+            # 表示は既存の照合済み実績だけでも継続する。
+            pass
+        query = """
             WITH evaluated AS (
-                SELECT r.*, f.hit, f.black_hit, f.gami_hit,
-                       f.payout_yen, f.return_rate, f.evaluated_at,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''), 'Unknown')
-                           ORDER BY datetime(f.evaluated_at) DESC, datetime(r.created_at) DESC, r.rowid DESC
-                       ) AS rn
+                SELECT
+                    r.race_key, r.plan_hash,
+                    COALESCE(NULLIF(r.race_date,''), rr.race_date) AS race_date,
+                    COALESCE(NULLIF(r.venue,''), rr.venue) AS venue,
+                    COALESCE(NULLIF(r.race_no,''), rr.race_no) AS race_no,
+                    COALESCE(NULLIF(r.app_version,''),'Unknown') AS app_version,
+                    r.logic_version, r.points, r.cost_yen, r.grade,
+                    r.model_return_rate, r.created_at,
+                    f.hit, f.black_hit, f.gami_hit, f.payout_yen,
+                    f.return_rate, f.evaluated_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''),'Unknown')
+                        ORDER BY datetime(f.evaluated_at) DESC,
+                                 datetime(r.created_at) DESC,
+                                 r.plan_hash DESC
+                    ) AS rn
                 FROM v187_mixed_plan_runs r
                 JOIN v187_mixed_plan_feedback f
                   ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                LEFT JOIN result_races rr ON rr.race_key=r.race_key
                 WHERE f.return_rate IS NOT NULL
                   AND COALESCE(r.include_in_live_stats,1)=1
             )
-            SELECT e.race_key,
-                   COALESCE(NULLIF(e.race_date,''), rr.race_date) AS race_date,
-                   COALESCE(NULLIF(e.venue,''), rr.venue) AS venue,
-                   COALESCE(NULLIF(e.race_no,''), rr.race_no) AS race_no,
-                   e.app_version, e.logic_version, e.points, e.cost_yen,
-                   e.grade, e.model_return_rate, e.created_at,
-                   e.hit, e.black_hit, e.gami_hit, e.payout_yen,
-                   e.return_rate, e.evaluated_at
-            FROM evaluated e
-            LEFT JOIN result_races rr ON rr.race_key=e.race_key
-            WHERE e.rn=1
+            SELECT race_key,race_date,venue,race_no,app_version,logic_version,
+                   points,cost_yen,grade,model_return_rate,created_at,
+                   hit,black_hit,gami_hit,payout_yen,return_rate,evaluated_at
+            FROM evaluated
+            WHERE rn=1
+            ORDER BY race_date,venue,CAST(race_no AS INTEGER),app_version
         """
-        try:
-            with sqlite3.connect(db_path) as con:
-                df = pd.read_sql_query(evaluated_latest_query, con)
-        except Exception:
-            pass
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            df = pd.read_sql_query(query, con)
+    except Exception:
+        return pd.DataFrame()
+
     if df.empty:
         return df
     df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
     df["month"] = df["race_date"].dt.strftime("%Y-%m")
-    df["収支"] = pd.to_numeric(df["payout_yen"], errors="coerce").fillna(0) - pd.to_numeric(df["cost_yen"], errors="coerce").fillna(0)
+    df["収支"] = (
+        pd.to_numeric(df["payout_yen"], errors="coerce").fillna(0)
+        - pd.to_numeric(df["cost_yen"], errors="coerce").fillna(0)
+    )
     df["推奨区分"] = df["grade"].fillna("").astype(str).apply(
         lambda x: "非推奨" if ("非推奨" in x or "⛔" in x) else "推奨"
     )
@@ -11211,7 +11417,14 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         try:
             with sqlite3.connect(db_path) as _c280:
                 _plans280=int(_c280.execute("SELECT COUNT(*) FROM v187_mixed_plan_runs").fetchone()[0] or 0)
-                _feedback280=int(_c280.execute("SELECT COUNT(*) FROM v187_mixed_plan_feedback WHERE return_rate IS NOT NULL").fetchone()[0] or 0)
+                _feedback280=int(_c280.execute("""
+                    SELECT COUNT(*)
+                    FROM v187_mixed_plan_feedback f
+                    JOIN v187_mixed_plan_runs r
+                      ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+                    WHERE f.return_rate IS NOT NULL
+                      AND COALESCE(r.include_in_live_stats,1)=1
+                """).fetchone()[0] or 0)
         except Exception:
             pass
         if _feedback280 > 0:
