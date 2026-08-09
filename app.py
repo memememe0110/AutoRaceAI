@@ -38,7 +38,7 @@ APP_VERSION = "Ver280"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver283"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver284"  # Ver280: 川口4日実測ベースの予測改善
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -2485,6 +2485,41 @@ def _v279_bg_prediction_any_active(db_path: str) -> bool:
 
 
 
+
+def _v284_apply_simulation_joint_ranks(df: pd.DataFrame, audit: dict) -> pd.DataFrame:
+    """6周展開シミュレーションの共同分布を最終順位として採用する。"""
+    try:
+        if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(audit,dict):
+            return df
+        car_col="車" if "車" in df.columns else ("車番" if "車番" in df.columns else None)
+        if car_col is None:
+            return df
+        expected=audit.get("finish_expected_rank") or {}
+        tops=audit.get("top_scenarios") or []
+        joint=[]
+        if tops:
+            joint=[int(x) for x in str(tops[0].get("combo") or "").split("-") if str(x).strip().isdigit()]
+        cars=[int(x) for x in pd.to_numeric(df[car_col],errors="coerce").dropna().astype(int).tolist()]
+        if len(joint)<3:
+            joint=sorted(cars,key=lambda c:(float(expected.get(str(c),99.0)),c))[:3]
+        rest=sorted([c for c in cars if c not in joint],
+                    key=lambda c:(float(expected.get(str(c),99.0)),c))
+        order=joint[:3]+rest
+        rank_map={c:i+1 for i,c in enumerate(order)}
+        out=df.copy()
+        out["Ver284_展開最終順位"]=pd.to_numeric(out[car_col],errors="coerce").map(
+            lambda x: rank_map.get(int(x),99) if pd.notna(x) else 99
+        )
+        out["Ver284_展開平均着順"]=pd.to_numeric(out[car_col],errors="coerce").map(
+            lambda x: round(float(expected.get(str(int(x)),99.0)),3) if pd.notna(x) else 99.0
+        )
+        out["改善後順位"]=out["Ver284_展開最終順位"].astype(int)
+        out["順位整合メモ"]="Ver284:6周展開共同分布を最終結果として採用"
+        return out
+    except Exception:
+        return df
+
+
 def _v283_apply_top3_priority_ranks(df: pd.DataFrame) -> pd.DataFrame:
     """1～3着を目的にしたVer283最終順位整合。
 
@@ -2643,8 +2678,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
 
             finish_prob=engine.v30_finish_probabilities(df,bets,trials)
             _v273_audit_keep={c:df[c].copy() for c in df.columns if str(c).startswith("Ver273_")}
-            df=engine.v196_apply_probability_aligned_ranks(df,finish_prob)
-            df=_v283_apply_top3_priority_ranks(df)
+            df = _v284_apply_simulation_joint_ranks(df, wall_audit)
             for _c273,_s273 in _v273_audit_keep.items():
                 try:
                     if len(_s273)==len(df):
@@ -2939,8 +2973,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             _v273_audit_keep={
                 c:df[c].copy() for c in df.columns if str(c).startswith("Ver273_")
             }
-            df=engine.v196_apply_probability_aligned_ranks(df,finish_prob)
-            df=_v283_apply_top3_priority_ranks(df)
+            df = _v284_apply_simulation_joint_ranks(df, wall_audit)
             for _c273,_s273 in _v273_audit_keep.items():
                 try:
                     if len(_s273)==len(df):
@@ -5141,6 +5174,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     sim_trials=max(1400,min(requested_trials,base_budget))
     counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
     lap_order_counts={lap:{} for lap in range(1,7)}
+    finish_position_counts={c:{pos:0 for pos in range(1,len(cars)+1)} for c in cars}
+    final_order_counts={}
     scenario_counts={}
     scenario_combo_counts={}
     route_counts={}
@@ -5341,6 +5376,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             lap_tuple=tuple(order)
             sim_lap_path.append(lap_tuple)
             lap_order_counts[lap][lap_tuple]=lap_order_counts[lap].get(lap_tuple,0)+1
+        final_tuple=tuple(order)
+        final_order_counts[final_tuple]=final_order_counts.get(final_tuple,0)+1
+        for _pos284,_car284 in enumerate(order,start=1):
+            finish_position_counts[_car284][_pos284]=finish_position_counts[_car284].get(_pos284,0)+1
         combo=tuple(order[:3]); counts[combo]=counts.get(combo,0)+1
         scenario_type=_v263_scenario_type_from_laps(sim_lap_path)
         scenario_counts[scenario_type]=scenario_counts.get(scenario_type,0)+1
@@ -5365,35 +5404,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     sim_trials=max(1, completed_trials)
     _v242_sim_seconds=time_module.perf_counter()-_v242_sim_started
     # Ver263: 実測から学んだ展開タイプ頻度へ弱く校正。
+    # Ver284: 各周の遷移確率補正だけで6周を完結させ、ゴール後には旧モデルや温度補正を混ぜない。
     weighted_counts=dict(counts)
-    scenario_weights={}
-    if scenario_prior.get('enabled') and scenario_counts:
-        learned=scenario_prior.get('prior') or {}
-        weighted_counts={k:0.0 for k in counts}
-        for typ,cc in scenario_combo_counts.items():
-            generated=float(scenario_counts.get(typ,0))/max(1,sim_trials)
-            target_prior=float(learned.get(typ,generated or 0.01))
-            ratio=(target_prior/max(0.01,generated))**0.12
-            w=float(np.clip(ratio,0.92,1.08))
-            scenario_weights[typ]=w
-            for combo,n in cc.items():
-                weighted_counts[combo]=weighted_counts.get(combo,0.0)+float(n)*w
-    # 元のtrial数へ整数スケール。シミュレーションだけで0回になった着順も、
-    # 旧モデル分布を少量混ぜて極端な消失を防ぎ、全組み合わせを必ず保存する。
+    scenario_weights={"Ver284":"post_simulation_weight_disabled"}
     target=max(1,int(trials))
     all_combos=[(a,b,c) for a in cars for b in cars for c in cars if a!=b and a!=c and b!=c]
-    prior_total=max(1.0,float(sum(tri.values()) or 1.0))
-    # Ver241: 失速連鎖を含む6周結果を尊重しつつ、有限試行の偶然と過信を温度校正する。
-    sim_mix=0.88
-    floor_mass=0.03 / max(1,len(all_combos))
-    scaled={}
-    for combo in all_combos:
-        sim_p=float(weighted_counts.get(combo,0))/max(1.0,float(sum(weighted_counts.values()) or sim_trials))
-        prior_p=float(tri.get(combo,0))/prior_total
-        # 7%だけ旧能力分布を残し、未知着順にもごく小さい裾を与える。
-        p=max(floor_mass, sim_mix*sim_p + (1.0-sim_mix)*prior_p)
-        # 温度校正。上位の山を少し低くし、現実的な着順違いの裾を残す。
-        scaled[combo]=p**0.86
+    _den284=max(1.0,float(sum(weighted_counts.values()) or sim_trials))
+    scaled={combo:float(weighted_counts.get(combo,0))/_den284 for combo in all_combos}
     norm=sum(scaled.values()) or 1.0
     scaled={k:(v/norm)*target for k,v in scaled.items()}
     ints={k:int(v) for k,v in scaled.items()}
@@ -5402,12 +5419,19 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         ranked=sorted(scaled.items(),key=lambda kv:kv[1]-int(kv[1]),reverse=True)
         for k,_ in ranked[:remain]: ints[k]+=1
     new_bets=dict(bets or {}); new_bets["三連単"]=ints
-    tf={}; nt={}; nf={}
+    tf={}; nt={}; nf={}; wide={}; win={}; place={}
     for (a,b,c),cnt in ints.items():
         tf[tuple(sorted((a,b,c)))]=tf.get(tuple(sorted((a,b,c))),0)+cnt
         nt[(a,b)]=nt.get((a,b),0)+cnt
         nf[tuple(sorted((a,b)))]=nf.get(tuple(sorted((a,b))),0)+cnt
+        win[(a,)]=win.get((a,),0)+cnt
+        place[(a,)]=place.get((a,),0)+cnt
+        place[(b,)]=place.get((b,),0)+cnt
+        for _x284,_y284 in ((a,b),(a,c),(b,c)):
+            _wk284=tuple(sorted((_x284,_y284)))
+            wide[_wk284]=wide.get(_wk284,0)+cnt
     new_bets["三連複"]=tf; new_bets["2連単"]=nt; new_bets["2連複"]=nf
+    new_bets["ワイド"]=wide; new_bets["単勝"]=win; new_bets["複勝"]=place
     out=df.copy()
     out["6周壁遭遇率"]=out[car_col].map(lambda x: wall_events.get(int(x),0)/(sim_trials*6)*100 if pd.notna(x) else 0.0)
     out["6周追抜成功回数"]=out[car_col].map(lambda x: pass_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
@@ -5483,8 +5507,24 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         pass  # Ver265: 展開フィードバックは評価表示のみ
     # 実測が既にある再シミュレーションはバックテストとして保存し、未来学習には混ぜない。
     lap_snapshot_save=_v252_save_lap_prediction(_v230_db_path(), meta, modal_laps, bool(actual_lap_orders))
+    finish_expected_rank={}
+    finish_position_probabilities={}
+    for _car284 in cars:
+        _pc284=finish_position_counts.get(_car284,{})
+        _denpos284=max(1,sim_trials)
+        finish_expected_rank[str(_car284)]=sum(
+            float(_p284)*float(_pc284.get(_p284,0)) for _p284 in range(1,len(cars)+1)
+        )/_denpos284
+        finish_position_probabilities[str(_car284)]={
+            str(_p284):float(_pc284.get(_p284,0))/_denpos284*100.0
+            for _p284 in range(1,len(cars)+1)
+        }
+    top_full_orders=[
+        {"order":"-".join(map(str,_ord284)),"prob":float(_n284)/max(1,sim_trials)*100.0}
+        for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
+    ]
     audit={
-        "enabled":True,"mode":"6周内蔵Ver265・Ver257基準＋タイム残差学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver284 6周遷移確率完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -5514,6 +5554,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "closest_route_v263": closest_route,
         "top_routes_v263": top_routes[:5],
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
+        "finish_expected_rank":finish_expected_rank,
+        "finish_position_probabilities":finish_position_probabilities,
+        "top_full_orders_v284":top_full_orders,
+        "v284_post_simulation_correction":False,
+        "v284_ticket_sources":["単勝","複勝","ワイド","2連単","2連複","三連複","三連単"],
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
         "message":f"Ver265ではVer257相当の展開係数へ戻し、実測の試走→競走タイム変換残差を開催場・選手・ハンデ帯で縮小学習して基礎能力へ小さく反映します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
@@ -13218,8 +13263,7 @@ elif selected_main_page == "🏁 予測":
                         for c in df.columns
                         if str(c).startswith("Ver273_")
                     }
-                    df = engine.v196_apply_probability_aligned_ranks(df, finish_prob)
-                    df = _v283_apply_top3_priority_ranks(df)
+                    df = _v284_apply_simulation_joint_ranks(df, wall_audit)
                     for _c273, _s273 in _v273_audit_keep.items():
                         try:
                             if len(_s273) == len(df):
@@ -13441,7 +13485,7 @@ elif selected_main_page == "🏁 予測":
                 "改善後順位", "1着候補順位", "連対候補順位", "3着候補順位", "総合点順位_従来",
                 "車", "選手名", "ハンデ", "試走換算", "予測競走T", "レース信頼度",
                 "本番1着率", "本番連対率", "本番3着率", "本番3着内率",
-                "Ver283_TOP3優先前順位", "Ver283_推定2着率", "Ver283_TOP3候補", "順位整合メモ",
+                "Ver284_展開最終順位", "Ver284_展開平均着順", "順位整合メモ",
                 "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
                 "スタート伸び指数", "ゴール前伸び指数", "安定上位指数",
                 "6周壁遭遇率", "6周追抜成功回数", "連続追抜発生回数", "1周目先頭率", "壁リスク", "壁突破力", "前残り指数", "壁ロス推定",
@@ -13494,7 +13538,7 @@ elif selected_main_page == "🏁 予測":
                     pass
             st.subheader("予測順位")
             st.dataframe(result, use_container_width=True, hide_index=True)
-            st.caption("Ver283では1位は本シミュレーションの1着率1位を固定し、2・3位候補だけ3着内率を優先して選抜します。2位/3位の順序は推定2着率を優先し、4位以下は従来順位の相対順を維持します。")
+            st.caption("Ver284では6周展開シミュレーションの共同分布を最終結果として使います。1～3位は最頻の三連単展開、4位以下は全試行の平均着順で表示し、ゴール後の別モデル順位補正は行いません。")
             try:
                 v196_val = v202_cached_probability_rank_validation(str(engine.DB_PATH), Path(engine.DB_PATH).stat().st_mtime)
                 if int(v196_val.get("race_count", 0)):
