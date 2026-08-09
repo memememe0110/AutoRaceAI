@@ -51,6 +51,8 @@ _V284_GITHUB_RAW_READBACK_PATCH = "2026-08-09-v1"
 _V284_GITHUB_RAW_TOKEN_FIX = "2026-08-09-v1"
 _V284_GITHUB_RELOAD_UNIFIED_VERIFY = "2026-08-09-v1"
 _V284_BOOT_GITHUB_CANONICAL_RESTORE = "2026-08-09-v1"
+_V284_DERIVED_TABLE_GUARD_FIX = "2026-08-09-v1"
+_V284_DIVERGED_SAFE_AUTO_MERGE = "2026-08-09-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -12387,14 +12389,30 @@ def _v283_compare_db_fingerprints(candidate: dict, baseline: dict) -> dict:
 
     cc=candidate.get("counts") or {}
     bc=baseline.get("counts") or {}
+
+    # Ver284: 再シミュレーション/再学習でDELETE→再生成される派生テーブルは、
+    # 一時的/正常な件数減少だけで「DB巻き戻り」と判定しない。
+    # 原本データ系は従来通り1件でも減れば停止する。
+    _rebuildable_count_tables284={
+        "weight_adjustment_history",
+    }
+
     for t,bv in bc.items():
         if t not in cc:
-            result["regressions"].append(f"{t}: 比較元{int(bv):,}件 → 候補テーブルなし")
+            if t in _rebuildable_count_tables284:
+                result["warnings"].append(f"{t}: 派生テーブル再生成中/再生成後のため候補テーブルなしを許容")
+            else:
+                result["regressions"].append(f"{t}: 比較元{int(bv):,}件 → 候補テーブルなし")
             continue
         cv=int(cc.get(t,0) or 0)
         bv=int(bv or 0)
         if cv < bv:
-            result["regressions"].append(f"{t}: {bv:,} → {cv:,}（-{bv-cv:,}）")
+            if t in _rebuildable_count_tables284:
+                result["warnings"].append(
+                    f"{t}: {bv:,} → {cv:,}（-{bv-cv:,}、派生テーブル再生成として許容）"
+                )
+            else:
+                result["regressions"].append(f"{t}: {bv:,} → {cv:,}（-{bv-cv:,}）")
 
     cand_latest=str(candidate.get("latest") or "")
     base_latest=str(baseline.get("latest") or "")
@@ -12892,6 +12910,141 @@ def _v281_push_large_file_via_git_data_api(snapshot_bytes: bytes, commit_message
     return True, f"DB登録成功｜GitHub保存成功（Git Data API / {len(snapshot_bytes)/1024/1024:.1f}MB）"
 
 
+
+def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> tuple[bool, bytes | None, dict]:
+    """diverged時に自然キーで『欠けている行だけ』を相互統合する。
+
+    方針:
+    - ローカルDBを土台にする（既存行は上書きしない）。
+    - GitHubにしか無い自然キーの行だけ追加。
+    - ID列が自然キーでない単一INTEGER PKは再採番して衝突を避ける。
+    - 統合後DBがローカル/remote双方を行単位で包含することを再確認。
+    - 保護テーブル件数がremoteより減る場合は失敗。
+    """
+    report={"ok":False,"added":{},"reason":"","relation_local":"","relation_remote":""}
+    if not (isinstance(local_bytes,(bytes,bytearray)) and bytes(local_bytes).startswith(b"SQLite format 3\x00")):
+        report["reason"]="ローカルDBがSQLiteではありません"
+        return False,None,report
+    if not (isinstance(remote_bytes,(bytes,bytearray)) and bytes(remote_bytes).startswith(b"SQLite format 3\x00")):
+        report["reason"]="GitHub DBがSQLiteではありません"
+        return False,None,report
+
+    keymap={
+        "players":("player_id",),
+        "race_history":("record_key",),
+        "player_lap_history":("race_key","car_no","lap_label"),
+        "result_races":("race_key",),
+        "result_entries":("race_key","car_no"),
+        "result_laps":("race_key","lap_label","position"),
+        "result_payouts":("race_key","bet_type","combination"),
+        "prediction_feedback":("race_key",),
+        "prediction_snapshots":("race_key","car_no"),
+        "v40_prediction_feature_snapshots":("race_key","car_no"),
+        "v41_registration_batches":("race_key",),
+        "v67_prediction_tickets":("race_key","bet_type","combination"),
+        "v67_ticket_feedback":("race_key","bet_type"),
+        "v141_heat_feature_snapshots":("race_key","car_no"),
+        "v142_aux_feature_snapshots":("race_key","car_no"),
+        "v151_race_context_feature_snapshots":("race_key","car_no"),
+        "v152_overtake_feature_snapshots":("race_key","car_no"),
+        "v187_mixed_plan_runs":("race_key","plan_hash"),
+        "v187_mixed_plan_tickets":("race_key","plan_hash","bet_type","combination"),
+        "v187_mixed_plan_feedback":("race_key","plan_hash"),
+        "v187_mixed_ticket_feedback":("race_key","plan_hash","bet_type","combination"),
+        "v221_odds_runs":("race_key","snapshot_id"),
+        "v221_odds_values":("race_key","snapshot_id","bet_key","combination"),
+        "v222_prediction_restore":("race_key",),
+        "v223_result_view_restore":("race_key",),
+        "v238_result_raw_archive":("race_key",),
+        "v279_player_incident_history":("race_key","car_no","incident_type"),
+        "v231_prediction_history":("race_key","app_version","prediction_time"),
+        "v252_lap_prediction_snapshots":("race_date","venue","race_no","lap_no","app_version","predicted_order","created_at"),
+    }
+
+    tmp_dir=Path(tempfile.mkdtemp(prefix="autorace_safe_union_"))
+    local_path=tmp_dir/"merged.sqlite3"
+    remote_path=tmp_dir/"remote.sqlite3"
+    try:
+        local_path.write_bytes(bytes(local_bytes))
+        remote_path.write_bytes(bytes(remote_bytes))
+        with sqlite3.connect(str(local_path),timeout=60.0) as lc, sqlite3.connect(str(remote_path),timeout=60.0) as rc:
+            lc.execute("PRAGMA busy_timeout=60000")
+            rc.execute("PRAGMA busy_timeout=60000")
+            lc_tables={str(r[0]) for r in lc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            rc_tables={str(r[0]) for r in rc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+            for table,keys in keymap.items():
+                if table not in lc_tables or table not in rc_tables:
+                    continue
+                linfo=lc.execute(f'PRAGMA table_info("{table}")').fetchall()
+                rinfo=rc.execute(f'PRAGMA table_info("{table}")').fetchall()
+                lcols=[str(r[1]) for r in linfo]
+                rcols=[str(r[1]) for r in rinfo]
+                if lcols != rcols or not all(k in lcols for k in keys):
+                    report["reason"]=f"{table}: スキーマ不一致または自然キー不足"
+                    return False,None,report
+
+                key_idx=[lcols.index(k) for k in keys]
+                local_rows=lc.execute(f'SELECT * FROM "{table}"').fetchall()
+                local_keys={tuple(row[i] for i in key_idx) for row in local_rows}
+                remote_rows=rc.execute(f'SELECT * FROM "{table}"').fetchall()
+                missing=[row for row in remote_rows if tuple(row[i] for i in key_idx) not in local_keys]
+                if not missing:
+                    continue
+
+                # 自然キーに含まれない単一INTEGER主キーは挿入時に除外して自動採番。
+                pk_cols=[(str(r[1]),str(r[2] or "").upper(),int(r[5] or 0)) for r in linfo if int(r[5] or 0)>0]
+                insert_cols=list(lcols)
+                omit=set()
+                if len(pk_cols)==1:
+                    pk_name,pk_type,_=pk_cols[0]
+                    if pk_name not in keys and "INT" in pk_type:
+                        omit.add(pk_name)
+                insert_cols=[c for c in insert_cols if c not in omit]
+                idxs=[lcols.index(c) for c in insert_cols]
+                qcols=",".join('"'+c.replace('"','""')+'"' for c in insert_cols)
+                placeholders=",".join("?" for _ in insert_cols)
+                lc.executemany(
+                    f'INSERT INTO "{table}" ({qcols}) VALUES ({placeholders})',
+                    [tuple(row[i] for i in idxs) for row in missing]
+                )
+                report["added"][table]=len(missing)
+
+            lc.commit()
+            chk=lc.execute("PRAGMA integrity_check").fetchone()
+            if not chk or str(chk[0]).lower()!="ok":
+                report["reason"]="統合後DBのintegrity_check失敗"
+                return False,None,report
+
+        merged=local_path.read_bytes()
+        rel_l=_v284_db_containment(merged,bytes(local_bytes))
+        rel_r=_v284_db_containment(merged,bytes(remote_bytes))
+        report["relation_local"]=str(rel_l.get("relation") or "")
+        report["relation_remote"]=str(rel_r.get("relation") or "")
+        if report["relation_local"] not in ("equal","candidate_contains"):
+            report["reason"]="統合後DBが端末DBを完全包含していません"
+            return False,None,report
+        if report["relation_remote"] not in ("equal","candidate_contains"):
+            report["reason"]="統合後DBがGitHub DBを完全包含していません"
+            return False,None,report
+
+        # 行キー比較対象外の保護テーブルも、remoteより件数を減らさない。
+        mfp=_v283_db_fingerprint_bytes(merged)
+        rfp=_v283_db_fingerprint_bytes(bytes(remote_bytes))
+        cmp_remote=_v283_compare_db_fingerprints(mfp,rfp)
+        if not cmp_remote.get("safe"):
+            report["reason"]="統合後DBがGitHub保護件数を満たしません: "+" / ".join(cmp_remote.get("regressions") or [])
+            return False,None,report
+
+        report["ok"]=True
+        return True,merged,report
+    except Exception as exc:
+        report["reason"]=f"{type(exc).__name__}: {exc}"
+        return False,None,report
+    finally:
+        shutil.rmtree(tmp_dir,ignore_errors=True)
+
+
 def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     # 保存ボタン押下時にも、アップロード正本よりDBが後退していないか最終確認。
     _pin284=st.session_state.get("v284_uploaded_master_identity")
@@ -12944,10 +13097,35 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
                 _v284_containment_message(_relpush284,"端末","GitHub")
             )
         if _rpush284=="diverged":
-            return False,(
-                "GitHub保存を中止しました。端末DBとGitHub DBの双方に固有データがあります。"
-                " 自動上書きせず統合が必要です。\n"+
-                _v284_containment_message(_relpush284,"端末","GitHub")
+            _merge_ok284,_merged_bytes284,_merge_report284=_v284_safe_union_merge_db_bytes(
+                snapshot_bytes,_remote_bytes284
+            )
+            if not _merge_ok284 or _merged_bytes284 is None:
+                return False,(
+                    "GitHub保存を中止しました。端末DBとGitHub DBはdivergedで、"
+                    "安全自動統合にも失敗しました。\n"+
+                    _v284_containment_message(_relpush284,"端末","GitHub")+
+                    "\n統合理由: "+str((_merge_report284 or {}).get("reason") or "不明")
+                )
+            # 統合DBを現在DBへ先に確定。以後の保存/端末DL/再起動復元で同じ正本を使う。
+            _install_merge_ok284,_install_merge_msg284=_v276_atomic_install_db_bytes(
+                _merged_bytes284,"diverged安全統合DB"
+            )
+            if not _install_merge_ok284:
+                return False,"diverged安全統合DBの現在DBへの反映に失敗しました: "+str(_install_merge_msg284)
+            snapshot_bytes=bytes(_merged_bytes284)
+            local_fp=_v283_db_fingerprint_bytes(snapshot_bytes)
+            st.session_state["v284_uploaded_master_bytes"]=snapshot_bytes
+            st.session_state["v284_uploaded_master_sha256"]=hashlib.sha256(snapshot_bytes).hexdigest()
+            _merged_identity284=_v284_current_db_identity()
+            if _merged_identity284.get("ok"):
+                st.session_state["v284_uploaded_master_identity"]=_merged_identity284
+                st.session_state["v284_db_identity_baseline"]=_merged_identity284
+                st.session_state["v284_db_identity_block"]=[]
+            _added284=(_merge_report284 or {}).get("added") or {}
+            st.session_state["v284_last_auto_merge_message"]=(
+                "🔀 端末DBとGitHub DBを安全統合しました。GitHub固有行を追加: "+
+                (", ".join(f"{k}+{v}" for k,v in sorted(_added284.items())) if _added284 else "追加なし")
             )
         if _rpush284=="unknown":
             return False,"GitHub保存を中止しました。端末DBとGitHub DBの包含関係を安全確認できません。"
@@ -13002,6 +13180,9 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     )
     if _ok_push284 and _recovery_push284:
         _msg_push284 += "｜current分割DB不整合から復旧保存（previous世代は温存）"
+    _merge_notice284=st.session_state.pop("v284_last_auto_merge_message",None)
+    if _ok_push284 and _merge_notice284:
+        _msg_push284 += "｜"+str(_merge_notice284)
     return _ok_push284,_msg_push284
 
 
@@ -13084,6 +13265,7 @@ def _v284_db_identity_regressed(now: dict, baseline: dict) -> tuple[bool,list[st
     if str(now.get("path")) != str(baseline.get("path")):
         reasons.append(f"DBパス変更: {baseline.get('path')} → {now.get('path')}")
     cmp=_v283_compare_db_fingerprints(now.get("fingerprint") or {},baseline.get("fingerprint") or {})
+    st.session_state["v284_db_identity_warnings"]=list(cmp.get("warnings") or [])
     if not cmp.get("safe"):
         reasons.extend(cmp.get("regressions") or [])
     return bool(reasons),reasons
@@ -13194,7 +13376,13 @@ with st.sidebar:
             " | 履歴 "+str((_fp284.get("counts") or {}).get("race_history","?"))
         )
     if _guard284:
-        st.error("⛔ DBが実行中に古い/別の実体へ切り替わったため保護停止中です。\n- "+"\n- ".join(map(str,_guard284)))
+        st.error("⛔ 原本データの減少またはDB実体切替を検知したため保護停止中です。\n- "+"\n- ".join(map(str,_guard284)))
+    _guard_warn284=st.session_state.get("v284_db_identity_warnings") or []
+    if _guard_warn284:
+        st.info(
+            "ℹ️ 再シミュレーション/再学習で再生成される派生テーブルの件数変化は"
+            "DB巻き戻り扱いにしていません。\n- "+"\n- ".join(map(str,_guard_warn284))
+        )
     db_file = st.file_uploader(
         "autorace_players.sqlite3を選択",
         type=None,
