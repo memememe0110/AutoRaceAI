@@ -11768,6 +11768,71 @@ def _v278_consistent_db_snapshot_bytes(db_path: str) -> bytes:
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+
+def _v281_push_large_file_via_git_data_api(snapshot_bytes: bytes, commit_message: str) -> tuple[bool, str]:
+    """GitHub Contents APIのサイズ制限を避け、Git Data APIでDBを保存する。"""
+    cfg = github_config()
+    repo_api = f"https://api.github.com/repos/{cfg['repo']}"
+    branch_q = urllib.parse.quote(str(cfg["branch"]), safe="")
+    path = str(cfg["path"]).lstrip("/")
+
+    # 現在ブランチ先頭を取得
+    status, ref = github_request(f"{repo_api}/git/ref/heads/{branch_q}")
+    if status != 200:
+        return False, f"GitHubブランチ確認に失敗しました: {ref.get('message', status)}"
+    parent_sha = ((ref.get("object") or {}).get("sha") or "").strip()
+    if not parent_sha:
+        return False, "GitHubブランチの最新コミットSHAを取得できませんでした。"
+
+    # 親コミットのtreeを取得
+    status, commit = github_request(f"{repo_api}/git/commits/{parent_sha}")
+    if status != 200:
+        return False, f"GitHubコミット確認に失敗しました: {commit.get('message', status)}"
+    base_tree = ((commit.get("tree") or {}).get("sha") or "").strip()
+    if not base_tree:
+        return False, "GitHubのbase tree SHAを取得できませんでした。"
+
+    # SQLiteをblobとして直接作成（Contents APIの大容量ファイル制限を回避）
+    status, blob = github_request(
+        f"{repo_api}/git/blobs",
+        method="POST",
+        payload={"content": base64.b64encode(snapshot_bytes).decode("ascii"), "encoding": "base64"},
+    )
+    if status != 201:
+        return False, f"GitHub DB blob作成に失敗しました: {blob.get('message', status)}"
+    blob_sha = str(blob.get("sha") or "").strip()
+
+    status, tree = github_request(
+        f"{repo_api}/git/trees",
+        method="POST",
+        payload={
+            "base_tree": base_tree,
+            "tree": [{"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}],
+        },
+    )
+    if status != 201:
+        return False, f"GitHub tree作成に失敗しました: {tree.get('message', status)}"
+    tree_sha = str(tree.get("sha") or "").strip()
+
+    status, new_commit = github_request(
+        f"{repo_api}/git/commits",
+        method="POST",
+        payload={"message": commit_message, "tree": tree_sha, "parents": [parent_sha]},
+    )
+    if status != 201:
+        return False, f"GitHubコミット作成に失敗しました: {new_commit.get('message', status)}"
+    new_sha = str(new_commit.get("sha") or "").strip()
+
+    status, updated = github_request(
+        f"{repo_api}/git/refs/heads/{branch_q}",
+        method="PATCH",
+        payload={"sha": new_sha, "force": False},
+    )
+    if status != 200:
+        return False, f"GitHubブランチ更新に失敗しました: {updated.get('message', status)}"
+    return True, f"DB登録成功｜GitHub保存成功（Git Data API / {len(snapshot_bytes)/1024/1024:.1f}MB）"
+
+
 def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     ready, message = github_ready()
     if not ready:
@@ -11798,8 +11863,14 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
         payload["sha"] = sha
     put_status, result = github_request(url, method="PUT", payload=payload)
     if put_status not in (200, 201):
-        return False, f"GitHub保存に失敗しました: {result.get('message', put_status)}"
-    return True, "最新コミットを含む整合DBをGitHubへ保存しました。"
+        # 大容量SQLiteではContents APIが "file is too large to be processed" になる。
+        # DB登録自体は既に完了しているため、Git Data APIへ自動フォールバックする。
+        err = str(result.get("message", put_status))
+        ok2, msg2 = _v281_push_large_file_via_git_data_api(snapshot_bytes, commit_message)
+        if ok2:
+            return True, msg2
+        return False, f"DB登録成功｜GitHub保存失敗: {err}｜大容量保存も失敗: {msg2}"
+    return True, f"DB登録成功｜GitHub保存成功（{len(snapshot_bytes)/1024/1024:.1f}MB）"
 
 
 
@@ -13788,7 +13859,7 @@ if selected_main_page == "👤 選手情報登録":
         ] if c in parsed.columns]
         st.dataframe(parsed[preview_cols], use_container_width=True, hide_index=True, height=420)
 
-        if st.button("DBへ登録してGitHubに保存", type="primary", use_container_width=True):
+        if st.button("DBへ登録（完了後にGitHubへバックアップ）", type="primary", use_container_width=True):
             _pause278={}
             try:
                 with st.spinner("バックグラウンド処理とのDB競合を確認しています…"):
@@ -13805,7 +13876,7 @@ if selected_main_page == "👤 選手情報登録":
                     f"保留 {pending_count}件"
                 )
                 if changed:
-                    with st.spinner("② GitHubへDBを保存しています…"):
+                    with st.spinner("② DB登録は完了しました。GitHubへバックアップしています…"):
                         ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新")
                     full_text = text + (f"｜{msg}" if msg else "")
                     level = "success" if ok else "warning"
