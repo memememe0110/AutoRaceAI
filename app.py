@@ -38,7 +38,7 @@ APP_VERSION = "Ver280"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver281"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver282"  # Ver280: 川口4日実測ベースの予測改善
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -3515,6 +3515,7 @@ def _v272_common_race_precision_compare(db_path: str, versions: list[str]) -> tu
     """
     cols = [
         "バージョン","共通R","照合周回","位置一致率","前後関係一致率","平均順位誤差",
+        "1着的中率","TOP3一致","三連複一致率","三連単一致率","実TOP3予測順位誤差","TOP3重視スコア",
         "1周目誤差","2周目誤差","3周目誤差","4周目誤差","5周目誤差","6周目誤差",
     ]
     versions = [str(v) for v in versions if str(v)]
@@ -3539,6 +3540,17 @@ def _v272_common_race_precision_compare(db_path: str, versions: list[str]) -> tu
                 JOIN result_races rr ON rr.race_key=rl.race_key
                 WHERE COALESCE(rr.learning_eligible,1)=1
                 ORDER BY rr.race_date,rr.venue,rr.race_no,rl.lap_no,rl.position
+            """, con)
+            finish = pd.read_sql_query("""
+                SELECT substr(rr.race_date,1,10) AS race_date,rr.venue,
+                       REPLACE(CAST(COALESCE(rr.race_no,'') AS TEXT),'R','') AS race_no,
+                       re.car_no,re.finish
+                FROM result_entries re
+                JOIN result_races rr ON rr.race_key=re.race_key
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                  AND re.finish IS NOT NULL
+                  AND CAST(re.finish AS INTEGER) BETWEEN 1 AND 8
+                ORDER BY rr.race_date,rr.venue,rr.race_no,CAST(re.finish AS INTEGER)
             """, con)
     except Exception:
         return pd.DataFrame(columns=cols), []
@@ -3576,12 +3588,23 @@ def _v272_common_race_precision_compare(db_path: str, versions: list[str]) -> tu
             int(x) for x in g.sort_values("position").car_no.tolist()
         )
 
+    finish_map = {}
+    if not finish.empty:
+        for key,g in finish.groupby(["race_date","venue","race_no"], dropna=False):
+            _fg=g.copy()
+            _fg["finish_num"]=pd.to_numeric(_fg["finish"],errors="coerce")
+            _fg=_fg.dropna(subset=["finish_num"]).sort_values(["finish_num","car_no"])
+            finish_map[(str(key[0])[:10],str(key[1]),str(key[2]))]=tuple(
+                int(x) for x in _fg.car_no.tolist()
+            )
+
     rows = []
     for ver in versions:
         gv = pred[pred["app_version"].astype(str) == ver]
         metrics = []
         lap_mae = {i: [] for i in range(1,7)}
         used_races = set()
+        final_pred_by_race = {}
         for row in gv.itertuples():
             key = (str(row.race_date)[:10], str(row.venue), str(row.race_no), int(row.lap_no))
             act = amap.get(key)
@@ -3608,6 +3631,35 @@ def _v272_common_race_precision_compare(db_path: str, versions: list[str]) -> tu
             if 1 <= int(row.lap_no) <= 6:
                 lap_mae[int(row.lap_no)].append(mae)
             used_races.add(key[:3])
+            _rk=key[:3]
+            _prev=final_pred_by_race.get(_rk)
+            if _prev is None or int(row.lap_no) >= int(_prev[0]):
+                final_pred_by_race[_rk]=(int(row.lap_no),prd)
+
+        # Ver282表示追加: 目的を1～3着へ寄せた評価。予測ロジックには使わない。
+        top3_eval=[]
+        for _rk,(_lap,_prd) in final_pred_by_race.items():
+            _act_finish=finish_map.get(_rk)
+            if not _act_finish or len(_act_finish)<3 or len(_prd)<3:
+                continue
+            _actual3=tuple(_act_finish[:3])
+            _pred3=tuple(_prd[:3])
+            _pp={c:i+1 for i,c in enumerate(_prd)}
+            _top3_n=len(set(_actual3)&set(_pred3))
+            _win_hit=int(_pred3[0]==_actual3[0])
+            _trio_hit=int(set(_pred3)==set(_actual3))
+            _trifecta_hit=int(_pred3==_actual3)
+            _actual_top3_rank_err=float(np.mean([
+                abs((i+1)-int(_pp.get(c,len(_prd)+1))) for i,c in enumerate(_actual3)
+            ]))
+            # 1着35% + TOP3捕捉35% + 三連複15% + 三連単15%
+            _score=(
+                35.0*_win_hit +
+                35.0*(_top3_n/3.0) +
+                15.0*_trio_hit +
+                15.0*_trifecta_hit
+            )
+            top3_eval.append((_win_hit,_top3_n,_trio_hit,_trifecta_hit,_actual_top3_rank_err,_score))
 
         if metrics:
             arr = np.asarray(metrics, dtype=float)
@@ -3619,6 +3671,21 @@ def _v272_common_race_precision_compare(db_path: str, versions: list[str]) -> tu
                 "前後関係一致率": round(float(arr[:,1].mean())*100,1),
                 "平均順位誤差": round(float(arr[:,2].mean()),2),
             }
+            if top3_eval:
+                _ta=np.asarray(top3_eval,dtype=float)
+                rec.update({
+                    "1着的中率":round(float(_ta[:,0].mean())*100,1),
+                    "TOP3一致":round(float(_ta[:,1].mean()),2),
+                    "三連複一致率":round(float(_ta[:,2].mean())*100,1),
+                    "三連単一致率":round(float(_ta[:,3].mean())*100,1),
+                    "実TOP3予測順位誤差":round(float(_ta[:,4].mean()),2),
+                    "TOP3重視スコア":round(float(_ta[:,5].mean()),1),
+                })
+            else:
+                rec.update({
+                    "1着的中率":None,"TOP3一致":None,"三連複一致率":None,
+                    "三連単一致率":None,"実TOP3予測順位誤差":None,"TOP3重視スコア":None,
+                })
             for lap in range(1,7):
                 rec[f"{lap}周目誤差"] = (
                     round(float(np.mean(lap_mae[lap])),2) if lap_mae[lap] else None
@@ -4594,7 +4661,7 @@ def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_t
         reasons.append("trial_missing")
 
     base_threshold = 4 if h >= 60.0 else 3
-    required = base_threshold  # Ver281: 5周目だけに課していた追加+1条件を撤廃。6周目条件は不変。
+    required = base_threshold
 
     if score < required:
         diag = {
@@ -4614,6 +4681,36 @@ def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_t
             "lap": lap_i,
         }
         return (1.0, diag) if return_diag else 1.0
+
+    # Ver282: Ver281で5周目が約6.8万回発動し、終盤周回誤差がわずかに悪化したため、
+    # 閾値ぴったりの「境界ケース」だけ追加根拠を要求する。
+    # score>required の強い追込根拠はそのまま通す。6周目はVer281と完全同条件。
+    if lap_i == 5 and score == required:
+        _trial_fast282 = (
+            trial is not None and tmed is not None and
+            np.isfinite(float(trial)) and np.isfinite(float(tmed)) and
+            float(trial) <= float(tmed) - 0.035
+        )
+        _residual_strong282 = bool(samples >= 5 and tadj <= -0.020)
+        _borderline_ok282 = bool(gate >= 0.85 and (_residual_strong282 or _trial_fast282))
+        if not _borderline_ok282:
+            diag = {
+                "eligible": True,
+                "reason": "v282_borderline_guard",
+                "score": score,
+                "threshold": required,
+                "base_threshold": base_threshold,
+                "factor": 1.0,
+                "reasons": reasons,
+                "gate": gate,
+                "samples": samples,
+                "time_adjust": tadj,
+                "trial": trial,
+                "trial_median": tmed,
+                "handicap": h,
+                "lap": lap_i,
+            }
+            return (1.0, diag) if return_diag else 1.0
 
     if score >= base_threshold + 2:
         factor = 1.08 if lap_i == 6 else 1.025
@@ -4820,7 +4917,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     late_release_audit_v273={
         5: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
             "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
-            "score_below_required":0,"residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0,
+            "score_below_required":0,"v282_borderline_guard":0,
+            "residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0,
             "errors":0,"last_error":""},
         6: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
             "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
@@ -5079,6 +5177,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                                 late_release_audit_v273[_lap_diag274]['factor_sum']+=float(_late_factor272)
                             elif str(_late_diag274.get('reason') or '')=='score_below_required':
                                 late_release_audit_v273[_lap_diag274]['score_below_required']+=1
+                            elif str(_late_diag274.get('reason') or '')=='v282_borderline_guard':
+                                if _lap_diag274 == 5:
+                                    late_release_audit_v273[_lap_diag274]['v282_borderline_guard']+=1
                             for _rr274 in (_late_diag274.get('reasons') or []):
                                 if _rr274 in ('residual_samples_lt5','gate_lt_080','trial_missing'):
                                     late_release_audit_v273[_lap_diag274][_rr274]+=1
@@ -5235,6 +5336,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["Ver273_6周目30m以上判定"]=int(late_release_audit_v273[6]["rear30_seen"])
     out["Ver273_6周目関数呼出"]=int(late_release_audit_v273[6]["function_called"])
     out["Ver273_5周目スコア不足"]=int(late_release_audit_v273[5]["score_below_required"])
+    out["Ver282_5周目境界抑制"]=int(late_release_audit_v273[5].get("v282_borderline_guard",0))
     out["Ver273_5周目残差不足"]=int(late_release_audit_v273[5]["residual_samples_lt5"])
     out["Ver273_5周目ゲート不足"]=int(late_release_audit_v273[5]["gate_lt_080"])
     out["Ver273_5周目試走不足"]=int(late_release_audit_v273[5]["trial_missing"])
@@ -11723,6 +11825,92 @@ def _v276_validate_db_bytes(data: bytes, label: str = "DB") -> tuple[bool, str]:
             tmp_path.unlink(missing_ok=True)
 
 
+
+def _v282_chunk_manifest_path() -> str:
+    return str(github_config()["path"]).lstrip("/") + ".chunks.json"
+
+
+def _v282_push_chunked_db(snapshot_bytes: bytes, commit_message: str, chunk_size: int = 4 * 1024 * 1024) -> tuple[bool, str]:
+    """大容量DBを小分けしてContents APIへ保存。APIの単発リクエスト肥大化を避ける。"""
+    cfg = github_config()
+    repo_api = f"https://api.github.com/repos/{cfg['repo']}/contents/"
+    branch = cfg["branch"]
+    base_path = str(cfg["path"]).lstrip("/")
+    chunks = [snapshot_bytes[i:i + chunk_size] for i in range(0, len(snapshot_bytes), chunk_size)]
+    import hashlib
+    digest = hashlib.sha256(snapshot_bytes).hexdigest()
+
+    def put_file(path: str, data: bytes, message: str) -> tuple[bool, str]:
+        encoded = urllib.parse.quote(path, safe="/")
+        url = repo_api + encoded
+        q = url + "?ref=" + urllib.parse.quote(branch)
+        s, old = github_request(q)
+        payload = {
+            "message": message,
+            "content": base64.b64encode(data).decode("ascii"),
+            "branch": branch,
+        }
+        if s == 200 and old.get("sha"):
+            payload["sha"] = old["sha"]
+        elif s != 404:
+            return False, str(old.get("message", s))
+        ps, body = github_request(url, method="PUT", payload=payload)
+        if ps not in (200, 201):
+            return False, str(body.get("message", ps))
+        return True, "ok"
+
+    chunk_paths = []
+    for idx, chunk in enumerate(chunks):
+        cp = f"{base_path}.part{idx:03d}"
+        ok, msg = put_file(cp, chunk, f"{commit_message} [part {idx+1}/{len(chunks)}]")
+        if not ok:
+            return False, f"分割DB part {idx+1}/{len(chunks)} 保存失敗: {msg}"
+        chunk_paths.append(cp)
+
+    manifest = {
+        "format": "AutoRaceAI-sqlite-chunks-v1",
+        "size": len(snapshot_bytes),
+        "sha256": digest,
+        "parts": chunk_paths,
+    }
+    manifest_bytes = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+    ok, msg = put_file(_v282_chunk_manifest_path(), manifest_bytes, f"{commit_message} [manifest]")
+    if not ok:
+        return False, f"分割DB manifest保存失敗: {msg}"
+    return True, f"DB登録成功｜GitHub分割保存成功（{len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割）"
+
+
+def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
+    """分割保存されたDBがあれば復元する。manifest無しなら従来方式へ戻す。"""
+    cfg = github_config()
+    repo_api = f"https://api.github.com/repos/{cfg['repo']}/contents/"
+    mp = _v282_chunk_manifest_path()
+    url = repo_api + urllib.parse.quote(mp, safe="/") + "?ref=" + urllib.parse.quote(cfg["branch"])
+    status, body = github_request(url)
+    if status == 404:
+        return False, None, "manifestなし"
+    if status != 200:
+        return False, None, f"分割DB manifest取得失敗: {body.get('message', status)}"
+    try:
+        manifest = json.loads(base64.b64decode(body["content"].replace("\n", "")).decode("utf-8"))
+        data_parts = []
+        for idx, cp in enumerate(manifest.get("parts") or []):
+            u = repo_api + urllib.parse.quote(cp, safe="/") + "?ref=" + urllib.parse.quote(cfg["branch"])
+            s, b = github_request(u)
+            if s != 200:
+                return False, None, f"分割DB part {idx+1}取得失敗: {b.get('message', s)}"
+            data_parts.append(base64.b64decode(b["content"].replace("\n", "")))
+        data = b"".join(data_parts)
+        import hashlib
+        if len(data) != int(manifest.get("size", -1)):
+            return False, None, "分割DBのサイズ検証に失敗しました。"
+        if hashlib.sha256(data).hexdigest() != str(manifest.get("sha256", "")):
+            return False, None, "分割DBのSHA256検証に失敗しました。"
+        return True, data, "ok"
+    except Exception as exc:
+        return False, None, f"分割DB復元エラー: {type(exc).__name__}: {exc}"
+
+
 def pull_db_from_github() -> tuple[bool, str]:
     try:
         if "_v278_bg_has_running_job" in globals() and _v278_bg_has_running_job(engine.DB_PATH):
@@ -11733,6 +11921,20 @@ def pull_db_from_github() -> tuple[bool, str]:
     if not ready:
         return False, message
     cfg = github_config()
+    chunk_ok, chunk_data, chunk_msg = _v282_pull_chunked_db()
+    if chunk_ok and chunk_data is not None:
+        data = chunk_data
+        try:
+            ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上の分割DB")
+            if not ok:
+                return False, "GitHub上の分割DBは採用しませんでした。現在のDBは保護されています。\n" + msg
+            st.session_state.pop("loaded_db_hash", None)
+            return True, f"GitHubから分割DBを安全に取得しました（{len(data) / 1024 / 1024:.2f} MB / 旧WAL・SHM除去済み）"
+        except Exception as exc:
+            return False, f"GitHub分割DB取得エラー: {type(exc).__name__}: {exc}"
+    elif chunk_msg != "manifestなし":
+        return False, chunk_msg
+
     url = github_api_url() + "?ref=" + urllib.parse.quote(cfg["branch"])
     status, body = github_request(url)
     if status != 200:
@@ -11869,7 +12071,11 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
         ok2, msg2 = _v281_push_large_file_via_git_data_api(snapshot_bytes, commit_message)
         if ok2:
             return True, msg2
-        return False, f"DB登録成功｜GitHub保存失敗: {err}｜大容量保存も失敗: {msg2}"
+        # Git Data APIでもbase64化した単発payloadが大き過ぎる環境では、4MB単位の分割保存へ退避。
+        ok3, msg3 = _v282_push_chunked_db(snapshot_bytes, commit_message)
+        if ok3:
+            return True, msg3
+        return False, f"DB登録成功｜GitHub保存失敗: {err}｜大容量保存も失敗: {msg2}｜分割保存も失敗: {msg3}"
     return True, f"DB登録成功｜GitHub保存成功（{len(snapshot_bytes)/1024/1024:.1f}MB）"
 
 
@@ -14642,6 +14848,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                             "5周対象": int(_a5.get("eligible",0) or 0),
                                             "5周発動": int(_a5.get("triggered",0) or 0),
                                             "5周スコア不足": int(_a5.get("score_below_required",0) or 0),
+                                            "5周境界抑制": int(_a5.get("v282_borderline_guard",0) or 0),
                                             "5周残差不足": int(_a5.get("residual_samples_lt5",0) or 0),
                                             "5周ゲート不足": int(_a5.get("gate_lt_080",0) or 0),
                                             "5周試走不足": int(_a5.get("trial_missing",0) or 0),
@@ -14687,7 +14894,8 @@ if selected_main_page == "🗃️ 登録情報確認":
                         st.markdown("#### ⚖️ Ver別 精度・回収率 共通レース比較")
                         st.caption(
                             "選択した全Verに共通する保存済みレースだけで、"
-                            "①周回予測精度 と ②同じ最古オッズを使った仮想100円均等回収率 を横並び比較します。"
+                            "①TOP3重視＋周回予測精度 と ②同じ最古オッズを使った仮想100円均等回収率 を横並び比較します。"
+                            " TOP3重視スコアは 1着35%・実TOP3捕捉35%・三連複15%・三連単15% で評価します。"
                         )
                         try:
                             _v272_all_hist = _v231_list_prediction_histories(engine.DB_PATH, 1000)
@@ -14744,6 +14952,12 @@ if selected_main_page == "🗃️ 登録情報確認":
                                             "位置一致率": st.column_config.NumberColumn(format="%.1f%%"),
                                             "前後関係一致率": st.column_config.NumberColumn(format="%.1f%%"),
                                             "平均順位誤差": st.column_config.NumberColumn(format="%.2f"),
+                                            "1着的中率": st.column_config.NumberColumn(format="%.1f%%"),
+                                            "TOP3一致": st.column_config.NumberColumn(format="%.2f/3"),
+                                            "三連複一致率": st.column_config.NumberColumn(format="%.1f%%"),
+                                            "三連単一致率": st.column_config.NumberColumn(format="%.1f%%"),
+                                            "実TOP3予測順位誤差": st.column_config.NumberColumn(format="%.2f"),
+                                            "TOP3重視スコア": st.column_config.NumberColumn(format="%.1f"),
                                             "1周目誤差": st.column_config.NumberColumn(format="%.2f"),
                                             "2周目誤差": st.column_config.NumberColumn(format="%.2f"),
                                             "3周目誤差": st.column_config.NumberColumn(format="%.2f"),
@@ -14788,7 +15002,8 @@ if selected_main_page == "🗃️ 登録情報確認":
                                         )
                                 st.caption(
                                     "精度は同じ実測グランドノート、回収率は同じレース・同じ最古保存オッズで評価します。"
-                                    "予測ロジックは変更しません。"
+                                    "TOP3重視スコアを主判断にし、4～8着を含む平均順位誤差は参考値として残します。"
+                                    "この追加は評価表示だけで、予測ロジックは変更しません。"
                                 )
 
                         run_v255=st.button("保存済みバージョンを再評価",key="v255_backtest_run",use_container_width=True)
