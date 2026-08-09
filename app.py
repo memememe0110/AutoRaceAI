@@ -5227,6 +5227,42 @@ def _v279_incident_summary(db_path: str, player_name: str = "") -> dict:
     return out
 
 
+
+# Ver280: 保存済みの元結果本文から、過去の反妨等を一括抽出して事故履歴へ登録する。
+def _v280_backfill_incident_history(db_path: str) -> dict:
+    report={"対象":0,"検出レース":0,"保存件数":0,"エラー":0}
+    _v279_ensure_player_incident_history_table(db_path)
+    try:
+        _v238_ensure_raw_result_archive(db_path)
+        with sqlite3.connect(db_path) as con:
+            raws=con.execute("SELECT race_key,raw_result_text FROM v238_result_raw_archive ORDER BY race_key").fetchall()
+        report["対象"]=len(raws)
+        for race_key, raw in raws:
+            try:
+                meta, incidents=_v227_detect_poststart_incidents(str(raw or ""), {})
+                if not incidents:
+                    continue
+                report["検出レース"]+=1
+                rows=pd.DataFrame()
+                try:
+                    with sqlite3.connect(db_path) as con:
+                        rows=pd.read_sql_query(
+                            "SELECT car_no AS 車番,player_name AS 選手名 FROM result_entries WHERE race_key=?",
+                            con,params=(str(race_key),)
+                        )
+                        rr=con.execute("SELECT race_date,venue,race_no FROM result_races WHERE race_key=?",(str(race_key),)).fetchone()
+                    if rr:
+                        meta.update({"開催日":rr[0],"開催場":rr[1],"R":rr[2]})
+                except Exception:
+                    pass
+                report["保存件数"] += _v279_save_player_incident_history(db_path,str(race_key),meta,rows,incidents)
+            except Exception:
+                report["エラー"]+=1
+    except Exception as exc:
+        report["fatal"]=f"{type(exc).__name__}: {exc}"
+    return report
+
+
 # Ver148: Streamlit fragment互換デコレーター
 # st.fragment が利用できる環境では部分再実行、未対応環境では通常関数として動作します。
 _v146_fragment = getattr(st, "fragment", lambda func: func)
@@ -5660,6 +5696,77 @@ def _v232_load_result_view_for_race(db_path: str, race_key: str) -> dict:
 
 
 # Ver238: 結果の元本文を構造化結果とは別に保管し、再構成本文による誤上書きを防ぐ。
+
+# Ver280: 復元した「その履歴バージョン」の予測と実結果を照合して表示する。
+# race_keyだけで保存された最新結果解析payloadをそのまま流用しない。
+def _v280_build_result_view_for_prediction(db_path: str, race_key: str, prediction_view: dict) -> dict:
+    if not race_key or not isinstance(prediction_view, dict):
+        return {}
+    pred_df = prediction_view.get("df")
+    if not isinstance(pred_df, pd.DataFrame) or pred_df.empty:
+        return {}
+    try:
+        with sqlite3.connect(db_path) as con:
+            actual = pd.read_sql_query("""
+                SELECT car_no AS 車番, player_name AS 選手名, finish AS 着順,
+                       result_status AS 結果状態
+                FROM result_entries WHERE race_key=?
+            """, con, params=(str(race_key),))
+        if actual.empty:
+            return {}
+        p = pred_df.copy()
+        car_col = "車" if "車" in p.columns else ("車番" if "車番" in p.columns else None)
+        if not car_col:
+            return {}
+        p["車番"] = pd.to_numeric(p[car_col], errors="coerce")
+        # 保存済み確率から順位を再現。これは再シミュレーションではなく、その履歴の保存値を使う。
+        if "本番1着率" in p.columns:
+            p["predicted_rank"] = pd.to_numeric(p["本番1着率"], errors="coerce").rank(method="first", ascending=False).astype("Int64")
+            p["win_prob"] = pd.to_numeric(p["本番1着率"], errors="coerce")
+        elif "勝率" in p.columns:
+            p["predicted_rank"] = pd.to_numeric(p["勝率"], errors="coerce").rank(method="first", ascending=False).astype("Int64")
+            p["win_prob"] = pd.to_numeric(p["勝率"], errors="coerce")
+        elif "改善後順位" in p.columns:
+            p["predicted_rank"] = pd.to_numeric(p["改善後順位"], errors="coerce").astype("Int64")
+        else:
+            return {}
+        if "本番3着内率" in p.columns:
+            p["top3_prob"] = pd.to_numeric(p["本番3着内率"], errors="coerce")
+        elif "3着以内率" in p.columns:
+            p["top3_prob"] = pd.to_numeric(p["3着以内率"], errors="coerce")
+        keep=["車番","predicted_rank"]+[c for c in ["win_prob","top3_prob"] if c in p.columns]
+        comp=actual.merge(p[keep],on="車番",how="left")
+        comp["順位誤差"]=pd.to_numeric(comp["着順"],errors="coerce")-pd.to_numeric(comp["predicted_rank"],errors="coerce")
+        normal=comp[~comp["結果状態"].fillna("通常").astype(str).str.contains(r"欠車|取消|除外|反妨|反則|失格|落車|中止|周誤",regex=True)]
+        ranked=normal.dropna(subset=["着順","predicted_rank"])
+        if ranked.empty:
+            analysis={"message":"この結果は予測精度評価の対象外です。"}
+        else:
+            winner=ranked[pd.to_numeric(ranked["着順"],errors="coerce")==1]
+            top3_actual=set(pd.to_numeric(ranked.loc[pd.to_numeric(ranked["着順"],errors="coerce")<=3,"車番"],errors="coerce").dropna().astype(int))
+            top3_pred=set(pd.to_numeric(ranked.nsmallest(3,"predicted_rank")["車番"],errors="coerce").dropna().astype(int))
+            analysis={
+                "平均順位誤差": round(float(ranked["順位誤差"].abs().mean()),2),
+                "1着的中": bool(not winner.empty and int(winner.iloc[0]["predicted_rank"])==1),
+                "3着内一致数": len(top3_actual & top3_pred),
+            }
+        out={
+            "key":str(race_key),
+            "comparison":comp,
+            "analysis":analysis,
+            "adjustment":{},
+            "restored_prediction_version":str(prediction_view.get("app_version") or "Unknown"),
+            "restored_prediction_time":str(prediction_view.get("prediction_time") or ""),
+        }
+        # 回収率は race_keyだけでなく、復元履歴側に保存された正式プランがあればそれを優先。
+        for k in ("mixed_plan_result","return_plan_result","ticket_result"):
+            if isinstance(prediction_view.get(k),dict):
+                out["mixed_plan_result"]=prediction_view.get(k); break
+        return out
+    except Exception:
+        return {}
+
+
 def _v238_ensure_raw_result_archive(db_path: str) -> None:
     with sqlite3.connect(db_path) as con:
         con.execute(
@@ -11288,8 +11395,13 @@ def render_last_result_analysis(view: dict) -> None:
     comparison = view.get("comparison")
     analysis = view.get("analysis") or {}
     adjustment = view.get("adjustment") or {}
-    st.markdown("### 📌 直前に登録した結果解析")
-    st.caption(f"登録キー: {view.get('key', '不明')}｜別タブ操作や再描画後も保持されます。")
+    _rv = str(view.get("restored_prediction_version") or "").strip()
+    if _rv:
+        st.markdown(f"### 📌 復元した{_rv}予測の結果解析")
+        st.caption(f"登録キー: {view.get('key', '不明')}｜復元した予測履歴の保存値と実結果を照合しています。")
+    else:
+        st.markdown("### 📌 直前に登録した結果解析")
+        st.caption(f"登録キー: {view.get('key', '不明')}｜別タブ操作や再描画後も保持されます。")
     mixed_result = view.get("mixed_plan_result")
     if not isinstance(mixed_result, dict):
         mixed_result = _v208_latest_mixed_plan_result(str(view.get("key", "")), engine.DB_PATH)
@@ -11566,9 +11678,13 @@ elif selected_main_page == "🏁 予測":
                         st.session_state["v163_saved_prediction_venue"] = restored_venue
                         st.session_state["prediction_input_version"] = int(st.session_state.get("prediction_input_version", 0)) + 1
                         restored_race_key = str(target.get("race_key") or history_meta.get("race_key") or restored_view.get("race_key") or "").strip()
-                        restored_result_view = _v232_load_result_view_for_race(engine.DB_PATH, restored_race_key)
+                        restored_result_view = _v280_build_result_view_for_prediction(
+                            engine.DB_PATH, restored_race_key, restored_view
+                        )
+                        if not restored_result_view:
+                            restored_result_view = _v232_load_result_view_for_race(engine.DB_PATH, restored_race_key)
                         if restored_result_view:
-                            st.session_state["v41_last_result_view"] = restored_result_view
+                            # 復元欄専用。全体の「直前結果」は上書きせず、旧バージョン表示との混線を防ぐ。
                             st.session_state["v232_restored_result_view"] = restored_result_view
                         else:
                             st.session_state.pop("v232_restored_result_view", None)
@@ -12868,6 +12984,18 @@ if selected_main_page == "✅ 結果登録・解析":
 
 
 if selected_main_page == "🗃️ 登録情報確認":
+    st.subheader("🧾 反妨など事故履歴の一括登録")
+    st.caption("保存済みの元結果本文を走査し、反妨・反則妨害・落車・競走中止・周誤・失格などを選手別履歴へ一括登録します。予測補正にはまだ使用しません。")
+    if st.button("保存済み結果から事故履歴を一括登録", use_container_width=True, key="v280_backfill_incidents"):
+        with st.spinner("保存済みの元結果本文を確認しています…"):
+            st.session_state["v280_backfill_report"]=_v280_backfill_incident_history(engine.DB_PATH)
+    _br=st.session_state.get("v280_backfill_report")
+    if isinstance(_br,dict):
+        if _br.get("fatal"):
+            st.warning(f"一括登録を完了できませんでした：{_br.get('fatal')}")
+        else:
+            st.success(f"確認 {_br.get('対象',0)}R｜事故検出 {_br.get('検出レース',0)}R｜保存 {_br.get('保存件数',0)}件｜エラー {_br.get('エラー',0)}件")
+    st.divider()
     st.subheader("全結果バックテスト・重み最適化")
     st.caption("単発レースの結果だけでなく、予測時に保存した特徴と登録済み結果をまとめて比較します。古い約70%で候補を探し、新しい約30%でも悪化しない候補だけを提案します。")
     candidate_count = st.slider("試す重み候補数", 200, 3000, 800, 100, key="v74_candidate_count")
