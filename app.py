@@ -39,6 +39,9 @@ SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
 _V231_APP_VERSION = "Ver284"  # Ver280: 川口4日実測ベースの予測改善
+
+# Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
+_V284_DB_GUARD_PATCH = "2026-08-09-v4-path-identity-lock"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -11570,6 +11573,13 @@ def install_uploaded_db(uploaded) -> tuple[bool, str]:
         return False, "DBを読み込めませんでした: " + msg
 
     st.session_state["loaded_db_hash"] = digest
+    try:
+        _id284=_v284_current_db_identity()
+        if _id284.get("ok"):
+            st.session_state["v284_db_identity_baseline"]=_id284
+            st.session_state["v284_db_identity_block"]=[]
+    except Exception:
+        pass
     return True, f"DBを安全に読み込みました（{len(data) / 1024 / 1024:.1f} MB / 旧WAL・SHM除去済み）"
 
 
@@ -12107,10 +12117,17 @@ def _v283_db_fingerprint_bytes(data: bytes) -> dict:
             ).fetchall()}
 
             protected=[
-                "players","race_history","result_races","result_entries","result_laps",
-                "result_payouts","v231_prediction_history","v252_lap_prediction_snapshots",
-                "v221_odds_runs","v221_odds_values","v67_prediction_tickets",
+                "players","race_history","player_lap_history",
+                "result_races","result_entries","result_laps","result_payouts",
+                "prediction_feedback","prediction_snapshots",
+                "v231_prediction_history","v252_lap_prediction_snapshots","v266_pred_time_snapshots",
+                "v221_odds_runs","v221_odds_values",
+                "v67_prediction_tickets","v67_ticket_feedback",
                 "v187_mixed_plan_runs","v187_mixed_plan_feedback",
+                "v187_mixed_plan_tickets","v187_mixed_ticket_feedback",
+                "v222_prediction_restore","v223_result_view_restore","v238_result_raw_archive",
+                "v40_prediction_feature_snapshots","v41_registration_batches",
+                "weight_adjustment_history",
             ]
             counts={}
             for t in protected:
@@ -12151,8 +12168,11 @@ def _v283_compare_db_fingerprints(candidate: dict, baseline: dict) -> dict:
     if not candidate.get("ok"):
         return {"safe":False,"regressions":[f"候補DBの指紋取得失敗: {candidate.get('reason','')}"],"warnings":[]}
     if not baseline or not baseline.get("ok"):
-        result["warnings"].append("比較元の指紋が無いため件数ガードは初回登録扱いです")
-        return result
+        return {
+            "safe":False,
+            "regressions":["比較元DBの指紋を取得できないため、安全確認なしのDB置換・保存は禁止しました"],
+            "warnings":[]
+        }
 
     cc=candidate.get("counts") or {}
     bc=baseline.get("counts") or {}
@@ -12218,9 +12238,13 @@ def _v282_push_chunked_db(
     base_path=str(cfg["path"]).lstrip("/")
 
     current_ok,current_manifest,_=_v283_get_chunk_manifest(branch=branch,previous=False)
+    _prev_ok_gen284,_prev_manifest_gen284,_=_v283_get_chunk_manifest(branch=branch,previous=True)
     current_slot=str((current_manifest or {}).get("slot") or "")
     next_slot="B" if current_slot=="A" else "A"
-    generation=int((current_manifest or {}).get("generation") or 0)+1
+    generation=max(
+        int((current_manifest or {}).get("generation") or 0),
+        int((_prev_manifest_gen284 or {}).get("generation") or 0) if _prev_ok_gen284 else 0,
+    )+1
 
     chunks=[snapshot_bytes[i:i+chunk_size] for i in range(0,len(snapshot_bytes),chunk_size)]
     import hashlib
@@ -12338,6 +12362,14 @@ def pull_db_from_github() -> tuple[bool, str]:
         try:
             # Ver283世代ガード: GitHub側が正常SQLiteでも、ローカルより欠損していれば巻き戻さない。
             _remote_fp283=_v283_db_fingerprint_bytes(data)
+            _mf_ok284,_mf284,_mf_msg284=_v283_get_chunk_manifest(branch=_v282_db_read_branch(),previous=False)
+            _mf_fp284=(_mf284 or {}).get("stats") or {}
+            if not _mf_ok284 or not _mf_fp284.get("ok"):
+                return False,"GitHub DBの再読込を中止しました。manifestのDB指紋が無い/不完全な世代は採用しません。"
+            _manifest_cmp284=_v283_compare_db_fingerprints(_remote_fp283,_mf_fp284)
+            _manifest_cmp284_rev=_v283_compare_db_fingerprints(_mf_fp284,_remote_fp283)
+            if not _manifest_cmp284.get("safe") or not _manifest_cmp284_rev.get("safe"):
+                return False,"GitHub DBの再読込を中止しました。manifest記録件数と実DB件数が一致しない世代です。"
             try:
                 _local_bytes283=_v278_consistent_db_snapshot_bytes(str(engine.DB_PATH))
                 _local_fp283=_v283_db_fingerprint_bytes(_local_bytes283)
@@ -12478,6 +12510,9 @@ def _v281_push_large_file_via_git_data_api(snapshot_bytes: bytes, commit_message
 
 
 def push_db_to_github(commit_message: str) -> tuple[bool, str]:
+    _guard284=st.session_state.get("v284_db_identity_block") or []
+    if _guard284:
+        return False,"DB参照先固定ガードが作動中のためGitHub保存を禁止しました。\n- "+"\n- ".join(map(str,_guard284))
     ready,message=github_ready()
     if not ready:
         return False,message
@@ -12510,12 +12545,24 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     remote_ok,remote_manifest,remote_msg=_v283_get_chunk_manifest(branch=db_branch,previous=False)
     if remote_ok:
         remote_fp=(remote_manifest or {}).get("stats") or {}
-        cmp=_v283_compare_db_fingerprints(local_fp,remote_fp)
-        if not cmp.get("safe"):
+        if not remote_fp.get("ok"):
+            return False,"GitHub保存を中止しました。current manifestのDB指紋が不完全です。"
+        _baseline_fps284=[("current",remote_fp)]
+        _prev_ok284,_prev_manifest284,_prev_msg284=_v283_get_chunk_manifest(branch=db_branch,previous=True)
+        if _prev_ok284:
+            _prev_fp284=(_prev_manifest284 or {}).get("stats") or {}
+            if _prev_fp284.get("ok"):
+                _baseline_fps284.append(("previous",_prev_fp284))
+        _reg284=[]
+        for _label284,_basefp284 in _baseline_fps284:
+            _cmp284=_v283_compare_db_fingerprints(local_fp,_basefp284)
+            if not _cmp284.get("safe"):
+                _reg284.extend([f"{_label284}: {x}" for x in (_cmp284.get("regressions") or [])])
+        if _reg284:
             return False,(
-                "GitHub保存を中止しました。現在DBはGitHub上の最新DBよりデータが減っています。"
-                " 巻き戻り防止のため自動上書きしません。まずDB統合を行ってください。\\n- "
-                +"\\n- ".join(cmp.get("regressions") or [])
+                "GitHub保存を中止しました。現在DBはGitHubの保護世代よりデータが減っています。"
+                " 不足DBを新しい世代へ昇格させません。まずDB統合を行ってください。\\n- "
+                +"\\n- ".join(_reg284)
             )
     elif remote_msg!="manifestなし":
         return False,"GitHub保存前の世代確認に失敗しました: "+str(remote_msg)
@@ -12582,6 +12629,51 @@ def _v278_render_bg_compact(location: str = "main") -> None:
         st.warning("⚠️ バックグラウンド再シミュレーションでエラーがあります。再シミュレーション画面で確認してください。")
 
 
+
+# Ver284 DB参照先固定ガード:
+# Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
+def _v284_current_db_identity() -> dict:
+    try:
+        p=Path(str(engine.DB_PATH)).resolve()
+        data=_v278_consistent_db_snapshot_bytes(str(p))
+        fp=_v283_db_fingerprint_bytes(data)
+        return {
+            "ok":bool(fp.get("ok")),
+            "path":str(p),
+            "sha256":hashlib.sha256(data).hexdigest(),
+            "size":len(data),
+            "fingerprint":fp,
+        }
+    except Exception as exc:
+        return {"ok":False,"path":str(getattr(engine,"DB_PATH","")),"reason":f"{type(exc).__name__}: {exc}"}
+
+def _v284_db_identity_regressed(now: dict, baseline: dict) -> tuple[bool,list[str]]:
+    reasons=[]
+    if not now.get("ok") or not baseline.get("ok"):
+        return True,["DB識別情報を取得できません"]
+    if str(now.get("path")) != str(baseline.get("path")):
+        reasons.append(f"DBパス変更: {baseline.get('path')} → {now.get('path')}")
+    cmp=_v283_compare_db_fingerprints(now.get("fingerprint") or {},baseline.get("fingerprint") or {})
+    if not cmp.get("safe"):
+        reasons.extend(cmp.get("regressions") or [])
+    return bool(reasons),reasons
+
+_v284_identity_now=_v284_current_db_identity()
+_v284_identity_key="v284_db_identity_baseline"
+_v284_identity_block_key="v284_db_identity_block"
+if _v284_identity_now.get("ok"):
+    _v284_identity_base=st.session_state.get(_v284_identity_key)
+    if not isinstance(_v284_identity_base,dict) or not _v284_identity_base.get("ok"):
+        st.session_state[_v284_identity_key]=_v284_identity_now
+        st.session_state[_v284_identity_block_key]=[]
+    else:
+        _v284_bad,_v284_reasons=_v284_db_identity_regressed(_v284_identity_now,_v284_identity_base)
+        st.session_state[_v284_identity_block_key]=_v284_reasons if _v284_bad else []
+        # 件数が増えた正常DBは新基準へ昇格。SHA変化だけでは巻き戻り扱いにしない。
+        if not _v284_bad:
+            st.session_state[_v284_identity_key]=_v284_identity_now
+
+
 with st.sidebar:
     _v278_render_bg_compact("sidebar")
     st.header("予測設定")
@@ -12589,6 +12681,18 @@ with st.sidebar:
     seed = st.number_input("乱数シード", min_value=0, value=20260719, step=1)
     st.divider()
     st.subheader("履歴DB")
+    _guard284=st.session_state.get("v284_db_identity_block") or []
+    _idshow284=_v284_current_db_identity()
+    if _idshow284.get("ok"):
+        _fp284=_idshow284.get("fingerprint") or {}
+        st.caption(
+            "DB固定監視: "+str(_idshow284.get("path"))+
+            f" | {float(_idshow284.get('size',0))/1024/1024:.2f} MB"+
+            " | SHA "+str(_idshow284.get("sha256",""))[:10]+
+            " | 履歴 "+str((_fp284.get("counts") or {}).get("race_history","?"))
+        )
+    if _guard284:
+        st.error("⛔ DBが実行中に古い/別の実体へ切り替わったため保護停止中です。\n- "+"\n- ".join(map(str,_guard284)))
     db_file = st.file_uploader(
         "autorace_players.sqlite3を選択",
         type=None,
