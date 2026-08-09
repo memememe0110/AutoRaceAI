@@ -50,6 +50,7 @@ _V284_GITHUB_READBACK_VERIFY_PATCH = "2026-08-09-v1"
 _V284_GITHUB_RAW_READBACK_PATCH = "2026-08-09-v1"
 _V284_GITHUB_RAW_TOKEN_FIX = "2026-08-09-v1"
 _V284_GITHUB_RELOAD_UNIFIED_VERIFY = "2026-08-09-v1"
+_V284_BOOT_GITHUB_CANONICAL_RESTORE = "2026-08-09-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -13112,6 +13113,46 @@ if isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_
         else:
             st.session_state["v284_db_identity_block"]=["アップロード正本の自動復元失敗: "+str(_v284_restore_msg)]
 
+# Ver284: Streamlit再起動/再デプロイ時はsession_state正本が消えるため、
+# GitHubの検証済みcurrent分割DBを起動時正本として復元する。
+# リポジトリ同梱の古いDBをbaselineに採用する前に実行する。
+if not st.session_state.get("v284_boot_github_restore_checked",False):
+    st.session_state["v284_boot_github_restore_checked"]=True
+    try:
+        _boot_ready284,_boot_ready_msg284=github_ready()
+        if _boot_ready284:
+            _boot_ok284,_boot_bytes284,_boot_msg284=_v282_pull_chunked_db()
+            if _boot_ok284 and isinstance(_boot_bytes284,(bytes,bytearray)):
+                _boot_remote284=_v283_db_fingerprint_bytes(bytes(_boot_bytes284))
+                _boot_local284=_v284_current_db_identity()
+                _boot_local_fp284=(_boot_local284.get("fingerprint") or {}) if _boot_local284.get("ok") else {}
+                _boot_remote_counts284=_boot_remote284.get("counts") or {}
+                _boot_local_counts284=_boot_local_fp284.get("counts") or {}
+                # GitHub currentがSQLiteとして正常で、主要件数がローカル以上なら起動時正本にする。
+                _boot_keys284=("players","race_history","result_races","result_entries","result_laps","result_payouts")
+                _boot_not_older284=all(
+                    int(_boot_remote_counts284.get(k,0) or 0) >= int(_boot_local_counts284.get(k,0) or 0)
+                    for k in _boot_keys284
+                )
+                if _boot_remote284.get("ok") and _boot_not_older284:
+                    _boot_sha_local284=str(_boot_local284.get("sha256","")) if _boot_local284.get("ok") else ""
+                    _boot_sha_remote284=hashlib.sha256(bytes(_boot_bytes284)).hexdigest()
+                    if _boot_sha_local284 != _boot_sha_remote284:
+                        _boot_install_ok284,_boot_install_msg284=_v276_atomic_install_db_bytes(
+                            bytes(_boot_bytes284),"起動時GitHub current正本復元"
+                        )
+                        if _boot_install_ok284:
+                            st.session_state["v284_boot_github_restored"]=True
+                        else:
+                            st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時復元失敗: "+str(_boot_install_msg284)
+                elif _boot_remote284.get("ok"):
+                    # currentがローカルより古い場合はローカルを壊さず維持。
+                    st.session_state["v284_boot_github_restore_note"]="GitHub currentは現在DBより古いため起動時置換を行いませんでした。"
+            elif _boot_msg284!="manifestなし":
+                st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時検証失敗: "+str(_boot_msg284)
+    except Exception as _boot_exc284:
+        st.session_state["v284_boot_github_restore_error"]=f"起動時GitHub正本確認失敗: {type(_boot_exc284).__name__}: {_boot_exc284}"
+
 _v284_identity_now=_v284_current_db_identity()
 _v284_identity_key="v284_db_identity_baseline"
 _v284_identity_block_key="v284_db_identity_block"
@@ -13137,6 +13178,11 @@ with st.sidebar:
     st.subheader("履歴DB")
     if st.session_state.pop("v284_db_auto_restored",False):
         st.success("🔒 rerunで古いDBへの後退を検知したため、アップロード済み正本へ自動復元しました。")
+    if st.session_state.pop("v284_boot_github_restored",False):
+        st.success("🔒 アプリ再起動を検知し、検証済みGitHub current DBを起動時正本として自動復元しました。")
+    _boot_err284=st.session_state.get("v284_boot_github_restore_error")
+    if _boot_err284:
+        st.error("⛔ "+str(_boot_err284)+"\n古い同梱DBへの自動切替は行いません。")
     _guard284=st.session_state.get("v284_db_identity_block") or []
     _idshow284=_v284_current_db_identity()
     if _idshow284.get("ok"):
