@@ -53,6 +53,7 @@ _V284_GITHUB_RELOAD_UNIFIED_VERIFY = "2026-08-09-v1"
 _V284_BOOT_GITHUB_CANONICAL_RESTORE = "2026-08-09-v1"
 _V284_DERIVED_TABLE_GUARD_FIX = "2026-08-09-v1"
 _V284_DIVERGED_SAFE_AUTO_MERGE = "2026-08-09-v1"
+_V284_V252_SEMANTIC_CONTAINMENT = "2026-08-10-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -12295,11 +12296,14 @@ def _v284_db_row_keysets_from_bytes(data: bytes) -> dict:
             # 周回予測もsnapshot_idではなく内容キーで比較
             if "v252_lap_prediction_snapshots" in tables:
                 cols={str(r[1]) for r in con.execute('PRAGMA table_info("v252_lap_prediction_snapshots")').fetchall()}
-                keys=("race_date","venue","race_no","lap_no","app_version","predicted_order","created_at")
+                # Ver284: created_at は再シミュレーションのたびに変わるため、
+                # 同じ周回予測を別物として diverged 判定しない。
+                # race/lap/version/backtest/予測順を意味キーとし、support/created_at差は同一スナップショット系列として扱う。
+                keys=("race_date","venue","race_no","lap_no","app_version","is_backtest","predicted_order")
                 if all(k in cols for k in keys):
                     result["v252_lap_prediction_snapshots"]={
                         tuple(r) for r in con.execute(
-                            'SELECT race_date,venue,race_no,lap_no,app_version,predicted_order,created_at '
+                            'SELECT race_date,venue,race_no,lap_no,app_version,is_backtest,predicted_order '
                             'FROM v252_lap_prediction_snapshots'
                         ).fetchall()
                     }
@@ -12958,7 +12962,8 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
         "v238_result_raw_archive":("race_key",),
         "v279_player_incident_history":("race_key","car_no","incident_type"),
         "v231_prediction_history":("race_key","app_version","prediction_time"),
-        "v252_lap_prediction_snapshots":("race_date","venue","race_no","lap_no","app_version","predicted_order","created_at"),
+        # created_at/support差だけの再シミュレーション重複は別行扱いしない。
+        "v252_lap_prediction_snapshots":("race_date","venue","race_no","lap_no","app_version","is_backtest","predicted_order"),
     }
 
     tmp_dir=Path(tempfile.mkdtemp(prefix="autorace_safe_union_"))
