@@ -45,6 +45,8 @@ _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
 _V284_TRANSITION_AUDIT_PATCH = "2026-08-09-v1"
 _V284_DOWNLOAD_SNAPSHOT_PATCH = "2026-08-09-v1"
 _V284_GITHUB_RECOVERY_PUSH_PATCH = "2026-08-09-v1"
+_V284_UPLOAD_MASTER_PIN_PATCH = "2026-08-09-v1"
+_V284_GITHUB_READBACK_VERIFY_PATCH = "2026-08-09-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -11618,12 +11620,18 @@ def install_uploaded_db(uploaded) -> tuple[bool, str]:
     st.session_state["loaded_db_hash"] = digest
     try:
         _id284=_v284_current_db_identity()
-        if _id284.get("ok"):
-            st.session_state["v284_db_identity_baseline"]=_id284
-            st.session_state["v284_db_identity_block"]=[]
-    except Exception:
-        pass
-    return True, f"DBを安全に読み込みました（{len(data) / 1024 / 1024:.1f} MB / 旧WAL・SHM除去済み）"
+        if not _id284.get("ok"):
+            return False, "アップロード後のDB固定確認に失敗しました。"
+        # Ver284: アップロード採用時点の「正本」をセッションにも保持。
+        # Streamlit rerun等で実ファイルが古いDBへ戻った場合は、この正本から原子的に復元できる。
+        st.session_state["v284_db_identity_baseline"]=_id284
+        st.session_state["v284_db_identity_block"]=[]
+        st.session_state["v284_uploaded_master_bytes"]=bytes(data)
+        st.session_state["v284_uploaded_master_sha256"]=digest
+        st.session_state["v284_uploaded_master_identity"]=_id284
+    except Exception as exc:
+        return False, f"アップロード後の正本固定に失敗しました: {type(exc).__name__}: {exc}"
+    return True, f"DBを安全に読み込み・正本固定しました（{len(data) / 1024 / 1024:.1f} MB / 旧WAL・SHM除去済み）"
 
 
 def secret_value(name: str, default: str = "") -> str:
@@ -12478,6 +12486,51 @@ def _v282_push_chunked_db(
             return False,f"分割DB slot{next_slot} part {idx+1}/{len(chunks)} 保存失敗: {msg}"
         chunk_paths.append(cp)
 
+    # Ver284: 「PUT成功」だけでは保存成功にしない。
+    # inactive slotへ書いた全partをGitHubから読み戻し、各partのサイズ/SHAと
+    # 結合DB全体のサイズ/SHAが元snapshotと完全一致した場合だけmanifestを切替える。
+    import time as _time284
+    _verified_chunks284=[]
+    for _idx284,(_cp284,_expected284) in enumerate(zip(chunk_paths,chunks)):
+        _verified284=False
+        _last284=""
+        for _try284 in range(4):
+            _enc284=urllib.parse.quote(_cp284,safe="/")
+            _url284=repo_api+_enc284+"?ref="+urllib.parse.quote(branch)
+            _s284,_obj284=github_request(_url284)
+            if _s284==200 and isinstance(_obj284,dict) and _obj284.get("content"):
+                try:
+                    _got284=base64.b64decode(str(_obj284.get("content") or "").replace("\n",""))
+                    _same_size284=len(_got284)==len(_expected284)
+                    _same_sha284=hashlib.sha256(_got284).hexdigest()==hashlib.sha256(_expected284).hexdigest()
+                    if _same_size284 and _same_sha284:
+                        _verified_chunks284.append(_got284)
+                        _verified284=True
+                        break
+                    _last284=f"size {len(_got284)}/{len(_expected284)}, sha一致={_same_sha284}"
+                except Exception as _exc284:
+                    _last284=f"{type(_exc284).__name__}: {_exc284}"
+            else:
+                _last284=str((_obj284 or {}).get("message",_s284)) if isinstance(_obj284,dict) else str(_s284)
+            _time284.sleep(0.35)
+        if not _verified284:
+            return False,(
+                f"GitHub保存を未完了として中止しました。slot{next_slot} part {_idx284+1}/{len(chunks)} "
+                f"の読み戻し検証に失敗: {_last284}。current manifestは切り替えていません。"
+            )
+
+    _joined284=b"".join(_verified_chunks284)
+    if len(_joined284)!=len(snapshot_bytes):
+        return False,(
+            f"GitHub保存を未完了として中止しました。読み戻し結合サイズ不一致 "
+            f"{len(_joined284)} != {len(snapshot_bytes)}。current manifestは切り替えていません。"
+        )
+    if hashlib.sha256(_joined284).hexdigest()!=digest:
+        return False,"GitHub保存を未完了として中止しました。読み戻しDBのSHA256不一致。current manifestは切り替えていません。"
+    _verify_fp284=_v283_db_fingerprint_bytes(_joined284)
+    if not _verify_fp284.get("ok"):
+        return False,"GitHub保存を未完了として中止しました。読み戻しDBのSQLite整合性確認に失敗。current manifestは切り替えていません。"
+
     fp=fingerprint if isinstance(fingerprint,dict) and fingerprint.get("ok") else _v283_db_fingerprint_bytes(snapshot_bytes)
     manifest={
         "format":"AutoRaceAI-sqlite-chunks-v2",
@@ -12486,6 +12539,9 @@ def _v282_push_chunked_db(
         "size":len(snapshot_bytes),
         "sha256":digest,
         "parts":chunk_paths,
+        "part_sizes":[len(c) for c in chunks],
+        "part_sha256":[hashlib.sha256(c).hexdigest() for c in chunks],
+        "verified_readback":True,
         "stats":fp,
         "app_version":str(_V231_APP_VERSION),
         "saved_at":_v228_now_jst_iso(),
@@ -12510,7 +12566,7 @@ def _v282_push_chunked_db(
 
     return True,(
         f"DB登録成功｜GitHub分割保存成功 "
-        f"（DB世代{generation} / slot{next_slot} / {len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割）"
+        f"（DB世代{generation} / slot{next_slot} / {len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割 / 全part読み戻し検証済み）"
     )
 
 
@@ -12720,6 +12776,13 @@ def _v281_push_large_file_via_git_data_api(snapshot_bytes: bytes, commit_message
 
 
 def push_db_to_github(commit_message: str) -> tuple[bool, str]:
+    # 保存ボタン押下時にも、アップロード正本よりDBが後退していないか最終確認。
+    _pin284=st.session_state.get("v284_uploaded_master_identity")
+    if isinstance(_pin284,dict) and _pin284.get("ok"):
+        _nowpin284=_v284_current_db_identity()
+        _badpin284,_why284=_v284_db_identity_regressed(_nowpin284,_pin284)
+        if _badpin284:
+            return False,"GitHub保存を中止しました。保存直前にDBがアップロード正本より後退しています。\n- "+"\n- ".join(map(str,_why284))
     _guard284=st.session_state.get("v284_db_identity_block") or []
     if _guard284:
         return False,"DB参照先固定ガードが作動中のためGitHub保存を禁止しました。\n- "+"\n- ".join(map(str,_guard284))
@@ -12908,6 +12971,31 @@ def _v284_db_identity_regressed(now: dict, baseline: dict) -> tuple[bool,list[st
         reasons.extend(cmp.get("regressions") or [])
     return bool(reasons),reasons
 
+# Ver284: アップロード済み正本がある場合、rerunでDB実体が後退していたら
+# GitHub操作や画面処理より前に同じ engine.DB_PATH へ原子的に復元する。
+_v284_pinned_bytes=st.session_state.get("v284_uploaded_master_bytes")
+_v284_pinned_id=st.session_state.get("v284_uploaded_master_identity")
+if isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_id,dict) and _v284_pinned_id.get("ok"):
+    _v284_before_restore=_v284_current_db_identity()
+    _v284_restore_needed=False
+    if not _v284_before_restore.get("ok"):
+        _v284_restore_needed=True
+    else:
+        _v284_regressed,_v284_restore_reasons=_v284_db_identity_regressed(_v284_before_restore,_v284_pinned_id)
+        # 正本とSHAが違っても「増えたDB」は正常更新なので復元しない。
+        # 件数後退/DBパス変更だけを復元対象にする。
+        _v284_restore_needed=bool(_v284_regressed)
+    if _v284_restore_needed:
+        _v284_restore_ok,_v284_restore_msg=_v276_atomic_install_db_bytes(bytes(_v284_pinned_bytes),"アップロード正本自動復元")
+        if _v284_restore_ok:
+            _v284_restored_id=_v284_current_db_identity()
+            if _v284_restored_id.get("ok"):
+                st.session_state["v284_db_identity_baseline"]=_v284_restored_id
+                st.session_state["v284_db_identity_block"]=[]
+                st.session_state["v284_db_auto_restored"]=True
+        else:
+            st.session_state["v284_db_identity_block"]=["アップロード正本の自動復元失敗: "+str(_v284_restore_msg)]
+
 _v284_identity_now=_v284_current_db_identity()
 _v284_identity_key="v284_db_identity_baseline"
 _v284_identity_block_key="v284_db_identity_block"
@@ -12931,6 +13019,8 @@ with st.sidebar:
     seed = st.number_input("乱数シード", min_value=0, value=20260719, step=1)
     st.divider()
     st.subheader("履歴DB")
+    if st.session_state.pop("v284_db_auto_restored",False):
+        st.success("🔒 rerunで古いDBへの後退を検知したため、アップロード済み正本へ自動復元しました。")
     _guard284=st.session_state.get("v284_db_identity_block") or []
     _idshow284=_v284_current_db_identity()
     if _idshow284.get("ok"):
