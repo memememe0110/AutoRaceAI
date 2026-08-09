@@ -43,6 +43,7 @@ _V231_APP_VERSION = "Ver284"  # Ver280: 川口4日実測ベースの予測改善
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
 _V284_TRANSITION_AUDIT_PATCH = "2026-08-09-v1"
+_V284_DOWNLOAD_SNAPSHOT_PATCH = "2026-08-09-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -12957,13 +12958,30 @@ with st.sidebar:
             pass
         db_path = Path(engine.DB_PATH)
         if db_path.exists():
-            st.download_button(
-                "💾 DBを端末へ保存",
-                db_path.read_bytes(),
-                file_name="autorace_players.sqlite3",
-                mime="application/octet-stream",
-                use_container_width=True,
-            )
+            # Ver284: SQLite本体だけをread_bytes()するとWAL内の最新コミットが欠落する。
+            # GitHub保存と同じ整合スナップショットを端末保存にも使用する。
+            try:
+                _download_snapshot284 = _v278_consistent_db_snapshot_bytes(str(db_path))
+                _download_fp284 = _v283_db_fingerprint_bytes(_download_snapshot284)
+                if not _download_fp284.get("ok"):
+                    raise RuntimeError(str(_download_fp284.get("reason") or "DB指紋取得失敗"))
+                st.download_button(
+                    "💾 DBを端末へ保存",
+                    _download_snapshot284,
+                    file_name="autorace_players.sqlite3",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+                st.caption(
+                    f"端末保存用スナップショット: {len(_download_snapshot284)/1024/1024:.2f} MB"
+                    "（WAL内の最新コミットを含む）"
+                )
+            except Exception as _download_exc284:
+                st.error(
+                    "端末保存用の最新DBスナップショットを作成できないため、"
+                    "古いDB本体のダウンロードは停止しました: "
+                    f"{type(_download_exc284).__name__}: {_download_exc284}"
+                )
     except Exception as exc:
         st.warning(f"DB情報を確認できません: {exc}")
 
