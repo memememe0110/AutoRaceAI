@@ -34,11 +34,11 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver280"
+APP_VERSION = "Ver285"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver284"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver285"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -5021,6 +5021,122 @@ def _v276_copy_retrial_to_prediction_df(df, entries):
     except Exception:
         return df
 
+
+_V285_SAME_SCENARIO_CACHE = globals().get("_V285_SAME_SCENARIO_CACHE", {})
+
+def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_date: str) -> dict:
+    """同じ展開型なのに周回内の入替量が違ったケースだけを学習する。
+
+    Ver284の保存済み予測のうち、実測展開型と同じ型だった上位routeを比較し、
+    周回ごとのペア順序反転率の「実測 - シミュレーション」だけを縮小学習する。
+    展開型の出現頻度そのものは補正しない。
+    cutoff_dateより前だけを使うwalk-forward。
+    """
+    result={"enabled":False,"samples":{},"delta_logit":{},"reason":"同展開比較不足"}
+    try:
+        stamp=(str(db_path),Path(db_path).stat().st_mtime_ns,str(venue or ""),str(cutoff_date or "")[:10])
+    except Exception:
+        stamp=(str(db_path),str(venue or ""),str(cutoff_date or "")[:10])
+    if stamp in _V285_SAME_SCENARIO_CACHE:
+        return dict(_V285_SAME_SCENARIO_CACHE[stamp])
+
+    try:
+        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            rows=con.execute("""
+                SELECT h.race_key,h.payload
+                FROM v231_prediction_history h
+                JOIN (
+                    SELECT race_key,MAX(history_id) AS mid
+                    FROM v231_prediction_history
+                    WHERE app_version='Ver284'
+                    GROUP BY race_key
+                ) x ON h.history_id=x.mid
+                WHERE (?='' OR h.race_key LIKE ?)
+            """,(str(venue or ""),f"%_{str(venue or '')}_%" if str(venue or "") else "%")).fetchall()
+    except Exception as exc:
+        result["reason"]=f"履歴読込失敗: {type(exc).__name__}: {exc}"
+        _V285_SAME_SCENARIO_CACHE[stamp]=dict(result)
+        return result
+
+    from collections import defaultdict
+    import itertools
+    agg=defaultdict(lambda:{"sim":0,"actual":0,"pairs":0,"races":set()})
+    for race_key,payload in rows:
+        try:
+            m=re.match(r'^(\d{8})_(.+?)_(\d+)R$',str(race_key or ''))
+            if not m:
+                continue
+            d8=m.group(1)
+            rdate=f"{d8[:4]}-{d8[4:6]}-{d8[6:8]}"
+            if str(cutoff_date or "")[:10] and rdate >= str(cutoff_date)[:10]:
+                continue
+            obj=pickle.loads(zlib.decompress(payload))
+            meta=(obj or {}).get("meta") or {}
+            audit=meta.get("6周展開シミュレーション") or meta.get("壁補正監査") or {}
+            actual_s=str(audit.get("actual_scenario_v263") or "")
+            if actual_s not in ("早仕掛け型","中盤入替型","後半追込型","波乱型","前残り型"):
+                continue
+            actual_orders=[]
+            for x in (audit.get("actual_lap_comparison") or []):
+                vals=tuple(int(v) for v in str(x.get("actual") or "").split("-") if str(v).strip().isdigit())
+                if vals:
+                    actual_orders.append(vals)
+            if len(actual_orders)<2:
+                continue
+            same=[r for r in (audit.get("top_routes_v263") or []) if str(r.get("scenario") or "")==actual_s]
+            if not same:
+                continue
+            # 「同じ展開」の中で実測に最も近いrouteだけ比較。別展開は学習材料にしない。
+            best=max(same,key=lambda r:float(r.get("similarity",0.0) or 0.0))
+            sim_orders=[]
+            for part in str(best.get("route") or "").split(" / "):
+                vals=tuple(int(v) for v in part.split("-") if str(v).strip().isdigit())
+                if vals:
+                    sim_orders.append(vals)
+            L=min(6,len(actual_orders),len(sim_orders))
+            for lap in range(2,L+1):
+                sp0={c:i for i,c in enumerate(sim_orders[lap-2])}; sp1={c:i for i,c in enumerate(sim_orders[lap-1])}
+                ap0={c:i for i,c in enumerate(actual_orders[lap-2])}; ap1={c:i for i,c in enumerate(actual_orders[lap-1])}
+                common=set(sp0)&set(sp1)&set(ap0)&set(ap1)
+                for a,b in itertools.combinations(common,2):
+                    sf=int((sp0[a]-sp0[b])*(sp1[a]-sp1[b])<0)
+                    af=int((ap0[a]-ap0[b])*(ap1[a]-ap1[b])<0)
+                    rec=agg[(actual_s,lap)]
+                    rec["sim"]+=sf; rec["actual"]+=af; rec["pairs"]+=1; rec["races"].add(str(race_key))
+        except Exception:
+            continue
+
+    deltas={}; samples={}
+    for (scenario,lap),rec in agg.items():
+        nr=len(rec["races"]); npairs=int(rec["pairs"] or 0)
+        if nr < 6 or npairs < 120 or lap < 3:
+            continue
+        sim_rate=float(rec["sim"])/max(1,npairs)
+        act_rate=float(rec["actual"])/max(1,npairs)
+        residual=act_rate-sim_rate
+        # レース数で縮小。最大でもlogit ±0.12の小補正に限定。
+        shrink=float(nr)/(float(nr)+8.0)
+        delta=float(np.clip(residual*2.0*shrink,-0.12,0.12))
+        key=f"{scenario}|{int(lap)}"
+        deltas[key]=delta
+        samples[key]={
+            "races":nr,"pairs":npairs,
+            "sim_flip_rate":sim_rate,"actual_flip_rate":act_rate,
+            "residual":residual,"delta_logit":delta,
+        }
+
+    result={
+        "enabled":bool(deltas),
+        "samples":samples,
+        "delta_logit":deltas,
+        "reason":"同一展開型routeと実測の周回内ペア反転差だけをwalk-forward縮小学習" if deltas else "同展開比較不足",
+    }
+    _V285_SAME_SCENARIO_CACHE.clear()
+    _V285_SAME_SCENARIO_CACHE[stamp]=dict(result)
+    return result
+
+
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
     if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(entries,pd.DataFrame) or entries.empty:
@@ -5170,6 +5286,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
     scenario_feedback_v264=_v264_feedback_scenario_adjustment(_v230_db_path(), venue, race_date)
     scenario_branch_prior_v264=_v264_blended_scenario_prior(scenario_prior, scenario_feedback_v264)
+    # Ver285: 展開頻度は触らず、同じ展開型で周回内入替がズレた分だけ学習。
+    same_scenario_transition_v285=_v285_same_scenario_transition_calibration(
+        _v230_db_path(), venue, race_date
+    )
     _v242_prepare_seconds=time_module.perf_counter()-_v242_prepare_started
     name_by_car={c:n for c,n in zip(cars,names)}
     # Ver276 speed: 試行中に変わらない値を数千回作り直さない。
@@ -5316,6 +5436,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         slowdown={c:0.0 for c in cars}
         for lap in range(1,7):
             _prev_top3_audit=set(order[:3])
+            # Ver285: ここまでに実際に枝分かれしたrouteから暫定展開型を判定。
+            # 未来の結果や実測展開型は使用しない。2周未満は補正なし。
+            _scenario_now_v285=_v263_scenario_type_from_laps(sim_lap_path) if len(sim_lap_path)>=2 else "不明"
+            _scenario_delta_v285=float(
+                ((same_scenario_transition_v285.get("delta_logit") or {}).get(
+                    f"{_scenario_now_v285}|{int(lap)}",0.0
+                ) or 0.0)
+            )
             # Ver250: 1周で何台も連続して抜く展開を抑える。
             # 速い車でも進路変更と立て直しが必要なため、周回内の追抜回数を保持する。
             lap_pass_count={c:0 for c in cars}
@@ -5418,6 +5546,12 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                             late_release_audit_v273[_lap_err275]["last_error"]=f"{type(_e_late275).__name__}: {_e_late275}"
                     except Exception:
                         pass
+                # Ver285: 同じ展開型の中でだけ、過去実測との差を追抜確率へ小さく反映。
+                # 展開型そのものの重み付けやゴール後の順位補正は行わない。
+                if abs(_scenario_delta_v285)>1e-12:
+                    _pp_v285=float(np.clip(p,1e-6,1.0-1e-6))
+                    _lg_v285=math.log(_pp_v285/(1.0-_pp_v285)) + _scenario_delta_v285
+                    p=float(np.clip(1.0/(1.0+math.exp(-_lg_v285)),0.035,0.88))
                 # 差が開きすぎていればまず追いつく必要がある。
                 # 大差なら即追越しは難しいが、速度優位車はまず差を詰められる。
                 catch_factor=max(0.10,1.0-min(0.78,gaps[i]*1.12))
@@ -5637,7 +5771,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
     ]
     audit={
-        "enabled":True,"mode":"Ver284 6周遷移確率完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver285 同展開内遷移補正・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -5660,6 +5794,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "scenario_prior_v263": scenario_prior,
         "scenario_feedback_v264": scenario_feedback_v264,
         "scenario_branch_prior_v264": scenario_branch_prior_v264,
+        "same_scenario_transition_v285": same_scenario_transition_v285,
+        "v285_scenario_policy":"展開型頻度は補正しない。同じ展開型route内の周回入替差だけを遷移確率へ反映",
         "scenario_distribution_v263": scenario_distribution,
         "scenario_weights_v263": scenario_weights,
         "actual_scenario_v263": actual_scenario,
@@ -5671,6 +5807,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "finish_position_probabilities":finish_position_probabilities,
         "top_full_orders_v284":top_full_orders,
         "v284_post_simulation_correction":False,
+        "v285_post_simulation_correction":False,
         "v284_ticket_sources":["単勝","複勝","ワイド","2連単","2連複","三連複","三連単"],
         "v284_transition_audit":{
             "trials":int(sim_trials),
