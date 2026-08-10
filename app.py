@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver293"
+APP_VERSION = "Ver294"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver293"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver294"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -76,6 +76,7 @@ def _runtime_clear_prediction_caches() -> None:
         _V263_SCENARIO_PRIOR_CACHE,
         _V264_SCENARIO_FEEDBACK_CACHE,
         _V292_TRIAL_GAP_GATE_CACHE,
+        _V294_FRONT_ST_GUARD_CACHE,
     ):
         try:
             cache.clear()
@@ -4516,6 +4517,132 @@ def _v292_trial_gap_gate_calibration(
     return out
 
 
+
+# Ver294: 小さい試走差 + 前車ST優位の「前残り」を全結果から自動較正。
+# 同ハンデは対象外。backtest時は未来結果を使わない。
+_V294_FRONT_ST_GUARD_CACHE = {}
+
+def _v294_front_st_guard_calibration(
+    db_path: str | None = None,
+    cutoff_date: str = "",
+    cutoff_race_no: int = 0,
+) -> dict:
+    path=str(db_path or _v230_db_path())
+    cutoff=str(cutoff_date or "").strip()[:10]
+    race_no=int(cutoff_race_no or 0)
+    try:
+        stamp=(path,int(Path(path).stat().st_mtime_ns),cutoff,race_no)
+    except Exception:
+        stamp=(path,0,cutoff,race_no)
+    if stamp in _V294_FRONT_ST_GUARD_CACHE:
+        return dict(_V294_FRONT_ST_GUARD_CACHE[stamp])
+
+    out={
+        "enabled":False,
+        "trial_gap_max":0.010,
+        "front_st_adv_min":0.020,
+        "guard_logit":0.035,
+        "samples":0,
+        "front_wins":0,
+        "raw_rate":None,
+        "posterior_mean":0.50,
+        "reason":"学習データ不足のため固定弱補正",
+    }
+
+    try:
+        with sqlite3.connect(path,timeout=8.0) as con:
+            con.execute("PRAGMA busy_timeout=8000")
+            q="""
+                SELECT rr.race_key, rr.race_date, rr.race_no,
+                       re.finish, re.trial_time, re.start_time, re.handicap,
+                       COALESCE(re.result_status,'通常')
+                FROM result_races rr
+                JOIN result_entries re ON re.race_key=rr.race_key
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                  AND re.finish IS NOT NULL
+                  AND re.trial_time IS NOT NULL
+                  AND re.start_time IS NOT NULL
+                  AND COALESCE(re.result_status,'通常') NOT IN (
+                      '欠車','出走取消','発走除外','競走除外',
+                      '落車','競走中止','失格','反則','反妨','周誤','周回誤認'
+                  )
+            """
+            params=[]
+            if cutoff:
+                if race_no>0:
+                    q += """ AND (
+                        substr(rr.race_date,1,10) < substr(?,1,10)
+                        OR (
+                            substr(rr.race_date,1,10)=substr(?,1,10)
+                            AND CAST(REPLACE(REPLACE(COALESCE(rr.race_no,''),'R',''),'r','') AS INTEGER) < ?
+                        )
+                    )"""
+                    params.extend([cutoff,cutoff,race_no])
+                else:
+                    q += " AND substr(rr.race_date,1,10) < substr(?,1,10)"
+                    params.append(cutoff)
+            rows=con.execute(q,params).fetchall()
+    except Exception as exc:
+        out["reason"]=f"読込失敗: {type(exc).__name__}: {exc}"
+        _V294_FRONT_ST_GUARD_CACHE[stamp]=dict(out)
+        return out
+
+    grouped={}
+    for rk,rd,rn,finish,trial,st,h,status in rows:
+        try:
+            m=re.search(r"-?\d+",str(h if h is not None else "0"))
+            hv=float(m.group()) if m else 0.0
+            grouped.setdefault(str(rk),[]).append((hv,float(finish),float(trial),float(st)))
+        except Exception:
+            continue
+
+    samples=0
+    front_wins=0
+    gap_max=float(out["trial_gap_max"])
+    st_min=float(out["front_st_adv_min"])
+
+    for g in grouped.values():
+        for rear_h,rear_finish,rear_trial,rear_st in g:
+            for front_h,front_finish,front_trial,front_st in g:
+                if rear_h <= front_h:
+                    continue
+                trial_adv=float(front_trial-rear_trial)   # 後方車の試走優位
+                front_st_adv=float(rear_st-front_st)      # 前車のST優位
+                if not (0.0 < trial_adv < gap_max):
+                    continue
+                if front_st_adv < st_min:
+                    continue
+                samples += 1
+                if front_finish < rear_finish:
+                    front_wins += 1
+
+    out["samples"]=int(samples)
+    out["front_wins"]=int(front_wins)
+    out["raw_rate"]=(float(front_wins/samples) if samples else None)
+
+    if samples < 40:
+        out["reason"]=f"対象{samples}ペア（40件未満）のため固定弱補正"
+        _V294_FRONT_ST_GUARD_CACHE[stamp]=dict(out)
+        return out
+
+    # Beta(20,20)で50%へ縮小。前残り優位が強いほどlogit guardを最大0.055まで強化。
+    alpha=20.0+front_wins
+    beta=20.0+(samples-front_wins)
+    mean=alpha/(alpha+beta)
+    strength=float(np.clip((mean-0.50)/0.18,0.0,1.0))
+    guard=float(0.020+0.035*strength)
+
+    out.update({
+        "enabled":True,
+        "posterior_mean":float(mean),
+        "guard_logit":guard,
+        "reason":"全登録結果から自動較正",
+        "races":int(len(grouped)),
+    })
+    _V294_FRONT_ST_GUARD_CACHE[stamp]=dict(out)
+    return out
+
+
 # Ver250: 前方集団残存・周回内連続追抜制限・ハンデ差別の壁を開催日前実績だけで自動学習する。
 _V250_FLOW_CALIBRATION_CACHE = {}
 
@@ -5832,6 +5959,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     trial_gap_gate_v292=_v292_trial_gap_gate_calibration(
         _v230_db_path(),race_date,_race_no_v292
     )
+    front_st_guard_v294=_v294_front_st_guard_calibration(
+        _v230_db_path(),race_date,_race_no_v292
+    )
     flow_calibration=_v250_flow_calibration(_v230_db_path(), venue, race_date)
     leader_hold_delta=float(flow_calibration.get("leader_hold_delta",0.0)) if flow_calibration.get("enabled") else 0.0
     front_survival_delta=float(flow_calibration.get("front_survival_delta",0.0)) if flow_calibration.get("enabled") else 0.0
@@ -6124,72 +6254,40 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 scenario_branch=0.0
                 # Ver290: 初速前半proxyは1～2周目だけ使用。
                 # 後車と前車の差だけを見るため、単純な「試走が速い=最終順位UP」にはしない。
-                # Ver293:
-                # 1周目だけ291/292の改善要素を試し、2周目はVer290へ完全に戻す。
-                # 3～6周目は従来通り初速追加補正なし。
-                _hc291=float(handicap.get(chaser,0) or 0)
-                _hf291=float(handicap.get(front,0) or 0)
+                # Ver294:
+                # 展開の土台はVer290へ戻す。
+                # 追加するのは「後方車の試走優位が0.01秒未満」かつ
+                # 「前車STが0.02秒以上良い」ハンデ跨ぎだけの弱い前残りguard。
+                _early_pair_delta290=float(
+                    early_launch_v290_base.get(chaser,0.0)
+                    - early_launch_v290_base.get(front,0.0)
+                )
+                _early_lap_weight290=0.090 if lap==1 else (0.050 if lap==2 else 0.0)
+                _early_logit290=float(np.clip(
+                    _early_pair_delta290*_early_lap_weight290,
+                    -0.11,0.11
+                ))
 
-                if lap == 1:
-                    _early_pair_delta290=float(
-                        early_launch_v293_lap1.get(chaser,0.0)
-                        - early_launch_v293_lap1.get(front,0.0)
-                    )
-                    _early_lap_weight290=0.090
+                _front_st_guard294=0.0
+                if lap in (1,2):
+                    try:
+                        _hc294=float(handicap.get(chaser,0) or 0)
+                        _hf294=float(handicap.get(front,0) or 0)
+                        if _hc294 > _hf294:  # 同ハンデ横並びは対象外
+                            _trial_adv294=float(trial.get(front,0.0)-trial.get(chaser,0.0))
+                            _st_adv294=float(stmean.get(chaser,0.0)-stmean.get(front,0.0))
+                            _gapmax294=float(front_st_guard_v294.get("trial_gap_max",0.010) or 0.010)
+                            _stmin294=float(front_st_guard_v294.get("front_st_adv_min",0.020) or 0.020)
+                            if 0.0 < _trial_adv294 < _gapmax294 and _st_adv294 >= _stmin294:
+                                # chaserの追抜logitから引く=前車残りを少し強める。
+                                # 2周目は1周目の70%に減衰。
+                                _front_st_guard294=float(front_st_guard_v294.get("guard_logit",0.035) or 0.035)
+                                if lap==2:
+                                    _front_st_guard294 *= 0.70
+                    except Exception:
+                        _front_st_guard294=0.0
 
-                    # Ver291のハンデ位置別強度は1周目だけ。
-                    if _hc291 > _hf291:
-                        if _hc291 >= 30.0:
-                            _handicap_early_scale291=1.00
-                        elif _hc291 >= 20.0:
-                            _handicap_early_scale291=0.80
-                        else:
-                            _handicap_early_scale291=0.60
-                    elif _hc291 == _hf291:
-                        _handicap_early_scale291=1.00
-                    else:
-                        _handicap_early_scale291=0.70
-
-                    # Ver292の0.01秒未満ゲートも1周目だけ。
-                    # 同ハンデ（横並び）は対象外。
-                    _trial_gap_scale292=1.0
-                    if _hc291 > _hf291:
-                        try:
-                            _trial_adv292=float(trial.get(front,0.0)-trial.get(chaser,0.0))
-                        except Exception:
-                            _trial_adv292=0.0
-                        _gate_threshold292=float(
-                            trial_gap_gate_v292.get("threshold",0.010) or 0.010
-                        )
-                        if 0.0 < _trial_adv292 < _gate_threshold292:
-                            _trial_gap_scale292=float(
-                                trial_gap_gate_v292.get("small_gap_scale",0.35) or 0.35
-                            )
-
-                    _early_logit290=float(np.clip(
-                        _early_pair_delta290
-                        *_early_lap_weight290
-                        *_handicap_early_scale291
-                        *_trial_gap_scale292,
-                        -0.11,0.11
-                    ))
-
-                elif lap == 2:
-                    # Ver290そのもの:
-                    # 試走62%+ST38%+first_gain、ハンデ位置別scaleなし、試走差gateなし。
-                    _early_pair_delta290=float(
-                        early_launch_v290_base.get(chaser,0.0)
-                        - early_launch_v290_base.get(front,0.0)
-                    )
-                    _early_lap_weight290=0.050
-                    _early_logit290=float(np.clip(
-                        _early_pair_delta290*_early_lap_weight290,
-                        -0.11,0.11
-                    ))
-                else:
-                    _early_pair_delta290=0.0
-                    _early_lap_weight290=0.0
-                    _early_logit290=0.0
+                _early_logit290 -= _front_st_guard294
                 logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus + _early_logit290 - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
                 _branch_noise=0.16
                 logit += rng.normal(0,_branch_noise)
@@ -6489,7 +6587,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
     ]
     audit={
-        "enabled":True,"mode":"Ver293 1周目だけ291/292改善+2周目Ver290復帰+TOP3境界限定・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver294 Ver290基準+小試走差前車ST残りguard+TOP3境界限定・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -6531,22 +6629,20 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             "reason":str(trial_gap_gate_v292.get("reason") or ""),
             "auto_update":"結果登録後、DB全体から次回予測時に自動再計算"
         },
-        "v293_first_lap_hybrid":{
-            "enabled":True,
-            "lap1":{
-                "proxy":"試走80%+ST20%+過去1周目上げ幅",
-                "handicap_cross_scale":{"rear_30m_plus":1.0,"rear_20m":0.80,"rear_0_10m":0.60,"same_handicap":1.0,"front_handicap_repass":0.70},
-                "trial_gap_gate":"Ver292全体学習ゲートを1周目だけ適用"
-            },
-            "lap2":{
-                "proxy":"Ver290: 試走62%+ST38%+過去1周目上げ幅",
-                "handicap_cross_scale":"なし",
-                "trial_gap_gate":"なし"
-            },
-            "lap3_6":"追加初速補正なし",
-            "cars_lap1":{str(k):round(float(v),4) for k,v in early_launch_v293_lap1.items()},
-            "cars_lap2_ver290":{str(k):round(float(v),4) for k,v in early_launch_v290_base.items()},
-            "max_pair_logit":0.11
+        "v294_front_st_guard":{
+            "enabled":bool(front_st_guard_v294.get("enabled")),
+            "base":"Ver290 early proxy (試走62%+ST38%+first_gain)",
+            "scope":"ハンデ跨ぎのみ・同ハンデ横並び除外",
+            "trial_gap_max":round(float(front_st_guard_v294.get("trial_gap_max",0.010) or 0.010),4),
+            "front_st_adv_min":round(float(front_st_guard_v294.get("front_st_adv_min",0.020) or 0.020),4),
+            "guard_logit_lap1":round(float(front_st_guard_v294.get("guard_logit",0.035) or 0.035),4),
+            "guard_logit_lap2":round(float(front_st_guard_v294.get("guard_logit",0.035) or 0.035)*0.70,4),
+            "samples":int(front_st_guard_v294.get("samples",0) or 0),
+            "front_wins":int(front_st_guard_v294.get("front_wins",0) or 0),
+            "raw_rate":front_st_guard_v294.get("raw_rate"),
+            "posterior_mean":round(float(front_st_guard_v294.get("posterior_mean",0.5) or 0.5),4),
+            "reason":str(front_st_guard_v294.get("reason") or ""),
+            "auto_update":"結果登録後、DB全体から次回予測時に自動再計算"
         },
         "scenario_distribution_v263": scenario_distribution,
         "scenario_weights_v263": scenario_weights,
