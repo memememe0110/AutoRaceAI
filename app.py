@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver289"
+APP_VERSION = "Ver290"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver289"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver290"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -5383,9 +5383,34 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     strength={c:max(-1.55,min(1.55,0.72*((v-mu)/sd))) for c,v in strength.items()}
     bvals=np.array(list(breakthrough.values()),dtype=float); blo=float(bvals.min()); bhi=float(bvals.max())
     breakthrough={c:(0.5 if bhi<=blo else (v-blo)/(bhi-blo)) for c,v in breakthrough.items()}
+
+    # Ver290: GO1式の「初速前半・2コーナー立ち上がり」を映像なしで弱く近似。
+    # 実際の2コーナー映像特徴はDBに無いため、当日試走・ST・過去1周目の上げ幅だけで作る。
+    # 既存のハンデ差/初期距離は別で扱うので、ここにはハンデを重複投入しない。
+    _trial_vals290=np.array([float(trial[c]) for c in cars],dtype=float)
+    _trial_mu290=float(_trial_vals290.mean()) if len(_trial_vals290) else 3.40
+    _trial_sd290=float(_trial_vals290.std()) if len(_trial_vals290) else 0.02
+    if _trial_sd290 < 0.006: _trial_sd290=0.006
+    _st_vals290=np.array([float(stmean[c]) for c in cars],dtype=float)
+    _st_mu290=float(_st_vals290.mean()) if len(_st_vals290) else 0.16
+    _st_sd290=float(_st_vals290.std()) if len(_st_vals290) else 0.03
+    if _st_sd290 < 0.012: _st_sd290=0.012
+    early_launch_v290={}
+    for c in cars:
+        # 試走は低いほど良い、STも低いほど良い。履歴first_gainは後段で追加する。
+        _trial_z290=(_trial_mu290-float(trial[c]))/_trial_sd290
+        _st_z290=(_st_mu290-float(stmean[c]))/_st_sd290
+        early_launch_v290[c]=float(np.clip(0.62*_trial_z290 + 0.38*_st_z290,-1.6,1.6))
     venue=str((meta or {}).get("開催場") or (meta or {}).get("venue") or "")
     _v242_prepare_started=time_module.perf_counter()
     profiles=_v230_hist_profiles(venue,names)
+    # Ver290: 過去の1周目上げ幅を初速proxyへ小さく追加（当日試走/STが主役）。
+    for _c290,_n290 in zip(cars,names):
+        _fg290=float((profiles.get(_n290,{}) or {}).get("first_gain",0.0) or 0.0)
+        early_launch_v290[_c290]=float(np.clip(
+            float(early_launch_v290.get(_c290,0.0)) + 0.18*np.clip(_fg290,-2.0,2.0),
+            -1.6,1.6
+        ))
     transition_profiles=_v240_transition_profiles(venue,names)
     matchups=_v230_matchup_map(names)
     wall_calibration=_v248_wall_calibration(_v230_db_path())
@@ -5682,7 +5707,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 front_pack=sum(1 for x in order[:min(3,len(order))] if handicap[x]==min_handicap)
                 pack_wall=(0.07*max(0,front_pack-1))*max(0.30,1.0-0.10*(lap-1))
                 scenario_branch=0.0
-                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
+                # Ver290: 初速前半proxyは1～2周目だけ使用。
+                # 後車と前車の差だけを見るため、単純な「試走が速い=最終順位UP」にはしない。
+                _early_pair_delta290=float(
+                    early_launch_v290.get(chaser,0.0)-early_launch_v290.get(front,0.0)
+                )
+                _early_lap_weight290=0.090 if lap==1 else (0.050 if lap==2 else 0.0)
+                _early_logit290=float(np.clip(_early_pair_delta290*_early_lap_weight290,-0.11,0.11))
+                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus + _early_logit290 - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
                 _branch_noise=0.16
                 logit += rng.normal(0,_branch_noise)
                 try:
@@ -5981,7 +6013,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
     ]
     audit={
-        "enabled":True,"mode":"Ver289 TOP3境界限定補正・286順序形成維持・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver290 TOP3境界限定補正+初速前半弱補正・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -6010,6 +6042,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "v289_dynamic_ratio":float(_V289_DYNAMIC_RATIO),
         "v289_zone_factors":{"top3_boundary":1.0,"outside_top3":0.30,"inside_top3":0.0},
         "v289_zone_audit":dict(v289_zone_audit),
+        "v290_early_launch_proxy":{
+            "enabled":True,
+            "source":"当日試走T+ST+過去1周目上げ幅（2コーナー映像は未使用）",
+            "lap_weights":{"1":0.090,"2":0.050,"3-6":0.0},
+            "cars":{str(k):round(float(v),4) for k,v in early_launch_v290.items()},
+            "max_pair_logit":0.11
+        },
         "scenario_distribution_v263": scenario_distribution,
         "scenario_weights_v263": scenario_weights,
         "actual_scenario_v263": actual_scenario,
