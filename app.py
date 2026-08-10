@@ -34,11 +34,11 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver285"
+APP_VERSION = "Ver286"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver285"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver286"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -5110,14 +5110,15 @@ def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_
     deltas={}; samples={}
     for (scenario,lap),rec in agg.items():
         nr=len(rec["races"]); npairs=int(rec["pairs"] or 0)
-        if nr < 6 or npairs < 120 or lap < 3:
+        if nr < 3 or npairs < 50 or lap < 3:
             continue
         sim_rate=float(rec["sim"])/max(1,npairs)
         act_rate=float(rec["actual"])/max(1,npairs)
         residual=act_rate-sim_rate
-        # レース数で縮小。最大でもlogit ±0.12の小補正に限定。
-        shrink=float(nr)/(float(nr)+8.0)
-        delta=float(np.clip(residual*2.0*shrink,-0.12,0.12))
+        # Ver286検証用: まず「効く」側へ強めに振り、過補正かどうかを実測する。
+        # 最大logit ±0.42。ただし3R/50ペア未満は一切使わない。
+        shrink=float(nr)/(float(nr)+3.0)
+        delta=float(np.clip(residual*4.8*shrink,-0.42,0.42))
         key=f"{scenario}|{int(lap)}"
         deltas[key]=delta
         samples[key]={
@@ -5439,9 +5440,19 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             # Ver285: ここまでに実際に枝分かれしたrouteから暫定展開型を判定。
             # 未来の結果や実測展開型は使用しない。2周未満は補正なし。
             _scenario_now_v285=_v263_scenario_type_from_laps(sim_lap_path) if len(sim_lap_path)>=2 else "不明"
+            # Ver286: 途中routeで型がまだ判定不能なら、過去だけから作ったbranch priorの
+            # 最有力型を仮採用。実測結果は使わない。route型が判定できたらroute側を優先。
+            _scenario_apply_v286=_scenario_now_v285
+            if _scenario_apply_v286 in ("不明",""):
+                try:
+                    _bp286=scenario_branch_prior_v264 or {}
+                    if _bp286:
+                        _scenario_apply_v286=max(_bp286.items(),key=lambda kv:float(kv[1] or 0.0))[0]
+                except Exception:
+                    _scenario_apply_v286="不明"
             _scenario_delta_v285=float(
                 ((same_scenario_transition_v285.get("delta_logit") or {}).get(
-                    f"{_scenario_now_v285}|{int(lap)}",0.0
+                    f"{_scenario_apply_v286}|{int(lap)}",0.0
                 ) or 0.0)
             )
             # Ver250: 1周で何台も連続して抜く展開を抑える。
@@ -5771,7 +5782,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
     ]
     audit={
-        "enabled":True,"mode":"Ver285 同展開内遷移補正・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver286 同展開内遷移補正・強め検証・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -5795,7 +5806,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "scenario_feedback_v264": scenario_feedback_v264,
         "scenario_branch_prior_v264": scenario_branch_prior_v264,
         "same_scenario_transition_v285": same_scenario_transition_v285,
-        "v285_scenario_policy":"展開型頻度は補正しない。同じ展開型route内の周回入替差だけを遷移確率へ反映",
+        "v285_scenario_policy":"Ver286強め検証: 展開型頻度は補正しない。同展開型内の周回入替差を最大logit±0.42で遷移確率へ反映",
         "scenario_distribution_v263": scenario_distribution,
         "scenario_weights_v263": scenario_weights,
         "actual_scenario_v263": actual_scenario,
