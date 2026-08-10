@@ -4471,7 +4471,39 @@ def v15_parse_player_history(text, player_name=None):
 # Ver15用DB
 # ------------------------------
 def v15_init_tables(db_path=DB_PATH):
-    with sqlite3.connect(db_path) as con:
+    """Ver15用テーブルを必要時だけ初期化する。
+
+    Ver291 startup hotfix3:
+    import engine 中にはこの関数を呼ばない。
+    保存処理などで本当に必要になった時だけ呼び、
+    既存4テーブルが揃っていればDDLを発行せず即returnする。
+    """
+    required = {
+        "v15_race_inputs",
+        "v15_race_entry_inputs",
+        "v15_similarity_weights",
+        "v15_player_history_imports",
+    }
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=5.0) as con:
+            con.execute("PRAGMA busy_timeout=5000")
+            existing = {
+                str(r[0])
+                for r in con.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name IN (?,?,?,?)",
+                    tuple(sorted(required))
+                ).fetchall()
+            }
+            if required.issubset(existing):
+                return
+    except sqlite3.Error:
+        # 読取確認に失敗した場合だけ、下の初期化へ進む。
+        pass
+
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
         con.execute("""
             CREATE TABLE IF NOT EXISTS v15_race_inputs (
                 race_key TEXT PRIMARY KEY,
@@ -4853,8 +4885,8 @@ def v15_save_result_using_existing(text):
 # ------------------------------
 # UI
 # ------------------------------
-v15_init_tables()
-
+# Ver291 startup hotfix3:
+# engine import中のv15 DDL初期化は禁止。必要な保存処理側でlazy initする。
 style = {"description_width": "110px"}
 
 
