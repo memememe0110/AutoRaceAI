@@ -2345,6 +2345,61 @@ def _v276_send_rerun_complete_notification(result: dict) -> None:
         pass
 
 
+
+def _v284_backfill_transition_audit_from_latest_histories(db_path: str, app_version: str = "") -> dict:
+    """最新予測payloadに既に入っているVer284展開監査をDB監査3表へ復元する。
+    再シミュレーションは行わない。batch保存経路の保険として完了時に必ず実行する。
+    """
+    result={"ok":False,"checked":0,"saved_races":0,"errors":[]}
+    ver=str(app_version or globals().get("_V231_APP_VERSION") or "Ver284")
+    try:
+        _v284_ensure_transition_audit_tables(db_path)
+        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            rows=con.execute("""
+                SELECT h.race_key,h.prediction_time,h.trials,h.payload
+                FROM v231_prediction_history h
+                JOIN (
+                    SELECT race_key,MAX(history_id) AS mid
+                    FROM v231_prediction_history
+                    WHERE app_version=?
+                    GROUP BY race_key
+                ) x ON h.history_id=x.mid
+                ORDER BY h.race_key
+            """,(ver,)).fetchall()
+        for race_key,prediction_time,trials,payload in rows:
+            result["checked"]+=1
+            try:
+                obj=pickle.loads(zlib.decompress(payload))
+                meta=(obj or {}).get("meta") or {}
+                wall=meta.get("6周展開シミュレーション") or meta.get("壁補正監査") or {}
+                detail=wall.get("v284_transition_audit") or {}
+                if not detail:
+                    continue
+                # 既にこのrace_keyの最新監査が6周あるなら重複保存しない。
+                with sqlite3.connect(str(db_path),timeout=30.0) as con:
+                    n=int(con.execute(
+                        "SELECT COUNT(DISTINCT lap_no) FROM v284_transition_audit WHERE race_key=? AND app_version=?",
+                        (str(race_key),ver)
+                    ).fetchone()[0] or 0)
+                if n>=6:
+                    result["saved_races"]+=1
+                    continue
+                save=_v284_save_transition_audit(db_path,str(race_key),wall)
+                if save.get("ok"):
+                    result["saved_races"]+=1
+                elif len(result["errors"])<8:
+                    result["errors"].append(f"{race_key}: {save.get('reason','保存失敗')}")
+            except Exception as exc:
+                if len(result["errors"])<8:
+                    result["errors"].append(f"{race_key}: {type(exc).__name__}: {exc}")
+        result["ok"]=(len(result["errors"])==0)
+        return result
+    except Exception as exc:
+        result["errors"].append(f"{type(exc).__name__}: {exc}")
+        return result
+
+
 def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool) -> None:
     try:
         _v278_bg_update(
@@ -2370,6 +2425,13 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             cancel_cb=lambda: _v278_bg_cancel_requested(db_path,job_id),
             pause_cb=lambda: _v278_bg_pause_loop(db_path,job_id),
         )
+        # Ver284 hotfix: 各レースの最新payloadには監査集計が保存されているため、
+        # batch終了時（停止時を含む）に必ず監査3表へ同期する。
+        _audit_backfill284=_v284_backfill_transition_audit_from_latest_histories(
+            db_path,str(globals().get("_V231_APP_VERSION") or "Ver284")
+        )
+        result["v284_audit_backfill"]=_audit_backfill284
+        result["v284_transition_audit_saved_races"]=int(_audit_backfill284.get("saved_races") or 0)
         cancelled=bool(result.get("cancelled")) or _v278_bg_cancel_requested(db_path,job_id)
         blob=zlib.compress(pickle.dumps(result,protocol=pickle.HIGHEST_PROTOCOL),level=6)
         _v278_bg_update(
@@ -2379,7 +2441,10 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             current_label="",
             message=(
                 "停止しました。処理済みレースは保存されています。"
-                if cancelled else str(result.get("message") or "完了しました。")
+                if cancelled else (
+                    str(result.get("message") or "完了しました。")
+                    + f" / Ver284展開監査DB保存{int(result.get('v284_transition_audit_saved_races') or 0)}R"
+                )
             ),
             result_blob=sqlite3.Binary(blob),
         )
