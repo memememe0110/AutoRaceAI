@@ -34,11 +34,11 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver286"
+APP_VERSION = "Ver287"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver286"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver287"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -5022,7 +5022,135 @@ def _v276_copy_retrial_to_prediction_df(df, entries):
         return df
 
 
+# Ver287: DB138のVer284・56R監査から確定した固定基準補正。
+# 個別レース結果への後掛けではなく、同展開型×周回の系統誤差を標準ルール化。
+_V287_FIXED_TRANSITION_LOGIT = {'後半追込型|3': -0.146885, '後半追込型|4': -0.055082, '後半追込型|5': 0.073443, '後半追込型|6': 0.110164, '早仕掛け型|3': 0.214286, '早仕掛け型|4': 0.128571, '早仕掛け型|5': 0.185714, '早仕掛け型|6': 0.0, '波乱型|3': -0.199745, '波乱型|4': 0.005548, '波乱型|5': 0.355102, '波乱型|6': -0.133163}
+_V287_DYNAMIC_RATIO = 0.25  # 新規履歴による微調整は固定基準の補助に限定
+
 _V285_SAME_SCENARIO_CACHE = globals().get("_V285_SAME_SCENARIO_CACHE", {})
+
+
+def _v287_ensure_global_transition_calibration_table(db_path: str) -> None:
+    with sqlite3.connect(str(db_path),timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS v287_global_transition_calibration (
+            scenario_type TEXT NOT NULL,
+            lap_no INTEGER NOT NULL,
+            sample_races INTEGER NOT NULL DEFAULT 0,
+            sample_pairs INTEGER NOT NULL DEFAULT 0,
+            sim_flip_rate REAL NOT NULL DEFAULT 0,
+            actual_flip_rate REAL NOT NULL DEFAULT 0,
+            residual REAL NOT NULL DEFAULT 0,
+            dynamic_logit REAL NOT NULL DEFAULT 0,
+            recalculated_at TEXT NOT NULL,
+            PRIMARY KEY(scenario_type,lap_no)
+        )
+        """)
+        con.commit()
+
+
+def _v287_recalculate_global_transition_calibration(db_path: str) -> dict:
+    """結果登録後、登録済み全体から動的微調整値を再計算して保存する。
+
+    直前に登録した1Rだけでは更新しない。
+    保存済みVer284監査のうち実測周回比較が存在する全レースを毎回再集計する。
+    事故等で学習対象外になったレースは、実測周回比較が監査に無ければ自然に除外される。
+    """
+    out={"ok":False,"source_races":0,"calibrations":0,"details":[],"reason":""}
+    try:
+        _v287_ensure_global_transition_calibration_table(db_path)
+        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            rows=con.execute("""
+                SELECT h.race_key,h.payload
+                FROM v231_prediction_history h
+                JOIN (
+                    SELECT race_key,MAX(history_id) AS mid
+                    FROM v231_prediction_history
+                    WHERE app_version='Ver284'
+                    GROUP BY race_key
+                ) x ON h.history_id=x.mid
+            """).fetchall()
+
+        from collections import defaultdict
+        import itertools
+        agg=defaultdict(lambda:{"sim":0,"actual":0,"pairs":0,"races":set()})
+        used_races=set()
+        for race_key,payload in rows:
+            try:
+                obj=pickle.loads(zlib.decompress(payload))
+                meta=(obj or {}).get("meta") or {}
+                audit=meta.get("6周展開シミュレーション") or meta.get("壁補正監査") or {}
+                actual_s=str(audit.get("actual_scenario_v263") or "")
+                if actual_s not in ("早仕掛け型","中盤入替型","後半追込型","波乱型","前残り型"):
+                    continue
+                actual_orders=[]
+                for x in (audit.get("actual_lap_comparison") or []):
+                    vals=tuple(int(v) for v in str(x.get("actual") or "").split("-") if str(v).strip().isdigit())
+                    if vals: actual_orders.append(vals)
+                same=[r for r in (audit.get("top_routes_v263") or []) if str(r.get("scenario") or "")==actual_s]
+                if len(actual_orders)<2 or not same:
+                    continue
+                best=max(same,key=lambda r:float(r.get("similarity",0.0) or 0.0))
+                sim_orders=[]
+                for part in str(best.get("route") or "").split(" / "):
+                    vals=tuple(int(v) for v in part.split("-") if str(v).strip().isdigit())
+                    if vals: sim_orders.append(vals)
+                L=min(6,len(actual_orders),len(sim_orders))
+                if L<3: continue
+                used_races.add(str(race_key))
+                for lap in range(3,L+1):
+                    sp0={c:i for i,c in enumerate(sim_orders[lap-2])}; sp1={c:i for i,c in enumerate(sim_orders[lap-1])}
+                    ap0={c:i for i,c in enumerate(actual_orders[lap-2])}; ap1={c:i for i,c in enumerate(actual_orders[lap-1])}
+                    common=set(sp0)&set(sp1)&set(ap0)&set(ap1)
+                    for a,b in itertools.combinations(common,2):
+                        sf=int((sp0[a]-sp0[b])*(sp1[a]-sp1[b])<0)
+                        af=int((ap0[a]-ap0[b])*(ap1[a]-ap1[b])<0)
+                        rec=agg[(actual_s,lap)]
+                        rec["sim"]+=sf; rec["actual"]+=af; rec["pairs"]+=1; rec["races"].add(str(race_key))
+            except Exception:
+                continue
+
+        now=_v228_now_jst_iso()
+        saved=[]
+        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("DELETE FROM v287_global_transition_calibration")
+            for (scenario,lap),rec in sorted(agg.items()):
+                nr=len(rec["races"]); npairs=int(rec["pairs"] or 0)
+                if nr<4 or npairs<80:
+                    continue
+                sim_rate=float(rec["sim"])/max(1,npairs)
+                act_rate=float(rec["actual"])/max(1,npairs)
+                residual=act_rate-sim_rate
+                # 固定値が主役。全体再集計側は小さな微調整のみ。
+                shrink=float(nr)/(float(nr)+8.0)
+                dyn=float(np.clip(residual*1.2*shrink,-0.10,0.10))
+                con.execute("""
+                    INSERT INTO v287_global_transition_calibration(
+                        scenario_type,lap_no,sample_races,sample_pairs,
+                        sim_flip_rate,actual_flip_rate,residual,dynamic_logit,recalculated_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,(scenario,int(lap),nr,npairs,sim_rate,act_rate,residual,dyn,now))
+                saved.append({
+                    "scenario":scenario,"lap":int(lap),"races":nr,"pairs":npairs,
+                    "dynamic_logit":dyn,
+                })
+            con.commit()
+
+        # prediction-side cache must not retain values calculated before result registration.
+        try:
+            _V285_SAME_SCENARIO_CACHE.clear()
+        except Exception:
+            pass
+        out.update({"ok":True,"source_races":len(used_races),"calibrations":len(saved),"details":saved})
+        return out
+    except Exception as exc:
+        out["reason"]=f"{type(exc).__name__}: {exc}"
+        return out
+
 
 def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_date: str) -> dict:
     """同じ展開型なのに周回内の入替量が違ったケースだけを学習する。
@@ -5033,10 +5161,31 @@ def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_
     cutoff_dateより前だけを使うwalk-forward。
     """
     result={"enabled":False,"samples":{},"delta_logit":{},"reason":"同展開比較不足"}
+    # Ver287: 結果登録時に「登録済み全体」から再計算して保存した値を最優先。
     try:
-        stamp=(str(db_path),Path(db_path).stat().st_mtime_ns,str(venue or ""),str(cutoff_date or "")[:10])
+        _v287_ensure_global_transition_calibration_table(db_path)
+        with sqlite3.connect(str(db_path),timeout=30.0) as _con287:
+            _rows287=_con287.execute("""
+                SELECT scenario_type,lap_no,sample_races,sample_pairs,
+                       sim_flip_rate,actual_flip_rate,residual,dynamic_logit
+                FROM v287_global_transition_calibration
+            """).fetchall()
+        if _rows287:
+            _d287={}; _s287={}
+            for sc,lap,nr,npairs,sr,ar,resid,dyn in _rows287:
+                key=f"{sc}|{int(lap)}"
+                _d287[key]=float(dyn or 0.0)
+                _s287[key]={"races":int(nr or 0),"pairs":int(npairs or 0),
+                            "sim_flip_rate":float(sr or 0.0),"actual_flip_rate":float(ar or 0.0),
+                            "residual":float(resid or 0.0),"delta_logit":float(dyn or 0.0)}
+            return {"enabled":True,"samples":_s287,"delta_logit":_d287,
+                    "reason":"結果登録時に登録済み全体から再計算した微調整値"}
     except Exception:
-        stamp=(str(db_path),str(venue or ""),str(cutoff_date or "")[:10])
+        pass
+    try:
+        stamp=(str(db_path),Path(db_path).stat().st_mtime_ns,"GLOBAL",str(cutoff_date or "")[:10])
+    except Exception:
+        stamp=(str(db_path),"GLOBAL",str(cutoff_date or "")[:10])
     if stamp in _V285_SAME_SCENARIO_CACHE:
         return dict(_V285_SAME_SCENARIO_CACHE[stamp])
 
@@ -5052,8 +5201,7 @@ def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_
                     WHERE app_version='Ver284'
                     GROUP BY race_key
                 ) x ON h.history_id=x.mid
-                WHERE (?='' OR h.race_key LIKE ?)
-            """,(str(venue or ""),f"%_{str(venue or '')}_%" if str(venue or "") else "%")).fetchall()
+            """).fetchall()
     except Exception as exc:
         result["reason"]=f"履歴読込失敗: {type(exc).__name__}: {exc}"
         _V285_SAME_SCENARIO_CACHE[stamp]=dict(result)
@@ -5110,15 +5258,15 @@ def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_
     deltas={}; samples={}
     for (scenario,lap),rec in agg.items():
         nr=len(rec["races"]); npairs=int(rec["pairs"] or 0)
-        if nr < 3 or npairs < 50 or lap < 3:
+        if nr < 4 or npairs < 80 or lap < 3:
             continue
         sim_rate=float(rec["sim"])/max(1,npairs)
         act_rate=float(rec["actual"])/max(1,npairs)
         residual=act_rate-sim_rate
-        # Ver286検証用: まず「効く」側へ強めに振り、過補正かどうかを実測する。
-        # 最大logit ±0.42。ただし3R/50ペア未満は一切使わない。
-        shrink=float(nr)/(float(nr)+3.0)
-        delta=float(np.clip(residual*4.8*shrink,-0.42,0.42))
+        # Ver287: 固定基準が主役。新しい履歴は微調整だけ。
+        # 動的部分単独では最大±0.10に制限する。
+        shrink=float(nr)/(float(nr)+8.0)
+        delta=float(np.clip(residual*1.2*shrink,-0.10,0.10))
         key=f"{scenario}|{int(lap)}"
         deltas[key]=delta
         samples[key]={
@@ -5450,11 +5598,16 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                         _scenario_apply_v286=max(_bp286.items(),key=lambda kv:float(kv[1] or 0.0))[0]
                 except Exception:
                     _scenario_apply_v286="不明"
-            _scenario_delta_v285=float(
-                ((same_scenario_transition_v285.get("delta_logit") or {}).get(
-                    f"{_scenario_apply_v286}|{int(lap)}",0.0
-                ) or 0.0)
+            _v287_key=f"{_scenario_apply_v286}|{int(lap)}"
+            _fixed_delta_v287=float(_V287_FIXED_TRANSITION_LOGIT.get(_v287_key,0.0) or 0.0)
+            _dynamic_delta_v287=float(
+                ((same_scenario_transition_v285.get("delta_logit") or {}).get(_v287_key,0.0) or 0.0)
             )
+            # 固定値は過去DBが無くても必ず効く。動的学習は最大25%だけ上乗せ。
+            _scenario_delta_v285=float(np.clip(
+                _fixed_delta_v287 + _dynamic_delta_v287*_V287_DYNAMIC_RATIO,
+                -0.46,0.46
+            ))
             # Ver250: 1周で何台も連続して抜く展開を抑える。
             # 速い車でも進路変更と立て直しが必要なため、周回内の追抜回数を保持する。
             lap_pass_count={c:0 for c in cars}
@@ -5782,7 +5935,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
     ]
     audit={
-        "enabled":True,"mode":"Ver286 同展開内遷移補正・強め検証・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver287 固定全体補正+微調整・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -5806,7 +5959,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "scenario_feedback_v264": scenario_feedback_v264,
         "scenario_branch_prior_v264": scenario_branch_prior_v264,
         "same_scenario_transition_v285": same_scenario_transition_v285,
-        "v285_scenario_policy":"Ver286強め検証: 展開型頻度は補正しない。同展開型内の周回入替差を最大logit±0.42で遷移確率へ反映",
+        "v285_scenario_policy":"Ver288固定基準+微調整: 56R監査由来の同展開型×周回固定logitを常時適用し、新規履歴は最大25%の微調整だけ追加",
+        "v288_fixed_transition_logit":dict(_V287_FIXED_TRANSITION_LOGIT),
+        "v288_dynamic_ratio":float(_V287_DYNAMIC_RATIO),
         "scenario_distribution_v263": scenario_distribution,
         "scenario_weights_v263": scenario_weights,
         "actual_scenario_v263": actual_scenario,
@@ -15186,6 +15341,12 @@ if selected_main_page == "✅ 結果登録・解析":
                         key, comparison, analysis, adjustment, registration = engine.v41_register_result(
                             meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
                         )
+                    # Ver287: 1Rの結果だけで補正せず、結果登録のたびに登録済み全体を再集計。
+                    # 学習対象外レースでは予測補正の再計算を行わない。
+                    if not (registration.get("learning_excluded") or meta_r.get("学習対象外")):
+                        global_transition_recalc_v287=_v287_recalculate_global_transition_calibration(engine.DB_PATH)
+                    else:
+                        global_transition_recalc_v287={"ok":False,"source_races":0,"calibrations":0,"reason":"学習対象外"}
                     ticket_analysis = engine.v67_analyze_ticket_result(meta_r, rows_r, engine.DB_PATH)
                     # Ver255管理修正: 予測時に保存済みのプランだけを、結果登録後に払戻と照合する。
                     # 復元表示だけでは新規保存せず、結果登録時点で元バージョンのまま回収率へ反映する。
@@ -15207,6 +15368,14 @@ if selected_main_page == "✅ 結果登録・解析":
                         result_message = f"結果を登録しました: {key}"
                     _set_sticky_notice("result_register_notice", "success", result_message)
                     st.success(result_message)
+                    _gr287=locals().get("global_transition_recalc_v287") or {}
+                    if _gr287.get("ok"):
+                        st.caption(
+                            f"🔄 Ver287全体補正を再計算：登録済み監査{int(_gr287.get('source_races') or 0)}R全体"
+                            f" → 補正{int(_gr287.get('calibrations') or 0)}条件を更新"
+                        )
+                    elif _gr287.get("reason") and _gr287.get("reason")!="学習対象外":
+                        st.warning("Ver287全体補正の再計算に失敗しました: "+str(_gr287.get("reason")))
                     if int(locals().get("incident_saved_count", 0) or 0) > 0:
                         st.caption(
                             f"🧾 発走後事故・反則を{int(incident_saved_count)}件、選手別事故履歴へ種類別保存しました。"
