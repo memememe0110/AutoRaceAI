@@ -2533,19 +2533,87 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
 
 
 
-# Ver290 hotfix2: Streamlit再デプロイ/プロセス再起動でdaemon threadだけ消え、
-# DB上のjobが running のまま残る「孤児ジョブ」を自動復旧する。
-def _v290_recover_orphaned_batch_job(db_path: str) -> dict:
+# Ver290 hotfix3: BG heartbeat / stale recovery.
+def _v290_parse_job_time(value) -> float:
+    try:
+        s=str(value or "").strip()
+        if not s:
+            return 0.0
+        dt=datetime.fromisoformat(s.replace("Z","+00:00"))
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=_V228_JST)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+def _v290_spawn_recovery_worker(db_path: str, old_job: dict, reason: str) -> dict:
+    """Old jobを打切り、新jobで保存済みVer290を除いた残りだけ再開する。"""
+    try:
+        jid_old=int(old_job.get("job_id") or 0)
+        done0=int(old_job.get("done_count") or 0)
+        total0=int(old_job.get("total_count") or 0)
+        limit0=max(1,int(old_job.get("limit_count") or total0 or 80))
+
+        # 古いjobは以後UIの「実行中」判定から外す。万一旧threadが戻ってもcancel_requestedを見て終了する。
+        with sqlite3.connect(str(db_path),timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            con.execute("""
+                UPDATE v278_background_jobs
+                   SET status='cancelled',
+                       cancel_requested=1,
+                       pause_requested=0,
+                       finished_at=?,
+                       message=?,
+                       updated_at=?
+                 WHERE job_id=?
+            """,(
+                _v228_now_jst_iso(),
+                "停止状態を検知したため新しいjobへ引継ぎ: "+str(reason),
+                _v228_now_jst_iso(),
+                jid_old
+            ))
+            con.commit()
+
+        now=_v228_now_jst_iso()
+        with sqlite3.connect(str(db_path),timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            cur=con.execute("""
+                INSERT INTO v278_background_jobs(
+                    job_type,app_version,status,created_at,updated_at,started_at,
+                    limit_count,force_current,done_count,total_count,current_label,message
+                ) VALUES ('batch_rerun',?,'running',?,?,?,?,0,?,?,?,?)
+            """,(
+                str(_V231_APP_VERSION),now,now,now,limit0,
+                done0,total0,str(old_job.get("current_label") or ""),
+                f"{done0}/{total0}から残りを自動再開しました。"
+            ))
+            con.commit()
+            jid_new=int(cur.lastrowid or 0)
+
+        th=threading.Thread(
+            target=_v278_bg_worker,
+            args=(str(db_path),jid_new,limit0,False,done0,total0),
+            daemon=True,
+            name=f"autorace-bg-rerun-recover-{jid_new}",
+        )
+        with _V278_BG_LOCK:
+            _V278_BG_THREADS[jid_new]=th
+        th.start()
+        return {"ok":True,"action":"restarted","old_job_id":jid_old,"job_id":jid_new,"done":done0,"total":total0,"reason":reason}
+    except Exception as exc:
+        return {"ok":False,"action":"error","reason":f"{type(exc).__name__}: {exc}"}
+
+def _v290_recover_orphaned_batch_job(db_path: str, stale_seconds: float = 150.0) -> dict:
     try:
         _v278_bg_ensure_table(db_path)
-        with sqlite3.connect(str(db_path),timeout=0.6) as con:
+        with sqlite3.connect(str(db_path),timeout=0.8) as con:
             con.row_factory=sqlite3.Row
-            con.execute("PRAGMA busy_timeout=600")
+            con.execute("PRAGMA busy_timeout=800")
             row=con.execute("""
                 SELECT *
                   FROM v278_background_jobs
                  WHERE job_type='batch_rerun'
-                   AND status IN ('queued','running','pause_requested','paused')
+                   AND status IN ('queued','running','pause_requested','paused','cancel_requested')
                  ORDER BY job_id DESC
                  LIMIT 1
             """).fetchone()
@@ -2557,62 +2625,40 @@ def _v290_recover_orphaned_batch_job(db_path: str) -> dict:
         if not jid:
             return {"ok":True,"action":"none"}
 
-        # 同じPythonプロセス内でthreadが生きているなら何もしない。
         th=None
         try:
             with _V278_BG_LOCK:
                 th=_V278_BG_THREADS.get(jid)
         except Exception:
             th=None
-        if th is not None and getattr(th,"is_alive",lambda:False)():
-            return {"ok":True,"action":"alive","job_id":jid}
+        alive=bool(th is not None and getattr(th,"is_alive",lambda:False)())
 
-        # 画面表示優先hotfixが残したpause状態も孤児時は解除する。
-        done0=int(job.get("done_count") or 0)
-        total0=int(job.get("total_count") or 0)
-        limit0=max(1,int(job.get("limit_count") or total0 or 80))
+        updated_ts=_v290_parse_job_time(job.get("updated_at"))
+        age=max(0.0,time_module.time()-updated_ts) if updated_ts else 999999.0
 
-        # 既にVer290保存済みのレースは再実行せず、残りだけ続行する。
-        # 元jobのforce_current=Trueでも、復旧時だけFalseにすることで重複再計算を防ぐ。
-        with sqlite3.connect(str(db_path),timeout=0.6) as con:
-            con.execute("PRAGMA busy_timeout=600")
-            con.execute("""
-                UPDATE v278_background_jobs
-                   SET status='running',
-                       pause_requested=0,
-                       cancel_requested=0,
-                       message=?,
-                       updated_at=?
-                 WHERE job_id=?
-            """,(
-                f"アプリ再起動を検知。{done0}/{total0}から残りを自動再開します。",
-                _v228_now_jst_iso(),jid
-            ))
-            con.commit()
+        # threadが無いなら即復旧。threadがあっても進捗DB更新が150秒以上無ければstale扱い。
+        if not alive:
+            return _v290_spawn_recovery_worker(db_path,job,"実行threadが存在しません")
+        if age >= float(stale_seconds):
+            return _v290_spawn_recovery_worker(db_path,job,f"進捗更新が{int(age)}秒ありません")
 
-        th=threading.Thread(
-            target=_v278_bg_worker,
-            args=(str(db_path),jid,limit0,False,done0,total0),
-            daemon=True,
-            name=f"autorace-bg-rerun-recover-{jid}",
-        )
-        with _V278_BG_LOCK:
-            _V278_BG_THREADS[jid]=th
-        th.start()
-        return {"ok":True,"action":"restarted","job_id":jid,"done":done0,"total":total0}
+        return {"ok":True,"action":"alive","job_id":jid,"age_seconds":round(age,1)}
     except Exception as exc:
         return {"ok":False,"action":"error","reason":f"{type(exc).__name__}: {exc}"}
 
 try:
     _v290_orphan_recovery=_v290_recover_orphaned_batch_job(engine.DB_PATH)
-    if isinstance(_v290_orphan_recovery,dict) and _v290_orphan_recovery.get("action")=="restarted":
-        st.session_state["v290_orphan_recovery_notice"]=(
-            f"バックグラウンド処理の中断を検知し、"
-            f"{int(_v290_orphan_recovery.get('done') or 0)}/"
-            f"{int(_v290_orphan_recovery.get('total') or 0)}から自動再開しました。"
-        )
-except Exception:
-    _v290_orphan_recovery={}
+    if isinstance(_v290_orphan_recovery,dict):
+        if _v290_orphan_recovery.get("action")=="restarted":
+            st.session_state["v290_orphan_recovery_notice"]=(
+                f"停止したバックグラウンド処理を検知し、"
+                f"{int(_v290_orphan_recovery.get('done') or 0)}/"
+                f"{int(_v290_orphan_recovery.get('total') or 0)}から残りを自動再開しました。"
+            )
+        elif _v290_orphan_recovery.get("action")=="error":
+            st.session_state["v290_orphan_recovery_error"]=str(_v290_orphan_recovery.get("reason") or "")
+except Exception as _v290_rec_exc:
+    _v290_orphan_recovery={"ok":False,"action":"error","reason":f"{type(_v290_rec_exc).__name__}: {_v290_rec_exc}"}
 
 # Ver279: 通常1R予測をStreamlit描画スレッドから分離してバックグラウンド実行する。
 # 計算式・seed・試行回数・6周展開は通常予測と同一。画面操作だけを解放する。
@@ -2849,6 +2895,8 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
 
             meta=dict(meta or {})
             df,bets,wall_audit=_v230_six_lap_simulation(df,bets,entries,meta,trials,seed)
+            if callable(progress_cb):
+                progress_cb(idx-1,total,label+"｜③予測保存中")
             meta["壁補正監査"]=wall_audit
             meta["6周展開シミュレーション"]=wall_audit
             _t1=time_module.perf_counter()
@@ -3123,6 +3171,16 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 pass
     except Exception:
         current_keys=set(); current_complete_keys=set(); current_audit_complete_keys=set()
+    # Ver290 hotfix3:
+    # 現行Verで6周+監査まで完全保存済みのレースは、ループ前に候補から除外する。
+    # 再起動復旧時に「11/57から再開」したのに先頭11Rをもう一度数える問題を防ぐ。
+    if not force_current:
+        _already_complete290=set(current_complete_keys) & set(current_audit_complete_keys)
+        if _already_complete290:
+            _before290=len(unique)
+            unique=[h for h in unique if str(h.get('race_key') or '').strip() not in _already_complete290]
+            out['skipped_current'] += int(_before290-len(unique))
+    total=len(unique)
     out['prepare_seconds_v276']=round(time_module.perf_counter()-_prep_t0_v276,3)
     _run_t0_v276=time_module.perf_counter()
     for idx,h in enumerate(unique,1):
@@ -3165,7 +3223,11 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             prediction_text=str(raw_text)
             if str(venue_override or '').strip():
                 prediction_text=f"開催場: {str(venue_override).strip()}\n"+prediction_text
+            if callable(progress_cb):
+                progress_cb(idx-1,total,label+"｜①基礎予測中")
             df,bets,output,entries,meta=engine.ver16_run_prediction(prediction_text,trials,seed,manual_excluded=excluded)
+            if callable(progress_cb):
+                progress_cb(idx-1,total,label+"｜②6周展開中")
             entries=_v276_mark_retrial_from_prediction_text(entries,prediction_text)
             df=_v276_copy_retrial_to_prediction_df(df,entries)
             meta=dict(meta or {})
@@ -3196,6 +3258,8 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 'batch_rerun':True,'walk_forward_v269':True,
             }
             hid=_v231_save_prediction_history(db_path,race_key,raw_text,venue_override,prediction_view,trials,seed)
+            if callable(progress_cb):
+                progress_cb(idx-1,total,label+"｜④周回保存中")
             _v222_save_prediction_restore(db_path,race_key,raw_text,venue_override,prediction_view)
             # 一括再シミュレーションした予測は、同じ現行Verで1〜6周の代表隊列も必ず保存する。
             snap=_v260_snapshot_from_saved_view(db_path,prediction_view,current_ver)
@@ -3204,6 +3268,8 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
 
             # Ver272: 過去レースの仮想100円均等・回収率採点。
             # 保存済み最古オッズを全バージョン共通で使い、結果/払戻は採点にだけ使用する。
+            if callable(progress_cb):
+                progress_cb(idx-1,total,label+"｜⑤回収率採点中")
             _roi273=_v273_virtual_roi_score(
                 db_path, race_key, bets, trials, meta, current_ver
             )
@@ -14191,9 +14257,12 @@ except Exception:
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
 _v278_render_bg_compact("main")
-_v290_recovery_notice=st.session_state.pop("v290_orphan_recovery_notice",None)
+_v290_recovery_notice=st.session_state.get("v290_orphan_recovery_notice")
 if _v290_recovery_notice:
     st.success("🔄 "+str(_v290_recovery_notice))
+_v290_recovery_error=st.session_state.get("v290_orphan_recovery_error")
+if _v290_recovery_error:
+    st.error("BG自動復旧エラー: "+str(_v290_recovery_error))
 _main_pages = ["🏁 予測", "⏱️ 再シミュレーション", "📊 回収率実績", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"]
 if st.session_state.get("v155_main_page") not in _main_pages:
     st.session_state["v155_main_page"] = _main_pages[0]
@@ -14240,6 +14309,31 @@ def _v278_render_background_quick_page(db_path: str) -> None:
         done=int(job.get("done_count",0) or 0)
         total=int(job.get("total_count",0) or 0)
         frac=(float(done)/float(total)) if total else 0.0
+        _updated_ts290=_v290_parse_job_time(job.get("updated_at"))
+        _age290=max(0.0,time_module.time()-_updated_ts290) if _updated_ts290 else 999999.0
+        _jid290=int(job.get("job_id") or 0)
+        _th290=None
+        try:
+            with _V278_BG_LOCK:
+                _th290=_V278_BG_THREADS.get(_jid290)
+        except Exception:
+            _th290=None
+        _alive290=bool(_th290 is not None and getattr(_th290,"is_alive",lambda:False)())
+        st.caption(
+            f"状態: {str(job.get('status') or '')}｜最終進捗更新 {_age290:.0f}秒前｜"
+            f"計算thread: {'稼働中' if _alive290 else 'なし'}"
+        )
+        if _age290 >= 150 or not _alive290:
+            st.warning("⚠️ バックグラウンド処理が停止している可能性があります。")
+            if st.button("🔧 停止中ジョブを破棄して残りから再開",use_container_width=True,key="v290_force_recover_bg"):
+                _rr290=_v290_spawn_recovery_worker(db_path,job,"画面から強制再開")
+                if _rr290.get("ok"):
+                    st.session_state["v290_orphan_recovery_notice"]=(
+                        f"{int(_rr290.get('done') or 0)}/{int(_rr290.get('total') or 0)}から残りを再開しました。"
+                    )
+                    st.rerun()
+                else:
+                    st.error("再開失敗: "+str(_rr290.get("reason") or "不明"))
         if total>0:
             st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}｜{str(job.get('current_label') or '')}")
         else:
