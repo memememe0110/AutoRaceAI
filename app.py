@@ -2694,6 +2694,61 @@ def _v290_recover_orphaned_batch_job(db_path: str, stale_seconds: float = 90.0) 
 # Ver290 hotfix5: 自動復旧・自動再開は行わない。停止後の再開はユーザー操作に限定。
 _v290_orphan_recovery={"ok":True,"action":"manual_control"}
 
+
+def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
+    """停止済み/停止要求済みjobを、ユーザー操作時だけ残りから再開する。"""
+    try:
+        if not isinstance(job,dict) or not job:
+            return {"ok":False,"reason":"再開対象jobがありません。"}
+        old_jid=int(job.get("job_id") or 0)
+        done0=int(job.get("done_count") or 0)
+        total0=int(job.get("total_count") or 0)
+        limit0=max(1,int(job.get("limit_count") or total0 or 80))
+        now=_v228_now_jst_iso()
+
+        with sqlite3.connect(str(db_path),timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            con.execute("""
+                UPDATE v278_background_jobs
+                   SET status='cancelled',
+                       cancel_requested=1,
+                       pause_requested=0,
+                       finished_at=COALESCE(finished_at,?),
+                       message='手動再開のため新しいjobへ引継ぎ',
+                       updated_at=?
+                 WHERE job_id=?
+            """,(now,now,old_jid))
+            con.commit()
+
+        with sqlite3.connect(str(db_path),timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            cur=con.execute("""
+                INSERT INTO v278_background_jobs(
+                    job_type,app_version,status,created_at,updated_at,started_at,
+                    limit_count,force_current,done_count,total_count,current_label,message
+                ) VALUES ('batch_rerun',?,'running',?,?,?,?,0,?,?,?,?)
+            """,(
+                str(_V231_APP_VERSION),now,now,now,limit0,
+                done0,total0,str(job.get("current_label") or ""),
+                f"{done0}/{total0}から手動再開しました。"
+            ))
+            con.commit()
+            new_jid=int(cur.lastrowid or 0)
+
+        th=threading.Thread(
+            target=_v278_bg_worker,
+            args=(str(db_path),new_jid,limit0,False,done0,total0),
+            daemon=True,
+            name=f"autorace-bg-rerun-manual-resume-{new_jid}",
+        )
+        with _V278_BG_LOCK:
+            _V278_BG_THREADS[new_jid]=th
+        th.start()
+        return {"ok":True,"job_id":new_jid,"done":done0,"total":total0}
+    except Exception as exc:
+        return {"ok":False,"reason":f"{type(exc).__name__}: {exc}"}
+
+
 # Ver279: 通常1R予測をStreamlit描画スレッドから分離してバックグラウンド実行する。
 # 計算式・seed・試行回数・6周展開は通常予測と同一。画面操作だけを解放する。
 _V279_BG_PRED_THREADS = globals().get("_V279_BG_PRED_THREADS", {})
@@ -14336,17 +14391,47 @@ def _v278_render_background_quick_page(db_path: str) -> None:
     )
     job=_v278_bg_get_job(db_path)
     running=bool(job and str(job.get("status") or "") in ("queued","running","pause_requested","paused","cancel_requested"))
+    _job_status290=str(job.get("status") or "") if isinstance(job,dict) else ""
+    _jid_resume290=int(job.get("job_id") or 0) if isinstance(job,dict) else 0
+    _th_resume290=None
+    try:
+        with _V278_BG_LOCK:
+            _th_resume290=_V278_BG_THREADS.get(_jid_resume290)
+    except Exception:
+        _th_resume290=None
+    _thread_alive_resume290=bool(_th_resume290 is not None and getattr(_th_resume290,"is_alive",lambda:False)())
+
+    if isinstance(job,dict) and _job_status290 in ("cancel_requested","cancelled","paused") and not _thread_alive_resume290:
+        if st.button(
+            "▶ 残りから再開",
+            use_container_width=True,
+            key="v290_manual_resume_batch",
+            type="primary",
+            help="保存済みVer290は再計算せず、停止位置の続きから手動で再開します。"
+        ):
+            _resume290=_v290_manual_resume_batch(db_path,job)
+            if _resume290.get("ok"):
+                st.session_state["v290_manual_resume_notice"]=(
+                    f"{int(_resume290.get('done') or 0)}/{int(_resume290.get('total') or 0)}から再開しました。"
+                )
+                st.rerun()
+            else:
+                st.error("再開失敗: "+str(_resume290.get("reason") or "不明"))
+    _manual_resume_notice290=st.session_state.pop("v290_manual_resume_notice",None)
+    if _manual_resume_notice290:
+        st.success("▶ "+str(_manual_resume_notice290))
 
     if running:
-        if st.button(
-            "⏹ バックグラウンド再シミュレーションを停止",
-            use_container_width=True,
-            key="v290_stop_only_batch",
-            help="現在レース終了後に停止します。停止後、必要なら開始ボタンから手動でやり直せます。"
-        ):
-            _v278_bg_request_cancel(db_path,int(job.get("job_id") or 0))
-            st.session_state["v290_stop_only_notice"]="停止要求を送信しました。現在レース終了後に停止します。"
-            st.rerun()
+        if _job_status290!="cancel_requested" or _thread_alive_resume290:
+            if st.button(
+                "⏹ バックグラウンド再シミュレーションを停止",
+                use_container_width=True,
+                key="v290_stop_only_batch",
+                help="現在レース終了後に停止します。停止後、必要なら開始ボタンから手動で再開できます。"
+            ):
+                _v278_bg_request_cancel(db_path,int(job.get("job_id") or 0))
+                st.session_state["v290_stop_only_notice"]="停止要求を送信しました。現在レース終了後に停止します。"
+                st.rerun()
         _stop_notice290=st.session_state.pop("v290_stop_only_notice",None)
         if _stop_notice290:
             st.info("⏹ "+str(_stop_notice290))
