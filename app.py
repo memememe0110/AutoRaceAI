@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver288"
+APP_VERSION = "Ver289"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver288"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver289"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -5025,8 +5025,8 @@ def _v276_copy_retrial_to_prediction_df(df, entries):
 
 # Ver287: DB138のVer284・56R監査から確定した固定基準補正。
 # 個別レース結果への後掛けではなく、同展開型×周回の系統誤差を標準ルール化。
-_V288_FIXED_TRANSITION_LOGIT = {'後半追込型|3': -0.117508, '後半追込型|4': -0.044066, '後半追込型|5': 0.058754, '後半追込型|6': 0.088131, '早仕掛け型|3': 0.171429, '早仕掛け型|4': 0.102857, '早仕掛け型|5': 0.148571, '早仕掛け型|6': 0.0, '波乱型|3': -0.159796, '波乱型|4': 0.004438, '波乱型|5': 0.284082, '波乱型|6': -0.10653}
-_V288_DYNAMIC_RATIO = 0.25  # 新規履歴による微調整は固定基準の補助に限定
+_V289_FIXED_TRANSITION_LOGIT = {'後半追込型|3': -0.146885, '後半追込型|4': -0.055082, '後半追込型|5': 0.073443, '後半追込型|6': 0.110164, '早仕掛け型|3': 0.214286, '早仕掛け型|4': 0.128571, '早仕掛け型|5': 0.185714, '早仕掛け型|6': 0.0, '波乱型|3': -0.199745, '波乱型|4': 0.005548, '波乱型|5': 0.355102, '波乱型|6': -0.133163}
+_V289_DYNAMIC_RATIO = 0.25  # 新規履歴による微調整は固定基準の補助に限定
 
 _V285_SAME_SCENARIO_CACHE = globals().get("_V285_SAME_SCENARIO_CACHE", {})
 
@@ -5584,6 +5584,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         momentum={c:0.0 for c in cars}
         # ギリギリ横並びで抜かれた車の一時失速。次周以降へ減衰して残す。
         slowdown={c:0.0 for c in cars}
+        # Ver289: Ver287補正は「TOP3に絡む力」へ限定。
+        # TOP3内の1↔2↔3着順交換には掛けず、286系の順序形成を残す。
+        v289_zone_audit={"boundary":0,"outside":0,"inside_top3":0,"applied":0}
         for lap in range(1,7):
             _prev_top3_audit=set(order[:3])
             # Ver285: ここまでに実際に枝分かれしたrouteから暫定展開型を判定。
@@ -5599,14 +5602,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                         _scenario_apply_v286=max(_bp286.items(),key=lambda kv:float(kv[1] or 0.0))[0]
                 except Exception:
                     _scenario_apply_v286="不明"
-            _v287_key=f"{_scenario_apply_v286}|{int(lap)}"
-            _fixed_delta_v287=float(_V288_FIXED_TRANSITION_LOGIT.get(_v287_key,0.0) or 0.0)
-            _dynamic_delta_v287=float(
-                ((same_scenario_transition_v285.get("delta_logit") or {}).get(_v287_key,0.0) or 0.0)
+            _v289_key=f"{_scenario_apply_v286}|{int(lap)}"
+            _fixed_delta_v289=float(_V289_FIXED_TRANSITION_LOGIT.get(_v289_key,0.0) or 0.0)
+            _dynamic_delta_v289=float(
+                ((same_scenario_transition_v285.get("delta_logit") or {}).get(_v289_key,0.0) or 0.0)
             )
-            # 固定値は過去DBが無くても必ず効く。動的学習は最大25%だけ上乗せ。
+            # ここでは補正の「素材」だけ作る。実際の適用強度は車列位置ごとに決める。
             _scenario_delta_v285=float(np.clip(
-                _fixed_delta_v287 + _dynamic_delta_v287*_V288_DYNAMIC_RATIO,
+                _fixed_delta_v289 + _dynamic_delta_v289*_V289_DYNAMIC_RATIO,
                 -0.46,0.46
             ))
             # Ver250: 1周で何台も連続して抜く展開を抑える。
@@ -5711,11 +5714,25 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                             late_release_audit_v273[_lap_err275]["last_error"]=f"{type(_e_late275).__name__}: {_e_late275}"
                     except Exception:
                         pass
-                # Ver285: 同じ展開型の中でだけ、過去実測との差を追抜確率へ小さく反映。
-                # 展開型そのものの重み付けやゴール後の順位補正は行わない。
-                if abs(_scenario_delta_v285)>1e-12:
+                # Ver289:
+                # 287で効いた「TOP3に絡む力」だけを6周シミュレーション内部へ残す。
+                # i==3 : 4位→3位のTOP3境界突破なので100%適用。
+                # i>=4 : TOP3へ近づく過程なので30%だけ適用。
+                # i<=2 : TOP3内の1～3着順交換なので適用しない（286系の順序形成を維持）。
+                if i == 3:
+                    _zone_factor_v289=1.0
+                    v289_zone_audit["boundary"]+=1
+                elif i >= 4:
+                    _zone_factor_v289=0.30
+                    v289_zone_audit["outside"]+=1
+                else:
+                    _zone_factor_v289=0.0
+                    v289_zone_audit["inside_top3"]+=1
+                _delta_apply_v289=float(_scenario_delta_v285)*float(_zone_factor_v289)
+                if abs(_delta_apply_v289)>1e-12:
+                    v289_zone_audit["applied"]+=1
                     _pp_v285=float(np.clip(p,1e-6,1.0-1e-6))
-                    _lg_v285=math.log(_pp_v285/(1.0-_pp_v285)) + _scenario_delta_v285
+                    _lg_v285=math.log(_pp_v285/(1.0-_pp_v285)) + _delta_apply_v289
                     p=float(np.clip(1.0/(1.0+math.exp(-_lg_v285)),0.035,0.88))
                 # 差が開きすぎていればまず追いつく必要がある。
                 # 大差なら即追越しは難しいが、速度優位車はまず差を詰められる。
@@ -5936,7 +5953,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
     ]
     audit={
-        "enabled":True,"mode":"Ver288 固定全体補正80%+微調整・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver289 TOP3境界限定補正・286順序形成維持・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -5960,10 +5977,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "scenario_feedback_v264": scenario_feedback_v264,
         "scenario_branch_prior_v264": scenario_branch_prior_v264,
         "same_scenario_transition_v285": same_scenario_transition_v285,
-        "v285_scenario_policy":"Ver288固定基準+微調整: 56R監査由来の同展開型×周回固定logitを常時適用し、新規履歴は最大25%の微調整だけ追加",
-        "v288_fixed_transition_logit":dict(_V288_FIXED_TRANSITION_LOGIT),
-        "v288_dynamic_ratio":float(_V288_DYNAMIC_RATIO),
-        "v288_fixed_scale":0.80,
+        "v285_scenario_policy":"Ver289: 287全体補正をTOP3境界100%・TOP3外30%・TOP3内0%で適用。TOP3候補改善だけ残し、1～3着順序は286系を維持",
+        "v289_fixed_transition_logit":dict(_V289_FIXED_TRANSITION_LOGIT),
+        "v289_dynamic_ratio":float(_V289_DYNAMIC_RATIO),
+        "v289_zone_factors":{"top3_boundary":1.0,"outside_top3":0.30,"inside_top3":0.0},
+        "v289_zone_audit":dict(v289_zone_audit),
         "scenario_distribution_v263": scenario_distribution,
         "scenario_weights_v263": scenario_weights,
         "actual_scenario_v263": actual_scenario,
@@ -5976,6 +5994,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "top_full_orders_v284":top_full_orders,
         "v284_post_simulation_correction":False,
         "v285_post_simulation_correction":False,
+        "v289_post_simulation_correction":False,
         "v284_ticket_sources":["単勝","複勝","ワイド","2連単","2連複","三連複","三連単"],
         "v284_transition_audit":{
             "trials":int(sim_trials),
