@@ -54,6 +54,7 @@ _V284_BOOT_GITHUB_CANONICAL_RESTORE = "2026-08-09-v1"
 _V284_DERIVED_TABLE_GUARD_FIX = "2026-08-09-v1"
 _V284_DIVERGED_SAFE_AUTO_MERGE = "2026-08-09-v1"
 _V284_V252_SEMANTIC_CONTAINMENT = "2026-08-10-v3"
+_V284_TRANSITION_AUDIT_PERSIST = "2026-08-10-v1"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -2706,6 +2707,9 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
         _v278_bg_update(db_path,job_id,done_count=3,current_label="保存",message="予測履歴を保存しています。")
         _t_save0=time_module.perf_counter()
         race_key=engine.v34_save_prediction_snapshot(meta,df,finish_prob,engine.DB_PATH)
+        _audit_save284=_v284_save_transition_audit(db_path,race_key,wall_audit)
+        if isinstance(meta,dict):
+            meta["v284_transition_audit_save"]=_audit_save284
         _t_save1=time_module.perf_counter()
         _v217_deferred_prediction_db_save(meta,bets,trials,df)
         timing={
@@ -2909,6 +2913,10 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                     _lap_complete276.add(f"{_d8}_{str(_v).strip()}_{_rn}R")
             current_complete_keys=(_target_keys276 & current_keys & _lap_complete276)
 
+        # Ver284: 6周展開詳細監査がDBへ永続保存されていないレースは再実行対象。
+        _persistent_audit_keys284=_v284_transition_audit_race_keys(db_path,current_ver)
+        current_complete_keys=current_complete_keys & _persistent_audit_keys284
+
         _audit_required273=[
             "Ver273_5周目ループ到達",
             "Ver273_5周目関数呼出",
@@ -2996,6 +3004,10 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 except Exception:
                     pass
             race_key=engine.v34_save_prediction_snapshot(meta,df,finish_prob,engine.DB_PATH)
+            _audit_save284=_v284_save_transition_audit(db_path,race_key,wall_audit)
+            meta["v284_transition_audit_save"]=_audit_save284
+            if not _audit_save284.get("ok"):
+                raise RuntimeError("Ver284展開監査DB保存失敗: "+str(_audit_save284.get("reason") or "不明"))
             prediction_view={
                 'df':df,'bets':bets,'output':output,'entries':entries,'meta':meta,
                 'finish_prob':finish_prob,'race_key':race_key,'trials':trials,'excluded':excluded,
@@ -3068,9 +3080,15 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         out["roi_return_rate"]=float(out["roi_payout_yen"])/float(out["roi_cost_yen"])*100.0
     else:
         out["roi_return_rate"]=None
+    try:
+        _audit_saved_keys284=_v284_transition_audit_race_keys(db_path,current_ver)
+        out["v284_transition_audit_saved_races"]=len(_audit_saved_keys284)
+    except Exception:
+        out["v284_transition_audit_saved_races"]=0
     _force_note = " / 強制再計算ON" if force_current else ""
     out['message']=(f"確認{out['checked']}レース / {current_ver}再シミュレーション{out['rerun']} / "
                     f"監査列まで保存済み{out['skipped_current']} / 入力材料なし{out['no_text']} / エラー{len(out['errors'])}"
+                    f" / Ver284展開監査DB保存{int(out.get('v284_transition_audit_saved_races',0) or 0)}R"
                     f"{_force_note} / 準備{float(out.get('prepare_seconds_v276',0) or 0):.2f}秒")
     return out
 
@@ -4955,6 +4973,191 @@ def _v276_copy_retrial_to_prediction_df(df, entries):
         return d
     except Exception:
         return df
+
+
+# Ver284: 6周展開シミュレーション詳細監査の永続保存。
+# 予測ロジックには一切使わず、再シミュレーション後の原因分析専用。
+def _v284_ensure_transition_audit_tables(db_path: str) -> None:
+    with sqlite3.connect(str(db_path),timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS v284_transition_audit (
+            audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            audit_run_id TEXT NOT NULL,
+            race_key TEXT NOT NULL,
+            app_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            trials INTEGER NOT NULL DEFAULT 0,
+            lap_no INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            successes INTEGER NOT NULL DEFAULT 0,
+            p_sum REAL NOT NULL DEFAULT 0,
+            wall_attempts INTEGER NOT NULL DEFAULT 0,
+            wall_successes INTEGER NOT NULL DEFAULT 0,
+            momentum_attempts INTEGER NOT NULL DEFAULT 0,
+            momentum_successes INTEGER NOT NULL DEFAULT 0,
+            slowdown_attempts INTEGER NOT NULL DEFAULT 0,
+            slowdown_successes INTEGER NOT NULL DEFAULT 0,
+            top3_entries INTEGER NOT NULL DEFAULT 0,
+            top3_exits INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(audit_run_id,lap_no)
+        )
+        """)
+        con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v284_transition_race
+        ON v284_transition_audit(race_key,app_version,created_at)
+        """)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS v284_transition_pair_audit (
+            audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            audit_run_id TEXT NOT NULL,
+            race_key TEXT NOT NULL,
+            app_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            lap_no INTEGER NOT NULL,
+            attacker_car INTEGER NOT NULL,
+            defender_car INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            successes INTEGER NOT NULL DEFAULT 0,
+            p_sum REAL NOT NULL DEFAULT 0,
+            wall_attempts INTEGER NOT NULL DEFAULT 0,
+            momentum_attempts INTEGER NOT NULL DEFAULT 0,
+            slowdown_attempts INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(audit_run_id,lap_no,attacker_car,defender_car)
+        )
+        """)
+        con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v284_transition_pair_race
+        ON v284_transition_pair_audit(race_key,app_version,created_at)
+        """)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS v284_top3_order_audit (
+            audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            audit_run_id TEXT NOT NULL,
+            race_key TEXT NOT NULL,
+            app_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            trials INTEGER NOT NULL DEFAULT 0,
+            top3_set TEXT NOT NULL,
+            order_key TEXT NOT NULL,
+            occurrences INTEGER NOT NULL DEFAULT 0,
+            probability REAL NOT NULL DEFAULT 0,
+            UNIQUE(audit_run_id,order_key)
+        )
+        """)
+        con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v284_top3_order_race
+        ON v284_top3_order_audit(race_key,app_version,created_at)
+        """)
+        con.commit()
+
+
+def _v284_save_transition_audit(db_path: str, race_key: str, audit: dict) -> dict:
+    """_v230_six_lap_simulation が返した監査集計をSQLiteへ保存する。"""
+    result={"ok":False,"race_key":str(race_key or ""),"laps":0,"pairs":0,"top3_orders":0,"reason":""}
+    try:
+        if not str(race_key or "").strip():
+            result["reason"]="race_keyなし"
+            return result
+        detail=(audit or {}).get("v284_transition_audit") or {}
+        if not isinstance(detail,dict) or not detail:
+            result["reason"]="v284_transition_auditなし"
+            return result
+        lap_stats=detail.get("lap_stats") or {}
+        pair_stats=detail.get("pair_stats") or {}
+        top3_orders=detail.get("top3_orders") or {}
+        trials=int(detail.get("trials") or (audit or {}).get("sim_trials") or 0)
+        created_at=_v228_now_jst_iso()
+        app_version=str(globals().get("_V231_APP_VERSION") or "Ver284")
+        run_seed=f"{race_key}|{app_version}|{created_at}|{trials}"
+        audit_run_id=hashlib.sha256(run_seed.encode("utf-8")).hexdigest()[:24]
+
+        _v284_ensure_transition_audit_tables(db_path)
+        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            con.execute("BEGIN IMMEDIATE")
+
+            for lap_raw,st in lap_stats.items():
+                lap=int(lap_raw)
+                st=st or {}
+                con.execute("""
+                    INSERT INTO v284_transition_audit(
+                        audit_run_id,race_key,app_version,created_at,trials,lap_no,
+                        attempts,successes,p_sum,wall_attempts,wall_successes,
+                        momentum_attempts,momentum_successes,slowdown_attempts,slowdown_successes,
+                        top3_entries,top3_exits
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,(
+                    audit_run_id,str(race_key),app_version,created_at,trials,lap,
+                    int(st.get("attempts",0) or 0),int(st.get("successes",0) or 0),float(st.get("p_sum",0.0) or 0.0),
+                    int(st.get("wall_attempts",0) or 0),int(st.get("wall_successes",0) or 0),
+                    int(st.get("momentum_attempts",0) or 0),int(st.get("momentum_successes",0) or 0),
+                    int(st.get("slowdown_attempts",0) or 0),int(st.get("slowdown_successes",0) or 0),
+                    int(st.get("top3_entries",0) or 0),int(st.get("top3_exits",0) or 0),
+                ))
+                result["laps"]+=1
+
+            for key,st in pair_stats.items():
+                try:
+                    lap_s,attacker_s,defender_s=str(key).split("|",2)
+                    lap=int(lap_s); attacker=int(attacker_s); defender=int(defender_s)
+                except Exception:
+                    continue
+                st=st or {}
+                con.execute("""
+                    INSERT INTO v284_transition_pair_audit(
+                        audit_run_id,race_key,app_version,created_at,lap_no,attacker_car,defender_car,
+                        attempts,successes,p_sum,wall_attempts,momentum_attempts,slowdown_attempts
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,(
+                    audit_run_id,str(race_key),app_version,created_at,lap,attacker,defender,
+                    int(st.get("attempts",0) or 0),int(st.get("successes",0) or 0),float(st.get("p_sum",0.0) or 0.0),
+                    int(st.get("wall_attempts",0) or 0),int(st.get("momentum_attempts",0) or 0),
+                    int(st.get("slowdown_attempts",0) or 0),
+                ))
+                result["pairs"]+=1
+
+            for order_key,count in top3_orders.items():
+                order=[int(x) for x in str(order_key).split("-") if str(x).strip().isdigit()]
+                if len(order)!=3:
+                    continue
+                cnt=int(count or 0)
+                con.execute("""
+                    INSERT INTO v284_top3_order_audit(
+                        audit_run_id,race_key,app_version,created_at,trials,top3_set,order_key,occurrences,probability
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,(
+                    audit_run_id,str(race_key),app_version,created_at,trials,
+                    "-".join(map(str,sorted(order))),"-".join(map(str,order)),cnt,
+                    float(cnt)/max(1,trials)*100.0,
+                ))
+                result["top3_orders"]+=1
+
+            con.commit()
+
+        result.update({"ok":True,"audit_run_id":audit_run_id,"created_at":created_at})
+        return result
+    except Exception as exc:
+        result["reason"]=f"{type(exc).__name__}: {exc}"
+        return result
+
+
+def _v284_transition_audit_race_keys(db_path: str, app_version: str) -> set[str]:
+    """現行Verで6周監査が全周保存済みのrace_keyを返す。"""
+    try:
+        _v284_ensure_transition_audit_tables(db_path)
+        with sqlite3.connect(str(db_path),timeout=30.0) as con:
+            rows=con.execute("""
+                SELECT race_key
+                FROM v284_transition_audit
+                WHERE app_version=?
+                GROUP BY race_key,audit_run_id
+                HAVING COUNT(DISTINCT lap_no)>=6
+            """,(str(app_version),)).fetchall()
+        return {str(r[0]) for r in rows if r and r[0]}
+    except Exception:
+        return set()
+
 
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
@@ -12186,6 +12389,7 @@ def _v283_db_fingerprint_bytes(data: bytes) -> dict:
                 "v222_prediction_restore","v223_result_view_restore","v238_result_raw_archive",
                 "v40_prediction_feature_snapshots","v41_registration_batches",
                 "weight_adjustment_history",
+                "v284_transition_audit","v284_transition_pair_audit","v284_top3_order_audit",
             ]
             counts={}
             for t in protected:
@@ -12266,6 +12470,12 @@ def _v284_db_row_keysets_from_bytes(data: bytes) -> dict:
             "v223_result_view_restore":("race_key",),
             "v238_result_raw_archive":("race_key",),
             "v279_player_incident_history":("race_key","car_no","incident_type"),
+        "v284_transition_audit":("audit_run_id","lap_no"),
+        "v284_transition_pair_audit":("audit_run_id","lap_no","attacker_car","defender_car"),
+        "v284_top3_order_audit":("audit_run_id","order_key"),
+            "v284_transition_audit":("audit_run_id","lap_no"),
+            "v284_transition_pair_audit":("audit_run_id","lap_no","attacker_car","defender_car"),
+            "v284_top3_order_audit":("audit_run_id","order_key"),
         }
         with sqlite3.connect(str(tmp_path),timeout=30.0) as con:
             con.execute("PRAGMA busy_timeout=30000")
@@ -14091,6 +14301,8 @@ elif selected_main_page == "🏁 予測":
             # オッズ欄の表示に必要なレースキーだけ同期保存。
             _t_save0 = time_module.perf_counter()
             race_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, engine.DB_PATH)
+            _audit_save284 = _v284_save_transition_audit(engine.DB_PATH, race_key, wall_audit)
+            meta["v284_transition_audit_save"] = _audit_save284
             _t_save1 = time_module.perf_counter()
             # 全買い目確率と特徴量は待たずにバックグラウンド保存する。
             # Ver276: 詳細保存は単一ワーカーへ投入。予測のたびに保存スレッドを
