@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver290"
+APP_VERSION = "Ver291"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver290"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver291"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -5649,7 +5649,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         # 試走は低いほど良い、STも低いほど良い。履歴first_gainは後段で追加する。
         _trial_z290=(_trial_mu290-float(trial[c]))/_trial_sd290
         _st_z290=(_st_mu290-float(stmean[c]))/_st_sd290
-        early_launch_v290[c]=float(np.clip(0.62*_trial_z290 + 0.38*_st_z290,-1.6,1.6))
+        # Ver291: DB150の実結果210R・ハンデ跨ぎ3,925ペアで、
+        # 試走優位の着順説明力がST優位より明確に強かったため、ST過重を縮小。
+        early_launch_v290[c]=float(np.clip(0.80*_trial_z290 + 0.20*_st_z290,-1.6,1.6))
     venue=str((meta or {}).get("開催場") or (meta or {}).get("venue") or "")
     _v242_prepare_started=time_module.perf_counter()
     profiles=_v230_hist_profiles(venue,names)
@@ -5962,7 +5964,31 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     early_launch_v290.get(chaser,0.0)-early_launch_v290.get(front,0.0)
                 )
                 _early_lap_weight290=0.090 if lap==1 else (0.050 if lap==2 else 0.0)
-                _early_logit290=float(np.clip(_early_pair_delta290*_early_lap_weight290,-0.11,0.11))
+
+                # Ver291: ハンデ跨ぎ時だけ後方ハンデ位置で強度を調整。
+                # DB150全結果では、後方車が試走優位の時に前車を上回る率は
+                # <=10m帯 約63%、20m帯 約61%、30m帯 約76%、40m以上 約75%。
+                # したがって30m以上は290強度を維持、20mは80%、0/10mは60%へ縮小。
+                # 同ハンデ組は横並びそのものが良化/悪化を分けなかったため強度変更しない。
+                _hc291=float(handicap.get(chaser,0) or 0)
+                _hf291=float(handicap.get(front,0) or 0)
+                if _hc291 > _hf291:
+                    if _hc291 >= 30.0:
+                        _handicap_early_scale291=1.00
+                    elif _hc291 >= 20.0:
+                        _handicap_early_scale291=0.80
+                    else:
+                        _handicap_early_scale291=0.60
+                elif _hc291 == _hf291:
+                    _handicap_early_scale291=1.00
+                else:
+                    # 名目上前ハンデ側が一度後ろへ下がった後の再逆転には強く掛けない。
+                    _handicap_early_scale291=0.70
+
+                _early_logit290=float(np.clip(
+                    _early_pair_delta290*_early_lap_weight290*_handicap_early_scale291,
+                    -0.11,0.11
+                ))
                 logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus + _early_logit290 - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
                 _branch_noise=0.16
                 logit += rng.normal(0,_branch_noise)
@@ -6262,7 +6288,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
     ]
     audit={
-        "enabled":True,"mode":"Ver290 TOP3境界限定補正+初速前半弱補正・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver291 ハンデ位置別初速補正+TOP3境界限定・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -6293,8 +6319,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "v289_zone_audit":dict(v289_zone_audit),
         "v290_early_launch_proxy":{
             "enabled":True,
-            "source":"当日試走T+ST+過去1周目上げ幅（2コーナー映像は未使用）",
+            "source":"Ver291: 当日試走T80%+ST20%+過去1周目上げ幅（2コーナー映像は未使用）",
             "lap_weights":{"1":0.090,"2":0.050,"3-6":0.0},
+            "handicap_cross_scale":{"rear_30m_plus":1.0,"rear_20m":0.80,"rear_0_10m":0.60,"same_handicap":1.0,"front_handicap_repass":0.70},
+            "evidence":"DB150 result_entries: eligible210R / cross-handicap3925pairs",
             "cars":{str(k):round(float(v),4) for k,v in early_launch_v290.items()},
             "max_pair_logit":0.11
         },
@@ -14377,7 +14405,8 @@ selected_main_page = st.session_state.get("v155_main_page", _main_pages[0])
 
 def _v278_render_background_quick_page(db_path: str) -> None:
     st.subheader("⏱️ 再シミュレーション")
-    st.caption("長い精度比較センターまでスクロールせず、ここから開始・進捗確認・停止ができます。")
+    st.caption("ここから開始・進捗確認・停止・手動再開ができます。")
+
     limit_count=st.number_input(
         "再シミュレーションする保存レース数",
         min_value=1,max_value=300,value=80,step=10,
@@ -14389,25 +14418,73 @@ def _v278_render_background_quick_page(db_path: str) -> None:
         f"{_V231_APP_VERSION}保存済みレースも再計算",
         value=False,key="v278_quick_force"
     )
+
     job=_v278_bg_get_job(db_path)
-    running=bool(job and str(job.get("status") or "") in ("queued","running","pause_requested","paused","cancel_requested"))
-    _job_status290=str(job.get("status") or "") if isinstance(job,dict) else ""
-    _jid_resume290=int(job.get("job_id") or 0) if isinstance(job,dict) else 0
-    _th_resume290=None
+    status=str(job.get("status") or "") if isinstance(job,dict) else ""
+    jid=int(job.get("job_id") or 0) if isinstance(job,dict) else 0
+    done=int(job.get("done_count") or 0) if isinstance(job,dict) else 0
+    total=int(job.get("total_count") or 0) if isinstance(job,dict) else 0
+
+    th=None
     try:
         with _V278_BG_LOCK:
-            _th_resume290=_V278_BG_THREADS.get(_jid_resume290)
+            th=_V278_BG_THREADS.get(jid)
     except Exception:
-        _th_resume290=None
-    _thread_alive_resume290=bool(_th_resume290 is not None and getattr(_th_resume290,"is_alive",lambda:False)())
+        th=None
+    alive=bool(th is not None and getattr(th,"is_alive",lambda:False)())
 
-    if isinstance(job,dict) and _job_status290 in ("cancel_requested","cancelled","paused") and not _thread_alive_resume290:
-        if st.button(
-            "▶ 残りから再開",
+    active_status=status in ("queued","running","pause_requested","paused","cancel_requested")
+    stopped_abnormally=bool(job and active_status and not alive)
+    normally_running=bool(job and active_status and alive and status!="cancel_requested")
+
+    # Ver290 hotfix7:
+    # UIを3状態に整理。
+    # 1) 正常稼働中 -> 「現在レース後に停止」だけ
+    # 2) status上は実行中だがthreadなし -> 「残りから再開」「この処理を終了」の2択
+    # 3) 完全停止/完了 -> 通常の開始ボタン
+    if normally_running:
+        _updated_ts290=_v290_parse_job_time(job.get("updated_at"))
+        _age290=max(0.0,time_module.time()-_updated_ts290) if _updated_ts290 else 999999.0
+        st.caption(
+            f"状態: {status}｜最終進捗更新 {_age290:.0f}秒前｜計算thread: 稼働中"
+        )
+        if total>0:
+            st.progress(
+                min(1.0,max(0.0,float(done)/float(total))),
+                text=f"{done}/{total}｜{str(job.get('current_label') or '')}"
+            )
+        else:
+            st.info("準備中… 対象レースを確認しています")
+
+        a,b=st.columns(2)
+        if a.button("🔄 進捗を更新",key="v278_quick_refresh",use_container_width=True):
+            st.rerun()
+        if b.button(
+            "⏹ 現在レース後に停止",
+            key="v278_quick_stop",
             use_container_width=True,
+        ):
+            _v278_bg_request_cancel(db_path,jid)
+            st.session_state["v290_stop_only_notice"]="停止要求を送信しました。現在レース終了後に停止します。"
+            st.rerun()
+
+    elif stopped_abnormally:
+        st.warning(
+            f"⚠️ 処理が停止しています。現在 {done}/{total if total else '?'}。"
+            "自動再開はしません。"
+        )
+        if total>0:
+            st.progress(
+                min(1.0,max(0.0,float(done)/float(total))),
+                text=f"{done}/{total}｜{str(job.get('current_label') or '')}"
+            )
+
+        c1,c2=st.columns(2)
+        if c1.button(
+            f"▶ {done}/{total if total else '?'}から再開",
             key="v290_manual_resume_batch",
             type="primary",
-            help="保存済みVer290は再計算せず、停止位置の続きから手動で再開します。"
+            use_container_width=True,
         ):
             _resume290=_v290_manual_resume_batch(db_path,job)
             if _resume290.get("ok"):
@@ -14417,68 +14494,32 @@ def _v278_render_background_quick_page(db_path: str) -> None:
                 st.rerun()
             else:
                 st.error("再開失敗: "+str(_resume290.get("reason") or "不明"))
-    _manual_resume_notice290=st.session_state.pop("v290_manual_resume_notice",None)
-    if _manual_resume_notice290:
-        st.success("▶ "+str(_manual_resume_notice290))
 
-    if running:
-        if _job_status290!="cancel_requested" or _thread_alive_resume290:
-            if st.button(
-                "⏹ バックグラウンド再シミュレーションを停止",
-                use_container_width=True,
-                key="v290_stop_only_batch",
-                help="現在レース終了後に停止します。停止後、必要なら開始ボタンから手動で再開できます。"
-            ):
-                _v278_bg_request_cancel(db_path,int(job.get("job_id") or 0))
-                st.session_state["v290_stop_only_notice"]="停止要求を送信しました。現在レース終了後に停止します。"
-                st.rerun()
-        _stop_notice290=st.session_state.pop("v290_stop_only_notice",None)
-        if _stop_notice290:
-            st.info("⏹ "+str(_stop_notice290))
-
-        done=int(job.get("done_count",0) or 0)
-        total=int(job.get("total_count",0) or 0)
-        frac=(float(done)/float(total)) if total else 0.0
-        _updated_ts290=_v290_parse_job_time(job.get("updated_at"))
-        _age290=max(0.0,time_module.time()-_updated_ts290) if _updated_ts290 else 999999.0
-        _jid290=int(job.get("job_id") or 0)
-        _th290=None
-        try:
-            with _V278_BG_LOCK:
-                _th290=_V278_BG_THREADS.get(_jid290)
-        except Exception:
-            _th290=None
-        _alive290=bool(_th290 is not None and getattr(_th290,"is_alive",lambda:False)())
-        st.caption(
-            f"状態: {str(job.get('status') or '')}｜最終進捗更新 {_age290:.0f}秒前｜"
-            f"計算thread: {'稼働中' if _alive290 else 'なし'}"
-        )
-        if _age290 >= 90 or not _alive290:
-            st.warning("⚠️ バックグラウンド処理が停止している可能性があります。自動再開はしません。")
-            if st.button(
-                "⏹ 停止要求を送る",
-                use_container_width=True,
-                key="v290_stale_stop_only"
-            ):
-                _v278_bg_request_cancel(db_path,int(job.get("job_id") or 0))
-                st.info("停止要求を送信しました。停止後、必要なら下の開始ボタンから手動でやり直せます。")
-        if total>0:
-            st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}｜{str(job.get('current_label') or '')}")
-        else:
-            st.info("準備中… 対象レースを確認しています")
-        a,b=st.columns(2)
-        if a.button("🔄 進捗を更新",key="v278_quick_refresh",use_container_width=True):
-            st.rerun()
-        if b.button(
-            "⏹ 現在レース後に停止",
-            key="v278_quick_stop",
+        if c2.button(
+            "⏹ この処理を終了",
+            key="v290_end_stuck_job",
             use_container_width=True,
-            disabled=str(job.get("status") or "")=="cancel_requested",
         ):
-            _v278_bg_request_cancel(db_path,int(job.get("job_id") or 0))
-            st.rerun()
-        if str(job.get("status") or "") in ("paused","pause_requested"):
-            st.info("選手履歴・結果などのDB登録を優先するため、一時停止または停止待ちです。")
+            try:
+                now=_v228_now_jst_iso()
+                with sqlite3.connect(str(db_path),timeout=1.0) as con:
+                    con.execute("PRAGMA busy_timeout=1000")
+                    con.execute("""
+                        UPDATE v278_background_jobs
+                           SET status='cancelled',
+                               cancel_requested=1,
+                               pause_requested=0,
+                               finished_at=COALESCE(finished_at,?),
+                               message='ユーザー操作でこの処理を終了しました。',
+                               updated_at=?
+                         WHERE job_id=?
+                    """,(now,now,jid))
+                    con.commit()
+                st.session_state["v290_stop_only_notice"]="この再シミュレーション処理を終了しました。"
+                st.rerun()
+            except Exception as exc:
+                st.error(f"終了処理失敗: {type(exc).__name__}: {exc}")
+
     else:
         if st.button(
             f"▶ バックグラウンドで{_V231_APP_VERSION}再シミュレーション開始",
@@ -14488,10 +14529,17 @@ def _v278_render_background_quick_page(db_path: str) -> None:
         ):
             r=_v278_bg_start(db_path,int(limit_count),bool(force_current))
             if r.get("ok"):
-                st.success(f"開始しました（ジョブID: {r.get('job_id')}）。他の画面へ移動して作業できます。")
+                st.success(f"開始しました（ジョブID: {r.get('job_id')}）。")
                 st.rerun()
             else:
                 st.warning(str(r.get("reason") or "開始できませんでした。"))
+
+    notice=st.session_state.pop("v290_stop_only_notice",None)
+    if notice:
+        st.info("⏹ "+str(notice))
+    rnotice=st.session_state.pop("v290_manual_resume_notice",None)
+    if rnotice:
+        st.success("▶ "+str(rnotice))
 
     job=_v278_bg_get_job(db_path)
     if job and str(job.get("status") or "") in ("completed","failed","cancelled"):
