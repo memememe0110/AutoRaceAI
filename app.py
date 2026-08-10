@@ -2473,15 +2473,18 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
         return {"ok":False,"reason":"すでにバックグラウンド再シミュレーションが動いています。"}
     now=_v228_now_jst_iso()
     try:
-        _hist278=_v231_list_prediction_histories(db_path,max(1,int(limit_count)))
-        _seen278=set()
-        _approx_total278=0
-        for _h278 in _hist278:
-            _rk278=str(_h278.get("race_key") or "").strip()
-            if not _rk278 or _rk278 in _seen278:
-                continue
-            _seen278.add(_rk278)
-            _approx_total278+=1
+        _v231_ensure_prediction_history_table(db_path)
+        with sqlite3.connect(str(db_path),timeout=30.0) as _con278:
+            _approx_total278=int(_con278.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT race_key
+                    FROM v231_prediction_history
+                    WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+                    GROUP BY race_key
+                    ORDER BY MAX(history_id) DESC
+                    LIMIT ?
+                )
+            """,(max(1,int(limit_count)),)).fetchone()[0] or 0)
     except Exception:
         _approx_total278=0
     with sqlite3.connect(str(db_path), timeout=30.0) as con:
@@ -2903,8 +2906,33 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         "roi_cost_yen":0,"roi_payout_yen":0,"roi_hits":0,"roi_rows":[],
         "roi_plus_cost_yen":0,"roi_plus_payout_yen":0,"roi_plus_extra_points":0,
     }
-    histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
-    # 同じレースの旧バージョンが複数あっても、入力復元元は最新1件だけ使う。
+    # Ver289 hotfix:
+    # limitは「履歴行数」ではなく「重複を除いたレース数」として扱う。
+    # 旧実装は最新limit件の履歴行だけ取得してからrace_key重複除去していたため、
+    # Ver284/285/286/287/288など同一レースの複数版が増えるほど
+    # 80指定でも30R程度まで候補が縮むことがあった。
+    try:
+        _v231_ensure_prediction_history_table(db_path)
+        with sqlite3.connect(str(db_path),timeout=30.0) as _con289:
+            _con289.row_factory=sqlite3.Row
+            _rows289=_con289.execute("""
+                SELECT h.history_id,h.race_key,h.race_label,h.app_version,h.simulation_mode,
+                       h.settings_hash,h.prediction_time,h.trials,h.seed
+                FROM v231_prediction_history h
+                JOIN (
+                    SELECT race_key,MAX(history_id) AS max_history_id
+                    FROM v231_prediction_history
+                    WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+                    GROUP BY race_key
+                ) x ON h.history_id=x.max_history_id
+                ORDER BY h.prediction_time DESC,h.history_id DESC
+                LIMIT ?
+            """,(max(1,int(limit)),)).fetchall()
+        histories=[dict(r) for r in _rows289]
+    except Exception:
+        histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
+
+    # 既にSQL側でrace_keyごと最新1件だが、旧DB/フォールバック時の安全用に重複除去。
     unique=[]; seen=set()
     for h in histories:
         rk=str(h.get('race_key') or '').strip()
