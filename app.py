@@ -7201,10 +7201,29 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 st.title("🏁 AutoRaceAI スマホ本予測")
 st.caption("Ver263｜複数展開ルートを確率化し、実測グランドノートから展開タイプと近似ルートを学習。")
+_v290_load_started=time_module.perf_counter()
+_v290_load_stage_started=_v290_load_started
+_v290_load_times={}
+_v290_load_box=st.empty()
+_v290_load_box.info("⏳ 読み込み中：学習設定を確認しています…")
+
+def _v290_load_stage(label: str) -> None:
+    global _v290_load_stage_started
+    try:
+        now=time_module.perf_counter()
+        prev=st.session_state.get("_v290_load_stage_label")
+        if prev:
+            _v290_load_times[str(prev)]=round(now-float(_v290_load_stage_started),2)
+        st.session_state["_v290_load_stage_label"]=str(label)
+        _v290_load_stage_started=now
+        _v290_load_box.info("⏳ 読み込み中："+str(label))
+    except Exception:
+        pass
 try:
     _v256_refresh_learning_settings(_v230_db_path())
 except Exception:
     pass
+_v290_load_stage("DB・GitHub正本の安全確認…")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
@@ -13760,18 +13779,39 @@ def _v278_render_bg_compact(location: str = "main") -> None:
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
+def _v290_db_stat_signature(path_value) -> tuple:
+    try:
+        p=Path(str(path_value)).resolve()
+        sig=[str(p)]
+        for q in (p,Path(str(p)+"-wal"),Path(str(p)+"-shm")):
+            try:
+                stt=q.stat()
+                sig.extend([str(q),int(stt.st_size),int(stt.st_mtime_ns)])
+            except Exception:
+                sig.extend([str(q),-1,-1])
+        return tuple(sig)
+    except Exception:
+        return (str(path_value),)
+
 def _v284_current_db_identity() -> dict:
+    """DB identity with WAL-aware stat cache to avoid rebuilding a 50MB snapshot multiple times per rerun."""
     try:
         p=Path(str(engine.DB_PATH)).resolve()
+        sig=_v290_db_stat_signature(p)
+        cached=st.session_state.get("_v290_identity_cache")
+        if isinstance(cached,dict) and cached.get("sig")==sig and isinstance(cached.get("value"),dict):
+            return dict(cached["value"])
         data=_v278_consistent_db_snapshot_bytes(str(p))
         fp=_v283_db_fingerprint_bytes(data)
-        return {
+        value={
             "ok":bool(fp.get("ok")),
             "path":str(p),
             "sha256":hashlib.sha256(data).hexdigest(),
             "size":len(data),
             "fingerprint":fp,
         }
+        st.session_state["_v290_identity_cache"]={"sig":sig,"value":dict(value)}
+        return value
     except Exception as exc:
         return {"ok":False,"path":str(getattr(engine,"DB_PATH","")),"reason":f"{type(exc).__name__}: {exc}"}
 
@@ -13812,55 +13852,69 @@ if isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_
         else:
             st.session_state["v284_db_identity_block"]=["アップロード正本の自動復元失敗: "+str(_v284_restore_msg)]
 
-# Ver284: Streamlit再起動/再デプロイ時はsession_state正本が消えるため、
-# GitHubの検証済みcurrent分割DBを起動時正本として復元する。
-# リポジトリ同梱の古いDBをbaselineに採用する前に実行する。
+# Ver290 speed hotfix:
+# 起動時はまず小さいmanifestだけ確認し、GitHub currentが現在DBを包含する時だけ
+# 50MB級の全partダウンロードを行う。現在DBが同等/新しいなら全part取得を省略する。
 if not st.session_state.get("v284_boot_github_restore_checked",False):
     st.session_state["v284_boot_github_restore_checked"]=True
     try:
         _boot_ready284,_boot_ready_msg284=github_ready()
         if _boot_ready284:
-            _boot_ok284,_boot_bytes284,_boot_msg284=_v282_pull_chunked_db()
-            if _boot_ok284 and isinstance(_boot_bytes284,(bytes,bytearray)):
-                _boot_remote284=_v283_db_fingerprint_bytes(bytes(_boot_bytes284))
-                _boot_local284=_v284_current_db_identity()
-                _boot_local_fp284=(_boot_local284.get("fingerprint") or {}) if _boot_local284.get("ok") else {}
-                _boot_remote_counts284=_boot_remote284.get("counts") or {}
-                _boot_local_counts284=_boot_local_fp284.get("counts") or {}
-                # Ver284 hotfix:
-                # 主要6テーブルだけではなく「現在DBが持つ全監査対象テーブル」を包含する場合だけ
-                # GitHub currentで起動時置換する。これにより、再シミュレーション直後の
-                # v284_transition_* 監査を持つDBが、古いGitHub currentへ巻き戻るのを防ぐ。
-                if _boot_local284.get("ok"):
-                    _boot_cmp284=_v283_compare_db_fingerprints(_boot_remote284,_boot_local_fp284)
-                    _boot_not_older284=bool(_boot_cmp284.get("safe"))
-                    if not _boot_not_older284:
+            _manifest_ok290,_manifest290,_manifest_msg290=_v283_get_chunk_manifest(previous=False)
+            _boot_local284=_v284_current_db_identity()
+            if _manifest_ok290:
+                _boot_remote_manifest_fp290=(_manifest290 or {}).get("stats") or {}
+                _boot_remote_sha290=str((_manifest290 or {}).get("sha256") or "")
+                _boot_local_sha290=str(_boot_local284.get("sha256") or "") if _boot_local284.get("ok") else ""
+                _need_full_pull290=False
+
+                if not _boot_local284.get("ok"):
+                    _need_full_pull290=bool(_boot_remote_manifest_fp290.get("ok"))
+                elif _boot_remote_sha290 and _boot_remote_sha290==_boot_local_sha290:
+                    st.session_state["v284_boot_github_restore_note"]="GitHub currentと現在DBは同一です。"
+                elif _boot_remote_manifest_fp290.get("ok"):
+                    _boot_cmp290=_v283_compare_db_fingerprints(
+                        _boot_remote_manifest_fp290,
+                        _boot_local284.get("fingerprint") or {}
+                    )
+                    if _boot_cmp290.get("safe"):
+                        _need_full_pull290=True
+                    else:
                         st.session_state["v284_boot_github_restore_note"]=(
                             "GitHub currentは現在DBを完全包含しないため起動時置換を禁止しました: "
-                            + " / ".join((_boot_cmp284.get("regressions") or [])[:8])
+                            +" / ".join((_boot_cmp290.get("regressions") or [])[:8])
                         )
-                else:
-                    # ローカルDB自体が読めない場合だけ、正常なGitHub currentを復旧候補にする。
-                    _boot_not_older284=bool(_boot_remote284.get("ok"))
-                if _boot_remote284.get("ok") and _boot_not_older284:
-                    _boot_sha_local284=str(_boot_local284.get("sha256","")) if _boot_local284.get("ok") else ""
-                    _boot_sha_remote284=hashlib.sha256(bytes(_boot_bytes284)).hexdigest()
-                    if _boot_sha_local284 != _boot_sha_remote284:
-                        _boot_install_ok284,_boot_install_msg284=_v276_atomic_install_db_bytes(
-                            bytes(_boot_bytes284),"起動時GitHub current正本復元"
-                        )
-                        if _boot_install_ok284:
-                            st.session_state["v284_boot_github_restored"]=True
+
+                if _need_full_pull290:
+                    _v290_load_stage("GitHub正本を取得しています…")
+                    _boot_ok284,_boot_bytes284,_boot_msg284=_v282_pull_chunked_db()
+                    if _boot_ok284 and isinstance(_boot_bytes284,(bytes,bytearray)):
+                        _boot_remote284=_v283_db_fingerprint_bytes(bytes(_boot_bytes284))
+                        _boot_local_fp284=(_boot_local284.get("fingerprint") or {}) if _boot_local284.get("ok") else {}
+                        if _boot_local284.get("ok"):
+                            _boot_cmp284=_v283_compare_db_fingerprints(_boot_remote284,_boot_local_fp284)
+                            _boot_not_older284=bool(_boot_cmp284.get("safe"))
                         else:
-                            st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時復元失敗: "+str(_boot_install_msg284)
-                elif _boot_remote284.get("ok"):
-                    # currentがローカルより古い場合はローカルを壊さず維持。
-                    st.session_state["v284_boot_github_restore_note"]="GitHub currentは現在DBより古いため起動時置換を行いませんでした。"
-            elif _boot_msg284!="manifestなし":
-                st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時検証失敗: "+str(_boot_msg284)
+                            _boot_not_older284=bool(_boot_remote284.get("ok"))
+                        if _boot_remote284.get("ok") and _boot_not_older284:
+                            _boot_sha_remote284=hashlib.sha256(bytes(_boot_bytes284)).hexdigest()
+                            if _boot_local_sha290 != _boot_sha_remote284:
+                                _boot_install_ok284,_boot_install_msg284=_v276_atomic_install_db_bytes(
+                                    bytes(_boot_bytes284),"起動時GitHub current正本復元"
+                                )
+                                if _boot_install_ok284:
+                                    st.session_state["v284_boot_github_restored"]=True
+                                    st.session_state.pop("_v290_identity_cache",None)
+                                else:
+                                    st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時復元失敗: "+str(_boot_install_msg284)
+                    elif _boot_msg284!="manifestなし":
+                        st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時検証失敗: "+str(_boot_msg284)
+            elif _manifest_msg290!="manifestなし":
+                st.session_state["v284_boot_github_restore_error"]="GitHub current manifest確認失敗: "+str(_manifest_msg290)
     except Exception as _boot_exc284:
         st.session_state["v284_boot_github_restore_error"]=f"起動時GitHub正本確認失敗: {type(_boot_exc284).__name__}: {_boot_exc284}"
 
+_v290_load_stage("DB固定監視を確認しています…")
 _v284_identity_now=_v284_current_db_identity()
 _v284_identity_key="v284_db_identity_baseline"
 _v284_identity_block_key="v284_db_identity_block"
@@ -13877,6 +13931,7 @@ if _v284_identity_now.get("ok"):
             st.session_state[_v284_identity_key]=_v284_identity_now
 
 
+_v290_load_stage("サイドバーとDB情報を準備しています…")
 with st.sidebar:
     _v278_render_bg_compact("sidebar")
     st.header("予測設定")
@@ -13895,7 +13950,7 @@ with st.sidebar:
     if _boot_note284:
         st.info("🔒 "+str(_boot_note284))
     _guard284=st.session_state.get("v284_db_identity_block") or []
-    _idshow284=_v284_current_db_identity()
+    _idshow284=_v284_identity_now if isinstance(_v284_identity_now,dict) else _v284_current_db_identity()
     if _idshow284.get("ok"):
         _fp284=_idshow284.get("fingerprint") or {}
         st.caption(
@@ -13961,30 +14016,37 @@ with st.sidebar:
             pass
         db_path = Path(engine.DB_PATH)
         if db_path.exists():
-            # Ver284: SQLite本体だけをread_bytes()するとWAL内の最新コミットが欠落する。
-            # GitHub保存と同じ整合スナップショットを端末保存にも使用する。
-            try:
-                _download_snapshot284 = _v278_consistent_db_snapshot_bytes(str(db_path))
-                _download_fp284 = _v283_db_fingerprint_bytes(_download_snapshot284)
-                if not _download_fp284.get("ok"):
-                    raise RuntimeError(str(_download_fp284.get("reason") or "DB指紋取得失敗"))
+            # Ver290 speed: 50MB級の整合スナップショットを毎rerun自動生成しない。
+            # 「準備」ボタンを押した時だけ作り、DB/WALが変われば自動無効化する。
+            _dl_sig290=_v290_db_stat_signature(db_path)
+            _dl_cache290=st.session_state.get("_v290_download_snapshot")
+            if isinstance(_dl_cache290,dict) and _dl_cache290.get("sig")!=_dl_sig290:
+                st.session_state.pop("_v290_download_snapshot",None)
+                _dl_cache290=None
+            if st.button("💾 端末保存用DBを準備",use_container_width=True,key="v290_prepare_db_download"):
+                try:
+                    with st.spinner("WALを含む最新DBスナップショットを作成しています…"):
+                        _download_snapshot284=_v278_consistent_db_snapshot_bytes(str(db_path))
+                        _download_fp284=_v283_db_fingerprint_bytes(_download_snapshot284)
+                    if not _download_fp284.get("ok"):
+                        raise RuntimeError(str(_download_fp284.get("reason") or "DB指紋取得失敗"))
+                    st.session_state["_v290_download_snapshot"]={
+                        "sig":_v290_db_stat_signature(db_path),
+                        "bytes":_download_snapshot284,
+                    }
+                    _dl_cache290=st.session_state["_v290_download_snapshot"]
+                except Exception as _download_exc284:
+                    st.error("端末保存用DBの準備失敗: "+f"{type(_download_exc284).__name__}: {_download_exc284}")
+            if isinstance(_dl_cache290,dict) and isinstance(_dl_cache290.get("bytes"),(bytes,bytearray)):
+                _dl_bytes290=bytes(_dl_cache290["bytes"])
                 st.download_button(
-                    "💾 DBを端末へ保存",
-                    _download_snapshot284,
+                    "⬇️ 準備済みDBを端末へ保存",
+                    _dl_bytes290,
                     file_name="autorace_players.sqlite3",
                     mime="application/octet-stream",
                     use_container_width=True,
                 )
-                st.caption(
-                    f"端末保存用スナップショット: {len(_download_snapshot284)/1024/1024:.2f} MB"
-                    "（WAL内の最新コミットを含む）"
-                )
-            except Exception as _download_exc284:
-                st.error(
-                    "端末保存用の最新DBスナップショットを作成できないため、"
-                    "古いDB本体のダウンロードは停止しました: "
-                    f"{type(_download_exc284).__name__}: {_download_exc284}"
-                )
+                st.caption(f"端末保存用スナップショット: {len(_dl_bytes290)/1024/1024:.2f} MB（WAL内の最新コミットを含む）")
     except Exception as exc:
         st.warning(f"DB情報を確認できません: {exc}")
 
@@ -14073,6 +14135,20 @@ def _v132_general_reminder_launcher():
 
 
 _v132_general_reminder_launcher()
+
+try:
+    _now290=time_module.perf_counter()
+    _prev290=st.session_state.get("_v290_load_stage_label")
+    if _prev290:
+        _v290_load_times[str(_prev290)]=round(_now290-float(_v290_load_stage_started),2)
+    _total290=round(_now290-float(_v290_load_started),2)
+    _v290_load_box.success(
+        "✅ 画面準備完了 "
+        +f"{_total290:.1f}秒"
+        +("｜"+" / ".join(f"{k}:{v:.1f}s" for k,v in _v290_load_times.items()) if _v290_load_times else "")
+    )
+except Exception:
+    pass
 
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
