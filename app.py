@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver292"
+APP_VERSION = "Ver293"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver292"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver293"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -5786,22 +5786,36 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     _st_mu290=float(_st_vals290.mean()) if len(_st_vals290) else 0.16
     _st_sd290=float(_st_vals290.std()) if len(_st_vals290) else 0.03
     if _st_sd290 < 0.012: _st_sd290=0.012
-    early_launch_v290={}
+    # Ver293:
+    # 2周目以降の展開強度はVer290へ戻し、1周目だけ291/292の改善要素を試す。
+    # Ver290基準 = 試走62% + ST38%
+    # 1周目試験 = 試走80% + ST20%
+    early_launch_v290_base={}
+    early_launch_v293_lap1={}
     for c in cars:
-        # 試走は低いほど良い、STも低いほど良い。履歴first_gainは後段で追加する。
         _trial_z290=(_trial_mu290-float(trial[c]))/_trial_sd290
         _st_z290=(_st_mu290-float(stmean[c]))/_st_sd290
-        # Ver291: DB150の実結果210R・ハンデ跨ぎ3,925ペアで、
-        # 試走優位の着順説明力がST優位より明確に強かったため、ST過重を縮小。
-        early_launch_v290[c]=float(np.clip(0.80*_trial_z290 + 0.20*_st_z290,-1.6,1.6))
+        early_launch_v290_base[c]=float(np.clip(
+            0.62*_trial_z290 + 0.38*_st_z290,
+            -1.6,1.6
+        ))
+        early_launch_v293_lap1[c]=float(np.clip(
+            0.80*_trial_z290 + 0.20*_st_z290,
+            -1.6,1.6
+        ))
     venue=str((meta or {}).get("開催場") or (meta or {}).get("venue") or "")
     _v242_prepare_started=time_module.perf_counter()
     profiles=_v230_hist_profiles(venue,names)
     # Ver290: 過去の1周目上げ幅を初速proxyへ小さく追加（当日試走/STが主役）。
     for _c290,_n290 in zip(cars,names):
         _fg290=float((profiles.get(_n290,{}) or {}).get("first_gain",0.0) or 0.0)
-        early_launch_v290[_c290]=float(np.clip(
-            float(early_launch_v290.get(_c290,0.0)) + 0.18*np.clip(_fg290,-2.0,2.0),
+        _fg_add290=0.18*np.clip(_fg290,-2.0,2.0)
+        early_launch_v290_base[_c290]=float(np.clip(
+            float(early_launch_v290_base.get(_c290,0.0)) + _fg_add290,
+            -1.6,1.6
+        ))
+        early_launch_v293_lap1[_c290]=float(np.clip(
+            float(early_launch_v293_lap1.get(_c290,0.0)) + _fg_add290,
             -1.6,1.6
         ))
     transition_profiles=_v240_transition_profiles(venue,names)
@@ -6110,54 +6124,72 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 scenario_branch=0.0
                 # Ver290: 初速前半proxyは1～2周目だけ使用。
                 # 後車と前車の差だけを見るため、単純な「試走が速い=最終順位UP」にはしない。
-                _early_pair_delta290=float(
-                    early_launch_v290.get(chaser,0.0)-early_launch_v290.get(front,0.0)
-                )
-                _early_lap_weight290=0.090 if lap==1 else (0.050 if lap==2 else 0.0)
-
-                # Ver291: ハンデ跨ぎ時だけ後方ハンデ位置で強度を調整。
-                # DB150全結果では、後方車が試走優位の時に前車を上回る率は
-                # <=10m帯 約63%、20m帯 約61%、30m帯 約76%、40m以上 約75%。
-                # したがって30m以上は290強度を維持、20mは80%、0/10mは60%へ縮小。
-                # 同ハンデ組は横並びそのものが良化/悪化を分けなかったため強度変更しない。
+                # Ver293:
+                # 1周目だけ291/292の改善要素を試し、2周目はVer290へ完全に戻す。
+                # 3～6周目は従来通り初速追加補正なし。
                 _hc291=float(handicap.get(chaser,0) or 0)
                 _hf291=float(handicap.get(front,0) or 0)
-                if _hc291 > _hf291:
-                    if _hc291 >= 30.0:
+
+                if lap == 1:
+                    _early_pair_delta290=float(
+                        early_launch_v293_lap1.get(chaser,0.0)
+                        - early_launch_v293_lap1.get(front,0.0)
+                    )
+                    _early_lap_weight290=0.090
+
+                    # Ver291のハンデ位置別強度は1周目だけ。
+                    if _hc291 > _hf291:
+                        if _hc291 >= 30.0:
+                            _handicap_early_scale291=1.00
+                        elif _hc291 >= 20.0:
+                            _handicap_early_scale291=0.80
+                        else:
+                            _handicap_early_scale291=0.60
+                    elif _hc291 == _hf291:
                         _handicap_early_scale291=1.00
-                    elif _hc291 >= 20.0:
-                        _handicap_early_scale291=0.80
                     else:
-                        _handicap_early_scale291=0.60
-                elif _hc291 == _hf291:
-                    _handicap_early_scale291=1.00
-                else:
-                    # 名目上前ハンデ側が一度後ろへ下がった後の再逆転には強く掛けない。
-                    _handicap_early_scale291=0.70
+                        _handicap_early_scale291=0.70
 
-                # Ver292: 同ハンデは横並びとしてゲート対象外。
-                # ハンデを跨ぐ後方車で、試走優位が0.01秒未満の時だけ、
-                # 全登録結果から学習した倍率で291初速補正を抑える。
-                _trial_gap_scale292=1.0
-                _trial_adv292=0.0
-                if _hc291 > _hf291:
-                    try:
-                        _trial_adv292=float(trial.get(front,0.0)-trial.get(chaser,0.0))
-                    except Exception:
-                        _trial_adv292=0.0
-                    _gate_threshold292=float(trial_gap_gate_v292.get("threshold",0.010) or 0.010)
-                    if 0.0 < _trial_adv292 < _gate_threshold292:
-                        _trial_gap_scale292=float(
-                            trial_gap_gate_v292.get("small_gap_scale",0.35) or 0.35
+                    # Ver292の0.01秒未満ゲートも1周目だけ。
+                    # 同ハンデ（横並び）は対象外。
+                    _trial_gap_scale292=1.0
+                    if _hc291 > _hf291:
+                        try:
+                            _trial_adv292=float(trial.get(front,0.0)-trial.get(chaser,0.0))
+                        except Exception:
+                            _trial_adv292=0.0
+                        _gate_threshold292=float(
+                            trial_gap_gate_v292.get("threshold",0.010) or 0.010
                         )
+                        if 0.0 < _trial_adv292 < _gate_threshold292:
+                            _trial_gap_scale292=float(
+                                trial_gap_gate_v292.get("small_gap_scale",0.35) or 0.35
+                            )
 
-                _early_logit290=float(np.clip(
-                    _early_pair_delta290
-                    *_early_lap_weight290
-                    *_handicap_early_scale291
-                    *_trial_gap_scale292,
-                    -0.11,0.11
-                ))
+                    _early_logit290=float(np.clip(
+                        _early_pair_delta290
+                        *_early_lap_weight290
+                        *_handicap_early_scale291
+                        *_trial_gap_scale292,
+                        -0.11,0.11
+                    ))
+
+                elif lap == 2:
+                    # Ver290そのもの:
+                    # 試走62%+ST38%+first_gain、ハンデ位置別scaleなし、試走差gateなし。
+                    _early_pair_delta290=float(
+                        early_launch_v290_base.get(chaser,0.0)
+                        - early_launch_v290_base.get(front,0.0)
+                    )
+                    _early_lap_weight290=0.050
+                    _early_logit290=float(np.clip(
+                        _early_pair_delta290*_early_lap_weight290,
+                        -0.11,0.11
+                    ))
+                else:
+                    _early_pair_delta290=0.0
+                    _early_lap_weight290=0.0
+                    _early_logit290=0.0
                 logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus + _early_logit290 - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
                 _branch_noise=0.16
                 logit += rng.normal(0,_branch_noise)
@@ -6457,7 +6489,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
     ]
     audit={
-        "enabled":True,"mode":"Ver292 全体学習試走差ゲート+ハンデ位置別初速補正+TOP3境界限定・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver293 1周目だけ291/292改善+2周目Ver290復帰+TOP3境界限定・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -6488,7 +6520,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "v289_zone_audit":dict(v289_zone_audit),
         "v292_trial_gap_gate":{
             "enabled":bool(trial_gap_gate_v292.get("enabled")),
-            "scope":"ハンデ跨ぎのみ・同ハンデ横並びは対象外",
+            "scope":"Ver293では1周目のハンデ跨ぎのみ・同ハンデ横並びは対象外",
             "threshold":round(float(trial_gap_gate_v292.get("threshold",0.010) or 0.010),4),
             "small_gap_scale":round(float(trial_gap_gate_v292.get("small_gap_scale",0.35) or 0.35),4),
             "samples":int(trial_gap_gate_v292.get("samples",0) or 0),
@@ -6499,13 +6531,21 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             "reason":str(trial_gap_gate_v292.get("reason") or ""),
             "auto_update":"結果登録後、DB全体から次回予測時に自動再計算"
         },
-        "v290_early_launch_proxy":{
+        "v293_first_lap_hybrid":{
             "enabled":True,
-            "source":"Ver291: 当日試走T80%+ST20%+過去1周目上げ幅（2コーナー映像は未使用）",
-            "lap_weights":{"1":0.090,"2":0.050,"3-6":0.0},
-            "handicap_cross_scale":{"rear_30m_plus":1.0,"rear_20m":0.80,"rear_0_10m":0.60,"same_handicap":1.0,"front_handicap_repass":0.70},
-            "evidence":"DB150 result_entries: eligible210R / cross-handicap3925pairs",
-            "cars":{str(k):round(float(v),4) for k,v in early_launch_v290.items()},
+            "lap1":{
+                "proxy":"試走80%+ST20%+過去1周目上げ幅",
+                "handicap_cross_scale":{"rear_30m_plus":1.0,"rear_20m":0.80,"rear_0_10m":0.60,"same_handicap":1.0,"front_handicap_repass":0.70},
+                "trial_gap_gate":"Ver292全体学習ゲートを1周目だけ適用"
+            },
+            "lap2":{
+                "proxy":"Ver290: 試走62%+ST38%+過去1周目上げ幅",
+                "handicap_cross_scale":"なし",
+                "trial_gap_gate":"なし"
+            },
+            "lap3_6":"追加初速補正なし",
+            "cars_lap1":{str(k):round(float(v),4) for k,v in early_launch_v293_lap1.items()},
+            "cars_lap2_ver290":{str(k):round(float(v),4) for k,v in early_launch_v290_base.items()},
             "max_pair_logit":0.11
         },
         "scenario_distribution_v263": scenario_distribution,
