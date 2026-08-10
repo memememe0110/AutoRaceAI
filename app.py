@@ -704,61 +704,10 @@ def _v266_render_error_analysis(db_path):
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
 
-# Ver290 hotfix: バックグラウンド再シミュレーション中でも画面を先に開けるようにする。
-# 重い初期化/DB読取に入る前に、稼働中batch_rerunへ「次のレース境界で一時停止」を直接要求する。
-# ここでは既存の重いhelperを呼ばず、短いtimeoutのSQLiteだけを使う。
-_V290_UI_PRIORITY_JOB_ID = 0
-_V290_UI_PRIORITY_REQUESTED = False
-try:
-    _db_ui290 = str(getattr(engine, "DB_PATH", "autorace_players.sqlite3"))
-    with sqlite3.connect(_db_ui290, timeout=0.35) as _c_ui290:
-        _c_ui290.execute("PRAGMA busy_timeout=350")
-        _row_ui290 = _c_ui290.execute("""
-            SELECT job_id,status,pause_requested
-              FROM v278_background_jobs
-             WHERE job_type='batch_rerun'
-               AND status IN ('queued','running','pause_requested','paused')
-             ORDER BY job_id DESC
-             LIMIT 1
-        """).fetchone()
-        if _row_ui290:
-            _V290_UI_PRIORITY_JOB_ID = int(_row_ui290[0] or 0)
-            _status_ui290 = str(_row_ui290[1] or "")
-            _already_pause_ui290 = bool(int(_row_ui290[2] or 0))
-            if _V290_UI_PRIORITY_JOB_ID and not _already_pause_ui290:
-                _c_ui290.execute("""
-                    UPDATE v278_background_jobs
-                       SET pause_requested=1,
-                           status=CASE WHEN status='paused' THEN 'paused' ELSE 'pause_requested' END,
-                           message='画面表示を優先するため、現在レース終了後に一時停止します。',
-                           updated_at=?
-                     WHERE job_id=?
-                """,(datetime.now(timezone.utc).isoformat(timespec="seconds"),_V290_UI_PRIORITY_JOB_ID))
-                _c_ui290.commit()
-                _V290_UI_PRIORITY_REQUESTED = True
-except Exception:
-    # UIを開くことが最優先。ロック中/旧DBではここで待たず、そのまま描画へ進む。
-    _V290_UI_PRIORITY_JOB_ID = 0
-    _V290_UI_PRIORITY_REQUESTED = False
-
-# 一時停止要求を出した場合だけ最大3秒、レース境界到達を軽く待つ。
-# 90秒待ちの前景DB登録とは違い、ページ表示では長時間ブロックしない。
-if _V290_UI_PRIORITY_REQUESTED and _V290_UI_PRIORITY_JOB_ID:
-    _deadline_ui290 = time_module.time() + 3.0
-    while time_module.time() < _deadline_ui290:
-        try:
-            with sqlite3.connect(_db_ui290, timeout=0.20) as _c2_ui290:
-                _c2_ui290.execute("PRAGMA busy_timeout=200")
-                _s_ui290 = _c2_ui290.execute(
-                    "SELECT status FROM v278_background_jobs WHERE job_id=?",
-                    (_V290_UI_PRIORITY_JOB_ID,)
-                ).fetchone()
-            if _s_ui290 and str(_s_ui290[0] or "") == "paused":
-                break
-        except Exception:
-            break
-        time_module.sleep(0.12)
-
+# Ver290 hotfix2:
+# 起動高速化（manifest-first / DB identity cache）で画面表示が十分軽くなったため、
+# 「画面を開くたびにbatch_rerunを一時停止する」処理は廃止。
+# バックグラウンド再シミュレーションは画面表示中も継続する。
 # Ver267 refactor: runtime-state-centralized
 
 
@@ -2457,7 +2406,7 @@ def _v284_backfill_transition_audit_from_latest_histories(db_path: str, app_vers
         return result
 
 
-def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool) -> None:
+def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool, resume_done_offset: int = 0, resume_total_target: int = 0) -> None:
     try:
         _v278_bg_update(
             db_path, job_id,
@@ -2466,12 +2415,19 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             message="対象レースを整理しています。"
         )
         def _progress(done,total,label):
+            _done_raw=int(done or 0)
+            _total_raw=int(total or 0)
+            _done_show=int(resume_done_offset or 0)+_done_raw
+            _total_show=int(resume_total_target or 0)
+            if _total_show <= 0:
+                _total_show=int(resume_done_offset or 0)+_total_raw
+            _total_show=max(_total_show,_done_show)
             _v278_bg_update(
                 db_path, job_id,
-                done_count=int(done or 0),
-                total_count=int(total or 0),
+                done_count=_done_show,
+                total_count=_total_show,
                 current_label=str(label or ""),
-                message=f"{int(done or 0)}/{int(total or 0)}｜{str(label or '')}"
+                message=f"{_done_show}/{_total_show}｜{str(label or '')}"
             )
 
         result=_v262_batch_rerun_saved_histories(
@@ -2575,6 +2531,88 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
     return {"ok":True,"job_id":job_id}
 
 
+
+
+# Ver290 hotfix2: Streamlit再デプロイ/プロセス再起動でdaemon threadだけ消え、
+# DB上のjobが running のまま残る「孤児ジョブ」を自動復旧する。
+def _v290_recover_orphaned_batch_job(db_path: str) -> dict:
+    try:
+        _v278_bg_ensure_table(db_path)
+        with sqlite3.connect(str(db_path),timeout=0.6) as con:
+            con.row_factory=sqlite3.Row
+            con.execute("PRAGMA busy_timeout=600")
+            row=con.execute("""
+                SELECT *
+                  FROM v278_background_jobs
+                 WHERE job_type='batch_rerun'
+                   AND status IN ('queued','running','pause_requested','paused')
+                 ORDER BY job_id DESC
+                 LIMIT 1
+            """).fetchone()
+        if not row:
+            return {"ok":True,"action":"none"}
+
+        job=dict(row)
+        jid=int(job.get("job_id") or 0)
+        if not jid:
+            return {"ok":True,"action":"none"}
+
+        # 同じPythonプロセス内でthreadが生きているなら何もしない。
+        th=None
+        try:
+            with _V278_BG_LOCK:
+                th=_V278_BG_THREADS.get(jid)
+        except Exception:
+            th=None
+        if th is not None and getattr(th,"is_alive",lambda:False)():
+            return {"ok":True,"action":"alive","job_id":jid}
+
+        # 画面表示優先hotfixが残したpause状態も孤児時は解除する。
+        done0=int(job.get("done_count") or 0)
+        total0=int(job.get("total_count") or 0)
+        limit0=max(1,int(job.get("limit_count") or total0 or 80))
+
+        # 既にVer290保存済みのレースは再実行せず、残りだけ続行する。
+        # 元jobのforce_current=Trueでも、復旧時だけFalseにすることで重複再計算を防ぐ。
+        with sqlite3.connect(str(db_path),timeout=0.6) as con:
+            con.execute("PRAGMA busy_timeout=600")
+            con.execute("""
+                UPDATE v278_background_jobs
+                   SET status='running',
+                       pause_requested=0,
+                       cancel_requested=0,
+                       message=?,
+                       updated_at=?
+                 WHERE job_id=?
+            """,(
+                f"アプリ再起動を検知。{done0}/{total0}から残りを自動再開します。",
+                _v228_now_jst_iso(),jid
+            ))
+            con.commit()
+
+        th=threading.Thread(
+            target=_v278_bg_worker,
+            args=(str(db_path),jid,limit0,False,done0,total0),
+            daemon=True,
+            name=f"autorace-bg-rerun-recover-{jid}",
+        )
+        with _V278_BG_LOCK:
+            _V278_BG_THREADS[jid]=th
+        th.start()
+        return {"ok":True,"action":"restarted","job_id":jid,"done":done0,"total":total0}
+    except Exception as exc:
+        return {"ok":False,"action":"error","reason":f"{type(exc).__name__}: {exc}"}
+
+try:
+    _v290_orphan_recovery=_v290_recover_orphaned_batch_job(engine.DB_PATH)
+    if isinstance(_v290_orphan_recovery,dict) and _v290_orphan_recovery.get("action")=="restarted":
+        st.session_state["v290_orphan_recovery_notice"]=(
+            f"バックグラウンド処理の中断を検知し、"
+            f"{int(_v290_orphan_recovery.get('done') or 0)}/"
+            f"{int(_v290_orphan_recovery.get('total') or 0)}から自動再開しました。"
+        )
+except Exception:
+    _v290_orphan_recovery={}
 
 # Ver279: 通常1R予測をStreamlit描画スレッドから分離してバックグラウンド実行する。
 # 計算式・seed・試行回数・6周展開は通常予測と同一。画面操作だけを解放する。
@@ -14153,6 +14191,9 @@ except Exception:
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
 _v278_render_bg_compact("main")
+_v290_recovery_notice=st.session_state.pop("v290_orphan_recovery_notice",None)
+if _v290_recovery_notice:
+    st.success("🔄 "+str(_v290_recovery_notice))
 _main_pages = ["🏁 予測", "⏱️ 再シミュレーション", "📊 回収率実績", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"]
 if st.session_state.get("v155_main_page") not in _main_pages:
     st.session_state["v155_main_page"] = _main_pages[0]
@@ -17275,28 +17316,3 @@ try:
         _v266_render_error_analysis(engine.DB_PATH)
 except Exception as _v266_exc:
     st.warning("Ver266誤差解析の表示に失敗しました: " + _runtime_exception_text(_v266_exc))
-
-# Ver290 hotfix: この画面rerunが要求したバックグラウンド一時停止だけを自動再開。
-# ユーザーが手動で一時停止していたjobは _V290_UI_PRIORITY_REQUESTED=False なので触らない。
-if globals().get("_V290_UI_PRIORITY_REQUESTED") and int(globals().get("_V290_UI_PRIORITY_JOB_ID") or 0):
-    try:
-        _jid_ui290=int(_V290_UI_PRIORITY_JOB_ID)
-        with sqlite3.connect(str(getattr(engine,"DB_PATH","autorace_players.sqlite3")),timeout=0.35) as _c3_ui290:
-            _c3_ui290.execute("PRAGMA busy_timeout=350")
-            _r3_ui290=_c3_ui290.execute(
-                "SELECT status,pause_requested,cancel_requested FROM v278_background_jobs WHERE job_id=?",
-                (_jid_ui290,)
-            ).fetchone()
-            if _r3_ui290 and str(_r3_ui290[0] or "") in ("paused","pause_requested") and int(_r3_ui290[1] or 0) and not int(_r3_ui290[2] or 0):
-                _c3_ui290.execute("""
-                    UPDATE v278_background_jobs
-                       SET pause_requested=0,
-                           status='running',
-                           message='画面表示完了。バックグラウンド再シミュレーションを再開しました。',
-                           updated_at=?
-                     WHERE job_id=?
-                """,(datetime.now(timezone.utc).isoformat(timespec="seconds"),_jid_ui290))
-                _c3_ui290.commit()
-    except Exception:
-        pass
-
