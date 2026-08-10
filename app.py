@@ -14434,8 +14434,32 @@ def _v278_render_background_quick_page(db_path: str) -> None:
     alive=bool(th is not None and getattr(th,"is_alive",lambda:False)())
 
     active_status=status in ("queued","running","pause_requested","paused","cancel_requested")
-    stopped_abnormally=bool(job and active_status and not alive)
-    normally_running=bool(job and active_status and alive and status!="cancel_requested")
+
+    # Ver291 UI hotfix:
+    # Streamlitのrerun/別実行コンテキストでは、実処理が進行中でも
+    # この画面側の _V278_BG_THREADS からthread参照が見えないことがある。
+    # そのため「threadが見えない=停止」とは判定せず、DBのupdated_atを正本にする。
+    _updated_ts291=_v290_parse_job_time(job.get("updated_at")) if isinstance(job,dict) else 0.0
+    _age291=max(0.0,time_module.time()-_updated_ts291) if _updated_ts291 else 999999.0
+    _heartbeat_fresh291=bool(_age291 < 180.0)
+
+    normally_running=bool(
+        job
+        and status in ("queued","running","pause_requested")
+        and status!="cancel_requested"
+        and (alive or _heartbeat_fresh291)
+    )
+    stopped_abnormally=bool(
+        job
+        and (
+            status in ("paused","cancel_requested")
+            or (
+                status in ("queued","running","pause_requested")
+                and not alive
+                and not _heartbeat_fresh291
+            )
+        )
+    )
 
     # Ver290 hotfix7:
     # UIを3状態に整理。
@@ -14443,10 +14467,9 @@ def _v278_render_background_quick_page(db_path: str) -> None:
     # 2) status上は実行中だがthreadなし -> 「残りから再開」「この処理を終了」の2択
     # 3) 完全停止/完了 -> 通常の開始ボタン
     if normally_running:
-        _updated_ts290=_v290_parse_job_time(job.get("updated_at"))
-        _age290=max(0.0,time_module.time()-_updated_ts290) if _updated_ts290 else 999999.0
+        _thread_text291="稼働中" if alive else "画面外で実行中"
         st.caption(
-            f"状態: {status}｜最終進捗更新 {_age290:.0f}秒前｜計算thread: 稼働中"
+            f"状態: {status}｜最終進捗更新 {_age291:.0f}秒前｜計算: {_thread_text291}"
         )
         if total>0:
             st.progress(
@@ -14456,6 +14479,7 @@ def _v278_render_background_quick_page(db_path: str) -> None:
         else:
             st.info("準備中… 対象レースを確認しています")
 
+        # 稼働中はthread参照の有無に関係なく、必ず更新ボタンを表示する。
         a,b=st.columns(2)
         if a.button("🔄 進捗を更新",key="v278_quick_refresh",use_container_width=True):
             st.rerun()
@@ -14469,9 +14493,17 @@ def _v278_render_background_quick_page(db_path: str) -> None:
             st.rerun()
 
     elif stopped_abnormally:
+        _why291=(
+            "停止要求済みです。"
+            if status=="cancel_requested"
+            else (
+                "一時停止中です。"
+                if status=="paused"
+                else f"最終進捗更新から{_age291:.0f}秒経過しているため停止の可能性があります。"
+            )
+        )
         st.warning(
-            f"⚠️ 処理が停止しています。現在 {done}/{total if total else '?'}。"
-            "自動再開はしません。"
+            f"⚠️ {_why291} 現在 {done}/{total if total else '?'}。自動再開はしません。"
         )
         if total>0:
             st.progress(
