@@ -2533,6 +2533,51 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
 
 
 
+
+# Ver290 hotfix4: 途中jobを捨てて「最初から」やり直すための安全な再スタート。
+# 既にVer290で正常保存済みのレースは再計算しないので、結果の重複は作らない。
+def _v290_restart_batch_clean(db_path: str, limit_count: int = 80) -> dict:
+    try:
+        _v278_bg_ensure_table(db_path)
+        now=_v228_now_jst_iso()
+
+        # 既存のbatch jobをすべて停止扱いへ。
+        with sqlite3.connect(str(db_path),timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            con.execute("""
+                UPDATE v278_background_jobs
+                   SET status='cancelled',
+                       cancel_requested=1,
+                       pause_requested=0,
+                       finished_at=?,
+                       message='Ver290クリーン再スタートのため旧jobを終了',
+                       updated_at=?
+                 WHERE job_type='batch_rerun'
+                   AND status IN ('queued','running','pause_requested','paused','cancel_requested')
+            """,(now,now))
+            con.commit()
+
+        # 同一プロセス内に残るthread参照も破棄。
+        try:
+            with _V278_BG_LOCK:
+                _V278_BG_THREADS.clear()
+        except Exception:
+            pass
+
+        # 新jobを「force_current=False」で開始。
+        # これによりVer290で6周+監査まで保存済みのレースは自動スキップし、
+        # 未完了レースだけを最初から順にやり直す。
+        result=_v278_bg_start(str(db_path),int(limit_count),False)
+        if result.get("ok"):
+            return {
+                "ok":True,
+                "job_id":int(result.get("job_id") or 0),
+                "message":"旧jobを破棄し、Ver290保存済みを除外して最初から再シミュレーションを開始しました。"
+            }
+        return {"ok":False,"reason":str(result.get("reason") or "開始失敗")}
+    except Exception as exc:
+        return {"ok":False,"reason":f"{type(exc).__name__}: {exc}"}
+
 # Ver290 hotfix3: BG heartbeat / stale recovery.
 def _v290_parse_job_time(value) -> float:
     try:
@@ -2603,7 +2648,7 @@ def _v290_spawn_recovery_worker(db_path: str, old_job: dict, reason: str) -> dic
     except Exception as exc:
         return {"ok":False,"action":"error","reason":f"{type(exc).__name__}: {exc}"}
 
-def _v290_recover_orphaned_batch_job(db_path: str, stale_seconds: float = 150.0) -> dict:
+def _v290_recover_orphaned_batch_job(db_path: str, stale_seconds: float = 90.0) -> dict:
     try:
         _v278_bg_ensure_table(db_path)
         with sqlite3.connect(str(db_path),timeout=0.8) as con:
@@ -14305,6 +14350,24 @@ def _v278_render_background_quick_page(db_path: str) -> None:
     )
     job=_v278_bg_get_job(db_path)
     running=bool(job and str(job.get("status") or "") in ("queued","running","pause_requested","paused","cancel_requested"))
+
+    if st.button(
+        "🧹 途中jobを捨てて最初からやり直す",
+        use_container_width=True,
+        key="v290_clean_restart_batch",
+        help="旧jobを終了し、正常保存済みVer290レースは除外して未完了分を最初から再実行します。"
+    ):
+        _rrclean290=_v290_restart_batch_clean(db_path,int(limit_count))
+        if _rrclean290.get("ok"):
+            st.session_state["v290_clean_restart_notice"]=str(_rrclean290.get("message") or "再スタートしました。")
+            st.rerun()
+        else:
+            st.error("クリーン再スタート失敗: "+str(_rrclean290.get("reason") or "不明"))
+
+    _clean_notice290=st.session_state.pop("v290_clean_restart_notice",None)
+    if _clean_notice290:
+        st.success("🧹 "+str(_clean_notice290))
+
     if running:
         done=int(job.get("done_count",0) or 0)
         total=int(job.get("total_count",0) or 0)
@@ -14323,7 +14386,7 @@ def _v278_render_background_quick_page(db_path: str) -> None:
             f"状態: {str(job.get('status') or '')}｜最終進捗更新 {_age290:.0f}秒前｜"
             f"計算thread: {'稼働中' if _alive290 else 'なし'}"
         )
-        if _age290 >= 150 or not _alive290:
+        if _age290 >= 90 or not _alive290:
             st.warning("⚠️ バックグラウンド処理が停止している可能性があります。")
             if st.button("🔧 停止中ジョブを破棄して残りから再開",use_container_width=True,key="v290_force_recover_bg"):
                 _rr290=_v290_spawn_recovery_worker(db_path,job,"画面から強制再開")
