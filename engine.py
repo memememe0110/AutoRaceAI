@@ -17,29 +17,95 @@ DB_DIR = APP_DIR
 HISTORY_COLS_DB = ['開催日','開催場','レース','着順','出走','走路','ハンデ','試走T','競走T','ST']
 
 def mount_and_init_db():
+    """DB起動時初期化。
+
+    Ver291 startup hotfix:
+    既存DBが正常な場合、importのたびにCREATE TABLE/INDEXを実行すると
+    バックグラウンド書込中のSQLiteとDDLロックが競合し、アプリ全体が起動不能になる。
+    まずread-only相当のschema確認だけを行い、必要なDDLが欠ける時だけ書込初期化する。
+    """
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS players (
-            player_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_name TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS race_history (
-            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_id INTEGER NOT NULL,
-            race_date TEXT, venue TEXT, race_no TEXT, finish REAL, starters REAL,
-            surface TEXT, handicap TEXT, trial_time REAL, race_time REAL, start_time REAL,
-            result_status TEXT NOT NULL DEFAULT '通常',
-            use_for_model INTEGER NOT NULL DEFAULT 1,
-            source TEXT, record_key TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(player_id) REFERENCES players(player_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_history_player_date ON race_history(player_id, race_date DESC);
-        """)
-    return DB_PATH
+
+    def _schema_ready() -> bool:
+        if not DB_PATH.exists() or DB_PATH.stat().st_size <= 0:
+            return False
+        try:
+            with sqlite3.connect(str(DB_PATH), timeout=5.0) as con:
+                con.execute("PRAGMA busy_timeout=5000")
+                names = {
+                    str(r[0])
+                    for r in con.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type IN ('table','index') "
+                        "AND name IN ('players','race_history','idx_history_player_date')"
+                    ).fetchall()
+                }
+                if not {"players","race_history","idx_history_player_date"}.issubset(names):
+                    return False
+
+                # index定義が期待列を参照していることまで確認。
+                idx_cols = [
+                    str(r[2])
+                    for r in con.execute("PRAGMA index_info('idx_history_player_date')").fetchall()
+                ]
+                return idx_cols[:2] == ["player_id","race_date"]
+        except sqlite3.Error:
+            return False
+
+    # 正常な既存DBならDDLを一切発行しない。
+    # バックグラウンド予測中でも起動時の書込ロックを取りにいかない。
+    if _schema_ready():
+        return DB_PATH
+
+    ddl = """
+    CREATE TABLE IF NOT EXISTS players (
+        player_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_name TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS race_history (
+        history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_id INTEGER NOT NULL,
+        race_date TEXT, venue TEXT, race_no TEXT, finish REAL, starters REAL,
+        surface TEXT, handicap TEXT, trial_time REAL, race_time REAL, start_time REAL,
+        result_status TEXT NOT NULL DEFAULT '通常',
+        use_for_model INTEGER NOT NULL DEFAULT 1,
+        source TEXT, record_key TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(player_id) REFERENCES players(player_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_history_player_date
+        ON race_history(player_id, race_date DESC);
+    """
+
+    last_exc = None
+    # 新規DB/不足schemaの時だけDDL。busy/lockedは短い間隔で再試行する。
+    for wait_s in (0.0, 0.35, 0.8, 1.5):
+        if wait_s:
+            time.sleep(wait_s)
+        try:
+            with sqlite3.connect(str(DB_PATH), timeout=30.0) as con:
+                con.execute("PRAGMA busy_timeout=30000")
+                con.executescript(ddl)
+                con.commit()
+            if _schema_ready():
+                return DB_PATH
+        except sqlite3.Error as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            if "locked" in msg or "busy" in msg:
+                continue
+            raise
+
+    # 最後にもう一度schema確認。
+    # 他プロセスがその間に初期化を完了していれば正常起動する。
+    if _schema_ready():
+        return DB_PATH
+
+    if last_exc is not None:
+        raise last_exc
+    raise sqlite3.DatabaseError("DB schema initialization failed")
 
 mount_and_init_db()
 
