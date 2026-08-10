@@ -703,6 +703,62 @@ def _v266_render_error_analysis(db_path):
         st.caption("この表はVer評価専用です。原因学習の統計には混ぜません。")
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
+
+# Ver290 hotfix: バックグラウンド再シミュレーション中でも画面を先に開けるようにする。
+# 重い初期化/DB読取に入る前に、稼働中batch_rerunへ「次のレース境界で一時停止」を直接要求する。
+# ここでは既存の重いhelperを呼ばず、短いtimeoutのSQLiteだけを使う。
+_V290_UI_PRIORITY_JOB_ID = 0
+_V290_UI_PRIORITY_REQUESTED = False
+try:
+    _db_ui290 = str(getattr(engine, "DB_PATH", "autorace_players.sqlite3"))
+    with sqlite3.connect(_db_ui290, timeout=0.35) as _c_ui290:
+        _c_ui290.execute("PRAGMA busy_timeout=350")
+        _row_ui290 = _c_ui290.execute("""
+            SELECT job_id,status,pause_requested
+              FROM v278_background_jobs
+             WHERE job_type='batch_rerun'
+               AND status IN ('queued','running','pause_requested','paused')
+             ORDER BY job_id DESC
+             LIMIT 1
+        """).fetchone()
+        if _row_ui290:
+            _V290_UI_PRIORITY_JOB_ID = int(_row_ui290[0] or 0)
+            _status_ui290 = str(_row_ui290[1] or "")
+            _already_pause_ui290 = bool(int(_row_ui290[2] or 0))
+            if _V290_UI_PRIORITY_JOB_ID and not _already_pause_ui290:
+                _c_ui290.execute("""
+                    UPDATE v278_background_jobs
+                       SET pause_requested=1,
+                           status=CASE WHEN status='paused' THEN 'paused' ELSE 'pause_requested' END,
+                           message='画面表示を優先するため、現在レース終了後に一時停止します。',
+                           updated_at=?
+                     WHERE job_id=?
+                """,(datetime.now(timezone.utc).isoformat(timespec="seconds"),_V290_UI_PRIORITY_JOB_ID))
+                _c_ui290.commit()
+                _V290_UI_PRIORITY_REQUESTED = True
+except Exception:
+    # UIを開くことが最優先。ロック中/旧DBではここで待たず、そのまま描画へ進む。
+    _V290_UI_PRIORITY_JOB_ID = 0
+    _V290_UI_PRIORITY_REQUESTED = False
+
+# 一時停止要求を出した場合だけ最大3秒、レース境界到達を軽く待つ。
+# 90秒待ちの前景DB登録とは違い、ページ表示では長時間ブロックしない。
+if _V290_UI_PRIORITY_REQUESTED and _V290_UI_PRIORITY_JOB_ID:
+    _deadline_ui290 = time_module.time() + 3.0
+    while time_module.time() < _deadline_ui290:
+        try:
+            with sqlite3.connect(_db_ui290, timeout=0.20) as _c2_ui290:
+                _c2_ui290.execute("PRAGMA busy_timeout=200")
+                _s_ui290 = _c2_ui290.execute(
+                    "SELECT status FROM v278_background_jobs WHERE job_id=?",
+                    (_V290_UI_PRIORITY_JOB_ID,)
+                ).fetchone()
+            if _s_ui290 and str(_s_ui290[0] or "") == "paused":
+                break
+        except Exception:
+            break
+        time_module.sleep(0.12)
+
 # Ver267 refactor: runtime-state-centralized
 
 
@@ -17143,3 +17199,28 @@ try:
         _v266_render_error_analysis(engine.DB_PATH)
 except Exception as _v266_exc:
     st.warning("Ver266誤差解析の表示に失敗しました: " + _runtime_exception_text(_v266_exc))
+
+# Ver290 hotfix: この画面rerunが要求したバックグラウンド一時停止だけを自動再開。
+# ユーザーが手動で一時停止していたjobは _V290_UI_PRIORITY_REQUESTED=False なので触らない。
+if globals().get("_V290_UI_PRIORITY_REQUESTED") and int(globals().get("_V290_UI_PRIORITY_JOB_ID") or 0):
+    try:
+        _jid_ui290=int(_V290_UI_PRIORITY_JOB_ID)
+        with sqlite3.connect(str(getattr(engine,"DB_PATH","autorace_players.sqlite3")),timeout=0.35) as _c3_ui290:
+            _c3_ui290.execute("PRAGMA busy_timeout=350")
+            _r3_ui290=_c3_ui290.execute(
+                "SELECT status,pause_requested,cancel_requested FROM v278_background_jobs WHERE job_id=?",
+                (_jid_ui290,)
+            ).fetchone()
+            if _r3_ui290 and str(_r3_ui290[0] or "") in ("paused","pause_requested") and int(_r3_ui290[1] or 0) and not int(_r3_ui290[2] or 0):
+                _c3_ui290.execute("""
+                    UPDATE v278_background_jobs
+                       SET pause_requested=0,
+                           status='running',
+                           message='画面表示完了。バックグラウンド再シミュレーションを再開しました。',
+                           updated_at=?
+                     WHERE job_id=?
+                """,(datetime.now(timezone.utc).isoformat(timespec="seconds"),_jid_ui290))
+                _c3_ui290.commit()
+    except Exception:
+        pass
+
