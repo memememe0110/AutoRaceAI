@@ -2691,19 +2691,8 @@ def _v290_recover_orphaned_batch_job(db_path: str, stale_seconds: float = 90.0) 
     except Exception as exc:
         return {"ok":False,"action":"error","reason":f"{type(exc).__name__}: {exc}"}
 
-try:
-    _v290_orphan_recovery=_v290_recover_orphaned_batch_job(engine.DB_PATH)
-    if isinstance(_v290_orphan_recovery,dict):
-        if _v290_orphan_recovery.get("action")=="restarted":
-            st.session_state["v290_orphan_recovery_notice"]=(
-                f"停止したバックグラウンド処理を検知し、"
-                f"{int(_v290_orphan_recovery.get('done') or 0)}/"
-                f"{int(_v290_orphan_recovery.get('total') or 0)}から残りを自動再開しました。"
-            )
-        elif _v290_orphan_recovery.get("action")=="error":
-            st.session_state["v290_orphan_recovery_error"]=str(_v290_orphan_recovery.get("reason") or "")
-except Exception as _v290_rec_exc:
-    _v290_orphan_recovery={"ok":False,"action":"error","reason":f"{type(_v290_rec_exc).__name__}: {_v290_rec_exc}"}
+# Ver290 hotfix5: 自動復旧・自動再開は行わない。停止後の再開はユーザー操作に限定。
+_v290_orphan_recovery={"ok":True,"action":"manual_control"}
 
 # Ver279: 通常1R予測をStreamlit描画スレッドから分離してバックグラウンド実行する。
 # 計算式・seed・試行回数・6周展開は通常予測と同一。画面操作だけを解放する。
@@ -14302,12 +14291,7 @@ except Exception:
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
 _v278_render_bg_compact("main")
-_v290_recovery_notice=st.session_state.get("v290_orphan_recovery_notice")
-if _v290_recovery_notice:
-    st.success("🔄 "+str(_v290_recovery_notice))
-_v290_recovery_error=st.session_state.get("v290_orphan_recovery_error")
-if _v290_recovery_error:
-    st.error("BG自動復旧エラー: "+str(_v290_recovery_error))
+# Ver290 hotfix5: BGは停止＋手動開始に統一。
 _main_pages = ["🏁 予測", "⏱️ 再シミュレーション", "📊 回収率実績", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"]
 if st.session_state.get("v155_main_page") not in _main_pages:
     st.session_state["v155_main_page"] = _main_pages[0]
@@ -14344,31 +14328,29 @@ def _v278_render_background_quick_page(db_path: str) -> None:
         min_value=1,max_value=300,value=80,step=10,
         key="v278_quick_limit"
     )
+    if "v278_quick_force" not in st.session_state:
+        st.session_state["v278_quick_force"]=False
     force_current=st.checkbox(
         f"{_V231_APP_VERSION}保存済みレースも再計算",
-        value=True,key="v278_quick_force"
+        value=False,key="v278_quick_force"
     )
     job=_v278_bg_get_job(db_path)
     running=bool(job and str(job.get("status") or "") in ("queued","running","pause_requested","paused","cancel_requested"))
 
-    if st.button(
-        "🧹 途中jobを捨てて最初からやり直す",
-        use_container_width=True,
-        key="v290_clean_restart_batch",
-        help="旧jobを終了し、正常保存済みVer290レースは除外して未完了分を最初から再実行します。"
-    ):
-        _rrclean290=_v290_restart_batch_clean(db_path,int(limit_count))
-        if _rrclean290.get("ok"):
-            st.session_state["v290_clean_restart_notice"]=str(_rrclean290.get("message") or "再スタートしました。")
-            st.rerun()
-        else:
-            st.error("クリーン再スタート失敗: "+str(_rrclean290.get("reason") or "不明"))
-
-    _clean_notice290=st.session_state.pop("v290_clean_restart_notice",None)
-    if _clean_notice290:
-        st.success("🧹 "+str(_clean_notice290))
-
     if running:
+        if st.button(
+            "⏹ バックグラウンド再シミュレーションを停止",
+            use_container_width=True,
+            key="v290_stop_only_batch",
+            help="現在レース終了後に停止します。停止後、必要なら開始ボタンから手動でやり直せます。"
+        ):
+            _v278_bg_request_cancel(db_path,int(job.get("job_id") or 0))
+            st.session_state["v290_stop_only_notice"]="停止要求を送信しました。現在レース終了後に停止します。"
+            st.rerun()
+        _stop_notice290=st.session_state.pop("v290_stop_only_notice",None)
+        if _stop_notice290:
+            st.info("⏹ "+str(_stop_notice290))
+
         done=int(job.get("done_count",0) or 0)
         total=int(job.get("total_count",0) or 0)
         frac=(float(done)/float(total)) if total else 0.0
@@ -14387,16 +14369,14 @@ def _v278_render_background_quick_page(db_path: str) -> None:
             f"計算thread: {'稼働中' if _alive290 else 'なし'}"
         )
         if _age290 >= 90 or not _alive290:
-            st.warning("⚠️ バックグラウンド処理が停止している可能性があります。")
-            if st.button("🔧 停止中ジョブを破棄して残りから再開",use_container_width=True,key="v290_force_recover_bg"):
-                _rr290=_v290_spawn_recovery_worker(db_path,job,"画面から強制再開")
-                if _rr290.get("ok"):
-                    st.session_state["v290_orphan_recovery_notice"]=(
-                        f"{int(_rr290.get('done') or 0)}/{int(_rr290.get('total') or 0)}から残りを再開しました。"
-                    )
-                    st.rerun()
-                else:
-                    st.error("再開失敗: "+str(_rr290.get("reason") or "不明"))
+            st.warning("⚠️ バックグラウンド処理が停止している可能性があります。自動再開はしません。")
+            if st.button(
+                "⏹ 停止要求を送る",
+                use_container_width=True,
+                key="v290_stale_stop_only"
+            ):
+                _v278_bg_request_cancel(db_path,int(job.get("job_id") or 0))
+                st.info("停止要求を送信しました。停止後、必要なら下の開始ボタンから手動でやり直せます。")
         if total>0:
             st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}｜{str(job.get('current_label') or '')}")
         else:
