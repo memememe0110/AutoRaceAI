@@ -19,43 +19,25 @@ HISTORY_COLS_DB = ['開催日','開催場','レース','着順','出走','走路
 def mount_and_init_db():
     """DB起動時初期化。
 
-    Ver291 startup hotfix:
-    既存DBが正常な場合、importのたびにCREATE TABLE/INDEXを実行すると
-    バックグラウンド書込中のSQLiteとDDLロックが競合し、アプリ全体が起動不能になる。
-    まずread-only相当のschema確認だけを行い、必要なDDLが欠ける時だけ書込初期化する。
+    Ver291 startup hotfix2:
+    既存DBが存在する場合は import engine 中にDDLを一切発行しない。
+    Streamlit起動直後のCREATE TABLE / CREATE INDEXが、
+    GitHub復元・バックグラウンド処理・WAL書込と競合して
+    sqlite3.DatabaseErrorを起こす経路を完全に切る。
+
+    新規DB（ファイルが無い/0 byte）の時だけ最小schemaを作る。
     """
     DB_DIR.mkdir(parents=True, exist_ok=True)
 
-    def _schema_ready() -> bool:
-        if not DB_PATH.exists() or DB_PATH.stat().st_size <= 0:
-            return False
-        try:
-            with sqlite3.connect(str(DB_PATH), timeout=5.0) as con:
-                con.execute("PRAGMA busy_timeout=5000")
-                names = {
-                    str(r[0])
-                    for r in con.execute(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type IN ('table','index') "
-                        "AND name IN ('players','race_history','idx_history_player_date')"
-                    ).fetchall()
-                }
-                if not {"players","race_history","idx_history_player_date"}.issubset(names):
-                    return False
-
-                # index定義が期待列を参照していることまで確認。
-                idx_cols = [
-                    str(r[2])
-                    for r in con.execute("PRAGMA index_info('idx_history_player_date')").fetchall()
-                ]
-                return idx_cols[:2] == ["player_id","race_date"]
-        except sqlite3.Error:
-            return False
-
-    # 正常な既存DBならDDLを一切発行しない。
-    # バックグラウンド予測中でも起動時の書込ロックを取りにいかない。
-    if _schema_ready():
-        return DB_PATH
+    # 既存DBは「起動時に触らない」。
+    # schema検査すらsqlite_master/index_infoを読みに行かず、
+    # import時のSQLite処理を最小化する。
+    try:
+        if DB_PATH.exists() and DB_PATH.stat().st_size > 0:
+            return DB_PATH
+    except Exception:
+        # stat自体が失敗した場合だけ新規初期化側へ進む
+        pass
 
     ddl = """
     CREATE TABLE IF NOT EXISTS players (
@@ -80,8 +62,7 @@ def mount_and_init_db():
     """
 
     last_exc = None
-    # 新規DB/不足schemaの時だけDDL。busy/lockedは短い間隔で再試行する。
-    for wait_s in (0.0, 0.35, 0.8, 1.5):
+    for wait_s in (0.0, 0.5, 1.0, 2.0):
         if wait_s:
             time.sleep(wait_s)
         try:
@@ -89,8 +70,7 @@ def mount_and_init_db():
                 con.execute("PRAGMA busy_timeout=30000")
                 con.executescript(ddl)
                 con.commit()
-            if _schema_ready():
-                return DB_PATH
+            return DB_PATH
         except sqlite3.Error as exc:
             last_exc = exc
             msg = str(exc).lower()
@@ -98,14 +78,9 @@ def mount_and_init_db():
                 continue
             raise
 
-    # 最後にもう一度schema確認。
-    # 他プロセスがその間に初期化を完了していれば正常起動する。
-    if _schema_ready():
-        return DB_PATH
-
     if last_exc is not None:
         raise last_exc
-    raise sqlite3.DatabaseError("DB schema initialization failed")
+    raise sqlite3.DatabaseError("DB initialization failed")
 
 mount_and_init_db()
 
