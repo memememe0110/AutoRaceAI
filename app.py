@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver287"
+APP_VERSION = "Ver288"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver287"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver288"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -5025,8 +5025,8 @@ def _v276_copy_retrial_to_prediction_df(df, entries):
 
 # Ver287: DB138のVer284・56R監査から確定した固定基準補正。
 # 個別レース結果への後掛けではなく、同展開型×周回の系統誤差を標準ルール化。
-_V287_FIXED_TRANSITION_LOGIT = {'後半追込型|3': -0.146885, '後半追込型|4': -0.055082, '後半追込型|5': 0.073443, '後半追込型|6': 0.110164, '早仕掛け型|3': 0.214286, '早仕掛け型|4': 0.128571, '早仕掛け型|5': 0.185714, '早仕掛け型|6': 0.0, '波乱型|3': -0.199745, '波乱型|4': 0.005548, '波乱型|5': 0.355102, '波乱型|6': -0.133163}
-_V287_DYNAMIC_RATIO = 0.25  # 新規履歴による微調整は固定基準の補助に限定
+_V288_FIXED_TRANSITION_LOGIT = {'後半追込型|3': -0.117508, '後半追込型|4': -0.044066, '後半追込型|5': 0.058754, '後半追込型|6': 0.088131, '早仕掛け型|3': 0.171429, '早仕掛け型|4': 0.102857, '早仕掛け型|5': 0.148571, '早仕掛け型|6': 0.0, '波乱型|3': -0.159796, '波乱型|4': 0.004438, '波乱型|5': 0.284082, '波乱型|6': -0.10653}
+_V288_DYNAMIC_RATIO = 0.25  # 新規履歴による微調整は固定基準の補助に限定
 
 _V285_SAME_SCENARIO_CACHE = globals().get("_V285_SAME_SCENARIO_CACHE", {})
 
@@ -5600,13 +5600,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 except Exception:
                     _scenario_apply_v286="不明"
             _v287_key=f"{_scenario_apply_v286}|{int(lap)}"
-            _fixed_delta_v287=float(_V287_FIXED_TRANSITION_LOGIT.get(_v287_key,0.0) or 0.0)
+            _fixed_delta_v287=float(_V288_FIXED_TRANSITION_LOGIT.get(_v287_key,0.0) or 0.0)
             _dynamic_delta_v287=float(
                 ((same_scenario_transition_v285.get("delta_logit") or {}).get(_v287_key,0.0) or 0.0)
             )
             # 固定値は過去DBが無くても必ず効く。動的学習は最大25%だけ上乗せ。
             _scenario_delta_v285=float(np.clip(
-                _fixed_delta_v287 + _dynamic_delta_v287*_V287_DYNAMIC_RATIO,
+                _fixed_delta_v287 + _dynamic_delta_v287*_V288_DYNAMIC_RATIO,
                 -0.46,0.46
             ))
             # Ver250: 1周で何台も連続して抜く展開を抑える。
@@ -5936,7 +5936,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
     ]
     audit={
-        "enabled":True,"mode":"Ver287 固定全体補正+微調整・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver288 固定全体補正80%+微調整・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -5961,8 +5961,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "scenario_branch_prior_v264": scenario_branch_prior_v264,
         "same_scenario_transition_v285": same_scenario_transition_v285,
         "v285_scenario_policy":"Ver288固定基準+微調整: 56R監査由来の同展開型×周回固定logitを常時適用し、新規履歴は最大25%の微調整だけ追加",
-        "v288_fixed_transition_logit":dict(_V287_FIXED_TRANSITION_LOGIT),
-        "v288_dynamic_ratio":float(_V287_DYNAMIC_RATIO),
+        "v288_fixed_transition_logit":dict(_V288_FIXED_TRANSITION_LOGIT),
+        "v288_dynamic_ratio":float(_V288_DYNAMIC_RATIO),
+        "v288_fixed_scale":0.80,
         "scenario_distribution_v263": scenario_distribution,
         "scenario_weights_v263": scenario_weights,
         "actual_scenario_v263": actual_scenario,
