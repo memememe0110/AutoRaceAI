@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver295"
+APP_VERSION = "Ver296"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver295"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver296"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -10843,8 +10843,8 @@ def _v295_ev_calibration_table(db_path: str, cutoff_date: str="") -> dict:
         if (str(r["race_key"]),bt,_v295_norm_combo(bt,r["combination"])) in wins:
             b["hits"]+=1
 
-    # 元モデル100件分を事前分布として実績を縮小。極端な補正は±30%に制限。
-    prior_n=100.0
+    # 元モデル200件分を事前分布として実績を縮小。極端な補正は±20%に制限。
+    prior_n=200.0
     for bt,arr in buckets.items():
         out["types"][bt]=[]
         for b in arr:
@@ -10852,7 +10852,7 @@ def _v295_ev_calibration_table(db_path: str, cutoff_date: str="") -> dict:
             mean_p=(b["sum_p"]/n) if n else None
             if n and mean_p is not None and mean_p>1e-12:
                 calibrated=(float(b["hits"])+prior_n*mean_p)/(n+prior_n)
-                ratio=float(np.clip(calibrated/mean_p,0.70,1.30))
+                ratio=float(np.clip(calibrated/mean_p,0.80,1.20))
             else:
                 ratio=1.0
             out["types"][bt].append({
@@ -12707,6 +12707,73 @@ def show_v184_eight_car_mixed_plan(
             )
         st.code("\n".join(ticket_lines), language=None)
 
+    # Ver296 UI監査表示:
+    # 計算済みの値を読むだけ。選定・期待値・確率・保存内容には一切反映しない。
+    try:
+        _audit_rows296=[]
+        for _atype296 in order:
+            for _r296 in (result.get("grouped",{}) or {}).get(_atype296,[]) or []:
+                _rawp296=float(_r296.get("probability",0.0) or 0.0)
+                _evp296=float(_r296.get("ev_probability",_rawp296) or _rawp296)
+                _ratio296=float(_r296.get("ev_calibration_ratio",1.0) or 1.0)
+                _n296=int(_r296.get("ev_calibration_samples",0) or 0)
+                _odds296=float(_r296.get("odds",0.0) or 0.0)
+                _audit_rows296.append({
+                    "券種":v205_ticket_display_name(_atype296),
+                    "買い目":str(_r296.get("combo","")),
+                    "元確率%":_rawp296,
+                    "校正後確率%":_evp296,
+                    "校正倍率":_ratio296,
+                    "学習n":_n296,
+                    "オッズ":_odds296,
+                    "元EV%":_rawp296*_odds296,
+                    "校正EV%":_evp296*_odds296,
+                    "差pt":(_evp296-_rawp296)*_odds296,
+                })
+        if _audit_rows296:
+            with st.expander("🔎 期待値校正の監査（表示のみ・結果には影響しません）",expanded=False):
+                _audit_df296=pd.DataFrame(_audit_rows296)
+                st.caption(
+                    "Ver296で実際に最終プランへ残った買い目について、"
+                    "元のシミュレーション確率と期待値評価用の校正確率を並べています。"
+                    "この表は計算済み値を表示するだけで、買い目選択や予測結果を変更しません。"
+                )
+                _c1_296,_c2_296,_c3_296,_c4_296=st.columns(4)
+                _c1_296.metric("表示買い目",f"{len(_audit_df296)}点")
+                _c2_296.metric(
+                    "平均校正倍率",
+                    f"×{float(_audit_df296['校正倍率'].mean()):.3f}"
+                )
+                _c3_296.metric(
+                    "下方補正",
+                    f"{int((_audit_df296['校正倍率']<0.9995).sum())}点"
+                )
+                _c4_296.metric(
+                    "上方補正",
+                    f"{int((_audit_df296['校正倍率']>1.0005).sum())}点"
+                )
+                st.dataframe(
+                    _audit_df296,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "元確率%":st.column_config.NumberColumn(format="%.3f%%"),
+                        "校正後確率%":st.column_config.NumberColumn(format="%.3f%%"),
+                        "校正倍率":st.column_config.NumberColumn(format="×%.3f"),
+                        "学習n":st.column_config.NumberColumn(format="%d"),
+                        "オッズ":st.column_config.NumberColumn(format="%.1f倍"),
+                        "元EV%":st.column_config.NumberColumn(format="%.1f%%"),
+                        "校正EV%":st.column_config.NumberColumn(format="%.1f%%"),
+                        "差pt":st.column_config.NumberColumn(format="%+.1f"),
+                    },
+                )
+                st.caption(
+                    "EV% = 確率(%) × オッズ。"
+                    "校正倍率は券種×確率帯の過去実現率をwalk-forwardで縮小学習した値です。"
+                )
+    except Exception as _audit_exc296:
+        st.caption("期待値校正監査を表示できませんでした: "+str(_audit_exc296))
+
     st.caption(
         f"モデル上の全外れ率 {result['miss']:.2f}%・参考モデル回収率 {result['model_return_rate']:.1f}%・実績補正後 {result.get('adjusted_return_rate',0):.1f}% 。"
         "車立て別に点数と券種配分を変え、黒字的中率が明確に改善する候補だけ追加します。6車は3連単中心、7車は中間、8車は補完券種を厚めに評価します。"
@@ -13801,14 +13868,8 @@ def _v282_push_chunked_db(
                     protected.add(str(_p295))
 
         # base_path の親ディレクトリをContents APIで1回だけ列挙。
-        # Ver295 hotfix:
-        # posixpath依存を完全撤去。GitHub pathは "/" 区切りなので文字列だけで安全に分解する。
-        _base295=str(base_path or "").strip("/")
-        if "/" in _base295:
-            _parent295,_name295=_base295.rsplit("/",1)
-        else:
-            _parent295=""
-            _name295=_base295
+        _parent295=posixpath.dirname(base_path)
+        _name295=posixpath.basename(base_path)
         _dir_url295=repo_api + urllib.parse.quote(_parent295,safe="/")
         if _parent295:
             _dir_url295 += "?ref=" + urllib.parse.quote(branch)
