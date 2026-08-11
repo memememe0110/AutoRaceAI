@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver298"
+APP_VERSION = "Ver299"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver298"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver299"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -10887,6 +10887,36 @@ def _v295_ev_probability(raw_probability_pct: float, bet_type: str, table: dict)
     return float(np.clip(p*ratio,0.0,100.0)),ratio,n
 
 
+
+def _v299_ev_trust(raw_ev_multiple: float, bet_type: str, probability_pct: float, odds: float) -> tuple[float,str]:
+    """DB167検証に基づく過大EVの滑らかな信頼減衰。
+
+    EV>2を即除外せず徐々に圧縮する。三連単の中穴候補は別枠で探索するため、
+    高オッズそのものを罰する関数にはしない。
+    """
+    ev=max(0.0,float(raw_ev_multiple or 0.0))
+    bt=str(bet_type or "")
+    p=max(0.0,float(probability_pct or 0.0))
+    od=max(0.0,float(odds or 0.0))
+    if ev <= 2.0:
+        trust=1.0
+        reason="通常"
+    else:
+        # 2倍超をゼロにせず、超過部分だけ圧縮。極端なモデルEVの暴走を抑える。
+        effective=2.0 + 0.35*(ev-2.0)
+        trust=max(0.45,min(1.0,effective/max(ev,1e-9)))
+        reason="高EV滑らか減衰"
+    # 2連複はDB167で実績が弱いが完全禁止しない。
+    if bt in ("2連複","二連複"):
+        trust*=0.90
+        reason += "・2連複弱縮小"
+    # 三連単の中穴帯は候補母集団から落とさない。信頼度の下限だけ確保する。
+    if bt in ("3連単","三連単") and 0.8 <= p <= 8.0 and od >= 30.0:
+        trust=max(trust,0.72)
+        reason += "・穴候補保護"
+    return float(np.clip(trust,0.40,1.0)),reason
+
+
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
     """6〜8車立て向けの役割分担型・回収率合成。
 
@@ -10972,6 +11002,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         unordered = label in ("三連複", "2連複")
         ordered = sorted(counter.items(), key=lambda x: x[1], reverse=True)
         added = 0
+        core_added = 0
+        hole_added = 0
         cumulative = 0.0
         target_cover = spec.get("target_cover")
         for combo, count in ordered:
@@ -10985,12 +11017,35 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             _ev_prob295,_ev_ratio295,_ev_n295=_v295_ev_probability(
                 probability,label,_ev_calibration295
             )
+            _raw_ev299=(_ev_prob295/100.0)*odds
+            _trust299,_trust_reason299=_v299_ev_trust(_raw_ev299,label,probability,odds)
+            _effective_ev_prob299=_ev_prob295*_trust299
+
+            # Ver299: 三連単は確率上位limit点を越えても「中穴の価値候補」を最大6点だけ探索。
+            # 極端な宝くじ領域ではなく、シミュレーションにも一定頻度で出る穴だけを対象にする。
+            _is_hole299=(
+                label=="三連単"
+                and core_added >= int(spec["limit"])
+                and hole_added < 6
+                and 0.80 <= probability <= 6.00
+                and odds >= 30.0
+                and 0.72 <= _raw_ev299 <= 2.20
+            )
+            if label=="三連単" and core_added >= int(spec["limit"]) and not _is_hole299:
+                continue
+
             ticket = {
                 "type": label, "combo": key, "probability": probability,
-                "ev_probability": _ev_prob295,
+                "ev_probability": _effective_ev_prob299,
+                "ev_probability_before_v299": _ev_prob295,
                 "ev_calibration_ratio": _ev_ratio295,
                 "ev_calibration_samples": _ev_n295,
-                "odds": odds, "cap": int(spec["cap"]), "role": spec["role"],
+                "v299_ev_trust": _trust299,
+                "v299_ev_trust_reason": _trust_reason299,
+                "v299_raw_ev_multiple": _raw_ev299,
+                "v299_hole_rescue": bool(_is_hole299),
+                "odds": odds, "cap": int(spec["cap"]),
+                "role": (spec["role"] + ("・中穴価値候補" if _is_hole299 else "")),
                 "learned_weight": learned_weight,
             }
             matched = {i for i, (outcome, _) in enumerate(outcomes) if ticket_matches(ticket, outcome)}
@@ -11000,14 +11055,21 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             ticket["matched_probability"] = sum(outcomes[i][1] for i in matched)
             candidates.append(ticket)
             added += 1
-            cumulative += probability
-            # 三連単は従来通り上位件数。その他は累積88〜90%到達まで候補化。
+            if _is_hole299:
+                hole_added += 1
+            else:
+                core_added += 1
+                cumulative += probability
+            # 三連単は上位limit点を確保した後も、条件を満たす中穴だけ最大6点探索する。
+            # その他券種は従来通り累積カバー到達で終了。
             if target_cover is not None and cumulative >= float(target_cover):
                 break
-            if target_cover is None and added >= int(spec["limit"]):
+            if target_cover is None and core_added >= int(spec["limit"]) and hole_added >= 6:
                 break
         pool_summary[label] = {
             "points": added,
+            "core_points": core_added,
+            "hole_points": hole_added,
             "cover": cumulative,
             "target": target_cover,
         }
@@ -11269,6 +11331,42 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     )
     selected = list(selected)
 
+    # Ver299: 「上位確率にいないから穴が候補にすら入らない」を防ぐ。
+    # 候補母集団へ救済した中穴から、全体のEV指標を壊さず黒字率も大きく落とさないものを最大2点追加。
+    v299_hole_notes = []
+    for _ in range(2):
+        _base299=evaluate(selected)
+        _selected_ids299={(str(t.get("type")),str(t.get("combo"))) for t in selected}
+        _best299=None
+        for _cand299 in candidates:
+            if not bool(_cand299.get("v299_hole_rescue")):
+                continue
+            _cid299=(str(_cand299.get("type")),str(_cand299.get("combo")))
+            if _cid299 in _selected_ids299:
+                continue
+            _trial299=selected+[_cand299]
+            _after299=evaluate(_trial299)
+            _ret_delta299=float(_after299.get("ev_model_return_rate",0.0)-_base299.get("ev_model_return_rate",0.0))
+            _black_delta299=float(_after299.get("black",0.0)-_base299.get("black",0.0))
+            _cover_gain299=float(_after299.get("cover",0.0)-_base299.get("cover",0.0))
+            _ev299=(float(_cand299.get("ev_probability",0.0))/100.0)*float(_cand299.get("odds",0.0))
+            # 穴だからという理由だけで追加しない。校正後EVと合成指標の両方を通す。
+            if _ev299 < 0.78 or _ret_delta299 < -1.5 or _black_delta299 < -0.45:
+                continue
+            _score299=2.0*_ret_delta299+1.4*_black_delta299+0.8*_cover_gain299+6.0*_ev299
+            _key299=(_score299,_ev299,float(_cand299.get("odds",0.0)),float(_cand299.get("probability",0.0)))
+            if _best299 is None or _key299>_best299[0]:
+                _best299=(_key299,_cand299,_after299,_ret_delta299,_black_delta299,_cover_gain299,_ev299)
+        if _best299 is None:
+            break
+        _,_cand299,_after299,_ret_delta299,_black_delta299,_cover_gain299,_ev299=_best299
+        selected.append(_cand299)
+        v299_hole_notes.append(
+            f"中穴価値候補を追加：3連単 {_cand299.get('combo')} "
+            f"（確率{float(_cand299.get('probability',0)):.2f}%・"
+            f"オッズ{float(_cand299.get('odds',0)):.1f}倍・信頼補正EV{_ev299*100:.1f}%）"
+        )
+
     # Ver201: 高確率本線を最終候補へ戻す。追加後の購入総額を含めて再評価し、
     # 回収率が悪ければ判定自体を下げるが、本線を黙って削ることはしない。
     protected_add_notes = []
@@ -11285,7 +11383,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
     # Ver192: 単独ではガミになる2連系を、同じ展開に含まれる三連単へ分解して比較する。
     # 的中範囲を極端に捨てず、黒字的中率・期待倍率が改善する場合だけ差し替える。
-    replacement_notes = []
+    replacement_notes = list(v299_hole_notes)
     for _ in range(3):
         base_metrics = evaluate(selected)
         base_cost = float(base_metrics.get("cost", len(selected) * 100.0))
@@ -12724,6 +12822,8 @@ def show_v184_eight_car_mixed_plan(
                     "元確率%":_rawp296,
                     "校正後確率%":_evp296,
                     "校正倍率":_ratio296,
+                    "EV信頼倍率":float(_r296.get("v299_ev_trust",1.0) or 1.0),
+                    "中穴救済":("○" if _r296.get("v299_hole_rescue") else ""),
                     "学習n":_n296,
                     "オッズ":_odds296,
                     "元EV%":_rawp296*_odds296,
@@ -14487,10 +14587,65 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
         _relpush284=_v284_db_containment(snapshot_bytes,_remote_bytes284)
         _rpush284=str(_relpush284.get("relation") or "unknown")
         if _rpush284=="baseline_contains":
-            return False,(
-                "GitHub保存を中止しました。GitHub DBが現在の端末DBを完全包含しています。"
-                " 先にGitHub DBを採用してください。\n"+
-                _v284_containment_message(_relpush284,"端末","GitHub")
+            # Ver298 DB同期改善:
+            # GitHub currentが端末DBを完全包含する場合、端末をGitHubへ上書きすると
+            # GitHub固有行を失うため、保存停止だけでなくGitHub正本を自動採用する。
+            # remote_bytesはmanifest検証・SHA検証済みの分割DB復元結果。
+            _adopt_fp298=_v283_db_fingerprint_bytes(_remote_bytes284)
+            if not _adopt_fp298.get("ok"):
+                return False,(
+                    "GitHub DBの自動採用を中止しました。復元DBの指紋確認に失敗しました: "+
+                    str(_adopt_fp298.get("reason") or "不明")
+                )
+
+            # 念のため採用直前にも包含関係を再確認。
+            _relcheck298=_v284_db_containment(snapshot_bytes,_remote_bytes284)
+            if str(_relcheck298.get("relation") or "")!="baseline_contains":
+                return False,(
+                    "GitHub DBの自動採用を中止しました。採用直前の包含関係が変化しました。\n"+
+                    _v284_containment_message(_relcheck298,"端末","GitHub")
+                )
+
+            _install_ok298,_install_msg298=_v276_atomic_install_db_bytes(
+                _remote_bytes284,"GitHub完全包含正本"
+            )
+            if not _install_ok298:
+                return False,"GitHub完全包含正本の端末DBへの反映に失敗しました: "+str(_install_msg298)
+
+            # 反映後の現在DBを再取得して、GitHub正本と行単位で完全一致することを確認。
+            try:
+                _installed_bytes298=_v278_consistent_db_snapshot_bytes(str(engine.DB_PATH))
+            except Exception as _snap_exc298:
+                return False,(
+                    "GitHub正本は端末へ反映しましたが、反映後スナップショット確認に失敗しました: "+
+                    f"{type(_snap_exc298).__name__}: {_snap_exc298}"
+                )
+            _post_rel298=_v284_db_containment(_installed_bytes298,_remote_bytes284)
+            if str(_post_rel298.get("relation") or "")!="equal":
+                return False,(
+                    "GitHub正本は端末へ反映しましたが、反映後の完全一致確認に失敗しました。\n"+
+                    _v284_containment_message(_post_rel298,"端末反映後","GitHub")
+                )
+
+            # 以後の再描画・端末保存・固定監視も同じ正本を参照するよう更新。
+            st.session_state["v284_uploaded_master_bytes"]=bytes(_remote_bytes284)
+            st.session_state["v284_uploaded_master_sha256"]=hashlib.sha256(_remote_bytes284).hexdigest()
+            _adopt_identity298=_v284_current_db_identity()
+            if _adopt_identity298.get("ok"):
+                st.session_state["v284_uploaded_master_identity"]=_adopt_identity298
+                st.session_state["v284_db_identity_baseline"]=_adopt_identity298
+                st.session_state["v284_db_identity_block"]=[]
+            st.session_state.pop("_v296_sidebar_db_summary_cache",None)
+            st.session_state.pop("_v296_sidebar_manifest_cache",None)
+            st.session_state.pop("_v290_identity_cache",None)
+            st.session_state.pop("_v290_download_snapshot",None)
+
+            _adopt_detail298=_v284_containment_message(_relpush284,"端末","GitHub")
+            return True,(
+                "✅ GitHub DBが端末DBを完全包含していたため、GitHub正本を自動採用しました。"
+                " 端末DBへ反映後、行単位の完全一致まで再確認済みです。"
+                " GitHub側は既に正本のため再保存は不要です。\n"+
+                _adopt_detail298
             )
         if _rpush284=="diverged":
             _merge_ok284,_merged_bytes284,_merge_report284=_v284_safe_union_merge_db_bytes(
@@ -14641,6 +14796,8 @@ _V296_RERUN_LIGHTWEIGHT_UI = "2026-08-11-v1"
 _V297_EV_RESTORE_OFFICIAL = "2026-08-11-v1"
 _V298_CHASE_HALF = "2026-08-11-v1"
 _V298_ALL_TICKET_COVERAGE = "2026-08-11-v1"
+_V298_BASELINE_CONTAINS_AUTO_ADOPT = "2026-08-11-v1"
+_V299_HOLE_VALUE_RESCUE = "2026-08-11-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
