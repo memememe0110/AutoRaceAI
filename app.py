@@ -13462,7 +13462,7 @@ def _v284_db_row_keysets_from_bytes(data: bytes) -> dict:
         tmp_path.write_bytes(data)
 
         keymap={
-            "players":("player_id",),
+            "players":("player_name",),
             "race_history":("record_key",),
             "player_lap_history":("race_key","car_no","lap_label"),
             "result_races":("race_key",),
@@ -13478,6 +13478,8 @@ def _v284_db_row_keysets_from_bytes(data: bytes) -> dict:
             "v141_heat_feature_snapshots":("race_key","car_no"),
             "v142_aux_feature_snapshots":("race_key","car_no"),
             "v151_race_context_feature_snapshots":("race_key","car_no"),
+            "v151_player_race_context_profiles":("player_key","context_key"),
+            "v15_player_history_imports":("history_key",),
             "v152_overtake_feature_snapshots":("race_key","car_no"),
             "v187_mixed_plan_runs":("race_key","plan_hash"),
             "v187_mixed_plan_tickets":("race_key","plan_hash","bet_type","combination"),
@@ -13799,8 +13801,14 @@ def _v282_push_chunked_db(
                     protected.add(str(_p295))
 
         # base_path の親ディレクトリをContents APIで1回だけ列挙。
-        _parent295=posixpath.dirname(base_path)
-        _name295=posixpath.basename(base_path)
+        # Ver295 hotfix:
+        # posixpath依存を完全撤去。GitHub pathは "/" 区切りなので文字列だけで安全に分解する。
+        _base295=str(base_path or "").strip("/")
+        if "/" in _base295:
+            _parent295,_name295=_base295.rsplit("/",1)
+        else:
+            _parent295=""
+            _name295=_base295
         _dir_url295=repo_api + urllib.parse.quote(_parent295,safe="/")
         if _parent295:
             _dir_url295 += "?ref=" + urllib.parse.quote(branch)
@@ -14225,7 +14233,7 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
         return False,None,report
 
     keymap={
-        "players":("player_id",),
+        "players":("player_name",),
         "race_history":("record_key",),
         "player_lap_history":("race_key","car_no","lap_label"),
         "result_races":("race_key",),
@@ -14241,6 +14249,8 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
         "v141_heat_feature_snapshots":("race_key","car_no"),
         "v142_aux_feature_snapshots":("race_key","car_no"),
         "v151_race_context_feature_snapshots":("race_key","car_no"),
+            "v151_player_race_context_profiles":("player_key","context_key"),
+            "v15_player_history_imports":("history_key",),
         "v152_overtake_feature_snapshots":("race_key","car_no"),
         "v187_mixed_plan_runs":("race_key","plan_hash"),
         "v187_mixed_plan_tickets":("race_key","plan_hash","bet_type","combination"),
@@ -14268,6 +14278,22 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
             rc.execute("PRAGMA busy_timeout=60000")
             lc_tables={str(r[0]) for r in lc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             rc_tables={str(r[0]) for r in rc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+            # Ver295: player_idはDB枝ごとに再採番され得るため、
+            # GitHub固有race_historyを追加するときはplayer_name経由でIDを対応付ける。
+            _remote_to_local_player_id295={}
+            if "players" in lc_tables and "players" in rc_tables:
+                _local_name_to_id295={
+                    str(_name295):int(_pid295)
+                    for _pid295,_name295 in lc.execute("SELECT player_id,player_name FROM players")
+                    if _pid295 is not None and _name295 is not None
+                }
+                for _rpid295,_rname295 in rc.execute("SELECT player_id,player_name FROM players"):
+                    if _rpid295 is None or _rname295 is None:
+                        continue
+                    _lpid295=_local_name_to_id295.get(str(_rname295))
+                    if _lpid295 is not None:
+                        _remote_to_local_player_id295[int(_rpid295)]=int(_lpid295)
 
             for table,keys in keymap.items():
                 if table not in lc_tables or table not in rc_tables:
@@ -14300,9 +14326,28 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
                 idxs=[lcols.index(c) for c in insert_cols]
                 qcols=",".join('"'+c.replace('"','""')+'"' for c in insert_cols)
                 placeholders=",".join("?" for _ in insert_cols)
+                _insert_rows295=[]
+                for row in missing:
+                    _vals295=[row[i] for i in idxs]
+                    if table=="race_history" and "player_id" in insert_cols:
+                        _pi295=insert_cols.index("player_id")
+                        try:
+                            _remote_pid295=int(_vals295[_pi295])
+                            _local_pid295=_remote_to_local_player_id295.get(_remote_pid295)
+                        except Exception:
+                            _local_pid295=None
+                        if _local_pid295 is None:
+                            report["reason"]=(
+                                "race_history: GitHub固有行の選手をplayer_name経由で"
+                                "端末playersへ安全に対応付けできません"
+                            )
+                            return False,None,report
+                        _vals295[_pi295]=int(_local_pid295)
+                    _insert_rows295.append(tuple(_vals295))
+
                 lc.executemany(
                     f'INSERT INTO "{table}" ({qcols}) VALUES ({placeholders})',
-                    [tuple(row[i] for i in idxs) for row in missing]
+                    _insert_rows295
                 )
                 report["added"][table]=len(missing)
 
@@ -14420,7 +14465,7 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
                 st.session_state["v284_db_identity_block"]=[]
             _added284=(_merge_report284 or {}).get("added") or {}
             st.session_state["v284_last_auto_merge_message"]=(
-                "🔀 端末DBとGitHub DBを安全統合しました。GitHub固有行を追加: "+
+                "🔀 端末DBとGitHub DBを安全統合しました。双方の自然キー完全包含を再確認済み。GitHub固有行を追加: "+
                 (", ".join(f"{k}+{v}" for k,v in sorted(_added284.items())) if _added284 else "追加なし")
             )
         if _rpush284=="unknown":
