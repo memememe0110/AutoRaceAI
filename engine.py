@@ -17,29 +17,70 @@ DB_DIR = APP_DIR
 HISTORY_COLS_DB = ['開催日','開催場','レース','着順','出走','走路','ハンデ','試走T','競走T','ST']
 
 def mount_and_init_db():
+    """DB起動時初期化。
+
+    Ver291 startup hotfix2:
+    既存DBが存在する場合は import engine 中にDDLを一切発行しない。
+    Streamlit起動直後のCREATE TABLE / CREATE INDEXが、
+    GitHub復元・バックグラウンド処理・WAL書込と競合して
+    sqlite3.DatabaseErrorを起こす経路を完全に切る。
+
+    新規DB（ファイルが無い/0 byte）の時だけ最小schemaを作る。
+    """
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS players (
-            player_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_name TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS race_history (
-            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_id INTEGER NOT NULL,
-            race_date TEXT, venue TEXT, race_no TEXT, finish REAL, starters REAL,
-            surface TEXT, handicap TEXT, trial_time REAL, race_time REAL, start_time REAL,
-            result_status TEXT NOT NULL DEFAULT '通常',
-            use_for_model INTEGER NOT NULL DEFAULT 1,
-            source TEXT, record_key TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(player_id) REFERENCES players(player_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_history_player_date ON race_history(player_id, race_date DESC);
-        """)
-    return DB_PATH
+
+    # 既存DBは「起動時に触らない」。
+    # schema検査すらsqlite_master/index_infoを読みに行かず、
+    # import時のSQLite処理を最小化する。
+    try:
+        if DB_PATH.exists() and DB_PATH.stat().st_size > 0:
+            return DB_PATH
+    except Exception:
+        # stat自体が失敗した場合だけ新規初期化側へ進む
+        pass
+
+    ddl = """
+    CREATE TABLE IF NOT EXISTS players (
+        player_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_name TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS race_history (
+        history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_id INTEGER NOT NULL,
+        race_date TEXT, venue TEXT, race_no TEXT, finish REAL, starters REAL,
+        surface TEXT, handicap TEXT, trial_time REAL, race_time REAL, start_time REAL,
+        result_status TEXT NOT NULL DEFAULT '通常',
+        use_for_model INTEGER NOT NULL DEFAULT 1,
+        source TEXT, record_key TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(player_id) REFERENCES players(player_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_history_player_date
+        ON race_history(player_id, race_date DESC);
+    """
+
+    last_exc = None
+    for wait_s in (0.0, 0.5, 1.0, 2.0):
+        if wait_s:
+            time.sleep(wait_s)
+        try:
+            with sqlite3.connect(str(DB_PATH), timeout=30.0) as con:
+                con.execute("PRAGMA busy_timeout=30000")
+                con.executescript(ddl)
+                con.commit()
+            return DB_PATH
+        except sqlite3.Error as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            if "locked" in msg or "busy" in msg:
+                continue
+            raise
+
+    if last_exc is not None:
+        raise last_exc
+    raise sqlite3.DatabaseError("DB initialization failed")
 
 mount_and_init_db()
 
@@ -4430,7 +4471,39 @@ def v15_parse_player_history(text, player_name=None):
 # Ver15用DB
 # ------------------------------
 def v15_init_tables(db_path=DB_PATH):
-    with sqlite3.connect(db_path) as con:
+    """Ver15用テーブルを必要時だけ初期化する。
+
+    Ver291 startup hotfix3:
+    import engine 中にはこの関数を呼ばない。
+    保存処理などで本当に必要になった時だけ呼び、
+    既存4テーブルが揃っていればDDLを発行せず即returnする。
+    """
+    required = {
+        "v15_race_inputs",
+        "v15_race_entry_inputs",
+        "v15_similarity_weights",
+        "v15_player_history_imports",
+    }
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=5.0) as con:
+            con.execute("PRAGMA busy_timeout=5000")
+            existing = {
+                str(r[0])
+                for r in con.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name IN (?,?,?,?)",
+                    tuple(sorted(required))
+                ).fetchall()
+            }
+            if required.issubset(existing):
+                return
+    except sqlite3.Error:
+        # 読取確認に失敗した場合だけ、下の初期化へ進む。
+        pass
+
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
         con.execute("""
             CREATE TABLE IF NOT EXISTS v15_race_inputs (
                 race_key TEXT PRIMARY KEY,
@@ -4812,8 +4885,8 @@ def v15_save_result_using_existing(text):
 # ------------------------------
 # UI
 # ------------------------------
-v15_init_tables()
-
+# Ver291 startup hotfix3:
+# engine import中のv15 DDL初期化は禁止。必要な保存処理側でlazy initする。
 style = {"description_width": "110px"}
 
 

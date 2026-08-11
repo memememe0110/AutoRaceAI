@@ -27,6 +27,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import engine
+import math
 
 # ---------------------------------------------------------------------------
 # AutoRaceAI runtime configuration / state
@@ -34,11 +35,26 @@ import engine
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver280"
+APP_VERSION = "Ver295"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver282"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver295"  # Ver280: 川口4日実測ベースの予測改善
+
+# Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
+_V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
+_V284_TRANSITION_AUDIT_PATCH = "2026-08-09-v1"
+_V284_DOWNLOAD_SNAPSHOT_PATCH = "2026-08-09-v1"
+_V284_GITHUB_RECOVERY_PUSH_PATCH = "2026-08-09-v1"
+_V284_UPLOAD_MASTER_PIN_PATCH = "2026-08-09-v1"
+_V284_GITHUB_READBACK_VERIFY_PATCH = "2026-08-09-v1"
+_V284_GITHUB_RAW_READBACK_PATCH = "2026-08-09-v1"
+_V284_GITHUB_RAW_TOKEN_FIX = "2026-08-09-v1"
+_V284_GITHUB_RELOAD_UNIFIED_VERIFY = "2026-08-09-v1"
+_V284_BOOT_GITHUB_CANONICAL_RESTORE = "2026-08-09-v1"
+_V284_DERIVED_TABLE_GUARD_FIX = "2026-08-09-v1"
+_V284_DIVERGED_SAFE_AUTO_MERGE = "2026-08-09-v1"
+_V284_V252_SEMANTIC_CONTAINMENT = "2026-08-10-v3"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Mutable runtime state.  Keep initialization centralized.
@@ -59,6 +75,8 @@ def _runtime_clear_prediction_caches() -> None:
         _V250_FLOW_CALIBRATION_CACHE,
         _V263_SCENARIO_PRIOR_CACHE,
         _V264_SCENARIO_FEEDBACK_CACHE,
+        _V292_TRIAL_GAP_GATE_CACHE,
+        _V294_FRONT_ST_GUARD_CACHE,
     ):
         try:
             cache.clear()
@@ -687,6 +705,11 @@ def _v266_render_error_analysis(db_path):
         st.caption("この表はVer評価専用です。原因学習の統計には混ぜません。")
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
+
+# Ver290 hotfix2:
+# 起動高速化（manifest-first / DB identity cache）で画面表示が十分軽くなったため、
+# 「画面を開くたびにbatch_rerunを一時停止する」処理は廃止。
+# バックグラウンド再シミュレーションは画面表示中も継続する。
 # Ver267 refactor: runtime-state-centralized
 
 
@@ -2330,7 +2353,62 @@ def _v276_send_rerun_complete_notification(result: dict) -> None:
         pass
 
 
-def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool) -> None:
+
+def _v284_backfill_transition_audit_from_latest_histories(db_path: str, app_version: str = "") -> dict:
+    """最新予測payloadに既に入っているVer284展開監査をDB監査3表へ復元する。
+    再シミュレーションは行わない。batch保存経路の保険として完了時に必ず実行する。
+    """
+    result={"ok":False,"checked":0,"saved_races":0,"errors":[]}
+    ver=str(app_version or globals().get("_V231_APP_VERSION") or "Ver284")
+    try:
+        _v284_ensure_transition_audit_tables(db_path)
+        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            rows=con.execute("""
+                SELECT h.race_key,h.prediction_time,h.trials,h.payload
+                FROM v231_prediction_history h
+                JOIN (
+                    SELECT race_key,MAX(history_id) AS mid
+                    FROM v231_prediction_history
+                    WHERE app_version=?
+                    GROUP BY race_key
+                ) x ON h.history_id=x.mid
+                ORDER BY h.race_key
+            """,(ver,)).fetchall()
+        for race_key,prediction_time,trials,payload in rows:
+            result["checked"]+=1
+            try:
+                obj=pickle.loads(zlib.decompress(payload))
+                meta=(obj or {}).get("meta") or {}
+                wall=meta.get("6周展開シミュレーション") or meta.get("壁補正監査") or {}
+                detail=wall.get("v284_transition_audit") or {}
+                if not detail:
+                    continue
+                # 既にこのrace_keyの最新監査が6周あるなら重複保存しない。
+                with sqlite3.connect(str(db_path),timeout=30.0) as con:
+                    n=int(con.execute(
+                        "SELECT COUNT(DISTINCT lap_no) FROM v284_transition_audit WHERE race_key=? AND app_version=?",
+                        (str(race_key),ver)
+                    ).fetchone()[0] or 0)
+                if n>=6:
+                    result["saved_races"]+=1
+                    continue
+                save=_v284_save_transition_audit(db_path,str(race_key),wall)
+                if save.get("ok"):
+                    result["saved_races"]+=1
+                elif len(result["errors"])<8:
+                    result["errors"].append(f"{race_key}: {save.get('reason','保存失敗')}")
+            except Exception as exc:
+                if len(result["errors"])<8:
+                    result["errors"].append(f"{race_key}: {type(exc).__name__}: {exc}")
+        result["ok"]=(len(result["errors"])==0)
+        return result
+    except Exception as exc:
+        result["errors"].append(f"{type(exc).__name__}: {exc}")
+        return result
+
+
+def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool, resume_done_offset: int = 0, resume_total_target: int = 0) -> None:
     try:
         _v278_bg_update(
             db_path, job_id,
@@ -2339,12 +2417,19 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             message="対象レースを整理しています。"
         )
         def _progress(done,total,label):
+            _done_raw=int(done or 0)
+            _total_raw=int(total or 0)
+            _done_show=int(resume_done_offset or 0)+_done_raw
+            _total_show=int(resume_total_target or 0)
+            if _total_show <= 0:
+                _total_show=int(resume_done_offset or 0)+_total_raw
+            _total_show=max(_total_show,_done_show)
             _v278_bg_update(
                 db_path, job_id,
-                done_count=int(done or 0),
-                total_count=int(total or 0),
+                done_count=_done_show,
+                total_count=_total_show,
                 current_label=str(label or ""),
-                message=f"{int(done or 0)}/{int(total or 0)}｜{str(label or '')}"
+                message=f"{_done_show}/{_total_show}｜{str(label or '')}"
             )
 
         result=_v262_batch_rerun_saved_histories(
@@ -2355,6 +2440,13 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             cancel_cb=lambda: _v278_bg_cancel_requested(db_path,job_id),
             pause_cb=lambda: _v278_bg_pause_loop(db_path,job_id),
         )
+        # Ver284 hotfix: 各レースの最新payloadには監査集計が保存されているため、
+        # batch終了時（停止時を含む）に必ず監査3表へ同期する。
+        _audit_backfill284=_v284_backfill_transition_audit_from_latest_histories(
+            db_path,str(globals().get("_V231_APP_VERSION") or "Ver284")
+        )
+        result["v284_audit_backfill"]=_audit_backfill284
+        result["v284_transition_audit_saved_races"]=int(_audit_backfill284.get("saved_races") or 0)
         cancelled=bool(result.get("cancelled")) or _v278_bg_cancel_requested(db_path,job_id)
         blob=zlib.compress(pickle.dumps(result,protocol=pickle.HIGHEST_PROTOCOL),level=6)
         _v278_bg_update(
@@ -2364,7 +2456,10 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             current_label="",
             message=(
                 "停止しました。処理済みレースは保存されています。"
-                if cancelled else str(result.get("message") or "完了しました。")
+                if cancelled else (
+                    str(result.get("message") or "完了しました。")
+                    + f" / Ver284展開監査DB保存{int(result.get('v284_transition_audit_saved_races') or 0)}R"
+                )
             ),
             result_blob=sqlite3.Binary(blob),
         )
@@ -2392,15 +2487,18 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
         return {"ok":False,"reason":"すでにバックグラウンド再シミュレーションが動いています。"}
     now=_v228_now_jst_iso()
     try:
-        _hist278=_v231_list_prediction_histories(db_path,max(1,int(limit_count)))
-        _seen278=set()
-        _approx_total278=0
-        for _h278 in _hist278:
-            _rk278=str(_h278.get("race_key") or "").strip()
-            if not _rk278 or _rk278 in _seen278:
-                continue
-            _seen278.add(_rk278)
-            _approx_total278+=1
+        _v231_ensure_prediction_history_table(db_path)
+        with sqlite3.connect(str(db_path),timeout=30.0) as _con278:
+            _approx_total278=int(_con278.execute("""
+                SELECT COUNT(*) FROM (
+                    SELECT race_key
+                    FROM v231_prediction_history
+                    WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+                    GROUP BY race_key
+                    ORDER BY MAX(history_id) DESC
+                    LIMIT ?
+                )
+            """,(max(1,int(limit_count)),)).fetchone()[0] or 0)
     except Exception:
         _approx_total278=0
     with sqlite3.connect(str(db_path), timeout=30.0) as con:
@@ -2434,6 +2532,223 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
     th.start()
     return {"ok":True,"job_id":job_id}
 
+
+
+
+
+# Ver290 hotfix4: 途中jobを捨てて「最初から」やり直すための安全な再スタート。
+# 既にVer290で正常保存済みのレースは再計算しないので、結果の重複は作らない。
+def _v290_restart_batch_clean(db_path: str, limit_count: int = 80) -> dict:
+    try:
+        _v278_bg_ensure_table(db_path)
+        now=_v228_now_jst_iso()
+
+        # 既存のbatch jobをすべて停止扱いへ。
+        with sqlite3.connect(str(db_path),timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            con.execute("""
+                UPDATE v278_background_jobs
+                   SET status='cancelled',
+                       cancel_requested=1,
+                       pause_requested=0,
+                       finished_at=?,
+                       message='Ver290クリーン再スタートのため旧jobを終了',
+                       updated_at=?
+                 WHERE job_type='batch_rerun'
+                   AND status IN ('queued','running','pause_requested','paused','cancel_requested')
+            """,(now,now))
+            con.commit()
+
+        # 同一プロセス内に残るthread参照も破棄。
+        try:
+            with _V278_BG_LOCK:
+                _V278_BG_THREADS.clear()
+        except Exception:
+            pass
+
+        # 新jobを「force_current=False」で開始。
+        # これによりVer290で6周+監査まで保存済みのレースは自動スキップし、
+        # 未完了レースだけを最初から順にやり直す。
+        result=_v278_bg_start(str(db_path),int(limit_count),False)
+        if result.get("ok"):
+            return {
+                "ok":True,
+                "job_id":int(result.get("job_id") or 0),
+                "message":"旧jobを破棄し、Ver290保存済みを除外して最初から再シミュレーションを開始しました。"
+            }
+        return {"ok":False,"reason":str(result.get("reason") or "開始失敗")}
+    except Exception as exc:
+        return {"ok":False,"reason":f"{type(exc).__name__}: {exc}"}
+
+# Ver290 hotfix3: BG heartbeat / stale recovery.
+def _v290_parse_job_time(value) -> float:
+    try:
+        s=str(value or "").strip()
+        if not s:
+            return 0.0
+        dt=datetime.fromisoformat(s.replace("Z","+00:00"))
+        if dt.tzinfo is None:
+            dt=dt.replace(tzinfo=_V228_JST)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+def _v290_spawn_recovery_worker(db_path: str, old_job: dict, reason: str) -> dict:
+    """Old jobを打切り、新jobで保存済みVer290を除いた残りだけ再開する。"""
+    try:
+        jid_old=int(old_job.get("job_id") or 0)
+        done0=int(old_job.get("done_count") or 0)
+        total0=int(old_job.get("total_count") or 0)
+        limit0=max(1,int(old_job.get("limit_count") or total0 or 80))
+
+        # 古いjobは以後UIの「実行中」判定から外す。万一旧threadが戻ってもcancel_requestedを見て終了する。
+        with sqlite3.connect(str(db_path),timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            con.execute("""
+                UPDATE v278_background_jobs
+                   SET status='cancelled',
+                       cancel_requested=1,
+                       pause_requested=0,
+                       finished_at=?,
+                       message=?,
+                       updated_at=?
+                 WHERE job_id=?
+            """,(
+                _v228_now_jst_iso(),
+                "停止状態を検知したため新しいjobへ引継ぎ: "+str(reason),
+                _v228_now_jst_iso(),
+                jid_old
+            ))
+            con.commit()
+
+        now=_v228_now_jst_iso()
+        with sqlite3.connect(str(db_path),timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            cur=con.execute("""
+                INSERT INTO v278_background_jobs(
+                    job_type,app_version,status,created_at,updated_at,started_at,
+                    limit_count,force_current,done_count,total_count,current_label,message
+                ) VALUES ('batch_rerun',?,'running',?,?,?,?,0,?,?,?,?)
+            """,(
+                str(_V231_APP_VERSION),now,now,now,limit0,
+                done0,total0,str(old_job.get("current_label") or ""),
+                f"{done0}/{total0}から残りを自動再開しました。"
+            ))
+            con.commit()
+            jid_new=int(cur.lastrowid or 0)
+
+        th=threading.Thread(
+            target=_v278_bg_worker,
+            args=(str(db_path),jid_new,limit0,False,done0,total0),
+            daemon=True,
+            name=f"autorace-bg-rerun-recover-{jid_new}",
+        )
+        with _V278_BG_LOCK:
+            _V278_BG_THREADS[jid_new]=th
+        th.start()
+        return {"ok":True,"action":"restarted","old_job_id":jid_old,"job_id":jid_new,"done":done0,"total":total0,"reason":reason}
+    except Exception as exc:
+        return {"ok":False,"action":"error","reason":f"{type(exc).__name__}: {exc}"}
+
+def _v290_recover_orphaned_batch_job(db_path: str, stale_seconds: float = 90.0) -> dict:
+    try:
+        _v278_bg_ensure_table(db_path)
+        with sqlite3.connect(str(db_path),timeout=0.8) as con:
+            con.row_factory=sqlite3.Row
+            con.execute("PRAGMA busy_timeout=800")
+            row=con.execute("""
+                SELECT *
+                  FROM v278_background_jobs
+                 WHERE job_type='batch_rerun'
+                   AND status IN ('queued','running','pause_requested','paused','cancel_requested')
+                 ORDER BY job_id DESC
+                 LIMIT 1
+            """).fetchone()
+        if not row:
+            return {"ok":True,"action":"none"}
+
+        job=dict(row)
+        jid=int(job.get("job_id") or 0)
+        if not jid:
+            return {"ok":True,"action":"none"}
+
+        th=None
+        try:
+            with _V278_BG_LOCK:
+                th=_V278_BG_THREADS.get(jid)
+        except Exception:
+            th=None
+        alive=bool(th is not None and getattr(th,"is_alive",lambda:False)())
+
+        updated_ts=_v290_parse_job_time(job.get("updated_at"))
+        age=max(0.0,time_module.time()-updated_ts) if updated_ts else 999999.0
+
+        # threadが無いなら即復旧。threadがあっても進捗DB更新が150秒以上無ければstale扱い。
+        if not alive:
+            return _v290_spawn_recovery_worker(db_path,job,"実行threadが存在しません")
+        if age >= float(stale_seconds):
+            return _v290_spawn_recovery_worker(db_path,job,f"進捗更新が{int(age)}秒ありません")
+
+        return {"ok":True,"action":"alive","job_id":jid,"age_seconds":round(age,1)}
+    except Exception as exc:
+        return {"ok":False,"action":"error","reason":f"{type(exc).__name__}: {exc}"}
+
+# Ver290 hotfix5: 自動復旧・自動再開は行わない。停止後の再開はユーザー操作に限定。
+_v290_orphan_recovery={"ok":True,"action":"manual_control"}
+
+
+def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
+    """停止済み/停止要求済みjobを、ユーザー操作時だけ残りから再開する。"""
+    try:
+        if not isinstance(job,dict) or not job:
+            return {"ok":False,"reason":"再開対象jobがありません。"}
+        old_jid=int(job.get("job_id") or 0)
+        done0=int(job.get("done_count") or 0)
+        total0=int(job.get("total_count") or 0)
+        limit0=max(1,int(job.get("limit_count") or total0 or 80))
+        now=_v228_now_jst_iso()
+
+        with sqlite3.connect(str(db_path),timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            con.execute("""
+                UPDATE v278_background_jobs
+                   SET status='cancelled',
+                       cancel_requested=1,
+                       pause_requested=0,
+                       finished_at=COALESCE(finished_at,?),
+                       message='手動再開のため新しいjobへ引継ぎ',
+                       updated_at=?
+                 WHERE job_id=?
+            """,(now,now,old_jid))
+            con.commit()
+
+        with sqlite3.connect(str(db_path),timeout=1.0) as con:
+            con.execute("PRAGMA busy_timeout=1000")
+            cur=con.execute("""
+                INSERT INTO v278_background_jobs(
+                    job_type,app_version,status,created_at,updated_at,started_at,
+                    limit_count,force_current,done_count,total_count,current_label,message
+                ) VALUES ('batch_rerun',?,'running',?,?,?,?,0,?,?,?,?)
+            """,(
+                str(_V231_APP_VERSION),now,now,now,limit0,
+                done0,total0,str(job.get("current_label") or ""),
+                f"{done0}/{total0}から手動再開しました。"
+            ))
+            con.commit()
+            new_jid=int(cur.lastrowid or 0)
+
+        th=threading.Thread(
+            target=_v278_bg_worker,
+            args=(str(db_path),new_jid,limit0,False,done0,total0),
+            daemon=True,
+            name=f"autorace-bg-rerun-manual-resume-{new_jid}",
+        )
+        with _V278_BG_LOCK:
+            _V278_BG_THREADS[new_jid]=th
+        th.start()
+        return {"ok":True,"job_id":new_jid,"done":done0,"total":total0}
+    except Exception as exc:
+        return {"ok":False,"reason":f"{type(exc).__name__}: {exc}"}
 
 
 # Ver279: 通常1R予測をStreamlit描画スレッドから分離してバックグラウンド実行する。
@@ -2482,6 +2797,139 @@ def _v279_bg_prediction_any_active(db_path: str) -> bool:
         return bool(int(row[0] or 0))
     except Exception:
         return False
+
+
+
+
+def _v284_apply_simulation_joint_ranks(df: pd.DataFrame, audit: dict) -> pd.DataFrame:
+    """6周展開シミュレーションの共同分布を最終順位として採用する。"""
+    try:
+        if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(audit,dict):
+            return df
+        car_col="車" if "車" in df.columns else ("車番" if "車番" in df.columns else None)
+        if car_col is None:
+            return df
+        expected=audit.get("finish_expected_rank") or {}
+        tops=audit.get("top_scenarios") or []
+        joint=[]
+        if tops:
+            joint=[int(x) for x in str(tops[0].get("combo") or "").split("-") if str(x).strip().isdigit()]
+        cars=[int(x) for x in pd.to_numeric(df[car_col],errors="coerce").dropna().astype(int).tolist()]
+        if len(joint)<3:
+            joint=sorted(cars,key=lambda c:(float(expected.get(str(c),99.0)),c))[:3]
+        rest=sorted([c for c in cars if c not in joint],
+                    key=lambda c:(float(expected.get(str(c),99.0)),c))
+        order=joint[:3]+rest
+        rank_map={c:i+1 for i,c in enumerate(order)}
+        out=df.copy()
+        out["Ver284_展開最終順位"]=pd.to_numeric(out[car_col],errors="coerce").map(
+            lambda x: rank_map.get(int(x),99) if pd.notna(x) else 99
+        )
+        out["Ver284_展開平均着順"]=pd.to_numeric(out[car_col],errors="coerce").map(
+            lambda x: round(float(expected.get(str(int(x)),99.0)),3) if pd.notna(x) else 99.0
+        )
+        out["改善後順位"]=out["Ver284_展開最終順位"].astype(int)
+        out["順位整合メモ"]="Ver284:6周展開共同分布を最終結果として採用"
+        return out
+    except Exception:
+        return df
+
+
+def _v283_apply_top3_priority_ranks(df: pd.DataFrame) -> pd.DataFrame:
+    """1～3着を目的にしたVer283最終順位整合。
+
+    - 1位はVer196の本番1着率1位を固定（勝者予測を壊さない）
+    - 2・3位候補は本番3着内率の上位から選ぶ
+    - 2位/3位の順序は推定2着率（本番連対率-本番1着率）を優先
+    - 4位以下は従来の改善後順位の相対順を維持
+    """
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        required = {"車", "改善後順位", "本番1着率", "本番3着内率"}
+        if not required.issubset(set(df.columns)):
+            return df
+
+        out = df.copy()
+        _cars = pd.to_numeric(out["車"], errors="coerce")
+        _rank = pd.to_numeric(out["改善後順位"], errors="coerce")
+        _win = pd.to_numeric(out["本番1着率"], errors="coerce").fillna(-1.0)
+        _top3 = pd.to_numeric(out["本番3着内率"], errors="coerce").fillna(-1.0)
+        if "本番連対率" in out.columns:
+            _place2 = (
+                pd.to_numeric(out["本番連対率"], errors="coerce").fillna(0.0)
+                - pd.to_numeric(out["本番1着率"], errors="coerce").fillna(0.0)
+            ).clip(lower=0.0)
+        else:
+            _place2 = _top3.clip(lower=0.0) - _win.clip(lower=0.0)
+
+        valid_idx = [
+            i for i in out.index
+            if pd.notna(_cars.loc[i]) and pd.notna(_rank.loc[i])
+        ]
+        if len(valid_idx) < 3:
+            return out
+
+        # Ver196の1位を維持。万一rank=1が無ければ本番1着率最大。
+        rank1 = [i for i in valid_idx if int(_rank.loc[i]) == 1]
+        if rank1:
+            winner_idx = rank1[0]
+        else:
+            winner_idx = max(valid_idx, key=lambda i: (float(_win.loc[i]), float(_top3.loc[i]), -int(_cars.loc[i])))
+
+        # 2・3着候補は3着内率を主軸に2台だけ選ぶ。
+        remaining = [i for i in valid_idx if i != winner_idx]
+        top3_candidates = sorted(
+            remaining,
+            key=lambda i: (
+                -float(_top3.loc[i]),
+                -float(_place2.loc[i]),
+                -float(_win.loc[i]),
+                int(_cars.loc[i]),
+            )
+        )[:2]
+
+        # 2着率を優先して2位/3位を並べる。
+        top3_candidates = sorted(
+            top3_candidates,
+            key=lambda i: (
+                -float(_place2.loc[i]),
+                -float(_win.loc[i]),
+                -float(_top3.loc[i]),
+                int(_cars.loc[i]),
+            )
+        )
+
+        first3 = [winner_idx] + top3_candidates
+
+        # 4着以下はVer196の既存順位をそのまま相対維持。
+        rest = sorted(
+            [i for i in valid_idx if i not in set(first3)],
+            key=lambda i: (float(_rank.loc[i]), int(_cars.loc[i]))
+        )
+        ordered = first3 + rest
+
+        new_rank = {idx: pos + 1 for pos, idx in enumerate(ordered)}
+        out["Ver283_TOP3優先前順位"] = _rank
+        out["Ver283_推定2着率"] = _place2.round(3)
+        out["Ver283_TOP3候補"] = False
+        for idx in first3:
+            out.loc[idx, "Ver283_TOP3候補"] = True
+        for idx, rank_no in new_rank.items():
+            out.loc[idx, "改善後順位"] = int(rank_no)
+
+        if "順位整合メモ" in out.columns:
+            old_note = out["順位整合メモ"].fillna("").astype(str)
+            out["順位整合メモ"] = old_note.apply(
+                lambda x: (x + " / " if x else "") + "Ver283:1着固定＋TOP3優先"
+            )
+        else:
+            out["順位整合メモ"] = "Ver283:1着固定＋TOP3優先"
+
+        return out
+    except Exception:
+        # 安全側: 何かあればVer196順位をそのまま使う。
+        return df
 
 
 def _v279_send_bg_prediction_complete_notification(result: dict) -> None:
@@ -2538,6 +2986,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
 
             meta=dict(meta or {})
             df,bets,wall_audit=_v230_six_lap_simulation(df,bets,entries,meta,trials,seed)
+            # 単発バックグラウンド予測の進捗はv278_background_jobsへ直接更新する。
             meta["壁補正監査"]=wall_audit
             meta["6周展開シミュレーション"]=wall_audit
             _t1=time_module.perf_counter()
@@ -2545,7 +2994,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
 
             finish_prob=engine.v30_finish_probabilities(df,bets,trials)
             _v273_audit_keep={c:df[c].copy() for c in df.columns if str(c).startswith("Ver273_")}
-            df=engine.v196_apply_probability_aligned_ranks(df,finish_prob)
+            df = _v284_apply_simulation_joint_ranks(df, wall_audit)
             for _c273,_s273 in _v273_audit_keep.items():
                 try:
                     if len(_s273)==len(df):
@@ -2689,8 +3138,33 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         "roi_cost_yen":0,"roi_payout_yen":0,"roi_hits":0,"roi_rows":[],
         "roi_plus_cost_yen":0,"roi_plus_payout_yen":0,"roi_plus_extra_points":0,
     }
-    histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
-    # 同じレースの旧バージョンが複数あっても、入力復元元は最新1件だけ使う。
+    # Ver289 hotfix:
+    # limitは「履歴行数」ではなく「重複を除いたレース数」として扱う。
+    # 旧実装は最新limit件の履歴行だけ取得してからrace_key重複除去していたため、
+    # Ver284/285/286/287/288など同一レースの複数版が増えるほど
+    # 80指定でも30R程度まで候補が縮むことがあった。
+    try:
+        _v231_ensure_prediction_history_table(db_path)
+        with sqlite3.connect(str(db_path),timeout=30.0) as _con289:
+            _con289.row_factory=sqlite3.Row
+            _rows289=_con289.execute("""
+                SELECT h.history_id,h.race_key,h.race_label,h.app_version,h.simulation_mode,
+                       h.settings_hash,h.prediction_time,h.trials,h.seed
+                FROM v231_prediction_history h
+                JOIN (
+                    SELECT race_key,MAX(history_id) AS max_history_id
+                    FROM v231_prediction_history
+                    WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+                    GROUP BY race_key
+                ) x ON h.history_id=x.max_history_id
+                ORDER BY h.prediction_time DESC,h.history_id DESC
+                LIMIT ?
+            """,(max(1,int(limit)),)).fetchall()
+        histories=[dict(r) for r in _rows289]
+    except Exception:
+        histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
+
+    # 既にSQL側でrace_keyごと最新1件だが、旧DB/フォールバック時の安全用に重複除去。
     unique=[]; seen=set()
     for h in histories:
         rk=str(h.get('race_key') or '').strip()
@@ -2787,6 +3261,16 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 pass
     except Exception:
         current_keys=set(); current_complete_keys=set(); current_audit_complete_keys=set()
+    # Ver290 hotfix3:
+    # 現行Verで6周+監査まで完全保存済みのレースは、ループ前に候補から除外する。
+    # 再起動復旧時に「11/57から再開」したのに先頭11Rをもう一度数える問題を防ぐ。
+    if not force_current:
+        _already_complete290=set(current_complete_keys) & set(current_audit_complete_keys)
+        if _already_complete290:
+            _before290=len(unique)
+            unique=[h for h in unique if str(h.get('race_key') or '').strip() not in _already_complete290]
+            out['skipped_current'] += int(_before290-len(unique))
+    total=len(unique)
     out['prepare_seconds_v276']=round(time_module.perf_counter()-_prep_t0_v276,3)
     _run_t0_v276=time_module.perf_counter()
     for idx,h in enumerate(unique,1):
@@ -2829,7 +3313,11 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             prediction_text=str(raw_text)
             if str(venue_override or '').strip():
                 prediction_text=f"開催場: {str(venue_override).strip()}\n"+prediction_text
+            if callable(progress_cb):
+                progress_cb(idx-1,total,label+"｜①基礎予測中")
             df,bets,output,entries,meta=engine.ver16_run_prediction(prediction_text,trials,seed,manual_excluded=excluded)
+            if callable(progress_cb):
+                progress_cb(idx-1,total,label+"｜②6周展開中")
             entries=_v276_mark_retrial_from_prediction_text(entries,prediction_text)
             df=_v276_copy_retrial_to_prediction_df(df,entries)
             meta=dict(meta or {})
@@ -2840,7 +3328,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             _v273_audit_keep={
                 c:df[c].copy() for c in df.columns if str(c).startswith("Ver273_")
             }
-            df=engine.v196_apply_probability_aligned_ranks(df,finish_prob)
+            df = _v284_apply_simulation_joint_ranks(df, wall_audit)
             for _c273,_s273 in _v273_audit_keep.items():
                 try:
                     if len(_s273)==len(df):
@@ -2860,6 +3348,8 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 'batch_rerun':True,'walk_forward_v269':True,
             }
             hid=_v231_save_prediction_history(db_path,race_key,raw_text,venue_override,prediction_view,trials,seed)
+            if callable(progress_cb):
+                progress_cb(idx-1,total,label+"｜④周回保存中")
             _v222_save_prediction_restore(db_path,race_key,raw_text,venue_override,prediction_view)
             # 一括再シミュレーションした予測は、同じ現行Verで1〜6周の代表隊列も必ず保存する。
             snap=_v260_snapshot_from_saved_view(db_path,prediction_view,current_ver)
@@ -2868,6 +3358,8 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
 
             # Ver272: 過去レースの仮想100円均等・回収率採点。
             # 保存済み最古オッズを全バージョン共通で使い、結果/払戻は採点にだけ使用する。
+            if callable(progress_cb):
+                progress_cb(idx-1,total,label+"｜⑤回収率採点中")
             _roi273=_v273_virtual_roi_score(
                 db_path, race_key, bets, trials, meta, current_ver
             )
@@ -3883,6 +4375,273 @@ def _v255_save_backtest_report(db_path: str, result: dict) -> int | None:
         return None
 
 
+
+# Ver292: ハンデ跨ぎの「小さい試走優位」を全登録結果から自動較正する。
+# 同ハンデ（横並び）はこのゲートの対象外。
+_V292_TRIAL_GAP_GATE_CACHE = {}
+
+def _v292_trial_gap_gate_calibration(
+    db_path: str | None = None,
+    cutoff_date: str = "",
+    cutoff_race_no: int = 0,
+) -> dict:
+    """結果登録済みの全開催場データから、小試走差ゲート強度を自動更新する。
+
+    - 対象: 後方ハンデ車の試走が前方車より速いが、その差が0.01秒未満のペア
+    - 同ハンデは対象外
+    - backtest時は対象レース以前だけを使用し、未来結果の混入を防ぐ
+    - Beta(20,20)事前分布で全体へ縮小し、少数サンプルで極端にならない
+    - posterior P(後方車先着率 > 50%) を [0.25,1.00] の補正倍率へ変換
+    """
+    path=str(db_path or _v230_db_path())
+    cutoff=str(cutoff_date or "").strip()[:10]
+    race_no=int(cutoff_race_no or 0)
+    try:
+        stamp=(path,int(Path(path).stat().st_mtime_ns),cutoff,race_no)
+    except Exception:
+        stamp=(path,0,cutoff,race_no)
+    if stamp in _V292_TRIAL_GAP_GATE_CACHE:
+        return dict(_V292_TRIAL_GAP_GATE_CACHE[stamp])
+
+    out={
+        "enabled":False,
+        "threshold":0.010,
+        "small_gap_scale":0.35,
+        "samples":0,
+        "wins":0,
+        "raw_rate":None,
+        "posterior_mean":0.50,
+        "posterior_p_gt_half":0.50,
+        "reason":"学習データ不足のため安全側固定値",
+    }
+
+    try:
+        with sqlite3.connect(path,timeout=8.0) as con:
+            con.execute("PRAGMA busy_timeout=8000")
+            q="""
+                SELECT rr.race_key, rr.race_date, rr.race_no,
+                       re.car_no, re.finish, re.trial_time, re.handicap,
+                       COALESCE(re.result_status,'通常') AS result_status
+                FROM result_races rr
+                JOIN result_entries re ON re.race_key=rr.race_key
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                  AND re.finish IS NOT NULL
+                  AND re.trial_time IS NOT NULL
+                  AND COALESCE(re.result_status,'通常') NOT IN (
+                      '欠車','出走取消','発走除外','競走除外',
+                      '落車','競走中止','失格','反則','反妨','周誤','周回誤認'
+                  )
+            """
+            params=[]
+            if cutoff:
+                if race_no>0:
+                    q += """ AND (
+                        substr(rr.race_date,1,10) < substr(?,1,10)
+                        OR (
+                            substr(rr.race_date,1,10) = substr(?,1,10)
+                            AND CAST(REPLACE(REPLACE(COALESCE(rr.race_no,''),'R',''),'r','') AS INTEGER) < ?
+                        )
+                    )"""
+                    params.extend([cutoff,cutoff,race_no])
+                else:
+                    q += " AND substr(rr.race_date,1,10) < substr(?,1,10)"
+                    params.append(cutoff)
+            rows=con.execute(q,params).fetchall()
+    except Exception as exc:
+        out["reason"]=f"読込失敗: {type(exc).__name__}: {exc}"
+        _V292_TRIAL_GAP_GATE_CACHE[stamp]=dict(out)
+        return out
+
+    grouped={}
+    for rk,rd,rn,car,finish,trial,h,status in rows:
+        try:
+            m=re.search(r"-?\d+",str(h if h is not None else "0"))
+            hv=float(m.group()) if m else 0.0
+            fv=float(finish)
+            tv=float(trial)
+            if not (np.isfinite(hv) and np.isfinite(fv) and np.isfinite(tv)):
+                continue
+            grouped.setdefault(str(rk),[]).append((hv,fv,tv))
+        except Exception:
+            continue
+
+    wins=0
+    samples=0
+    threshold=0.010
+    for _,g in grouped.items():
+        for rear_h,rear_finish,rear_trial in g:
+            for front_h,front_finish,front_trial in g:
+                if rear_h <= front_h:
+                    continue
+                adv=float(front_trial-rear_trial)  # 正なら後方車の試走が速い
+                if not (0.0 < adv < threshold):
+                    continue
+                samples += 1
+                if rear_finish < front_finish:
+                    wins += 1
+
+    out["samples"]=int(samples)
+    out["wins"]=int(wins)
+    out["raw_rate"]=(float(wins/samples) if samples else None)
+
+    # 現状のDB151では180件超ある。将来DBが小さくても60ペア未満では学習値を使わない。
+    if samples < 60:
+        out["reason"]=f"小試走差ペア{samples}件（60件未満）のため安全側固定値"
+        _V292_TRIAL_GAP_GATE_CACHE[stamp]=dict(out)
+        return out
+
+    # Beta(20,20): 先着率50%を中心に40件分の中立事前分布。
+    alpha=20.0+float(wins)
+    beta=20.0+float(samples-wins)
+    total=alpha+beta
+    mean=alpha/total
+    var=(alpha*beta)/((total**2)*(total+1.0))
+    sd=math.sqrt(max(var,1e-12))
+    z=(mean-0.5)/sd
+    p_gt=0.5*(1.0+math.erf(z/math.sqrt(2.0)))
+
+    # 「小差なのに本当に後方車先着が50%超と言える確率」をそのまま強度へ。
+    # 完全無効にはせず、最低25%は残して試走/ST/履歴の複合proxyを尊重する。
+    scale=float(np.clip(0.25+0.75*p_gt,0.25,1.00))
+
+    out.update({
+        "enabled":True,
+        "small_gap_scale":scale,
+        "posterior_mean":float(mean),
+        "posterior_p_gt_half":float(p_gt),
+        "reason":"全登録結果から自動較正",
+        "races":int(len(grouped)),
+    })
+    _V292_TRIAL_GAP_GATE_CACHE[stamp]=dict(out)
+    return out
+
+
+
+# Ver294: 小さい試走差 + 前車ST優位の「前残り」を全結果から自動較正。
+# 同ハンデは対象外。backtest時は未来結果を使わない。
+_V294_FRONT_ST_GUARD_CACHE = {}
+
+def _v294_front_st_guard_calibration(
+    db_path: str | None = None,
+    cutoff_date: str = "",
+    cutoff_race_no: int = 0,
+) -> dict:
+    path=str(db_path or _v230_db_path())
+    cutoff=str(cutoff_date or "").strip()[:10]
+    race_no=int(cutoff_race_no or 0)
+    try:
+        stamp=(path,int(Path(path).stat().st_mtime_ns),cutoff,race_no)
+    except Exception:
+        stamp=(path,0,cutoff,race_no)
+    if stamp in _V294_FRONT_ST_GUARD_CACHE:
+        return dict(_V294_FRONT_ST_GUARD_CACHE[stamp])
+
+    out={
+        "enabled":False,
+        "trial_gap_max":0.010,
+        "front_st_adv_min":0.020,
+        "guard_logit":0.035,
+        "samples":0,
+        "front_wins":0,
+        "raw_rate":None,
+        "posterior_mean":0.50,
+        "reason":"学習データ不足のため固定弱補正",
+    }
+
+    try:
+        with sqlite3.connect(path,timeout=8.0) as con:
+            con.execute("PRAGMA busy_timeout=8000")
+            q="""
+                SELECT rr.race_key, rr.race_date, rr.race_no,
+                       re.finish, re.trial_time, re.start_time, re.handicap,
+                       COALESCE(re.result_status,'通常')
+                FROM result_races rr
+                JOIN result_entries re ON re.race_key=rr.race_key
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                  AND re.finish IS NOT NULL
+                  AND re.trial_time IS NOT NULL
+                  AND re.start_time IS NOT NULL
+                  AND COALESCE(re.result_status,'通常') NOT IN (
+                      '欠車','出走取消','発走除外','競走除外',
+                      '落車','競走中止','失格','反則','反妨','周誤','周回誤認'
+                  )
+            """
+            params=[]
+            if cutoff:
+                if race_no>0:
+                    q += """ AND (
+                        substr(rr.race_date,1,10) < substr(?,1,10)
+                        OR (
+                            substr(rr.race_date,1,10)=substr(?,1,10)
+                            AND CAST(REPLACE(REPLACE(COALESCE(rr.race_no,''),'R',''),'r','') AS INTEGER) < ?
+                        )
+                    )"""
+                    params.extend([cutoff,cutoff,race_no])
+                else:
+                    q += " AND substr(rr.race_date,1,10) < substr(?,1,10)"
+                    params.append(cutoff)
+            rows=con.execute(q,params).fetchall()
+    except Exception as exc:
+        out["reason"]=f"読込失敗: {type(exc).__name__}: {exc}"
+        _V294_FRONT_ST_GUARD_CACHE[stamp]=dict(out)
+        return out
+
+    grouped={}
+    for rk,rd,rn,finish,trial,st,h,status in rows:
+        try:
+            m=re.search(r"-?\d+",str(h if h is not None else "0"))
+            hv=float(m.group()) if m else 0.0
+            grouped.setdefault(str(rk),[]).append((hv,float(finish),float(trial),float(st)))
+        except Exception:
+            continue
+
+    samples=0
+    front_wins=0
+    gap_max=float(out["trial_gap_max"])
+    st_min=float(out["front_st_adv_min"])
+
+    for g in grouped.values():
+        for rear_h,rear_finish,rear_trial,rear_st in g:
+            for front_h,front_finish,front_trial,front_st in g:
+                if rear_h <= front_h:
+                    continue
+                trial_adv=float(front_trial-rear_trial)   # 後方車の試走優位
+                front_st_adv=float(rear_st-front_st)      # 前車のST優位
+                if not (0.0 < trial_adv < gap_max):
+                    continue
+                if front_st_adv < st_min:
+                    continue
+                samples += 1
+                if front_finish < rear_finish:
+                    front_wins += 1
+
+    out["samples"]=int(samples)
+    out["front_wins"]=int(front_wins)
+    out["raw_rate"]=(float(front_wins/samples) if samples else None)
+
+    if samples < 40:
+        out["reason"]=f"対象{samples}ペア（40件未満）のため固定弱補正"
+        _V294_FRONT_ST_GUARD_CACHE[stamp]=dict(out)
+        return out
+
+    # Beta(20,20)で50%へ縮小。前残り優位が強いほどlogit guardを最大0.055まで強化。
+    alpha=20.0+front_wins
+    beta=20.0+(samples-front_wins)
+    mean=alpha/(alpha+beta)
+    strength=float(np.clip((mean-0.50)/0.18,0.0,1.0))
+    guard=float(0.020+0.035*strength)
+
+    out.update({
+        "enabled":True,
+        "posterior_mean":float(mean),
+        "guard_logit":guard,
+        "reason":"全登録結果から自動較正",
+        "races":int(len(grouped)),
+    })
+    _V294_FRONT_ST_GUARD_CACHE[stamp]=dict(out)
+    return out
+
+
 # Ver250: 前方集団残存・周回内連続追抜制限・ハンデ差別の壁を開催日前実績だけで自動学習する。
 _V250_FLOW_CALIBRATION_CACHE = {}
 
@@ -4808,6 +5567,271 @@ def _v276_copy_retrial_to_prediction_df(df, entries):
     except Exception:
         return df
 
+
+# Ver287: DB138のVer284・56R監査から確定した固定基準補正。
+# 個別レース結果への後掛けではなく、同展開型×周回の系統誤差を標準ルール化。
+_V289_FIXED_TRANSITION_LOGIT = {'後半追込型|3': -0.146885, '後半追込型|4': -0.055082, '後半追込型|5': 0.073443, '後半追込型|6': 0.110164, '早仕掛け型|3': 0.214286, '早仕掛け型|4': 0.128571, '早仕掛け型|5': 0.185714, '早仕掛け型|6': 0.0, '波乱型|3': -0.199745, '波乱型|4': 0.005548, '波乱型|5': 0.355102, '波乱型|6': -0.133163}
+_V289_DYNAMIC_RATIO = 0.25  # 新規履歴による微調整は固定基準の補助に限定
+
+_V285_SAME_SCENARIO_CACHE = globals().get("_V285_SAME_SCENARIO_CACHE", {})
+
+
+def _v287_ensure_global_transition_calibration_table(db_path: str) -> None:
+    with sqlite3.connect(str(db_path),timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS v287_global_transition_calibration (
+            scenario_type TEXT NOT NULL,
+            lap_no INTEGER NOT NULL,
+            sample_races INTEGER NOT NULL DEFAULT 0,
+            sample_pairs INTEGER NOT NULL DEFAULT 0,
+            sim_flip_rate REAL NOT NULL DEFAULT 0,
+            actual_flip_rate REAL NOT NULL DEFAULT 0,
+            residual REAL NOT NULL DEFAULT 0,
+            dynamic_logit REAL NOT NULL DEFAULT 0,
+            recalculated_at TEXT NOT NULL,
+            PRIMARY KEY(scenario_type,lap_no)
+        )
+        """)
+        con.commit()
+
+
+def _v287_recalculate_global_transition_calibration(db_path: str) -> dict:
+    """結果登録後、登録済み全体から動的微調整値を再計算して保存する。
+
+    直前に登録した1Rだけでは更新しない。
+    保存済みVer284監査のうち実測周回比較が存在する全レースを毎回再集計する。
+    事故等で学習対象外になったレースは、実測周回比較が監査に無ければ自然に除外される。
+    """
+    out={"ok":False,"source_races":0,"calibrations":0,"details":[],"reason":""}
+    try:
+        _v287_ensure_global_transition_calibration_table(db_path)
+        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            rows=con.execute("""
+                SELECT h.race_key,h.payload
+                FROM v231_prediction_history h
+                JOIN (
+                    SELECT race_key,MAX(history_id) AS mid
+                    FROM v231_prediction_history
+                    WHERE app_version='Ver284'
+                    GROUP BY race_key
+                ) x ON h.history_id=x.mid
+            """).fetchall()
+
+        from collections import defaultdict
+        import itertools
+        agg=defaultdict(lambda:{"sim":0,"actual":0,"pairs":0,"races":set()})
+        used_races=set()
+        for race_key,payload in rows:
+            try:
+                obj=pickle.loads(zlib.decompress(payload))
+                meta=(obj or {}).get("meta") or {}
+                audit=meta.get("6周展開シミュレーション") or meta.get("壁補正監査") or {}
+                actual_s=str(audit.get("actual_scenario_v263") or "")
+                if actual_s not in ("早仕掛け型","中盤入替型","後半追込型","波乱型","前残り型"):
+                    continue
+                actual_orders=[]
+                for x in (audit.get("actual_lap_comparison") or []):
+                    vals=tuple(int(v) for v in str(x.get("actual") or "").split("-") if str(v).strip().isdigit())
+                    if vals: actual_orders.append(vals)
+                same=[r for r in (audit.get("top_routes_v263") or []) if str(r.get("scenario") or "")==actual_s]
+                if len(actual_orders)<2 or not same:
+                    continue
+                best=max(same,key=lambda r:float(r.get("similarity",0.0) or 0.0))
+                sim_orders=[]
+                for part in str(best.get("route") or "").split(" / "):
+                    vals=tuple(int(v) for v in part.split("-") if str(v).strip().isdigit())
+                    if vals: sim_orders.append(vals)
+                L=min(6,len(actual_orders),len(sim_orders))
+                if L<3: continue
+                used_races.add(str(race_key))
+                for lap in range(3,L+1):
+                    sp0={c:i for i,c in enumerate(sim_orders[lap-2])}; sp1={c:i for i,c in enumerate(sim_orders[lap-1])}
+                    ap0={c:i for i,c in enumerate(actual_orders[lap-2])}; ap1={c:i for i,c in enumerate(actual_orders[lap-1])}
+                    common=set(sp0)&set(sp1)&set(ap0)&set(ap1)
+                    for a,b in itertools.combinations(common,2):
+                        sf=int((sp0[a]-sp0[b])*(sp1[a]-sp1[b])<0)
+                        af=int((ap0[a]-ap0[b])*(ap1[a]-ap1[b])<0)
+                        rec=agg[(actual_s,lap)]
+                        rec["sim"]+=sf; rec["actual"]+=af; rec["pairs"]+=1; rec["races"].add(str(race_key))
+            except Exception:
+                continue
+
+        now=_v228_now_jst_iso()
+        saved=[]
+        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("DELETE FROM v287_global_transition_calibration")
+            for (scenario,lap),rec in sorted(agg.items()):
+                nr=len(rec["races"]); npairs=int(rec["pairs"] or 0)
+                if nr<4 or npairs<80:
+                    continue
+                sim_rate=float(rec["sim"])/max(1,npairs)
+                act_rate=float(rec["actual"])/max(1,npairs)
+                residual=act_rate-sim_rate
+                # 固定値が主役。全体再集計側は小さな微調整のみ。
+                shrink=float(nr)/(float(nr)+8.0)
+                dyn=float(np.clip(residual*1.2*shrink,-0.10,0.10))
+                con.execute("""
+                    INSERT INTO v287_global_transition_calibration(
+                        scenario_type,lap_no,sample_races,sample_pairs,
+                        sim_flip_rate,actual_flip_rate,residual,dynamic_logit,recalculated_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,(scenario,int(lap),nr,npairs,sim_rate,act_rate,residual,dyn,now))
+                saved.append({
+                    "scenario":scenario,"lap":int(lap),"races":nr,"pairs":npairs,
+                    "dynamic_logit":dyn,
+                })
+            con.commit()
+
+        # prediction-side cache must not retain values calculated before result registration.
+        try:
+            _V285_SAME_SCENARIO_CACHE.clear()
+        except Exception:
+            pass
+        out.update({"ok":True,"source_races":len(used_races),"calibrations":len(saved),"details":saved})
+        return out
+    except Exception as exc:
+        out["reason"]=f"{type(exc).__name__}: {exc}"
+        return out
+
+
+def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_date: str) -> dict:
+    """同じ展開型なのに周回内の入替量が違ったケースだけを学習する。
+
+    Ver284の保存済み予測のうち、実測展開型と同じ型だった上位routeを比較し、
+    周回ごとのペア順序反転率の「実測 - シミュレーション」だけを縮小学習する。
+    展開型の出現頻度そのものは補正しない。
+    cutoff_dateより前だけを使うwalk-forward。
+    """
+    result={"enabled":False,"samples":{},"delta_logit":{},"reason":"同展開比較不足"}
+    # Ver287: 結果登録時に「登録済み全体」から再計算して保存した値を最優先。
+    try:
+        _v287_ensure_global_transition_calibration_table(db_path)
+        with sqlite3.connect(str(db_path),timeout=30.0) as _con287:
+            _rows287=_con287.execute("""
+                SELECT scenario_type,lap_no,sample_races,sample_pairs,
+                       sim_flip_rate,actual_flip_rate,residual,dynamic_logit
+                FROM v287_global_transition_calibration
+            """).fetchall()
+        if _rows287:
+            _d287={}; _s287={}
+            for sc,lap,nr,npairs,sr,ar,resid,dyn in _rows287:
+                key=f"{sc}|{int(lap)}"
+                _d287[key]=float(dyn or 0.0)
+                _s287[key]={"races":int(nr or 0),"pairs":int(npairs or 0),
+                            "sim_flip_rate":float(sr or 0.0),"actual_flip_rate":float(ar or 0.0),
+                            "residual":float(resid or 0.0),"delta_logit":float(dyn or 0.0)}
+            return {"enabled":True,"samples":_s287,"delta_logit":_d287,
+                    "reason":"結果登録時に登録済み全体から再計算した微調整値"}
+    except Exception:
+        pass
+    try:
+        stamp=(str(db_path),Path(db_path).stat().st_mtime_ns,"GLOBAL",str(cutoff_date or "")[:10])
+    except Exception:
+        stamp=(str(db_path),"GLOBAL",str(cutoff_date or "")[:10])
+    if stamp in _V285_SAME_SCENARIO_CACHE:
+        return dict(_V285_SAME_SCENARIO_CACHE[stamp])
+
+    try:
+        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            rows=con.execute("""
+                SELECT h.race_key,h.payload
+                FROM v231_prediction_history h
+                JOIN (
+                    SELECT race_key,MAX(history_id) AS mid
+                    FROM v231_prediction_history
+                    WHERE app_version='Ver284'
+                    GROUP BY race_key
+                ) x ON h.history_id=x.mid
+            """).fetchall()
+    except Exception as exc:
+        result["reason"]=f"履歴読込失敗: {type(exc).__name__}: {exc}"
+        _V285_SAME_SCENARIO_CACHE[stamp]=dict(result)
+        return result
+
+    from collections import defaultdict
+    import itertools
+    agg=defaultdict(lambda:{"sim":0,"actual":0,"pairs":0,"races":set()})
+    for race_key,payload in rows:
+        try:
+            m=re.match(r'^(\d{8})_(.+?)_(\d+)R$',str(race_key or ''))
+            if not m:
+                continue
+            d8=m.group(1)
+            rdate=f"{d8[:4]}-{d8[4:6]}-{d8[6:8]}"
+            if str(cutoff_date or "")[:10] and rdate >= str(cutoff_date)[:10]:
+                continue
+            obj=pickle.loads(zlib.decompress(payload))
+            meta=(obj or {}).get("meta") or {}
+            audit=meta.get("6周展開シミュレーション") or meta.get("壁補正監査") or {}
+            actual_s=str(audit.get("actual_scenario_v263") or "")
+            if actual_s not in ("早仕掛け型","中盤入替型","後半追込型","波乱型","前残り型"):
+                continue
+            actual_orders=[]
+            for x in (audit.get("actual_lap_comparison") or []):
+                vals=tuple(int(v) for v in str(x.get("actual") or "").split("-") if str(v).strip().isdigit())
+                if vals:
+                    actual_orders.append(vals)
+            if len(actual_orders)<2:
+                continue
+            same=[r for r in (audit.get("top_routes_v263") or []) if str(r.get("scenario") or "")==actual_s]
+            if not same:
+                continue
+            # 「同じ展開」の中で実測に最も近いrouteだけ比較。別展開は学習材料にしない。
+            best=max(same,key=lambda r:float(r.get("similarity",0.0) or 0.0))
+            sim_orders=[]
+            for part in str(best.get("route") or "").split(" / "):
+                vals=tuple(int(v) for v in part.split("-") if str(v).strip().isdigit())
+                if vals:
+                    sim_orders.append(vals)
+            L=min(6,len(actual_orders),len(sim_orders))
+            for lap in range(2,L+1):
+                sp0={c:i for i,c in enumerate(sim_orders[lap-2])}; sp1={c:i for i,c in enumerate(sim_orders[lap-1])}
+                ap0={c:i for i,c in enumerate(actual_orders[lap-2])}; ap1={c:i for i,c in enumerate(actual_orders[lap-1])}
+                common=set(sp0)&set(sp1)&set(ap0)&set(ap1)
+                for a,b in itertools.combinations(common,2):
+                    sf=int((sp0[a]-sp0[b])*(sp1[a]-sp1[b])<0)
+                    af=int((ap0[a]-ap0[b])*(ap1[a]-ap1[b])<0)
+                    rec=agg[(actual_s,lap)]
+                    rec["sim"]+=sf; rec["actual"]+=af; rec["pairs"]+=1; rec["races"].add(str(race_key))
+        except Exception:
+            continue
+
+    deltas={}; samples={}
+    for (scenario,lap),rec in agg.items():
+        nr=len(rec["races"]); npairs=int(rec["pairs"] or 0)
+        if nr < 4 or npairs < 80 or lap < 3:
+            continue
+        sim_rate=float(rec["sim"])/max(1,npairs)
+        act_rate=float(rec["actual"])/max(1,npairs)
+        residual=act_rate-sim_rate
+        # Ver287: 固定基準が主役。新しい履歴は微調整だけ。
+        # 動的部分単独では最大±0.10に制限する。
+        shrink=float(nr)/(float(nr)+8.0)
+        delta=float(np.clip(residual*1.2*shrink,-0.10,0.10))
+        key=f"{scenario}|{int(lap)}"
+        deltas[key]=delta
+        samples[key]={
+            "races":nr,"pairs":npairs,
+            "sim_flip_rate":sim_rate,"actual_flip_rate":act_rate,
+            "residual":residual,"delta_logit":delta,
+        }
+
+    result={
+        "enabled":bool(deltas),
+        "samples":samples,
+        "delta_logit":deltas,
+        "reason":"同一展開型routeと実測の周回内ペア反転差だけをwalk-forward縮小学習" if deltas else "同展開比較不足",
+    }
+    _V285_SAME_SCENARIO_CACHE.clear()
+    _V285_SAME_SCENARIO_CACHE[stamp]=dict(result)
+    return result
+
+
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
     if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(entries,pd.DataFrame) or entries.empty:
@@ -4876,15 +5900,67 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     strength={c:max(-1.55,min(1.55,0.72*((v-mu)/sd))) for c,v in strength.items()}
     bvals=np.array(list(breakthrough.values()),dtype=float); blo=float(bvals.min()); bhi=float(bvals.max())
     breakthrough={c:(0.5 if bhi<=blo else (v-blo)/(bhi-blo)) for c,v in breakthrough.items()}
+
+    # Ver290: GO1式の「初速前半・2コーナー立ち上がり」を映像なしで弱く近似。
+    # 実際の2コーナー映像特徴はDBに無いため、当日試走・ST・過去1周目の上げ幅だけで作る。
+    # 既存のハンデ差/初期距離は別で扱うので、ここにはハンデを重複投入しない。
+    _trial_vals290=np.array([float(trial[c]) for c in cars],dtype=float)
+    _trial_mu290=float(_trial_vals290.mean()) if len(_trial_vals290) else 3.40
+    _trial_sd290=float(_trial_vals290.std()) if len(_trial_vals290) else 0.02
+    if _trial_sd290 < 0.006: _trial_sd290=0.006
+    _st_vals290=np.array([float(stmean[c]) for c in cars],dtype=float)
+    _st_mu290=float(_st_vals290.mean()) if len(_st_vals290) else 0.16
+    _st_sd290=float(_st_vals290.std()) if len(_st_vals290) else 0.03
+    if _st_sd290 < 0.012: _st_sd290=0.012
+    # Ver293:
+    # 2周目以降の展開強度はVer290へ戻し、1周目だけ291/292の改善要素を試す。
+    # Ver290基準 = 試走62% + ST38%
+    # 1周目試験 = 試走80% + ST20%
+    early_launch_v290_base={}
+    early_launch_v293_lap1={}
+    for c in cars:
+        _trial_z290=(_trial_mu290-float(trial[c]))/_trial_sd290
+        _st_z290=(_st_mu290-float(stmean[c]))/_st_sd290
+        early_launch_v290_base[c]=float(np.clip(
+            0.62*_trial_z290 + 0.38*_st_z290,
+            -1.6,1.6
+        ))
+        early_launch_v293_lap1[c]=float(np.clip(
+            0.80*_trial_z290 + 0.20*_st_z290,
+            -1.6,1.6
+        ))
     venue=str((meta or {}).get("開催場") or (meta or {}).get("venue") or "")
     _v242_prepare_started=time_module.perf_counter()
     profiles=_v230_hist_profiles(venue,names)
+    # Ver290: 過去の1周目上げ幅を初速proxyへ小さく追加（当日試走/STが主役）。
+    for _c290,_n290 in zip(cars,names):
+        _fg290=float((profiles.get(_n290,{}) or {}).get("first_gain",0.0) or 0.0)
+        _fg_add290=0.18*np.clip(_fg290,-2.0,2.0)
+        early_launch_v290_base[_c290]=float(np.clip(
+            float(early_launch_v290_base.get(_c290,0.0)) + _fg_add290,
+            -1.6,1.6
+        ))
+        early_launch_v293_lap1[_c290]=float(np.clip(
+            float(early_launch_v293_lap1.get(_c290,0.0)) + _fg_add290,
+            -1.6,1.6
+        ))
     transition_profiles=_v240_transition_profiles(venue,names)
     matchups=_v230_matchup_map(names)
     wall_calibration=_v248_wall_calibration(_v230_db_path())
     venue_wall_delta=float((wall_calibration.get("venue_delta") or {}).get(venue,0.0)) if wall_calibration.get("enabled") else 0.0
     lap_wall_delta=wall_calibration.get("lap_delta") or {}
     race_date=str((meta or {}).get("開催日") or (meta or {}).get("race_date") or "")[:10]
+    try:
+        _race_no_v292_m=re.search(r"\d+",str((meta or {}).get("R") or (meta or {}).get("レース") or (meta or {}).get("race_no") or ""))
+        _race_no_v292=int(_race_no_v292_m.group()) if _race_no_v292_m else 0
+    except Exception:
+        _race_no_v292=0
+    trial_gap_gate_v292=_v292_trial_gap_gate_calibration(
+        _v230_db_path(),race_date,_race_no_v292
+    )
+    front_st_guard_v294=_v294_front_st_guard_calibration(
+        _v230_db_path(),race_date,_race_no_v292
+    )
     flow_calibration=_v250_flow_calibration(_v230_db_path(), venue, race_date)
     leader_hold_delta=float(flow_calibration.get("leader_hold_delta",0.0)) if flow_calibration.get("enabled") else 0.0
     front_survival_delta=float(flow_calibration.get("front_survival_delta",0.0)) if flow_calibration.get("enabled") else 0.0
@@ -4957,6 +6033,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
     scenario_feedback_v264=_v264_feedback_scenario_adjustment(_v230_db_path(), venue, race_date)
     scenario_branch_prior_v264=_v264_blended_scenario_prior(scenario_prior, scenario_feedback_v264)
+    # Ver285: 展開頻度は触らず、同じ展開型で周回内入替がズレた分だけ学習。
+    same_scenario_transition_v285=_v285_same_scenario_transition_calibration(
+        _v230_db_path(), venue, race_date
+    )
     _v242_prepare_seconds=time_module.perf_counter()-_v242_prepare_started
     name_by_car={c:n for c,n in zip(cars,names)}
     # Ver276 speed: 試行中に変わらない値を数千回作り直さない。
@@ -5041,9 +6121,19 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     sim_trials=max(1400,min(requested_trials,base_budget))
     counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
     lap_order_counts={lap:{} for lap in range(1,7)}
+    finish_position_counts={c:{pos:0 for pos in range(1,len(cars)+1)} for c in cars}
+    final_order_counts={}
     scenario_counts={}
     scenario_combo_counts={}
     route_counts={}
+    # Ver284 詳細監査。予測判定には一切使わず、再シミュレーション後の原因分析専用。
+    transition_audit={lap:{"attempts":0,"successes":0,"p_sum":0.0,
+                           "wall_attempts":0,"wall_successes":0,
+                           "momentum_attempts":0,"momentum_successes":0,
+                           "slowdown_attempts":0,"slowdown_successes":0,
+                           "top3_entries":0,"top3_exits":0} for lap in range(1,7)}
+    transition_pair_audit={}
+    top3_order_audit={}
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
     # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
@@ -5091,7 +6181,34 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         momentum={c:0.0 for c in cars}
         # ギリギリ横並びで抜かれた車の一時失速。次周以降へ減衰して残す。
         slowdown={c:0.0 for c in cars}
+        # Ver289: Ver287補正は「TOP3に絡む力」へ限定。
+        # TOP3内の1↔2↔3着順交換には掛けず、286系の順序形成を残す。
+        v289_zone_audit={"boundary":0,"outside":0,"inside_top3":0,"applied":0}
         for lap in range(1,7):
+            _prev_top3_audit=set(order[:3])
+            # Ver285: ここまでに実際に枝分かれしたrouteから暫定展開型を判定。
+            # 未来の結果や実測展開型は使用しない。2周未満は補正なし。
+            _scenario_now_v285=_v263_scenario_type_from_laps(sim_lap_path) if len(sim_lap_path)>=2 else "不明"
+            # Ver286: 途中routeで型がまだ判定不能なら、過去だけから作ったbranch priorの
+            # 最有力型を仮採用。実測結果は使わない。route型が判定できたらroute側を優先。
+            _scenario_apply_v286=_scenario_now_v285
+            if _scenario_apply_v286 in ("不明",""):
+                try:
+                    _bp286=scenario_branch_prior_v264 or {}
+                    if _bp286:
+                        _scenario_apply_v286=max(_bp286.items(),key=lambda kv:float(kv[1] or 0.0))[0]
+                except Exception:
+                    _scenario_apply_v286="不明"
+            _v289_key=f"{_scenario_apply_v286}|{int(lap)}"
+            _fixed_delta_v289=float(_V289_FIXED_TRANSITION_LOGIT.get(_v289_key,0.0) or 0.0)
+            _dynamic_delta_v289=float(
+                ((same_scenario_transition_v285.get("delta_logit") or {}).get(_v289_key,0.0) or 0.0)
+            )
+            # ここでは補正の「素材」だけ作る。実際の適用強度は車列位置ごとに決める。
+            _scenario_delta_v285=float(np.clip(
+                _fixed_delta_v289 + _dynamic_delta_v289*_V289_DYNAMIC_RATIO,
+                -0.46,0.46
+            ))
             # Ver250: 1周で何台も連続して抜く展開を抑える。
             # 速い車でも進路変更と立て直しが必要なため、周回内の追抜回数を保持する。
             lap_pass_count={c:0 for c in cars}
@@ -5134,7 +6251,43 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 front_pack=sum(1 for x in order[:min(3,len(order))] if handicap[x]==min_handicap)
                 pack_wall=(0.07*max(0,front_pack-1))*max(0.30,1.0-0.10*(lap-1))
                 scenario_branch=0.0
-                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
+                # Ver290: 初速前半proxyは1～2周目だけ使用。
+                # 後車と前車の差だけを見るため、単純な「試走が速い=最終順位UP」にはしない。
+                # Ver294:
+                # 展開の土台はVer290へ戻す。
+                # 追加するのは「後方車の試走優位が0.01秒未満」かつ
+                # 「前車STが0.02秒以上良い」ハンデ跨ぎだけの弱い前残りguard。
+                _early_pair_delta290=float(
+                    early_launch_v290_base.get(chaser,0.0)
+                    - early_launch_v290_base.get(front,0.0)
+                )
+                _early_lap_weight290=0.090 if lap==1 else (0.050 if lap==2 else 0.0)
+                _early_logit290=float(np.clip(
+                    _early_pair_delta290*_early_lap_weight290,
+                    -0.11,0.11
+                ))
+
+                _front_st_guard294=0.0
+                if lap in (1,2):
+                    try:
+                        _hc294=float(handicap.get(chaser,0) or 0)
+                        _hf294=float(handicap.get(front,0) or 0)
+                        if _hc294 > _hf294:  # 同ハンデ横並びは対象外
+                            _trial_adv294=float(trial.get(front,0.0)-trial.get(chaser,0.0))
+                            _st_adv294=float(stmean.get(chaser,0.0)-stmean.get(front,0.0))
+                            _gapmax294=float(front_st_guard_v294.get("trial_gap_max",0.010) or 0.010)
+                            _stmin294=float(front_st_guard_v294.get("front_st_adv_min",0.020) or 0.020)
+                            if 0.0 < _trial_adv294 < _gapmax294 and _st_adv294 >= _stmin294:
+                                # chaserの追抜logitから引く=前車残りを少し強める。
+                                # 2周目は1周目の70%に減衰。
+                                _front_st_guard294=float(front_st_guard_v294.get("guard_logit",0.035) or 0.035)
+                                if lap==2:
+                                    _front_st_guard294 *= 0.70
+                    except Exception:
+                        _front_st_guard294=0.0
+
+                _early_logit290 -= _front_st_guard294
+                logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus + _early_logit290 - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
                 _branch_noise=0.16
                 logit += rng.normal(0,_branch_noise)
                 try:
@@ -5194,12 +6347,51 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                             late_release_audit_v273[_lap_err275]["last_error"]=f"{type(_e_late275).__name__}: {_e_late275}"
                     except Exception:
                         pass
+                # Ver289:
+                # 287で効いた「TOP3に絡む力」だけを6周シミュレーション内部へ残す。
+                # i==3 : 4位→3位のTOP3境界突破なので100%適用。
+                # i>=4 : TOP3へ近づく過程なので30%だけ適用。
+                # i<=2 : TOP3内の1～3着順交換なので適用しない（286系の順序形成を維持）。
+                if i == 3:
+                    _zone_factor_v289=1.0
+                    v289_zone_audit["boundary"]+=1
+                elif i >= 4:
+                    _zone_factor_v289=0.30
+                    v289_zone_audit["outside"]+=1
+                else:
+                    _zone_factor_v289=0.0
+                    v289_zone_audit["inside_top3"]+=1
+                _delta_apply_v289=float(_scenario_delta_v285)*float(_zone_factor_v289)
+                if abs(_delta_apply_v289)>1e-12:
+                    v289_zone_audit["applied"]+=1
+                    _pp_v285=float(np.clip(p,1e-6,1.0-1e-6))
+                    _lg_v285=math.log(_pp_v285/(1.0-_pp_v285)) + _delta_apply_v289
+                    p=float(np.clip(1.0/(1.0+math.exp(-_lg_v285)),0.035,0.88))
                 # 差が開きすぎていればまず追いつく必要がある。
                 # 大差なら即追越しは難しいが、速度優位車はまず差を詰められる。
                 catch_factor=max(0.10,1.0-min(0.78,gaps[i]*1.12))
                 catch_factor=min(1.15,catch_factor+0.10*max(0.0,speed_edge))
                 p*=catch_factor
+                _ta=transition_audit[lap]
+                _ta["attempts"]+=1; _ta["p_sum"]+=float(p)
+                _wall_audit=bool(wall>=2)
+                _mom_audit=bool(momentum.get(chaser,0.0)>0.02)
+                _slow_audit=bool(slowdown.get(front,0.0)>0.02)
+                if _wall_audit: _ta["wall_attempts"]+=1
+                if _mom_audit: _ta["momentum_attempts"]+=1
+                if _slow_audit: _ta["slowdown_attempts"]+=1
+                _pair_key=(int(lap),int(chaser),int(front))
+                _pa=transition_pair_audit.setdefault(_pair_key,{"attempts":0,"successes":0,"p_sum":0.0,
+                                                                 "wall_attempts":0,"momentum_attempts":0,"slowdown_attempts":0})
+                _pa["attempts"]+=1; _pa["p_sum"]+=float(p)
+                if _wall_audit: _pa["wall_attempts"]+=1
+                if _mom_audit: _pa["momentum_attempts"]+=1
+                if _slow_audit: _pa["slowdown_attempts"]+=1
                 if rng.random()<p:
+                    _ta["successes"]+=1; _pa["successes"]+=1
+                    if _wall_audit: _ta["wall_successes"]+=1
+                    if _mom_audit: _ta["momentum_successes"]+=1
+                    if _slow_audit: _ta["slowdown_successes"]+=1
                     order[i-1],order[i]=order[i],order[i-1]
                     gaps[i]=max(0.07,gaps[i]*0.45)
                     pass_events[chaser]+=1
@@ -5238,10 +6430,19 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 if j==1 and perf[cur]-perf[front]>0.35:
                     rel += 0.012*(1.0+0.15*lap)
                 gaps[j]=min(2.0,max(0.04,gaps[j]-rel))
+            _new_top3_audit=set(order[:3])
+            transition_audit[lap]["top3_entries"]+=len(_new_top3_audit-_prev_top3_audit)
+            transition_audit[lap]["top3_exits"]+=len(_prev_top3_audit-_new_top3_audit)
             lap_tuple=tuple(order)
             sim_lap_path.append(lap_tuple)
             lap_order_counts[lap][lap_tuple]=lap_order_counts[lap].get(lap_tuple,0)+1
-        combo=tuple(order[:3]); counts[combo]=counts.get(combo,0)+1
+        final_tuple=tuple(order)
+        final_order_counts[final_tuple]=final_order_counts.get(final_tuple,0)+1
+        for _pos284,_car284 in enumerate(order,start=1):
+            finish_position_counts[_car284][_pos284]=finish_position_counts[_car284].get(_pos284,0)+1
+        combo=tuple(order[:3])
+        top3_order_audit[combo]=top3_order_audit.get(combo,0)+1
+        counts[combo]=counts.get(combo,0)+1
         scenario_type=_v263_scenario_type_from_laps(sim_lap_path)
         scenario_counts[scenario_type]=scenario_counts.get(scenario_type,0)+1
         sc=scenario_combo_counts.setdefault(scenario_type,{})
@@ -5265,35 +6466,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     sim_trials=max(1, completed_trials)
     _v242_sim_seconds=time_module.perf_counter()-_v242_sim_started
     # Ver263: 実測から学んだ展開タイプ頻度へ弱く校正。
+    # Ver284: 各周の遷移確率補正だけで6周を完結させ、ゴール後には旧モデルや温度補正を混ぜない。
     weighted_counts=dict(counts)
-    scenario_weights={}
-    if scenario_prior.get('enabled') and scenario_counts:
-        learned=scenario_prior.get('prior') or {}
-        weighted_counts={k:0.0 for k in counts}
-        for typ,cc in scenario_combo_counts.items():
-            generated=float(scenario_counts.get(typ,0))/max(1,sim_trials)
-            target_prior=float(learned.get(typ,generated or 0.01))
-            ratio=(target_prior/max(0.01,generated))**0.12
-            w=float(np.clip(ratio,0.92,1.08))
-            scenario_weights[typ]=w
-            for combo,n in cc.items():
-                weighted_counts[combo]=weighted_counts.get(combo,0.0)+float(n)*w
-    # 元のtrial数へ整数スケール。シミュレーションだけで0回になった着順も、
-    # 旧モデル分布を少量混ぜて極端な消失を防ぎ、全組み合わせを必ず保存する。
+    scenario_weights={"Ver284":"post_simulation_weight_disabled"}
     target=max(1,int(trials))
     all_combos=[(a,b,c) for a in cars for b in cars for c in cars if a!=b and a!=c and b!=c]
-    prior_total=max(1.0,float(sum(tri.values()) or 1.0))
-    # Ver241: 失速連鎖を含む6周結果を尊重しつつ、有限試行の偶然と過信を温度校正する。
-    sim_mix=0.88
-    floor_mass=0.03 / max(1,len(all_combos))
-    scaled={}
-    for combo in all_combos:
-        sim_p=float(weighted_counts.get(combo,0))/max(1.0,float(sum(weighted_counts.values()) or sim_trials))
-        prior_p=float(tri.get(combo,0))/prior_total
-        # 7%だけ旧能力分布を残し、未知着順にもごく小さい裾を与える。
-        p=max(floor_mass, sim_mix*sim_p + (1.0-sim_mix)*prior_p)
-        # 温度校正。上位の山を少し低くし、現実的な着順違いの裾を残す。
-        scaled[combo]=p**0.86
+    _den284=max(1.0,float(sum(weighted_counts.values()) or sim_trials))
+    scaled={combo:float(weighted_counts.get(combo,0))/_den284 for combo in all_combos}
     norm=sum(scaled.values()) or 1.0
     scaled={k:(v/norm)*target for k,v in scaled.items()}
     ints={k:int(v) for k,v in scaled.items()}
@@ -5302,12 +6481,19 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         ranked=sorted(scaled.items(),key=lambda kv:kv[1]-int(kv[1]),reverse=True)
         for k,_ in ranked[:remain]: ints[k]+=1
     new_bets=dict(bets or {}); new_bets["三連単"]=ints
-    tf={}; nt={}; nf={}
+    tf={}; nt={}; nf={}; wide={}; win={}; place={}
     for (a,b,c),cnt in ints.items():
         tf[tuple(sorted((a,b,c)))]=tf.get(tuple(sorted((a,b,c))),0)+cnt
         nt[(a,b)]=nt.get((a,b),0)+cnt
         nf[tuple(sorted((a,b)))]=nf.get(tuple(sorted((a,b))),0)+cnt
+        win[(a,)]=win.get((a,),0)+cnt
+        place[(a,)]=place.get((a,),0)+cnt
+        place[(b,)]=place.get((b,),0)+cnt
+        for _x284,_y284 in ((a,b),(a,c),(b,c)):
+            _wk284=tuple(sorted((_x284,_y284)))
+            wide[_wk284]=wide.get(_wk284,0)+cnt
     new_bets["三連複"]=tf; new_bets["2連単"]=nt; new_bets["2連複"]=nf
+    new_bets["ワイド"]=wide; new_bets["単勝"]=win; new_bets["複勝"]=place
     out=df.copy()
     out["6周壁遭遇率"]=out[car_col].map(lambda x: wall_events.get(int(x),0)/(sim_trials*6)*100 if pd.notna(x) else 0.0)
     out["6周追抜成功回数"]=out[car_col].map(lambda x: pass_events.get(int(x),0)/sim_trials if pd.notna(x) else 0.0)
@@ -5383,8 +6569,24 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         pass  # Ver265: 展開フィードバックは評価表示のみ
     # 実測が既にある再シミュレーションはバックテストとして保存し、未来学習には混ぜない。
     lap_snapshot_save=_v252_save_lap_prediction(_v230_db_path(), meta, modal_laps, bool(actual_lap_orders))
+    finish_expected_rank={}
+    finish_position_probabilities={}
+    for _car284 in cars:
+        _pc284=finish_position_counts.get(_car284,{})
+        _denpos284=max(1,sim_trials)
+        finish_expected_rank[str(_car284)]=sum(
+            float(_p284)*float(_pc284.get(_p284,0)) for _p284 in range(1,len(cars)+1)
+        )/_denpos284
+        finish_position_probabilities[str(_car284)]={
+            str(_p284):float(_pc284.get(_p284,0))/_denpos284*100.0
+            for _p284 in range(1,len(cars)+1)
+        }
+    top_full_orders=[
+        {"order":"-".join(map(str,_ord284)),"prob":float(_n284)/max(1,sim_trials)*100.0}
+        for _ord284,_n284 in sorted(final_order_counts.items(),key=lambda kv:kv[1],reverse=True)[:10]
+    ]
     audit={
-        "enabled":True,"mode":"6周内蔵Ver265・Ver257基準＋タイム残差学習","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
+        "enabled":True,"mode":"Ver294 Ver290基準+小試走差前車ST残りguard+TOP3境界限定・6周完結・ゴール後補正なし","sim_trials":sim_trials,"planned_trials":planned_trials,"requested_trials":requested_trials,
         "history_players":sum(1 for n in names if profiles.get(n,{}).get("sample",0)>0),
         "matchups":len(matchups)//2,
         "transition_players":sum(1 for n in names if transition_profiles.get(n,{}).get("sample",0)>0),
@@ -5407,6 +6609,40 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "scenario_prior_v263": scenario_prior,
         "scenario_feedback_v264": scenario_feedback_v264,
         "scenario_branch_prior_v264": scenario_branch_prior_v264,
+        "same_scenario_transition_v285": same_scenario_transition_v285,
+        "v285_scenario_policy":"Ver289: 287全体補正をTOP3境界100%・TOP3外30%・TOP3内0%で適用。TOP3候補改善だけ残し、1～3着順序は286系を維持",
+        "v289_fixed_transition_logit":dict(_V289_FIXED_TRANSITION_LOGIT),
+        "v289_dynamic_ratio":float(_V289_DYNAMIC_RATIO),
+        "v289_zone_factors":{"top3_boundary":1.0,"outside_top3":0.30,"inside_top3":0.0},
+        "v289_zone_audit":dict(v289_zone_audit),
+        "v292_trial_gap_gate":{
+            "enabled":bool(trial_gap_gate_v292.get("enabled")),
+            "scope":"Ver293では1周目のハンデ跨ぎのみ・同ハンデ横並びは対象外",
+            "threshold":round(float(trial_gap_gate_v292.get("threshold",0.010) or 0.010),4),
+            "small_gap_scale":round(float(trial_gap_gate_v292.get("small_gap_scale",0.35) or 0.35),4),
+            "samples":int(trial_gap_gate_v292.get("samples",0) or 0),
+            "wins":int(trial_gap_gate_v292.get("wins",0) or 0),
+            "raw_rate":trial_gap_gate_v292.get("raw_rate"),
+            "posterior_mean":round(float(trial_gap_gate_v292.get("posterior_mean",0.5) or 0.5),4),
+            "posterior_p_gt_half":round(float(trial_gap_gate_v292.get("posterior_p_gt_half",0.5) or 0.5),4),
+            "reason":str(trial_gap_gate_v292.get("reason") or ""),
+            "auto_update":"結果登録後、DB全体から次回予測時に自動再計算"
+        },
+        "v294_front_st_guard":{
+            "enabled":bool(front_st_guard_v294.get("enabled")),
+            "base":"Ver290 early proxy (試走62%+ST38%+first_gain)",
+            "scope":"ハンデ跨ぎのみ・同ハンデ横並び除外",
+            "trial_gap_max":round(float(front_st_guard_v294.get("trial_gap_max",0.010) or 0.010),4),
+            "front_st_adv_min":round(float(front_st_guard_v294.get("front_st_adv_min",0.020) or 0.020),4),
+            "guard_logit_lap1":round(float(front_st_guard_v294.get("guard_logit",0.035) or 0.035),4),
+            "guard_logit_lap2":round(float(front_st_guard_v294.get("guard_logit",0.035) or 0.035)*0.70,4),
+            "samples":int(front_st_guard_v294.get("samples",0) or 0),
+            "front_wins":int(front_st_guard_v294.get("front_wins",0) or 0),
+            "raw_rate":front_st_guard_v294.get("raw_rate"),
+            "posterior_mean":round(float(front_st_guard_v294.get("posterior_mean",0.5) or 0.5),4),
+            "reason":str(front_st_guard_v294.get("reason") or ""),
+            "auto_update":"結果登録後、DB全体から次回予測時に自動再計算"
+        },
         "scenario_distribution_v263": scenario_distribution,
         "scenario_weights_v263": scenario_weights,
         "actual_scenario_v263": actual_scenario,
@@ -5414,6 +6650,20 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "closest_route_v263": closest_route,
         "top_routes_v263": top_routes[:5],
         "top_scenarios":[{"combo":"-".join(map(str,k)),"prob":v/target*100} for k,v in top],
+        "finish_expected_rank":finish_expected_rank,
+        "finish_position_probabilities":finish_position_probabilities,
+        "top_full_orders_v284":top_full_orders,
+        "v284_post_simulation_correction":False,
+        "v285_post_simulation_correction":False,
+        "v289_post_simulation_correction":False,
+        "v284_ticket_sources":["単勝","複勝","ワイド","2連単","2連複","三連複","三連単"],
+        "v284_transition_audit":{
+            "trials":int(sim_trials),
+            "lap_stats":transition_audit,
+            "pair_stats":{"|".join(map(str,k)):v for k,v in transition_pair_audit.items()},
+            "top3_orders":{"-".join(map(str,k)):int(v) for k,v in top3_order_audit.items()},
+            "purpose":"原因分析専用。予測値への後補正なし",
+        },
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
         "message":f"Ver265ではVer257相当の展開係数へ戻し、実測の試走→競走タイム変換残差を開催場・選手・ハンデ帯で縮小学習して基礎能力へ小さく反映します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
@@ -6489,10 +7739,29 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 st.title("🏁 AutoRaceAI スマホ本予測")
 st.caption("Ver263｜複数展開ルートを確率化し、実測グランドノートから展開タイプと近似ルートを学習。")
+_v290_load_started=time_module.perf_counter()
+_v290_load_stage_started=_v290_load_started
+_v290_load_times={}
+_v290_load_box=st.empty()
+_v290_load_box.info("⏳ 読み込み中：学習設定を確認しています…")
+
+def _v290_load_stage(label: str) -> None:
+    global _v290_load_stage_started
+    try:
+        now=time_module.perf_counter()
+        prev=st.session_state.get("_v290_load_stage_label")
+        if prev:
+            _v290_load_times[str(prev)]=round(now-float(_v290_load_stage_started),2)
+        st.session_state["_v290_load_stage_label"]=str(label)
+        _v290_load_stage_started=now
+        _v290_load_box.info("⏳ 読み込み中："+str(label))
+    except Exception:
+        pass
 try:
     _v256_refresh_learning_settings(_v230_db_path())
 except Exception:
     pass
+_v290_load_stage("DB・GitHub正本の安全確認…")
 
 # Ver241: iPhone Safariでselectbox選択時に画面が自動拡大（フォーカスイン）するのを抑止。
 # 16px未満のフォーム部品へフォーカスするとSafariが自動ズームするため、
@@ -8798,7 +10067,15 @@ def show_v182_odds_adjusted_tight_recommendation(bets: dict, trials: int, meta: 
 
 # Ver187: 8車合成プランをDB保存し、結果登録後に自動照合して次回判定へ反映する。
 def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
-    with sqlite3.connect(db_path) as con:
+    """回収率学習テーブルの存在だけを保証する安全版。
+
+    Ver282:
+    予測表示・復元表示のたびに孤立データのINSERT/DELETEやTRIGGER作成を行うと、
+    同時読込・バックグラウンド処理中にSQLiteへ不要な書込が発生する。
+    ここではDDLの最小保証だけに限定し、孤立データ処理は監査/メンテナンス側へ分離する。
+    """
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
         con.executescript("""
         CREATE TABLE IF NOT EXISTS v187_mixed_plan_runs (
             race_key TEXT NOT NULL,
@@ -8849,27 +10126,6 @@ def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
             payout_yen INTEGER NOT NULL,
             PRIMARY KEY (race_key, plan_hash, bet_type, combination)
         );
-        """)
-        # Ver215: 予測時点のプランを後から完全に切り分けられるよう、メタ情報を保持する。
-        existing_cols = {row[1] for row in con.execute("PRAGMA table_info(v187_mixed_plan_runs)").fetchall()}
-        for col_name, col_type in [
-            ("app_version", "TEXT"),
-            ("logic_version", "TEXT"),
-            ("race_date", "TEXT"),
-            ("venue", "TEXT"),
-            ("race_no", "TEXT"),
-            ("starter_count", "INTEGER"),
-            # Ver279: 復元後に入力したオッズから作ったプランは保存するが、
-            # リアルタイム実績・学習とは明確に分離する。
-            ("plan_origin", "TEXT DEFAULT 'live'"),
-            ("source_prediction_version", "TEXT"),
-            ("include_in_live_stats", "INTEGER DEFAULT 1"),
-        ]:
-            if col_name not in existing_cols:
-                con.execute(f"ALTER TABLE v187_mixed_plan_runs ADD COLUMN {col_name} {col_type}")
-        # Ver280: 比較・再評価処理の途中失敗で run が無い feedback が残るのを防ぐ。
-        # 既存の孤立データは削除前に退避し、正式な回収率集計からだけ外す。
-        con.executescript("""
         CREATE TABLE IF NOT EXISTS v280_orphan_plan_feedback_archive (
             race_key TEXT NOT NULL,
             plan_hash TEXT NOT NULL,
@@ -8910,98 +10166,85 @@ def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
             PRIMARY KEY (race_key, plan_hash, bet_type, combination)
         );
         """)
-        _archive_now = _v228_now_jst_iso()
-        # plan feedback
-        con.execute("""
-            INSERT OR IGNORE INTO v280_orphan_plan_feedback_archive
-            SELECT f.race_key,f.plan_hash,f.hit,f.black_hit,f.gami_hit,
-                   f.payout_yen,f.cost_yen,f.realized_multiple,f.return_rate,
-                   f.winning_types,f.evaluated_at,?,?
-            FROM v187_mixed_plan_feedback f
-            LEFT JOIN v187_mixed_plan_runs r
-              ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
-            WHERE r.race_key IS NULL
-        """, (_archive_now, "runなしの孤立feedback"))
-        # ticket feedback
-        con.execute("""
-            INSERT OR IGNORE INTO v280_orphan_ticket_feedback_archive
-            SELECT f.race_key,f.plan_hash,f.bet_type,f.combination,
-                   f.hit,f.payout_yen,?,?
-            FROM v187_mixed_ticket_feedback f
-            LEFT JOIN v187_mixed_plan_runs r
-              ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
-            WHERE r.race_key IS NULL
-        """, (_archive_now, "runなしの孤立ticket feedback"))
-        # plan tickets
-        con.execute("""
-            INSERT OR IGNORE INTO v280_orphan_plan_tickets_archive
-            SELECT t.race_key,t.plan_hash,t.bet_type,t.combination,
-                   t.probability,t.odds,t.role,?,?
-            FROM v187_mixed_plan_tickets t
-            LEFT JOIN v187_mixed_plan_runs r
-              ON r.race_key=t.race_key AND r.plan_hash=t.plan_hash
-            WHERE r.race_key IS NULL
-        """, (_archive_now, "runなしの孤立ticket"))
 
-        # 元データはアーカイブ済みなので、正式集計テーブルからのみ除外する。
-        con.execute("""
-            DELETE FROM v187_mixed_ticket_feedback
-            WHERE NOT EXISTS (
-                SELECT 1 FROM v187_mixed_plan_runs r
-                WHERE r.race_key=v187_mixed_ticket_feedback.race_key
-                  AND r.plan_hash=v187_mixed_ticket_feedback.plan_hash
-            )
-        """)
-        con.execute("""
-            DELETE FROM v187_mixed_plan_feedback
-            WHERE NOT EXISTS (
-                SELECT 1 FROM v187_mixed_plan_runs r
-                WHERE r.race_key=v187_mixed_plan_feedback.race_key
-                  AND r.plan_hash=v187_mixed_plan_feedback.plan_hash
-            )
-        """)
-        con.execute("""
-            DELETE FROM v187_mixed_plan_tickets
-            WHERE NOT EXISTS (
-                SELECT 1 FROM v187_mixed_plan_runs r
-                WHERE r.race_key=v187_mixed_plan_tickets.race_key
-                  AND r.plan_hash=v187_mixed_plan_tickets.plan_hash
-            )
-        """)
+        existing_cols = {row[1] for row in con.execute("PRAGMA table_info(v187_mixed_plan_runs)").fetchall()}
+        for col_name, col_type in [
+            ("app_version", "TEXT"),
+            ("logic_version", "TEXT"),
+            ("race_date", "TEXT"),
+            ("venue", "TEXT"),
+            ("race_no", "TEXT"),
+            ("starter_count", "INTEGER"),
+            ("plan_origin", "TEXT DEFAULT 'live'"),
+            ("source_prediction_version", "TEXT"),
+            ("include_in_live_stats", "INTEGER DEFAULT 1"),
+        ]:
+            if col_name not in existing_cols:
+                con.execute(f"ALTER TABLE v187_mixed_plan_runs ADD COLUMN {col_name} {col_type}")
 
-        # 今後はrunが存在しない単独保存をDBレベルで拒否する。
+        # 旧Ver280で作った書込TRIGGERは、予測中のDB状態を複雑化させるため解除。
         con.executescript("""
-        CREATE TRIGGER IF NOT EXISTS v280_guard_plan_feedback_insert
-        BEFORE INSERT ON v187_mixed_plan_feedback
-        WHEN NOT EXISTS (
-            SELECT 1 FROM v187_mixed_plan_runs r
-            WHERE r.race_key=NEW.race_key AND r.plan_hash=NEW.plan_hash
-        )
-        BEGIN
-            SELECT RAISE(IGNORE);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS v280_guard_ticket_feedback_insert
-        BEFORE INSERT ON v187_mixed_ticket_feedback
-        WHEN NOT EXISTS (
-            SELECT 1 FROM v187_mixed_plan_runs r
-            WHERE r.race_key=NEW.race_key AND r.plan_hash=NEW.plan_hash
-        )
-        BEGIN
-            SELECT RAISE(IGNORE);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS v280_guard_plan_ticket_insert
-        BEFORE INSERT ON v187_mixed_plan_tickets
-        WHEN NOT EXISTS (
-            SELECT 1 FROM v187_mixed_plan_runs r
-            WHERE r.race_key=NEW.race_key AND r.plan_hash=NEW.plan_hash
-        )
-        BEGIN
-            SELECT RAISE(IGNORE);
-        END;
+        DROP TRIGGER IF EXISTS v280_guard_plan_feedback_insert;
+        DROP TRIGGER IF EXISTS v280_guard_ticket_feedback_insert;
+        DROP TRIGGER IF EXISTS v280_guard_plan_ticket_insert;
         """)
         con.commit()
+
+
+def _v282_archive_orphan_mixed_plan_rows(db_path: str) -> dict:
+    """明示的メンテナンス時だけ孤立行を退避する。通常の予測/復元表示からは呼ばない。"""
+    out={"archived_plan_feedback":0,"archived_ticket_feedback":0,"archived_plan_tickets":0,"ok":False,"error":""}
+    try:
+        _v187_ensure_mixed_learning_tables(db_path)
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            con.row_factory=sqlite3.Row
+            now=_v228_now_jst_iso()
+
+            before=int(con.execute("SELECT COUNT(*) FROM v280_orphan_plan_feedback_archive").fetchone()[0] or 0)
+            con.execute("""
+                INSERT OR IGNORE INTO v280_orphan_plan_feedback_archive
+                SELECT f.race_key,f.plan_hash,f.hit,f.black_hit,f.gami_hit,
+                       f.payout_yen,f.cost_yen,f.realized_multiple,f.return_rate,
+                       f.winning_types,f.evaluated_at,?,?
+                FROM v187_mixed_plan_feedback f
+                LEFT JOIN v187_mixed_plan_runs r
+                  ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+                WHERE r.race_key IS NULL
+            """,(now,"runなしの孤立feedback"))
+            after=int(con.execute("SELECT COUNT(*) FROM v280_orphan_plan_feedback_archive").fetchone()[0] or 0)
+            out["archived_plan_feedback"]=max(0,after-before)
+
+            before=int(con.execute("SELECT COUNT(*) FROM v280_orphan_ticket_feedback_archive").fetchone()[0] or 0)
+            con.execute("""
+                INSERT OR IGNORE INTO v280_orphan_ticket_feedback_archive
+                SELECT f.race_key,f.plan_hash,f.bet_type,f.combination,
+                       f.hit,f.payout_yen,?,?
+                FROM v187_mixed_ticket_feedback f
+                LEFT JOIN v187_mixed_plan_runs r
+                  ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+                WHERE r.race_key IS NULL
+            """,(now,"runなしの孤立ticket feedback"))
+            after=int(con.execute("SELECT COUNT(*) FROM v280_orphan_ticket_feedback_archive").fetchone()[0] or 0)
+            out["archived_ticket_feedback"]=max(0,after-before)
+
+            before=int(con.execute("SELECT COUNT(*) FROM v280_orphan_plan_tickets_archive").fetchone()[0] or 0)
+            con.execute("""
+                INSERT OR IGNORE INTO v280_orphan_plan_tickets_archive
+                SELECT t.race_key,t.plan_hash,t.bet_type,t.combination,
+                       t.probability,t.odds,t.role,?,?
+                FROM v187_mixed_plan_tickets t
+                LEFT JOIN v187_mixed_plan_runs r
+                  ON r.race_key=t.race_key AND r.plan_hash=t.plan_hash
+                WHERE r.race_key IS NULL
+            """,(now,"runなしの孤立ticket"))
+            after=int(con.execute("SELECT COUNT(*) FROM v280_orphan_plan_tickets_archive").fetchone()[0] or 0)
+            out["archived_plan_tickets"]=max(0,after-before)
+            con.commit()
+            out["ok"]=True
+    except Exception as exc:
+        out["error"]=f"{type(exc).__name__}: {exc}"
+    return out
 
 
 def _v280_orphan_mixed_plan_audit(db_path: str) -> dict:
@@ -9060,6 +10303,48 @@ def _v187_norm_combo(bet_type: str, combo: str) -> str:
     return "-".join(nums)
 
 
+
+def _v282_is_full_refund_race(con, race_key: str) -> bool:
+    """結果DB上で全券種が『全返還』になっているレースを判定する。"""
+    try:
+        rows = con.execute(
+            "SELECT bet_type, combination, payout_yen FROM result_payouts WHERE race_key=?",
+            (str(race_key),),
+        ).fetchall()
+        if not rows:
+            return False
+        combos = [str(r["combination"] if hasattr(r, "keys") else r[1] or "").strip() for r in rows]
+        return bool(combos) and all("全返還" in x for x in combos if x) and all(bool(x) for x in combos)
+    except Exception:
+        return False
+
+
+def _v282_write_full_refund_feedback(con, plan) -> None:
+    """全返還は投資額=払戻額、回収率100%。的中/外れ判定には加えない。"""
+    tickets = con.execute(
+        "SELECT * FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?",
+        (plan["race_key"], plan["plan_hash"]),
+    ).fetchall()
+    cost = int(plan["cost_yen"] or len(tickets) * 100)
+    unit = int(round(cost / len(tickets))) if tickets else 0
+    for t in tickets:
+        con.execute("""
+            INSERT OR REPLACE INTO v187_mixed_ticket_feedback
+            (race_key,plan_hash,bet_type,combination,hit,payout_yen)
+            VALUES (?,?,?,?,?,?)
+        """, (plan["race_key"], plan["plan_hash"], t["bet_type"], t["combination"], 0, unit))
+    con.execute("""
+        INSERT OR REPLACE INTO v187_mixed_plan_feedback
+        (race_key,plan_hash,hit,black_hit,gami_hit,payout_yen,cost_yen,
+         realized_multiple,return_rate,winning_types,evaluated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        plan["race_key"], plan["plan_hash"], 0, 0, 0,
+        cost, cost, 1.0, 100.0,
+        json.dumps(["全返還"], ensure_ascii=False), _v228_now_jst_iso()
+    ))
+
+
 def _v187_sync_mixed_feedback(db_path: str) -> int:
     """結果登録済みプランを照合。戻り値は今回新しく評価した件数。"""
     _v187_ensure_mixed_learning_tables(db_path)
@@ -9071,10 +10356,24 @@ def _v187_sync_mixed_feedback(db_path: str) -> int:
             LEFT JOIN v187_mixed_plan_feedback f
               ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
             WHERE f.race_key IS NULL
-              AND EXISTS (SELECT 1 FROM result_races rr WHERE rr.race_key=r.race_key
-                          AND COALESCE(rr.learning_eligible,1)=1)
+              AND EXISTS (
+                    SELECT 1 FROM result_races rr
+                    WHERE rr.race_key=r.race_key
+                      AND (
+                            COALESCE(rr.learning_eligible,1)=1
+                            OR EXISTS (
+                                SELECT 1 FROM result_payouts rp
+                                WHERE rp.race_key=r.race_key
+                                  AND COALESCE(rp.combination,'') LIKE '%全返還%'
+                            )
+                      )
+              )
         """).fetchall()
         for plan in plans:
+            if _v282_is_full_refund_race(con, plan["race_key"]):
+                _v282_write_full_refund_feedback(con, plan)
+                done += 1
+                continue
             payouts = con.execute(
                 "SELECT bet_type, combination, payout_yen FROM result_payouts WHERE race_key=?",
                 (plan["race_key"],),
@@ -9126,6 +10425,10 @@ def _v212_recalculate_plan_feedback(db_path: str, race_key: str, plan_hash: str)
             (race_key, plan_hash),
         ).fetchone()
         if plan is None:
+            return
+        if _v282_is_full_refund_race(con, race_key):
+            _v282_write_full_refund_feedback(con, plan)
+            con.commit()
             return
         payouts = con.execute(
             "SELECT bet_type, combination, payout_yen FROM result_payouts WHERE race_key=?",
@@ -9212,6 +10515,8 @@ def _v208_latest_mixed_plan_result(race_key: str, db_path: str) -> dict:
             ORDER BY CASE t.bet_type WHEN '3連単' THEN 1 WHEN '3連複' THEN 2 WHEN '2連単' THEN 3 WHEN '2連複' THEN 4 WHEN 'ワイド' THEN 5 WHEN '単勝' THEN 6 WHEN '複勝' THEN 7 ELSE 9 END, t.combination
         """, (race_key, plan["plan_hash"])).fetchall()
     evaluated = plan["return_rate"] is not None
+    _winning_types_text = str(plan["winning_types"] or "") if "winning_types" in plan.keys() else ""
+    full_refund = "全返還" in _winning_types_text
     hit_tickets = [dict(t) for t in tickets if int(t["hit"] or 0) == 1]
     cost = int(plan["cost_yen"] or len(tickets) * 100)
     payout = int(plan["payout_yen"] or 0) if evaluated else 0
@@ -9230,6 +10535,7 @@ def _v208_latest_mixed_plan_result(race_key: str, db_path: str) -> dict:
         "profit_yen": payout - cost if evaluated else None,
         "return_rate": float(plan["return_rate"] or 0.0) if evaluated else None,
         "hit": bool(plan["hit"]) if evaluated else False,
+        "full_refund": bool(full_refund),
         "black_hit": bool(plan["black_hit"]) if evaluated else False,
         "gami_hit": bool(plan["gami_hit"]) if evaluated else False,
         "hit_tickets": hit_tickets,
@@ -9249,10 +10555,13 @@ def _v208_render_mixed_plan_result(result: dict) -> None:
     if not result.get("evaluated"):
         st.warning("プランは保存されていますが、払戻金との照合がまだ完了していません。")
         return
+    full_refund = bool(result.get("full_refund"))
     hit = bool(result.get("hit"))
     black = bool(result.get("black_hit"))
     gami = bool(result.get("gami_hit"))
-    if not hit:
+    if full_refund:
+        verdict = "↩ 全返還"
+    elif not hit:
         verdict = "× 外れ"
     elif black:
         verdict = "◎ 的中・黒字"
@@ -9268,7 +10577,9 @@ def _v208_render_mixed_plan_result(result: dict) -> None:
     profit = int(result.get("profit_yen") or 0)
     st.metric("収支", f"{profit:+,}円")
     hit_tickets = result.get("hit_tickets") or []
-    if hit_tickets:
+    if full_refund:
+        st.caption("このレースは全返還です。投資額と同額を返還し、回収率100%として記録します。的中率・買い目学習には使用しません。")
+    elif hit_tickets:
         rows=[]
         for t in hit_tickets:
             rows.append({
@@ -9288,7 +10599,15 @@ def _v208_render_mixed_plan_result(result: dict) -> None:
 
 
 def _v187_learning_profile(db_path: str) -> dict:
-    _v187_ensure_mixed_learning_tables(db_path)
+    try:
+        _v187_ensure_mixed_learning_tables(db_path)
+    except sqlite3.DatabaseError as _db187:
+        # 回収率学習領域のDB不調で予測本体まで落とさない。
+        return {
+            "races":0, "return_rate":None, "hit_rate":None, "black_rate":None,
+            "gami_rate":None, "ticket_stats":{}, "enabled":False,
+            "reason":f"回収率学習DBを一時スキップ: {type(_db187).__name__}: {_db187}"
+        }
     _v187_sync_mixed_feedback(db_path)
     out = {"samples":0, "hit_rate":None, "black_rate":None, "gami_rate":None, "return_rate":None, "type_weights":{}}
     with sqlite3.connect(db_path) as con:
@@ -9298,6 +10617,7 @@ def _v187_learning_profile(db_path: str) -> dict:
             JOIN v187_mixed_plan_runs r
               ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
             WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
         """).fetchone()
         if row and int(row[0] or 0)>0:
             out.update(samples=int(row[0]), hit_rate=float(row[1] or 0), black_rate=float(row[2] or 0),
@@ -9307,7 +10627,10 @@ def _v187_learning_profile(db_path: str) -> dict:
             FROM v187_mixed_ticket_feedback tf
             JOIN v187_mixed_plan_runs r
               ON r.race_key=tf.race_key AND r.plan_hash=tf.plan_hash
+            JOIN v187_mixed_plan_feedback pf
+              ON pf.race_key=tf.race_key AND pf.plan_hash=tf.plan_hash
             WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND COALESCE(pf.winning_types,'') NOT LIKE '%全返還%'
             GROUP BY tf.bet_type
         """).fetchall()
         for bet_type,n,hit_rate,avg_payout in rows:
@@ -9432,6 +10755,138 @@ def _v195_return_calibration(db_path: str) -> dict:
         pass
     return out
 
+
+# Ver295: 仮想ゲーム用・期待値確率校正。
+# 展開確率はそのまま、期待値評価だけを券種×確率帯の過去実現率で縮小補正する。
+_V295_EV_CALIBRATION_CACHE = {}
+
+def _v295_norm_combo(bet_type: str, combo) -> str:
+    s=str(combo or "").strip().replace("→","-").replace(">","-").replace(" ","")
+    parts=[x for x in re.split(r"[-‐‑–—]+",s) if x!=""]
+    if str(bet_type) in ("2連複","3連複"):
+        try:
+            parts=sorted(parts,key=lambda x:int(re.sub(r"\\D","",x) or 999))
+        except Exception:
+            parts=sorted(parts)
+    return "-".join(parts)
+
+def _v295_ev_calibration_table(db_path: str, cutoff_date: str="") -> dict:
+    path=str(db_path)
+    cutoff=str(cutoff_date or "").strip()[:10]
+    try:
+        stamp=(path,int(Path(path).stat().st_mtime_ns),cutoff)
+    except Exception:
+        stamp=(path,0,cutoff)
+    if stamp in _V295_EV_CALIBRATION_CACHE:
+        return _V295_EV_CALIBRATION_CACHE[stamp]
+
+    edges=[0.0,0.5,1.0,2.0,3.0,5.0,8.0,12.0,20.0,35.0,100.0001]
+    out={"edges":edges,"types":{},"samples":0,"cutoff":cutoff}
+    supported=("2連単","2連複","3連単","3連複")
+
+    try:
+        with sqlite3.connect(path,timeout=12.0) as con:
+            con.row_factory=sqlite3.Row
+            sql="""
+                SELECT t.race_key,t.bet_type,t.combination,t.probability
+                FROM v67_prediction_tickets t
+                JOIN result_races rr ON rr.race_key=t.race_key
+                WHERE t.bet_type IN ('2連単','2連複','3連単','3連複')
+                  AND EXISTS (
+                    SELECT 1 FROM result_payouts rp
+                    WHERE rp.race_key=t.race_key AND rp.bet_type=t.bet_type
+                  )
+            """
+            params=[]
+            if cutoff:
+                sql+=" AND substr(rr.race_date,1,10) < substr(?,1,10)"
+                params.append(cutoff)
+            rows=con.execute(sql,params).fetchall()
+
+            wsql="""
+                SELECT rp.race_key,rp.bet_type,rp.combination
+                FROM result_payouts rp
+                JOIN result_races rr ON rr.race_key=rp.race_key
+                WHERE rp.bet_type IN ('2連単','2連複','3連単','3連複')
+            """
+            wparams=[]
+            if cutoff:
+                wsql+=" AND substr(rr.race_date,1,10) < substr(?,1,10)"
+                wparams.append(cutoff)
+            win_rows=con.execute(wsql,wparams).fetchall()
+    except Exception:
+        _V295_EV_CALIBRATION_CACHE[stamp]=out
+        return out
+
+    wins=set(
+        (str(r["race_key"]),str(r["bet_type"]),_v295_norm_combo(r["bet_type"],r["combination"]))
+        for r in win_rows
+    )
+    buckets={bt:[{"n":0,"sum_p":0.0,"hits":0} for _ in range(len(edges)-1)] for bt in supported}
+
+    for r in rows:
+        bt=str(r["bet_type"] or "")
+        try:
+            p=float(r["probability"] or 0.0)
+        except Exception:
+            continue
+        if bt not in buckets or not (0.0 <= p <= 100.0):
+            continue
+        bi=len(edges)-2
+        for j in range(len(edges)-1):
+            if edges[j] <= p < edges[j+1]:
+                bi=j
+                break
+        b=buckets[bt][bi]
+        b["n"]+=1
+        b["sum_p"]+=p/100.0
+        if (str(r["race_key"]),bt,_v295_norm_combo(bt,r["combination"])) in wins:
+            b["hits"]+=1
+
+    # 元モデル100件分を事前分布として実績を縮小。極端な補正は±30%に制限。
+    prior_n=100.0
+    for bt,arr in buckets.items():
+        out["types"][bt]=[]
+        for b in arr:
+            n=int(b["n"])
+            mean_p=(b["sum_p"]/n) if n else None
+            if n and mean_p is not None and mean_p>1e-12:
+                calibrated=(float(b["hits"])+prior_n*mean_p)/(n+prior_n)
+                ratio=float(np.clip(calibrated/mean_p,0.70,1.30))
+            else:
+                ratio=1.0
+            out["types"][bt].append({
+                "n":n,
+                "mean_p":mean_p,
+                "hits":int(b["hits"]),
+                "actual_rate":(float(b["hits"]/n) if n else None),
+                "ratio":ratio,
+            })
+            out["samples"]+=n
+
+    _V295_EV_CALIBRATION_CACHE[stamp]=out
+    return out
+
+def _v295_ev_probability(raw_probability_pct: float, bet_type: str, table: dict) -> tuple[float,float,int]:
+    try:
+        p=float(raw_probability_pct)
+    except Exception:
+        return 0.0,1.0,0
+    edges=list((table or {}).get("edges") or [])
+    arr=list(((table or {}).get("types") or {}).get(str(bet_type)) or [])
+    if len(edges)<2 or not arr:
+        return p,1.0,0
+    bi=len(edges)-2
+    for j in range(len(edges)-1):
+        if edges[j] <= p < edges[j+1]:
+            bi=j
+            break
+    row=arr[min(bi,len(arr)-1)]
+    ratio=float(row.get("ratio",1.0) or 1.0)
+    n=int(row.get("n",0) or 0)
+    return float(np.clip(p*ratio,0.0,100.0)),ratio,n
+
+
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
     """6〜8車立て向けの役割分担型・回収率合成。
 
@@ -9443,6 +10898,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     if not starter_count or int(starter_count) not in (6, 7, 8):
         return {"available": False, "reason": "回収率重視の合成推奨は6〜8車立てに対応しています。"}
     starter_count = int(starter_count)
+    _race_date295=str((meta or {}).get("開催日") or (meta or {}).get("race_date") or "")[:10]
+    _ev_calibration295=_v295_ev_calibration_table(str(engine.DB_PATH),_race_date295)
     if not isinstance(bets, dict) or int(trials or 0) <= 0:
         return {"available": False, "reason": "シミュレーション確率を取得できません。"}
 
@@ -9451,6 +10908,11 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         return {"available": False, "reason": "三連単シミュレーションがありません。"}
 
     learning = _v187_learning_profile(engine.DB_PATH)
+    if isinstance(learning,dict) and learning.get("enabled") is False and learning.get("reason"):
+        try:
+            st.caption("回収率学習: " + str(learning.get("reason")))
+        except Exception:
+            pass
     type_weights = learning.get("type_weights", {})
 
     # 車立て別に役割を変更。6車は三連単中心、7車は準中心、8車は複数券種の補完を厚くする。
@@ -9520,8 +10982,14 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             if odds <= 0:
                 continue
             learned_weight = float(type_weights.get(label, 1.0))
+            _ev_prob295,_ev_ratio295,_ev_n295=_v295_ev_probability(
+                probability,label,_ev_calibration295
+            )
             ticket = {
                 "type": label, "combo": key, "probability": probability,
+                "ev_probability": _ev_prob295,
+                "ev_calibration_ratio": _ev_ratio295,
+                "ev_calibration_samples": _ev_n295,
                 "odds": odds, "cap": int(spec["cap"]), "role": spec["role"],
                 "learned_weight": learned_weight,
             }
@@ -9647,6 +11115,17 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             hit_min_multiple = 0.0
             hit_max_multiple = 0.0
         model_expected_multiple = expected_return / cost if cost else 0.0
+
+        # Ver295: 期待値評価専用の校正済み期待払戻。
+        # cover/black/lowは元の展開シミュレーション確率のまま維持する。
+        ev_expected_return = sum(
+            (float(t.get("ev_probability",t.get("probability",0.0)) or 0.0)/100.0)
+            * float(t.get("odds",0.0) or 0.0) * 100.0
+            for t in plan
+        )
+        ev_expected_multiple = ev_expected_return / cost if cost else 0.0
+        ev_model_return_rate = ev_expected_multiple * 100.0
+
         # Ver191: 黒字的中率を主役にする。単なる的中範囲とガミ的中は強く評価しない。
         # 点数増加は購入総額そのものを押し上げるため、以前より明確に減点する。
         tri_share = (counts.get("三連単", 0) / max(1, n))
@@ -9659,6 +11138,9 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             "miss": max(0.0, 100.0 - cover), "expected_return": expected_return,
             "model_return_rate": model_expected_multiple * 100.0,
             "model_expected_multiple": model_expected_multiple,
+            "ev_expected_return": ev_expected_return,
+            "ev_model_return_rate": ev_model_return_rate,
+            "ev_expected_multiple": ev_expected_multiple,
             "hit_average_payout": hit_average_payout,
             "hit_average_multiple": hit_average_multiple,
             "hit_min_multiple": hit_min_multiple,
@@ -9767,7 +11249,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             break
         if len(plan) >= 8 and mg["black_gain"] < 0.22:
             break
-        if len(plan) >= 12 and (mg["black_gain"] < 0.80 or mg["after"]["model_expected_multiple"] < evaluate(plan)["model_expected_multiple"]):
+        if len(plan) >= 12 and (mg["black_gain"] < 0.80 or mg["after"]["ev_expected_multiple"] < evaluate(plan)["ev_expected_multiple"]):
             break
         plan.append(cand)
         remaining.remove(cand)
@@ -9782,7 +11264,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     near = [(p, m) for p, m in snapshots if m["score"] >= best_score - 0.18]
     selected, metrics = max(
         near,
-        key=lambda x: (x[1]["black"], x[1]["model_expected_multiple"],
+        key=lambda x: (x[1]["black"], x[1]["ev_expected_multiple"],
                        x[1]["black_share_of_hits"], x[1]["cover"], -x[1]["low"], -x[1]["points"]),
     )
     selected = list(selected)
@@ -9835,8 +11317,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 trial_metrics = evaluate(trial_plan)
                 cover_loss = base_metrics["cover"] - trial_metrics["cover"]
                 black_gain = trial_metrics["black"] - base_metrics["black"]
-                expected_gain = (trial_metrics["model_expected_multiple"]
-                                 - base_metrics["model_expected_multiple"])
+                expected_gain = (trial_metrics["ev_expected_multiple"]
+                                 - base_metrics["ev_expected_multiple"])
                 gami_drop = base_metrics["low"] - trial_metrics["low"]
                 # 的中重視なので、カバー低下は原則2.5pt以内。大幅な黒字改善時のみ4ptまで許容。
                 allowed_loss = 4.0 if black_gain >= 1.20 else 2.5
@@ -10028,7 +11510,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 break
             odds = float(ticket.get("odds", 0.0) or 0.0)
             prob = float(ticket.get("probability", 0.0) or 0.0)
-            standalone_ev = (prob / 100.0) * odds
+            standalone_ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
             payout_ratio = (odds * 100.0 / float(base.get("cost", 1.0))) if base.get("cost") else 0.0
 
             # 2.0倍以下はEV100%未満なら無条件除外。
@@ -10077,7 +11559,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
             odds = float(ticket.get("odds", 0.0) or 0.0)
             prob = float(ticket.get("probability", 0.0) or 0.0)
-            standalone_ev = (prob / 100.0) * odds
+            standalone_ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
             payout_ratio = (odds * 100.0 / float(before.get("cost", 1.0))) if before.get("cost") else 0.0
             cover_loss = float(before["cover"] - after["cover"])
             black_delta = float(after["black"] - before["black"])
@@ -10235,7 +11717,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 break_even_ok = all(float(t.get("odds", 0.0)) >= float(k) for t in compact)
                 utility = (
                     2.10 * compact_metrics["black"]
-                    + 10.0 * compact_metrics["model_expected_multiple"]
+                    + 10.0 * compact_metrics["ev_expected_multiple"]
                     + 0.18 * compact_metrics["cover"]
                     - 0.75 * compact_metrics["low"]
                     - 0.35 * k
@@ -10245,7 +11727,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
             _, compact_plan, compact_metrics, break_even_ok = max(
                 compact_options,
-                key=lambda x: (x[3], x[0], x[2]["black"], x[2]["model_expected_multiple"], -x[2]["points"]),
+                key=lambda x: (x[3], x[0], x[2]["black"], x[2]["ev_expected_multiple"], -x[2]["points"]),
             )
             normal_metrics = evaluate(selected)
 
@@ -10316,12 +11798,12 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             if p1 <= 0 or p2 < 0.80 or p2 < p1 * 0.62:
                 continue
             new_points = len(selected) + 1
-            standalone_ev = (p2 / 100.0) * odds2
+            standalone_ev = (float(reverse_ticket.get("ev_probability",p2) or p2) / 100.0) * odds2
             if odds2 < float(new_points) or standalone_ev < 0.72:
                 continue
             trial_plan = list(selected) + [reverse_ticket]
             after = evaluate(trial_plan)
-            return_drop = float(base_pair_metrics.get("model_return_rate", 0.0) - after.get("model_return_rate", 0.0))
+            return_drop = float(base_pair_metrics.get("ev_model_return_rate", 0.0) - after.get("ev_model_return_rate", 0.0))
             black_drop = float(base_pair_metrics.get("black", 0.0) - after.get("black", 0.0))
             cover_gain = float(after.get("cover", 0.0) - base_pair_metrics.get("cover", 0.0))
             low_gain = float(after.get("low", 0.0) - base_pair_metrics.get("low", 0.0))
@@ -10369,7 +11851,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             if payout + 1e-9 >= current_cost:
                 continue
             prob = float(ticket.get("probability", 0.0) or 0.0)
-            ev = (prob / 100.0) * odds
+            ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
             trial = [t for t in selected if t is not ticket]
             after = evaluate(trial)
             return_gain = float(after.get("model_return_rate", 0.0) - current.get("model_return_rate", 0.0))
@@ -10448,7 +11930,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
                 odds = float(cand.get("odds", 0.0) or 0.0)
                 probability = float(cand.get("probability", 0.0) or 0.0)
-                standalone_ev = probability / 100.0 * odds
+                standalone_ev = float(cand.get("ev_probability",probability) or probability) / 100.0 * odds
                 if odds <= 0 or standalone_ev < 1.00:
                     continue
 
@@ -10527,7 +12009,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
         probability = float(cand.get("probability", 0.0) or 0.0)
         odds = float(cand.get("odds", 0.0) or 0.0)
-        standalone_ev = probability / 100.0 * odds
+        standalone_ev = float(cand.get("ev_probability",probability) or probability) / 100.0 * odds
         add_metrics = evaluate(selected + [cand])
         cover_gain = add_metrics["cover"] - base_for_residual["cover"]
         black_gain = add_metrics["black"] - base_for_residual["black"]
@@ -10540,7 +12022,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 continue
             swapped = [t for t in selected if t is not old] + [cand]
             sm = evaluate(swapped)
-            if sm["model_return_rate"] + 0.01 < base_for_residual["model_return_rate"]:
+            if sm["ev_model_return_rate"] + 0.01 < base_for_residual["ev_model_return_rate"]:
                 continue
             if sm["black"] + 0.25 < base_for_residual["black"]:
                 continue
@@ -10550,7 +12032,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 continue
             key = (
                 sm["black"] - base_for_residual["black"],
-                sm["model_return_rate"] - base_for_residual["model_return_rate"],
+                sm["ev_model_return_rate"] - base_for_residual["ev_model_return_rate"],
                 base_for_residual["low"] - sm["low"],
                 sm["cover"] - base_for_residual["cover"],
             )
@@ -10623,7 +12105,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
             prob = float(ticket.get("probability", 0.0) or 0.0)
             odds = float(ticket.get("odds", 0.0) or 0.0)
-            standalone_ev = (prob / 100.0) * odds
+            standalone_ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
             key = (
                 return_delta,
                 black_delta,
@@ -10686,7 +12168,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             cover_delta = float(after_refill.get("cover", 0.0) - before_refill.get("cover", 0.0))
             probability = float(cand.get("probability", 0.0) or 0.0)
             odds = float(cand.get("odds", 0.0) or 0.0)
-            standalone_ev = (probability / 100.0) * odds
+            standalone_ev = (float(cand.get("ev_probability",probability) or probability) / 100.0) * odds
 
             acceptable = (
                 return_delta >= 0.05
@@ -11366,7 +12848,20 @@ def install_uploaded_db(uploaded) -> tuple[bool, str]:
         return False, "DBを読み込めませんでした: " + msg
 
     st.session_state["loaded_db_hash"] = digest
-    return True, f"DBを安全に読み込みました（{len(data) / 1024 / 1024:.1f} MB / 旧WAL・SHM除去済み）"
+    try:
+        _id284=_v284_current_db_identity()
+        if not _id284.get("ok"):
+            return False, "アップロード後のDB固定確認に失敗しました。"
+        # Ver284: アップロード採用時点の「正本」をセッションにも保持。
+        # Streamlit rerun等で実ファイルが古いDBへ戻った場合は、この正本から原子的に復元できる。
+        st.session_state["v284_db_identity_baseline"]=_id284
+        st.session_state["v284_db_identity_block"]=[]
+        st.session_state["v284_uploaded_master_bytes"]=bytes(data)
+        st.session_state["v284_uploaded_master_sha256"]=digest
+        st.session_state["v284_uploaded_master_identity"]=_id284
+    except Exception as exc:
+        return False, f"アップロード後の正本固定に失敗しました: {type(exc).__name__}: {exc}"
+    return True, f"DBを安全に読み込み・正本固定しました（{len(data) / 1024 / 1024:.1f} MB / 旧WAL・SHM除去済み）"
 
 
 def secret_value(name: str, default: str = "") -> str:
@@ -11404,7 +12899,7 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                     r.logic_version, r.points, r.cost_yen, r.grade,
                     r.model_return_rate, r.created_at,
                     f.hit, f.black_hit, f.gami_hit, f.payout_yen,
-                    f.return_rate, f.evaluated_at,
+                    f.return_rate, f.winning_types, f.evaluated_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''),'Unknown')
                         ORDER BY datetime(f.evaluated_at) DESC,
@@ -11420,7 +12915,7 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
             )
             SELECT race_key,race_date,venue,race_no,app_version,logic_version,
                    points,cost_yen,grade,model_return_rate,created_at,
-                   hit,black_hit,gami_hit,payout_yen,return_rate,evaluated_at
+                   hit,black_hit,gami_hit,payout_yen,return_rate,winning_types,evaluated_at
             FROM evaluated
             WHERE rn=1
             ORDER BY race_date,venue,CAST(race_no AS INTEGER),app_version
@@ -11442,6 +12937,7 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
     df["推奨区分"] = df["grade"].fillna("").astype(str).apply(
         lambda x: "非推奨" if ("非推奨" in x or "⛔" in x) else "推奨"
     )
+    df["全返還"] = df.get("winning_types", "").fillna("").astype(str).str.contains("全返還", regex=False)
     return df
 
 
@@ -11453,12 +12949,13 @@ def _v216_summary_values(df: pd.DataFrame) -> dict:
                     "hit_rate": None, "black_rate": None, "gami_rate": None}
         cost = float(pd.to_numeric(part["cost_yen"], errors="coerce").fillna(0).sum())
         payout = float(pd.to_numeric(part["payout_yen"], errors="coerce").fillna(0).sum())
+        judged = part[~part.get("全返還", pd.Series(False, index=part.index)).fillna(False).astype(bool)]
         return {
             "races": int(len(part)), "cost": int(cost), "payout": int(payout),
             "profit": int(payout - cost), "return": (payout / cost * 100.0) if cost > 0 else None,
-            "hit_rate": float(pd.to_numeric(part["hit"], errors="coerce").fillna(0).mean() * 100.0),
-            "black_rate": float(pd.to_numeric(part["black_hit"], errors="coerce").fillna(0).mean() * 100.0),
-            "gami_rate": float(pd.to_numeric(part["gami_hit"], errors="coerce").fillna(0).mean() * 100.0),
+            "hit_rate": (float(pd.to_numeric(judged["hit"], errors="coerce").fillna(0).mean() * 100.0) if not judged.empty else None),
+            "black_rate": (float(pd.to_numeric(judged["black_hit"], errors="coerce").fillna(0).mean() * 100.0) if not judged.empty else None),
+            "gami_rate": (float(pd.to_numeric(judged["gami_hit"], errors="coerce").fillna(0).mean() * 100.0) if not judged.empty else None),
         }
     return {
         "全レース": one(df),
@@ -11471,8 +12968,10 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
     if df.empty:
         return pd.DataFrame()
     work = df.copy()
+    work["判定対象"] = (~work.get("全返還", pd.Series(False, index=work.index)).fillna(False).astype(bool)).astype(int)
     grouped = work.groupby(group_cols, dropna=False).agg(
         レース数=("race_key", "count"),
+        判定対象レース数=("判定対象", "sum"),
         的中数=("hit", "sum"),
         黒字数=("black_hit", "sum"),
         ガミ数=("gami_hit", "sum"),
@@ -11480,8 +12979,8 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
         払戻額=("payout_yen", "sum"),
         収支=("収支", "sum"),
     ).reset_index()
-    grouped["的中率"] = grouped["的中数"] / grouped["レース数"].clip(lower=1) * 100.0
-    grouped["黒字率"] = grouped["黒字数"] / grouped["レース数"].clip(lower=1) * 100.0
+    grouped["的中率"] = grouped["的中数"] / grouped["判定対象レース数"].replace(0, pd.NA) * 100.0
+    grouped["黒字率"] = grouped["黒字数"] / grouped["判定対象レース数"].replace(0, pd.NA) * 100.0
     grouped["回収率"] = grouped["払戻額"] / grouped["購入額"].replace(0, pd.NA) * 100.0
 
     # 同じ集計単位について、非推奨を除いた成績を横並びにする。
@@ -11489,6 +12988,7 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
     if not recommended.empty:
         rec = recommended.groupby(group_cols, dropna=False).agg(
             推奨レース数=("race_key", "count"),
+            推奨判定対象レース数=("判定対象", "sum"),
             推奨的中数=("hit", "sum"),
             推奨黒字数=("black_hit", "sum"),
             推奨ガミ数=("gami_hit", "sum"),
@@ -11497,8 +12997,8 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
             推奨収支=("収支", "sum"),
         ).reset_index()
         rec["非推奨除外回収率"] = rec["推奨払戻額"] / rec["推奨購入額"].replace(0, pd.NA) * 100.0
-        rec["非推奨除外的中率"] = rec["推奨的中数"] / rec["推奨レース数"].clip(lower=1) * 100.0
-        rec["非推奨除外黒字率"] = rec["推奨黒字数"] / rec["推奨レース数"].clip(lower=1) * 100.0
+        rec["非推奨除外的中率"] = rec["推奨的中数"] / rec["推奨判定対象レース数"].replace(0, pd.NA) * 100.0
+        rec["非推奨除外黒字率"] = rec["推奨黒字数"] / rec["推奨判定対象レース数"].replace(0, pd.NA) * 100.0
         keep = group_cols + ["推奨レース数", "非推奨除外回収率", "非推奨除外的中率", "非推奨除外黒字率", "推奨収支"]
         grouped = grouped.merge(rec[keep], on=group_cols, how="left")
     else:
@@ -11570,11 +13070,17 @@ def _v215_render_return_dashboard(db_path: str) -> None:
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("**全レース**")
-        st.caption(f"的中率 {all_s['hit_rate']:.1f}% / 黒字率 {all_s['black_rate']:.1f}% / ガミ率 {all_s['gami_rate']:.1f}% / 収支 {all_s['profit']:+,}円")
+        st.caption(
+            f"的中率 {all_s['hit_rate']:.1f}% / 黒字率 {all_s['black_rate']:.1f}% / ガミ率 {all_s['gami_rate']:.1f}% / 収支 {all_s['profit']:+,}円"
+            if all_s['hit_rate'] is not None else f"的中判定対象なし / 収支 {all_s['profit']:+,}円"
+        )
     with c2:
         st.markdown("**推奨のみ（非推奨除外）**")
         if rec_s['races']:
-            st.caption(f"{rec_s['races']}R・的中率 {rec_s['hit_rate']:.1f}% / 黒字率 {rec_s['black_rate']:.1f}% / ガミ率 {rec_s['gami_rate']:.1f}% / 収支 {rec_s['profit']:+,}円")
+            st.caption(
+                f"{rec_s['races']}R・的中率 {rec_s['hit_rate']:.1f}% / 黒字率 {rec_s['black_rate']:.1f}% / ガミ率 {rec_s['gami_rate']:.1f}% / 収支 {rec_s['profit']:+,}円"
+                if rec_s['hit_rate'] is not None else f"{rec_s['races']}R・的中判定対象なし / 収支 {rec_s['profit']:+,}円"
+            )
         else:
             st.caption("該当なし")
     with c3:
@@ -11872,94 +13378,662 @@ def _v276_validate_db_bytes(data: bytes, label: str = "DB") -> tuple[bool, str]:
 
 
 
+
+def _v283_db_fingerprint_bytes(data: bytes) -> dict:
+    """DBの『中身の世代』を容量ではなく主要件数＋最新時刻で指紋化する。"""
+    out={"ok":False,"counts":{},"latest":"","size":len(data),"reason":""}
+    tmp_path=None
+    try:
+        if not data.startswith(b"SQLite format 3\x00"):
+            out["reason"]="SQLite形式ではありません"
+            return out
+        fd,tmp_name=tempfile.mkstemp(prefix="autorace_db_fingerprint_",suffix=".sqlite3")
+        os.close(fd)
+        tmp_path=Path(tmp_name)
+        tmp_path.write_bytes(data)
+        with sqlite3.connect(str(tmp_path),timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            tables={str(r[0]) for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+
+            protected=[
+                "players","race_history","player_lap_history",
+                "result_races","result_entries","result_laps","result_payouts",
+                "prediction_feedback","prediction_snapshots",
+                "v231_prediction_history","v252_lap_prediction_snapshots","v266_pred_time_snapshots",
+                "v221_odds_runs","v221_odds_values",
+                "v67_prediction_tickets","v67_ticket_feedback",
+                "v187_mixed_plan_runs","v187_mixed_plan_feedback",
+                "v187_mixed_plan_tickets","v187_mixed_ticket_feedback",
+                "v222_prediction_restore","v223_result_view_restore","v238_result_raw_archive",
+                "v40_prediction_feature_snapshots","v41_registration_batches",
+                "weight_adjustment_history",
+            ]
+            counts={}
+            for t in protected:
+                if t in tables:
+                    q='"'+t.replace('"','""')+'"'
+                    counts[t]=int(con.execute(f"SELECT COUNT(*) FROM {q}").fetchone()[0] or 0)
+            out["counts"]=counts
+
+            latest_candidates=[]
+            latest_specs=[
+                ("race_history","race_date"),
+                ("result_races","registered_at"),
+                ("v231_prediction_history","prediction_time"),
+                ("v221_odds_runs","created_at"),
+                ("v187_mixed_plan_runs","created_at"),
+            ]
+            for t,c in latest_specs:
+                if t in tables:
+                    cols={str(r[1]) for r in con.execute(f'PRAGMA table_info("{t}")').fetchall()}
+                    if c in cols:
+                        v=con.execute(f'SELECT MAX(COALESCE("{c}", "")) FROM "{t}"').fetchone()[0]
+                        if v:
+                            latest_candidates.append(str(v))
+            out["latest"]=max(latest_candidates) if latest_candidates else ""
+            out["ok"]=True
+            return out
+    except Exception as exc:
+        out["reason"]=f"{type(exc).__name__}: {exc}"
+        return out
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+
+def _v284_db_row_keysets_from_bytes(data: bytes) -> dict:
+    """主要保存テーブルを自然キーで比較できる形へ変換する。
+
+    件数だけではなく「どちらにしか存在しない行があるか」を判定するために使う。
+    ID再採番の影響を避けるため、可能な限りrace_key等の自然キーを使う。
+    """
+    out={"ok":False,"tables":{},"reason":""}
+    tmp_path=None
+    try:
+        if not data.startswith(b"SQLite format 3\x00"):
+            out["reason"]="SQLite形式ではありません"
+            return out
+        fd,tmp_name=tempfile.mkstemp(prefix="autorace_rowset_",suffix=".sqlite3")
+        os.close(fd)
+        tmp_path=Path(tmp_name)
+        tmp_path.write_bytes(data)
+
+        keymap={
+            "players":("player_name",),
+            "race_history":("record_key",),
+            "player_lap_history":("race_key","car_no","lap_label"),
+            "result_races":("race_key",),
+            "result_entries":("race_key","car_no"),
+            "result_laps":("race_key","lap_label","position"),
+            "result_payouts":("race_key","bet_type","combination"),
+            "prediction_feedback":("race_key",),
+            "prediction_snapshots":("race_key","car_no"),
+            "v40_prediction_feature_snapshots":("race_key","car_no"),
+            "v41_registration_batches":("race_key",),
+            "v67_prediction_tickets":("race_key","bet_type","combination"),
+            "v67_ticket_feedback":("race_key","bet_type"),
+            "v141_heat_feature_snapshots":("race_key","car_no"),
+            "v142_aux_feature_snapshots":("race_key","car_no"),
+            "v151_race_context_feature_snapshots":("race_key","car_no"),
+            "v151_player_race_context_profiles":("player_key","context_key"),
+            "v15_player_history_imports":("history_key",),
+            "v152_overtake_feature_snapshots":("race_key","car_no"),
+            "v187_mixed_plan_runs":("race_key","plan_hash"),
+            "v187_mixed_plan_tickets":("race_key","plan_hash","bet_type","combination"),
+            "v187_mixed_plan_feedback":("race_key","plan_hash"),
+            "v187_mixed_ticket_feedback":("race_key","plan_hash","bet_type","combination"),
+            "v221_odds_runs":("race_key","snapshot_id"),
+            "v221_odds_values":("race_key","snapshot_id","bet_key","combination"),
+            "v222_prediction_restore":("race_key",),
+            "v223_result_view_restore":("race_key",),
+            "v238_result_raw_archive":("race_key",),
+            "v279_player_incident_history":("race_key","car_no","incident_type"),
+        }
+        with sqlite3.connect(str(tmp_path),timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            tables={str(r[0]) for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            result={}
+            for t,keys in keymap.items():
+                if t not in tables:
+                    continue
+                cols={str(r[1]) for r in con.execute(f'PRAGMA table_info("{t}")').fetchall()}
+                if not all(k in cols for k in keys):
+                    continue
+                qcols=",".join('"'+k.replace('"','""')+'"' for k in keys)
+                result[t]={tuple(r) for r in con.execute(f'SELECT {qcols} FROM "{t}"').fetchall()}
+
+            # 予測履歴はhistory_idではなく意味キーで比較
+            if "v231_prediction_history" in tables:
+                cols={str(r[1]) for r in con.execute('PRAGMA table_info("v231_prediction_history")').fetchall()}
+                keys=("race_key","app_version","prediction_time")
+                if all(k in cols for k in keys):
+                    result["v231_prediction_history"]={
+                        tuple(r) for r in con.execute(
+                            'SELECT race_key,app_version,prediction_time FROM v231_prediction_history'
+                        ).fetchall()
+                    }
+
+            # 周回予測もsnapshot_idではなく内容キーで比較
+            if "v252_lap_prediction_snapshots" in tables:
+                cols={str(r[1]) for r in con.execute('PRAGMA table_info("v252_lap_prediction_snapshots")').fetchall()}
+                # Ver284: created_at は再シミュレーションのたびに変わるため、
+                # 同じ周回予測を別物として diverged 判定しない。
+                # race/lap/version/backtest/予測順を意味キーとし、support/created_at差は同一スナップショット系列として扱う。
+                keys=("race_date","venue","race_no","lap_no","app_version")
+                if all(k in cols for k in keys):
+                    result["v252_lap_prediction_snapshots"]={
+                        tuple(r) for r in con.execute(
+                            'SELECT race_date,venue,race_no,lap_no,app_version '
+                            'FROM v252_lap_prediction_snapshots'
+                        ).fetchall()
+                    }
+
+            # 予測タイムはhistory_idが枝で変わるため、race情報が直接無ければ比較対象から外す。
+            out["tables"]=result
+            out["ok"]=True
+            return out
+    except Exception as exc:
+        out["reason"]=f"{type(exc).__name__}: {exc}"
+        return out
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _v284_db_containment(candidate_bytes: bytes, baseline_bytes: bytes) -> dict:
+    """candidateとbaselineの行単位包含関係を返す。
+
+    relation:
+      equal                 完全一致
+      candidate_contains    candidateがbaselineを完全包含
+      baseline_contains     baselineがcandidateを完全包含
+      diverged              双方に固有行あり
+      unknown               判定不能
+    """
+    c=_v284_db_row_keysets_from_bytes(candidate_bytes)
+    b=_v284_db_row_keysets_from_bytes(baseline_bytes)
+    if not c.get("ok") or not b.get("ok"):
+        return {
+            "relation":"unknown",
+            "candidate_only":{},
+            "baseline_only":{},
+            "reason":f"candidate={c.get('reason','')} / baseline={b.get('reason','')}",
+        }
+
+    c_only={}
+    b_only={}
+    all_tables=sorted(set(c.get("tables",{})) | set(b.get("tables",{})))
+    for t in all_tables:
+        cs=set((c.get("tables") or {}).get(t,set()))
+        bs=set((b.get("tables") or {}).get(t,set()))
+        co=cs-bs
+        bo=bs-cs
+        if co: c_only[t]=len(co)
+        if bo: b_only[t]=len(bo)
+
+    if not c_only and not b_only:
+        relation="equal"
+    elif c_only and not b_only:
+        relation="candidate_contains"
+    elif b_only and not c_only:
+        relation="baseline_contains"
+    else:
+        relation="diverged"
+
+    return {
+        "relation":relation,
+        "candidate_only":c_only,
+        "baseline_only":b_only,
+        "reason":"ok",
+    }
+
+
+def _v284_containment_message(rel: dict, candidate_label: str, baseline_label: str) -> str:
+    co=rel.get("candidate_only") or {}
+    bo=rel.get("baseline_only") or {}
+    parts=[f"包含判定: {rel.get('relation','unknown')}"]
+    if co:
+        parts.append(candidate_label+"のみ: "+", ".join(f"{k}+{v}" for k,v in sorted(co.items())))
+    if bo:
+        parts.append(baseline_label+"のみ: "+", ".join(f"{k}+{v}" for k,v in sorted(bo.items())))
+    return " / ".join(parts)
+
+
+def _v283_compare_db_fingerprints(candidate: dict, baseline: dict) -> dict:
+    """candidateがbaselineより欠損していないか確認する。欠損が1件でもあれば停止。"""
+    result={"safe":True,"regressions":[],"warnings":[]}
+    if not candidate.get("ok"):
+        return {"safe":False,"regressions":[f"候補DBの指紋取得失敗: {candidate.get('reason','')}"],"warnings":[]}
+    if not baseline or not baseline.get("ok"):
+        return {
+            "safe":False,
+            "regressions":["比較元DBの指紋を取得できないため、安全確認なしのDB置換・保存は禁止しました"],
+            "warnings":[]
+        }
+
+    cc=candidate.get("counts") or {}
+    bc=baseline.get("counts") or {}
+
+    # Ver284: 再シミュレーション/再学習でDELETE→再生成される派生テーブルは、
+    # 一時的/正常な件数減少だけで「DB巻き戻り」と判定しない。
+    # 原本データ系は従来通り1件でも減れば停止する。
+    _rebuildable_count_tables284={
+        "weight_adjustment_history",
+    }
+
+    for t,bv in bc.items():
+        if t not in cc:
+            if t in _rebuildable_count_tables284:
+                result["warnings"].append(f"{t}: 派生テーブル再生成中/再生成後のため候補テーブルなしを許容")
+            else:
+                result["regressions"].append(f"{t}: 比較元{int(bv):,}件 → 候補テーブルなし")
+            continue
+        cv=int(cc.get(t,0) or 0)
+        bv=int(bv or 0)
+        if cv < bv:
+            if t in _rebuildable_count_tables284:
+                result["warnings"].append(
+                    f"{t}: {bv:,} → {cv:,}（-{bv-cv:,}、派生テーブル再生成として許容）"
+                )
+            else:
+                result["regressions"].append(f"{t}: {bv:,} → {cv:,}（-{bv-cv:,}）")
+
+    cand_latest=str(candidate.get("latest") or "")
+    base_latest=str(baseline.get("latest") or "")
+    if cand_latest and base_latest and cand_latest < base_latest:
+        result["regressions"].append(f"最新データ時刻: {base_latest} → {cand_latest}")
+
+    result["safe"]=not result["regressions"]
+    return result
+
+
+def _v283_get_chunk_manifest(branch: str | None = None, previous: bool = False) -> tuple[bool, dict, str]:
+    cfg=github_config()
+    repo_api=f"https://api.github.com/repos/{cfg['repo']}/contents/"
+    path=(
+        str(cfg["path"]).lstrip("/") + ".chunks.previous.json"
+        if previous else _v282_chunk_manifest_path()
+    )
+    read_branch=str(branch or _v282_db_read_branch())
+    url=repo_api+urllib.parse.quote(path,safe="/")+"?ref="+urllib.parse.quote(read_branch)
+    status,body=github_request(url)
+    if status==404:
+        return False,{},"manifestなし"
+    if status!=200:
+        return False,{},f"manifest取得失敗: {body.get('message',status)}"
+    try:
+        raw=base64.b64decode(str(body.get("content") or "").replace("\n",""))
+        return True,json.loads(raw.decode("utf-8")), "ok"
+    except Exception as exc:
+        return False,{},f"manifest解析失敗: {type(exc).__name__}: {exc}"
+
+
 def _v282_chunk_manifest_path() -> str:
     return str(github_config()["path"]).lstrip("/") + ".chunks.json"
 
 
-def _v282_push_chunked_db(snapshot_bytes: bytes, commit_message: str, chunk_size: int = 4 * 1024 * 1024) -> tuple[bool, str]:
-    """大容量DBを小分けしてContents APIへ保存。APIの単発リクエスト肥大化を避ける。"""
-    cfg = github_config()
-    repo_api = f"https://api.github.com/repos/{cfg['repo']}/contents/"
-    ok_branch, branch_msg = _v282_ensure_db_branch()
+def _v282_push_chunked_db(
+    snapshot_bytes: bytes, commit_message: str,
+    chunk_size: int = 8 * 1024 * 1024,
+    fingerprint: dict | None = None,
+    preserve_previous_manifest: bool = False,
+) -> tuple[bool, str]:
+    """Ver283: DBをA/B二世代スロットで分割保存する。
+
+    現在manifestがAなら次はBへ全partを書き終えてからmanifestを切替える。
+    途中失敗しても現在manifestが指す旧世代は壊さない。
+    """
+    cfg=github_config()
+    repo_api=f"https://api.github.com/repos/{cfg['repo']}/contents/"
+    ok_branch,branch_msg=_v282_ensure_db_branch()
     if not ok_branch:
-        return False, branch_msg
-    branch = branch_msg
-    base_path = str(cfg["path"]).lstrip("/")
-    chunks = [snapshot_bytes[i:i + chunk_size] for i in range(0, len(snapshot_bytes), chunk_size)]
+        return False,branch_msg
+    branch=branch_msg
+    base_path=str(cfg["path"]).lstrip("/")
+
+    current_ok,current_manifest,_=_v283_get_chunk_manifest(branch=branch,previous=False)
+    _prev_ok_gen284,_prev_manifest_gen284,_=_v283_get_chunk_manifest(branch=branch,previous=True)
+    current_slot=str((current_manifest or {}).get("slot") or "")
+    next_slot="B" if current_slot=="A" else "A"
+    generation=max(
+        int((current_manifest or {}).get("generation") or 0),
+        int((_prev_manifest_gen284 or {}).get("generation") or 0) if _prev_ok_gen284 else 0,
+    )+1
+
+    chunks=[snapshot_bytes[i:i+chunk_size] for i in range(0,len(snapshot_bytes),chunk_size)]
     import hashlib
-    digest = hashlib.sha256(snapshot_bytes).hexdigest()
+    digest=hashlib.sha256(snapshot_bytes).hexdigest()
 
-    def put_file(path: str, data: bytes, message: str) -> tuple[bool, str]:
-        encoded = urllib.parse.quote(path, safe="/")
-        url = repo_api + encoded
-        q = url + "?ref=" + urllib.parse.quote(branch)
-        s, old = github_request(q)
-        payload = {
-            "message": message,
-            "content": base64.b64encode(data).decode("ascii"),
-            "branch": branch,
+    # Ver294 UI/速度修正:
+    # 以前のmanifestにGit blob SHAがあれば更新前GETを省略する。
+    # GitHub PUT応答のcontent.shaをローカル計算Git blob SHAと照合し、
+    # 全partを再ダウンロードする二重転送を不要にする。
+    _known_git_sha294={}
+    for _m294 in (current_manifest or {}, _prev_manifest_gen284 or {}):
+        _parts294=list((_m294 or {}).get("parts") or [])
+        _shas294=list((_m294 or {}).get("part_git_sha1") or [])
+        if len(_parts294)==len(_shas294):
+            for _p294,_s294 in zip(_parts294,_shas294):
+                if _p294 and _s294:
+                    _known_git_sha294[str(_p294)]=str(_s294)
+
+    _saved_git_sha294={}
+
+    def _git_blob_sha294(data: bytes) -> str:
+        import hashlib as _hashlib294
+        header=f"blob {len(data)}\0".encode("utf-8")
+        return _hashlib294.sha1(header+data).hexdigest()
+
+    def put_file(path: str, data: bytes, message: str) -> tuple[bool,str]:
+        encoded=urllib.parse.quote(path,safe="/")
+        url=repo_api+encoded
+        payload={
+            "message":message,
+            "content":base64.b64encode(data).decode("ascii"),
+            "branch":branch,
         }
-        if s == 200 and old.get("sha"):
-            payload["sha"] = old["sha"]
-        elif s != 404:
-            return False, str(old.get("message", s))
-        ps, body = github_request(url, method="PUT", payload=payload)
-        if ps not in (200, 201):
-            return False, str(body.get("message", ps))
-        return True, "ok"
 
-    chunk_paths = []
-    for idx, chunk in enumerate(chunks):
-        cp = f"{base_path}.part{idx:03d}"
-        ok, msg = put_file(cp, chunk, f"{commit_message} [part {idx+1}/{len(chunks)}]")
+        # 前世代manifestにSHAがあれば、更新対象の存在確認GETを省略。
+        _old_sha294=_known_git_sha294.get(str(path))
+        if _old_sha294:
+            payload["sha"]=_old_sha294
+        else:
+            q=url+"?ref="+urllib.parse.quote(branch)
+            s,old=github_request(q)
+            if s==200 and old.get("sha"):
+                payload["sha"]=old["sha"]
+            elif s!=404:
+                return False,str(old.get("message",s))
+
+        ps,body=github_request(url,method="PUT",payload=payload)
+        if ps not in (200,201):
+            return False,str(body.get("message",ps))
+
+        _expected_sha294=_git_blob_sha294(data)
+        _returned_sha294=str(((body or {}).get("content") or {}).get("sha") or "")
+        if _returned_sha294:
+            # Ver295 hotfix:
+            # HTTP 200/201 + GitHubが返したcontent.shaを保存成功の正本とする。
+            # ローカル計算SHAとの差だけで保存失敗にしない。
+            # 次回更新時はこのGitHub実SHAをmanifestから再利用する。
+            _saved_git_sha294[str(path)]=_returned_sha294
+            return True,"ok"
+
+        # 応答にSHAが無い特殊時だけ1回読み戻して確認。
+        try:
+            _req294=urllib.request.Request(
+                url+"?ref="+urllib.parse.quote(branch),
+                headers={
+                    **({"Authorization":f"Bearer {cfg.get('token')}"} if cfg.get("token") else {}),
+                    "Accept":"application/vnd.github.raw+json",
+                    "User-Agent":"AutoRaceAI",
+                }
+            )
+            with urllib.request.urlopen(_req294,timeout=45) as _r294:
+                _got294=_r294.read()
+            if _got294 != data:
+                return False,"GitHub PUT後のフォールバック読み戻し不一致"
+            _saved_git_sha294[str(path)]=_expected_sha294
+            return True,"ok"
+        except Exception as _exc294:
+            return False,f"GitHub PUT後検証失敗: {type(_exc294).__name__}: {_exc294}"
+
+    def _cleanup_orphan_parts295(
+        active_manifest: dict,
+        previous_manifest: dict,
+        target_slot: str,
+    ) -> tuple[int,list[str]]:
+        """manifest切替成功後だけ、参照されていない旧partを削除する。
+
+        - current/previous のどちらかが参照しているpartは絶対に削除しない。
+        - 対象は今回書いたtarget_slotと同じslotのpartだけ。
+        - 削除失敗はDB保存成功を取り消さず、警告として返す。
+        """
+        protected=set()
+        for _m295 in (active_manifest or {}, previous_manifest or {}):
+            for _p295 in list((_m295 or {}).get("parts") or []):
+                if _p295:
+                    protected.add(str(_p295))
+
+        # base_path の親ディレクトリをContents APIで1回だけ列挙。
+        _parent295=posixpath.dirname(base_path)
+        _name295=posixpath.basename(base_path)
+        _dir_url295=repo_api + urllib.parse.quote(_parent295,safe="/")
+        if _parent295:
+            _dir_url295 += "?ref=" + urllib.parse.quote(branch)
+        else:
+            _dir_url295 = repo_api.rstrip("/") + "?ref=" + urllib.parse.quote(branch)
+
+        try:
+            _s295,_rows295=github_request(_dir_url295)
+        except Exception as _exc295:
+            return 0,[f"旧part一覧取得失敗: {type(_exc295).__name__}: {_exc295}"]
+        if _s295 != 200 or not isinstance(_rows295,list):
+            return 0,[f"旧part一覧取得失敗: HTTP {_s295}"]
+
+        _prefix295=f"{_name295}.slot{target_slot}.part"
+        _deleted295=0
+        _errors295=[]
+        for _row295 in _rows295:
+            if not isinstance(_row295,dict):
+                continue
+            _nm295=str(_row295.get("name") or "")
+            _path295=str(_row295.get("path") or "")
+            _sha295=str(_row295.get("sha") or "")
+            if not _nm295.startswith(_prefix295):
+                continue
+            if _path295 in protected:
+                continue
+            if not _sha295:
+                _errors295.append(f"{_path295}: SHAなしのため削除保留")
+                continue
+
+            _del_url295=repo_api+urllib.parse.quote(_path295,safe="/")
+            _payload295={
+                "message":f"{commit_message} [不要旧part削除 {_path295}]",
+                "sha":_sha295,
+                "branch":branch,
+            }
+            try:
+                _ds295,_dbody295=github_request(
+                    _del_url295,method="DELETE",payload=_payload295
+                )
+                if _ds295 in (200,204):
+                    _deleted295+=1
+                else:
+                    _msg295=(
+                        _dbody295.get("message",_ds295)
+                        if isinstance(_dbody295,dict) else _ds295
+                    )
+                    _errors295.append(f"{_path295}: {_msg295}")
+            except Exception as _exc295:
+                _errors295.append(
+                    f"{_path295}: {type(_exc295).__name__}: {_exc295}"
+                )
+        return _deleted295,_errors295
+
+    # inactive slotへ先に全partを書き込む。manifestはまだ切り替えない。
+    chunk_paths=[]
+    for idx,chunk in enumerate(chunks):
+        cp=f"{base_path}.slot{next_slot}.part{idx:03d}"
+        ok,msg=put_file(cp,chunk,f"{commit_message} [DB世代{generation} slot{next_slot} part {idx+1}/{len(chunks)}]")
         if not ok:
-            return False, f"分割DB part {idx+1}/{len(chunks)} 保存失敗: {msg}"
+            return False,f"分割DB slot{next_slot} part {idx+1}/{len(chunks)} 保存失敗: {msg}"
         chunk_paths.append(cp)
 
-    manifest = {
-        "format": "AutoRaceAI-sqlite-chunks-v1",
-        "size": len(snapshot_bytes),
-        "sha256": digest,
-        "parts": chunk_paths,
+    # Ver294高速化:
+    # 各partはPUT応答のGit blob SHAで内容一致を確認済み。
+    # 以前はここで全partをもう一度GitHubからダウンロードしていたため、
+    # 80MB級DBではアップロード後に同容量を再転送して待ち時間が長かった。
+    # PUT時SHA検証に置き換え、二重転送を廃止する。
+    if len(_saved_git_sha294) != len(chunk_paths):
+        return False,(
+            f"GitHub保存を未完了として中止しました。"
+            f"part SHA確認数 {_saved_git_sha294.__len__()}/{len(chunk_paths)}。"
+            "current manifestは切り替えていません。"
+        )
+
+    fp=fingerprint if isinstance(fingerprint,dict) and fingerprint.get("ok") else _v283_db_fingerprint_bytes(snapshot_bytes)
+    manifest={
+        "format":"AutoRaceAI-sqlite-chunks-v2",
+        "generation":generation,
+        "slot":next_slot,
+        "size":len(snapshot_bytes),
+        "sha256":digest,
+        "parts":chunk_paths,
+        "part_sizes":[len(c) for c in chunks],
+        "part_sha256":[hashlib.sha256(c).hexdigest() for c in chunks],
+        "part_git_sha1":[_saved_git_sha294.get(p,"") for p in chunk_paths],
+        "verified_readback":False,
+        "verified_upload_git_sha":True,
+        "stats":fp,
+        "app_version":str(_V231_APP_VERSION),
+        "saved_at":_v228_now_jst_iso(),
+        "commit_message":str(commit_message),
     }
-    manifest_bytes = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
-    ok, msg = put_file(_v282_chunk_manifest_path(), manifest_bytes, f"{commit_message} [manifest]")
+
+    # 通常時は現在世代をpreviousへ退避。
+    # Ver284復旧保存時はcurrent分割実体が壊れているため、正常なprevious manifestを上書きしない。
+    if current_ok and current_manifest and not preserve_previous_manifest:
+        prev_bytes=json.dumps(current_manifest,ensure_ascii=False,sort_keys=True).encode("utf-8")
+        ok,msg=put_file(
+            base_path+".chunks.previous.json",prev_bytes,
+            f"{commit_message} [previous manifest 世代{current_manifest.get('generation','旧')}]"
+        )
+        if not ok:
+            return False,f"previous manifest保存失敗: {msg}"
+
+    manifest_bytes=json.dumps(manifest,ensure_ascii=False,sort_keys=True).encode("utf-8")
+    ok,msg=put_file(_v282_chunk_manifest_path(),manifest_bytes,f"{commit_message} [manifest 世代{generation}]")
     if not ok:
-        return False, f"分割DB manifest保存失敗: {msg}"
-    return True, f"DB登録成功｜GitHub分割保存成功（{len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割）"
+        return False,f"分割DB manifest保存失敗: {msg}"
+
+    # Ver295: manifest切替が完全成功した後にだけ旧余剰partを掃除する。
+    # previousとして実際に保持されるmanifestを明示して、参照中partは保護する。
+    if current_ok and current_manifest and not preserve_previous_manifest:
+        _previous_after295=dict(current_manifest)
+    else:
+        _previous_after295=dict(_prev_manifest_gen284 or {}) if _prev_ok_gen284 else {}
+
+    _deleted_orphans295,_cleanup_errors295=_cleanup_orphan_parts295(
+        manifest,_previous_after295,next_slot
+    )
+    _cleanup_note295=f" / 旧余剰part削除{int(_deleted_orphans295)}件"
+    if _cleanup_errors295:
+        _cleanup_note295 += f" / 削除保留{len(_cleanup_errors295)}件"
+
+    return True,(
+        f"DB登録成功｜GitHub分割保存成功 "
+        f"（DB世代{generation} / slot{next_slot} / {len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割 / 全part Git SHA検証済み"
+        f"{_cleanup_note295}）"
+    )
+
 
 
 def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
-    """分割保存されたDBがあれば復元する。manifest無しなら従来方式へ戻す。"""
+    """Ver284: 保存時と同じ3段取得で分割DBを復元し、part単位+全体を厳密検証する。"""
     cfg = github_config()
     repo_api = f"https://api.github.com/repos/{cfg['repo']}/contents/"
     mp = _v282_chunk_manifest_path()
     read_branch = _v282_db_read_branch()
-    url = repo_api + urllib.parse.quote(mp, safe="/") + "?ref=" + urllib.parse.quote(read_branch)
-    status, body = github_request(url)
-    if status == 404:
-        return False, None, "manifestなし"
-    if status != 200:
-        return False, None, f"分割DB manifest取得失敗: {body.get('message', status)}"
-    try:
-        manifest = json.loads(base64.b64decode(body["content"].replace("\n", "")).decode("utf-8"))
-        data_parts = []
-        for idx, cp in enumerate(manifest.get("parts") or []):
-            u = repo_api + urllib.parse.quote(cp, safe="/") + "?ref=" + urllib.parse.quote(read_branch)
-            s, b = github_request(u)
-            if s != 200:
-                return False, None, f"分割DB part {idx+1}取得失敗: {b.get('message', s)}"
-            data_parts.append(base64.b64decode(b["content"].replace("\n", "")))
-        data = b"".join(data_parts)
-        import hashlib
-        if len(data) != int(manifest.get("size", -1)):
-            return False, None, "分割DBのサイズ検証に失敗しました。"
-        if hashlib.sha256(data).hexdigest() != str(manifest.get("sha256", "")):
-            return False, None, "分割DBのSHA256検証に失敗しました。"
-        return True, data, "ok"
-    except Exception as exc:
-        return False, None, f"分割DB復元エラー: {type(exc).__name__}: {exc}"
 
+    def _fetch284(path284: str) -> tuple[bool, bytes | None, str]:
+        enc284=urllib.parse.quote(path284,safe="/")
+        url284=repo_api+enc284+"?ref="+urllib.parse.quote(read_branch)
+        status284,obj284=github_request(url284)
+        if status284 != 200 or not isinstance(obj284,dict):
+            msg284=obj284.get("message",status284) if isinstance(obj284,dict) else status284
+            return False,None,f"Contents API: {msg284}"
+
+        content284=obj284.get("content")
+        if content284:
+            try:
+                return True,base64.b64decode(str(content284).replace("\n","")),"contents-base64"
+            except Exception:
+                pass
+
+        dl284=obj284.get("download_url")
+        if dl284:
+            try:
+                headers284={"Accept":"application/octet-stream","User-Agent":"AutoRaceAI"}
+                if cfg.get("token"):
+                    headers284["Authorization"]=f"Bearer {cfg.get('token')}"
+                req284=urllib.request.Request(str(dl284),headers=headers284)
+                with urllib.request.urlopen(req284,timeout=45) as resp284:
+                    return True,resp284.read(),"download_url"
+            except Exception:
+                pass
+
+        try:
+            headers284={"Accept":"application/vnd.github.raw+json","User-Agent":"AutoRaceAI"}
+            if cfg.get("token"):
+                headers284["Authorization"]=f"Bearer {cfg.get('token')}"
+            req284=urllib.request.Request(url284,headers=headers284)
+            with urllib.request.urlopen(req284,timeout=45) as resp284:
+                return True,resp284.read(),"github-raw"
+        except Exception as exc284:
+            return False,None,f"raw {type(exc284).__name__}: {exc284}"
+
+    okm284,mbytes284,mmethod284=_fetch284(mp)
+    if not okm284 or mbytes284 is None:
+        # 旧挙動との互換: manifestそのものが無い場合だけ従来方式へフォールバック可能にする。
+        urlm284=repo_api+urllib.parse.quote(mp,safe="/")+"?ref="+urllib.parse.quote(read_branch)
+        sm284,bm284=github_request(urlm284)
+        if sm284==404:
+            return False,None,"manifestなし"
+        return False,None,f"分割DB manifest取得失敗: {mmethod284}"
+
+    try:
+        manifest=json.loads(mbytes284.decode("utf-8"))
+    except Exception as exc284:
+        return False,None,f"分割DB manifest解析失敗: {type(exc284).__name__}: {exc284}"
+
+    parts284=list(manifest.get("parts") or [])
+    sizes284=list(manifest.get("part_sizes") or [])
+    shas284=list(manifest.get("part_sha256") or [])
+    data_parts284=[]
+
+    for idx284,cp284 in enumerate(parts284):
+        ok284,pdata284,method284=_fetch284(str(cp284))
+        if not ok284 or pdata284 is None:
+            return False,None,f"分割DB part {idx284+1}/{len(parts284)}取得失敗: {method284}"
+
+        if idx284 < len(sizes284):
+            try:
+                if len(pdata284) != int(sizes284[idx284]):
+                    return False,None,(
+                        f"分割DB part {idx284+1}/{len(parts284)}サイズ検証失敗 "
+                        f"({method284}: {len(pdata284)} != {int(sizes284[idx284])})"
+                    )
+            except Exception as exc284:
+                return False,None,f"分割DB partサイズ情報不正: {type(exc284).__name__}: {exc284}"
+
+        if idx284 < len(shas284) and str(shas284[idx284]):
+            if hashlib.sha256(pdata284).hexdigest() != str(shas284[idx284]):
+                return False,None,f"分割DB part {idx284+1}/{len(parts284)} SHA256検証失敗 ({method284})"
+
+        data_parts284.append(pdata284)
+
+    data284=b"".join(data_parts284)
+    try:
+        expected_size284=int(manifest.get("size",-1))
+    except Exception:
+        expected_size284=-1
+    if len(data284) != expected_size284:
+        return False,None,f"分割DB全体サイズ検証失敗 ({len(data284)} != {expected_size284})"
+    if hashlib.sha256(data284).hexdigest() != str(manifest.get("sha256","")):
+        return False,None,"分割DB全体SHA256検証失敗"
+
+    fp284=_v283_db_fingerprint_bytes(data284)
+    if not fp284.get("ok"):
+        return False,None,"分割DBのSQLite整合性検証に失敗しました。"
+
+    return True,data284,"全part読み戻し・SHA256・SQLite整合性検証済み"
 
 def pull_db_from_github() -> tuple[bool, str]:
     try:
@@ -11975,6 +14049,36 @@ def pull_db_from_github() -> tuple[bool, str]:
     if chunk_ok and chunk_data is not None:
         data = chunk_data
         try:
+            # Ver283世代ガード: GitHub側が正常SQLiteでも、ローカルより欠損していれば巻き戻さない。
+            _remote_fp283=_v283_db_fingerprint_bytes(data)
+            _mf_ok284,_mf284,_mf_msg284=_v283_get_chunk_manifest(branch=_v282_db_read_branch(),previous=False)
+            _mf_fp284=(_mf284 or {}).get("stats") or {}
+            if not _mf_ok284 or not _mf_fp284.get("ok"):
+                return False,"GitHub DBの再読込を中止しました。manifestのDB指紋が無い/不完全な世代は採用しません。"
+            _manifest_cmp284=_v283_compare_db_fingerprints(_remote_fp283,_mf_fp284)
+            _manifest_cmp284_rev=_v283_compare_db_fingerprints(_mf_fp284,_remote_fp283)
+            if not _manifest_cmp284.get("safe") or not _manifest_cmp284_rev.get("safe"):
+                return False,"GitHub DBの再読込を中止しました。manifest記録件数と実DB件数が一致しない世代です。"
+            try:
+                _local_bytes283=_v278_consistent_db_snapshot_bytes(str(engine.DB_PATH))
+                _local_fp283=_v283_db_fingerprint_bytes(_local_bytes283)
+            except Exception:
+                _local_fp283={"ok":False,"reason":"ローカル指紋取得失敗"}
+            _rel284=_v284_db_containment(data,_local_bytes283)
+            _relation284=str(_rel284.get("relation") or "unknown")
+            if _relation284=="baseline_contains":
+                return False,(
+                    "GitHub DBは現在の端末DBの古い部分集合です。端末DBを維持してください。\n"+
+                    _v284_containment_message(_rel284,"GitHub","端末")
+                )
+            if _relation284=="diverged":
+                return False,(
+                    "GitHub DBと端末DBの双方に固有データがあります。自動上書きせず統合が必要です。\n"+
+                    _v284_containment_message(_rel284,"GitHub","端末")
+                )
+            if _relation284=="unknown":
+                return False,"GitHub DBの包含関係を安全確認できないため再読込を中止しました。"
+            # equal または GitHubが端末を完全包含する場合のみ採用
             ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上の分割DB")
             if not ok:
                 return False, "GitHub上の分割DBは採用しませんでした。現在のDBは保護されています。\n" + msg
@@ -11992,6 +14096,20 @@ def pull_db_from_github() -> tuple[bool, str]:
         return False, f"GitHubからDBを取得できませんでした: {body.get('message', status)}"
     try:
         data = base64.b64decode(body["content"].replace("\n", ""))
+        _remote_fp283=_v283_db_fingerprint_bytes(data)
+        try:
+            _local_bytes283=_v278_consistent_db_snapshot_bytes(str(engine.DB_PATH))
+            _local_fp283=_v283_db_fingerprint_bytes(_local_bytes283)
+        except Exception:
+            _local_fp283={"ok":False,"reason":"ローカル指紋取得失敗"}
+        _rel284=_v284_db_containment(data,_local_bytes283)
+        _relation284=str(_rel284.get("relation") or "unknown")
+        if _relation284=="baseline_contains":
+            return False,"GitHub DBは端末DBの古い部分集合です。端末DBを維持してください。\n"+_v284_containment_message(_rel284,"GitHub","端末")
+        if _relation284=="diverged":
+            return False,"GitHub DBと端末DBの双方に固有データがあります。統合が必要です。\n"+_v284_containment_message(_rel284,"GitHub","端末")
+        if _relation284=="unknown":
+            return False,"GitHub DBの包含関係を安全確認できないため再読込を中止しました。"
         ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上のDB")
         if not ok:
             return False, "GitHub上のDBは採用しませんでした。現在のDBは保護されています。\n" + msg
@@ -12089,52 +14207,318 @@ def _v281_push_large_file_via_git_data_api(snapshot_bytes: bytes, commit_message
     return True, f"DB登録成功｜GitHub保存成功（Git Data API / {len(snapshot_bytes)/1024/1024:.1f}MB）"
 
 
+
+def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> tuple[bool, bytes | None, dict]:
+    """diverged時に自然キーで『欠けている行だけ』を相互統合する。
+
+    方針:
+    - ローカルDBを土台にする（既存行は上書きしない）。
+    - GitHubにしか無い自然キーの行だけ追加。
+    - ID列が自然キーでない単一INTEGER PKは再採番して衝突を避ける。
+    - 統合後DBがローカル/remote双方を行単位で包含することを再確認。
+    - 保護テーブル件数がremoteより減る場合は失敗。
+    """
+    report={"ok":False,"added":{},"reason":"","relation_local":"","relation_remote":""}
+    if not (isinstance(local_bytes,(bytes,bytearray)) and bytes(local_bytes).startswith(b"SQLite format 3\x00")):
+        report["reason"]="ローカルDBがSQLiteではありません"
+        return False,None,report
+    if not (isinstance(remote_bytes,(bytes,bytearray)) and bytes(remote_bytes).startswith(b"SQLite format 3\x00")):
+        report["reason"]="GitHub DBがSQLiteではありません"
+        return False,None,report
+
+    keymap={
+        "players":("player_name",),
+        "race_history":("record_key",),
+        "player_lap_history":("race_key","car_no","lap_label"),
+        "result_races":("race_key",),
+        "result_entries":("race_key","car_no"),
+        "result_laps":("race_key","lap_label","position"),
+        "result_payouts":("race_key","bet_type","combination"),
+        "prediction_feedback":("race_key",),
+        "prediction_snapshots":("race_key","car_no"),
+        "v40_prediction_feature_snapshots":("race_key","car_no"),
+        "v41_registration_batches":("race_key",),
+        "v67_prediction_tickets":("race_key","bet_type","combination"),
+        "v67_ticket_feedback":("race_key","bet_type"),
+        "v141_heat_feature_snapshots":("race_key","car_no"),
+        "v142_aux_feature_snapshots":("race_key","car_no"),
+        "v151_race_context_feature_snapshots":("race_key","car_no"),
+            "v151_player_race_context_profiles":("player_key","context_key"),
+            "v15_player_history_imports":("history_key",),
+        "v152_overtake_feature_snapshots":("race_key","car_no"),
+        "v187_mixed_plan_runs":("race_key","plan_hash"),
+        "v187_mixed_plan_tickets":("race_key","plan_hash","bet_type","combination"),
+        "v187_mixed_plan_feedback":("race_key","plan_hash"),
+        "v187_mixed_ticket_feedback":("race_key","plan_hash","bet_type","combination"),
+        "v221_odds_runs":("race_key","snapshot_id"),
+        "v221_odds_values":("race_key","snapshot_id","bet_key","combination"),
+        "v222_prediction_restore":("race_key",),
+        "v223_result_view_restore":("race_key",),
+        "v238_result_raw_archive":("race_key",),
+        "v279_player_incident_history":("race_key","car_no","incident_type"),
+        "v231_prediction_history":("race_key","app_version","prediction_time"),
+        # created_at/support差だけの再シミュレーション重複は別行扱いしない。
+        "v252_lap_prediction_snapshots":("race_date","venue","race_no","lap_no","app_version"),
+    }
+
+    tmp_dir=Path(tempfile.mkdtemp(prefix="autorace_safe_union_"))
+    local_path=tmp_dir/"merged.sqlite3"
+    remote_path=tmp_dir/"remote.sqlite3"
+    try:
+        local_path.write_bytes(bytes(local_bytes))
+        remote_path.write_bytes(bytes(remote_bytes))
+        with sqlite3.connect(str(local_path),timeout=60.0) as lc, sqlite3.connect(str(remote_path),timeout=60.0) as rc:
+            lc.execute("PRAGMA busy_timeout=60000")
+            rc.execute("PRAGMA busy_timeout=60000")
+            lc_tables={str(r[0]) for r in lc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            rc_tables={str(r[0]) for r in rc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+            # Ver295: player_idはDB枝ごとに再採番され得るため、
+            # GitHub固有race_historyを追加するときはplayer_name経由でIDを対応付ける。
+            _remote_to_local_player_id295={}
+            if "players" in lc_tables and "players" in rc_tables:
+                _local_name_to_id295={
+                    str(_name295):int(_pid295)
+                    for _pid295,_name295 in lc.execute("SELECT player_id,player_name FROM players")
+                    if _pid295 is not None and _name295 is not None
+                }
+                for _rpid295,_rname295 in rc.execute("SELECT player_id,player_name FROM players"):
+                    if _rpid295 is None or _rname295 is None:
+                        continue
+                    _lpid295=_local_name_to_id295.get(str(_rname295))
+                    if _lpid295 is not None:
+                        _remote_to_local_player_id295[int(_rpid295)]=int(_lpid295)
+
+            for table,keys in keymap.items():
+                if table not in lc_tables or table not in rc_tables:
+                    continue
+                linfo=lc.execute(f'PRAGMA table_info("{table}")').fetchall()
+                rinfo=rc.execute(f'PRAGMA table_info("{table}")').fetchall()
+                lcols=[str(r[1]) for r in linfo]
+                rcols=[str(r[1]) for r in rinfo]
+                if lcols != rcols or not all(k in lcols for k in keys):
+                    report["reason"]=f"{table}: スキーマ不一致または自然キー不足"
+                    return False,None,report
+
+                key_idx=[lcols.index(k) for k in keys]
+                local_rows=lc.execute(f'SELECT * FROM "{table}"').fetchall()
+                local_keys={tuple(row[i] for i in key_idx) for row in local_rows}
+                remote_rows=rc.execute(f'SELECT * FROM "{table}"').fetchall()
+                missing=[row for row in remote_rows if tuple(row[i] for i in key_idx) not in local_keys]
+                if not missing:
+                    continue
+
+                # 自然キーに含まれない単一INTEGER主キーは挿入時に除外して自動採番。
+                pk_cols=[(str(r[1]),str(r[2] or "").upper(),int(r[5] or 0)) for r in linfo if int(r[5] or 0)>0]
+                insert_cols=list(lcols)
+                omit=set()
+                if len(pk_cols)==1:
+                    pk_name,pk_type,_=pk_cols[0]
+                    if pk_name not in keys and "INT" in pk_type:
+                        omit.add(pk_name)
+                insert_cols=[c for c in insert_cols if c not in omit]
+                idxs=[lcols.index(c) for c in insert_cols]
+                qcols=",".join('"'+c.replace('"','""')+'"' for c in insert_cols)
+                placeholders=",".join("?" for _ in insert_cols)
+                _insert_rows295=[]
+                for row in missing:
+                    _vals295=[row[i] for i in idxs]
+                    if table=="race_history" and "player_id" in insert_cols:
+                        _pi295=insert_cols.index("player_id")
+                        try:
+                            _remote_pid295=int(_vals295[_pi295])
+                            _local_pid295=_remote_to_local_player_id295.get(_remote_pid295)
+                        except Exception:
+                            _local_pid295=None
+                        if _local_pid295 is None:
+                            report["reason"]=(
+                                "race_history: GitHub固有行の選手をplayer_name経由で"
+                                "端末playersへ安全に対応付けできません"
+                            )
+                            return False,None,report
+                        _vals295[_pi295]=int(_local_pid295)
+                    _insert_rows295.append(tuple(_vals295))
+
+                lc.executemany(
+                    f'INSERT INTO "{table}" ({qcols}) VALUES ({placeholders})',
+                    _insert_rows295
+                )
+                report["added"][table]=len(missing)
+
+            lc.commit()
+            chk=lc.execute("PRAGMA integrity_check").fetchone()
+            if not chk or str(chk[0]).lower()!="ok":
+                report["reason"]="統合後DBのintegrity_check失敗"
+                return False,None,report
+
+        merged=local_path.read_bytes()
+        rel_l=_v284_db_containment(merged,bytes(local_bytes))
+        rel_r=_v284_db_containment(merged,bytes(remote_bytes))
+        report["relation_local"]=str(rel_l.get("relation") or "")
+        report["relation_remote"]=str(rel_r.get("relation") or "")
+        if report["relation_local"] not in ("equal","candidate_contains"):
+            report["reason"]="統合後DBが端末DBを完全包含していません"
+            return False,None,report
+        if report["relation_remote"] not in ("equal","candidate_contains"):
+            report["reason"]="統合後DBがGitHub DBを完全包含していません"
+            return False,None,report
+
+        # 行キー比較対象外の保護テーブルも、remoteより件数を減らさない。
+        mfp=_v283_db_fingerprint_bytes(merged)
+        rfp=_v283_db_fingerprint_bytes(bytes(remote_bytes))
+        cmp_remote=_v283_compare_db_fingerprints(mfp,rfp)
+        if not cmp_remote.get("safe"):
+            report["reason"]="統合後DBがGitHub保護件数を満たしません: "+" / ".join(cmp_remote.get("regressions") or [])
+            return False,None,report
+
+        report["ok"]=True
+        return True,merged,report
+    except Exception as exc:
+        report["reason"]=f"{type(exc).__name__}: {exc}"
+        return False,None,report
+    finally:
+        shutil.rmtree(tmp_dir,ignore_errors=True)
+
+
 def push_db_to_github(commit_message: str) -> tuple[bool, str]:
-    ready, message = github_ready()
+    # 保存ボタン押下時にも、アップロード正本よりDBが後退していないか最終確認。
+    _pin284=st.session_state.get("v284_uploaded_master_identity")
+    if isinstance(_pin284,dict) and _pin284.get("ok"):
+        _nowpin284=_v284_current_db_identity()
+        _badpin284,_why284=_v284_db_identity_regressed(_nowpin284,_pin284)
+        if _badpin284:
+            return False,"GitHub保存を中止しました。保存直前にDBがアップロード正本より後退しています。\n- "+"\n- ".join(map(str,_why284))
+    _guard284=st.session_state.get("v284_db_identity_block") or []
+    if _guard284:
+        return False,"DB参照先固定ガードが作動中のためGitHub保存を禁止しました。\n- "+"\n- ".join(map(str,_guard284))
+    ready,message=github_ready()
     if not ready:
-        return False, message
-    db_path = Path(engine.DB_PATH)
+        return False,message
+    db_path=Path(engine.DB_PATH)
     if not db_path.exists():
-        return False, "保存するDBがありません。"
+        return False,"保存するDBがありません。"
 
     try:
         snapshot_bytes=_v278_consistent_db_snapshot_bytes(str(db_path))
     except Exception as exc:
-        return False, f"DB整合スナップショット作成エラー: {type(exc).__name__}: {exc}"
+        return False,f"DB整合スナップショット作成エラー: {type(exc).__name__}: {exc}"
 
-    cfg = github_config()
-    ok_branch, db_branch = _v282_ensure_db_branch()
+    # 破損DBは絶対に保存しない。
+    ok_validate,msg_validate=_v276_validate_db_bytes(snapshot_bytes,"GitHub保存前DB")
+    if not ok_validate:
+        return False,(
+            "GitHub保存を中止しました。現在DBにSQLite異常があります。"
+            " GitHub上の正常DBは上書きしていません。\\n"+str(msg_validate)
+        )
+
+    local_fp=_v283_db_fingerprint_bytes(snapshot_bytes)
+    if not local_fp.get("ok"):
+        return False,"GitHub保存を中止しました。DB内容の世代確認に失敗しました: "+str(local_fp.get("reason") or "")
+
+    ok_branch,db_branch=_v282_ensure_db_branch()
     if not ok_branch:
-        return False, db_branch
-    url = github_api_url()
-    query_url = url + "?ref=" + urllib.parse.quote(db_branch)
-    status, existing = github_request(query_url)
-    sha = existing.get("sha") if status == 200 else None
-    if status not in (200, 404):
-        return False, f"GitHub上のDB確認に失敗しました: {existing.get('message', status)}"
+        return False,db_branch
 
-    payload = {
-        "message": commit_message,
-        "content": base64.b64encode(snapshot_bytes).decode("ascii"),
-        "branch": db_branch,
-    }
-    if sha:
-        payload["sha"] = sha
-    put_status, result = github_request(url, method="PUT", payload=payload)
-    if put_status not in (200, 201):
-        # 大容量SQLiteではContents APIが "file is too large to be processed" になる。
-        # DB登録自体は既に完了しているため、Git Data APIへ自動フォールバックする。
-        err = str(result.get("message", put_status))
-        ok2, msg2 = _v281_push_large_file_via_git_data_api(snapshot_bytes, commit_message)
-        if ok2:
-            return True, msg2
-        # Git Data APIでもbase64化した単発payloadが大き過ぎる環境では、4MB単位の分割保存へ退避。
-        ok3, msg3 = _v282_push_chunked_db(snapshot_bytes, commit_message)
-        if ok3:
-            return True, msg3
-        return False, f"DB登録成功｜GitHub保存失敗: {err}｜大容量保存も失敗: {msg2}｜分割保存も失敗: {msg3}"
-    return True, f"DB登録成功｜GitHub保存成功（{len(snapshot_bytes)/1024/1024:.1f}MB）"
+    # GitHub current DBと行単位の包含関係を比較。
+    # 件数だけではなく、どちらにしか存在しない自然キーがあるかで判断する。
+    _remote_chunk_ok284,_remote_bytes284,_remote_chunk_msg284=_v282_pull_chunked_db()
+    if _remote_chunk_ok284 and _remote_bytes284 is not None:
+        _relpush284=_v284_db_containment(snapshot_bytes,_remote_bytes284)
+        _rpush284=str(_relpush284.get("relation") or "unknown")
+        if _rpush284=="baseline_contains":
+            return False,(
+                "GitHub保存を中止しました。GitHub DBが現在の端末DBを完全包含しています。"
+                " 先にGitHub DBを採用してください。\n"+
+                _v284_containment_message(_relpush284,"端末","GitHub")
+            )
+        if _rpush284=="diverged":
+            _merge_ok284,_merged_bytes284,_merge_report284=_v284_safe_union_merge_db_bytes(
+                snapshot_bytes,_remote_bytes284
+            )
+            if not _merge_ok284 or _merged_bytes284 is None:
+                return False,(
+                    "GitHub保存を中止しました。端末DBとGitHub DBはdivergedで、"
+                    "安全自動統合にも失敗しました。\n"+
+                    _v284_containment_message(_relpush284,"端末","GitHub")+
+                    "\n統合理由: "+str((_merge_report284 or {}).get("reason") or "不明")
+                )
+            # 統合DBを現在DBへ先に確定。以後の保存/端末DL/再起動復元で同じ正本を使う。
+            _install_merge_ok284,_install_merge_msg284=_v276_atomic_install_db_bytes(
+                _merged_bytes284,"diverged安全統合DB"
+            )
+            if not _install_merge_ok284:
+                return False,"diverged安全統合DBの現在DBへの反映に失敗しました: "+str(_install_merge_msg284)
+            snapshot_bytes=bytes(_merged_bytes284)
+            local_fp=_v283_db_fingerprint_bytes(snapshot_bytes)
+            st.session_state["v284_uploaded_master_bytes"]=snapshot_bytes
+            st.session_state["v284_uploaded_master_sha256"]=hashlib.sha256(snapshot_bytes).hexdigest()
+            _merged_identity284=_v284_current_db_identity()
+            if _merged_identity284.get("ok"):
+                st.session_state["v284_uploaded_master_identity"]=_merged_identity284
+                st.session_state["v284_db_identity_baseline"]=_merged_identity284
+                st.session_state["v284_db_identity_block"]=[]
+            _added284=(_merge_report284 or {}).get("added") or {}
+            st.session_state["v284_last_auto_merge_message"]=(
+                "🔀 端末DBとGitHub DBを安全統合しました。双方の自然キー完全包含を再確認済み。GitHub固有行を追加: "+
+                (", ".join(f"{k}+{v}" for k,v in sorted(_added284.items())) if _added284 else "追加なし")
+            )
+        if _rpush284=="unknown":
+            return False,"GitHub保存を中止しました。端末DBとGitHub DBの包含関係を安全確認できません。"
+        # equal / 端末がGitHubを完全包含 の場合のみ保存可能
+    _recovery_push284=False
+    _recovery_reason284=""
+    if not _remote_chunk_ok284 and _remote_chunk_msg284!="manifestなし":
+        # Ver284: current分割実体が壊れていても、manifestの保護件数とprevious世代を使って
+        # ローカルDBが後退していないことを二重確認できる場合だけ復旧保存を許可する。
+        _cur_ok284,_cur_manifest284,_cur_msg284=_v283_get_chunk_manifest(branch=db_branch,previous=False)
+        _prev_ok284,_prev_manifest284,_prev_msg284=_v283_get_chunk_manifest(branch=db_branch,previous=True)
+        if not _cur_ok284:
+            return False,"GitHub保存前のcurrent DB取得に失敗し、current manifestも確認できません: "+str(_remote_chunk_msg284)
+        _cur_fp284=(_cur_manifest284 or {}).get("stats") or {}
+        if not _cur_fp284.get("ok"):
+            return False,"GitHub保存を中止しました。壊れたcurrent DBのmanifest指紋が不完全で復旧判定できません。"
+        _cmp_cur284=_v283_compare_db_fingerprints(local_fp,_cur_fp284)
+        if not _cmp_cur284.get("safe"):
+            return False,(
+                "GitHub保存を中止しました。current分割DBは復元できず、"
+                "さらに現在DBがcurrent manifestの保護件数を満たしていません。\n- "
+                +"\n- ".join(map(str,_cmp_cur284.get("regressions") or []))
+            )
+        if _prev_ok284:
+            _prev_fp284=(_prev_manifest284 or {}).get("stats") or {}
+            if not _prev_fp284.get("ok"):
+                return False,"GitHub保存を中止しました。previous manifestのDB指紋が不完全です。"
+            _cmp_prev284=_v283_compare_db_fingerprints(local_fp,_prev_fp284)
+            if not _cmp_prev284.get("safe"):
+                return False,(
+                    "GitHub保存を中止しました。現在DBがprevious正常世代の保護件数を満たしていません。\n- "
+                    +"\n- ".join(map(str,_cmp_prev284.get("regressions") or []))
+                )
+        _recovery_push284=True
+        _recovery_reason284=str(_remote_chunk_msg284)
 
+    # manifest件数ガードも補助的に残す。
+    remote_ok,remote_manifest,remote_msg=_v283_get_chunk_manifest(branch=db_branch,previous=False)
+    if remote_ok:
+        remote_fp=(remote_manifest or {}).get("stats") or {}
+        if not remote_fp.get("ok"):
+            return False,"GitHub保存を中止しました。current manifestのDB指紋が不完全です。"
+    elif remote_msg!="manifestなし":
+        return False,"GitHub保存前の世代確認に失敗しました: "+str(remote_msg)
+
+    # Ver283ではDB保存経路をmanifest付きA/B分割保存へ一本化。
+    # 復旧時は壊れたcurrent manifestをpreviousへ退避せず、既存previousを温存する。
+    _ok_push284,_msg_push284=_v282_push_chunked_db(
+        snapshot_bytes,commit_message,
+        fingerprint=local_fp,
+        preserve_previous_manifest=bool(_recovery_push284),
+    )
+    if _ok_push284 and _recovery_push284:
+        _msg_push284 += "｜current分割DB不整合から復旧保存（previous世代は温存）"
+    _merge_notice284=st.session_state.pop("v284_last_auto_merge_message",None)
+    if _ok_push284 and _merge_notice284:
+        _msg_push284 += "｜"+str(_merge_notice284)
+    return _ok_push284,_msg_push284
 
 
 # Ver276 DB安全化: 起動時にGitHub DBで現在DBを自動上書きしない。
@@ -12191,6 +14575,162 @@ def _v278_render_bg_compact(location: str = "main") -> None:
         st.warning("⚠️ バックグラウンド再シミュレーションでエラーがあります。再シミュレーション画面で確認してください。")
 
 
+
+# Ver284 DB参照先固定ガード:
+# Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
+def _v290_db_stat_signature(path_value) -> tuple:
+    try:
+        p=Path(str(path_value)).resolve()
+        sig=[str(p)]
+        for q in (p,Path(str(p)+"-wal"),Path(str(p)+"-shm")):
+            try:
+                stt=q.stat()
+                sig.extend([str(q),int(stt.st_size),int(stt.st_mtime_ns)])
+            except Exception:
+                sig.extend([str(q),-1,-1])
+        return tuple(sig)
+    except Exception:
+        return (str(path_value),)
+
+def _v284_current_db_identity() -> dict:
+    """DB identity with WAL-aware stat cache to avoid rebuilding a 50MB snapshot multiple times per rerun."""
+    try:
+        p=Path(str(engine.DB_PATH)).resolve()
+        sig=_v290_db_stat_signature(p)
+        cached=st.session_state.get("_v290_identity_cache")
+        if isinstance(cached,dict) and cached.get("sig")==sig and isinstance(cached.get("value"),dict):
+            return dict(cached["value"])
+        data=_v278_consistent_db_snapshot_bytes(str(p))
+        fp=_v283_db_fingerprint_bytes(data)
+        value={
+            "ok":bool(fp.get("ok")),
+            "path":str(p),
+            "sha256":hashlib.sha256(data).hexdigest(),
+            "size":len(data),
+            "fingerprint":fp,
+        }
+        st.session_state["_v290_identity_cache"]={"sig":sig,"value":dict(value)}
+        return value
+    except Exception as exc:
+        return {"ok":False,"path":str(getattr(engine,"DB_PATH","")),"reason":f"{type(exc).__name__}: {exc}"}
+
+def _v284_db_identity_regressed(now: dict, baseline: dict) -> tuple[bool,list[str]]:
+    reasons=[]
+    if not now.get("ok") or not baseline.get("ok"):
+        return True,["DB識別情報を取得できません"]
+    if str(now.get("path")) != str(baseline.get("path")):
+        reasons.append(f"DBパス変更: {baseline.get('path')} → {now.get('path')}")
+    cmp=_v283_compare_db_fingerprints(now.get("fingerprint") or {},baseline.get("fingerprint") or {})
+    st.session_state["v284_db_identity_warnings"]=list(cmp.get("warnings") or [])
+    if not cmp.get("safe"):
+        reasons.extend(cmp.get("regressions") or [])
+    return bool(reasons),reasons
+
+# Ver284: アップロード済み正本がある場合、rerunでDB実体が後退していたら
+# GitHub操作や画面処理より前に同じ engine.DB_PATH へ原子的に復元する。
+_v284_pinned_bytes=st.session_state.get("v284_uploaded_master_bytes")
+_v284_pinned_id=st.session_state.get("v284_uploaded_master_identity")
+if isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_id,dict) and _v284_pinned_id.get("ok"):
+    _v284_before_restore=_v284_current_db_identity()
+    _v284_restore_needed=False
+    if not _v284_before_restore.get("ok"):
+        _v284_restore_needed=True
+    else:
+        _v284_regressed,_v284_restore_reasons=_v284_db_identity_regressed(_v284_before_restore,_v284_pinned_id)
+        # 正本とSHAが違っても「増えたDB」は正常更新なので復元しない。
+        # 件数後退/DBパス変更だけを復元対象にする。
+        _v284_restore_needed=bool(_v284_regressed)
+    if _v284_restore_needed:
+        _v284_restore_ok,_v284_restore_msg=_v276_atomic_install_db_bytes(bytes(_v284_pinned_bytes),"アップロード正本自動復元")
+        if _v284_restore_ok:
+            _v284_restored_id=_v284_current_db_identity()
+            if _v284_restored_id.get("ok"):
+                st.session_state["v284_db_identity_baseline"]=_v284_restored_id
+                st.session_state["v284_db_identity_block"]=[]
+                st.session_state["v284_db_auto_restored"]=True
+        else:
+            st.session_state["v284_db_identity_block"]=["アップロード正本の自動復元失敗: "+str(_v284_restore_msg)]
+
+# Ver290 speed hotfix:
+# 起動時はまず小さいmanifestだけ確認し、GitHub currentが現在DBを包含する時だけ
+# 50MB級の全partダウンロードを行う。現在DBが同等/新しいなら全part取得を省略する。
+if not st.session_state.get("v284_boot_github_restore_checked",False):
+    st.session_state["v284_boot_github_restore_checked"]=True
+    try:
+        _boot_ready284,_boot_ready_msg284=github_ready()
+        if _boot_ready284:
+            _manifest_ok290,_manifest290,_manifest_msg290=_v283_get_chunk_manifest(previous=False)
+            _boot_local284=_v284_current_db_identity()
+            if _manifest_ok290:
+                _boot_remote_manifest_fp290=(_manifest290 or {}).get("stats") or {}
+                _boot_remote_sha290=str((_manifest290 or {}).get("sha256") or "")
+                _boot_local_sha290=str(_boot_local284.get("sha256") or "") if _boot_local284.get("ok") else ""
+                _need_full_pull290=False
+
+                if not _boot_local284.get("ok"):
+                    _need_full_pull290=bool(_boot_remote_manifest_fp290.get("ok"))
+                elif _boot_remote_sha290 and _boot_remote_sha290==_boot_local_sha290:
+                    st.session_state["v284_boot_github_restore_note"]="GitHub currentと現在DBは同一です。"
+                elif _boot_remote_manifest_fp290.get("ok"):
+                    _boot_cmp290=_v283_compare_db_fingerprints(
+                        _boot_remote_manifest_fp290,
+                        _boot_local284.get("fingerprint") or {}
+                    )
+                    if _boot_cmp290.get("safe"):
+                        _need_full_pull290=True
+                    else:
+                        st.session_state["v284_boot_github_restore_note"]=(
+                            "GitHub currentは現在DBを完全包含しないため起動時置換を禁止しました: "
+                            +" / ".join((_boot_cmp290.get("regressions") or [])[:8])
+                        )
+
+                if _need_full_pull290:
+                    _v290_load_stage("GitHub正本を取得しています…")
+                    _boot_ok284,_boot_bytes284,_boot_msg284=_v282_pull_chunked_db()
+                    if _boot_ok284 and isinstance(_boot_bytes284,(bytes,bytearray)):
+                        _boot_remote284=_v283_db_fingerprint_bytes(bytes(_boot_bytes284))
+                        _boot_local_fp284=(_boot_local284.get("fingerprint") or {}) if _boot_local284.get("ok") else {}
+                        if _boot_local284.get("ok"):
+                            _boot_cmp284=_v283_compare_db_fingerprints(_boot_remote284,_boot_local_fp284)
+                            _boot_not_older284=bool(_boot_cmp284.get("safe"))
+                        else:
+                            _boot_not_older284=bool(_boot_remote284.get("ok"))
+                        if _boot_remote284.get("ok") and _boot_not_older284:
+                            _boot_sha_remote284=hashlib.sha256(bytes(_boot_bytes284)).hexdigest()
+                            if _boot_local_sha290 != _boot_sha_remote284:
+                                _boot_install_ok284,_boot_install_msg284=_v276_atomic_install_db_bytes(
+                                    bytes(_boot_bytes284),"起動時GitHub current正本復元"
+                                )
+                                if _boot_install_ok284:
+                                    st.session_state["v284_boot_github_restored"]=True
+                                    st.session_state.pop("_v290_identity_cache",None)
+                                else:
+                                    st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時復元失敗: "+str(_boot_install_msg284)
+                    elif _boot_msg284!="manifestなし":
+                        st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時検証失敗: "+str(_boot_msg284)
+            elif _manifest_msg290!="manifestなし":
+                st.session_state["v284_boot_github_restore_error"]="GitHub current manifest確認失敗: "+str(_manifest_msg290)
+    except Exception as _boot_exc284:
+        st.session_state["v284_boot_github_restore_error"]=f"起動時GitHub正本確認失敗: {type(_boot_exc284).__name__}: {_boot_exc284}"
+
+_v290_load_stage("DB固定監視を確認しています…")
+_v284_identity_now=_v284_current_db_identity()
+_v284_identity_key="v284_db_identity_baseline"
+_v284_identity_block_key="v284_db_identity_block"
+if _v284_identity_now.get("ok"):
+    _v284_identity_base=st.session_state.get(_v284_identity_key)
+    if not isinstance(_v284_identity_base,dict) or not _v284_identity_base.get("ok"):
+        st.session_state[_v284_identity_key]=_v284_identity_now
+        st.session_state[_v284_identity_block_key]=[]
+    else:
+        _v284_bad,_v284_reasons=_v284_db_identity_regressed(_v284_identity_now,_v284_identity_base)
+        st.session_state[_v284_identity_block_key]=_v284_reasons if _v284_bad else []
+        # 件数が増えた正常DBは新基準へ昇格。SHA変化だけでは巻き戻り扱いにしない。
+        if not _v284_bad:
+            st.session_state[_v284_identity_key]=_v284_identity_now
+
+
+_v290_load_stage("サイドバーとDB情報を準備しています…")
 with st.sidebar:
     _v278_render_bg_compact("sidebar")
     st.header("予測設定")
@@ -12198,6 +14738,34 @@ with st.sidebar:
     seed = st.number_input("乱数シード", min_value=0, value=20260719, step=1)
     st.divider()
     st.subheader("履歴DB")
+    if st.session_state.pop("v284_db_auto_restored",False):
+        st.success("🔒 rerunで古いDBへの後退を検知したため、アップロード済み正本へ自動復元しました。")
+    if st.session_state.pop("v284_boot_github_restored",False):
+        st.success("🔒 アプリ再起動を検知し、検証済みGitHub current DBを起動時正本として自動復元しました。")
+    _boot_err284=st.session_state.get("v284_boot_github_restore_error")
+    if _boot_err284:
+        st.error("⛔ "+str(_boot_err284)+"\n古い同梱DBへの自動切替は行いません。")
+    _boot_note284=st.session_state.get("v284_boot_github_restore_note")
+    if _boot_note284:
+        st.info("🔒 "+str(_boot_note284))
+    _guard284=st.session_state.get("v284_db_identity_block") or []
+    _idshow284=_v284_identity_now if isinstance(_v284_identity_now,dict) else _v284_current_db_identity()
+    if _idshow284.get("ok"):
+        _fp284=_idshow284.get("fingerprint") or {}
+        st.caption(
+            "DB固定監視: "+str(_idshow284.get("path"))+
+            f" | {float(_idshow284.get('size',0))/1024/1024:.2f} MB"+
+            " | SHA "+str(_idshow284.get("sha256",""))[:10]+
+            " | 履歴 "+str((_fp284.get("counts") or {}).get("race_history","?"))
+        )
+    if _guard284:
+        st.error("⛔ 原本データの減少またはDB実体切替を検知したため保護停止中です。\n- "+"\n- ".join(map(str,_guard284)))
+    _guard_warn284=st.session_state.get("v284_db_identity_warnings") or []
+    if _guard_warn284:
+        st.info(
+            "ℹ️ 再シミュレーション/再学習で再生成される派生テーブルの件数変化は"
+            "DB巻き戻り扱いにしていません。\n- "+"\n- ".join(map(str,_guard_warn284))
+        )
     db_file = st.file_uploader(
         "autorace_players.sqlite3を選択",
         type=None,
@@ -12237,15 +14805,47 @@ with st.sidebar:
         c1.metric("登録選手", display_players)
         c2.metric("登録履歴", display_history)
         st.caption(f"DB容量: {summary.get('size', 0) / 1024 / 1024:.2f} MB")
+        try:
+            _gm_ok283,_gm283,_=_v283_get_chunk_manifest(previous=False)
+            if _gm_ok283:
+                _g283=int((_gm283 or {}).get("generation") or 0)
+                _s283=str((_gm283 or {}).get("slot") or "?")
+                st.caption(f"GitHub DB世代: {_g283} / 保管slot: {_s283}（行単位包含判定 有効）")
+        except Exception:
+            pass
         db_path = Path(engine.DB_PATH)
         if db_path.exists():
-            st.download_button(
-                "💾 DBを端末へ保存",
-                db_path.read_bytes(),
-                file_name="autorace_players.sqlite3",
-                mime="application/octet-stream",
-                use_container_width=True,
-            )
+            # Ver290 speed: 50MB級の整合スナップショットを毎rerun自動生成しない。
+            # 「準備」ボタンを押した時だけ作り、DB/WALが変われば自動無効化する。
+            _dl_sig290=_v290_db_stat_signature(db_path)
+            _dl_cache290=st.session_state.get("_v290_download_snapshot")
+            if isinstance(_dl_cache290,dict) and _dl_cache290.get("sig")!=_dl_sig290:
+                st.session_state.pop("_v290_download_snapshot",None)
+                _dl_cache290=None
+            if st.button("💾 端末保存用DBを準備",use_container_width=True,key="v290_prepare_db_download"):
+                try:
+                    with st.spinner("WALを含む最新DBスナップショットを作成しています…"):
+                        _download_snapshot284=_v278_consistent_db_snapshot_bytes(str(db_path))
+                        _download_fp284=_v283_db_fingerprint_bytes(_download_snapshot284)
+                    if not _download_fp284.get("ok"):
+                        raise RuntimeError(str(_download_fp284.get("reason") or "DB指紋取得失敗"))
+                    st.session_state["_v290_download_snapshot"]={
+                        "sig":_v290_db_stat_signature(db_path),
+                        "bytes":_download_snapshot284,
+                    }
+                    _dl_cache290=st.session_state["_v290_download_snapshot"]
+                except Exception as _download_exc284:
+                    st.error("端末保存用DBの準備失敗: "+f"{type(_download_exc284).__name__}: {_download_exc284}")
+            if isinstance(_dl_cache290,dict) and isinstance(_dl_cache290.get("bytes"),(bytes,bytearray)):
+                _dl_bytes290=bytes(_dl_cache290["bytes"])
+                st.download_button(
+                    "⬇️ 準備済みDBを端末へ保存",
+                    _dl_bytes290,
+                    file_name="autorace_players.sqlite3",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+                st.caption(f"端末保存用スナップショット: {len(_dl_bytes290)/1024/1024:.2f} MB（WAL内の最新コミットを含む）")
     except Exception as exc:
         st.warning(f"DB情報を確認できません: {exc}")
 
@@ -12335,9 +14935,24 @@ def _v132_general_reminder_launcher():
 
 _v132_general_reminder_launcher()
 
+try:
+    _now290=time_module.perf_counter()
+    _prev290=st.session_state.get("_v290_load_stage_label")
+    if _prev290:
+        _v290_load_times[str(_prev290)]=round(_now290-float(_v290_load_stage_started),2)
+    _total290=round(_now290-float(_v290_load_started),2)
+    _v290_load_box.success(
+        "✅ 画面準備完了 "
+        +f"{_total290:.1f}秒"
+        +("｜"+" / ".join(f"{k}:{v:.1f}s" for k,v in _v290_load_times.items()) if _v290_load_times else "")
+    )
+except Exception:
+    pass
+
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
 _v278_render_bg_compact("main")
+# Ver290 hotfix5: BGは停止＋手動開始に統一。
 _main_pages = ["🏁 予測", "⏱️ 再シミュレーション", "📊 回収率実績", "✅ 結果登録・解析", "👤 選手情報登録", "🗃️ 登録情報確認"]
 if st.session_state.get("v155_main_page") not in _main_pages:
     st.session_state["v155_main_page"] = _main_pages[0]
@@ -12368,26 +14983,81 @@ selected_main_page = st.session_state.get("v155_main_page", _main_pages[0])
 
 def _v278_render_background_quick_page(db_path: str) -> None:
     st.subheader("⏱️ 再シミュレーション")
-    st.caption("長い精度比較センターまでスクロールせず、ここから開始・進捗確認・停止ができます。")
+    st.caption("ここから開始・進捗確認・停止・手動再開ができます。")
+
     limit_count=st.number_input(
         "再シミュレーションする保存レース数",
         min_value=1,max_value=300,value=80,step=10,
         key="v278_quick_limit"
     )
+    if "v278_quick_force" not in st.session_state:
+        st.session_state["v278_quick_force"]=False
     force_current=st.checkbox(
         f"{_V231_APP_VERSION}保存済みレースも再計算",
-        value=True,key="v278_quick_force"
+        value=False,key="v278_quick_force"
     )
+
     job=_v278_bg_get_job(db_path)
-    running=bool(job and str(job.get("status") or "") in ("queued","running","pause_requested","paused","cancel_requested"))
-    if running:
-        done=int(job.get("done_count",0) or 0)
-        total=int(job.get("total_count",0) or 0)
-        frac=(float(done)/float(total)) if total else 0.0
+    status=str(job.get("status") or "") if isinstance(job,dict) else ""
+    jid=int(job.get("job_id") or 0) if isinstance(job,dict) else 0
+    done=int(job.get("done_count") or 0) if isinstance(job,dict) else 0
+    total=int(job.get("total_count") or 0) if isinstance(job,dict) else 0
+
+    th=None
+    try:
+        with _V278_BG_LOCK:
+            th=_V278_BG_THREADS.get(jid)
+    except Exception:
+        th=None
+    alive=bool(th is not None and getattr(th,"is_alive",lambda:False)())
+
+    active_status=status in ("queued","running","pause_requested","paused","cancel_requested")
+
+    # Ver291 UI hotfix:
+    # Streamlitのrerun/別実行コンテキストでは、実処理が進行中でも
+    # この画面側の _V278_BG_THREADS からthread参照が見えないことがある。
+    # そのため「threadが見えない=停止」とは判定せず、DBのupdated_atを正本にする。
+    _updated_ts291=_v290_parse_job_time(job.get("updated_at")) if isinstance(job,dict) else 0.0
+    _age291=max(0.0,time_module.time()-_updated_ts291) if _updated_ts291 else 999999.0
+    _heartbeat_fresh291=bool(_age291 < 180.0)
+
+    normally_running=bool(
+        job
+        and status in ("queued","running","pause_requested")
+        and status!="cancel_requested"
+        and (alive or _heartbeat_fresh291)
+    )
+    stopped_abnormally=bool(
+        job
+        and (
+            status in ("paused","cancel_requested")
+            or (
+                status in ("queued","running","pause_requested")
+                and not alive
+                and not _heartbeat_fresh291
+            )
+        )
+    )
+
+    # Ver290 hotfix7:
+    # UIを3状態に整理。
+    # 1) 正常稼働中 -> 「現在レース後に停止」だけ
+    # 2) status上は実行中だがthreadなし -> 「残りから再開」「この処理を終了」の2択
+    # 3) 完全停止/完了 -> 通常の開始ボタン
+    if normally_running:
+        _thread_text291="稼働中" if alive else "画面外で実行中"
+        st.caption(
+            f"状態: {status}｜最終進捗更新 {_age291:.0f}秒前｜計算: {_thread_text291}"
+        )
         if total>0:
-            st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}｜{str(job.get('current_label') or '')}")
+            st.progress(
+                min(1.0,max(0.0,float(done)/float(total))),
+                text=f"{done}/{total}｜{str(job.get('current_label') or '')}"
+            )
         else:
             st.info("準備中… 対象レースを確認しています")
+
+        # 稼働中はthread参照の有無に関係なく、必ず更新ボタンを表示する。
         a,b=st.columns(2)
         if a.button("🔄 進捗を更新",key="v278_quick_refresh",use_container_width=True):
             st.rerun()
@@ -12395,12 +15065,71 @@ def _v278_render_background_quick_page(db_path: str) -> None:
             "⏹ 現在レース後に停止",
             key="v278_quick_stop",
             use_container_width=True,
-            disabled=str(job.get("status") or "")=="cancel_requested",
         ):
-            _v278_bg_request_cancel(db_path,int(job.get("job_id") or 0))
+            _v278_bg_request_cancel(db_path,jid)
+            st.session_state["v290_stop_only_notice"]="停止要求を送信しました。現在レース終了後に停止します。"
             st.rerun()
-        if str(job.get("status") or "") in ("paused","pause_requested"):
-            st.info("選手履歴・結果などのDB登録を優先するため、一時停止または停止待ちです。")
+
+    elif stopped_abnormally:
+        _why291=(
+            "停止要求済みです。"
+            if status=="cancel_requested"
+            else (
+                "一時停止中です。"
+                if status=="paused"
+                else f"最終進捗更新から{_age291:.0f}秒経過しているため停止の可能性があります。"
+            )
+        )
+        st.warning(
+            f"⚠️ {_why291} 現在 {done}/{total if total else '?'}。自動再開はしません。"
+        )
+        if total>0:
+            st.progress(
+                min(1.0,max(0.0,float(done)/float(total))),
+                text=f"{done}/{total}｜{str(job.get('current_label') or '')}"
+            )
+
+        c1,c2=st.columns(2)
+        if c1.button(
+            f"▶ {done}/{total if total else '?'}から再開",
+            key="v290_manual_resume_batch",
+            type="primary",
+            use_container_width=True,
+        ):
+            _resume290=_v290_manual_resume_batch(db_path,job)
+            if _resume290.get("ok"):
+                st.session_state["v290_manual_resume_notice"]=(
+                    f"{int(_resume290.get('done') or 0)}/{int(_resume290.get('total') or 0)}から再開しました。"
+                )
+                st.rerun()
+            else:
+                st.error("再開失敗: "+str(_resume290.get("reason") or "不明"))
+
+        if c2.button(
+            "⏹ この処理を終了",
+            key="v290_end_stuck_job",
+            use_container_width=True,
+        ):
+            try:
+                now=_v228_now_jst_iso()
+                with sqlite3.connect(str(db_path),timeout=1.0) as con:
+                    con.execute("PRAGMA busy_timeout=1000")
+                    con.execute("""
+                        UPDATE v278_background_jobs
+                           SET status='cancelled',
+                               cancel_requested=1,
+                               pause_requested=0,
+                               finished_at=COALESCE(finished_at,?),
+                               message='ユーザー操作でこの処理を終了しました。',
+                               updated_at=?
+                         WHERE job_id=?
+                    """,(now,now,jid))
+                    con.commit()
+                st.session_state["v290_stop_only_notice"]="この再シミュレーション処理を終了しました。"
+                st.rerun()
+            except Exception as exc:
+                st.error(f"終了処理失敗: {type(exc).__name__}: {exc}")
+
     else:
         if st.button(
             f"▶ バックグラウンドで{_V231_APP_VERSION}再シミュレーション開始",
@@ -12410,10 +15139,17 @@ def _v278_render_background_quick_page(db_path: str) -> None:
         ):
             r=_v278_bg_start(db_path,int(limit_count),bool(force_current))
             if r.get("ok"):
-                st.success(f"開始しました（ジョブID: {r.get('job_id')}）。他の画面へ移動して作業できます。")
+                st.success(f"開始しました（ジョブID: {r.get('job_id')}）。")
                 st.rerun()
             else:
                 st.warning(str(r.get("reason") or "開始できませんでした。"))
+
+    notice=st.session_state.pop("v290_stop_only_notice",None)
+    if notice:
+        st.info("⏹ "+str(notice))
+    rnotice=st.session_state.pop("v290_manual_resume_notice",None)
+    if rnotice:
+        st.success("▶ "+str(rnotice))
 
     job=_v278_bg_get_job(db_path)
     if job and str(job.get("status") or "") in ("completed","failed","cancelled"):
@@ -12864,7 +15600,7 @@ elif selected_main_page == "🏁 予測":
                         for c in df.columns
                         if str(c).startswith("Ver273_")
                     }
-                    df = engine.v196_apply_probability_aligned_ranks(df, finish_prob)
+                    df = _v284_apply_simulation_joint_ranks(df, wall_audit)
                     for _c273, _s273 in _v273_audit_keep.items():
                         try:
                             if len(_s273) == len(df):
@@ -13085,7 +15821,8 @@ elif selected_main_page == "🏁 予測":
             cols = [c for c in [
                 "改善後順位", "1着候補順位", "連対候補順位", "3着候補順位", "総合点順位_従来",
                 "車", "選手名", "ハンデ", "試走換算", "予測競走T", "レース信頼度",
-                "本番1着率", "本番連対率", "本番3着率", "本番3着内率", "順位整合メモ",
+                "本番1着率", "本番連対率", "本番3着率", "本番3着内率",
+                "Ver284_展開最終順位", "Ver284_展開平均着順", "順位整合メモ",
                 "基礎スピード点", "実戦能力点", "勝負強さ点", "展開適性点",
                 "スタート伸び指数", "ゴール前伸び指数", "安定上位指数",
                 "6周壁遭遇率", "6周追抜成功回数", "連続追抜発生回数", "1周目先頭率", "壁リスク", "壁突破力", "前残り指数", "壁ロス推定",
@@ -13138,7 +15875,7 @@ elif selected_main_page == "🏁 予測":
                     pass
             st.subheader("予測順位")
             st.dataframe(result, use_container_width=True, hide_index=True)
-            st.caption("Ver196では最終順位を本シミュレーションの1着率と一致させます。従来の総合点順位は診断列として残し、連対・3着候補は別順位で確認できます。")
+            st.caption("Ver284では6周展開シミュレーションの共同分布を最終結果として使います。1～3位は最頻の三連単展開、4位以下は全試行の平均着順で表示し、ゴール後の別モデル順位補正は行いません。")
             try:
                 v196_val = v202_cached_probability_rank_validation(str(engine.DB_PATH), Path(engine.DB_PATH).stat().st_mtime)
                 if int(v196_val.get("race_count", 0)):
@@ -13625,7 +16362,7 @@ if selected_main_page == "✅ 結果登録・解析":
     if no_contest_r:
         st.write("解析したレース情報", meta_r)
         st.error("🚫 レース不成立・全返還")
-        st.info("着順・競走タイム・STは登録せず、選手履歴・予測評価・重み学習の対象外として保存します。")
+        st.info("着順・競走タイム・STは登録せず、選手履歴・予測評価・重み学習の対象外として保存します。回収率は投資額=返還額の100%で記録します。")
         if isinstance(payouts_r, pd.DataFrame) and not payouts_r.empty:
             st.subheader("全返還")
             st.dataframe(payouts_r, use_container_width=True, hide_index=True)
@@ -13745,6 +16482,12 @@ if selected_main_page == "✅ 結果登録・解析":
                         key, comparison, analysis, adjustment, registration = engine.v41_register_result(
                             meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
                         )
+                    # Ver287: 1Rの結果だけで補正せず、結果登録のたびに登録済み全体を再集計。
+                    # 学習対象外レースでは予測補正の再計算を行わない。
+                    if not (registration.get("learning_excluded") or meta_r.get("学習対象外")):
+                        global_transition_recalc_v287=_v287_recalculate_global_transition_calibration(engine.DB_PATH)
+                    else:
+                        global_transition_recalc_v287={"ok":False,"source_races":0,"calibrations":0,"reason":"学習対象外"}
                     ticket_analysis = engine.v67_analyze_ticket_result(meta_r, rows_r, engine.DB_PATH)
                     # Ver255管理修正: 予測時に保存済みのプランだけを、結果登録後に払戻と照合する。
                     # 復元表示だけでは新規保存せず、結果登録時点で元バージョンのまま回収率へ反映する。
@@ -13766,6 +16509,14 @@ if selected_main_page == "✅ 結果登録・解析":
                         result_message = f"結果を登録しました: {key}"
                     _set_sticky_notice("result_register_notice", "success", result_message)
                     st.success(result_message)
+                    _gr287=locals().get("global_transition_recalc_v287") or {}
+                    if _gr287.get("ok"):
+                        st.caption(
+                            f"🔄 Ver287全体補正を再計算：登録済み監査{int(_gr287.get('source_races') or 0)}R全体"
+                            f" → 補正{int(_gr287.get('calibrations') or 0)}条件を更新"
+                        )
+                    elif _gr287.get("reason") and _gr287.get("reason")!="学習対象外":
+                        st.warning("Ver287全体補正の再計算に失敗しました: "+str(_gr287.get("reason")))
                     if int(locals().get("incident_saved_count", 0) or 0) > 0:
                         st.caption(
                             f"🧾 発走後事故・反則を{int(incident_saved_count)}件、選手別事故履歴へ種類別保存しました。"
@@ -14140,7 +16891,7 @@ if selected_main_page == "👤 選手情報登録":
                     f"保留 {pending_count}件"
                 )
                 if changed:
-                    with st.spinner("② DB登録は完了しました。GitHubへバックアップしています…"):
+                    with st.spinner("② DB登録完了。GitHubへ高速バックアップしています（DB保存済み）…"):
                         ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新")
                     full_text = text + (f"｜{msg}" if msg else "")
                     level = "success" if ok else "warning"
