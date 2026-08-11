@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver294"
+APP_VERSION = "Ver295"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver294"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver295"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -10756,6 +10756,138 @@ def _v195_return_calibration(db_path: str) -> dict:
         pass
     return out
 
+
+# Ver295: 仮想ゲーム用・期待値確率校正。
+# 展開確率はそのまま、期待値評価だけを券種×確率帯の過去実現率で縮小補正する。
+_V295_EV_CALIBRATION_CACHE = {}
+
+def _v295_norm_combo(bet_type: str, combo) -> str:
+    s=str(combo or "").strip().replace("→","-").replace(">","-").replace(" ","")
+    parts=[x for x in re.split(r"[-‐‑–—]+",s) if x!=""]
+    if str(bet_type) in ("2連複","3連複"):
+        try:
+            parts=sorted(parts,key=lambda x:int(re.sub(r"\\D","",x) or 999))
+        except Exception:
+            parts=sorted(parts)
+    return "-".join(parts)
+
+def _v295_ev_calibration_table(db_path: str, cutoff_date: str="") -> dict:
+    path=str(db_path)
+    cutoff=str(cutoff_date or "").strip()[:10]
+    try:
+        stamp=(path,int(Path(path).stat().st_mtime_ns),cutoff)
+    except Exception:
+        stamp=(path,0,cutoff)
+    if stamp in _V295_EV_CALIBRATION_CACHE:
+        return _V295_EV_CALIBRATION_CACHE[stamp]
+
+    edges=[0.0,0.5,1.0,2.0,3.0,5.0,8.0,12.0,20.0,35.0,100.0001]
+    out={"edges":edges,"types":{},"samples":0,"cutoff":cutoff}
+    supported=("2連単","2連複","3連単","3連複")
+
+    try:
+        with sqlite3.connect(path,timeout=12.0) as con:
+            con.row_factory=sqlite3.Row
+            sql="""
+                SELECT t.race_key,t.bet_type,t.combination,t.probability
+                FROM v67_prediction_tickets t
+                JOIN result_races rr ON rr.race_key=t.race_key
+                WHERE t.bet_type IN ('2連単','2連複','3連単','3連複')
+                  AND EXISTS (
+                    SELECT 1 FROM result_payouts rp
+                    WHERE rp.race_key=t.race_key AND rp.bet_type=t.bet_type
+                  )
+            """
+            params=[]
+            if cutoff:
+                sql+=" AND substr(rr.race_date,1,10) < substr(?,1,10)"
+                params.append(cutoff)
+            rows=con.execute(sql,params).fetchall()
+
+            wsql="""
+                SELECT rp.race_key,rp.bet_type,rp.combination
+                FROM result_payouts rp
+                JOIN result_races rr ON rr.race_key=rp.race_key
+                WHERE rp.bet_type IN ('2連単','2連複','3連単','3連複')
+            """
+            wparams=[]
+            if cutoff:
+                wsql+=" AND substr(rr.race_date,1,10) < substr(?,1,10)"
+                wparams.append(cutoff)
+            win_rows=con.execute(wsql,wparams).fetchall()
+    except Exception:
+        _V295_EV_CALIBRATION_CACHE[stamp]=out
+        return out
+
+    wins=set(
+        (str(r["race_key"]),str(r["bet_type"]),_v295_norm_combo(r["bet_type"],r["combination"]))
+        for r in win_rows
+    )
+    buckets={bt:[{"n":0,"sum_p":0.0,"hits":0} for _ in range(len(edges)-1)] for bt in supported}
+
+    for r in rows:
+        bt=str(r["bet_type"] or "")
+        try:
+            p=float(r["probability"] or 0.0)
+        except Exception:
+            continue
+        if bt not in buckets or not (0.0 <= p <= 100.0):
+            continue
+        bi=len(edges)-2
+        for j in range(len(edges)-1):
+            if edges[j] <= p < edges[j+1]:
+                bi=j
+                break
+        b=buckets[bt][bi]
+        b["n"]+=1
+        b["sum_p"]+=p/100.0
+        if (str(r["race_key"]),bt,_v295_norm_combo(bt,r["combination"])) in wins:
+            b["hits"]+=1
+
+    # 元モデル100件分を事前分布として実績を縮小。極端な補正は±30%に制限。
+    prior_n=100.0
+    for bt,arr in buckets.items():
+        out["types"][bt]=[]
+        for b in arr:
+            n=int(b["n"])
+            mean_p=(b["sum_p"]/n) if n else None
+            if n and mean_p is not None and mean_p>1e-12:
+                calibrated=(float(b["hits"])+prior_n*mean_p)/(n+prior_n)
+                ratio=float(np.clip(calibrated/mean_p,0.70,1.30))
+            else:
+                ratio=1.0
+            out["types"][bt].append({
+                "n":n,
+                "mean_p":mean_p,
+                "hits":int(b["hits"]),
+                "actual_rate":(float(b["hits"]/n) if n else None),
+                "ratio":ratio,
+            })
+            out["samples"]+=n
+
+    _V295_EV_CALIBRATION_CACHE[stamp]=out
+    return out
+
+def _v295_ev_probability(raw_probability_pct: float, bet_type: str, table: dict) -> tuple[float,float,int]:
+    try:
+        p=float(raw_probability_pct)
+    except Exception:
+        return 0.0,1.0,0
+    edges=list((table or {}).get("edges") or [])
+    arr=list(((table or {}).get("types") or {}).get(str(bet_type)) or [])
+    if len(edges)<2 or not arr:
+        return p,1.0,0
+    bi=len(edges)-2
+    for j in range(len(edges)-1):
+        if edges[j] <= p < edges[j+1]:
+            bi=j
+            break
+    row=arr[min(bi,len(arr)-1)]
+    ratio=float(row.get("ratio",1.0) or 1.0)
+    n=int(row.get("n",0) or 0)
+    return float(np.clip(p*ratio,0.0,100.0)),ratio,n
+
+
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
     """6〜8車立て向けの役割分担型・回収率合成。
 
@@ -10767,6 +10899,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     if not starter_count or int(starter_count) not in (6, 7, 8):
         return {"available": False, "reason": "回収率重視の合成推奨は6〜8車立てに対応しています。"}
     starter_count = int(starter_count)
+    _race_date295=str((meta or {}).get("開催日") or (meta or {}).get("race_date") or "")[:10]
+    _ev_calibration295=_v295_ev_calibration_table(str(engine.DB_PATH),_race_date295)
     if not isinstance(bets, dict) or int(trials or 0) <= 0:
         return {"available": False, "reason": "シミュレーション確率を取得できません。"}
 
@@ -10849,8 +10983,14 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             if odds <= 0:
                 continue
             learned_weight = float(type_weights.get(label, 1.0))
+            _ev_prob295,_ev_ratio295,_ev_n295=_v295_ev_probability(
+                probability,label,_ev_calibration295
+            )
             ticket = {
                 "type": label, "combo": key, "probability": probability,
+                "ev_probability": _ev_prob295,
+                "ev_calibration_ratio": _ev_ratio295,
+                "ev_calibration_samples": _ev_n295,
                 "odds": odds, "cap": int(spec["cap"]), "role": spec["role"],
                 "learned_weight": learned_weight,
             }
@@ -10976,6 +11116,17 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             hit_min_multiple = 0.0
             hit_max_multiple = 0.0
         model_expected_multiple = expected_return / cost if cost else 0.0
+
+        # Ver295: 期待値評価専用の校正済み期待払戻。
+        # cover/black/lowは元の展開シミュレーション確率のまま維持する。
+        ev_expected_return = sum(
+            (float(t.get("ev_probability",t.get("probability",0.0)) or 0.0)/100.0)
+            * float(t.get("odds",0.0) or 0.0) * 100.0
+            for t in plan
+        )
+        ev_expected_multiple = ev_expected_return / cost if cost else 0.0
+        ev_model_return_rate = ev_expected_multiple * 100.0
+
         # Ver191: 黒字的中率を主役にする。単なる的中範囲とガミ的中は強く評価しない。
         # 点数増加は購入総額そのものを押し上げるため、以前より明確に減点する。
         tri_share = (counts.get("三連単", 0) / max(1, n))
@@ -10988,6 +11139,9 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             "miss": max(0.0, 100.0 - cover), "expected_return": expected_return,
             "model_return_rate": model_expected_multiple * 100.0,
             "model_expected_multiple": model_expected_multiple,
+            "ev_expected_return": ev_expected_return,
+            "ev_model_return_rate": ev_model_return_rate,
+            "ev_expected_multiple": ev_expected_multiple,
             "hit_average_payout": hit_average_payout,
             "hit_average_multiple": hit_average_multiple,
             "hit_min_multiple": hit_min_multiple,
@@ -11096,7 +11250,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             break
         if len(plan) >= 8 and mg["black_gain"] < 0.22:
             break
-        if len(plan) >= 12 and (mg["black_gain"] < 0.80 or mg["after"]["model_expected_multiple"] < evaluate(plan)["model_expected_multiple"]):
+        if len(plan) >= 12 and (mg["black_gain"] < 0.80 or mg["after"]["ev_expected_multiple"] < evaluate(plan)["ev_expected_multiple"]):
             break
         plan.append(cand)
         remaining.remove(cand)
@@ -11111,7 +11265,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     near = [(p, m) for p, m in snapshots if m["score"] >= best_score - 0.18]
     selected, metrics = max(
         near,
-        key=lambda x: (x[1]["black"], x[1]["model_expected_multiple"],
+        key=lambda x: (x[1]["black"], x[1]["ev_expected_multiple"],
                        x[1]["black_share_of_hits"], x[1]["cover"], -x[1]["low"], -x[1]["points"]),
     )
     selected = list(selected)
@@ -11164,8 +11318,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 trial_metrics = evaluate(trial_plan)
                 cover_loss = base_metrics["cover"] - trial_metrics["cover"]
                 black_gain = trial_metrics["black"] - base_metrics["black"]
-                expected_gain = (trial_metrics["model_expected_multiple"]
-                                 - base_metrics["model_expected_multiple"])
+                expected_gain = (trial_metrics["ev_expected_multiple"]
+                                 - base_metrics["ev_expected_multiple"])
                 gami_drop = base_metrics["low"] - trial_metrics["low"]
                 # 的中重視なので、カバー低下は原則2.5pt以内。大幅な黒字改善時のみ4ptまで許容。
                 allowed_loss = 4.0 if black_gain >= 1.20 else 2.5
@@ -11357,7 +11511,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 break
             odds = float(ticket.get("odds", 0.0) or 0.0)
             prob = float(ticket.get("probability", 0.0) or 0.0)
-            standalone_ev = (prob / 100.0) * odds
+            standalone_ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
             payout_ratio = (odds * 100.0 / float(base.get("cost", 1.0))) if base.get("cost") else 0.0
 
             # 2.0倍以下はEV100%未満なら無条件除外。
@@ -11406,7 +11560,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
             odds = float(ticket.get("odds", 0.0) or 0.0)
             prob = float(ticket.get("probability", 0.0) or 0.0)
-            standalone_ev = (prob / 100.0) * odds
+            standalone_ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
             payout_ratio = (odds * 100.0 / float(before.get("cost", 1.0))) if before.get("cost") else 0.0
             cover_loss = float(before["cover"] - after["cover"])
             black_delta = float(after["black"] - before["black"])
@@ -11564,7 +11718,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 break_even_ok = all(float(t.get("odds", 0.0)) >= float(k) for t in compact)
                 utility = (
                     2.10 * compact_metrics["black"]
-                    + 10.0 * compact_metrics["model_expected_multiple"]
+                    + 10.0 * compact_metrics["ev_expected_multiple"]
                     + 0.18 * compact_metrics["cover"]
                     - 0.75 * compact_metrics["low"]
                     - 0.35 * k
@@ -11574,7 +11728,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
             _, compact_plan, compact_metrics, break_even_ok = max(
                 compact_options,
-                key=lambda x: (x[3], x[0], x[2]["black"], x[2]["model_expected_multiple"], -x[2]["points"]),
+                key=lambda x: (x[3], x[0], x[2]["black"], x[2]["ev_expected_multiple"], -x[2]["points"]),
             )
             normal_metrics = evaluate(selected)
 
@@ -11645,12 +11799,12 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             if p1 <= 0 or p2 < 0.80 or p2 < p1 * 0.62:
                 continue
             new_points = len(selected) + 1
-            standalone_ev = (p2 / 100.0) * odds2
+            standalone_ev = (float(reverse_ticket.get("ev_probability",p2) or p2) / 100.0) * odds2
             if odds2 < float(new_points) or standalone_ev < 0.72:
                 continue
             trial_plan = list(selected) + [reverse_ticket]
             after = evaluate(trial_plan)
-            return_drop = float(base_pair_metrics.get("model_return_rate", 0.0) - after.get("model_return_rate", 0.0))
+            return_drop = float(base_pair_metrics.get("ev_model_return_rate", 0.0) - after.get("ev_model_return_rate", 0.0))
             black_drop = float(base_pair_metrics.get("black", 0.0) - after.get("black", 0.0))
             cover_gain = float(after.get("cover", 0.0) - base_pair_metrics.get("cover", 0.0))
             low_gain = float(after.get("low", 0.0) - base_pair_metrics.get("low", 0.0))
@@ -11698,7 +11852,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             if payout + 1e-9 >= current_cost:
                 continue
             prob = float(ticket.get("probability", 0.0) or 0.0)
-            ev = (prob / 100.0) * odds
+            ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
             trial = [t for t in selected if t is not ticket]
             after = evaluate(trial)
             return_gain = float(after.get("model_return_rate", 0.0) - current.get("model_return_rate", 0.0))
@@ -11777,7 +11931,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
                 odds = float(cand.get("odds", 0.0) or 0.0)
                 probability = float(cand.get("probability", 0.0) or 0.0)
-                standalone_ev = probability / 100.0 * odds
+                standalone_ev = float(cand.get("ev_probability",probability) or probability) / 100.0 * odds
                 if odds <= 0 or standalone_ev < 1.00:
                     continue
 
@@ -11856,7 +12010,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
         probability = float(cand.get("probability", 0.0) or 0.0)
         odds = float(cand.get("odds", 0.0) or 0.0)
-        standalone_ev = probability / 100.0 * odds
+        standalone_ev = float(cand.get("ev_probability",probability) or probability) / 100.0 * odds
         add_metrics = evaluate(selected + [cand])
         cover_gain = add_metrics["cover"] - base_for_residual["cover"]
         black_gain = add_metrics["black"] - base_for_residual["black"]
@@ -11869,7 +12023,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 continue
             swapped = [t for t in selected if t is not old] + [cand]
             sm = evaluate(swapped)
-            if sm["model_return_rate"] + 0.01 < base_for_residual["model_return_rate"]:
+            if sm["ev_model_return_rate"] + 0.01 < base_for_residual["ev_model_return_rate"]:
                 continue
             if sm["black"] + 0.25 < base_for_residual["black"]:
                 continue
@@ -11879,7 +12033,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 continue
             key = (
                 sm["black"] - base_for_residual["black"],
-                sm["model_return_rate"] - base_for_residual["model_return_rate"],
+                sm["ev_model_return_rate"] - base_for_residual["ev_model_return_rate"],
                 base_for_residual["low"] - sm["low"],
                 sm["cover"] - base_for_residual["cover"],
             )
@@ -11952,7 +12106,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
             prob = float(ticket.get("probability", 0.0) or 0.0)
             odds = float(ticket.get("odds", 0.0) or 0.0)
-            standalone_ev = (prob / 100.0) * odds
+            standalone_ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
             key = (
                 return_delta,
                 black_delta,
@@ -12015,7 +12169,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             cover_delta = float(after_refill.get("cover", 0.0) - before_refill.get("cover", 0.0))
             probability = float(cand.get("probability", 0.0) or 0.0)
             odds = float(cand.get("odds", 0.0) or 0.0)
-            standalone_ev = (probability / 100.0) * odds
+            standalone_ev = (float(cand.get("ev_probability",probability) or probability) / 100.0) * odds
 
             acceptable = (
                 return_delta >= 0.05
