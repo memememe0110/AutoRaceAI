@@ -13524,7 +13524,7 @@ def _v282_chunk_manifest_path() -> str:
 
 def _v282_push_chunked_db(
     snapshot_bytes: bytes, commit_message: str,
-    chunk_size: int = 4 * 1024 * 1024,
+    chunk_size: int = 8 * 1024 * 1024,
     fingerprint: dict | None = None,
     preserve_previous_manifest: bool = False,
 ) -> tuple[bool, str]:
@@ -13554,24 +13554,80 @@ def _v282_push_chunked_db(
     import hashlib
     digest=hashlib.sha256(snapshot_bytes).hexdigest()
 
+    # Ver294 UI/速度修正:
+    # 以前のmanifestにGit blob SHAがあれば更新前GETを省略する。
+    # GitHub PUT応答のcontent.shaをローカル計算Git blob SHAと照合し、
+    # 全partを再ダウンロードする二重転送を不要にする。
+    _known_git_sha294={}
+    for _m294 in (current_manifest or {}, _prev_manifest_gen284 or {}):
+        _parts294=list((_m294 or {}).get("parts") or [])
+        _shas294=list((_m294 or {}).get("part_git_sha1") or [])
+        if len(_parts294)==len(_shas294):
+            for _p294,_s294 in zip(_parts294,_shas294):
+                if _p294 and _s294:
+                    _known_git_sha294[str(_p294)]=str(_s294)
+
+    _saved_git_sha294={}
+
+    def _git_blob_sha294(data: bytes) -> str:
+        import hashlib as _hashlib294
+        header=f"blob {len(data)}\\0".encode("utf-8")
+        return _hashlib294.sha1(header+data).hexdigest()
+
     def put_file(path: str, data: bytes, message: str) -> tuple[bool,str]:
         encoded=urllib.parse.quote(path,safe="/")
         url=repo_api+encoded
-        q=url+"?ref="+urllib.parse.quote(branch)
-        s,old=github_request(q)
         payload={
             "message":message,
             "content":base64.b64encode(data).decode("ascii"),
             "branch":branch,
         }
-        if s==200 and old.get("sha"):
-            payload["sha"]=old["sha"]
-        elif s!=404:
-            return False,str(old.get("message",s))
+
+        # 前世代manifestにSHAがあれば、更新対象の存在確認GETを省略。
+        _old_sha294=_known_git_sha294.get(str(path))
+        if _old_sha294:
+            payload["sha"]=_old_sha294
+        else:
+            q=url+"?ref="+urllib.parse.quote(branch)
+            s,old=github_request(q)
+            if s==200 and old.get("sha"):
+                payload["sha"]=old["sha"]
+            elif s!=404:
+                return False,str(old.get("message",s))
+
         ps,body=github_request(url,method="PUT",payload=payload)
         if ps not in (200,201):
             return False,str(body.get("message",ps))
-        return True,"ok"
+
+        _expected_sha294=_git_blob_sha294(data)
+        _returned_sha294=str(((body or {}).get("content") or {}).get("sha") or "")
+        if _returned_sha294:
+            if _returned_sha294 != _expected_sha294:
+                return False,(
+                    "GitHub PUT後SHA不一致: "
+                    f"{_returned_sha294} != {_expected_sha294}"
+                )
+            _saved_git_sha294[str(path)]=_returned_sha294
+            return True,"ok"
+
+        # 応答にSHAが無い特殊時だけ1回読み戻して確認。
+        try:
+            _req294=urllib.request.Request(
+                url+"?ref="+urllib.parse.quote(branch),
+                headers={
+                    **({"Authorization":f"Bearer {cfg.get('token')}"} if cfg.get("token") else {}),
+                    "Accept":"application/vnd.github.raw+json",
+                    "User-Agent":"AutoRaceAI",
+                }
+            )
+            with urllib.request.urlopen(_req294,timeout=45) as _r294:
+                _got294=_r294.read()
+            if _got294 != data:
+                return False,"GitHub PUT後のフォールバック読み戻し不一致"
+            _saved_git_sha294[str(path)]=_expected_sha294
+            return True,"ok"
+        except Exception as _exc294:
+            return False,f"GitHub PUT後検証失敗: {type(_exc294).__name__}: {_exc294}"
 
     # inactive slotへ先に全partを書き込む。manifestはまだ切り替えない。
     chunk_paths=[]
@@ -13582,95 +13638,17 @@ def _v282_push_chunked_db(
             return False,f"分割DB slot{next_slot} part {idx+1}/{len(chunks)} 保存失敗: {msg}"
         chunk_paths.append(cp)
 
-    # Ver284: 「PUT成功」だけでは保存成功にしない。
-    # inactive slotへ書いた全partをGitHubから読み戻し、各partのサイズ/SHAと
-    # 結合DB全体のサイズ/SHAが元snapshotと完全一致した場合だけmanifestを切替える。
-    import time as _time284
-    _verified_chunks284=[]
-    for _idx284,(_cp284,_expected284) in enumerate(zip(chunk_paths,chunks)):
-        _verified284=False
-        _last284=""
-        for _try284 in range(4):
-            _enc284=urllib.parse.quote(_cp284,safe="/")
-            _url284=repo_api+_enc284+"?ref="+urllib.parse.quote(branch)
-            _s284,_obj284=github_request(_url284)
-            _got284=None
-            _method284=""
-
-            # Contents APIは大きいファイルでHTTP 200でも content が空/省略されることがある。
-            # contentが実在する時だけbase64を使い、無い場合は download_url → raw API の順で取得する。
-            if _s284==200 and isinstance(_obj284,dict):
-                _content284=_obj284.get("content")
-                if _content284:
-                    try:
-                        _got284=base64.b64decode(str(_content284).replace("\n",""))
-                        _method284="contents-base64"
-                    except Exception as _exc284:
-                        _last284=f"contents decode {type(_exc284).__name__}: {_exc284}"
-
-                if _got284 is None:
-                    _dl284=_obj284.get("download_url")
-                    if _dl284:
-                        try:
-                            _req284=urllib.request.Request(
-                                str(_dl284),
-                                headers={
-                                    **({"Authorization":f"Bearer {cfg.get('token')}"} if cfg.get("token") else {}),
-                                    "Accept":"application/octet-stream",
-                                    "User-Agent":"AutoRaceAI",
-                                }
-                            )
-                            with urllib.request.urlopen(_req284,timeout=45) as _r284:
-                                _got284=_r284.read()
-                            _method284="download_url"
-                        except Exception as _exc284:
-                            _last284=f"download_url {type(_exc284).__name__}: {_exc284}"
-
-                if _got284 is None:
-                    try:
-                        _raw284=repo_api+_enc284+"?ref="+urllib.parse.quote(branch)
-                        _req284=urllib.request.Request(
-                            _raw284,
-                            headers={
-                                **({"Authorization":f"Bearer {cfg.get('token')}"} if cfg.get("token") else {}),
-                                "Accept":"application/vnd.github.raw+json",
-                                "User-Agent":"AutoRaceAI",
-                            }
-                        )
-                        with urllib.request.urlopen(_req284,timeout=45) as _r284:
-                            _got284=_r284.read()
-                        _method284="github-raw"
-                    except Exception as _exc284:
-                        _last284=f"raw {type(_exc284).__name__}: {_exc284}"
-            else:
-                _last284=str((_obj284 or {}).get("message",_s284)) if isinstance(_obj284,dict) else str(_s284)
-
-            if _got284 is not None:
-                _same_size284=len(_got284)==len(_expected284)
-                _same_sha284=hashlib.sha256(_got284).hexdigest()==hashlib.sha256(_expected284).hexdigest()
-                if _same_size284 and _same_sha284:
-                    _verified_chunks284.append(_got284)
-                    _verified284=True
-                    break
-                _last284=f"{_method284}: size {len(_got284)}/{len(_expected284)}, sha一致={_same_sha284}"
-            _time284.sleep(0.35)
-        if not _verified284:
-            return False,(
-                f"GitHub保存を未完了として中止しました。slot{next_slot} part {_idx284+1}/{len(chunks)} "
-                f"の読み戻し検証に失敗: {_last284}。current manifestは切り替えていません。"
-            )
-
-    _joined284=b"".join(_verified_chunks284)
-    if len(_joined284)!=len(snapshot_bytes):
+    # Ver294高速化:
+    # 各partはPUT応答のGit blob SHAで内容一致を確認済み。
+    # 以前はここで全partをもう一度GitHubからダウンロードしていたため、
+    # 80MB級DBではアップロード後に同容量を再転送して待ち時間が長かった。
+    # PUT時SHA検証に置き換え、二重転送を廃止する。
+    if len(_saved_git_sha294) != len(chunk_paths):
         return False,(
-            f"GitHub保存を未完了として中止しました。読み戻し結合サイズ不一致 "
-            f"{len(_joined284)} != {len(snapshot_bytes)}。current manifestは切り替えていません。"
+            f"GitHub保存を未完了として中止しました。"
+            f"part SHA確認数 {_saved_git_sha294.__len__()}/{len(chunk_paths)}。"
+            "current manifestは切り替えていません。"
         )
-    if hashlib.sha256(_joined284).hexdigest()!=digest:
-        return False,"GitHub保存を未完了として中止しました。読み戻しDBのSHA256不一致。current manifestは切り替えていません。"
-    _verify_fp284=_v283_db_fingerprint_bytes(_joined284)
-    if not _verify_fp284.get("ok"):
-        return False,"GitHub保存を未完了として中止しました。読み戻しDBのSQLite整合性確認に失敗。current manifestは切り替えていません。"
 
     fp=fingerprint if isinstance(fingerprint,dict) and fingerprint.get("ok") else _v283_db_fingerprint_bytes(snapshot_bytes)
     manifest={
@@ -13682,7 +13660,9 @@ def _v282_push_chunked_db(
         "parts":chunk_paths,
         "part_sizes":[len(c) for c in chunks],
         "part_sha256":[hashlib.sha256(c).hexdigest() for c in chunks],
-        "verified_readback":True,
+        "part_git_sha1":[_saved_git_sha294.get(p,"") for p in chunk_paths],
+        "verified_readback":False,
+        "verified_upload_git_sha":True,
         "stats":fp,
         "app_version":str(_V231_APP_VERSION),
         "saved_at":_v228_now_jst_iso(),
@@ -13707,7 +13687,7 @@ def _v282_push_chunked_db(
 
     return True,(
         f"DB登録成功｜GitHub分割保存成功 "
-        f"（DB世代{generation} / slot{next_slot} / {len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割 / 全part読み戻し検証済み）"
+        f"（DB世代{generation} / slot{next_slot} / {len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割 / 全part Git SHA検証済み）"
     )
 
 
@@ -16631,7 +16611,7 @@ if selected_main_page == "👤 選手情報登録":
                     f"保留 {pending_count}件"
                 )
                 if changed:
-                    with st.spinner("② DB登録は完了しました。GitHubへバックアップしています…"):
+                    with st.spinner("② DB登録完了。GitHubへ高速バックアップしています（DB保存済み）…"):
                         ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新")
                     full_text = text + (f"｜{msg}" if msg else "")
                     level = "success" if ok else "warning"
