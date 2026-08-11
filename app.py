@@ -13781,6 +13781,80 @@ def _v282_push_chunked_db(
         except Exception as _exc294:
             return False,f"GitHub PUT後検証失敗: {type(_exc294).__name__}: {_exc294}"
 
+    def _cleanup_orphan_parts295(
+        active_manifest: dict,
+        previous_manifest: dict,
+        target_slot: str,
+    ) -> tuple[int,list[str]]:
+        """manifest切替成功後だけ、参照されていない旧partを削除する。
+
+        - current/previous のどちらかが参照しているpartは絶対に削除しない。
+        - 対象は今回書いたtarget_slotと同じslotのpartだけ。
+        - 削除失敗はDB保存成功を取り消さず、警告として返す。
+        """
+        protected=set()
+        for _m295 in (active_manifest or {}, previous_manifest or {}):
+            for _p295 in list((_m295 or {}).get("parts") or []):
+                if _p295:
+                    protected.add(str(_p295))
+
+        # base_path の親ディレクトリをContents APIで1回だけ列挙。
+        _parent295=posixpath.dirname(base_path)
+        _name295=posixpath.basename(base_path)
+        _dir_url295=repo_api + urllib.parse.quote(_parent295,safe="/")
+        if _parent295:
+            _dir_url295 += "?ref=" + urllib.parse.quote(branch)
+        else:
+            _dir_url295 = repo_api.rstrip("/") + "?ref=" + urllib.parse.quote(branch)
+
+        try:
+            _s295,_rows295=github_request(_dir_url295)
+        except Exception as _exc295:
+            return 0,[f"旧part一覧取得失敗: {type(_exc295).__name__}: {_exc295}"]
+        if _s295 != 200 or not isinstance(_rows295,list):
+            return 0,[f"旧part一覧取得失敗: HTTP {_s295}"]
+
+        _prefix295=f"{_name295}.slot{target_slot}.part"
+        _deleted295=0
+        _errors295=[]
+        for _row295 in _rows295:
+            if not isinstance(_row295,dict):
+                continue
+            _nm295=str(_row295.get("name") or "")
+            _path295=str(_row295.get("path") or "")
+            _sha295=str(_row295.get("sha") or "")
+            if not _nm295.startswith(_prefix295):
+                continue
+            if _path295 in protected:
+                continue
+            if not _sha295:
+                _errors295.append(f"{_path295}: SHAなしのため削除保留")
+                continue
+
+            _del_url295=repo_api+urllib.parse.quote(_path295,safe="/")
+            _payload295={
+                "message":f"{commit_message} [不要旧part削除 {_path295}]",
+                "sha":_sha295,
+                "branch":branch,
+            }
+            try:
+                _ds295,_dbody295=github_request(
+                    _del_url295,method="DELETE",payload=_payload295
+                )
+                if _ds295 in (200,204):
+                    _deleted295+=1
+                else:
+                    _msg295=(
+                        _dbody295.get("message",_ds295)
+                        if isinstance(_dbody295,dict) else _ds295
+                    )
+                    _errors295.append(f"{_path295}: {_msg295}")
+            except Exception as _exc295:
+                _errors295.append(
+                    f"{_path295}: {type(_exc295).__name__}: {_exc295}"
+                )
+        return _deleted295,_errors295
+
     # inactive slotへ先に全partを書き込む。manifestはまだ切り替えない。
     chunk_paths=[]
     for idx,chunk in enumerate(chunks):
@@ -13837,9 +13911,24 @@ def _v282_push_chunked_db(
     if not ok:
         return False,f"分割DB manifest保存失敗: {msg}"
 
+    # Ver295: manifest切替が完全成功した後にだけ旧余剰partを掃除する。
+    # previousとして実際に保持されるmanifestを明示して、参照中partは保護する。
+    if current_ok and current_manifest and not preserve_previous_manifest:
+        _previous_after295=dict(current_manifest)
+    else:
+        _previous_after295=dict(_prev_manifest_gen284 or {}) if _prev_ok_gen284 else {}
+
+    _deleted_orphans295,_cleanup_errors295=_cleanup_orphan_parts295(
+        manifest,_previous_after295,next_slot
+    )
+    _cleanup_note295=f" / 旧余剰part削除{int(_deleted_orphans295)}件"
+    if _cleanup_errors295:
+        _cleanup_note295 += f" / 削除保留{len(_cleanup_errors295)}件"
+
     return True,(
         f"DB登録成功｜GitHub分割保存成功 "
-        f"（DB世代{generation} / slot{next_slot} / {len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割 / 全part Git SHA検証済み）"
+        f"（DB世代{generation} / slot{next_slot} / {len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割 / 全part Git SHA検証済み"
+        f"{_cleanup_note295}）"
     )
 
 
