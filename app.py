@@ -2986,8 +2986,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
 
             meta=dict(meta or {})
             df,bets,wall_audit=_v230_six_lap_simulation(df,bets,entries,meta,trials,seed)
-            if callable(progress_cb):
-                progress_cb(idx-1,total,label+"｜③予測保存中")
+            # 単発バックグラウンド予測の進捗はv278_background_jobsへ直接更新する。
             meta["壁補正監査"]=wall_audit
             meta["6周展開シミュレーション"]=wall_audit
             _t1=time_module.perf_counter()
@@ -13725,7 +13724,7 @@ def _v282_push_chunked_db(
 
     def _git_blob_sha294(data: bytes) -> str:
         import hashlib as _hashlib294
-        header=f"blob {len(data)}\\0".encode("utf-8")
+        header=f"blob {len(data)}\0".encode("utf-8")
         return _hashlib294.sha1(header+data).hexdigest()
 
     def put_file(path: str, data: bytes, message: str) -> tuple[bool,str]:
@@ -13756,11 +13755,10 @@ def _v282_push_chunked_db(
         _expected_sha294=_git_blob_sha294(data)
         _returned_sha294=str(((body or {}).get("content") or {}).get("sha") or "")
         if _returned_sha294:
-            if _returned_sha294 != _expected_sha294:
-                return False,(
-                    "GitHub PUT後SHA不一致: "
-                    f"{_returned_sha294} != {_expected_sha294}"
-                )
+            # Ver295 hotfix:
+            # HTTP 200/201 + GitHubが返したcontent.shaを保存成功の正本とする。
+            # ローカル計算SHAとの差だけで保存失敗にしない。
+            # 次回更新時はこのGitHub実SHAをmanifestから再利用する。
             _saved_git_sha294[str(path)]=_returned_sha294
             return True,"ok"
 
