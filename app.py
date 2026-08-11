@@ -12740,18 +12740,9 @@ def show_v184_eight_car_mixed_plan(
                 )
                 _c1_296,_c2_296,_c3_296,_c4_296=st.columns(4)
                 _c1_296.metric("表示買い目",f"{len(_audit_df296)}点")
-                _c2_296.metric(
-                    "平均校正倍率",
-                    f"×{float(_audit_df296['校正倍率'].mean()):.3f}"
-                )
-                _c3_296.metric(
-                    "下方補正",
-                    f"{int((_audit_df296['校正倍率']<0.9995).sum())}点"
-                )
-                _c4_296.metric(
-                    "上方補正",
-                    f"{int((_audit_df296['校正倍率']>1.0005).sum())}点"
-                )
+                _c2_296.metric("平均校正倍率",f"×{float(_audit_df296['校正倍率'].mean()):.3f}")
+                _c3_296.metric("下方補正",f"{int((_audit_df296['校正倍率']<0.9995).sum())}点")
+                _c4_296.metric("上方補正",f"{int((_audit_df296['校正倍率']>1.0005).sum())}点")
                 st.dataframe(
                     _audit_df296,
                     use_container_width=True,
@@ -12767,10 +12758,7 @@ def show_v184_eight_car_mixed_plan(
                         "差pt":st.column_config.NumberColumn(format="%+.1f"),
                     },
                 )
-                st.caption(
-                    "EV% = 確率(%) × オッズ。"
-                    "校正倍率は券種×確率帯の過去実現率をwalk-forwardで縮小学習した値です。"
-                )
+                st.caption("EV% = 確率(%) × オッズ。校正倍率は券種×確率帯のwalk-forward縮小学習値です。")
     except Exception as _audit_exc296:
         st.caption("期待値校正監査を表示できませんでした: "+str(_audit_exc296))
 
@@ -13868,8 +13856,14 @@ def _v282_push_chunked_db(
                     protected.add(str(_p295))
 
         # base_path の親ディレクトリをContents APIで1回だけ列挙。
-        _parent295=posixpath.dirname(base_path)
-        _name295=posixpath.basename(base_path)
+        # Ver295 hotfix:
+        # posixpath依存を完全撤去。GitHub pathは "/" 区切りなので文字列だけで安全に分解する。
+        _base295=str(base_path or "").strip("/")
+        if "/" in _base295:
+            _parent295,_name295=_base295.rsplit("/",1)
+        else:
+            _parent295=""
+            _name295=_base295
         _dir_url295=repo_api + urllib.parse.quote(_parent295,safe="/")
         if _parent295:
             _dir_url295 += "?ref=" + urllib.parse.quote(branch)
@@ -14643,6 +14637,8 @@ def _v278_render_bg_compact(location: str = "main") -> None:
 
 
 
+_V296_RERUN_LIGHTWEIGHT_UI = "2026-08-11-v1"
+
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
 def _v290_db_stat_signature(path_value) -> tuple:
@@ -14693,11 +14689,22 @@ def _v284_db_identity_regressed(now: dict, baseline: dict) -> tuple[bool,list[st
         reasons.extend(cmp.get("regressions") or [])
     return bool(reasons),reasons
 
+# Ver296 speed: バックグラウンド再シミュレーション中のrerunでは、
+# 進捗表示のためだけに80MB級DBの整合スナップショット/指紋を毎回作らない。
+# BG終了後の最初のrerunで通常の完全監視へ自動復帰する。
+def _v296_bg_fast_rerun_active() -> bool:
+    try:
+        return bool(_v278_bg_has_running_job(engine.DB_PATH))
+    except Exception:
+        return False
+
+_v296_bg_fast_rerun=_v296_bg_fast_rerun_active()
+
 # Ver284: アップロード済み正本がある場合、rerunでDB実体が後退していたら
 # GitHub操作や画面処理より前に同じ engine.DB_PATH へ原子的に復元する。
 _v284_pinned_bytes=st.session_state.get("v284_uploaded_master_bytes")
 _v284_pinned_id=st.session_state.get("v284_uploaded_master_identity")
-if isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_id,dict) and _v284_pinned_id.get("ok"):
+if (not _v296_bg_fast_rerun) and isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_id,dict) and _v284_pinned_id.get("ok"):
     _v284_before_restore=_v284_current_db_identity()
     _v284_restore_needed=False
     if not _v284_before_restore.get("ok"):
@@ -14781,9 +14788,14 @@ if not st.session_state.get("v284_boot_github_restore_checked",False):
         st.session_state["v284_boot_github_restore_error"]=f"起動時GitHub正本確認失敗: {type(_boot_exc284).__name__}: {_boot_exc284}"
 
 _v290_load_stage("DB固定監視を確認しています…")
-_v284_identity_now=_v284_current_db_identity()
 _v284_identity_key="v284_db_identity_baseline"
 _v284_identity_block_key="v284_db_identity_block"
+if _v296_bg_fast_rerun:
+    _v284_identity_now=dict(st.session_state.get(_v284_identity_key) or {})
+    if not _v284_identity_now.get("ok"):
+        _v284_identity_now=_v284_current_db_identity()
+else:
+    _v284_identity_now=_v284_current_db_identity()
 if _v284_identity_now.get("ok"):
     _v284_identity_base=st.session_state.get(_v284_identity_key)
     if not isinstance(_v284_identity_base,dict) or not _v284_identity_base.get("ok"):
@@ -14793,7 +14805,7 @@ if _v284_identity_now.get("ok"):
         _v284_bad,_v284_reasons=_v284_db_identity_regressed(_v284_identity_now,_v284_identity_base)
         st.session_state[_v284_identity_block_key]=_v284_reasons if _v284_bad else []
         # 件数が増えた正常DBは新基準へ昇格。SHA変化だけでは巻き戻り扱いにしない。
-        if not _v284_bad:
+        if not _v284_bad and not _v296_bg_fast_rerun:
             st.session_state[_v284_identity_key]=_v284_identity_now
 
 
@@ -14819,11 +14831,13 @@ with st.sidebar:
     _idshow284=_v284_identity_now if isinstance(_v284_identity_now,dict) else _v284_current_db_identity()
     if _idshow284.get("ok"):
         _fp284=_idshow284.get("fingerprint") or {}
+        _monitor_note296=" | BG進捗中は直前検証値" if _v296_bg_fast_rerun else ""
         st.caption(
             "DB固定監視: "+str(_idshow284.get("path"))+
             f" | {float(_idshow284.get('size',0))/1024/1024:.2f} MB"+
             " | SHA "+str(_idshow284.get("sha256",""))[:10]+
-            " | 履歴 "+str((_fp284.get("counts") or {}).get("race_history","?"))
+            " | 履歴 "+str((_fp284.get("counts") or {}).get("race_history","?"))+
+            _monitor_note296
         )
     if _guard284:
         st.error("⛔ 原本データの減少またはDB実体切替を検知したため保護停止中です。\n- "+"\n- ".join(map(str,_guard284)))
@@ -14844,11 +14858,7 @@ with st.sidebar:
 
     ready, ready_msg = github_ready()
     (st.success if ready else st.warning)(ready_msg)
-    _bg_busy_sidebar=False
-    try:
-        _bg_busy_sidebar=_v278_bg_has_running_job(engine.DB_PATH)
-    except Exception:
-        _bg_busy_sidebar=False
+    _bg_busy_sidebar=bool(_v296_bg_fast_rerun)
     if st.button(
         "GitHubからDBを再読込",
         use_container_width=True,
@@ -14858,14 +14868,31 @@ with st.sidebar:
         ok, msg = pull_db_from_github()
         (st.success if ok else st.error)(msg)
         if ok:
+            st.session_state.pop("_v296_sidebar_db_summary_cache",None)
+            st.session_state.pop("_v296_sidebar_manifest_cache",None)
+            st.session_state.pop("_v290_identity_cache",None)
             st.rerun()
     if st.button("現在のDBをGitHubへ保存", use_container_width=True, disabled=not ready,
                  help="DB専用branchへ保存するため、Streamlit本体の再デプロイは発生しません。"):
         ok, msg = push_db_to_github("AutoRaceAI: DBを手動保存")
         (st.success if ok else st.error)(msg)
+        if ok:
+            st.session_state.pop("_v296_sidebar_manifest_cache",None)
 
     try:
-        summary = db_summary(engine.DB_PATH)
+        _summary_sig296=_v290_db_stat_signature(engine.DB_PATH)
+        _summary_cache296=st.session_state.get("_v296_sidebar_db_summary_cache")
+        if _v296_bg_fast_rerun and isinstance(_summary_cache296,dict) and isinstance(_summary_cache296.get("value"),dict):
+            summary=dict(_summary_cache296["value"])
+        elif (
+            isinstance(_summary_cache296,dict)
+            and _summary_cache296.get("sig")==_summary_sig296
+            and isinstance(_summary_cache296.get("value"),dict)
+        ):
+            summary=dict(_summary_cache296["value"])
+        else:
+            summary=db_summary(engine.DB_PATH)
+            st.session_state["_v296_sidebar_db_summary_cache"]={"sig":_summary_sig296,"value":dict(summary)}
         c1, c2 = st.columns(2)
         display_players = summary.get("players", 0) or summary.get("import_players", 0)
         display_history = summary.get("history", 0) or summary.get("import_history", 0)
@@ -14873,11 +14900,25 @@ with st.sidebar:
         c2.metric("登録履歴", display_history)
         st.caption(f"DB容量: {summary.get('size', 0) / 1024 / 1024:.2f} MB")
         try:
-            _gm_ok283,_gm283,_=_v283_get_chunk_manifest(previous=False)
+            _gm_cache296=st.session_state.get("_v296_sidebar_manifest_cache")
+            _gm_now296=float(time_module.time())
+            _gm_use_cache296=(
+                isinstance(_gm_cache296,dict)
+                and isinstance(_gm_cache296.get("manifest"),dict)
+                and (_v296_bg_fast_rerun or (_gm_now296-float(_gm_cache296.get("at",0.0) or 0.0) < 120.0))
+            )
+            if _gm_use_cache296:
+                _gm_ok283=True
+                _gm283=dict(_gm_cache296["manifest"])
+            else:
+                _gm_ok283,_gm283,_=_v283_get_chunk_manifest(previous=False)
+                if _gm_ok283 and isinstance(_gm283,dict):
+                    st.session_state["_v296_sidebar_manifest_cache"]={"at":_gm_now296,"manifest":dict(_gm283)}
             if _gm_ok283:
                 _g283=int((_gm283 or {}).get("generation") or 0)
                 _s283=str((_gm283 or {}).get("slot") or "?")
-                st.caption(f"GitHub DB世代: {_g283} / 保管slot: {_s283}（行単位包含判定 有効）")
+                _cache_note296=" / BG中キャッシュ" if _v296_bg_fast_rerun else ""
+                st.caption(f"GitHub DB世代: {_g283} / 保管slot: {_s283}（行単位包含判定 有効）{_cache_note296}")
         except Exception:
             pass
         db_path = Path(engine.DB_PATH)
