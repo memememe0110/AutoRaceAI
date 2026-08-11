@@ -11566,6 +11566,9 @@ def v67_save_ticket_snapshot(meta, bets, trials, db_path=DB_PATH):
     race_key = v34_race_key(meta)
     total = max(int(trials or 0), 1)
     mapping = {
+        "単勝": ("単勝", False),
+        "複勝": ("複勝", False),
+        "ワイド": ("ワイド", True),
         "2連単": ("2車単", False),
         "2連複": ("2車複", True),
         "3連複": ("三連複", True),
@@ -11606,33 +11609,50 @@ def _v67_actual_combinations(results):
     if len(cars) < 3:
         return {}
     return {
-        "2連単": f"{cars[0]}-{cars[1]}",
-        "2連複": "-".join(map(str, sorted(cars[:2]))),
-        "3連複": "-".join(map(str, sorted(cars[:3]))),
-        "3連単": f"{cars[0]}-{cars[1]}-{cars[2]}",
+        "単勝": [str(cars[0])],
+        "複勝": [str(c) for c in cars[:3]],
+        "ワイド": [
+            "-".join(map(str, sorted(pair)))
+            for pair in ((cars[0], cars[1]), (cars[0], cars[2]), (cars[1], cars[2]))
+        ],
+        "2連単": [f"{cars[0]}-{cars[1]}"],
+        "2連複": ["-".join(map(str, sorted(cars[:2])))],
+        "3連複": ["-".join(map(str, sorted(cars[:3])))],
+        "3連単": [f"{cars[0]}-{cars[1]}-{cars[2]}"],
     }
 
 
 def v67_analyze_ticket_result(meta, results, db_path=DB_PATH):
-    """実結果が予測確率上位から累積何%地点にあったかを券種別に保存・返却する。"""
+    """実結果が予測確率上位から累積何%地点にあったかを全券種で保存・返却する。
+
+    複勝・ワイドは実結果に複数の的中組み合わせがあるため、
+    その中で予測順位が最上位だった的中組み合わせを「的中位置」として採用する。
+    """
     v67_init_ticket_feedback_tables(db_path)
     race_key = v34_race_key(meta)
     actuals = _v67_actual_combinations(results)
     rows = []
     now = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(db_path) as con:
-        for bet_type, actual in actuals.items():
-            hit = con.execute("""
-                SELECT predicted_rank, probability, cumulative_probability
-                FROM v67_prediction_tickets
-                WHERE race_key=? AND bet_type=? AND combination=?
-            """, (race_key, bet_type, actual)).fetchone()
+        for bet_type, actual_candidates in actuals.items():
+            if not isinstance(actual_candidates, (list, tuple, set)):
+                actual_candidates = [actual_candidates]
+            actual_candidates = [str(x) for x in actual_candidates if str(x)]
+            hits = []
+            for actual in actual_candidates:
+                hit = con.execute("""
+                    SELECT predicted_rank, probability, cumulative_probability
+                    FROM v67_prediction_tickets
+                    WHERE race_key=? AND bet_type=? AND combination=?
+                """, (race_key, bet_type, actual)).fetchone()
+                if hit:
+                    hits.append((int(hit[0]), float(hit[1]), float(hit[2]), actual))
             total_combos = con.execute(
                 "SELECT COUNT(*) FROM v67_prediction_tickets WHERE race_key=? AND bet_type=?",
                 (race_key, bet_type),
             ).fetchone()[0]
-            if hit:
-                rank, prob, cumulative = int(hit[0]), float(hit[1]), float(hit[2])
+            if hits:
+                rank, prob, cumulative, actual = min(hits, key=lambda x: (x[0], x[2], x[3]))
                 con.execute("""
                     INSERT INTO v67_ticket_feedback
                     (race_key,bet_type,actual_combination,predicted_rank,individual_probability,cumulative_probability,total_combinations,analyzed_at)
@@ -11648,11 +11668,11 @@ def v67_analyze_ticket_result(meta, results, db_path=DB_PATH):
                 rows.append({"券種": bet_type, "的中組み合わせ": actual, "予測順位": rank,
                              "個別確率": prob, "上位累積確率": cumulative, "全組み合わせ数": total_combos})
             else:
-                rows.append({"券種": bet_type, "的中組み合わせ": actual, "予測順位": None,
+                actual_label = " / ".join(actual_candidates)
+                rows.append({"券種": bet_type, "的中組み合わせ": actual_label, "予測順位": None,
                              "個別確率": None, "上位累積確率": None, "全組み合わせ数": total_combos})
         con.commit()
     return pd.DataFrame(rows)
-
 
 def v67_ticket_feedback_stats(db_path=DB_PATH):
     """券種別の的中位置平均と累積分位点を返す。"""
@@ -11675,7 +11695,7 @@ def v67_ticket_feedback_stats(db_path=DB_PATH):
             "中央値": float(vals.median()), "80%カバー": float(vals.quantile(.80)),
             "90%カバー": float(vals.quantile(.90)), "95%カバー": float(vals.quantile(.95)),
         })
-    order = {"2連単":0,"2連複":1,"3連複":2,"3連単":3}
+    order = {"単勝":0,"複勝":1,"ワイド":2,"2連複":3,"2連単":4,"3連複":5,"3連単":6}
     return pd.DataFrame(out).sort_values("券種", key=lambda s:s.map(order)).reset_index(drop=True)
 
 
@@ -18311,6 +18331,12 @@ def v40_apply_adaptive_weights(df, db_path=DB_PATH):
     out = df.copy()
     profile = v190_weight_validation_profile(db_path)
     weights = dict(profile.get("effective") or v40_get_weights(db_path))
+    # Ver298: DB164の実6周アブレーションで最有力候補だった
+    # V40「追い込み」寄与だけを半減する。
+    # 他9項目は再正規化せず、そのまま維持して追い込み成分だけを純粋に50%へ落とす。
+    # DBに保存される学習重み自体は変更せず、今後の結果学習も継続する。
+    _v298_chase_original=float(weights.get("追い込み",0.0) or 0.0)
+    weights["追い込み"]=_v298_chase_original*0.50
     features = v40_feature_frame(out)
     base = pd.to_numeric(out.get("改善後総合点", pd.Series(0, index=out.index)), errors="coerce").fillna(0.0)
     out["調整前総合点"] = base
@@ -18321,6 +18347,9 @@ def v40_apply_adaptive_weights(df, db_path=DB_PATH):
     out["改善後総合点"] = base + bonus
     out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
     out["重み検証適用率"] = float(profile.get("blend", 1.0))
+    out["Ver298追い込み元実効重み"] = float(_v298_chase_original)
+    out["Ver298追い込み適用重み"] = float(weights.get("追い込み",0.0))
+    out["Ver298追い込み倍率"] = 0.50
     for k in V40_DEFAULT_WEIGHTS:
         out[f"学習特徴_{k}"] = features[k]
     comments=[]

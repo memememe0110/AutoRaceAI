@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver297"
+APP_VERSION = "Ver298"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver297"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver298"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -8913,7 +8913,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
     else:
         st.caption("現在の設定：点数制限なし。選択したカバーラインまで強調")
 
-    bet_types = ["2連単", "2連複", "3連複", "3連単"]
+    bet_types = ["単勝", "複勝", "ワイド", "2連複", "2連単", "3連複", "3連単"]
     selected_bet_type = st.radio(
         "表示する券種", bet_types, horizontal=True,
         key=f"v155_cover_bet_type_{coverage}_{line_mode}",
@@ -14639,6 +14639,8 @@ def _v278_render_bg_compact(location: str = "main") -> None:
 
 _V296_RERUN_LIGHTWEIGHT_UI = "2026-08-11-v1"
 _V297_EV_RESTORE_OFFICIAL = "2026-08-11-v1"
+_V298_CHASE_HALF = "2026-08-11-v1"
+_V298_ALL_TICKET_COVERAGE = "2026-08-11-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
