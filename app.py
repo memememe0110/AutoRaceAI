@@ -10126,6 +10126,20 @@ def _v187_ensure_mixed_learning_tables(db_path: str) -> None:
             payout_yen INTEGER NOT NULL,
             PRIMARY KEY (race_key, plan_hash, bet_type, combination)
         );
+        CREATE TABLE IF NOT EXISTS v300_recommendation_audit (
+            race_key TEXT NOT NULL,
+            plan_hash TEXT NOT NULL,
+            recommendation_label TEXT NOT NULL,
+            recommendation_score INTEGER NOT NULL,
+            adjusted_return_rate REAL,
+            cover REAL,
+            max_ev REAL,
+            hole_count INTEGER,
+            reasons_json TEXT,
+            app_version TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (race_key, plan_hash)
+        );
         CREATE TABLE IF NOT EXISTS v280_orphan_plan_feedback_archive (
             race_key TEXT NOT NULL,
             plan_hash TEXT NOT NULL,
@@ -10727,6 +10741,46 @@ def _v187_save_mixed_plan(
         con.commit()
     _v187_sync_mixed_feedback(db_path)
     return plan_hash
+
+
+def _v300_save_recommendation_audit(
+    db_path: str, race_key: str, plan_hash: str, audit: dict,
+    app_version: str | None = None,
+) -> None:
+    """新推奨判定を監査用に保存。買い目・既存gradeには一切反映しない。"""
+    if not race_key or not plan_hash or not isinstance(audit,dict) or not audit:
+        return
+    _v187_ensure_mixed_learning_tables(db_path)
+    with sqlite3.connect(str(db_path),timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""
+            INSERT INTO v300_recommendation_audit
+            (race_key,plan_hash,recommendation_label,recommendation_score,
+             adjusted_return_rate,cover,max_ev,hole_count,reasons_json,app_version,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(race_key,plan_hash) DO UPDATE SET
+                recommendation_label=excluded.recommendation_label,
+                recommendation_score=excluded.recommendation_score,
+                adjusted_return_rate=excluded.adjusted_return_rate,
+                cover=excluded.cover,
+                max_ev=excluded.max_ev,
+                hole_count=excluded.hole_count,
+                reasons_json=excluded.reasons_json,
+                app_version=excluded.app_version,
+                created_at=excluded.created_at
+        """,(
+            str(race_key),str(plan_hash),
+            str(audit.get("label") or "△検証中"),
+            int(audit.get("score",0) or 0),
+            float(audit.get("adjusted_return_rate",0.0) or 0.0),
+            float(audit.get("cover",0.0) or 0.0),
+            float(audit.get("max_ev",0.0) or 0.0),
+            int(audit.get("hole_count",0) or 0),
+            json.dumps(list(audit.get("reasons") or []),ensure_ascii=False),
+            str(app_version or APP_VERSION),
+            _v228_now_jst_iso(),
+        ))
+        con.commit()
 
 
 def _v195_return_calibration(db_path: str) -> dict:
@@ -12690,6 +12744,11 @@ def show_v184_eight_car_mixed_plan(
                 source_prediction_version=source_prediction_version,
                 include_in_live_stats=include_in_live_stats,
             )
+            if saved_hash and _rec_audit300:
+                _v300_save_recommendation_audit(
+                    engine.DB_PATH, str(race_key), str(saved_hash), _rec_audit300,
+                    app_version=(app_version or APP_VERSION),
+                )
     except Exception as exc:
         st.warning(f"合成プランをDBへ保存できませんでした: {exc}")
 
@@ -13129,6 +13188,12 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                     COALESCE(NULLIF(r.app_version,''),'Unknown') AS app_version,
                     r.logic_version, r.points, r.cost_yen, r.grade,
                     r.model_return_rate, r.created_at,
+                    a.recommendation_label AS new_recommendation_label,
+                    a.recommendation_score AS new_recommendation_score,
+                    a.adjusted_return_rate AS new_adjusted_return_rate,
+                    a.cover AS new_recommendation_cover,
+                    a.max_ev AS new_recommendation_max_ev,
+                    a.hole_count AS new_recommendation_hole_count,
                     f.hit, f.black_hit, f.gami_hit, f.payout_yen,
                     f.return_rate, f.winning_types, f.evaluated_at,
                     ROW_NUMBER() OVER (
@@ -13140,12 +13205,16 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                 FROM v187_mixed_plan_runs r
                 JOIN v187_mixed_plan_feedback f
                   ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                LEFT JOIN v300_recommendation_audit a
+                  ON a.race_key=r.race_key AND a.plan_hash=r.plan_hash
                 LEFT JOIN result_races rr ON rr.race_key=r.race_key
                 WHERE f.return_rate IS NOT NULL
                   AND COALESCE(r.include_in_live_stats,1)=1
             )
             SELECT race_key,race_date,venue,race_no,app_version,logic_version,
                    points,cost_yen,grade,model_return_rate,created_at,
+                   new_recommendation_label,new_recommendation_score,new_adjusted_return_rate,
+                   new_recommendation_cover,new_recommendation_max_ev,new_recommendation_hole_count,
                    hit,black_hit,gami_hit,payout_yen,return_rate,winning_types,evaluated_at
             FROM evaluated
             WHERE rn=1
@@ -13192,6 +13261,49 @@ def _v216_summary_values(df: pd.DataFrame) -> dict:
         "全レース": one(df),
         "推奨のみ": one(df[df["推奨区分"] == "推奨"]),
         "非推奨のみ": one(df[df["推奨区分"] == "非推奨"]),
+    }
+
+
+def _v300_new_recommendation_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """保存済み新推奨判定ごとの実回収率。監査用。"""
+    if df.empty or "new_recommendation_label" not in df.columns:
+        return pd.DataFrame()
+    w=df[df["new_recommendation_label"].fillna("").astype(str)!=""].copy()
+    if w.empty:
+        return pd.DataFrame()
+    w["判定対象"]=(~w.get("全返還",pd.Series(False,index=w.index)).fillna(False).astype(bool)).astype(int)
+    out=w.groupby("new_recommendation_label",dropna=False).agg(
+        レース数=("race_key","count"),
+        判定対象レース数=("判定対象","sum"),
+        的中数=("hit","sum"),
+        黒字数=("black_hit","sum"),
+        購入額=("cost_yen","sum"),
+        払戻額=("payout_yen","sum"),
+    ).reset_index().rename(columns={"new_recommendation_label":"新推奨判定"})
+    out["的中率"]=out["的中数"]/out["判定対象レース数"].replace(0,pd.NA)*100.0
+    out["黒字率"]=out["黒字数"]/out["判定対象レース数"].replace(0,pd.NA)*100.0
+    out["回収率"]=out["払戻額"]/out["購入額"].replace(0,pd.NA)*100.0
+    order={"◎推奨":0,"○候補":1,"△検証中":2,"見送り":3}
+    out["_order"]=out["新推奨判定"].map(order).fillna(99)
+    return out.sort_values(["_order","新推奨判定"]).drop(columns=["_order"]).reset_index(drop=True)
+
+
+def _v300_combo_recommendation_summary(df: pd.DataFrame) -> dict:
+    """◎のみ / ◎+○ / 全体を同じ購入額基準で比較。"""
+    def one(part):
+        if part.empty:
+            return {"races":0,"cost":0,"payout":0,"hits":0,"return":None}
+        cost=float(pd.to_numeric(part["cost_yen"],errors="coerce").fillna(0).sum())
+        pay=float(pd.to_numeric(part["payout_yen"],errors="coerce").fillna(0).sum())
+        return {"races":int(len(part)),"cost":int(cost),"payout":int(pay),
+                "hits":int(pd.to_numeric(part["hit"],errors="coerce").fillna(0).sum()),
+                "return":(pay/cost*100.0 if cost>0 else None)}
+    label=df.get("new_recommendation_label",pd.Series("",index=df.index)).fillna("").astype(str)
+    audited=df[label!=""].copy()
+    return {
+        "◎のみ":one(audited[audited["new_recommendation_label"]=="◎推奨"]),
+        "◎＋○":one(audited[audited["new_recommendation_label"].isin(["◎推奨","○候補"])]),
+        "監査済み全体":one(audited),
     }
 
 
@@ -13321,6 +13433,29 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         else:
             st.caption("該当なし")
 
+    st.markdown("### 🧪 新推奨判定の実績（監査）")
+    _new_rec_rows300=_v300_new_recommendation_summary(filtered)
+    _new_rec_combo300=_v300_combo_recommendation_summary(filtered)
+    if _new_rec_rows300.empty:
+        st.caption("新推奨判定をDB保存したレースはまだありません。この更新版以降の保存・再シミュレーションから蓄積します。")
+    else:
+        _aa300,_bb300,_cc300=st.columns(3)
+        for _col300,_key300 in zip((_aa300,_bb300,_cc300),("◎のみ","◎＋○","監査済み全体")):
+            _s300=_new_rec_combo300[_key300]
+            _ret300="－" if _s300["return"] is None else f"{_s300['return']:.1f}%"
+            _col300.metric(_key300,f"{_s300['races']}R / {_ret300}")
+            _col300.caption(f"購入{_s300['cost']:,}円・払戻{_s300['payout']:,}円・的中{_s300['hits']}R")
+        st.dataframe(
+            _new_rec_rows300,
+            use_container_width=True,hide_index=True,
+            column_config={
+                "的中率":st.column_config.NumberColumn(format="%.1f%%"),
+                "黒字率":st.column_config.NumberColumn(format="%.1f%%"),
+                "回収率":st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+        st.caption("この集計は新推奨判定の検証専用です。現時点では◎/○によって買い目を自動削除・購入制限しません。")
+
     st.markdown("### 日別")
     daily = _v215_aggregate_return(filtered, ["race_date"])
     if not daily.empty:
@@ -13345,10 +13480,17 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         detail = filtered.copy()
         detail["日付"] = detail["race_date"].dt.strftime("%Y-%m-%d")
         detail["判定"] = detail.apply(lambda r: "◎黒字" if r.get("black_hit") else ("△ガミ" if r.get("gami_hit") else "×外れ"), axis=1)
-        cols = ["日付","venue","race_no","推奨区分","grade","判定","points","cost_yen","payout_yen","return_rate","収支","app_version"]
+        cols = ["日付","venue","race_no","推奨区分","grade","new_recommendation_label",
+                "new_recommendation_score","new_adjusted_return_rate","new_recommendation_cover",
+                "new_recommendation_max_ev","new_recommendation_hole_count",
+                "判定","points","cost_yen","payout_yen","return_rate","収支","app_version"]
+        cols = [c for c in cols if c in detail.columns]
         detail = detail[cols].rename(columns={
             "venue":"開催場","race_no":"R","points":"点数","cost_yen":"購入額",
             "payout_yen":"払戻額","return_rate":"回収率","app_version":"バージョン","grade":"元判定",
+            "new_recommendation_label":"新推奨","new_recommendation_score":"推奨スコア",
+            "new_adjusted_return_rate":"新判定参考回収率","new_recommendation_cover":"新判定カバー",
+            "new_recommendation_max_ev":"新判定最大EV","new_recommendation_hole_count":"中穴候補数",
         })
         st.dataframe(detail.sort_values(["日付","開催場","R"], ascending=[False,True,True]), use_container_width=True, hide_index=True)
 
@@ -14876,6 +15018,7 @@ _V298_BASELINE_CONTAINS_AUTO_ADOPT = "2026-08-11-v1"
 _V299_HOLE_VALUE_RESCUE = "2026-08-11-v1"
 _V300_TRIFECTA_ONLY_VALUE_RESCUE = "2026-08-11-v1"
 _V300_RECOMMEND_AUDIT = "2026-08-12-v1"
+_V300_RECOMMEND_AUDIT_PERSIST = "2026-08-12-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
