@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver296"
+APP_VERSION = "Ver297"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver296"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver297"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -10844,7 +10844,7 @@ def _v295_ev_calibration_table(db_path: str, cutoff_date: str="") -> dict:
             b["hits"]+=1
 
     # 元モデル200件分を事前分布として実績を縮小。極端な補正は±20%に制限。
-    prior_n=200.0
+    prior_n=100.0
     for bt,arr in buckets.items():
         out["types"][bt]=[]
         for b in arr:
@@ -10852,7 +10852,7 @@ def _v295_ev_calibration_table(db_path: str, cutoff_date: str="") -> dict:
             mean_p=(b["sum_p"]/n) if n else None
             if n and mean_p is not None and mean_p>1e-12:
                 calibrated=(float(b["hits"])+prior_n*mean_p)/(n+prior_n)
-                ratio=float(np.clip(calibrated/mean_p,0.80,1.20))
+                ratio=float(np.clip(calibrated/mean_p,0.70,1.30))
             else:
                 ratio=1.0
             out["types"][bt].append({
@@ -14638,6 +14638,7 @@ def _v278_render_bg_compact(location: str = "main") -> None:
 
 
 _V296_RERUN_LIGHTWEIGHT_UI = "2026-08-11-v1"
+_V297_EV_RESTORE_OFFICIAL = "2026-08-11-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
