@@ -13794,6 +13794,7 @@ def _v282_push_chunked_db(
         - 対象は今回書いたtarget_slotと同じslotのpartだけ。
         - 削除失敗はDB保存成功を取り消さず、警告として返す。
         """
+        import posixpath
         protected=set()
         for _m295 in (active_manifest or {}, previous_manifest or {}):
             for _p295 in list((_m295 or {}).get("parts") or []):
