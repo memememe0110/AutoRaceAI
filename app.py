@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver299"
+APP_VERSION = "Ver300"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver299"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver300"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -10898,6 +10898,10 @@ def _v299_ev_trust(raw_ev_multiple: float, bet_type: str, probability_pct: float
     bt=str(bet_type or "")
     p=max(0.0,float(probability_pct or 0.0))
     od=max(0.0,float(odds or 0.0))
+    # Ver300: DB169の同一71R比較で、Ver299の新規利益は三連単に集中。
+    # 他券種の選び替えは的中を失っていたため、EV信頼減衰は三連単だけに限定する。
+    if bt not in ("3連単","三連単"):
+        return 1.0,"Ver298互換（非3連単）"
     if ev <= 2.0:
         trust=1.0
         reason="通常"
@@ -10906,15 +10910,65 @@ def _v299_ev_trust(raw_ev_multiple: float, bet_type: str, probability_pct: float
         effective=2.0 + 0.35*(ev-2.0)
         trust=max(0.45,min(1.0,effective/max(ev,1e-9)))
         reason="高EV滑らか減衰"
-    # 2連複はDB167で実績が弱いが完全禁止しない。
-    if bt in ("2連複","二連複"):
-        trust*=0.90
-        reason += "・2連複弱縮小"
     # 三連単の中穴帯は候補母集団から落とさない。信頼度の下限だけ確保する。
-    if bt in ("3連単","三連単") and 0.8 <= p <= 8.0 and od >= 30.0:
+    if 0.8 <= p <= 8.0 and od >= 30.0:
         trust=max(trust,0.72)
         reason += "・穴候補保護"
     return float(np.clip(trust,0.40,1.0)),reason
+
+
+
+def _v300_recommendation_audit(result: dict) -> dict:
+    """DB169で見えた傾向を監査表示するだけの新推奨判定。買い目・保存gradeには影響させない。"""
+    tickets=list(result.get("tickets") or [])
+    adjusted=float(result.get("adjusted_return_rate",0.0) or 0.0)
+    cover=float(result.get("cover",0.0) or 0.0)
+    raw_evs=[]
+    hole_count=0
+    for t in tickets:
+        p=float(t.get("ev_probability",t.get("probability",0.0)) or 0.0)
+        od=float(t.get("odds",0.0) or 0.0)
+        raw_evs.append((p/100.0)*od)
+        if bool(t.get("v299_hole_rescue")):
+            hole_count+=1
+    max_ev=max(raw_evs) if raw_evs else 0.0
+
+    # 固定AND条件ではなく段階スコア。DB169の有望領域を中心にしつつ境界を滑らかにする。
+    score=0
+    reasons=[]
+    if adjusted <= 150.0:
+        score+=2; reasons.append("参考回収率≤150%")
+    elif adjusted <= 175.0:
+        score+=1; reasons.append("参考回収率≤175%")
+    else:
+        score-=2; reasons.append("参考回収率が高すぎる")
+    if cover <= 40.0:
+        score+=2; reasons.append("カバー≤40%")
+    elif cover <= 50.0:
+        score+=1; reasons.append("カバー≤50%")
+    else:
+        score-=1; reasons.append("カバー広め")
+    if max_ev <= 2.0:
+        score+=2; reasons.append("最大EV≤2.0")
+    elif max_ev <= 2.5:
+        score+=1; reasons.append("最大EV≤2.5")
+    else:
+        score-=2; reasons.append("最大EV暴走")
+    if hole_count in (1,2):
+        score+=1; reasons.append(f"中穴価値候補{hole_count}点")
+    elif hole_count>=3:
+        score-=1; reasons.append("穴候補過多")
+
+    if score>=6:
+        label,icon="◎推奨","◎"
+    elif score>=4:
+        label,icon="○候補","○"
+    elif score>=2:
+        label,icon="△検証中","△"
+    else:
+        label,icon="見送り","—"
+    return {"label":label,"icon":icon,"score":int(score),"adjusted_return_rate":adjusted,
+            "cover":cover,"max_ev":max_ev,"hole_count":hole_count,"reasons":reasons}
 
 
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
@@ -11019,7 +11073,9 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             )
             _raw_ev299=(_ev_prob295/100.0)*odds
             _trust299,_trust_reason299=_v299_ev_trust(_raw_ev299,label,probability,odds)
-            _effective_ev_prob299=_ev_prob295*_trust299
+            _effective_ev_prob299=(
+                _ev_prob295*_trust299 if label=="三連単" else _ev_prob295
+            )
 
             # Ver299: 三連単は確率上位limit点を越えても「中穴の価値候補」を最大6点だけ探索。
             # 極端な宝くじ領域ではなく、シミュレーションにも一定頻度で出る穴だけを対象にする。
@@ -12616,6 +12672,8 @@ def show_v184_eight_car_mixed_plan(
 ) -> None:
     result = v184_eight_car_mixed_plan(bets, trials, meta, odds_maps)
     result = v277_provisional_merge_7types(result, bets, trials, odds_maps)
+    # Ver300: 新推奨判定は監査表示のみ。既存grade・買い目・保存内容を変更しない。
+    _rec_audit300 = _v300_recommendation_audit(result) if result.get("available") else {}
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH) or 0
     st.markdown(f"#### 🧩 {int(starter_count)}車向け・黒字的中重視の回収率合成")
     if not result.get("available"):
@@ -12650,6 +12708,24 @@ def show_v184_eight_car_mixed_plan(
             )
     formation_sections, formation_notes = v207_build_mixed_formation_sections(result)
     st.subheader(f"{result['icon']} 回収率重視：{result['points']}点・{result['grade']}")
+    if _rec_audit300:
+        _lab300=str(_rec_audit300.get("label","△検証中"))
+        _msg300=(
+            f"🧪 新推奨判定（監査のみ）：{_lab300}｜スコア {_rec_audit300.get('score',0)} "
+            f"｜参考回収率 {_rec_audit300.get('adjusted_return_rate',0):.1f}% "
+            f"｜カバー {_rec_audit300.get('cover',0):.1f}% "
+            f"｜最大EV {_rec_audit300.get('max_ev',0):.2f}"
+        )
+        if _lab300=="◎推奨":
+            st.success(_msg300)
+        elif _lab300=="○候補":
+            st.info(_msg300)
+        elif _lab300=="△検証中":
+            st.warning(_msg300)
+        else:
+            st.caption(_msg300)
+        st.caption("判定根拠："+" / ".join(_rec_audit300.get("reasons",[]))+
+                   "　※監査表示のみ。買い目・既存推奨grade・回収率計算・DB保存には影響しません。")
     _v277_added = result.get("provisional_7type_added", []) or []
     _v277_candidates = result.get("provisional_7type_candidates", []) or []
     if _v277_added:
@@ -14798,6 +14874,8 @@ _V298_CHASE_HALF = "2026-08-11-v1"
 _V298_ALL_TICKET_COVERAGE = "2026-08-11-v1"
 _V298_BASELINE_CONTAINS_AUTO_ADOPT = "2026-08-11-v1"
 _V299_HOLE_VALUE_RESCUE = "2026-08-11-v1"
+_V300_TRIFECTA_ONLY_VALUE_RESCUE = "2026-08-11-v1"
+_V300_RECOMMEND_AUDIT = "2026-08-12-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
