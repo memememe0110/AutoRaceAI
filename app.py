@@ -13374,6 +13374,70 @@ def _v300_combo_recommendation_summary(df: pd.DataFrame) -> dict:
     }
 
 
+def _v300_maxev_threshold_audit(df: pd.DataFrame) -> pd.DataFrame:
+    """新推奨監査済みレースを最大EV閾値ごとに仮想絞り込みして実績比較。表示専用。"""
+    if df.empty or "new_recommendation_max_ev" not in df.columns:
+        return pd.DataFrame()
+    w=df[df["new_recommendation_label"].fillna("").astype(str)!=""].copy()
+    if w.empty:
+        return pd.DataFrame()
+
+    w["new_recommendation_max_ev"]=pd.to_numeric(
+        w["new_recommendation_max_ev"],errors="coerce"
+    )
+    w=w.dropna(subset=["new_recommendation_max_ev"])
+    if w.empty:
+        return pd.DataFrame()
+
+    thresholds=[1.50,1.70,1.80,1.90,2.00,2.10,2.30,2.50]
+    rows=[]
+    for th in thresholds:
+        part=w[w["new_recommendation_max_ev"]<=th].copy()
+        if part.empty:
+            rows.append({
+                "最大EV上限":th,"レース数":0,"的中数":0,"的中率":None,
+                "購入額":0,"払戻額":0,"回収率":None,"収支":0
+            })
+            continue
+        cost=float(pd.to_numeric(part["cost_yen"],errors="coerce").fillna(0).sum())
+        pay=float(pd.to_numeric(part["payout_yen"],errors="coerce").fillna(0).sum())
+        hit=int(pd.to_numeric(part["hit"],errors="coerce").fillna(0).sum())
+        judged=part[~part.get("全返還",pd.Series(False,index=part.index)).fillna(False).astype(bool)]
+        hit_rate=(float(pd.to_numeric(judged["hit"],errors="coerce").fillna(0).mean()*100.0)
+                  if not judged.empty else None)
+        rows.append({
+            "最大EV上限":th,
+            "レース数":int(len(part)),
+            "的中数":hit,
+            "的中率":hit_rate,
+            "購入額":int(cost),
+            "払戻額":int(pay),
+            "回収率":(pay/cost*100.0 if cost>0 else None),
+            "収支":int(pay-cost),
+        })
+    return pd.DataFrame(rows)
+
+
+def _v300_recommendation_bucket_detail(df: pd.DataFrame) -> pd.DataFrame:
+    """◎/○/△/見送りごとの最大EV分布を確認する監査表。"""
+    if df.empty or "new_recommendation_label" not in df.columns:
+        return pd.DataFrame()
+    w=df[df["new_recommendation_label"].fillna("").astype(str)!=""].copy()
+    if w.empty:
+        return pd.DataFrame()
+    w["new_recommendation_max_ev"]=pd.to_numeric(w["new_recommendation_max_ev"],errors="coerce")
+    out=w.groupby("new_recommendation_label",dropna=False).agg(
+        レース数=("race_key","count"),
+        最大EV平均=("new_recommendation_max_ev","mean"),
+        最大EV中央値=("new_recommendation_max_ev","median"),
+        最大EV最小=("new_recommendation_max_ev","min"),
+        最大EV最大=("new_recommendation_max_ev","max"),
+    ).reset_index().rename(columns={"new_recommendation_label":"新推奨判定"})
+    order={"◎推奨":0,"○候補":1,"△検証中":2,"見送り":3}
+    out["_order"]=out["新推奨判定"].map(order).fillna(99)
+    return out.sort_values(["_order","新推奨判定"]).drop(columns=["_order"]).reset_index(drop=True)
+
+
 def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -13549,6 +13613,47 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             },
         )
         st.caption("この集計は新推奨判定の検証専用です。現時点では◎/○によって買い目を自動削除・購入制限しません。")
+
+        with st.expander("🔬 最大EVしきい値の監査（表示のみ）", expanded=False):
+            _th300=_v300_maxev_threshold_audit(filtered)
+            _dist300=_v300_recommendation_bucket_detail(filtered)
+            st.caption(
+                "保存済み新推奨監査レースを、最大EV上限だけ仮に変えた場合の実績です。"
+                "買い目・推奨判定・DB保存内容は変更しません。"
+            )
+            if not _th300.empty:
+                st.dataframe(
+                    _th300,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "最大EV上限":st.column_config.NumberColumn(format="%.2f"),
+                        "的中率":st.column_config.NumberColumn(format="%.1f%%"),
+                        "回収率":st.column_config.NumberColumn(format="%.1f%%"),
+                        "購入額":st.column_config.NumberColumn(format="%d円"),
+                        "払戻額":st.column_config.NumberColumn(format="%d円"),
+                        "収支":st.column_config.NumberColumn(format="%+d円"),
+                    },
+                )
+            else:
+                st.caption("しきい値監査に使える新推奨保存データがまだありません。")
+            if not _dist300.empty:
+                st.markdown("**新推奨区分ごとの最大EV分布**")
+                st.dataframe(
+                    _dist300,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "最大EV平均":st.column_config.NumberColumn(format="%.2f"),
+                        "最大EV中央値":st.column_config.NumberColumn(format="%.2f"),
+                        "最大EV最小":st.column_config.NumberColumn(format="%.2f"),
+                        "最大EV最大":st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+            st.caption(
+                "見るポイント：閾値を厳しくするほど回収率が安定するか、"
+                "対象レース数が減りすぎないか、◎と○で最大EV分布が本当に分かれているか。"
+            )
 
     st.markdown("### 日別")
     daily = _v215_aggregate_return(filtered, ["race_date"])
@@ -15114,6 +15219,7 @@ _V300_TRIFECTA_ONLY_VALUE_RESCUE = "2026-08-11-v1"
 _V300_RECOMMEND_AUDIT = "2026-08-12-v1"
 _V300_RECOMMEND_AUDIT_PERSIST = "2026-08-12-v1"
 _V300_RECOMMEND_AUDIT_BACKFILL = "2026-08-12-v1"
+_V300_MAXEV_THRESHOLD_AUDIT = "2026-08-12-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
