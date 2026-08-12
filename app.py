@@ -35,11 +35,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver300"
+APP_VERSION = "Ver301"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver300"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver301"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -11092,6 +11092,71 @@ def _v300_recommendation_audit(result: dict) -> dict:
             "cover":cover,"max_ev":max_ev,"hole_count":hole_count,"reasons":reasons}
 
 
+
+def _v301_live_recommendation(result: dict) -> dict:
+    """予測時に実運用する強推奨判定。
+
+    DB172までの監査で有望だった条件:
+    - 最大EV <= 1.70 かつ 最終プランの券種支持数 >= 2
+    - 1.70 < 最大EV <= 2.10 かつ 券種支持数 >= 3
+
+    買い目自体は変更せず、レース推奨表示だけに使う。
+    """
+    tickets=list(result.get("tickets") or [])
+    bet_types={
+        str(t.get("type") or "")
+        for t in tickets
+        if str(t.get("type") or "")
+    }
+    support_count=len(bet_types)
+
+    evs=[]
+    for t in tickets:
+        # 実運用時はその場で保持している期待値評価用確率を優先。
+        p=float(t.get("ev_probability",t.get("probability",0.0)) or 0.0)
+        od=float(t.get("odds",0.0) or 0.0)
+        evs.append((p/100.0)*od)
+    max_ev=max(evs) if evs else 0.0
+
+    strong = (
+        (max_ev <= 1.70 and support_count >= 2)
+        or
+        (1.70 < max_ev <= 2.10 and support_count >= 3)
+    )
+
+    if strong:
+        if max_ev <= 1.70:
+            reason=f"最大EV {max_ev:.2f} <= 1.70 かつ {support_count}券種支持"
+        else:
+            reason=f"最大EV {max_ev:.2f}（1.70〜2.10）かつ {support_count}券種支持"
+        return {
+            "recommended":True,
+            "label":"◎強推奨",
+            "icon":"🔥",
+            "max_ev":float(max_ev),
+            "support_count":int(support_count),
+            "reason":reason,
+        }
+
+    # 非強推奨も理由を明示。
+    if max_ev > 2.10:
+        why=f"最大EV {max_ev:.2f} > 2.10"
+    elif max_ev <= 1.70 and support_count < 2:
+        why=f"最大EVは{max_ev:.2f}だが券種支持が{support_count}"
+    elif 1.70 < max_ev <= 2.10 and support_count < 3:
+        why=f"最大EV {max_ev:.2f}に対して券種支持が{support_count}"
+    else:
+        why="強推奨条件未達"
+    return {
+        "recommended":False,
+        "label":"見送り寄り",
+        "icon":"—",
+        "max_ev":float(max_ev),
+        "support_count":int(support_count),
+        "reason":why,
+    }
+
+
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
     """6〜8車立て向けの役割分担型・回収率合成。
 
@@ -12793,8 +12858,10 @@ def show_v184_eight_car_mixed_plan(
 ) -> None:
     result = v184_eight_car_mixed_plan(bets, trials, meta, odds_maps)
     result = v277_provisional_merge_7types(result, bets, trials, odds_maps)
-    # Ver300: 新推奨判定は監査表示のみ。既存grade・買い目・保存内容を変更しない。
+    # Ver300監査は継続。
     _rec_audit300 = _v300_recommendation_audit(result) if result.get("available") else {}
+    # Ver301: 予測時の実運用推奨。買い目自体は変更しない。
+    _live_rec301 = _v301_live_recommendation(result) if result.get("available") else {}
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH) or 0
     st.markdown(f"#### 🧩 {int(starter_count)}車向け・黒字的中重視の回収率合成")
     if not result.get("available"):
@@ -12812,8 +12879,16 @@ def show_v184_eight_car_mixed_plan(
                 include_in_live_stats=include_in_live_stats,
             )
             if saved_hash and _rec_audit300:
+                _save_audit301=dict(_rec_audit300)
+                if _live_rec301:
+                    _save_audit301["label"]=(
+                        "◎強推奨" if _live_rec301.get("recommended") else _save_audit301.get("label","見送り")
+                    )
+                    _save_audit301["reasons"]=list(_save_audit301.get("reasons") or []) + [
+                        "Ver301実運用推奨: " + str(_live_rec301.get("reason",""))
+                    ]
                 _v300_save_recommendation_audit(
-                    engine.DB_PATH, str(race_key), str(saved_hash), _rec_audit300,
+                    engine.DB_PATH, str(race_key), str(saved_hash), _save_audit301,
                     app_version=(app_version or APP_VERSION),
                 )
     except Exception as exc:
@@ -12834,6 +12909,21 @@ def show_v184_eight_car_mixed_plan(
             )
     formation_sections, formation_notes = v207_build_mixed_formation_sections(result)
     st.subheader(f"{result['icon']} 回収率重視：{result['points']}点・{result['grade']}")
+    if _live_rec301:
+        _lr_label301=str(_live_rec301.get("label","見送り寄り"))
+        _lr_msg301=(
+            f"{_live_rec301.get('icon','')} 実運用推奨：{_lr_label301}"
+            f"｜最大EV {_live_rec301.get('max_ev',0.0):.2f}"
+            f"｜券種支持 {_live_rec301.get('support_count',0)}"
+        )
+        if bool(_live_rec301.get("recommended")):
+            st.success(_lr_msg301)
+        else:
+            st.info(_lr_msg301)
+        st.caption(
+            "判定根拠：" + str(_live_rec301.get("reason","")) +
+            "　※Ver301ではこの判定を予測時の推奨表示として使用します。買い目自体は変更しません。"
+        )
     if _rec_audit300:
         _lab300=str(_rec_audit300.get("label","△検証中"))
         _msg300=(
@@ -13350,7 +13440,7 @@ def _v300_new_recommendation_summary(df: pd.DataFrame) -> pd.DataFrame:
     out["的中率"]=out["的中数"]/out["判定対象レース数"].replace(0,pd.NA)*100.0
     out["黒字率"]=out["黒字数"]/out["判定対象レース数"].replace(0,pd.NA)*100.0
     out["回収率"]=out["払戻額"]/out["購入額"].replace(0,pd.NA)*100.0
-    order={"◎推奨":0,"○候補":1,"△検証中":2,"見送り":3}
+    order={"◎強推奨":0,"◎推奨":1,"○候補":2,"△検証中":3,"見送り":4}
     out["_order"]=out["新推奨判定"].map(order).fillna(99)
     return out.sort_values(["_order","新推奨判定"]).drop(columns=["_order"]).reset_index(drop=True)
 
@@ -13368,8 +13458,8 @@ def _v300_combo_recommendation_summary(df: pd.DataFrame) -> dict:
     label=df.get("new_recommendation_label",pd.Series("",index=df.index)).fillna("").astype(str)
     audited=df[label!=""].copy()
     return {
-        "◎のみ":one(audited[audited["new_recommendation_label"]=="◎推奨"]),
-        "◎＋○":one(audited[audited["new_recommendation_label"].isin(["◎推奨","○候補"])]),
+        "◎のみ":one(audited[audited["new_recommendation_label"].isin(["◎強推奨","◎推奨"])]),
+        "◎＋○":one(audited[audited["new_recommendation_label"].isin(["◎強推奨","◎推奨","○候補"])]),
         "監査済み全体":one(audited),
     }
 
@@ -15400,6 +15490,7 @@ _V300_RECOMMEND_AUDIT_PERSIST = "2026-08-12-v1"
 _V300_RECOMMEND_AUDIT_BACKFILL = "2026-08-12-v1"
 _V300_MAXEV_THRESHOLD_AUDIT = "2026-08-12-v1"
 _V300_BETTYPE_SUPPORT_AUDIT = "2026-08-12-v1"
+_V301_LIVE_STRONG_RECOMMEND = "2026-08-12-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
