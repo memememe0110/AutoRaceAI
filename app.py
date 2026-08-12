@@ -10810,6 +10810,82 @@ def _v300_backfill_recommendation_audit(db_path: str, app_version_filter: str = 
     return {"done":done,"skipped":skipped,"errors":errors,"factor":factor}
 
 
+def _v301_auto_backfill_strong_recommendation(db_path: str) -> dict:
+    """保存済みVer300/Ver301プランをVer301強推奨基準で自動再判定する。再シミュレーションは行わない。"""
+    _v187_ensure_mixed_learning_tables(db_path)
+    done=0; skipped=0; errors=[]
+    with sqlite3.connect(str(db_path),timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        rows=con.execute("""
+            SELECT r.race_key,r.plan_hash,COALESCE(r.app_version,'')
+            FROM v187_mixed_plan_runs r
+            WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND COALESCE(r.app_version,'') IN ('Ver300','Ver301')
+            ORDER BY r.created_at
+        """).fetchall()
+        for race_key,plan_hash,app_ver in rows:
+            try:
+                tickets=con.execute("""
+                    SELECT bet_type,probability,odds
+                    FROM v187_mixed_plan_tickets
+                    WHERE race_key=? AND plan_hash=?
+                """,(race_key,plan_hash)).fetchall()
+                if not tickets:
+                    skipped+=1
+                    continue
+                support_count=len({str(bt or "") for bt,_,_ in tickets if str(bt or "")})
+                max_ev=0.0
+                for _,probability,odds in tickets:
+                    p=float(probability or 0.0)
+                    od=float(odds or 0.0)
+                    max_ev=max(max_ev,(p/100.0)*od)
+
+                recommended=((max_ev<=1.70 and support_count>=2) or
+                             (1.70<max_ev<=2.10 and support_count>=3))
+                label="◎強推奨" if recommended else "見送り"
+                score=10 if recommended else 0
+                reason=(f"Ver301自動再判定: 最大EV {max_ev:.2f} / 券種支持 {support_count} → {label}")
+
+                prev=con.execute("""
+                    SELECT adjusted_return_rate,cover,hole_count,reasons_json
+                    FROM v300_recommendation_audit
+                    WHERE race_key=? AND plan_hash=?
+                """,(race_key,plan_hash)).fetchone()
+                adjusted=float(prev[0] or 0.0) if prev else 0.0
+                cover=float(prev[1] or 0.0) if prev else 0.0
+                hole_count=int(prev[2] or 0) if prev else 0
+                reasons=[reason]
+                if prev and prev[3]:
+                    try:
+                        old_reasons=json.loads(prev[3])
+                        if isinstance(old_reasons,list):
+                            reasons=old_reasons+[reason]
+                    except Exception:
+                        pass
+
+                con.execute("""
+                    INSERT INTO v300_recommendation_audit
+                    (race_key,plan_hash,recommendation_label,recommendation_score,
+                     adjusted_return_rate,cover,max_ev,hole_count,reasons_json,app_version,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(race_key,plan_hash) DO UPDATE SET
+                        recommendation_label=excluded.recommendation_label,
+                        recommendation_score=excluded.recommendation_score,
+                        max_ev=excluded.max_ev,
+                        reasons_json=excluded.reasons_json,
+                        app_version=excluded.app_version,
+                        created_at=excluded.created_at
+                """,(str(race_key),str(plan_hash),label,int(score),
+                     adjusted,cover,float(max_ev),int(hole_count),
+                     json.dumps(reasons,ensure_ascii=False),
+                     str(app_ver or "Ver301"),_v228_now_jst_iso()))
+                done+=1
+            except Exception as exc:
+                errors.append(f"{race_key}: {type(exc).__name__}: {exc}")
+        con.commit()
+    return {"done":done,"skipped":skipped,"errors":errors}
+
+
 def _v300_save_recommendation_audit(
     db_path: str, race_key: str, plan_hash: str, audit: dict,
     app_version: str | None = None,
@@ -13391,21 +13467,12 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
         pd.to_numeric(df["payout_yen"], errors="coerce").fillna(0)
         - pd.to_numeric(df["cost_yen"], errors="coerce").fillna(0)
     )
-    # Ver301: ユーザーが「推奨」と呼ぶ基準は◎強推奨。
-    # 新推奨監査が保存されている行はそれを正本とし、未保存の旧データだけ従来gradeへフォールバック。
+    # Ver301: 「推奨」= ◎強推奨に完全統一。旧gradeへのフォールバックはしない。
     if "new_recommendation_label" in df.columns:
         _newlbl301=df["new_recommendation_label"].fillna("").astype(str)
-        _oldgrade301=df["grade"].fillna("").astype(str)
-        df["推奨区分"]=[
-            ("推奨" if lbl=="◎強推奨" else "非推奨")
-            if lbl
-            else ("非推奨" if ("非推奨" in grd or "⛔" in grd) else "推奨")
-            for lbl,grd in zip(_newlbl301,_oldgrade301)
-        ]
+        df["推奨区分"]=_newlbl301.apply(lambda x:"推奨" if x=="◎強推奨" else "推奨外")
     else:
-        df["推奨区分"] = df["grade"].fillna("").astype(str).apply(
-            lambda x: "非推奨" if ("非推奨" in x or "⛔" in x) else "推奨"
-        )
+        df["推奨区分"]="推奨外"
     df["全返還"] = df.get("winning_types", "").fillna("").astype(str).str.contains("全返還", regex=False)
     return df
 
@@ -13721,23 +13788,32 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
             推奨収支=("収支", "sum"),
         ).reset_index()
         rec["推奨レース回収率"] = rec["推奨払戻額"] / rec["推奨購入額"].replace(0, pd.NA) * 100.0
-        rec["非推奨除外的中率"] = rec["推奨的中数"] / rec["推奨判定対象レース数"].replace(0, pd.NA) * 100.0
-        rec["非推奨除外黒字率"] = rec["推奨黒字数"] / rec["推奨判定対象レース数"].replace(0, pd.NA) * 100.0
-        keep = group_cols + ["推奨レース数", "推奨レース回収率", "非推奨除外的中率", "非推奨除外黒字率", "推奨収支"]
+        rec["推奨レース的中率"] = rec["推奨的中数"] / rec["推奨判定対象レース数"].replace(0, pd.NA) * 100.0
+        rec["推奨レース黒字率"] = rec["推奨黒字数"] / rec["推奨判定対象レース数"].replace(0, pd.NA) * 100.0
+        keep = group_cols + ["推奨レース数", "推奨レース回収率", "推奨レース的中率", "推奨レース黒字率", "推奨収支"]
         grouped = grouped.merge(rec[keep], on=group_cols, how="left")
     else:
         grouped["推奨レース数"] = 0
         grouped["推奨レース回収率"] = pd.NA
-        grouped["非推奨除外的中率"] = pd.NA
-        grouped["非推奨除外黒字率"] = pd.NA
+        grouped["推奨レース的中率"] = pd.NA
+        grouped["推奨レース黒字率"] = pd.NA
         grouped["推奨収支"] = 0
     return grouped
 
 
 def _v215_render_return_dashboard(db_path: str) -> None:
     st.markdown("## 📊 回収率重視プラン実績")
-    st.caption("Ver301以降は『推奨』＝◎強推奨です。最大EV×複数券種支持の実運用推奨を基準に集計します。旧データで新推奨未保存の行だけ従来gradeへフォールバックします。")
-    st.caption("各レース・各バージョンで最後に保存されたプランを、予測時点の買い目のまま別々に集計します。新版を再シミュレーションしても旧版の実績は残ります。")
+    st.caption("Ver301以降は『推奨』＝◎強推奨です。最大EV×複数券種支持の実運用推奨を基準に集計します。")
+    try:
+        _stamp301=(str(db_path),Path(str(db_path)).stat().st_mtime_ns)
+        if st.session_state.get("_v301_auto_rec_backfill_stamp") != _stamp301:
+            _bf301=_v301_auto_backfill_strong_recommendation(str(db_path))
+            st.session_state["_v301_auto_rec_backfill_stamp"]=_stamp301
+            if _bf301.get("done",0)>0:
+                st.caption(f"Ver301推奨を保存済みプランから自動振り分け済み：{_bf301['done']}件（再シミュレーションなし）")
+    except Exception as _bf301_exc:
+        st.warning("Ver301推奨の自動振り分けに失敗しました: "+_runtime_exception_text(_bf301_exc))
+    st.caption("各レース・各バージョンで最後に保存されたプランを、予測時点の買い目のまま別々に集計します。")
     df = _v215_return_dashboard_rows(db_path)
     if df.empty:
         _plans280=_feedback280=0
@@ -15505,6 +15581,7 @@ _V300_MAXEV_THRESHOLD_AUDIT = "2026-08-12-v1"
 _V300_BETTYPE_SUPPORT_AUDIT = "2026-08-12-v1"
 _V301_LIVE_STRONG_RECOMMEND = "2026-08-12-v1"
 _V301_RECOMMEND_CANONICAL = "2026-08-12-v1"
+_V301_AUTO_RECOMMEND_BACKFILL = "2026-08-12-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
@@ -19069,7 +19146,7 @@ if selected_main_page == "🗃️ 登録情報確認":
 # Ver215: 回収率重視プランを版情報付きで完全保存し、日別・開催場別・日付×開催場・月別・全体の実回収率ダッシュボードを追加。
 
 
-# Ver216: 回収率実績に非推奨除外・推奨のみ・推奨外比較を追加
+# Ver216: 回収率実績に推奨レース・推奨のみ・推奨外比較を追加
 
 # Ver217: シミュレーション後は最小スナップショットだけ同期保存し、全買い目・特徴量保存をバックグラウンド化。
 
