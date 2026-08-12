@@ -13438,6 +13438,154 @@ def _v300_recommendation_bucket_detail(df: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["_order","新推奨判定"]).drop(columns=["_order"]).reset_index(drop=True)
 
 
+def _v300_bettype_support_audit(db_path: str, df: pd.DataFrame) -> pd.DataFrame:
+    """最大EV帯×買い目内券種支持数の実績を監査。表示専用。"""
+    if df.empty:
+        return pd.DataFrame()
+    needed={"race_key","app_version","cost_yen","payout_yen","hit"}
+    if not needed.issubset(set(df.columns)):
+        return pd.DataFrame()
+
+    # 最新照合プランに対応する plan_hash を取得し、そのプラン内の券種数を数える。
+    try:
+        with sqlite3.connect(str(db_path),timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            q="""
+                WITH evaluated AS (
+                    SELECT
+                        r.race_key,r.plan_hash,
+                        COALESCE(NULLIF(r.app_version,''),'Unknown') AS app_version,
+                        f.evaluated_at,r.created_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''),'Unknown')
+                            ORDER BY datetime(f.evaluated_at) DESC,
+                                     datetime(r.created_at) DESC,
+                                     r.plan_hash DESC
+                        ) AS rn
+                    FROM v187_mixed_plan_runs r
+                    JOIN v187_mixed_plan_feedback f
+                      ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                    WHERE f.return_rate IS NOT NULL
+                      AND COALESCE(r.include_in_live_stats,1)=1
+                )
+                SELECT e.race_key,e.app_version,e.plan_hash,
+                       COUNT(DISTINCT t.bet_type) AS bet_type_count
+                FROM evaluated e
+                JOIN v187_mixed_plan_tickets t
+                  ON t.race_key=e.race_key AND t.plan_hash=e.plan_hash
+                WHERE e.rn=1
+                GROUP BY e.race_key,e.app_version,e.plan_hash
+            """
+            support=pd.read_sql_query(q,con)
+    except Exception:
+        return pd.DataFrame()
+
+    if support.empty:
+        return pd.DataFrame()
+
+    w=df.merge(support,on=["race_key","app_version"],how="inner")
+    if "new_recommendation_max_ev" not in w.columns:
+        return pd.DataFrame()
+
+    w["最大EV"]=pd.to_numeric(w["new_recommendation_max_ev"],errors="coerce")
+    w["券種支持数"]=pd.to_numeric(w["bet_type_count"],errors="coerce")
+    w=w.dropna(subset=["最大EV","券種支持数"])
+    if w.empty:
+        return pd.DataFrame()
+
+    # 監査帯は現在の検証に合わせる。
+    def ev_band(v):
+        v=float(v)
+        if v<=1.70: return "≤1.70"
+        if v<=2.10: return "1.70超〜2.10"
+        if v<=2.50: return "2.10超〜2.50"
+        return ">2.50"
+
+    w["最大EV帯"]=w["最大EV"].apply(ev_band)
+    w["券種支持数"]=w["券種支持数"].clip(lower=1,upper=7).astype(int)
+
+    out=w.groupby(["最大EV帯","券種支持数"],dropna=False).agg(
+        レース数=("race_key","count"),
+        的中数=("hit","sum"),
+        購入額=("cost_yen","sum"),
+        払戻額=("payout_yen","sum"),
+    ).reset_index()
+    out["的中率"]=out["的中数"]/out["レース数"].replace(0,pd.NA)*100.0
+    out["回収率"]=out["払戻額"]/out["購入額"].replace(0,pd.NA)*100.0
+    out["収支"]=out["払戻額"]-out["購入額"]
+
+    band_order={"≤1.70":0,"1.70超〜2.10":1,"2.10超〜2.50":2,">2.50":3}
+    out["_band"]=out["最大EV帯"].map(band_order).fillna(99)
+    return out.sort_values(["_band","券種支持数"]).drop(columns=["_band"]).reset_index(drop=True)
+
+
+def _v300_support_rescue_summary(db_path: str, df: pd.DataFrame) -> dict:
+    """≤1.70を基本採用し、1.70超〜2.10は3券種以上だけ救済した仮想比較。"""
+    if df.empty:
+        return {}
+    try:
+        with sqlite3.connect(str(db_path),timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            q="""
+                WITH evaluated AS (
+                    SELECT
+                        r.race_key,r.plan_hash,
+                        COALESCE(NULLIF(r.app_version,''),'Unknown') AS app_version,
+                        f.evaluated_at,r.created_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''),'Unknown')
+                            ORDER BY datetime(f.evaluated_at) DESC,
+                                     datetime(r.created_at) DESC,
+                                     r.plan_hash DESC
+                        ) AS rn
+                    FROM v187_mixed_plan_runs r
+                    JOIN v187_mixed_plan_feedback f
+                      ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                    WHERE f.return_rate IS NOT NULL
+                      AND COALESCE(r.include_in_live_stats,1)=1
+                )
+                SELECT e.race_key,e.app_version,
+                       COUNT(DISTINCT t.bet_type) AS bet_type_count
+                FROM evaluated e
+                JOIN v187_mixed_plan_tickets t
+                  ON t.race_key=e.race_key AND t.plan_hash=e.plan_hash
+                WHERE e.rn=1
+                GROUP BY e.race_key,e.app_version
+            """
+            s=pd.read_sql_query(q,con)
+    except Exception:
+        return {}
+
+    w=df.merge(s,on=["race_key","app_version"],how="inner")
+    if "new_recommendation_max_ev" not in w.columns:
+        return {}
+    w["max_ev"]=pd.to_numeric(w["new_recommendation_max_ev"],errors="coerce")
+    w["support"]=pd.to_numeric(w["bet_type_count"],errors="coerce")
+    w=w.dropna(subset=["max_ev","support"])
+
+    def one(part):
+        if part.empty:
+            return {"races":0,"hits":0,"cost":0,"payout":0,"return":None}
+        cost=float(pd.to_numeric(part["cost_yen"],errors="coerce").fillna(0).sum())
+        payout=float(pd.to_numeric(part["payout_yen"],errors="coerce").fillna(0).sum())
+        return {
+            "races":int(len(part)),
+            "hits":int(pd.to_numeric(part["hit"],errors="coerce").fillna(0).sum()),
+            "cost":int(cost),
+            "payout":int(payout),
+            "return":(payout/cost*100.0 if cost>0 else None),
+        }
+
+    base=w[w["max_ev"]<=1.70]
+    rescued=w[(w["max_ev"]<=1.70) | ((w["max_ev"]>1.70)&(w["max_ev"]<=2.10)&(w["support"]>=3))]
+    upto210=w[w["max_ev"]<=2.10]
+    return {
+        "≤1.70":one(base),
+        "≤1.70＋1.70〜2.10で3券種以上":one(rescued),
+        "≤2.10全部":one(upto210),
+    }
+
+
 def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -13654,6 +13802,37 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 "見るポイント：閾値を厳しくするほど回収率が安定するか、"
                 "対象レース数が減りすぎないか、◎と○で最大EV分布が本当に分かれているか。"
             )
+
+            st.markdown("**最大EV帯 × 券種支持数**")
+            _support_tbl300=_v300_bettype_support_audit(str(db_path),filtered)
+            if not _support_tbl300.empty:
+                st.dataframe(
+                    _support_tbl300,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "的中率":st.column_config.NumberColumn(format="%.1f%%"),
+                        "回収率":st.column_config.NumberColumn(format="%.1f%%"),
+                        "購入額":st.column_config.NumberColumn(format="%d円"),
+                        "払戻額":st.column_config.NumberColumn(format="%d円"),
+                        "収支":st.column_config.NumberColumn(format="%+d円"),
+                    },
+                )
+
+            _rescue300=_v300_support_rescue_summary(str(db_path),filtered)
+            if _rescue300:
+                st.markdown("**1.70〜2.10を複数券種支持で救済した場合の仮想比較**")
+                _cols300=st.columns(3)
+                for _col300,(_name300,_s300) in zip(_cols300,_rescue300.items()):
+                    _ret300="－" if _s300.get("return") is None else f"{_s300['return']:.1f}%"
+                    _col300.metric(_name300,f"{_s300['races']}R / {_ret300}")
+                    _col300.caption(
+                        f"的中{_s300['hits']}R・購入{_s300['cost']:,}円・払戻{_s300['payout']:,}円"
+                    )
+                st.caption(
+                    "現在は監査だけです。『3券種以上』で実際の推奨判定や買い目を変更しません。"
+                    "データが増えてもこの傾向が続くか確認します。"
+                )
 
     st.markdown("### 日別")
     daily = _v215_aggregate_return(filtered, ["race_date"])
@@ -15220,6 +15399,7 @@ _V300_RECOMMEND_AUDIT = "2026-08-12-v1"
 _V300_RECOMMEND_AUDIT_PERSIST = "2026-08-12-v1"
 _V300_RECOMMEND_AUDIT_BACKFILL = "2026-08-12-v1"
 _V300_MAXEV_THRESHOLD_AUDIT = "2026-08-12-v1"
+_V300_BETTYPE_SUPPORT_AUDIT = "2026-08-12-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
