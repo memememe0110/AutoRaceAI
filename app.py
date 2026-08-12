@@ -10743,6 +10743,73 @@ def _v187_save_mixed_plan(
     return plan_hash
 
 
+def _v300_backfill_recommendation_audit(db_path: str, app_version_filter: str = "Ver300") -> dict:
+    """保存済みプランだけから新推奨監査を補完。シミュレーションは実行しない。"""
+    _v187_ensure_mixed_learning_tables(db_path)
+    calibration=_v195_return_calibration(db_path)
+    factor=float(calibration.get("factor",1.0) or 1.0)
+    done=0; skipped=0; errors=[]
+    with sqlite3.connect(str(db_path),timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        rows=con.execute("""
+            SELECT r.race_key,r.plan_hash,r.cover,r.model_return_rate,
+                   COALESCE(r.app_version,'')
+            FROM v187_mixed_plan_runs r
+            LEFT JOIN v300_recommendation_audit a
+              ON a.race_key=r.race_key AND a.plan_hash=r.plan_hash
+            WHERE a.race_key IS NULL
+              AND COALESCE(r.app_version,'')=?
+              AND COALESCE(r.include_in_live_stats,1)=1
+            ORDER BY r.created_at
+        """,(str(app_version_filter),)).fetchall()
+        for race_key,plan_hash,cover,model_rr,app_ver in rows:
+            try:
+                tickets=con.execute("""
+                    SELECT probability,odds,role
+                    FROM v187_mixed_plan_tickets
+                    WHERE race_key=? AND plan_hash=?
+                """,(race_key,plan_hash)).fetchall()
+                if not tickets:
+                    skipped+=1; continue
+                max_ev=0.0; hole_count=0
+                for probability,odds,role in tickets:
+                    p=float(probability or 0.0); od=float(odds or 0.0)
+                    max_ev=max(max_ev,(p/100.0)*od)
+                    if "中穴価値候補" in str(role or ""):
+                        hole_count+=1
+                reconstructed={
+                    "tickets":[],
+                    "adjusted_return_rate":float(model_rr or 0.0)*factor,
+                    "cover":float(cover or 0.0),
+                }
+                # Reuse the exact scoring thresholds; feed reconstructed ticket EV/hole info explicitly below.
+                score=0; reasons=[]; adjusted=float(reconstructed["adjusted_return_rate"]); cv=float(reconstructed["cover"])
+                if adjusted<=150.0: score+=2; reasons.append("参考回収率≤150%")
+                elif adjusted<=175.0: score+=1; reasons.append("参考回収率≤175%")
+                else: score-=2; reasons.append("参考回収率が高すぎる")
+                if cv<=40.0: score+=2; reasons.append("カバー≤40%")
+                elif cv<=50.0: score+=1; reasons.append("カバー≤50%")
+                else: score-=1; reasons.append("カバー広め")
+                if max_ev<=2.0: score+=2; reasons.append("最大EV≤2.0")
+                elif max_ev<=2.5: score+=1; reasons.append("最大EV≤2.5")
+                else: score-=2; reasons.append("最大EV暴走")
+                if hole_count in (1,2): score+=1; reasons.append(f"中穴価値候補{hole_count}点")
+                elif hole_count>=3: score-=1; reasons.append("穴候補過多")
+                label="◎推奨" if score>=6 else ("○候補" if score>=4 else ("△検証中" if score>=2 else "見送り"))
+                con.execute("""
+                    INSERT OR REPLACE INTO v300_recommendation_audit
+                    (race_key,plan_hash,recommendation_label,recommendation_score,
+                     adjusted_return_rate,cover,max_ev,hole_count,reasons_json,app_version,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,(str(race_key),str(plan_hash),label,int(score),adjusted,cv,max_ev,int(hole_count),
+                     json.dumps(reasons,ensure_ascii=False),str(app_ver or app_version_filter),_v228_now_jst_iso()))
+                done+=1
+            except Exception as exc:
+                errors.append(f"{race_key}: {type(exc).__name__}: {exc}")
+        con.commit()
+    return {"done":done,"skipped":skipped,"errors":errors,"factor":factor}
+
+
 def _v300_save_recommendation_audit(
     db_path: str, race_key: str, plan_hash: str, audit: dict,
     app_version: str | None = None,
@@ -13434,6 +13501,33 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             st.caption("該当なし")
 
     st.markdown("### 🧪 新推奨判定の実績（監査）")
+    _missing_rec300=0
+    try:
+        with sqlite3.connect(str(db_path)) as _con300:
+            _missing_rec300=int(_con300.execute("""
+                SELECT COUNT(*)
+                FROM v187_mixed_plan_runs r
+                LEFT JOIN v300_recommendation_audit a
+                  ON a.race_key=r.race_key AND a.plan_hash=r.plan_hash
+                WHERE COALESCE(r.app_version,'')='Ver300'
+                  AND COALESCE(r.include_in_live_stats,1)=1
+                  AND a.race_key IS NULL
+            """).fetchone()[0] or 0)
+    except Exception:
+        _missing_rec300=0
+    if _missing_rec300>0:
+        st.caption(f"保存済みVer300のうち、新推奨判定が未補完：{_missing_rec300}R")
+        if st.button(f"🧩 新推奨判定をまとめて補完（{_missing_rec300}R・再シミュレーション不要）",
+                     key="v300_backfill_recommendation_audit"):
+            with st.spinner("保存済み買い目から新推奨判定だけ計算しています…"):
+                _bf300=_v300_backfill_recommendation_audit(str(db_path),"Ver300")
+            if _bf300.get("errors"):
+                st.warning(f"{_bf300.get('done',0)}R補完、{len(_bf300['errors'])}Rでエラー。")
+                with st.expander("補完エラー詳細",expanded=False):
+                    st.code("\n".join(_bf300["errors"][:30]))
+            else:
+                st.success(f"新推奨判定を{_bf300.get('done',0)}R補完しました。再シミュレーションはしていません。")
+            st.rerun()
     _new_rec_rows300=_v300_new_recommendation_summary(filtered)
     _new_rec_combo300=_v300_combo_recommendation_summary(filtered)
     if _new_rec_rows300.empty:
@@ -15019,6 +15113,7 @@ _V299_HOLE_VALUE_RESCUE = "2026-08-11-v1"
 _V300_TRIFECTA_ONLY_VALUE_RESCUE = "2026-08-11-v1"
 _V300_RECOMMEND_AUDIT = "2026-08-12-v1"
 _V300_RECOMMEND_AUDIT_PERSIST = "2026-08-12-v1"
+_V300_RECOMMEND_AUDIT_BACKFILL = "2026-08-12-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
