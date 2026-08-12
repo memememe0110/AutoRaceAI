@@ -12882,7 +12882,7 @@ def show_v184_eight_car_mixed_plan(
                 _save_audit301=dict(_rec_audit300)
                 if _live_rec301:
                     _save_audit301["label"]=(
-                        "◎強推奨" if _live_rec301.get("recommended") else _save_audit301.get("label","見送り")
+                        "◎強推奨" if _live_rec301.get("recommended") else "見送り"
                     )
                     _save_audit301["reasons"]=list(_save_audit301.get("reasons") or []) + [
                         "Ver301実運用推奨: " + str(_live_rec301.get("reason",""))
@@ -13391,15 +13391,27 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
         pd.to_numeric(df["payout_yen"], errors="coerce").fillna(0)
         - pd.to_numeric(df["cost_yen"], errors="coerce").fillna(0)
     )
-    df["推奨区分"] = df["grade"].fillna("").astype(str).apply(
-        lambda x: "非推奨" if ("非推奨" in x or "⛔" in x) else "推奨"
-    )
+    # Ver301: ユーザーが「推奨」と呼ぶ基準は◎強推奨。
+    # 新推奨監査が保存されている行はそれを正本とし、未保存の旧データだけ従来gradeへフォールバック。
+    if "new_recommendation_label" in df.columns:
+        _newlbl301=df["new_recommendation_label"].fillna("").astype(str)
+        _oldgrade301=df["grade"].fillna("").astype(str)
+        df["推奨区分"]=[
+            ("推奨" if lbl=="◎強推奨" else "非推奨")
+            if lbl
+            else ("非推奨" if ("非推奨" in grd or "⛔" in grd) else "推奨")
+            for lbl,grd in zip(_newlbl301,_oldgrade301)
+        ]
+    else:
+        df["推奨区分"] = df["grade"].fillna("").astype(str).apply(
+            lambda x: "非推奨" if ("非推奨" in x or "⛔" in x) else "推奨"
+        )
     df["全返還"] = df.get("winning_types", "").fillna("").astype(str).str.contains("全返還", regex=False)
     return df
 
 
 def _v216_summary_values(df: pd.DataFrame) -> dict:
-    """全体・推奨のみ・非推奨のみの実績を同じ基準で返す。"""
+    """全体・推奨のみ・推奨外の実績を同じ基準で返す。"""
     def one(part: pd.DataFrame) -> dict:
         if part.empty:
             return {"races": 0, "cost": 0, "payout": 0, "profit": 0, "return": None,
@@ -13417,7 +13429,7 @@ def _v216_summary_values(df: pd.DataFrame) -> dict:
     return {
         "全レース": one(df),
         "推奨のみ": one(df[df["推奨区分"] == "推奨"]),
-        "非推奨のみ": one(df[df["推奨区分"] == "非推奨"]),
+        "推奨外": one(df[df["推奨区分"] == "非推奨"]),
     }
 
 
@@ -13458,8 +13470,8 @@ def _v300_combo_recommendation_summary(df: pd.DataFrame) -> dict:
     label=df.get("new_recommendation_label",pd.Series("",index=df.index)).fillna("").astype(str)
     audited=df[label!=""].copy()
     return {
-        "◎のみ":one(audited[audited["new_recommendation_label"].isin(["◎強推奨","◎推奨"])]),
-        "◎＋○":one(audited[audited["new_recommendation_label"].isin(["◎強推奨","◎推奨","○候補"])]),
+        "◎のみ":one(audited[audited["new_recommendation_label"]=="◎強推奨"]),
+        "推奨のみ":one(audited[audited["new_recommendation_label"]=="◎強推奨"]),
         "監査済み全体":one(audited),
     }
 
@@ -13708,14 +13720,14 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
             推奨払戻額=("payout_yen", "sum"),
             推奨収支=("収支", "sum"),
         ).reset_index()
-        rec["非推奨除外回収率"] = rec["推奨払戻額"] / rec["推奨購入額"].replace(0, pd.NA) * 100.0
+        rec["推奨レース回収率"] = rec["推奨払戻額"] / rec["推奨購入額"].replace(0, pd.NA) * 100.0
         rec["非推奨除外的中率"] = rec["推奨的中数"] / rec["推奨判定対象レース数"].replace(0, pd.NA) * 100.0
         rec["非推奨除外黒字率"] = rec["推奨黒字数"] / rec["推奨判定対象レース数"].replace(0, pd.NA) * 100.0
-        keep = group_cols + ["推奨レース数", "非推奨除外回収率", "非推奨除外的中率", "非推奨除外黒字率", "推奨収支"]
+        keep = group_cols + ["推奨レース数", "推奨レース回収率", "非推奨除外的中率", "非推奨除外黒字率", "推奨収支"]
         grouped = grouped.merge(rec[keep], on=group_cols, how="left")
     else:
         grouped["推奨レース数"] = 0
-        grouped["非推奨除外回収率"] = pd.NA
+        grouped["推奨レース回収率"] = pd.NA
         grouped["非推奨除外的中率"] = pd.NA
         grouped["非推奨除外黒字率"] = pd.NA
         grouped["推奨収支"] = 0
@@ -13724,6 +13736,7 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
 
 def _v215_render_return_dashboard(db_path: str) -> None:
     st.markdown("## 📊 回収率重視プラン実績")
+    st.caption("Ver301以降は『推奨』＝◎強推奨です。最大EV×複数券種支持の実運用推奨を基準に集計します。旧データで新推奨未保存の行だけ従来gradeへフォールバックします。")
     st.caption("各レース・各バージョンで最後に保存されたプランを、予測時点の買い目のまま別々に集計します。新版を再シミュレーションしても旧版の実績は残ります。")
     df = _v215_return_dashboard_rows(db_path)
     if df.empty:
@@ -13768,13 +13781,13 @@ def _v215_render_return_dashboard(db_path: str) -> None:
     summary = _v216_summary_values(filtered)
     all_s = summary["全レース"]
     rec_s = summary["推奨のみ"]
-    no_s = summary["非推奨のみ"]
+    no_s = summary["推奨外"]
 
-    st.markdown("### 全体と非推奨除外の比較")
+    st.markdown("### 全体と推奨レースの比較")
     a,b,c,d,e = st.columns(5)
     a.metric("全レース", f"{all_s['races']}R")
     b.metric("全体回収率", f"{all_s['return']:.1f}%" if all_s['return'] is not None else "－")
-    c.metric("非推奨除外回収率", f"{rec_s['return']:.1f}%" if rec_s['return'] is not None else "－",
+    c.metric("推奨レース回収率", f"{rec_s['return']:.1f}%" if rec_s['return'] is not None else "－",
              delta=(f"{rec_s['return']-all_s['return']:+.1f}pt" if rec_s['return'] is not None and all_s['return'] is not None else None))
     d.metric("推奨のみ収支", f"{rec_s['profit']:+,}円")
     e.metric("推奨率", f"{(rec_s['races']/all_s['races']*100.0):.1f}%" if all_s['races'] else "－")
@@ -13787,7 +13800,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             if all_s['hit_rate'] is not None else f"的中判定対象なし / 収支 {all_s['profit']:+,}円"
         )
     with c2:
-        st.markdown("**推奨のみ（非推奨除外）**")
+        st.markdown("**推奨のみ（Ver301 ◎強推奨）**")
         if rec_s['races']:
             st.caption(
                 f"{rec_s['races']}R・的中率 {rec_s['hit_rate']:.1f}% / 黒字率 {rec_s['black_rate']:.1f}% / ガミ率 {rec_s['gami_rate']:.1f}% / 収支 {rec_s['profit']:+,}円"
@@ -13796,7 +13809,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         else:
             st.caption("該当なし")
     with c3:
-        st.markdown("**非推奨のみ**")
+        st.markdown("**推奨外**")
         if no_s['races']:
             st.caption(f"{no_s['races']}R・回収率 {no_s['return']:.1f}% / 的中率 {no_s['hit_rate']:.1f}% / 収支 {no_s['profit']:+,}円")
         else:
@@ -13836,7 +13849,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         st.caption("新推奨判定をDB保存したレースはまだありません。この更新版以降の保存・再シミュレーションから蓄積します。")
     else:
         _aa300,_bb300,_cc300=st.columns(3)
-        for _col300,_key300 in zip((_aa300,_bb300,_cc300),("◎のみ","◎＋○","監査済み全体")):
+        for _col300,_key300 in zip((_aa300,_bb300,_cc300),("◎のみ","推奨のみ","監査済み全体")):
             _s300=_new_rec_combo300[_key300]
             _ret300="－" if _s300["return"] is None else f"{_s300['return']:.1f}%"
             _col300.metric(_key300,f"{_s300['races']}R / {_ret300}")
@@ -15491,6 +15504,7 @@ _V300_RECOMMEND_AUDIT_BACKFILL = "2026-08-12-v1"
 _V300_MAXEV_THRESHOLD_AUDIT = "2026-08-12-v1"
 _V300_BETTYPE_SUPPORT_AUDIT = "2026-08-12-v1"
 _V301_LIVE_STRONG_RECOMMEND = "2026-08-12-v1"
+_V301_RECOMMEND_CANONICAL = "2026-08-12-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
@@ -19055,7 +19069,7 @@ if selected_main_page == "🗃️ 登録情報確認":
 # Ver215: 回収率重視プランを版情報付きで完全保存し、日別・開催場別・日付×開催場・月別・全体の実回収率ダッシュボードを追加。
 
 
-# Ver216: 回収率実績に非推奨除外・推奨のみ・非推奨のみ比較を追加
+# Ver216: 回収率実績に非推奨除外・推奨のみ・推奨外比較を追加
 
 # Ver217: シミュレーション後は最小スナップショットだけ同期保存し、全買い目・特徴量保存をバックグラウンド化。
 
