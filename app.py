@@ -10,6 +10,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import zipfile
 import threading
 import traceback
 import urllib.error
@@ -15728,6 +15729,7 @@ _V301_RECOMMEND_CANONICAL = "2026-08-12-v1"
 _V301_AUTO_RECOMMEND_BACKFILL = "2026-08-12-v1"
 _V301_HARD_EXPAND_AUDIT = "2026-08-13-v1"
 _V301_BG_RACE_BINDING_FIX = "2026-08-13-v1"
+_V301_ANALYSIS_LIGHT_EXPORT = "2026-08-13-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
@@ -16044,8 +16046,190 @@ with st.sidebar:
                     use_container_width=True,
                 )
                 st.caption(f"端末保存用スナップショット: {len(_dl_bytes290)/1024/1024:.2f} MB（WAL内の最新コミットを含む）")
+
+            st.markdown("##### 📦 ChatGPT解析用・軽量DB")
+            st.caption("大容量の予測payload・画面復元データ・一時キャッシュだけを外し、分析に必要な履歴/結果/オッズ/回収率/推奨/展開監査は残します。正本復元には使いません。")
+            _light_sig301=_v290_db_stat_signature(db_path)
+            _light_cache301=st.session_state.get("_v301_analysis_light_export")
+            if isinstance(_light_cache301,dict) and _light_cache301.get("sig")!=_light_sig301:
+                st.session_state.pop("_v301_analysis_light_export",None)
+                _light_cache301=None
+            if st.button("🪶 ChatGPT解析用の軽量DBを準備",use_container_width=True,key="v301_prepare_analysis_light_db"):
+                try:
+                    with st.spinner("最新DBを安全にスナップショット化し、解析用に軽量化しています…"):
+                        _source301=_v278_consistent_db_snapshot_bytes(str(db_path))
+                        _pack301=_v301_build_analysis_light_db_zip(_source301)
+                    _pack301["sig"]=_v290_db_stat_signature(db_path)
+                    st.session_state["_v301_analysis_light_export"]=_pack301
+                    _light_cache301=_pack301
+                except Exception as _light_exc301:
+                    st.error("解析用軽量DBの作成に失敗しました: "+f"{type(_light_exc301).__name__}: {_light_exc301}")
+            if isinstance(_light_cache301,dict) and isinstance(_light_cache301.get("bytes"),(bytes,bytearray)):
+                _light_bytes301=bytes(_light_cache301["bytes"])
+                st.download_button(
+                    "⬇️ ChatGPT解析用DB（ZIP）を保存",
+                    _light_bytes301,
+                    file_name="AutoRaceAI_ChatGPT解析用_軽量DB.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    key="v301_download_analysis_light_db",
+                )
+                _src_mb301=float(_light_cache301.get("source_size",0))/1024/1024
+                _db_mb301=float(_light_cache301.get("db_size",0))/1024/1024
+                _zip_mb301=float(_light_cache301.get("zip_size",0))/1024/1024
+                st.success(f"軽量化完了: 元DB {_src_mb301:.1f} MB → 軽量DB {_db_mb301:.1f} MB → ZIP {_zip_mb301:.1f} MB")
+                st.caption(f"保持テーブル {_light_cache301.get('copied_tables',0)}個 / 除外 {len(_light_cache301.get('excluded_tables') or [])}個。ZIPのままこのチャットへ添付できます。")
+                if _light_cache301.get("errors"):
+                    with st.expander("軽量化時のスキップ詳細",expanded=False):
+                        st.code("\n".join(map(str,_light_cache301.get("errors") or [])))
     except Exception as exc:
         st.warning(f"DB情報を確認できません: {exc}")
+
+_V301_ANALYSIS_EXPORT_EXCLUDE_TABLES = {
+    # 大容量の復元payload。解析に必要な履歴メタ情報は別summaryへ残す。
+    "v231_prediction_history",
+    "v222_prediction_restore",
+    "v223_result_view_restore",
+    "v238_result_raw_archive",
+    # 実行状態・一時キャッシュ・孤立退避。予測精度/回収率分析には不要。
+    "v278_background_jobs",
+    "v280_orphan_plan_feedback_archive",
+    "v280_orphan_plan_tickets_archive",
+    "v280_orphan_ticket_feedback_archive",
+    "venue_analysis_cache",
+    "v105_registration_health_cache",
+    "v105_batch_progress",
+}
+
+
+def _v301_sql_ident(name: str) -> str:
+    return '"' + str(name).replace('"','""') + '"'
+
+
+def _v301_build_analysis_light_db_zip(snapshot_bytes: bytes) -> dict:
+    """ChatGPT等へ渡す解析用軽量DB ZIPを作成する。
+
+    正本DBの置換/復元には使わない。大容量payload・UI復元・一時キャッシュだけ外し、
+    選手履歴、結果、払戻、オッズ、予測券種確率、回収率実績、展開監査、学習値などは保持する。
+    """
+    if not isinstance(snapshot_bytes,(bytes,bytearray)) or not snapshot_bytes:
+        raise RuntimeError("DBスナップショットが空です。")
+    with tempfile.TemporaryDirectory(prefix="autorace_analysis_") as td:
+        tdp=Path(td)
+        src_path=tdp/"source.sqlite3"
+        dst_path=tdp/"autorace_analysis_light.sqlite3"
+        zip_path=tdp/"autorace_analysis_light.zip"
+        src_path.write_bytes(bytes(snapshot_bytes))
+
+        src=sqlite3.connect(str(src_path),timeout=30.0)
+        dst=sqlite3.connect(str(dst_path),timeout=30.0)
+        copied=[]; excluded=[]; errors=[]
+        try:
+            ok=src.execute("PRAGMA integrity_check").fetchone()
+            if not ok or str(ok[0]).lower()!="ok":
+                raise RuntimeError("元DBのintegrity_checkに失敗しました。")
+            dst.execute("PRAGMA journal_mode=DELETE")
+            dst.execute("PRAGMA synchronous=OFF")
+            table_rows=src.execute("""
+                SELECT name,sql FROM sqlite_master
+                WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+            """).fetchall()
+            for table_name,create_sql in table_rows:
+                name=str(table_name)
+                if name in _V301_ANALYSIS_EXPORT_EXCLUDE_TABLES:
+                    excluded.append(name)
+                    continue
+                if not create_sql:
+                    continue
+                try:
+                    dst.execute(str(create_sql))
+                    cols=[str(r[1]) for r in src.execute(f"PRAGMA table_info({_v301_sql_ident(name)})").fetchall()]
+                    if not cols:
+                        copied.append((name,0)); continue
+                    qcols=','.join(_v301_sql_ident(c) for c in cols)
+                    placeholders=','.join('?' for _ in cols)
+                    cur=src.execute(f"SELECT {qcols} FROM {_v301_sql_ident(name)}")
+                    count=0
+                    while True:
+                        batch=cur.fetchmany(1000)
+                        if not batch: break
+                        dst.executemany(
+                            f"INSERT INTO {_v301_sql_ident(name)} ({qcols}) VALUES ({placeholders})",
+                            batch,
+                        )
+                        count += len(batch)
+                    copied.append((name,count))
+                except Exception as exc:
+                    errors.append(f"{name}: {type(exc).__name__}: {exc}")
+                    try: dst.execute(f"DROP TABLE IF EXISTS {_v301_sql_ident(name)}")
+                    except Exception: pass
+
+            # v231の巨大payloadは除外するが、どのレース/Verを予測したかのメタ情報は残す。
+            try:
+                info=[r for r in src.execute("PRAGMA table_info(v231_prediction_history)").fetchall() if str(r[1])!='payload']
+                if info:
+                    coldefs=[]; cols=[]
+                    for r in info:
+                        cname=str(r[1]); ctype=str(r[2] or '')
+                        cols.append(cname)
+                        coldefs.append(f"{_v301_sql_ident(cname)} {ctype}".strip())
+                    dst.execute("CREATE TABLE analysis_prediction_history_summary ("+','.join(coldefs)+")")
+                    qcols=','.join(_v301_sql_ident(c) for c in cols)
+                    ph=','.join('?' for _ in cols)
+                    cur=src.execute(f"SELECT {qcols} FROM v231_prediction_history")
+                    n=0
+                    while True:
+                        batch=cur.fetchmany(1000)
+                        if not batch: break
+                        dst.executemany("INSERT INTO analysis_prediction_history_summary VALUES ("+ph+")",batch)
+                        n+=len(batch)
+                    copied.append(("analysis_prediction_history_summary",n))
+            except Exception as exc:
+                errors.append(f"prediction_history_summary: {type(exc).__name__}: {exc}")
+
+            dst.execute("CREATE TABLE analysis_export_manifest(key TEXT PRIMARY KEY,value TEXT)")
+            manifest={
+                "purpose":"ChatGPT/解析用軽量DB。正本復元には使用しない",
+                "app_version":str(APP_VERSION),
+                "created_at":_v228_now_jst_iso(),
+                "source_bytes":len(snapshot_bytes),
+                "excluded_tables":sorted(_V301_ANALYSIS_EXPORT_EXCLUDE_TABLES),
+                "copied_tables":len(copied),
+                "copy_errors":errors,
+            }
+            for k,v in manifest.items():
+                dst.execute("INSERT INTO analysis_export_manifest(key,value) VALUES (?,?)",(str(k),json.dumps(v,ensure_ascii=False)))
+            dst.commit()
+            dst.execute("VACUUM")
+            dst.commit()
+            chk=dst.execute("PRAGMA integrity_check").fetchone()
+            if not chk or str(chk[0]).lower()!="ok":
+                raise RuntimeError("軽量DBのintegrity_checkに失敗しました。")
+        finally:
+            src.close(); dst.close()
+
+        readme=(
+            "AutoRaceAI ChatGPT解析用軽量DB\n"
+            "正本DBの復元・GitHub保存には使用しないでください。\n\n"
+            "保持: 選手/履歴/ラップ/結果/払戻/オッズ/券種確率/回収率実績/推奨監査/展開監査/学習値など。\n"
+            "除外: 大容量予測payload、入力復元payload、結果UI復元、結果生本文、BGジョブ、一時キャッシュ、孤立退避。\n"
+            "v231_prediction_historyはpayloadだけ落とし、analysis_prediction_history_summaryへメタ情報を残しています。\n"
+        )
+        with zipfile.ZipFile(str(zip_path),'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+            z.write(str(dst_path),arcname="autorace_analysis_light.sqlite3")
+            z.writestr("README_解析用.txt",readme)
+        zip_bytes=zip_path.read_bytes()
+        return {
+            "bytes":zip_bytes,
+            "zip_size":len(zip_bytes),
+            "db_size":dst_path.stat().st_size,
+            "source_size":len(snapshot_bytes),
+            "copied_tables":len(copied),
+            "excluded_tables":excluded,
+            "errors":errors,
+        }
+
 
 def _show_sticky_notice(key: str) -> None:
     notice = st.session_state.get(key)
