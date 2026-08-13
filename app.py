@@ -10697,6 +10697,7 @@ def _v187_learning_profile(db_path: str) -> dict:
             JOIN v187_mixed_plan_runs r
               ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
             WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
               AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
         """).fetchone()
         if row and int(row[0] or 0)>0:
@@ -10710,6 +10711,7 @@ def _v187_learning_profile(db_path: str) -> dict:
             JOIN v187_mixed_plan_feedback pf
               ON pf.race_key=tf.race_key AND pf.plan_hash=tf.plan_hash
             WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
               AND COALESCE(pf.winning_types,'') NOT LIKE '%全返還%'
             GROUP BY tf.bet_type
         """).fetchall()
@@ -10826,6 +10828,7 @@ def _v300_backfill_recommendation_audit(db_path: str, app_version_filter: str = 
             WHERE a.race_key IS NULL
               AND COALESCE(r.app_version,'')=?
               AND COALESCE(r.include_in_live_stats,1)=1
+                  AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
             ORDER BY r.created_at
         """,(str(app_version_filter),)).fetchall()
         for race_key,plan_hash,cover,model_rr,app_ver in rows:
@@ -10886,6 +10889,7 @@ def _v301_auto_backfill_strong_recommendation(db_path: str) -> dict:
             SELECT r.race_key,r.plan_hash,COALESCE(r.app_version,'')
             FROM v187_mixed_plan_runs r
             WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
               AND COALESCE(r.app_version,'') IN ('Ver300','Ver301')
             ORDER BY r.created_at
         """).fetchall()
@@ -11006,6 +11010,7 @@ def _v195_return_calibration(db_path: str) -> dict:
                 JOIN v187_mixed_plan_runs r
                   ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
                 WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
             """).fetchone()
         n, payout, cost, model_payout = row if row else (0,0,0,0)
         n=int(n or 0); payout=float(payout or 0); cost=float(cost or 0); model_payout=float(model_payout or 0)
@@ -13608,6 +13613,7 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                 LEFT JOIN result_races rr ON rr.race_key=r.race_key
                 WHERE f.return_rate IS NOT NULL
                   AND COALESCE(r.include_in_live_stats,1)=1
+                  AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
             )
             SELECT race_key,race_date,venue,race_no,app_version,logic_version,
                    points,cost_yen,grade,model_return_rate,created_at,
@@ -13801,6 +13807,7 @@ def _v300_bettype_support_audit(db_path: str, df: pd.DataFrame) -> pd.DataFrame:
                       ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
                     WHERE f.return_rate IS NOT NULL
                       AND COALESCE(r.include_in_live_stats,1)=1
+                  AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
                 )
                 SELECT e.race_key,e.app_version,e.plan_hash,
                        COUNT(DISTINCT t.bet_type) AS bet_type_count
@@ -13877,6 +13884,7 @@ def _v300_support_rescue_summary(db_path: str, df: pd.DataFrame) -> dict:
                       ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
                     WHERE f.return_rate IS NOT NULL
                       AND COALESCE(r.include_in_live_stats,1)=1
+                  AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
                 )
                 SELECT e.race_key,e.app_version,
                        COUNT(DISTINCT t.bet_type) AS bet_type_count
@@ -13992,6 +14000,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                       ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
                     WHERE f.return_rate IS NOT NULL
                       AND COALESCE(r.include_in_live_stats,1)=1
+                  AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
                 """).fetchone()[0] or 0)
         except Exception:
             pass
@@ -14067,6 +14076,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                   ON a.race_key=r.race_key AND a.plan_hash=r.plan_hash
                 WHERE COALESCE(r.app_version,'')='Ver300'
                   AND COALESCE(r.include_in_live_stats,1)=1
+                  AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
                   AND a.race_key IS NULL
             """).fetchone()[0] or 0)
     except Exception:
@@ -17176,15 +17186,17 @@ elif selected_main_page == "🏁 予測":
             show_v184_eight_car_mixed_plan(
                 bets, view_trials, meta, fast_odds_maps, race_key=race_key,
                 app_version=str(_V231_APP_VERSION),
-                save_enabled=True,
-                plan_origin=("current_version_restore" if _restored_plan_mode else "live"),
+                # Ver302表示集計修正: 過去予測の「復元」は閲覧専用。
+                # 当時保存された元バージョン実績を正本とし、現在Verへ重複登録しない。
+                save_enabled=(not _restored_plan_mode),
+                plan_origin=("restore_view_only" if _restored_plan_mode else "live"),
                 source_prediction_version=_restored_source_ver,
-                include_in_live_stats=True,
+                include_in_live_stats=(not _restored_plan_mode),
             )
             if _restored_plan_mode:
                 st.caption(
-                    f"♻️ 復元した予測に現在の保存オッズを適用し、{_V231_APP_VERSION}の回収率重視プランとして正式保存しました。"
-                    f"復元元の予測版（{_restored_source_ver}）は参照情報として保持します。"
+                    f"♻️ 復元表示：元予測版（{_restored_source_ver}）の保存済み実績を正本として使用します。"
+                    f"復元しただけでは{_V231_APP_VERSION}側へ新しい回収率実績を登録しません。"
                 )
             st.divider()
             st.markdown("### 詳細予測・診断")
