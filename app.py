@@ -36,11 +36,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver301"
+APP_VERSION = "Ver302"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver301"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver302"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -57,6 +57,13 @@ _V284_DERIVED_TABLE_GUARD_FIX = "2026-08-09-v1"
 _V284_DIVERGED_SAFE_AUTO_MERGE = "2026-08-09-v1"
 _V284_V252_SEMANTIC_CONTAINMENT = "2026-08-10-v3"
 _V231_SIMULATION_MODE = SIMULATION_MODE
+
+# Ver302: 保存済み事故レースの学習混入を起動時に軽量監査。
+# raw archive / result rows / result races が変わっていなければsignature一致で即終了。
+try:
+    V302_STARTUP_ACCIDENT_REPAIR = engine.v302_repair_existing_poststart_incidents(engine.DB_PATH)
+except Exception as _v302_startup_exc:
+    V302_STARTUP_ACCIDENT_REPAIR = {"reason": f"{type(_v302_startup_exc).__name__}: {_v302_startup_exc}", "skipped": False}
 
 # Mutable runtime state.  Keep initialization centralized.
 
@@ -5663,6 +5670,9 @@ def _v287_recalculate_global_transition_calibration(db_path: str) -> dict:
                     WHERE app_version='Ver284'
                     GROUP BY race_key
                 ) x ON h.history_id=x.mid
+                JOIN result_races rr ON rr.race_key=h.race_key
+                WHERE COALESCE(rr.model_eligible,1)=1
+                  AND COALESCE(rr.learning_eligible,1)=1
             """).fetchall()
 
         from collections import defaultdict
@@ -5742,6 +5752,16 @@ def _v287_recalculate_global_transition_calibration(db_path: str) -> dict:
     except Exception as exc:
         out["reason"]=f"{type(exc).__name__}: {exc}"
         return out
+
+
+# Ver302: 事故清掃で学習対象が変わった時は、Ver287全体補正も正常レースだけで再構築する。
+try:
+    if int((V302_STARTUP_ACCIDENT_REPAIR or {}).get("newly_excluded", 0) or 0) > 0 or int((V302_STARTUP_ACCIDENT_REPAIR or {}).get("weight_rows_removed", 0) or 0) > 0:
+        V302_STARTUP_V287_RECALC = _v287_recalculate_global_transition_calibration(engine.DB_PATH)
+    else:
+        V302_STARTUP_V287_RECALC = {"ok": True, "skipped": True}
+except Exception as _v302_v287_exc:
+    V302_STARTUP_V287_RECALC = {"ok": False, "reason": f"{type(_v302_v287_exc).__name__}: {_v302_v287_exc}"}
 
 
 def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_date: str) -> dict:
@@ -6802,7 +6822,7 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
     if not raw:
         return dict(meta or {}), []
     normalized = re.sub(r"[\t\u3000]+", " ", raw)
-    words = r"反妨|反則妨害|妨害失格|反則失格|落車|競走中止|周回誤認|周誤|失格"
+    words = r"反妨|反則妨害|妨害失格|反則失格|落車|他落|落妨|競走中止|周回誤認|周誤|失格|故障"
     found: list[dict] = []
     # 公式結果の「- 6 選手名 ... /反妨」形式を優先。
     pat = re.compile(

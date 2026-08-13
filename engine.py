@@ -18607,3 +18607,389 @@ def v67_compress_formations(combos, bet_type):
     if missing:
         selected.extend(_v165_plain_lines(missing, bet_type))
     return selected
+
+
+# ============================================================
+# Ver302: 発走後事故の完全学習遮断 + 既存混入の安全清掃
+# ============================================================
+# 結果表から事故車の行そのものが欠ける公式形式でも、parser meta の
+# 「発走後事故車」を最終ゲートとして使う。結果・払戻は保存するが、
+# 予測精度、選手履歴、展開、開催場/壁/熱走路、重み学習には流さない。
+V302_POSTSTART_INCIDENT_PATTERN = re.compile(
+    r"落車|他落|落妨|反則|反妨|反則妨害|妨害失格|妨害|周誤|周回誤認|競走中止|不成立|失格|故障|欠責",
+    re.IGNORECASE,
+)
+
+
+def _v302_meta_incident_map(meta):
+    out = {}
+    if not isinstance(meta, dict):
+        return out
+    raw = meta.get("発走後事故車")
+    if isinstance(raw, dict):
+        for car, reason in raw.items():
+            try:
+                out[int(car)] = str(reason or "競走中止等")
+            except Exception:
+                pass
+    elif isinstance(raw, (list, tuple, set)):
+        reasons = meta.get("発走後事故理由") if isinstance(meta.get("発走後事故理由"), dict) else {}
+        for car in raw:
+            try:
+                c = int(car)
+                out[c] = str(reasons.get(str(c)) or reasons.get(c) or "競走中止等")
+            except Exception:
+                pass
+    reasons = meta.get("発走後事故理由")
+    if isinstance(reasons, dict):
+        for car, reason in reasons.items():
+            try:
+                out[int(car)] = str(reason or "競走中止等")
+            except Exception:
+                pass
+    return out
+
+
+def _v302_result_incident_reasons(results):
+    reasons = []
+    work = results if isinstance(results, pd.DataFrame) else pd.DataFrame(results or [])
+    if work.empty:
+        return reasons
+    for _, row in work.iterrows():
+        text = _v76_status_text(row) if '_v76_status_text' in globals() else " ".join(
+            str(row.get(k) or "") for k in ("結果区分", "事故", "result_status", "status", "異常") if k in row.index
+        )
+        for m in V302_POSTSTART_INCIDENT_PATTERN.findall(str(text or "")):
+            if m and m not in reasons:
+                reasons.append(m)
+    return reasons
+
+
+def v302_incident_reasons(meta=None, results=None):
+    reasons = []
+    for reason in _v302_meta_incident_map(meta).values():
+        hits = V302_POSTSTART_INCIDENT_PATTERN.findall(str(reason or ""))
+        if hits:
+            for h in hits:
+                if h not in reasons:
+                    reasons.append(h)
+        elif str(reason or "").strip() and str(reason) not in reasons:
+            reasons.append(str(reason))
+    for h in _v302_result_incident_reasons(results):
+        if h not in reasons:
+            reasons.append(h)
+    if isinstance(meta, dict) and not reasons and any(bool(meta.get(k)) for k in ("発走後事故", "事故レース", "事故あり")):
+        reasons.append("発走後事故")
+    return reasons
+
+
+def v302_is_poststart_incident_race(meta=None, results=None):
+    return bool(_v302_meta_incident_map(meta) or v302_incident_reasons(meta, results))
+
+
+def _v302_enrich_incident_meta(meta, results=None):
+    out = dict(meta or {})
+    incident_map = _v302_meta_incident_map(out)
+    if not incident_map and not v302_incident_reasons(out, results):
+        return out
+    reason_list = v302_incident_reasons(out, results)
+    reason_text = "・".join(dict.fromkeys(str(x) for x in reason_list if str(x).strip())) or "発走後事故"
+    out.update({
+        "発走後事故": True,
+        "事故レース": True,
+        "事故あり": True,
+        "レース状態": "発走後事故",
+        "予測精度評価対象": False,
+        "予測精度評価対象外": True,
+        "AI学習対象": False,
+        "学習対象外": True,
+        "学習除外": True,
+        "選手履歴学習対象": False,
+        "展開学習対象": False,
+        "追い抜き相性学習対象": False,
+        "開催場補正学習対象": False,
+        "壁補正学習対象": False,
+        "重み更新対象": False,
+        "learning_excluded": True,
+        "learning_exclusion_reason": reason_text,
+        "学習除外理由": reason_text,
+    })
+    if incident_map:
+        out["発走後事故車"] = dict(sorted(incident_map.items()))
+        out["発走後事故車番"] = sorted(incident_map)
+        out["発走後事故理由"] = {str(k): v for k, v in sorted(incident_map.items())}
+    return out
+
+
+def _v302_prepare_result_rows(meta, results):
+    """metaで検出済みの事故車をresultsへ注入し、旧v76ゲートも必ず作動させる。"""
+    work = results.copy() if isinstance(results, pd.DataFrame) else pd.DataFrame(results or [])
+    incident_map = _v302_meta_incident_map(meta)
+    if not incident_map:
+        return work
+    if work.empty:
+        work = pd.DataFrame(columns=["着順", "車番", "選手名", "事故", "結果区分"])
+    if "車番" not in work.columns:
+        work["車番"] = np.nan
+    if "事故" not in work.columns:
+        work["事故"] = ""
+    if "結果区分" not in work.columns:
+        work["結果区分"] = ""
+    cars = set(pd.to_numeric(work["車番"], errors="coerce").dropna().astype(int).tolist())
+    for car, reason in incident_map.items():
+        mask = pd.to_numeric(work["車番"], errors="coerce").eq(int(car))
+        if mask.any():
+            work.loc[mask, "事故"] = str(reason)
+            work.loc[mask, "結果区分"] = str(reason)
+            continue
+        row = {c: None for c in work.columns}
+        row["車番"] = int(car)
+        if "着順" in row:
+            row["着順"] = np.nan
+        row["事故"] = str(reason)
+        row["結果区分"] = str(reason)
+        work = pd.concat([work, pd.DataFrame([row])], ignore_index=True)
+    return work
+
+
+def _v302_ensure_learning_columns(con):
+    cols = {r[1] for r in con.execute("PRAGMA table_info(result_races)").fetchall()}
+    if "model_eligible" not in cols:
+        con.execute("ALTER TABLE result_races ADD COLUMN model_eligible INTEGER NOT NULL DEFAULT 1")
+    if "model_exclusion_reason" not in cols:
+        con.execute("ALTER TABLE result_races ADD COLUMN model_exclusion_reason TEXT NOT NULL DEFAULT ''")
+    if "learning_eligible" not in cols:
+        con.execute("ALTER TABLE result_races ADD COLUMN learning_eligible INTEGER DEFAULT 1")
+    if "learning_exclusion_reason" not in cols:
+        con.execute("ALTER TABLE result_races ADD COLUMN learning_exclusion_reason TEXT")
+
+
+def _v302_mark_and_scrub_one_race(meta, results, db_path=DB_PATH):
+    if not v302_is_poststart_incident_race(meta, results):
+        return {"excluded": False, "race_key": v34_race_key(meta)}
+    key = v34_race_key(meta)
+    reason = "・".join(v302_incident_reasons(meta, results)) or "発走後事故"
+    incident_map = _v302_meta_incident_map(meta)
+    stats = {"excluded": True, "race_key": key, "reason": reason, "weight_rows_removed": 0, "lap_rows_removed": 0}
+    with sqlite3.connect(str(db_path), timeout=30) as con:
+        _v302_ensure_learning_columns(con)
+        con.execute("""UPDATE result_races
+                       SET model_eligible=0, model_exclusion_reason=?,
+                           learning_eligible=0, learning_exclusion_reason=?
+                       WHERE race_key=?""", (reason, reason, key))
+        # 事故車が結果明細に存在する場合は「通常」のまま残さない。
+        for car, status in incident_map.items():
+            cur = con.execute("UPDATE result_entries SET result_status=? WHERE race_key=? AND car_no=?", (str(status), key, int(car)))
+            if (cur.rowcount or 0) == 0:
+                try:
+                    pred = con.execute("SELECT player_name FROM prediction_snapshots WHERE race_key=? AND car_no=? LIMIT 1", (key, int(car))).fetchone()
+                    name = pred[0] if pred else None
+                    con.execute("""INSERT OR IGNORE INTO result_entries
+                        (race_key,car_no,player_name,finish,trial_time,race_time,start_time,handicap,result_status)
+                        VALUES(?,?,?,?,?,?,?,?,?)""", (key, int(car), name, None, None, None, None, None, str(status)))
+                except sqlite3.Error:
+                    pass
+        # 事故レースから生成された直接学習物だけを除去。結果・払戻・買い目実績は残す。
+        for table in ("player_lap_history", "prediction_feedback"):
+            try:
+                cur = con.execute(f"DELETE FROM {table} WHERE race_key=?", (key,))
+                if table == "player_lap_history":
+                    stats["lap_rows_removed"] += max(0, cur.rowcount or 0)
+            except sqlite3.Error:
+                pass
+        # 既に重みへ混ざった差分だけを取り消す。正常レースの差分はそのまま保持する。
+        try:
+            deltas = con.execute("""SELECT feature_name, COALESCE(SUM(delta),0), COUNT(*)
+                                    FROM weight_adjustment_history WHERE race_key=? GROUP BY feature_name""", (key,)).fetchall()
+            for feature_name, delta, cnt in deltas:
+                con.execute("""UPDATE adaptive_weights
+                               SET current_weight=current_weight-?,
+                                   update_count=MAX(0,update_count-?),
+                                   updated_at=?
+                               WHERE feature_name=?""",
+                            (float(delta or 0.0), int(cnt or 0), datetime.now().isoformat(timespec="seconds"), str(feature_name)))
+            cur = con.execute("DELETE FROM weight_adjustment_history WHERE race_key=?", (key,))
+            stats["weight_rows_removed"] = max(0, cur.rowcount or 0)
+        except sqlite3.Error:
+            pass
+        # race_historyは履歴として残すが予測学習には使わない。
+        try:
+            rr = con.execute("SELECT race_date,venue,race_no FROM result_races WHERE race_key=?", (key,)).fetchone()
+            if rr:
+                rno = v61_race_no(rr[2]) if 'v61_race_no' in globals() else None
+                con.execute("""UPDATE race_history SET use_for_model=0
+                               WHERE race_date=? AND venue=?
+                                 AND (? IS NULL OR CAST(REPLACE(COALESCE(race_no,''),'R','') AS INTEGER)=?)""",
+                            (rr[0], rr[1], rno, rno))
+        except sqlite3.Error:
+            pass
+        con.commit()
+    return stats
+
+
+def _v302_extract_incidents_from_raw(raw_text):
+    """保存原文から車番ごとの事故種類を近傍混線させず抽出する。"""
+    raw = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[\t\u3000]+", " ", x).strip() for x in raw.split("\n")]
+    out = {}
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        car = None
+        m = re.match(r"^[-－—–]?\s*([1-8])(?:\s|$)", line)
+        if m:
+            car = int(m.group(1))
+        elif re.fullmatch(r"[-－—–]", line) and i + 1 < len(lines) and re.fullmatch(r"[1-8]", lines[i + 1] or ""):
+            car = int(lines[i + 1])
+        if car is None:
+            continue
+        # 同じ行を最優先。縦型は次の数行だけを見るが、次の車番行へは跨がない。
+        chunks = [line]
+        for j in range(i + 1, min(len(lines), i + 6)):
+            nxt = lines[j]
+            if re.match(r"^[-－—–]?\s*[1-8](?:\s|$)", nxt or ""):
+                break
+            chunks.append(nxt)
+        local = " ".join(chunks)
+        hits = V302_POSTSTART_INCIDENT_PATTERN.findall(local)
+        if hits:
+            out[car] = str(hits[0])
+    return out
+
+
+def v302_repair_existing_poststart_incidents(db_path=DB_PATH, force=False):
+    """保存済み原文 + 結果明細を再走査し、事故学習混入を安全に除去する。
+
+    元結果本文が変わっていなければsignatureで即時終了するため、通常起動は軽い。
+    """
+    out = {"checked": 0, "incident_races": 0, "newly_excluded": 0, "weight_rows_removed": 0,
+           "lap_rows_removed": 0, "status_rows_fixed": 0, "skipped": False, "reason": ""}
+    try:
+        with sqlite3.connect(str(db_path), timeout=30) as con:
+            _v302_ensure_learning_columns(con)
+            con.execute("""CREATE TABLE IF NOT EXISTS v302_accident_cleanup_state(
+                id INTEGER PRIMARY KEY CHECK(id=1), source_signature TEXT NOT NULL, cleaned_at TEXT NOT NULL,
+                incident_races INTEGER NOT NULL DEFAULT 0, weight_rows_removed INTEGER NOT NULL DEFAULT 0)""")
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            raw_info = (0, "")
+            if "v238_result_raw_archive" in tables:
+                raw_info = con.execute("SELECT COUNT(*),COALESCE(MAX(saved_at),'') FROM v238_result_raw_archive").fetchone()
+            entry_info = con.execute("SELECT COUNT(*),COALESCE(MAX(rowid),0) FROM result_entries").fetchone()
+            race_info = con.execute("SELECT COUNT(*),COALESCE(MAX(registered_at),'') FROM result_races").fetchone()
+            signature = "|".join(map(str, [*raw_info, *entry_info, *race_info]))
+            prev = con.execute("SELECT source_signature FROM v302_accident_cleanup_state WHERE id=1").fetchone()
+            if prev and prev[0] == signature and not force:
+                out.update({"skipped": True, "reason": "変更なし"})
+                return out
+            races = con.execute("SELECT race_key,race_date,venue,race_no,COALESCE(model_eligible,1),COALESCE(learning_eligible,1) FROM result_races").fetchall()
+            raw_map = {}
+            if "v238_result_raw_archive" in tables:
+                raw_map = {str(k): str(t or "") for k,t in con.execute("SELECT race_key,raw_result_text FROM v238_result_raw_archive").fetchall()}
+        out["checked"] = len(races)
+        for key, race_date, venue, race_no, old_model, old_learning in races:
+            key = str(key)
+            with sqlite3.connect(str(db_path), timeout=30) as con:
+                entry_rows = con.execute("SELECT car_no,player_name,finish,result_status FROM result_entries WHERE race_key=? ORDER BY car_no", (key,)).fetchall()
+            results = pd.DataFrame(entry_rows, columns=["車番","選手名","着順","結果区分"])
+            meta = {"開催日": race_date, "開催場": venue, "レース": race_no}
+            raw = raw_map.get(key, "")
+            if raw:
+                try:
+                    inc = _v302_extract_incidents_from_raw(raw)
+                    if inc:
+                        meta["発走後事故車"] = inc
+                except Exception:
+                    inc = {}
+                if not inc:
+                    # 原文の事故語だけでもレース除外を逃さない。車番不明時は理由だけ記録。
+                    hits = list(dict.fromkeys(V302_POSTSTART_INCIDENT_PATTERN.findall(raw)))
+                    if hits:
+                        meta["発走後事故"] = True
+                        meta["発走後事故理由"] = {"?": "・".join(hits)}
+            if not v302_is_poststart_incident_race(meta, results):
+                continue
+            out["incident_races"] += 1
+            if int(1 if old_model is None else old_model) != 0 or int(1 if old_learning is None else old_learning) != 0:
+                out["newly_excluded"] += 1
+            before_status = results["結果区分"].fillna("").astype(str).tolist() if not results.empty else []
+            stat = _v302_mark_and_scrub_one_race(meta, _v302_prepare_result_rows(meta, results), db_path)
+            out["weight_rows_removed"] += int(stat.get("weight_rows_removed",0) or 0)
+            out["lap_rows_removed"] += int(stat.get("lap_rows_removed",0) or 0)
+            if _v302_meta_incident_map(meta):
+                out["status_rows_fixed"] += len(_v302_meta_incident_map(meta))
+        with sqlite3.connect(str(db_path), timeout=30) as con:
+            tables2 = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            raw_info2 = con.execute("SELECT COUNT(*),COALESCE(MAX(saved_at),'') FROM v238_result_raw_archive").fetchone() if "v238_result_raw_archive" in tables2 else (0, "")
+            entry_info2 = con.execute("SELECT COUNT(*),COALESCE(MAX(rowid),0) FROM result_entries").fetchone()
+            race_info2 = con.execute("SELECT COUNT(*),COALESCE(MAX(registered_at),'') FROM result_races").fetchone()
+            final_signature = "|".join(map(str, [*raw_info2, *entry_info2, *race_info2]))
+            con.execute("""INSERT INTO v302_accident_cleanup_state(id,source_signature,cleaned_at,incident_races,weight_rows_removed)
+                           VALUES(1,?,?,?,?)
+                           ON CONFLICT(id) DO UPDATE SET source_signature=excluded.source_signature,
+                           cleaned_at=excluded.cleaned_at,incident_races=excluded.incident_races,
+                           weight_rows_removed=excluded.weight_rows_removed""",
+                        (final_signature, datetime.now().isoformat(timespec="seconds"), int(out["incident_races"]), int(out["weight_rows_removed"])))
+            con.commit()
+        return out
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+
+# parser段階でmetaを確定。事故車の行が結果表に無くても学習遮断フラグを保持する。
+_v302_base_parse_result_text = v35_parse_result_text
+
+def v35_parse_result_text(text, venue_override="", race_no_override=""):
+    meta, rows, laps, payouts = _v302_base_parse_result_text(text, venue_override, race_no_override)
+    meta = _v302_enrich_incident_meta(meta, rows)
+    rows = _v302_prepare_result_rows(meta, rows)
+    return meta, rows, laps, payouts
+
+
+# 最新登録経路の最外周でmeta由来事故をresultsへ反映してから旧学習処理へ渡す。
+_v302_base_register_result = v41_register_result
+
+def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    meta2 = _v302_enrich_incident_meta(meta, results)
+    work = _v302_prepare_result_rows(meta2, results)
+    output = _v302_base_register_result(meta2, work, laps, payouts, db_path)
+    if v302_is_poststart_incident_race(meta2, work):
+        scrub = _v302_mark_and_scrub_one_race(meta2, work, db_path)
+        try:
+            key, comparison, analysis, adjustment, registration = output
+            analysis = dict(analysis or {})
+            registration = dict(registration or {})
+            reason = scrub.get("reason") or "発走後事故"
+            analysis.update({"学習対象外": True, "学習除外理由": reason})
+            registration.update({"learning_excluded": True, "learning_exclusion_reason": reason,
+                                 "v302_accident_scrub": scrub})
+            adjustment = {"message": f"発走後事故（{reason}）のため、重みは変更していません。",
+                          "learning_excluded": True, "reason": reason}
+            return key, comparison, analysis, adjustment, registration
+        except Exception:
+            pass
+    return output
+
+
+_v302_base_replace_registered_result = v70_replace_registered_result
+
+def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
+    meta2 = _v302_enrich_incident_meta(meta, results)
+    work = _v302_prepare_result_rows(meta2, results)
+    output = _v302_base_replace_registered_result(meta2, work, laps, payouts, db_path)
+    if v302_is_poststart_incident_race(meta2, work):
+        scrub = _v302_mark_and_scrub_one_race(meta2, work, db_path)
+        try:
+            key, comparison, analysis, adjustment, registration = output
+            analysis = dict(analysis or {})
+            registration = dict(registration or {})
+            reason = scrub.get("reason") or "発走後事故"
+            analysis.update({"学習対象外": True, "学習除外理由": reason, "再登録": True})
+            registration.update({"learning_excluded": True, "learning_exclusion_reason": reason,
+                                 "v302_accident_scrub": scrub, "replaced": True})
+            adjustment = {"message": f"発走後事故（{reason}）のため、重みは変更していません。",
+                          "learning_excluded": True, "reason": reason}
+            return key, comparison, analysis, adjustment, registration
+        except Exception:
+            pass
+    return output
