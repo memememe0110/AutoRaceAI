@@ -10754,16 +10754,19 @@ def _v187_save_mixed_plan(
 ) -> str:
     """回収率重視プランを買い目・オッズ・確率・版情報・生成経路ごと完全保存する。
 
-    Ver279: 復元表示に保存オッズを適用して作るプランも、現在版の正式プランとして保存する。
-    復元元の予測版は source_prediction_version に保持し、現在版の回収率実績・学習へ含める。
+    Ver302集計修正3: 復元プランは元予測版を app_version として保存する。
+    source_prediction_version も保持し、復元操作だけで現在版の回収率実績を増やさない。
     """
     source_version = str(app_version or _V231_APP_VERSION or "Unknown").strip() or "Unknown"
     origin = str(plan_origin or "live").strip() or "live"
     src_pred_ver = str(source_prediction_version or source_version or "Unknown").strip() or "Unknown"
+    # Ver302集計修正3: 復元プランは「復元した時の現在Ver」ではなく元予測Verへ直接保存する。
+    # これにより日別・開催場別・月別・レース明細など全ての実績集計で版が一貫する。
+    effective_version = src_pred_ver if origin == "current_version_restore" and src_pred_ver not in ("", "Unknown") else source_version
     live_flag = 1 if bool(include_in_live_stats) else 0
     _v187_ensure_mixed_learning_tables(db_path)
     payload = {
-        "app_version": source_version,
+        "app_version": effective_version,
         "logic_version": "return_plan_v279_7types_trial",
         "plan_origin": origin,
         "source_prediction_version": src_pred_ver,
@@ -10794,7 +10797,7 @@ def _v187_save_mixed_plan(
             float(result.get("cover", 0)), float(result.get("black", 0)), float(result.get("low", 0)),
             float(result.get("hit_average_multiple", 0)), float(result.get("model_expected_multiple", 0)),
             float(result.get("model_return_rate", 0)), len(result.get("grouped", {})), now,
-            source_version, "return_plan_v279_7types_trial", meta.get("race_date"), meta.get("venue"), meta.get("race_no"), starter_count,
+            effective_version, "return_plan_v279_7types_trial", meta.get("race_date"), meta.get("venue"), meta.get("race_no"), starter_count,
             origin, src_pred_ver, live_flag,
         ))
         if int(cur.rowcount or 0) > 0:
@@ -13567,14 +13570,38 @@ def secret_value(name: str, default: str = "") -> str:
 
 
 # Ver247管理修正2: 同一レースを新版で再予測しても、旧版を回収率比較から消さない。
+def _v302_normalize_restore_plan_versions(db_path: str) -> int:
+    """既存の跨ぎVer復元プランを元予測Verへ正規化する。表示・集計メタデータのみ。"""
+    try:
+        _v187_ensure_mixed_learning_tables(db_path)
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            cur = con.execute("""
+                UPDATE v187_mixed_plan_runs
+                   SET app_version = source_prediction_version
+                 WHERE COALESCE(plan_origin,'live')='current_version_restore'
+                   AND NULLIF(source_prediction_version,'') IS NOT NULL
+                   AND source_prediction_version <> 'Unknown'
+                   AND COALESCE(NULLIF(app_version,''),'Unknown') <> source_prediction_version
+            """)
+            changed = int(cur.rowcount or 0)
+            con.commit()
+            return changed
+    except Exception:
+        return 0
+
+
 def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
     """各レース・各バージョンの最新「照合済み」プランを集計用DataFrameで返す。
 
-    Ver280表示修正:
+    Ver302表示集計修正2:
+    跨ぎVer復元は除外せず source_prediction_version を実績Verとして扱う。
+    同一レース・同一元Verは1件へまとめる。
     最新保存プランが未照合でも、それ以前の同レース・同Verの照合済み実績を消さない。
     feedback単独の孤立レコードは集計せず、runと結合できる正式プランだけを使う。
     """
     try:
+        _v302_normalize_restore_plan_versions(db_path)
         _v187_ensure_mixed_learning_tables(db_path)
         try:
             _v187_sync_mixed_feedback(db_path)
@@ -13588,7 +13615,12 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                     COALESCE(NULLIF(r.race_date,''), rr.race_date) AS race_date,
                     COALESCE(NULLIF(r.venue,''), rr.venue) AS venue,
                     COALESCE(NULLIF(r.race_no,''), rr.race_no) AS race_no,
-                    COALESCE(NULLIF(r.app_version,''),'Unknown') AS app_version,
+                    CASE
+                        WHEN COALESCE(r.plan_origin,'live')='current_version_restore'
+                             AND NULLIF(r.source_prediction_version,'') IS NOT NULL
+                        THEN r.source_prediction_version
+                        ELSE COALESCE(NULLIF(r.app_version,''),'Unknown')
+                    END AS app_version,
                     r.logic_version, r.points, r.cost_yen, r.grade,
                     r.model_return_rate, r.created_at,
                     a.recommendation_label AS new_recommendation_label,
@@ -13600,7 +13632,13 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                     f.hit, f.black_hit, f.gami_hit, f.payout_yen,
                     f.return_rate, f.winning_types, f.evaluated_at,
                     ROW_NUMBER() OVER (
-                        PARTITION BY r.race_key, COALESCE(NULLIF(r.app_version,''),'Unknown')
+                        PARTITION BY r.race_key,
+                            CASE
+                                WHEN COALESCE(r.plan_origin,'live')='current_version_restore'
+                                     AND NULLIF(r.source_prediction_version,'') IS NOT NULL
+                                THEN r.source_prediction_version
+                                ELSE COALESCE(NULLIF(r.app_version,''),'Unknown')
+                            END
                         ORDER BY datetime(f.evaluated_at) DESC,
                                  datetime(r.created_at) DESC,
                                  r.plan_hash DESC
@@ -13613,7 +13651,6 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                 LEFT JOIN result_races rr ON rr.race_key=r.race_key
                 WHERE f.return_rate IS NOT NULL
                   AND COALESCE(r.include_in_live_stats,1)=1
-                  AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
             )
             SELECT race_key,race_date,venue,race_no,app_version,logic_version,
                    points,cost_yen,grade,model_return_rate,created_at,
@@ -13977,6 +14014,7 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
 def _v215_render_return_dashboard(db_path: str) -> None:
     st.markdown("## 📊 回収率重視プラン実績")
     st.caption("Ver301以降は『推奨』＝◎強推奨です。最大EV×複数券種支持の実運用推奨を基準に集計します。")
+    st.caption("✅ Ver302 集計修正3適用済み：復元実績は元予測Verへ統一")
     try:
         _stamp301=(str(db_path),Path(str(db_path)).stat().st_mtime_ns)
         if st.session_state.get("_v301_auto_rec_backfill_stamp") != _stamp301:
@@ -17185,18 +17223,18 @@ elif selected_main_page == "🏁 予測":
             _restored_source_ver = str(view.get("app_version") or view.get("_v231_source_app_version") or "Unknown")
             show_v184_eight_car_mixed_plan(
                 bets, view_trials, meta, fast_odds_maps, race_key=race_key,
-                app_version=str(_V231_APP_VERSION),
-                # Ver302表示集計修正: 過去予測の「復元」は閲覧専用。
-                # 当時保存された元バージョン実績を正本とし、現在Verへ重複登録しない。
-                save_enabled=(not _restored_plan_mode),
-                plan_origin=("restore_view_only" if _restored_plan_mode else "live"),
+                # Ver302表示集計修正2: 復元で作られた回収率プランは現在Verではなく元予測Verへ保存する。
+                # これにより結果登録後の実績も元Verのレースとして集計され、新Ver側へ重複しない。
+                app_version=(_restored_source_ver if _restored_plan_mode else str(_V231_APP_VERSION)),
+                save_enabled=True,
+                plan_origin=("source_version_restore" if _restored_plan_mode else "live"),
                 source_prediction_version=_restored_source_ver,
-                include_in_live_stats=(not _restored_plan_mode),
+                include_in_live_stats=True,
             )
             if _restored_plan_mode:
                 st.caption(
-                    f"♻️ 復元表示：元予測版（{_restored_source_ver}）の保存済み実績を正本として使用します。"
-                    f"復元しただけでは{_V231_APP_VERSION}側へ新しい回収率実績を登録しません。"
+                    f"♻️ 復元表示：回収率実績は元予測版（{_restored_source_ver}）へ紐づけます。"
+                    f"{_V231_APP_VERSION}側には重複計上しません。"
                 )
             st.divider()
             st.markdown("### 詳細予測・診断")
