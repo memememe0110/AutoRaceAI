@@ -12172,6 +12172,60 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 "compact_low": float(compact_metrics.get("low", 0.0)),
                 "break_even_ok": bool(break_even_ok),
             }
+
+            # Ver301監査: 堅いレースで3点固定が本当に有利か、
+            # 同じ三連単候補から 3/6/8/10/16点へ広げた場合を表示用に比較する。
+            # ここでは買い目自体は変更しない。
+            try:
+                _audit_order301=[]
+                _audit_seen301=set()
+
+                # まず実際のコンパクト案を優先して並べる。
+                for _t301 in list(compact_plan):
+                    _k301=(str(_t301.get("type","")),str(_t301.get("combo","")))
+                    if _k301 not in _audit_seen301:
+                        _audit_order301.append(_t301)
+                        _audit_seen301.add(_k301)
+
+                # 残りは「校正後EV・モデル確率・オッズ」の順で候補を広げる。
+                _rest301=[]
+                for _t301 in tri_candidates:
+                    _k301=(str(_t301.get("type","")),str(_t301.get("combo","")))
+                    if _k301 in _audit_seen301:
+                        continue
+                    _p301=float(_t301.get("probability",0.0) or 0.0)
+                    _ep301=float(_t301.get("ev_probability",_p301) or _p301)
+                    _od301=float(_t301.get("odds",0.0) or 0.0)
+                    _ev301=(_ep301/100.0)*_od301
+                    _rest301.append((_ev301,_p301,_od301,_t301))
+
+                for _,_,_,_t301 in sorted(_rest301,key=lambda x:(x[0],x[1],x[2]),reverse=True):
+                    _k301=(str(_t301.get("type","")),str(_t301.get("combo","")))
+                    if _k301 not in _audit_seen301:
+                        _audit_order301.append(_t301)
+                        _audit_seen301.add(_k301)
+
+                _rows301=[]
+                for _target301 in (3,6,8,10,16):
+                    _plan301=_audit_order301[:min(_target301,len(_audit_order301))]
+                    if not _plan301:
+                        continue
+                    _m301=evaluate(_plan301)
+                    _rows301.append({
+                        "points":int(len(_plan301)),
+                        "cover":float(_m301.get("cover",0.0)),
+                        "black":float(_m301.get("black",0.0)),
+                        "low":float(_m301.get("low",0.0)),
+                        "model_return_rate":float(_m301.get("model_return_rate",0.0)),
+                        "ev_model_return_rate":float(_m301.get("ev_model_return_rate",_m301.get("model_return_rate",0.0))),
+                        "hit_average_multiple":float(_m301.get("hit_average_multiple",0.0)),
+                        "min_odds":min((float(_t.get("odds",0.0) or 0.0) for _t in _plan301),default=0.0),
+                        "max_odds":max((float(_t.get("odds",0.0) or 0.0) for _t in _plan301),default=0.0),
+                        "combos":[str(_t.get("combo","")) for _t in _plan301],
+                    })
+                hard_race_info["expand_audit"]=_rows301
+            except Exception:
+                hard_race_info["expand_audit"]=[]
             if compact_is_better:
                 selected = list(compact_plan)
                 metrics = compact_metrics
@@ -12983,6 +13037,51 @@ def show_v184_eight_car_mixed_plan(
             st.info(
                 f"🔒 堅いレース候補を検出しましたが、少点数化で黒字確率または参考回収率が悪化するため通常構成を維持しました。"
             )
+
+        _expand301=hard_info.get("expand_audit") or []
+        if _expand301:
+            with st.expander("🧪 堅いレース・3点→6/8/10/16点拡張監査（表示のみ）",expanded=False):
+                _edf301=pd.DataFrame([{
+                    "点数":r.get("points"),
+                    "合成的中率":r.get("cover"),
+                    "黒字的中率":r.get("black"),
+                    "ガミ率":r.get("low"),
+                    "モデル回収率":r.get("model_return_rate"),
+                    "期待値評価回収率":r.get("ev_model_return_rate"),
+                    "的中時平均倍率":r.get("hit_average_multiple"),
+                    "最低オッズ":r.get("min_odds"),
+                    "最高オッズ":r.get("max_odds"),
+                } for r in _expand301])
+                st.dataframe(
+                    _edf301,use_container_width=True,hide_index=True,
+                    column_config={
+                        "合成的中率":st.column_config.NumberColumn(format="%.2f%%"),
+                        "黒字的中率":st.column_config.NumberColumn(format="%.2f%%"),
+                        "ガミ率":st.column_config.NumberColumn(format="%.2f%%"),
+                        "モデル回収率":st.column_config.NumberColumn(format="%.1f%%"),
+                        "期待値評価回収率":st.column_config.NumberColumn(format="%.1f%%"),
+                        "的中時平均倍率":st.column_config.NumberColumn(format="%.2f倍"),
+                        "最低オッズ":st.column_config.NumberColumn(format="%.1f倍"),
+                        "最高オッズ":st.column_config.NumberColumn(format="%.1f倍"),
+                    },
+                )
+                _base301=next((r for r in _expand301 if int(r.get("points",0))==3),_expand301[0])
+                _best301=max(
+                    _expand301,
+                    key=lambda r:(
+                        float(r.get("black",0.0)),
+                        float(r.get("cover",0.0)),
+                        float(r.get("ev_model_return_rate",0.0)),
+                        -int(r.get("points",0)),
+                    )
+                )
+                st.caption(
+                    f"監査上の最有力：{int(_best301.get('points',0))}点"
+                    f"｜黒字的中率 {float(_best301.get('black',0.0)):.2f}%"
+                    f"｜合成的中率 {float(_best301.get('cover',0.0)):.2f}%"
+                    f"｜期待値評価回収率 {float(_best301.get('ev_model_return_rate',0.0)):.1f}%"
+                )
+                st.caption("※この比較は表示専用です。実際の買い目はまだ3点固定ロジックのままです。")
     formation_sections, formation_notes = v207_build_mixed_formation_sections(result)
     st.subheader(f"{result['icon']} 回収率重視：{result['points']}点・{result['grade']}")
     if _live_rec301:
@@ -15582,6 +15681,7 @@ _V300_BETTYPE_SUPPORT_AUDIT = "2026-08-12-v1"
 _V301_LIVE_STRONG_RECOMMEND = "2026-08-12-v1"
 _V301_RECOMMEND_CANONICAL = "2026-08-12-v1"
 _V301_AUTO_RECOMMEND_BACKFILL = "2026-08-12-v1"
+_V301_HARD_EXPAND_AUDIT = "2026-08-13-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
