@@ -2784,6 +2784,40 @@ def _v279_bg_prediction_get_latest(db_path: str) -> dict:
         return {}
 
 
+def _v301_bg_input_fingerprint(raw_text: str, venue_override: str, excluded: list[int] | None = None) -> str:
+    """BG予測開始時の入力を固定するための軽量指紋。表示制御専用。"""
+    try:
+        src=(str(venue_override or "").strip()+"\n"+str(raw_text or "").strip()+"\n"+
+             ",".join(str(int(x)) for x in sorted(excluded or [])))
+        return hashlib.sha256(src.encode("utf-8",errors="replace")).hexdigest()[:24]
+    except Exception:
+        return ""
+
+
+def _v301_bg_completed_view_matches(job: dict, view: dict, raw_text: str, venue_override: str) -> tuple[bool,str]:
+    """完了ジョブと読み込んだ履歴が同一レース・同一ジョブ由来かを検証する。"""
+    try:
+        result=(job or {}).get("result") or {}
+        expected_job=int((job or {}).get("job_id") or 0)
+        expected_race=str(result.get("race_key") or "").strip()
+        expected_fp=str(result.get("input_fingerprint") or "").strip()
+        actual_race=str((view or {}).get("race_key") or "").strip()
+        actual_job=int((view or {}).get("_v301_bg_job_id") or 0)
+        actual_fp=str((view or {}).get("_v301_bg_input_fingerprint") or "").strip()
+        if expected_job and actual_job and expected_job!=actual_job:
+            return False,f"job_id不一致 expected={expected_job} actual={actual_job}"
+        if expected_race and actual_race and expected_race!=actual_race:
+            return False,f"race_key不一致 expected={expected_race} actual={actual_race}"
+        if expected_fp and actual_fp and expected_fp!=actual_fp:
+            return False,"入力指紋不一致"
+        # 新修正版で保存されたジョブは3項目を必須にする。
+        if expected_fp and (not actual_job or not actual_fp or not actual_race):
+            return False,"BG結果の識別情報が不足"
+        return True,""
+    except Exception as exc:
+        return False,f"照合エラー: {type(exc).__name__}: {exc}"
+
+
 def _v279_bg_prediction_any_active(db_path: str) -> bool:
     try:
         _v278_bg_ensure_table(db_path)
@@ -3031,6 +3065,8 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             "rerun_source_version":str(request_data.get("rerun_source_version") or ""),
             "rerun_source_history_id":int(request_data.get("rerun_source_history_id") or 0),
             "background_prediction":True,
+            "_v301_bg_job_id":int(job_id),
+            "_v301_bg_input_fingerprint":str(request_data.get("_v301_bg_input_fingerprint") or ""),
         }
         history_id=_v231_save_prediction_history(
             db_path,race_key,raw_text,venue_override,prediction_view,trials,seed
@@ -3047,6 +3083,8 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             "rerun_from_restored":bool(request_data.get("rerun_from_restored", False)),
             "rerun_source_version":str(request_data.get("rerun_source_version") or ""),
             "rerun_source_history_id":int(request_data.get("rerun_source_history_id") or 0),
+            "job_id":int(job_id),
+            "input_fingerprint":str(request_data.get("_v301_bg_input_fingerprint") or ""),
         }
         blob=zlib.compress(pickle.dumps(result,protocol=pickle.HIGHEST_PROTOCOL),level=6)
         _v278_bg_update(
@@ -3102,9 +3140,12 @@ def _v279_bg_prediction_start(
             job_type,str(_V231_APP_VERSION),"queued",now,now,1,0,0,4,"準備中",start_message
         ))
         con.commit(); job_id=int(cur.lastrowid or 0)
+    _excluded301=[int(x) for x in (excluded or [])]
+    _input_fp301=_v301_bg_input_fingerprint(str(raw_text),str(venue_override or ""),_excluded301)
     request_data={
         "raw_text":str(raw_text),"venue_override":str(venue_override or ""),"trials":int(trials),
-        "seed":int(seed),"excluded":[int(x) for x in (excluded or [])],
+        "seed":int(seed),"excluded":_excluded301,
+        "_v301_bg_job_id":int(job_id),"_v301_bg_input_fingerprint":_input_fp301,
         "rerun_from_restored":bool(rerun_from_restored),
         "rerun_source_version":str(rerun_source_version or ""),
         "rerun_source_history_id":int(rerun_source_history_id or 0),
@@ -3126,7 +3167,11 @@ def _v279_bg_prediction_load_completed(db_path: str, job: dict) -> tuple[dict,st
         if not hid:
             return {},"",""
         view,raw_text,venue_override,_meta=_v231_load_prediction_history(db_path,hid)
-        return (view if isinstance(view,dict) else {}),str(raw_text or ""),str(venue_override or "")
+        view=(view if isinstance(view,dict) else {})
+        _ok301,_why301=_v301_bg_completed_view_matches(job,view,str(raw_text or ""),str(venue_override or ""))
+        if not _ok301:
+            return {},"",""
+        return view,str(raw_text or ""),str(venue_override or "")
     except Exception:
         return {},"",""
 
@@ -15682,6 +15727,7 @@ _V301_LIVE_STRONG_RECOMMEND = "2026-08-12-v1"
 _V301_RECOMMEND_CANONICAL = "2026-08-12-v1"
 _V301_AUTO_RECOMMEND_BACKFILL = "2026-08-12-v1"
 _V301_HARD_EXPAND_AUDIT = "2026-08-13-v1"
+_V301_BG_RACE_BINDING_FIX = "2026-08-13-v1"
 
 # Ver284 DB参照先固定ガード:
 # Streamlit rerun中に engine.DB_PATH やDB実体が意図せず別DBへ切り替わるのを検知する。
@@ -16627,16 +16673,30 @@ elif selected_main_page == "🏁 予測":
         _bres=(_v279_bg_job or {}).get("result") or {}
         _bjobid=int((_v279_bg_job or {}).get("job_id") or 0)
         if int(st.session_state.get("v279_bg_loaded_job_id",0) or 0) != _bjobid:
-            st.success(f"✅ バックグラウンド予測が完了しました：{str(_bres.get('race_label') or _bres.get('race_key') or '')}")
-            if st.button("📂 完了した予測を表示",type="primary",use_container_width=True,key=f"v279_bg_pred_load_{_bjobid}"):
-                _bview,_braw,_bvenue=_v279_bg_prediction_load_completed(engine.DB_PATH,_v279_bg_job)
-                if _bview:
-                    st.session_state["last_prediction_view"]=_bview
-                    st.session_state["v279_bg_loaded_job_id"]=_bjobid
-                    st.session_state.pop("v232_restored_result_view",None)
-                    st.rerun()
-                else:
-                    st.warning("完了した予測履歴を読み込めませんでした。")
+            _expected_job301=int(st.session_state.get("v301_bg_expected_job_id",0) or 0)
+            _same_job301=bool(_expected_job301 and _expected_job301==_bjobid)
+            if _same_job301:
+                st.success(f"✅ バックグラウンド予測が完了しました：{str(_bres.get('race_label') or _bres.get('race_key') or '')}")
+                if st.button("📂 完了した予測を表示",type="primary",use_container_width=True,key=f"v279_bg_pred_load_{_bjobid}"):
+                    _bview,_braw,_bvenue=_v279_bg_prediction_load_completed(engine.DB_PATH,_v279_bg_job)
+                    if _bview:
+                        _loaded_race301=str(_bview.get("race_key") or "")
+                        _result_race301=str(_bres.get("race_key") or "")
+                        if _loaded_race301 and _result_race301 and _loaded_race301==_result_race301:
+                            st.session_state["last_prediction_view"]=_bview
+                            st.session_state["v279_bg_loaded_job_id"]=_bjobid
+                            st.session_state.pop("v232_restored_result_view",None)
+                            st.rerun()
+                        else:
+                            st.error("BG予測のレース照合に失敗したため、別レースの結果は表示しませんでした。")
+                    else:
+                        st.error("BG予測のjob_id・race_key照合に失敗したため、結果を表示しませんでした。")
+            else:
+                st.info(
+                    f"別セッション/別ジョブのバックグラウンド予測が完了しています："
+                    f"{str(_bres.get('race_label') or _bres.get('race_key') or '')} "
+                    f"(job {_bjobid})。現在の予測画面には自動反映しません。"
+                )
     elif _v279_bg_status == "failed":
         st.warning("バックグラウンド予測に失敗しました："+str((_v279_bg_job or {}).get("error_text") or (_v279_bg_job or {}).get("message") or "不明"))
 
@@ -16678,6 +16738,7 @@ elif selected_main_page == "🏁 予測":
                 rerun_source_history_id=_src_hid_bg,
             )
             if _bgstart.get("ok"):
+                st.session_state["v301_bg_expected_job_id"] = int(_bgstart.get("job_id") or 0)
                 st.session_state["v279_bg_loaded_job_id"] = 0
                 st.success(
                     f"{_src_ver_bg}の復元内容を{_V231_APP_VERSION}でバックグラウンド再シミュレーション開始しました"
@@ -16712,6 +16773,7 @@ elif selected_main_page == "🏁 予測":
                     engine.DB_PATH,text,prediction_venue_override,int(trials),int(seed),[int(x) for x in manual_excluded]
                 )
                 if _bgstart.get("ok"):
+                    st.session_state["v301_bg_expected_job_id"]=int(_bgstart.get("job_id") or 0)
                     st.session_state["v279_bg_loaded_job_id"]=0
                     st.success(f"バックグラウンド予測を開始しました（ジョブID: {_bgstart.get('job_id')}）。他の画面へ移動できます。")
                     st.rerun()
