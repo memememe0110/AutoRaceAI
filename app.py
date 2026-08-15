@@ -56,6 +56,7 @@ _V284_BOOT_GITHUB_CANONICAL_RESTORE = "2026-08-09-v1"
 _V284_DERIVED_TABLE_GUARD_FIX = "2026-08-09-v1"
 _V284_DIVERGED_SAFE_AUTO_MERGE = "2026-08-09-v1"
 _V302_DIVERGED_TABLE_MERGE_FIX = "2026-08-15-v1"
+_V302_WAL_MERGE_CHECKPOINT_FIX = "2026-08-15-v1"
 _V284_V252_SEMANTIC_CONTAINMENT = "2026-08-10-v3"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
@@ -15420,6 +15421,16 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
         with sqlite3.connect(str(local_path),timeout=60.0) as lc, sqlite3.connect(str(remote_path),timeout=60.0) as rc:
             lc.execute("PRAGMA busy_timeout=60000")
             rc.execute("PRAGMA busy_timeout=60000")
+
+            # Ver302 WAL修正:
+            # 元DBが journal_mode=WAL の場合、commit後も追加行が -wal 側に残り、
+            # main .sqlite3 を read_bytes() した包含監査から見えないことがある。
+            # 一時統合DBではDELETE journalへ切り替え、統合結果を必ず本体DBへ確定する。
+            try:
+                lc.execute("PRAGMA wal_checkpoint(FULL)")
+            except Exception:
+                pass
+            lc.execute("PRAGMA journal_mode=DELETE")
             lc_tables={str(r[0]) for r in lc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             rc_tables={str(r[0]) for r in rc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
@@ -15517,9 +15528,27 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
                 report["added"][table]=len(missing)
 
             lc.commit()
+
+            # WAL/SHMに未反映の差分を残さない最終確定。
+            try:
+                lc.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            lc.execute("PRAGMA journal_mode=DELETE")
+            lc.commit()
+
             chk=lc.execute("PRAGMA integrity_check").fetchone()
             if not chk or str(chk[0]).lower()!="ok":
                 report["reason"]="統合後DBのintegrity_check失敗"
+                return False,None,report
+
+        # connection contextを抜けた後、本体SQLiteだけで再オープンして
+        # 追加行が本当に見えることを確認してからbytes化する。
+        with sqlite3.connect(str(local_path), timeout=60.0) as _verify302:
+            _verify302.execute("PRAGMA busy_timeout=60000")
+            _chk302=_verify302.execute("PRAGMA integrity_check").fetchone()
+            if not _chk302 or str(_chk302[0]).lower()!="ok":
+                report["reason"]="WAL確定後のintegrity_check失敗"
                 return False,None,report
 
         merged=local_path.read_bytes()
