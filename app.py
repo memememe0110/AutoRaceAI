@@ -1,4 +1,5 @@
 from __future__ import annotations
+_V303_MIXED_PLAN_FUTURE_CUTOFF = "2026-08-15-v1"
 
 import base64
 import glob
@@ -10680,7 +10681,7 @@ def _v208_render_mixed_plan_result(result: dict) -> None:
         st.caption(f"予測時に保存された最新プラン（{int(result.get('points',0))}点）だけで判定しています。結果確認後の買い目差し替えは行いません。")
 
 
-def _v187_learning_profile(db_path: str) -> dict:
+def _v187_learning_profile(db_path: str, cutoff_race_date: str = "") -> dict:
     try:
         _v187_ensure_mixed_learning_tables(db_path)
     except sqlite3.DatabaseError as _db187:
@@ -10692,6 +10693,14 @@ def _v187_learning_profile(db_path: str) -> dict:
         }
     _v187_sync_mixed_feedback(db_path)
     out = {"samples":0, "hit_rate":None, "black_rate":None, "gami_rate":None, "return_rate":None, "type_weights":{}}
+    _cut187 = str(cutoff_race_date or "").strip()[:10]
+    _date_sql187 = ""
+    _date_params187 = ()
+    if _cut187:
+        # Ver303: 過去再シミュでは対象レース当日以降の実績を学習へ混ぜない。
+        _date_sql187 = " AND (COALESCE(NULLIF(r.race_date,''),'9999-12-31') < ?) "
+        _date_params187 = (_cut187,)
+
     with sqlite3.connect(db_path) as con:
         row = con.execute("""
             SELECT COUNT(*), AVG(f.hit)*100.0, AVG(f.black_hit)*100.0, AVG(f.gami_hit)*100.0, AVG(f.return_rate)
@@ -10701,7 +10710,7 @@ def _v187_learning_profile(db_path: str) -> dict:
             WHERE COALESCE(r.include_in_live_stats,1)=1
               AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
               AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
-        """).fetchone()
+        """ + _date_sql187, _date_params187).fetchone()
         if row and int(row[0] or 0)>0:
             out.update(samples=int(row[0]), hit_rate=float(row[1] or 0), black_rate=float(row[2] or 0),
                        gami_rate=float(row[3] or 0), return_rate=float(row[4] or 0))
@@ -10715,8 +10724,9 @@ def _v187_learning_profile(db_path: str) -> dict:
             WHERE COALESCE(r.include_in_live_stats,1)=1
               AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
               AND COALESCE(pf.winning_types,'') NOT LIKE '%全返還%'
+        """ + _date_sql187 + """
             GROUP BY tf.bet_type
-        """).fetchall()
+        """, _date_params187).fetchall()
         for bet_type,n,hit_rate,avg_payout in rows:
             # 少数データは1.0へ縮小。実績が増えるほど0.80～1.20の範囲で効かせる。
             reliability = min(1.0, float(n)/30.0)
@@ -11329,7 +11339,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     if not tri_counter:
         return {"available": False, "reason": "三連単シミュレーションがありません。"}
 
-    learning = _v187_learning_profile(engine.DB_PATH)
+    # Ver303: 当時まだ存在しなかった回収率実績を使わない。
+    learning = _v187_learning_profile(engine.DB_PATH, _race_date295)
     if isinstance(learning,dict) and learning.get("enabled") is False and learning.get("reason"):
         try:
             st.caption("回収率学習: " + str(learning.get("reason")))
