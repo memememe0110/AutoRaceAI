@@ -55,6 +55,7 @@ _V284_GITHUB_RELOAD_UNIFIED_VERIFY = "2026-08-09-v1"
 _V284_BOOT_GITHUB_CANONICAL_RESTORE = "2026-08-09-v1"
 _V284_DERIVED_TABLE_GUARD_FIX = "2026-08-09-v1"
 _V284_DIVERGED_SAFE_AUTO_MERGE = "2026-08-09-v1"
+_V302_DIVERGED_TABLE_MERGE_FIX = "2026-08-15-v1"
 _V284_V252_SEMANTIC_CONTAINMENT = "2026-08-10-v3"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
@@ -15438,9 +15439,30 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
                     if _lpid295 is not None:
                         _remote_to_local_player_id295[int(_rpid295)]=int(_lpid295)
 
+            # Ver302同期修正:
+            # 比較対象テーブルがGitHub側にしか存在しない場合も、統合対象から落とさない。
+            # 以前は片側にテーブル自体が無いとcontinueしていたため、
+            # 行追加は成功していても最終包含判定で「GitHubを完全包含していない」と停止し得た。
             for table,keys in keymap.items():
-                if table not in lc_tables or table not in rc_tables:
+                if table not in rc_tables:
                     continue
+                if table not in lc_tables:
+                    _schema_row302=rc.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                        (table,)
+                    ).fetchone()
+                    _schema_sql302=str(_schema_row302[0] or "").strip() if _schema_row302 else ""
+                    if not _schema_sql302:
+                        report["reason"]=f"{table}: GitHub側テーブル定義を取得できません"
+                        return False,None,report
+                    try:
+                        lc.execute(_schema_sql302)
+                        lc.commit()
+                        lc_tables.add(table)
+                    except Exception as _create_exc302:
+                        report["reason"]=f"{table}: GitHub固有テーブル作成失敗: {type(_create_exc302).__name__}: {_create_exc302}"
+                        return False,None,report
+
                 linfo=lc.execute(f'PRAGMA table_info("{table}")').fetchall()
                 rinfo=rc.execute(f'PRAGMA table_info("{table}")').fetchall()
                 lcols=[str(r[1]) for r in linfo]
