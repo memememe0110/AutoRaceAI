@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver302"
+APP_VERSION = "Ver303"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver302"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver303"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -10905,7 +10905,7 @@ def _v301_auto_backfill_strong_recommendation(db_path: str) -> dict:
             FROM v187_mixed_plan_runs r
             WHERE COALESCE(r.include_in_live_stats,1)=1
               AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
-              AND COALESCE(r.app_version,'') IN ('Ver300','Ver301','Ver302')
+              AND COALESCE(r.app_version,'') IN ('Ver300','Ver301','Ver302','Ver303')
             ORDER BY r.created_at
         """).fetchall()
         for race_key,plan_hash,app_ver in rows:
