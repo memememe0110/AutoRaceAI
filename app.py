@@ -10883,7 +10883,7 @@ def _v300_backfill_recommendation_audit(db_path: str, app_version_filter: str = 
 
 
 def _v301_auto_backfill_strong_recommendation(db_path: str) -> dict:
-    """保存済みVer300/Ver301プランをVer301強推奨基準で自動再判定する。再シミュレーションは行わない。"""
+    """保存済みVer300/Ver301/Ver302プランをVer301強推奨基準で自動再判定する。再シミュレーションは行わない。"""
     _v187_ensure_mixed_learning_tables(db_path)
     done=0; skipped=0; errors=[]
     with sqlite3.connect(str(db_path),timeout=30.0) as con:
@@ -10893,7 +10893,7 @@ def _v301_auto_backfill_strong_recommendation(db_path: str) -> dict:
             FROM v187_mixed_plan_runs r
             WHERE COALESCE(r.include_in_live_stats,1)=1
               AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
-              AND COALESCE(r.app_version,'') IN ('Ver300','Ver301')
+              AND COALESCE(r.app_version,'') IN ('Ver300','Ver301','Ver302')
             ORDER BY r.created_at
         """).fetchall()
         for race_key,plan_hash,app_ver in rows:
@@ -14021,7 +14021,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             _bf301=_v301_auto_backfill_strong_recommendation(str(db_path))
             st.session_state["_v301_auto_rec_backfill_stamp"]=_stamp301
             if _bf301.get("done",0)>0:
-                st.caption(f"Ver301推奨を保存済みプランから自動振り分け済み：{_bf301['done']}件（再シミュレーションなし）")
+                st.caption(f"推奨判定を保存済みプランから自動補完済み：{_bf301['done']}件（Ver302含む・再シミュレーションなし）")
     except Exception as _bf301_exc:
         st.warning("Ver301推奨の自動振り分けに失敗しました: "+_runtime_exception_text(_bf301_exc))
     st.caption("各レース・各バージョンで最後に保存されたプランを、予測時点の買い目のまま別々に集計します。")

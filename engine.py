@@ -18949,10 +18949,28 @@ def v35_parse_result_text(text, venue_override="", race_no_override=""):
 # 最新登録経路の最外周でmeta由来事故をresultsへ反映してから旧学習処理へ渡す。
 _v302_base_register_result = v41_register_result
 
+def _v302_rows_for_legacy_result_register(results):
+    """旧結果登録へは着順が確定した完走行だけ渡す。
+
+    Ver302の事故遮断では、結果表に存在しない事故車も着順NaNの行として補完するが、
+    旧登録・分析処理の一部は全行に通常着順がある前提。事故行はmeta/事故保存側で保持し、
+    旧処理には混ぜないことで iloc[0] / int(NaN) 系の連鎖エラーを防ぐ。
+    """
+    work = results.copy() if isinstance(results, pd.DataFrame) else pd.DataFrame(results or [])
+    if work.empty or "着順" not in work.columns:
+        return work
+    finish = pd.to_numeric(work["着順"], errors="coerce")
+    safe = work.loc[finish.notna()].copy()
+    if not safe.empty:
+        safe["着順"] = pd.to_numeric(safe["着順"], errors="coerce").astype(int)
+    return safe.reset_index(drop=True)
+
+
 def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
     meta2 = _v302_enrich_incident_meta(meta, results)
     work = _v302_prepare_result_rows(meta2, results)
-    output = _v302_base_register_result(meta2, work, laps, payouts, db_path)
+    legacy_work = _v302_rows_for_legacy_result_register(work)
+    output = _v302_base_register_result(meta2, legacy_work, laps, payouts, db_path)
     if v302_is_poststart_incident_race(meta2, work):
         scrub = _v302_mark_and_scrub_one_race(meta2, work, db_path)
         try:
@@ -18976,7 +18994,8 @@ _v302_base_replace_registered_result = v70_replace_registered_result
 def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_path=DB_PATH):
     meta2 = _v302_enrich_incident_meta(meta, results)
     work = _v302_prepare_result_rows(meta2, results)
-    output = _v302_base_replace_registered_result(meta2, work, laps, payouts, db_path)
+    legacy_work = _v302_rows_for_legacy_result_register(work)
+    output = _v302_base_replace_registered_result(meta2, legacy_work, laps, payouts, db_path)
     if v302_is_poststart_incident_race(meta2, work):
         scrub = _v302_mark_and_scrub_one_race(meta2, work, db_path)
         try:
