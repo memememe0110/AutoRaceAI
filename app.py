@@ -2460,10 +2460,14 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
         result["v284_transition_audit_saved_races"]=int(_audit_backfill284.get("saved_races") or 0)
         cancelled=bool(result.get("cancelled")) or _v278_bg_cancel_requested(db_path,job_id)
         blob=zlib.compress(pickle.dumps(result,protocol=pickle.HIGHEST_PROTOCOL),level=6)
+        _final_done278=int(resume_done_offset or 0)+int(result.get("checked",0) or 0)
+        _final_total278=int(resume_done_offset or 0)+int(result.get("candidate_total",result.get("checked",0)) or 0)
         _v278_bg_update(
             db_path, job_id,
             status="cancelled" if cancelled else "completed",
             finished_at=_v228_now_jst_iso(),
+            done_count=_final_done278,
+            total_count=_final_total278,
             current_label="",
             message=(
                 "停止しました。処理済みレースは保存されています。"
@@ -2500,16 +2504,29 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
     try:
         _v231_ensure_prediction_history_table(db_path)
         with sqlite3.connect(str(db_path),timeout=30.0) as _con278:
-            _approx_total278=int(_con278.execute("""
-                SELECT COUNT(*) FROM (
-                    SELECT race_key
-                    FROM v231_prediction_history
-                    WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
-                    GROUP BY race_key
-                    ORDER BY MAX(history_id) DESC
-                    LIMIT ?
-                )
-            """,(max(1,int(limit_count)),)).fetchone()[0] or 0)
+            if bool(force_current):
+                _approx_total278=int(_con278.execute("""
+                    SELECT COUNT(*) FROM (
+                        SELECT race_key FROM v231_prediction_history
+                        WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+                        GROUP BY race_key
+                        ORDER BY MAX(history_id) DESC LIMIT ?
+                    )
+                """,(max(1,int(limit_count)),)).fetchone()[0] or 0)
+            else:
+                _approx_total278=int(_con278.execute("""
+                    SELECT COUNT(*) FROM (
+                        SELECT h.race_key
+                        FROM v231_prediction_history h
+                        WHERE h.race_key IS NOT NULL AND TRIM(h.race_key)<>''
+                          AND NOT EXISTS (
+                              SELECT 1 FROM v231_prediction_history c
+                              WHERE c.race_key=h.race_key AND c.app_version=?
+                          )
+                        GROUP BY h.race_key
+                        ORDER BY MAX(h.history_id) DESC LIMIT ?
+                    )
+                """,(str(_V231_APP_VERSION),max(1,int(limit_count)))).fetchone()[0] or 0)
     except Exception:
         _approx_total278=0
     with sqlite3.connect(str(db_path), timeout=30.0) as con:
@@ -3331,6 +3348,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
     # これで古い未処理レースが候補外へ押し出されるのを防ぐ。
     unique = unique[:max(1, int(limit))]
     total=len(unique)
+    out['candidate_total']=int(total)
     out['prepare_seconds_v276']=round(time_module.perf_counter()-_prep_t0_v276,3)
     _run_t0_v276=time_module.perf_counter()
     for idx,h in enumerate(unique,1):
@@ -10891,6 +10909,8 @@ def _v304_roi_population_status(db_path, current_ver):
         "remaining": 0,
         "replayable_remaining": 0,
         "no_saved_history_remaining": 0,
+        "legacy_rescored": 0,
+        "legacy_rescore_pending": 0,
     }
     try:
         with sqlite3.connect(str(db_path)) as con:
@@ -10931,15 +10951,186 @@ def _v304_roi_population_status(db_path, current_ver):
 
         remaining = all_keys - cur_keys
         replayable = remaining & hist_keys
+        _legacy_done=set()
+        try:
+            _legacy_done={str(r[0]) for r in con.execute(
+                "SELECT race_key FROM v304_legacy_plan_rescore"
+            ).fetchall() if r and r[0]}
+        except Exception:
+            _legacy_done=set()
+        _legacy_candidates=remaining-hist_keys
         out.update(
             all_calculable=len(all_keys),
             current_evaluated=len(all_keys & cur_keys),
             remaining=len(remaining),
             replayable_remaining=len(replayable),
-            no_saved_history_remaining=len(remaining - hist_keys),
+            no_saved_history_remaining=len(_legacy_candidates),
+            legacy_rescored=len(_legacy_candidates & _legacy_done),
+            legacy_rescore_pending=len(_legacy_candidates - _legacy_done),
         )
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _v304_ensure_legacy_plan_rescore_table(db_path: str) -> None:
+    with sqlite3.connect(str(db_path),timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v304_legacy_plan_rescore (
+                race_key TEXT PRIMARY KEY,
+                source_plan_hash TEXT NOT NULL,
+                source_app_version TEXT,
+                source_created_at TEXT,
+                recommendation_label TEXT NOT NULL,
+                recommended INTEGER NOT NULL DEFAULT 0,
+                max_ev REAL NOT NULL DEFAULT 0,
+                support_count INTEGER NOT NULL DEFAULT 0,
+                cost_yen INTEGER NOT NULL DEFAULT 0,
+                payout_yen INTEGER NOT NULL DEFAULT 0,
+                return_rate REAL,
+                rescored_at TEXT NOT NULL
+            )
+        """)
+        con.commit()
+
+
+def _v304_legacy_rescore_missing_without_history(db_path: str, current_ver: str) -> dict:
+    """v231履歴が無い旧レースは、保存済みプランをVer301強推奨基準で再採点する。
+
+    これは現行モデルの再シミュレーションではない。保存済み買い目を変えず、
+    最終推奨判定だけを同一基準で再評価する監査用フォールバック。
+    """
+    _v304_ensure_legacy_plan_rescore_table(db_path)
+    out={"checked":0,"rescored":0,"recommended":0,"errors":[]}
+    try:
+        with sqlite3.connect(str(db_path),timeout=30.0) as con:
+            con.row_factory=sqlite3.Row
+            con.execute("PRAGMA busy_timeout=30000")
+            rows=con.execute("""
+                WITH calc AS (
+                    SELECT DISTINCT r.race_key
+                    FROM v187_mixed_plan_runs r
+                    JOIN v187_mixed_plan_feedback f
+                      ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                    WHERE COALESCE(r.include_in_live_stats,1)=1
+                      AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
+                      AND f.cost_yen IS NOT NULL AND f.payout_yen IS NOT NULL
+                ), cur AS (
+                    SELECT DISTINCT r.race_key
+                    FROM v187_mixed_plan_runs r
+                    JOIN v187_mixed_plan_feedback f
+                      ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                    WHERE COALESCE(NULLIF(r.app_version,''),'Unknown')=?
+                      AND COALESCE(r.include_in_live_stats,1)=1
+                      AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
+                      AND f.cost_yen IS NOT NULL AND f.payout_yen IS NOT NULL
+                ), hist AS (
+                    SELECT DISTINCT race_key FROM v231_prediction_history
+                    WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+                ), ranked AS (
+                    SELECT r.race_key,r.plan_hash,COALESCE(r.app_version,'Unknown') app_version,
+                           r.created_at,f.cost_yen,f.payout_yen,f.return_rate,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY r.race_key
+                               ORDER BY r.created_at DESC,r.plan_hash DESC
+                           ) rn
+                    FROM v187_mixed_plan_runs r
+                    JOIN v187_mixed_plan_feedback f
+                      ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                    JOIN calc c ON c.race_key=r.race_key
+                    LEFT JOIN cur cv ON cv.race_key=r.race_key
+                    LEFT JOIN hist h ON h.race_key=r.race_key
+                    WHERE cv.race_key IS NULL AND h.race_key IS NULL
+                      AND COALESCE(r.include_in_live_stats,1)=1
+                      AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
+                      AND f.cost_yen IS NOT NULL AND f.payout_yen IS NOT NULL
+                      AND NOT (
+                        COALESCE(r.plan_origin,'live')='current_version_restore'
+                        AND COALESCE(NULLIF(r.app_version,''),'Unknown')
+                            <> COALESCE(NULLIF(r.source_prediction_version,''),
+                                        COALESCE(NULLIF(r.app_version,''),'Unknown'))
+                      )
+                )
+                SELECT * FROM ranked WHERE rn=1 ORDER BY race_key
+            """,(str(current_ver or ''),)).fetchall()
+
+            for row in rows:
+                out["checked"]+=1
+                try:
+                    tickets=con.execute("""
+                        SELECT bet_type,combination,probability,odds
+                        FROM v187_mixed_plan_tickets
+                        WHERE race_key=? AND plan_hash=?
+                        ORDER BY bet_type,combination
+                    """,(row["race_key"],row["plan_hash"])).fetchall()
+                    if not tickets:
+                        continue
+                    _tickets=[]
+                    for t in tickets:
+                        _tickets.append({
+                            "type":_v212_norm_bet_type(t["bet_type"]),
+                            "combo":str(t["combination"] or ''),
+                            "probability":float(t["probability"] or 0.0),
+                            "odds":float(t["odds"] or 0.0),
+                        })
+                    rec=_v301_live_recommendation({"tickets":_tickets})
+                    con.execute("""
+                        INSERT INTO v304_legacy_plan_rescore(
+                            race_key,source_plan_hash,source_app_version,source_created_at,
+                            recommendation_label,recommended,max_ev,support_count,
+                            cost_yen,payout_yen,return_rate,rescored_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(race_key) DO UPDATE SET
+                            source_plan_hash=excluded.source_plan_hash,
+                            source_app_version=excluded.source_app_version,
+                            source_created_at=excluded.source_created_at,
+                            recommendation_label=excluded.recommendation_label,
+                            recommended=excluded.recommended,
+                            max_ev=excluded.max_ev,
+                            support_count=excluded.support_count,
+                            cost_yen=excluded.cost_yen,
+                            payout_yen=excluded.payout_yen,
+                            return_rate=excluded.return_rate,
+                            rescored_at=excluded.rescored_at
+                    """,(
+                        str(row["race_key"]),str(row["plan_hash"]),str(row["app_version"] or 'Unknown'),
+                        str(row["created_at"] or ''),str(rec.get("label") or "見送り寄り"),
+                        1 if rec.get("recommended") else 0,float(rec.get("max_ev",0.0) or 0.0),
+                        int(rec.get("support_count",0) or 0),int(row["cost_yen"] or 0),
+                        int(row["payout_yen"] or 0),float(row["return_rate"] or 0.0),
+                        _v228_now_jst_iso(),
+                    ))
+                    out["rescored"]+=1
+                    out["recommended"]+=int(bool(rec.get("recommended")))
+                except Exception as exc:
+                    if len(out["errors"])<10:
+                        out["errors"].append(f"{row['race_key']}: {type(exc).__name__}: {exc}")
+            con.commit()
+        return out
+    except Exception as exc:
+        out["errors"].append(f"{type(exc).__name__}: {exc}")
+        return out
+
+
+def _v304_legacy_rescore_summary(db_path: str) -> dict:
+    out={"races":0,"recommended":0,"cost":0,"payout":0,"recommended_cost":0,"recommended_payout":0}
+    try:
+        _v304_ensure_legacy_plan_rescore_table(db_path)
+        with sqlite3.connect(str(db_path)) as con:
+            r=con.execute("""
+                SELECT COUNT(*),SUM(recommended),SUM(cost_yen),SUM(payout_yen),
+                       SUM(CASE WHEN recommended=1 THEN cost_yen ELSE 0 END),
+                       SUM(CASE WHEN recommended=1 THEN payout_yen ELSE 0 END)
+                FROM v304_legacy_plan_rescore
+            """).fetchone()
+        if r:
+            out.update(races=int(r[0] or 0),recommended=int(r[1] or 0),cost=int(r[2] or 0),
+                       payout=int(r[3] or 0),recommended_cost=int(r[4] or 0),recommended_payout=int(r[5] or 0))
+        if out["cost"]>0: out["return_rate"]=out["payout"]/out["cost"]*100.0
+        if out["recommended_cost"]>0: out["recommended_return_rate"]=out["recommended_payout"]/out["recommended_cost"]*100.0
+    except Exception as exc:
+        out["error"]=f"{type(exc).__name__}: {exc}"
     return out
 
 def _v304_common_race_keys_for_versions(db_path, versions):
@@ -16641,6 +16832,7 @@ selected_main_page = st.session_state.get("v155_main_page", _main_pages[0])
 
 
 def _v278_render_background_quick_page(db_path: str) -> None:
+    _pop304={}
     st.subheader("⏱️ 再シミュレーション")
     st.caption("ここから開始・進捗確認・停止・手動再開ができます。")
 
@@ -16652,12 +16844,40 @@ def _v278_render_background_quick_page(db_path: str) -> None:
                 f"{_V231_APP_VERSION}採点済み {_pop304['current_evaluated']}R ｜ "
                 f"残り {_pop304['remaining']}R"
             )
-            if int(_pop304.get("no_saved_history_remaining", 0) or 0) > 0:
+            if int(_pop304.get("remaining",0) or 0)>0:
                 st.caption(
-                    f"残りのうち保存予測履歴から一括再シミュレーション可能 "
-                    f"{_pop304['replayable_remaining']}R / "
-                    f"元の保存予測履歴なし {_pop304['no_saved_history_remaining']}R。"
+                    f"完全再シミュレーション可能 {_pop304['replayable_remaining']}R / "
+                    f"旧保存プラン再採点対象 {_pop304['no_saved_history_remaining']}R。"
                 )
+                if int(_pop304.get("no_saved_history_remaining",0) or 0)>0:
+                    st.warning(
+                        "旧30Rは元の出走表payloadが残っていないため、現行モデルを完全再計算はできません。"
+                        "ただし保存済み買い目は残っているので、Ver301と同じ強推奨基準で公平に再採点できます。"
+                    )
+                    if int(_pop304.get("legacy_rescore_pending",0) or 0)>0:
+                        if st.button(
+                            f"▶ 旧保存プラン {_pop304['legacy_rescore_pending']}R を強推奨基準で再採点",
+                            key="v304_legacy_rescore_missing",use_container_width=True
+                        ):
+                            _lr304=_v304_legacy_rescore_missing_without_history(db_path,_V231_APP_VERSION)
+                            if _lr304.get("errors"):
+                                st.warning(
+                                    f"再採点 {_lr304.get('rescored',0)}R / エラー {len(_lr304.get('errors') or [])}件"
+                                )
+                            else:
+                                st.success(
+                                    f"旧保存プラン {_lr304.get('rescored',0)}R の再採点が完了しました。"
+                                )
+                            st.rerun()
+                    _ls304=_v304_legacy_rescore_summary(db_path)
+                    if int(_ls304.get("races",0) or 0)>0:
+                        _rr304=_ls304.get("recommended_return_rate")
+                        _rrtxt304=(f" / 強推奨対象の実績回収率 {_rr304:.1f}%" if _rr304 is not None else "")
+                        st.caption(
+                            f"旧データ再採点済み {_ls304['races']}R / "
+                            f"強推奨 {_ls304['recommended']}R{_rrtxt304}。"
+                            "※現行モデル再シミュではなく、当時保存されたプランの推奨判定だけを統一した監査です。"
+                        )
     except Exception:
         pass
 
@@ -16807,11 +17027,18 @@ def _v278_render_background_quick_page(db_path: str) -> None:
                 st.error(f"終了処理失敗: {type(exc).__name__}: {exc}")
 
     else:
+        _no_true_pending304=(
+            not bool(force_current)
+            and int((_pop304 or {}).get("replayable_remaining",0) or 0)<=0
+        )
+        if _no_true_pending304:
+            st.caption("未処理の『完全再シミュレーション可能』レースは0Rです。上の旧保存プラン再採点を使用してください。")
         if st.button(
             f"▶ バックグラウンドで{_V231_APP_VERSION}再シミュレーション開始",
             key="v278_quick_start",
             type="primary",
             use_container_width=True,
+            disabled=_no_true_pending304,
         ):
             r=_v278_bg_start(db_path,int(limit_count),bool(force_current))
             if r.get("ok"):
