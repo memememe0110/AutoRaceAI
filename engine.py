@@ -19979,3 +19979,86 @@ def v197_same_day_trend_profile(meta=None, db_path=DB_PATH):
         return dict(s["v197_day_trend"])
     return _v305_base_v197_same_day_trend_profile(meta, db_path)
 
+
+
+# ============================================================
+# Ver305 result-input hotfix5:
+# 軽量通常結果の「振り分け判定」を強制・堅牢化
+# ============================================================
+
+_v305_prev_result_text_fix5 = v35_parse_result_text
+
+
+def _v305_is_compact_result_strict_header(text):
+    """通常-結果ラベルが欠けても、表ヘッダから軽量結果形式を確定する。"""
+    raw = v15_clean_text(text)
+    s = re.sub(r"\s+", " ", raw)
+
+    has_result_header = bool(
+        re.search(r"着\s*事\s*車\s*選手名", s)
+        and re.search(r"競走車名\s*H\s*試T\s*競T\s*ST", s)
+    )
+    has_result_values = bool(
+        re.search(
+            r"(?m)^\s*[1-8](?:\s+|\t+)+[1-8]\s*$",
+            raw,
+        )
+        or re.search(
+            r"(?m)^\s*[1-8]\s*$\s*\n\s*[1-8]\s*$",
+            raw,
+        )
+    )
+    has_payout_or_laps = ("払戻金" in s) or ("グランドノート" in s)
+
+    # 「通常-結果」があれば最優先。
+    if "通常-結果" in s and has_result_header:
+        return True
+
+    # ラベルがコピーで落ちても、結果専用ヘッダ＋着順行＋払戻/周回が揃えば確定。
+    return bool(has_result_header and has_result_values and has_payout_or_laps)
+
+
+def v35_parse_result_text(text, venue_override="", race_no_override=""):
+    # Ver305 fix5:
+    # 旧 _v305_is_compact_result() がfalseでも、表ヘッダで軽量結果と判定できれば
+    # 必ず専用parserへ送る。legacy parserへの誤フォールバックを止める。
+    if _v305_is_compact_result_strict_header(text):
+        body_race_no = _v305_detect_compact_result_race_no(text)
+
+        # 本文Rが取れたら、保存済みの古い補助Rは一切使わない。
+        effective_override = "" if body_race_no is not None else race_no_override
+        meta = _v305_compact_result_meta_strict(text, venue_override, effective_override)
+        if body_race_no is not None:
+            meta["レース"] = int(body_race_no)
+
+        rows = _v305_compact_result_rows_strict(text)
+        laps = _v305_parse_compact_laps(text)
+        payouts = _v305_parse_compact_payouts(text)
+
+        # 軽量結果で正常完走している行は H/試T/競T/ST を必須確認。
+        if isinstance(rows, pd.DataFrame) and not rows.empty:
+            normal = rows[rows["結果区分"].astype(str).eq("通常")].copy()
+            missing = []
+            for col in ["ハンデ", "試走T", "競走T", "ST"]:
+                if col not in normal.columns or normal[col].isna().any():
+                    missing.append(col)
+            if missing:
+                raise ValueError(
+                    "軽量通常結果の専用解析には入りましたが、"
+                    f"{'/'.join(missing)} に欠損があります。"
+                )
+
+        if not meta.get("開催日") or not meta.get("開催場") or not meta.get("レース"):
+            raise ValueError(
+                f"メタ情報不足: 開催日={meta.get('開催日')} / "
+                f"開催場={meta.get('開催場')} / R={meta.get('レース')}"
+            )
+
+        # 監査用。画面・保存側で専用parser使用を確認できる。
+        meta = dict(meta)
+        meta["_結果解析形式"] = "compact_result_v305_fix5"
+        meta["_本文R優先"] = bool(body_race_no is not None)
+        return meta, rows, laps, payouts
+
+    return _v305_prev_result_text_fix5(text, venue_override, race_no_override)
+
