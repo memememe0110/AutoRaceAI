@@ -3211,6 +3211,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         "roi_cost_yen":0,"roi_payout_yen":0,"roi_hits":0,"roi_rows":[],
         "roi_plus_cost_yen":0,"roi_plus_payout_yen":0,"roi_plus_extra_points":0,
     }
+    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver304')
     # Ver289 hotfix:
     # limitは「履歴行数」ではなく「重複を除いたレース数」として扱う。
     # 旧実装は最新limit件の履歴行だけ取得してからrace_key重複除去していたため、
@@ -3235,6 +3236,14 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         histories=[dict(r) for r in _rows289]
     except Exception:
         histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
+
+    # Ver304 hotfix2:
+    # v231履歴が無い過去レースも、v222保存入力または
+    # 結果DBの「事前判明項目だけ」から安全に再構成して候補へ追加する。
+    try:
+        histories.extend(_v304_missing_full_replay_records(db_path,current_ver))
+    except Exception:
+        pass
 
     # 既にSQL側でrace_keyごと最新1件だが、旧DB/フォールバック時の安全用に重複除去。
     unique=[]; seen=set()
@@ -3271,7 +3280,6 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
     unique=[x[4] for x in chronological]
 
     total=len(unique)
-    current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver271')
     # Ver276 speed: 現行Ver済み判定を N件のpayload展開 + N回COUNT から、
     # まとめSQL + 対象レースの最新payloadだけの確認へ変更。予測値・スキップ条件は変更しない。
     current_keys=set()
@@ -3373,6 +3381,8 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 pass
         out['checked']+=1
         label=str(h.get('race_label') or h.get('race_key') or f'履歴{idx}')
+        if h.get('_v304_input_source')=='result_prerace_safe_rebuild':
+            label += "｜事前情報再構成"
         try:
             if callable(progress_cb):
                 progress_cb(idx-1,total,label)
@@ -3380,14 +3390,20 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             if (not force_current) and race_key0 in current_complete_keys and race_key0 in current_audit_complete_keys:
                 out['skipped_current']+=1
                 continue
-            view, raw_text, venue_override, hm=_v231_load_prediction_history(db_path,int(h.get('history_id') or 0))
-            if not view or not str(raw_text or '').strip():
+            if str(h.get('_v304_raw_text') or '').strip():
+                view=h.get('_v304_view') if isinstance(h.get('_v304_view'),dict) else {}
+                raw_text=str(h.get('_v304_raw_text') or '')
+                venue_override=str(h.get('_v304_venue_override') or '')
+                hm={'app_version':str(h.get('app_version') or 'Unknown')}
+            else:
+                view, raw_text, venue_override, hm=_v231_load_prediction_history(db_path,int(h.get('history_id') or 0))
+            if not str(raw_text or '').strip():
                 out['no_text']+=1
                 continue
-            src_ver=str((hm or {}).get('app_version') or h.get('app_version') or view.get('app_version') or 'Unknown')
-            trials=int(h.get('trials') or view.get('trials') or 20000)
-            seed=int(h.get('seed') or view.get('seed') or 42)
-            excluded=[int(x) for x in (view.get('excluded') or [])]
+            src_ver=str((hm or {}).get('app_version') or h.get('app_version') or (view or {}).get('app_version') or 'Unknown')
+            trials=int(h.get('trials') or (view or {}).get('trials') or 20000)
+            seed=int(h.get('seed') or (view or {}).get('seed') or 20260719)
+            excluded=[int(x) for x in ((view or {}).get('excluded') or [])]
             prediction_text=str(raw_text)
             if str(venue_override or '').strip():
                 prediction_text=f"開催場: {str(venue_override).strip()}\n"+prediction_text
@@ -3424,6 +3440,9 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 'rerun_from_restored':True,'rerun_source_version':src_ver,
                 'rerun_source_history_id':int(h.get('history_id') or 0),
                 'batch_rerun':True,'walk_forward_v269':True,
+                'input_source_v304':str(h.get('_v304_input_source') or 'v231_prediction_history'),
+                'input_reconstructed_v304':bool(h.get('_v304_input_source')=='result_prerace_safe_rebuild'),
+                'input_rebuild_audit_v304':h.get('_v304_rebuild_audit') if isinstance(h.get('_v304_rebuild_audit'),dict) else {},
             }
             hid=_v231_save_prediction_history(db_path,race_key,raw_text,venue_override,prediction_view,trials,seed)
             if callable(progress_cb):
@@ -10901,20 +10920,142 @@ def _v304_all_calculable_race_keys(db_path):
 
 
 
-def _v304_roi_population_status(db_path, current_ver):
-    """回収率計算可能な全レースと、現行Ver採点済み・残りを数える。"""
-    out = {
-        "all_calculable": 0,
-        "current_evaluated": 0,
-        "remaining": 0,
-        "replayable_remaining": 0,
-        "no_saved_history_remaining": 0,
-        "legacy_rescored": 0,
-        "legacy_rescore_pending": 0,
-    }
+
+_V304_SAFE_REBUILD_INPUT = "2026-08-16-v2"
+
+def _v304_safe_result_rebuild_keys(db_path: str) -> set[str]:
+    """結果DBから、事前に判明していた項目だけで出走表を再構成できるrace_key。"""
     try:
         with sqlite3.connect(str(db_path)) as con:
-            all_rows = con.execute("""
+            rows = con.execute("""
+                SELECT rr.race_key,
+                       COUNT(CASE
+                           WHEN COALESCE(TRIM(re.player_name),'')<>''
+                            AND re.car_no IS NOT NULL
+                            AND COALESCE(TRIM(re.result_status),'通常')
+                                NOT IN ('欠車','出走取消','出走取り消し','不出走','除外','参加解除')
+                           THEN 1 END) AS starters,
+                       COUNT(CASE
+                           WHEN COALESCE(TRIM(re.player_name),'')<>''
+                            AND re.car_no IS NOT NULL
+                            AND re.trial_time IS NOT NULL
+                            AND COALESCE(TRIM(re.result_status),'通常')
+                                NOT IN ('欠車','出走取消','出走取り消し','不出走','除外','参加解除')
+                           THEN 1 END) AS trial_rows
+                  FROM result_races rr
+                  JOIN result_entries re ON re.race_key=rr.race_key
+                 WHERE COALESCE(TRIM(rr.race_date),'')<>''
+                   AND COALESCE(TRIM(rr.venue),'')<>''
+                   AND COALESCE(TRIM(rr.race_no),'')<>''
+                 GROUP BY rr.race_key
+                HAVING starters>=2 AND trial_rows>=2
+            """).fetchall()
+        return {str(r[0]) for r in rows if r and r[0]}
+    except Exception:
+        return set()
+
+
+def _v304_build_safe_prediction_text_from_result(db_path: str, race_key: str) -> tuple[str, dict]:
+    """結果登録DBから「レース前に判明していた項目だけ」を使い、再予測用テキストを作る。
+
+    使用:
+      日付 / 開催場 / R / 走路状態 / 走路温度 / 気温 / 湿度 /
+      車番 / 選手名 / ハンデ / 試走T
+
+    不使用:
+      着順 / 競走T / 実際のST / 払戻 / 結果ステータス由来の走力情報
+    """
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory = sqlite3.Row
+            rr = con.execute("""
+                SELECT race_key,race_date,venue,race_no,surface,track_temp,air_temp,humidity
+                  FROM result_races
+                 WHERE race_key=?
+            """, (str(race_key or ""),)).fetchone()
+            if not rr:
+                return "", {"reason":"result_racesなし"}
+
+            ents = con.execute("""
+                SELECT car_no,player_name,handicap,trial_time,result_status
+                  FROM result_entries
+                 WHERE race_key=?
+                 ORDER BY car_no
+            """, (str(race_key or ""),)).fetchall()
+
+        usable = []
+        nonstarter = {'欠車','出走取消','出走取り消し','不出走','除外','参加解除'}
+        for e in ents:
+            status = str(e["result_status"] or "通常").strip()
+            if status in nonstarter:
+                continue
+            if e["car_no"] is None or not str(e["player_name"] or "").strip():
+                continue
+            usable.append(e)
+        if len(usable) < 2:
+            return "", {"reason":"再構成可能な出走者不足"}
+
+        date_s = str(rr["race_date"] or "")[:10]
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", date_s)
+        if not m:
+            return "", {"reason":"日付不正"}
+        yy, mm, dd = [int(x) for x in m.groups()]
+        rno_m = re.search(r"\d+", str(rr["race_no"] or ""))
+        if not rno_m:
+            return "", {"reason":"R番号不正"}
+        rno = int(rno_m.group())
+
+        surface = str(rr["surface"] or "良走路").strip() or "良走路"
+        track_temp = float(rr["track_temp"]) if rr["track_temp"] is not None else 30.0
+
+        lines = [
+            f"{rno}R",
+            f"{yy}年{mm}月{dd}日",
+            str(rr["venue"] or "").strip(),
+            f"3100m {len(usable)}車 6周",
+            f"{surface} /{track_temp:g}℃",
+        ]
+        if rr["air_temp"] is not None:
+            lines.append(f"気温：{float(rr['air_temp']):g}℃")
+        if rr["humidity"] is not None:
+            lines.append(f"湿度：{float(rr['humidity']):g}%")
+
+        for e in usable:
+            h = re.search(r"-?\d+", str(e["handicap"] or "0"))
+            hnum = int(h.group()) if h else 0
+            trial = e["trial_time"]
+            if trial is not None:
+                lines.append(
+                    f"{int(e['car_no'])} {str(e['player_name']).strip()} "
+                    f"{hnum}m {float(trial):.2f}"
+                )
+            else:
+                lines.append(
+                    f"{int(e['car_no'])} {str(e['player_name']).strip()} {hnum}m"
+                )
+
+        return "\n".join(lines), {
+            "source":"result_prerace_safe_rebuild",
+            "race_key":str(race_key or ""),
+            "fields":[
+                "race_date","venue","race_no","surface","track_temp","air_temp","humidity",
+                "car_no","player_name","handicap","trial_time"
+            ],
+            "excluded_future_fields":[
+                "finish","race_time","start_time(actual_ST)","payout","winning_types"
+            ],
+        }
+    except Exception as exc:
+        return "", {"reason":f"{type(exc).__name__}: {exc}"}
+
+
+def _v304_missing_full_replay_records(db_path: str, current_ver: str) -> list[dict]:
+    """現行Ver未採点の回収率計算可能レースを、保存入力または安全再構成入力で再実行候補化。"""
+    result = []
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory = sqlite3.Row
+            calc = {str(r[0]) for r in con.execute("""
                 SELECT DISTINCT r.race_key
                   FROM v187_mixed_plan_runs r
                   JOIN v187_mixed_plan_feedback f
@@ -10923,10 +11064,8 @@ def _v304_roi_population_status(db_path, current_ver):
                    AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
                    AND f.cost_yen IS NOT NULL
                    AND f.payout_yen IS NOT NULL
-            """).fetchall()
-            all_keys = {str(x[0]) for x in all_rows if x and x[0]}
-
-            cur_rows = con.execute("""
+            """).fetchall() if r and r[0]}
+            cur = {str(r[0]) for r in con.execute("""
                 SELECT DISTINCT r.race_key
                   FROM v187_mixed_plan_runs r
                   JOIN v187_mixed_plan_feedback f
@@ -10936,40 +11075,158 @@ def _v304_roi_population_status(db_path, current_ver):
                    AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
                    AND f.cost_yen IS NOT NULL
                    AND f.payout_yen IS NOT NULL
-            """, (str(current_ver or ""),)).fetchall()
-            cur_keys = {str(x[0]) for x in cur_rows if x and x[0]}
+            """,(str(current_ver or ""),)).fetchall() if r and r[0]}
+            hist = {str(r[0]) for r in con.execute("""
+                SELECT DISTINCT race_key FROM v231_prediction_history
+                 WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+            """).fetchall() if r and r[0]}
+            try:
+                restore = {
+                    str(r[0]) for r in con.execute("""
+                        SELECT race_key FROM v222_prediction_restore
+                         WHERE COALESCE(TRIM(raw_text),'')<>''
+                    """).fetchall() if r and r[0]
+                }
+            except Exception:
+                restore = set()
+
+            latest_source = {}
+            for rk, ver in con.execute("""
+                SELECT race_key,app_version FROM (
+                    SELECT race_key,COALESCE(NULLIF(app_version,''),'Unknown') app_version,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY race_key
+                               ORDER BY created_at DESC,plan_hash DESC
+                           ) rn
+                      FROM v187_mixed_plan_runs
+                     WHERE COALESCE(include_in_live_stats,1)=1
+                ) WHERE rn=1
+            """).fetchall():
+                latest_source[str(rk)] = str(ver or "Unknown")
+
+        missing = sorted(calc - cur)
+        for rk in missing:
+            # Normal v231 history is already supplied by the normal batch path.
+            if rk in hist:
+                continue
+
+            if rk in restore:
+                view, raw_text, venue_override = _v222_load_prediction_restore(db_path, rk)
+                if str(raw_text or "").strip():
+                    result.append({
+                        "history_id":0,
+                        "race_key":rk,
+                        "race_label":_v222_race_label((view or {}).get("meta") or {},rk),
+                        "app_version":str((view or {}).get("app_version") or latest_source.get(rk) or "Unknown"),
+                        "simulation_mode":"restore_fallback",
+                        "settings_hash":"",
+                        "prediction_time":"",
+                        "trials":int((view or {}).get("trials") or 20000),
+                        "seed":int((view or {}).get("seed") or 20260719),
+                        "_v304_raw_text":str(raw_text),
+                        "_v304_venue_override":str(venue_override or ""),
+                        "_v304_view":view if isinstance(view,dict) else {},
+                        "_v304_input_source":"saved_restore",
+                    })
+                    continue
+
+            raw_text, audit = _v304_build_safe_prediction_text_from_result(db_path, rk)
+            if str(raw_text or "").strip():
+                m = re.match(r'^(\d{8})_(.+?)_(\d+)R$', rk)
+                label = rk
+                if m:
+                    d8, venue, rno = m.groups()
+                    label = f"{d8[:4]}-{d8[4:6]}-{d8[6:8]} {venue} {int(rno)}R"
+                result.append({
+                    "history_id":0,
+                    "race_key":rk,
+                    "race_label":label,
+                    "app_version":latest_source.get(rk,"Unknown"),
+                    "simulation_mode":"safe_result_rebuild",
+                    "settings_hash":"",
+                    "prediction_time":"",
+                    "trials":20000,
+                    "seed":20260719,
+                    "_v304_raw_text":raw_text,
+                    "_v304_venue_override":"",
+                    "_v304_view":{},
+                    "_v304_input_source":"result_prerace_safe_rebuild",
+                    "_v304_rebuild_audit":audit,
+                })
+        return result
+    except Exception:
+        return []
+
+def _v304_roi_population_status(db_path, current_ver):
+    """回収率計算可能な全レースと、現行Ver採点済み・再シミュ可能な残りを数える。"""
+    out = {
+        "all_calculable":0,
+        "current_evaluated":0,
+        "remaining":0,
+        "replayable_remaining":0,
+        "saved_history_remaining":0,
+        "saved_restore_remaining":0,
+        "safe_rebuild_remaining":0,
+        "no_input_remaining":0,
+    }
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            all_keys = {str(r[0]) for r in con.execute("""
+                SELECT DISTINCT r.race_key
+                  FROM v187_mixed_plan_runs r
+                  JOIN v187_mixed_plan_feedback f
+                    ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                 WHERE COALESCE(r.include_in_live_stats,1)=1
+                   AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
+                   AND f.cost_yen IS NOT NULL
+                   AND f.payout_yen IS NOT NULL
+            """).fetchall() if r and r[0]}
+
+            cur_keys = {str(r[0]) for r in con.execute("""
+                SELECT DISTINCT r.race_key
+                  FROM v187_mixed_plan_runs r
+                  JOIN v187_mixed_plan_feedback f
+                    ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                 WHERE COALESCE(NULLIF(r.app_version,''),'Unknown')=?
+                   AND COALESCE(r.include_in_live_stats,1)=1
+                   AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
+                   AND f.cost_yen IS NOT NULL
+                   AND f.payout_yen IS NOT NULL
+            """,(str(current_ver or ""),)).fetchall() if r and r[0]}
+
+            hist_keys = {str(r[0]) for r in con.execute("""
+                SELECT DISTINCT race_key FROM v231_prediction_history
+                 WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+            """).fetchall() if r and r[0]}
 
             try:
-                hist_rows = con.execute("""
-                    SELECT DISTINCT race_key
-                      FROM v231_prediction_history
-                     WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
-                """).fetchall()
-                hist_keys = {str(x[0]) for x in hist_rows if x and x[0]}
+                restore_keys = {str(r[0]) for r in con.execute("""
+                    SELECT race_key FROM v222_prediction_restore
+                     WHERE COALESCE(TRIM(raw_text),'')<>''
+                """).fetchall() if r and r[0]}
             except Exception:
-                hist_keys = set()
+                restore_keys = set()
 
+        rebuild_keys = _v304_safe_result_rebuild_keys(db_path)
         remaining = all_keys - cur_keys
-        replayable = remaining & hist_keys
-        _legacy_done=set()
-        try:
-            _legacy_done={str(r[0]) for r in con.execute(
-                "SELECT race_key FROM v304_legacy_plan_rescore"
-            ).fetchall() if r and r[0]}
-        except Exception:
-            _legacy_done=set()
-        _legacy_candidates=remaining-hist_keys
+        saved_hist = remaining & hist_keys
+        saved_restore = (remaining - hist_keys) & restore_keys
+        rebuild = (remaining - hist_keys - restore_keys) & rebuild_keys
+        replayable = saved_hist | saved_restore | rebuild
+        no_input = remaining - replayable
+
         out.update(
             all_calculable=len(all_keys),
             current_evaluated=len(all_keys & cur_keys),
             remaining=len(remaining),
             replayable_remaining=len(replayable),
-            no_saved_history_remaining=len(_legacy_candidates),
-            legacy_rescored=len(_legacy_candidates & _legacy_done),
-            legacy_rescore_pending=len(_legacy_candidates - _legacy_done),
+            saved_history_remaining=len(saved_hist),
+            saved_restore_remaining=len(saved_restore),
+            safe_rebuild_remaining=len(rebuild),
+            no_input_remaining=len(no_input),
         )
     except Exception as exc:
-        out["error"] = f"{type(exc).__name__}: {exc}"
+        out["error"]=f"{type(exc).__name__}: {exc}"
     return out
 
 
@@ -16846,38 +17103,21 @@ def _v278_render_background_quick_page(db_path: str) -> None:
             )
             if int(_pop304.get("remaining",0) or 0)>0:
                 st.caption(
-                    f"完全再シミュレーション可能 {_pop304['replayable_remaining']}R / "
-                    f"旧保存プラン再採点対象 {_pop304['no_saved_history_remaining']}R。"
+                    f"完全再シミュレーション可能 {_pop304['replayable_remaining']}R "
+                    f"（保存履歴 {_pop304['saved_history_remaining']}R / "
+                    f"保存復元入力 {_pop304['saved_restore_remaining']}R / "
+                    f"事前情報再構成 {_pop304['safe_rebuild_remaining']}R）"
                 )
-                if int(_pop304.get("no_saved_history_remaining",0) or 0)>0:
+                if int(_pop304.get("safe_rebuild_remaining",0) or 0)>0:
                     st.warning(
-                        "旧30Rは元の出走表payloadが残っていないため、現行モデルを完全再計算はできません。"
-                        "ただし保存済み買い目は残っているので、Ver301と同じ強推奨基準で公平に再採点できます。"
+                        f"うち {_pop304['safe_rebuild_remaining']}R は元の出走表全文が無いため、"
+                        "結果DBに残っている『レース前に判明していた項目』だけから入力を再構成して再計算します。"
+                        "着順・競走T・実際のST・払戻は予測入力に使いません。"
                     )
-                    if int(_pop304.get("legacy_rescore_pending",0) or 0)>0:
-                        if st.button(
-                            f"▶ 旧保存プラン {_pop304['legacy_rescore_pending']}R を強推奨基準で再採点",
-                            key="v304_legacy_rescore_missing",use_container_width=True
-                        ):
-                            _lr304=_v304_legacy_rescore_missing_without_history(db_path,_V231_APP_VERSION)
-                            if _lr304.get("errors"):
-                                st.warning(
-                                    f"再採点 {_lr304.get('rescored',0)}R / エラー {len(_lr304.get('errors') or [])}件"
-                                )
-                            else:
-                                st.success(
-                                    f"旧保存プラン {_lr304.get('rescored',0)}R の再採点が完了しました。"
-                                )
-                            st.rerun()
-                    _ls304=_v304_legacy_rescore_summary(db_path)
-                    if int(_ls304.get("races",0) or 0)>0:
-                        _rr304=_ls304.get("recommended_return_rate")
-                        _rrtxt304=(f" / 強推奨対象の実績回収率 {_rr304:.1f}%" if _rr304 is not None else "")
-                        st.caption(
-                            f"旧データ再採点済み {_ls304['races']}R / "
-                            f"強推奨 {_ls304['recommended']}R{_rrtxt304}。"
-                            "※現行モデル再シミュではなく、当時保存されたプランの推奨判定だけを統一した監査です。"
-                        )
+                if int(_pop304.get("no_input_remaining",0) or 0)>0:
+                    st.caption(
+                        f"入力材料が足りず完全再計算できないレース {_pop304['no_input_remaining']}R。"
+                    )
     except Exception:
         pass
 
@@ -17032,7 +17272,7 @@ def _v278_render_background_quick_page(db_path: str) -> None:
             and int((_pop304 or {}).get("replayable_remaining",0) or 0)<=0
         )
         if _no_true_pending304:
-            st.caption("未処理の『完全再シミュレーション可能』レースは0Rです。上の旧保存プラン再採点を使用してください。")
+            st.caption("未処理の再シミュレーション可能レースは0Rです。")
         if st.button(
             f"▶ バックグラウンドで{_V231_APP_VERSION}再シミュレーション開始",
             key="v278_quick_start",
