@@ -19519,3 +19519,230 @@ def _v305_parse_compact_result_entries(text):
         )
     return pd.DataFrame(rows)
 
+
+
+# ============================================================
+# Ver305 result-input hotfix3:
+# 軽量「通常-結果」は専用メタ/行パーサーを最優先
+# ============================================================
+
+_v305_prev_result_text_fix3 = v35_parse_result_text
+
+
+def _v305_compact_result_meta_strict(text, venue_override="", race_no_override=""):
+    """下部の1R〜12Rナビを絶対にレース番号へ使わない。"""
+    raw = v15_clean_text(text)
+    compact = re.sub(r"\s+", " ", raw)
+
+    meta = _v35_parse_meta(text, venue_override, "")
+    # まず開催年
+    year = None
+    ym = re.search(r"開催期間\s*[:：]\s*(20\d{2})年", compact)
+    if ym:
+        year = int(ym.group(1))
+    if year is None:
+        ym = re.search(r"(20\d{2})年\d{1,2}月\d{1,2}日", compact)
+        if ym:
+            year = int(ym.group(1))
+
+    # 「日付 レース 距離 天候」の直後だけを見る。
+    table = re.search(
+        r"日付\s*レース\s*距離\s*天候\s*"
+        r"(\d{1,2})月\s*(\d{1,2})日(?:\([^)]*\))?\s*"
+        r"([^\s]*?)(\d{1,2})R\s*"
+        r"(\d{4})m\s*"
+        r"(晴|曇|雨|小雨|雪)",
+        compact
+    )
+    if table:
+        month = int(table.group(1))
+        day = int(table.group(2))
+        race_no = int(table.group(4))
+        distance = int(table.group(5))
+        weather = table.group(6)
+        if year:
+            meta["開催日"] = f"{year:04d}-{month:02d}-{day:02d}"
+        meta["レース"] = race_no
+        meta["距離"] = distance
+        meta["天候"] = weather
+
+    # 補助入力が明示された場合だけ最終上書き。
+    if str(race_no_override or "").strip():
+        m = re.search(r"\d+", str(race_no_override))
+        if m:
+            meta["レース"] = int(m.group())
+
+    # 開催場はタイトルから
+    venues = ["川口","伊勢崎","浜松","山陽","飯塚"]
+    if str(venue_override or "").strip():
+        meta["開催場"] = str(venue_override).strip()
+    else:
+        for v in venues:
+            if v in raw:
+                meta["開催場"] = v
+                break
+
+    # 気象横表
+    wm = re.search(
+        r"気温\s*湿度\s*走路温度\s*走路状況\s*"
+        r"(-?\d+(?:\.\d+)?)℃\s*"
+        r"(\d+(?:\.\d+)?)%\s*"
+        r"(-?\d+(?:\.\d+)?)℃\s*"
+        r"(良走路|湿走路|斑走路|風走路|荒走路)",
+        compact
+    )
+    if wm:
+        meta["気温"] = float(wm.group(1))
+        meta["湿度"] = float(wm.group(2))
+        meta["走路温度"] = float(wm.group(3))
+        meta["走路状態"] = wm.group(4)
+
+    sm = re.search(r"発走予定\s*(\d{1,2}:\d{2})", compact)
+    if sm:
+        meta["発走時刻"] = sm.group(1)
+
+    return meta
+
+
+def _v305_compact_result_rows_strict(text):
+    """通常-結果の表だけを読む。競走T/STを欠損にしない。"""
+    # ヘッダから払戻金までだけ
+    s = text.find("着")
+    e = text.find("払戻金", s if s >= 0 else 0)
+    block = text[s:e if e >= 0 else len(text)]
+
+    # 改行単位。タブは列境界なのでスペースへ。
+    lines = [re.sub(r"[\t\u3000]+", " ", x).strip() for x in block.splitlines()]
+    lines = [x for x in lines if x]
+
+    rows = []
+    i = 0
+
+    def numeric_result_line(v):
+        return re.match(
+            r"^(-?\d+)\s+"
+            r"(?:再)?(\d\.\d{2,3}|-)\s+"
+            r"(\d\.\d{3}|0(?:\.000)?)\s+"
+            r"([+-]?\d?\.\d{2,3}|-)"
+            r"(?:\s+(.*))?$",
+            v
+        )
+
+    while i < len(lines):
+        finish = car = None
+
+        # パターンA: "1 1"
+        m = re.fullmatch(r"([1-8])\s+([1-8])", lines[i])
+        if m:
+            finish, car = int(m.group(1)), int(m.group(2))
+            i += 1
+        # パターンB: "1" / "1" が別行
+        elif (
+            re.fullmatch(r"[1-8]", lines[i])
+            and i + 1 < len(lines)
+            and re.fullmatch(r"[1-8]", lines[i+1])
+        ):
+            finish, car = int(lines[i]), int(lines[i+1])
+            i += 2
+        else:
+            i += 1
+            continue
+
+        # 選手名
+        if i >= len(lines):
+            break
+        name = lines[i]
+        i += 1
+
+        # 競走車名。次行が数値行でなければ車名。
+        car_name = ""
+        if i < len(lines) and not numeric_result_line(lines[i]):
+            car_name = lines[i]
+            i += 1
+
+        # H/試T/競T/ST が一行
+        if i >= len(lines):
+            break
+        rm = numeric_result_line(lines[i])
+
+        # もし4項目が別行なら連結
+        if not rm:
+            toks = []
+            j = i
+            while j < len(lines) and len(toks) < 6:
+                if re.fullmatch(r"-?\d+|(?:再)?\d\.\d{2,3}|-", lines[j]):
+                    toks.append(lines[j])
+                    j += 1
+                else:
+                    break
+            if len(toks) >= 4:
+                rm = numeric_result_line(" ".join(toks))
+                if rm:
+                    i = j
+
+        if not rm:
+            # この車だけ飛ばすのではなく、異常を明確化
+            raise ValueError(
+                f"{finish}着 {car}番 {name} の H/試T/競T/ST を解析できませんでした。"
+            )
+
+        if i < len(lines) and numeric_result_line(lines[i]):
+            i += 1
+
+        handicap = int(rm.group(1))
+        trial = np.nan if rm.group(2) == "-" else float(rm.group(2))
+        race_t = np.nan if rm.group(3) in {"0","0.000"} else float(rm.group(3))
+        st = np.nan if rm.group(4) == "-" else float(rm.group(4))
+        tail = (rm.group(5) or "").strip()
+
+        # 早見は事故ではない
+        tail = re.sub(r"(?:^|\s)\d{1,2}R\s*$", "", tail).strip()
+        if i < len(lines) and re.fullmatch(r"\d{1,2}R", lines[i]):
+            i += 1
+
+        rows.append({
+            "着順": finish,
+            "車番": car,
+            "選手名": v15_normalize_name(name),
+            "所属": "",
+            "ハンデ": handicap,
+            "試走T": trial,
+            "競走T": race_t,
+            "ST": st,
+            "人気": np.nan,
+            "事故": tail,
+            "結果区分": "通常" if not tail else tail,
+            "競走車名": car_name,
+        })
+
+    if len(rows) < 3:
+        raise ValueError(f"通常-結果を解析できませんでした。解析車数 {len(rows)}。")
+    df = pd.DataFrame(rows).sort_values("着順").reset_index(drop=True)
+
+    # 通常完走車は競走T/ST必須。安全チェックへ空値を渡さない。
+    bad = df[
+        (df["結果区分"].astype(str) == "通常")
+        & (df["競走T"].isna() | df["ST"].isna())
+    ]
+    if not bad.empty:
+        cars = ",".join(str(int(x)) for x in bad["車番"].tolist())
+        raise ValueError(f"競走T/STを取得できない車があります: {cars}番")
+    return df
+
+
+def v35_parse_result_text(text, venue_override="", race_no_override=""):
+    if not _v305_is_compact_result(text):
+        return _v305_prev_result_text_fix3(text, venue_override, race_no_override)
+
+    meta = _v305_compact_result_meta_strict(text, venue_override, race_no_override)
+    rows = _v305_compact_result_rows_strict(text)
+    laps = _v305_parse_compact_laps(text)
+    payouts = _v305_parse_compact_payouts(text)
+
+    if not meta.get("開催日") or not meta.get("開催場") or not meta.get("レース"):
+        raise ValueError(
+            f"メタ情報不足: 開催日={meta.get('開催日')} / "
+            f"開催場={meta.get('開催場')} / R={meta.get('レース')}"
+        )
+    return meta, rows, laps, payouts
+
