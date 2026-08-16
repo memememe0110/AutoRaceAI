@@ -10857,6 +10857,27 @@ def _v187_save_mixed_plan(
 
 _V304_COMMON_RACE_COMPARISON = "2026-08-16-v1"
 
+_V304_ALL_CALCULABLE_RACES = "2026-08-16-v1"
+
+def _v304_all_calculable_race_keys(db_path):
+    """保存買い目と結果照合が揃い、実回収率を計算できる全race_key。Ver共通条件なし。"""
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            rows = con.execute("""
+                SELECT DISTINCT r.race_key
+                  FROM v187_mixed_plan_runs r
+                  JOIN v187_mixed_plan_feedback f
+                    ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                 WHERE COALESCE(r.include_in_live_stats,1)=1
+                   AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
+                   AND f.invest_yen IS NOT NULL
+                   AND f.payout_yen IS NOT NULL
+            """).fetchall()
+        return {str(x[0]) for x in rows if x and x[0]}
+    except Exception:
+        return set()
+
+
 def _v304_common_race_keys_for_versions(db_path, versions):
     """指定Verすべてに回収率実績がある race_key の共通集合を返す。"""
     versions = [str(v).strip() for v in (versions or []) if str(v).strip()]
