@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver303"
+APP_VERSION = "Ver304"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver303"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver304"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -10682,58 +10682,86 @@ def _v208_render_mixed_plan_result(result: dict) -> None:
 
 
 def _v187_learning_profile(db_path: str, cutoff_race_date: str = "") -> dict:
+    """回収率学習。Ver304では同一レースの再シミュ版を重複学習しない。"""
     try:
         _v187_ensure_mixed_learning_tables(db_path)
     except sqlite3.DatabaseError as _db187:
-        # 回収率学習領域のDB不調で予測本体まで落とさない。
         return {
             "races":0, "return_rate":None, "hit_rate":None, "black_rate":None,
             "gami_rate":None, "ticket_stats":{}, "enabled":False,
             "reason":f"回収率学習DBを一時スキップ: {type(_db187).__name__}: {_db187}"
         }
     _v187_sync_mixed_feedback(db_path)
-    out = {"samples":0, "hit_rate":None, "black_rate":None, "gami_rate":None, "return_rate":None, "type_weights":{}}
+    out = {"samples":0, "hit_rate":None, "black_rate":None, "gami_rate":None,
+           "return_rate":None, "type_weights":{}}
     _cut187 = str(cutoff_race_date or "").strip()[:10]
-    _date_sql187 = ""
-    _date_params187 = ()
+
+    # 同じ race_key をVer違い・再シミュ違いで何十回も数えると、
+    # 1レースの結果が学習を占有する。1 race_key = 1学習標本へ正規化する。
+    # 過去再シミュでは、対象レースより前に「実際に作成済み」だったプランだけを候補にする。
+    where_extra = ""
+    params = ()
     if _cut187:
-        # Ver303: 過去再シミュでは対象レース当日以降の実績を学習へ混ぜない。
-        _date_sql187 = " AND (COALESCE(NULLIF(r.race_date,''),'9999-12-31') < ?) "
-        _date_params187 = (_cut187,)
+        where_extra = """
+          AND COALESCE(NULLIF(r.race_date,''),'9999-12-31') < ?
+          AND substr(COALESCE(r.created_at,''),1,10) < ?
+        """
+        params = (_cut187, _cut187)
 
     with sqlite3.connect(db_path) as con:
-        row = con.execute("""
-            SELECT COUNT(*), AVG(f.hit)*100.0, AVG(f.black_hit)*100.0, AVG(f.gami_hit)*100.0, AVG(f.return_rate)
-            FROM v187_mixed_plan_feedback f
-            JOIN v187_mixed_plan_runs r
+        ranked_sql = """
+            WITH eligible AS (
+                SELECT r.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY r.race_key
+                           ORDER BY r.created_at DESC, r.plan_hash DESC
+                       ) AS rn
+                FROM v187_mixed_plan_runs r
+                WHERE COALESCE(r.include_in_live_stats,1)=1
+                  AND NOT (
+                    COALESCE(r.plan_origin,'live')='current_version_restore'
+                    AND COALESCE(NULLIF(r.app_version,''),'Unknown')
+                        <> COALESCE(NULLIF(r.source_prediction_version,''),
+                                    COALESCE(NULLIF(r.app_version,''),'Unknown'))
+                  )
+        """ + where_extra + """
+            )
+        """
+
+        row = con.execute(ranked_sql + """
+            SELECT COUNT(*), AVG(f.hit)*100.0, AVG(f.black_hit)*100.0,
+                   AVG(f.gami_hit)*100.0, AVG(f.return_rate)
+            FROM eligible r
+            JOIN v187_mixed_plan_feedback f
               ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
-            WHERE COALESCE(r.include_in_live_stats,1)=1
-              AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
+            WHERE r.rn=1
               AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
-        """ + _date_sql187, _date_params187).fetchone()
+        """, params).fetchone()
+
         if row and int(row[0] or 0)>0:
-            out.update(samples=int(row[0]), hit_rate=float(row[1] or 0), black_rate=float(row[2] or 0),
-                       gami_rate=float(row[3] or 0), return_rate=float(row[4] or 0))
-        rows = con.execute("""
-            SELECT tf.bet_type, COUNT(*) n, AVG(tf.hit)*100.0 hit_rate, AVG(tf.payout_yen) avg_payout
-            FROM v187_mixed_ticket_feedback tf
-            JOIN v187_mixed_plan_runs r
+            out.update(samples=int(row[0]), hit_rate=float(row[1] or 0),
+                       black_rate=float(row[2] or 0), gami_rate=float(row[3] or 0),
+                       return_rate=float(row[4] or 0))
+
+        rows = con.execute(ranked_sql + """
+            SELECT tf.bet_type, COUNT(*) n, AVG(tf.hit)*100.0 hit_rate,
+                   AVG(tf.payout_yen) avg_payout
+            FROM eligible r
+            JOIN v187_mixed_ticket_feedback tf
               ON r.race_key=tf.race_key AND r.plan_hash=tf.plan_hash
             JOIN v187_mixed_plan_feedback pf
-              ON pf.race_key=tf.race_key AND pf.plan_hash=tf.plan_hash
-            WHERE COALESCE(r.include_in_live_stats,1)=1
-              AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
+              ON pf.race_key=r.race_key AND pf.plan_hash=r.plan_hash
+            WHERE r.rn=1
               AND COALESCE(pf.winning_types,'') NOT LIKE '%全返還%'
-        """ + _date_sql187 + """
             GROUP BY tf.bet_type
-        """, _date_params187).fetchall()
+        """, params).fetchall()
+
         for bet_type,n,hit_rate,avg_payout in rows:
-            # 少数データは1.0へ縮小。実績が増えるほど0.80～1.20の範囲で効かせる。
+            # 少数標本は中立1.0へ強く縮小。独立レースが増えて初めて効かせる。
             reliability = min(1.0, float(n)/30.0)
             raw = 0.80 + min(0.40, max(0.0, float(hit_rate or 0)/25.0))
             out["type_weights"][bet_type] = 1.0 + (raw-1.0)*reliability
     return out
-
 
 def _v215_race_meta_from_key(race_key: str, db_path: str) -> dict:
     """レースキーまたは結果DBから、集計用の日付・開催場・Rを取得する。"""
@@ -10826,6 +10854,40 @@ def _v187_save_mixed_plan(
     return plan_hash
 
 
+
+_V304_COMMON_RACE_COMPARISON = "2026-08-16-v1"
+
+def _v304_common_race_keys_for_versions(db_path, versions):
+    """指定Verすべてに回収率実績がある race_key の共通集合を返す。"""
+    versions = [str(v).strip() for v in (versions or []) if str(v).strip()]
+    if len(versions) < 2:
+        return set()
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            ph = ",".join("?" for _ in versions)
+            rows = con.execute(f"""
+                SELECT r.race_key
+                  FROM v187_mixed_plan_runs r
+                  JOIN v187_mixed_plan_feedback f
+                    ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                 WHERE COALESCE(NULLIF(r.app_version,''),'Unknown') IN ({ph})
+                   AND COALESCE(r.include_in_live_stats,1)=1
+                   AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
+                 GROUP BY r.race_key
+                HAVING COUNT(DISTINCT COALESCE(NULLIF(r.app_version,''),'Unknown')) = ?
+            """, tuple(versions) + (len(set(versions)),)).fetchall()
+        return {str(x[0]) for x in rows if x and x[0]}
+    except Exception:
+        return set()
+
+def _v304_filter_common_races(df, common_keys):
+    """race_key列がある集計DataFrameを共通レースだけへ絞る。"""
+    if df is None or getattr(df, "empty", True) or not common_keys:
+        return df
+    if "race_key" not in df.columns:
+        return df
+    return df[df["race_key"].astype(str).isin(common_keys)].copy()
+
 def _v300_backfill_recommendation_audit(db_path: str, app_version_filter: str = "Ver300") -> dict:
     """保存済みプランだけから新推奨監査を補完。シミュレーションは実行しない。"""
     _v187_ensure_mixed_learning_tables(db_path)
@@ -10905,7 +10967,7 @@ def _v301_auto_backfill_strong_recommendation(db_path: str) -> dict:
             FROM v187_mixed_plan_runs r
             WHERE COALESCE(r.include_in_live_stats,1)=1
               AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
-              AND COALESCE(r.app_version,'') IN ('Ver300','Ver301','Ver302','Ver303')
+              AND COALESCE(r.app_version,'') IN ('Ver300','Ver301','Ver302','Ver303','Ver304')
             ORDER BY r.created_at
         """).fetchall()
         for race_key,plan_hash,app_ver in rows:
