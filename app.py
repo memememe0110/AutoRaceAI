@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver304"
+APP_VERSION = "Ver305"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver304"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver305"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -11914,6 +11914,177 @@ def _v301_live_recommendation(result: dict) -> dict:
     }
 
 
+
+def _v305_live_recommendation(result: dict) -> dict:
+    """Ver305 強推奨判定。
+
+    Ver301のEV条件を候補条件として維持しつつ、
+    ◎強推奨は4券種以上の独立した支持がある場合だけに限定する。
+
+    狙い:
+    ・過去数Rの当たり外れへ合わせてEV閾値を細かく最適化しない
+    ・最終プランが複数券種で同じ方向を支持する「安定性」だけを追加
+    ・従来条件は○候補として残し、情報を捨てない
+    """
+    tickets = list(result.get("tickets") or [])
+    bet_types = {
+        str(t.get("type") or "")
+        for t in tickets
+        if str(t.get("type") or "")
+    }
+    support_count = len(bet_types)
+
+    evs = []
+    for t in tickets:
+        p = float(t.get("ev_probability", t.get("probability", 0.0)) or 0.0)
+        od = float(t.get("odds", 0.0) or 0.0)
+        evs.append((p / 100.0) * od)
+    max_ev = max(evs) if evs else 0.0
+
+    # Ver301の候補条件はそのまま。
+    legacy_candidate = (
+        (max_ev <= 1.70 and support_count >= 2)
+        or
+        (1.70 < max_ev <= 2.10 and support_count >= 3)
+    )
+
+    # Ver305: ◎だけは4券種以上の一致を必須にする。
+    strong = bool(legacy_candidate and support_count >= 4)
+
+    if strong:
+        return {
+            "recommended": True,
+            "candidate": True,
+            "label": "◎強推奨",
+            "icon": "🔥",
+            "max_ev": float(max_ev),
+            "support_count": int(support_count),
+            "reason": (
+                f"最大EV {max_ev:.2f} / {support_count}券種支持。"
+                "Ver301候補条件＋4券種以上の安定性条件を通過"
+            ),
+        }
+
+    if legacy_candidate:
+        return {
+            "recommended": False,
+            "candidate": True,
+            "label": "○候補",
+            "icon": "○",
+            "max_ev": float(max_ev),
+            "support_count": int(support_count),
+            "reason": (
+                f"Ver301候補条件は通過（最大EV {max_ev:.2f} / {support_count}券種支持）"
+                "だが、◎に必要な4券種支持には未達"
+            ),
+        }
+
+    if max_ev > 2.10:
+        why = f"最大EV {max_ev:.2f} > 2.10"
+    elif max_ev <= 1.70 and support_count < 2:
+        why = f"最大EVは{max_ev:.2f}だが券種支持が{support_count}"
+    elif 1.70 < max_ev <= 2.10 and support_count < 3:
+        why = f"最大EV {max_ev:.2f}に対して券種支持が{support_count}"
+    else:
+        why = "強推奨候補条件未達"
+
+    return {
+        "recommended": False,
+        "candidate": False,
+        "label": "見送り",
+        "icon": "—",
+        "max_ev": float(max_ev),
+        "support_count": int(support_count),
+        "reason": why,
+    }
+
+
+def _v305_auto_backfill_current_recommendation(db_path: str) -> dict:
+    """Ver305プランだけをVer305基準で監査補完。旧Verの監査は書き換えない。"""
+    _v187_ensure_mixed_learning_tables(db_path)
+    done = 0
+    skipped = 0
+    errors = []
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        rows = con.execute("""
+            SELECT r.race_key,r.plan_hash,COALESCE(r.app_version,'')
+              FROM v187_mixed_plan_runs r
+             WHERE COALESCE(r.include_in_live_stats,1)=1
+               AND COALESCE(r.app_version,'')='Ver305'
+               AND NOT (
+                    COALESCE(r.plan_origin,'live')='current_version_restore'
+                    AND COALESCE(NULLIF(r.app_version,''),'Unknown')
+                        <> COALESCE(NULLIF(r.source_prediction_version,''),
+                                    COALESCE(NULLIF(r.app_version,''),'Unknown'))
+               )
+             ORDER BY r.created_at
+        """).fetchall()
+
+        for race_key, plan_hash, app_ver in rows:
+            try:
+                tickets = con.execute("""
+                    SELECT bet_type,probability,odds
+                      FROM v187_mixed_plan_tickets
+                     WHERE race_key=? AND plan_hash=?
+                """, (race_key, plan_hash)).fetchall()
+                if not tickets:
+                    skipped += 1
+                    continue
+
+                rec_tickets = [
+                    {
+                        "type": str(bt or ""),
+                        "probability": float(prob or 0.0),
+                        "odds": float(od or 0.0),
+                    }
+                    for bt, prob, od in tickets
+                ]
+                rec = _v305_live_recommendation({"tickets": rec_tickets})
+
+                prev = con.execute("""
+                    SELECT adjusted_return_rate,cover,hole_count
+                      FROM v300_recommendation_audit
+                     WHERE race_key=? AND plan_hash=?
+                """, (race_key, plan_hash)).fetchone()
+                adjusted = float(prev[0] or 0.0) if prev else 0.0
+                cover = float(prev[1] or 0.0) if prev else 0.0
+                hole_count = int(prev[2] or 0) if prev else 0
+
+                con.execute("""
+                    INSERT INTO v300_recommendation_audit
+                    (race_key,plan_hash,recommendation_label,recommendation_score,
+                     adjusted_return_rate,cover,max_ev,hole_count,reasons_json,app_version,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(race_key,plan_hash) DO UPDATE SET
+                        recommendation_label=excluded.recommendation_label,
+                        recommendation_score=excluded.recommendation_score,
+                        max_ev=excluded.max_ev,
+                        reasons_json=excluded.reasons_json,
+                        app_version=excluded.app_version,
+                        created_at=excluded.created_at
+                """, (
+                    str(race_key), str(plan_hash),
+                    str(rec.get("label") or "見送り"),
+                    10 if rec.get("recommended") else (5 if rec.get("candidate") else 0),
+                    adjusted, cover,
+                    float(rec.get("max_ev", 0.0) or 0.0),
+                    hole_count,
+                    json.dumps(
+                        ["Ver305安定性判定: " + str(rec.get("reason") or "")],
+                        ensure_ascii=False,
+                    ),
+                    str(app_ver or "Ver305"),
+                    _v228_now_jst_iso(),
+                ))
+                done += 1
+            except Exception as exc:
+                if len(errors) < 20:
+                    errors.append(f"{race_key}: {type(exc).__name__}: {exc}")
+        con.commit()
+    return {"done": done, "skipped": skipped, "errors": errors}
+
+
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
     """6〜8車立て向けの役割分担型・回収率合成。
 
@@ -13672,8 +13843,16 @@ def show_v184_eight_car_mixed_plan(
     result = v277_provisional_merge_7types(result, bets, trials, odds_maps)
     # Ver300監査は継続。
     _rec_audit300 = _v300_recommendation_audit(result) if result.get("available") else {}
-    # Ver301: 予測時の実運用推奨。買い目自体は変更しない。
-    _live_rec301 = _v301_live_recommendation(result) if result.get("available") else {}
+    # Ver305: 現行Verは4券種安定性ゲート。旧Ver復元は当時のVer301基準を維持。
+    _rec_target_ver = str(app_version or APP_VERSION)
+    if result.get("available"):
+        _live_rec301 = (
+            _v305_live_recommendation(result)
+            if _rec_target_ver == "Ver305"
+            else _v301_live_recommendation(result)
+        )
+    else:
+        _live_rec301 = {}
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH) or 0
     st.markdown(f"#### 🧩 {int(starter_count)}車向け・黒字的中重視の回収率合成")
     if not result.get("available"):
@@ -13693,11 +13872,17 @@ def show_v184_eight_car_mixed_plan(
             if saved_hash and _rec_audit300:
                 _save_audit301=dict(_rec_audit300)
                 if _live_rec301:
-                    _save_audit301["label"]=(
-                        "◎強推奨" if _live_rec301.get("recommended") else "見送り"
+                    _save_audit301["label"] = str(
+                        _live_rec301.get("label")
+                        or ("◎強推奨" if _live_rec301.get("recommended") else "見送り")
+                    )
+                    _save_audit301["score"] = (
+                        10 if _live_rec301.get("recommended")
+                        else (5 if _live_rec301.get("candidate") else 0)
                     )
                     _save_audit301["reasons"]=list(_save_audit301.get("reasons") or []) + [
-                        "Ver301実運用推奨: " + str(_live_rec301.get("reason",""))
+                        ("Ver305安定性推奨: " if _rec_target_ver=="Ver305" else "Ver301実運用推奨: ")
+                        + str(_live_rec301.get("reason",""))
                     ]
                 _v300_save_recommendation_audit(
                     engine.DB_PATH, str(race_key), str(saved_hash), _save_audit301,
@@ -14621,7 +14806,7 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
 
 def _v215_render_return_dashboard(db_path: str) -> None:
     st.markdown("## 📊 回収率重視プラン実績")
-    st.caption("Ver301以降は『推奨』＝◎強推奨です。最大EV×複数券種支持の実運用推奨を基準に集計します。")
+    st.caption("Ver305の◎強推奨は、Ver301のEV候補条件に加えて4券種以上の支持一致を必須化。従来条件だけのものは○候補として分離します。")
     st.caption("✅ Ver302 集計修正3適用済み：復元実績は元予測Verへ統一")
     try:
         _stamp301=(str(db_path),Path(str(db_path)).stat().st_mtime_ns)
@@ -14630,6 +14815,15 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             st.session_state["_v301_auto_rec_backfill_stamp"]=_stamp301
             if _bf301.get("done",0)>0:
                 st.caption(f"推奨判定を保存済みプランから自動補完済み：{_bf301['done']}件（Ver302含む・再シミュレーションなし）")
+        _stamp305=(str(db_path),Path(str(db_path)).stat().st_mtime_ns,"Ver305")
+        if st.session_state.get("_v305_auto_rec_backfill_stamp") != _stamp305:
+            _bf305=_v305_auto_backfill_current_recommendation(str(db_path))
+            st.session_state["_v305_auto_rec_backfill_stamp"]=_stamp305
+            if _bf305.get("done",0)>0:
+                st.caption(
+                    f"Ver305推奨判定を4券種安定性基準で補完済み："
+                    f"{_bf305['done']}件（旧Ver監査は変更なし）"
+                )
     except Exception as _bf301_exc:
         st.warning("Ver301推奨の自動振り分けに失敗しました: "+_runtime_exception_text(_bf301_exc))
     st.caption("各レース・各バージョンで最後に保存されたプランを、予測時点の買い目のまま別々に集計します。")

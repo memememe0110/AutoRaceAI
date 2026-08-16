@@ -13441,6 +13441,162 @@ def v15_parse_entries(text, manual_excluded=None):
     return _v86_previous_parse_entries(text, manual_excluded=manual_excluded)
 
 
+
+# ============================================================
+# Ver305 input hotfix: 公式「出走表 / 近10走 / 良5走 ...」軽量形式
+# ============================================================
+
+_v305_previous_parse_entries = v15_parse_entries
+_v305_previous_parse_meta = v15_parse_race_meta
+
+
+def _v305_compact_official_blocks(text):
+    """車 / 選手 / ハンデ / 試走T / 偏差 / 連率 の軽量出走表を選手単位へ分割。"""
+    lines = [x.strip() for x in v15_clean_text(text).splitlines()]
+    starts = []
+    for i, line in enumerate(lines):
+        if not re.fullmatch(r"[1-8]", line):
+            continue
+        # 次の数行に氏名、所属xx期、xx歳、ランクがある時だけ車番開始とみなす。
+        following = [x for x in lines[i+1:i+10] if x]
+        if len(following) < 3:
+            continue
+        has_term = any(re.search(r"(川口|伊勢崎|浜松|山陽|飯塚)\s*\d{1,2}期", x) for x in following)
+        has_age_rank = any(re.search(r"\d{1,3}歳.*\b[SAB]-\d+\b", x) for x in following)
+        if has_term and has_age_rank:
+            starts.append(i)
+    blocks=[]
+    for n,s in enumerate(starts):
+        e=starts[n+1] if n+1<len(starts) else len(lines)
+        blocks.append({"車番":int(lines[s]),"lines":[x for x in lines[s+1:e] if x]})
+    return blocks
+
+
+def _v305_parse_compact_official_entry(block):
+    car_no=int(block["車番"])
+    lines=list(block.get("lines") or [])
+    if not lines:
+        return None
+    name=v15_normalize_name(lines[0])
+    car_name=lines[1] if len(lines)>1 else None
+    compact=" ".join(lines)
+
+    lg=None; term=None
+    tm=re.search(r"(川口|伊勢崎|浜松|山陽|飯塚)\s*(\d{1,2})期",compact)
+    if tm:
+        lg,term=tm.group(1),int(tm.group(2))
+    age=v15_int(v15_first_match([r"(\d{1,3})歳"],compact))
+    rank=v15_first_match([r"\b([SAB]-\d+)\b"],compact)
+    grade_num=v15_int(v15_first_match([r"(\d)級"],compact))
+
+    # 「0 3.45 105」のような当日列を、ランク行より後だけから取得。
+    handicap=None; trial=np.nan; trial_dev=np.nan
+    rank_idx=next((i for i,x in enumerate(lines) if re.search(r"\b[SAB]-\d+\b",x)),None)
+    if rank_idx is not None:
+        tail=" ".join(lines[rank_idx+1:rank_idx+8])
+        seq=re.search(
+            r"(?:^|\s)(0|10|20|30|40|50|60|70|80)\s+(?:再)?([3-9]\.\d{2,3}|-)\s+(\d{2,3})(?:\s|$)",
+            tail
+        )
+        if seq:
+            handicap=int(seq.group(1))
+            if seq.group(2)!="-":
+                trial=float(seq.group(2))
+            trial_dev=int(seq.group(3))/1000.0
+
+    # 上記が改行で崩れた時は、ランク後の先頭3トークンだけを見る。
+    if handicap is None and rank_idx is not None:
+        tokens=[]
+        for x in lines[rank_idx+1:rank_idx+8]:
+            tokens.extend(x.split())
+        for i,t in enumerate(tokens):
+            if re.fullmatch(r"(0|10|20|30|40|50|60|70|80)",t):
+                if i+2<len(tokens) and re.fullmatch(r"(?:再)?[3-9]\.\d{2,3}|-",tokens[i+1]) and re.fullmatch(r"\d{2,3}",tokens[i+2]):
+                    handicap=int(t)
+                    if tokens[i+1]!="-" :
+                        trial=float(tokens[i+1].replace("再",""))
+                    trial_dev=int(tokens[i+2])/1000.0
+                    break
+
+    two_rate=v15_float(v15_first_match([r"2連率\s*([0-9.]+)"],compact))
+    three_rate=v15_float(v15_first_match([r"3連率\s*([0-9.]+)"],compact))
+
+    # 前1〜3走等は _raw に残す。既存のDB履歴が本体の長期履歴を補完する。
+    return {
+        "車番":car_no,"選手名":name,"ハンデ":handicap,"試走T":trial,
+        # この表のSTは「前走ST」。当日STとしては絶対に入れない。
+        "ST":np.nan,
+        "年齢":age,
+        "級別":rank.split("-")[0] if rank else (str(grade_num) if grade_num else None),
+        "期別":term,"所属":lg,"現ランク":rank,
+        "試走偏差":trial_dev,
+        "近10走2連":two_rate,"近10走3連":three_rate,
+        "2連対率":two_rate,"3連対率":three_rate,
+        "車名":car_name,
+        "_raw":"\n".join(lines),
+        "_input_format":"official_compact_v305",
+    }
+
+
+def _v305_parse_compact_official_entries(text):
+    # 誤検出防止。今回の公式軽量表に固有の見出しがある時だけ有効。
+    compact=re.sub(r"\s+"," ",v15_clean_text(text))
+    if not (
+        "出走表" in compact
+        and "近10走" in compact
+        and "良5走" in compact
+        and "近90日" in compact
+        and "近180日" in compact
+        and re.search(r"車\s*選手\s*ハンデ\s*試走T\s*偏差",compact)
+    ):
+        return pd.DataFrame()
+    rows=[]
+    for b in _v305_compact_official_blocks(text):
+        r=_v305_parse_compact_official_entry(b)
+        if r:
+            rows.append(r)
+    df=pd.DataFrame(rows)
+    if not df.empty:
+        df=df.drop_duplicates("車番").sort_values("車番").reset_index(drop=True)
+    return df
+
+
+def v15_parse_entries(text, manual_excluded=None):
+    compact_df=_v305_parse_compact_official_entries(text)
+    if not compact_df.empty and compact_df["車番"].nunique()>=2:
+        excluded=dict(v17_detect_nonstarters(text))
+        if manual_excluded is not None:
+            excluded={int(car):"手動欠車" for car in manual_excluded}
+        compact_df=compact_df.copy()
+        compact_df["出走状態"]=compact_df["車番"].map(lambda x:excluded.get(int(x),"出走"))
+        compact_df["解析対象"]=~compact_df["車番"].astype(int).isin(excluded)
+        return compact_df[compact_df["解析対象"]].sort_values("車番").reset_index(drop=True)
+    return _v305_previous_parse_entries(text,manual_excluded=manual_excluded)
+
+
+def v15_parse_race_meta(text):
+    meta=_v305_previous_parse_meta(text)
+    compact=re.sub(r"\s+"," ",v15_clean_text(text))
+
+    # 軽量表では「発走予定」の次行に時刻が来る。
+    if not meta.get("発走時刻"):
+        m=re.search(r"発走予定\s*(\d{1,2}:\d{2})",compact)
+        if m:
+            meta["発走時刻"]=m.group(1)
+            h=int(m.group(1).split(":")[0])
+            meta["時間帯"]="昼" if h<16 else ("夕方" if h<18 else "夜")
+
+    # 「開催期間：2026年8月3日～5日」の開始日を開催日と誤認した場合、
+    # 「8月5日(水) 一般戦6R」のレース行の日付を優先する。
+    rm=re.search(r"(\d{1,2})月\s*(\d{1,2})日[^0-9]{0,20}(?:一般戦|予選|準決勝|優勝戦)?\s*(\d{1,2})R",compact)
+    ym=re.search(r"開催期間\s*[:：]\s*(20\d{2})年",compact)
+    if rm and ym:
+        meta["開催日"]=f"{int(ym.group(1)):04d}-{int(rm.group(1)):02d}-{int(rm.group(2)):02d}"
+        meta["レース"]=int(rm.group(3))
+
+    return meta
+
+
 # ============================================================
 # Ver91: 結果表の「LG/ハンデ/試走T」を安全に解析
 #         例: 飯塚/0m/再3.45, 飯塚/20m/-, 空欄にも対応
@@ -19012,3 +19168,190 @@ def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_pat
         except Exception:
             pass
     return output
+
+
+# ============================================================
+# Ver305 result-input hotfix:
+# 公式「通常-結果」軽量表 + 払戻表 + 「1周回」グランドノート
+# ============================================================
+
+_v305_previous_v35_parse_result_text = v35_parse_result_text
+
+
+def _v305_is_compact_result(text):
+    s=re.sub(r"\s+"," ",v15_clean_text(text))
+    return bool(
+        "通常-結果" in s
+        and "レース結果" in s
+        and re.search(r"着\s*事\s*車\s*選手名",s)
+        and re.search(r"\bH\s*試T\s*競T\s*ST\b",s)
+    )
+
+
+def _v305_parse_compact_result_entries(text):
+    # 結果表区間だけに限定。
+    start=text.find("着\t事\t車")
+    if start<0:
+        start=text.find("着 事 車")
+    if start<0:
+        start=text.find("着")
+    end_candidates=[p for p in [text.find("払戻金",start),text.find("グランドノート",start)] if p>=0]
+    end=min(end_candidates) if end_candidates else len(text)
+    block=text[start:end]
+    lines=[re.sub(r"[\t\u3000]+"," ",x).strip() for x in block.splitlines()]
+    lines=[x for x in lines if x]
+
+    rows=[]; i=0
+    # Standard compact row:
+    # 1  1
+    # 石橋 大
+    # バウアー2
+    # 0 3.45 3.568 0.16  [異] [早見]
+    while i<len(lines):
+        # finish / incident-column / car. Empty incident column disappears after whitespace normalization.
+        m=re.match(r"^([1-8])\s+([1-8])(?:\s+(.+))?$",lines[i])
+        if not m:
+            i+=1; continue
+        finish=int(m.group(1)); car=int(m.group(2))
+        trailing=(m.group(3) or "").strip()
+        i+=1
+
+        # Name is normally next line. If inline trailing text exists and isn't numeric, use it.
+        name=""
+        if trailing and re.search(r"[^0-9.\-]",trailing):
+            name=trailing
+        elif i<len(lines):
+            name=lines[i]; i+=1
+
+        # Vehicle name line. Do not use for numeric parsing.
+        car_name=""
+        if i<len(lines) and not re.match(r"^-?\d+\s+(?:再)?\d\.\d{2,3}",lines[i]):
+            car_name=lines[i]; i+=1
+
+        if i>=len(lines):
+            break
+        vals=lines[i]
+        vm=re.match(
+            r"^(-?\d+)\s+(?:再)?(\d\.\d{2,3}|-)\s+(\d\.\d{3}|0(?:\.000)?)\s+([+-]?\d?\.\d{2,3}|-)(?:\s+(.*))?$",
+            vals
+        )
+        if not vm:
+            i+=1
+            continue
+        handicap=int(vm.group(1))
+        trial=np.nan if vm.group(2)=="-" else float(vm.group(2))
+        race_t=np.nan if vm.group(3) in {"0","0.000"} else float(vm.group(3))
+        st_time=np.nan if vm.group(4)=="-" else float(vm.group(4))
+        tail=(vm.group(5) or "").strip()
+
+        # 最後の「1R」等は早見なので事故扱いしない。
+        accident=re.sub(r"(?:^|\s)\d{1,2}R\s*$","",tail).strip()
+        result_type="通常" if not accident else accident
+        rows.append({
+            "着順":finish,"車番":car,"選手名":v15_normalize_name(name),
+            "所属":"","ハンデ":handicap,"試走T":trial,"競走T":race_t,
+            "ST":st_time,"人気":np.nan,"事故":accident,"結果区分":result_type,
+            "競走車名":car_name,
+        })
+        i+=1
+
+    if len(rows)<3:
+        raise ValueError("軽量『通常-結果』の着順表を解析できませんでした。")
+    return pd.DataFrame(sorted(rows,key=lambda r:r["着順"]))
+
+
+def _v305_parse_compact_payouts(text):
+    if "払戻金" not in text:
+        return pd.DataFrame(columns=["券種","組合せ","払戻金","人気"])
+    block=text.split("払戻金",1)[1]
+    if "グランドノート" in block:
+        block=block.split("グランドノート",1)[0]
+    lines=[re.sub(r"[\t\u3000]+"," ",x).strip() for x in block.splitlines()]
+    lines=[x for x in lines if x]
+    known={"単勝","複勝","2連複","2連単","ワイド","3連複","3連単"}
+    rows=[]; current=""
+    for line in lines:
+        if line in {"賭式 払戻金 人気","賭式","払戻金","人気","返還"}:
+            continue
+        m=re.match(
+            r"^(?:(単勝|複勝|2連複|2連単|ワイド|3連複|3連単)\s+)?"
+            r"([1-8](?:[-=][1-8]){0,2})\s+([\d,]+)円\s+(\d+)(?:人気)?$",
+            line
+        )
+        if not m:
+            continue
+        if m.group(1):
+            current=m.group(1)
+        if current not in known:
+            continue
+        combo=m.group(2)
+        # 内部表現は既存結果と同じ矢印/ハイフン系へ正規化。
+        if current in {"2連単","3連単"}:
+            combo=combo.replace("-","→")
+        elif current in {"2連複","3連複","ワイド"}:
+            combo=combo.replace("=","-")
+        rows.append({
+            "券種":current,"組合せ":combo,
+            "払戻金":int(m.group(3).replace(",","")),
+            "人気":int(m.group(4)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _v305_parse_compact_laps(text):
+    if "グランドノート" not in text:
+        return pd.DataFrame(columns=["周回","周回番号","順位","車番"])
+    block=text.split("グランドノート",1)[1]
+    records=[]
+    for raw in block.splitlines():
+        line=re.sub(r"[\t\u3000]+"," ",raw).strip()
+        # 新形式は「6周回」。従来の「6周目」も許容。
+        m=re.match(r"^(ゴール線|([1-9])周(?:回|目))\s+((?:[1-8]\s*){3,8})$",line)
+        if not m:
+            continue
+        label=m.group(1)
+        lap_no=99 if label=="ゴール線" else int(m.group(2))
+        # DB内の既存表示と合わせて n周目 に正規化。
+        norm_label="ゴール線" if label=="ゴール線" else f"{lap_no}周目"
+        cars=[int(x) for x in re.findall(r"[1-8]",m.group(3))]
+        for rank,car in enumerate(cars,1):
+            records.append({"周回":norm_label,"周回番号":lap_no,"順位":rank,"車番":car})
+    if not records:
+        return pd.DataFrame(columns=["周回","周回番号","順位","車番"])
+    return pd.DataFrame(records).sort_values(["周回番号","順位"]).reset_index(drop=True)
+
+
+def v35_parse_result_text(text, venue_override="", race_no_override=""):
+    if not _v305_is_compact_result(text):
+        return _v305_previous_v35_parse_result_text(text,venue_override,race_no_override)
+
+    if not str(text).strip():
+        raise ValueError("結果ページを貼り付けてください。")
+    meta=_v35_parse_meta(text,venue_override,race_no_override)
+
+    # 軽量ページの日付/R欄を開催期間開始日より優先。
+    compact=re.sub(r"\s+"," ",v15_clean_text(text))
+    dm=re.search(r"開催期間\s*[:：]\s*(20\d{2})年",compact)
+    rm=re.search(r"(\d{1,2})月\s*(\d{1,2})日[^0-9]{0,20}(?:一般戦|予選|準決勝戦?|優勝戦)?\s*(\d{1,2})R",compact)
+    if dm and rm:
+        meta["開催日"]=f"{int(dm.group(1)):04d}-{int(rm.group(1)):02d}-{int(rm.group(2)):02d}"
+        meta["レース"]=int(rm.group(3))
+
+    # 「走路温度」表形式。
+    mt=re.search(
+        r"気温\s*湿度\s*走路温度\s*走路状況\s*"
+        r"(-?\d+(?:\.\d+)?)℃\s*(\d+(?:\.\d+)?)%\s*(-?\d+(?:\.\d+)?)℃\s*"
+        r"(良走路|湿走路|斑走路|風走路|荒走路)",
+        compact
+    )
+    if mt:
+        meta["気温"]=float(mt.group(1)); meta["湿度"]=float(mt.group(2))
+        meta["走路温度"]=float(mt.group(3)); meta["走路状態"]=mt.group(4)
+
+    rows=_v305_parse_compact_result_entries(text)
+    laps=_v305_parse_compact_laps(text)
+    payouts=_v305_parse_compact_payouts(text)
+    if not meta.get("開催日") or not meta.get("開催場") or not meta.get("レース"):
+        raise ValueError("開催日・開催場・レース番号を取得できませんでした。")
+    return meta,rows,laps,payouts
+
