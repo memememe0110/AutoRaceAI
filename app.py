@@ -3341,6 +3341,21 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 pass
     except Exception:
         current_keys=set(); current_complete_keys=set(); current_audit_complete_keys=set()
+    # Ver305 recommendation-only: 旧『再計算Ver305』は完了扱いにしない。
+    # Ver304土台固定のoverlayプランまで作成済みのレースだけを完了扱いにする。
+    if current_ver == 'Ver305':
+        try:
+            with sqlite3.connect(str(db_path)) as _c305done:
+                _overlay305={str(r[0]) for r in _c305done.execute(
+                    "SELECT DISTINCT race_key FROM v187_mixed_plan_runs WHERE app_version='Ver305' AND plan_origin=? AND COALESCE(include_in_live_stats,1)=1",
+                    (_V305_REC_ONLY_ORIGIN,)
+                ).fetchall() if r and r[0]}
+            current_complete_keys=set(current_complete_keys) & _overlay305
+            current_audit_complete_keys=set(current_audit_complete_keys) & _overlay305
+        except Exception:
+            current_complete_keys=set()
+            current_audit_complete_keys=set()
+
     # Ver290 hotfix3:
     # 現行Verで6周+監査まで完全保存済みのレースは、ループ前に候補から除外する。
     # 再起動復旧時に「11/57から再開」したのに先頭11Rをもう一度数える問題を防ぐ。
@@ -3389,6 +3404,39 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             race_key0=str(h.get('race_key') or '').strip()
             if (not force_current) and race_key0 in current_complete_keys and race_key0 in current_audit_complete_keys:
                 out['skipped_current']+=1
+                continue
+
+            # Ver305は『Ver304の予測・6周・買い目固定 + 推奨だけ変更』として比較する。
+            # Ver304保存済みならモデルを再計算せず、その保存値をそのまま複製する。
+            if current_ver == 'Ver305' and _v305_latest_ver304_plan(db_path,race_key0):
+                if callable(progress_cb):
+                    progress_cb(idx-1,total,label+'｜Ver304土台を固定コピー中')
+                _h305=_v305_clone_ver304_history(db_path,race_key0)
+                _l305=_v305_clone_ver304_laps(db_path,race_key0)
+                _p305=_v305_clone_ver304_plan_as_rec_only(db_path,race_key0)
+                if not _p305.get('ok'):
+                    raise RuntimeError('Ver304買い目固定コピー失敗: '+str(_p305.get('reason') or '不明'))
+                # 実績はVer304買い目と完全同一。
+                try:
+                    with sqlite3.connect(str(db_path)) as _c305:
+                        _fb305=_c305.execute(
+                            'SELECT hit,cost_yen,payout_yen,return_rate FROM v187_mixed_plan_feedback WHERE race_key=? AND plan_hash=?',
+                            (race_key0,str(_p305.get('plan_hash') or ''))
+                        ).fetchone()
+                    if _fb305:
+                        out['roi_evaluated']+=1
+                        out['roi_hits']+=int(bool(_fb305[0]))
+                        out['roi_cost_yen']+=int(_fb305[1] or 0)
+                        out['roi_payout_yen']+=int(_fb305[2] or 0)
+                except Exception:
+                    pass
+                out['rerun']+=1
+                out['labels'].append(
+                    f"{label} → Ver305（Ver304予測・6周・買い目固定 / 推奨のみ再判定）"
+                )
+                current_keys.add(race_key0)
+                current_complete_keys.add(race_key0)
+                current_audit_complete_keys.add(race_key0)
                 continue
             if str(h.get('_v304_raw_text') or '').strip():
                 view=h.get('_v304_view') if isinstance(h.get('_v304_view'),dict) else {}
@@ -12085,6 +12133,280 @@ def _v305_auto_backfill_current_recommendation(db_path: str) -> dict:
     return {"done": done, "skipped": skipped, "errors": errors}
 
 
+
+# ============================================================
+# Ver305 hotfix: recommendation-only comparison mode
+# Ver304の基礎予測・6周展開・買い目を固定し、Ver305では推奨だけ変更する。
+# ============================================================
+_V305_REC_ONLY_BASE_VERSION = "Ver304"
+_V305_REC_ONLY_ORIGIN = "v305_rec_only_from_ver304"
+
+
+def _v305_rec_only_hash(race_key: str, source_plan_hash: str) -> str:
+    raw=f"Ver305-rec-only|{race_key}|{source_plan_hash}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _v305_latest_ver304_plan(db_path: str, race_key: str) -> dict:
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory=sqlite3.Row
+            row=con.execute("""
+                SELECT r.*
+                  FROM v187_mixed_plan_runs r
+                 WHERE r.race_key=?
+                   AND COALESCE(r.app_version,'')=?
+                   AND COALESCE(r.include_in_live_stats,1)=1
+                   AND NOT (
+                     COALESCE(r.plan_origin,'live')='current_version_restore'
+                     AND COALESCE(NULLIF(r.app_version,''),'Unknown')
+                         <> COALESCE(NULLIF(r.source_prediction_version,''),
+                                     COALESCE(NULLIF(r.app_version,''),'Unknown'))
+                   )
+                 ORDER BY CASE WHEN COALESCE(r.plan_origin,'live')='live' THEN 0 ELSE 1 END,
+                          r.created_at DESC
+                 LIMIT 1
+            """,(str(race_key or ''),_V305_REC_ONLY_BASE_VERSION)).fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _v305_clone_ver304_plan_as_rec_only(db_path: str, race_key: str) -> dict:
+    """Ver304の最終買い目・実績をVer305比較用へ完全コピーし、推奨だけVer305判定する。"""
+    src=_v305_latest_ver304_plan(db_path,race_key)
+    if not src:
+        return {"ok":False,"reason":"Ver304保存プランなし"}
+    src_hash=str(src.get('plan_hash') or '')
+    if not src_hash:
+        return {"ok":False,"reason":"Ver304 plan_hashなし"}
+    dst_hash=_v305_rec_only_hash(str(race_key),src_hash)
+    now=_v228_now_jst_iso()
+
+    try:
+        _v187_ensure_mixed_learning_tables(db_path)
+        with sqlite3.connect(str(db_path),timeout=30.0) as con:
+            con.row_factory=sqlite3.Row
+            con.execute("PRAGMA busy_timeout=30000")
+
+            # 同じ過去レースで再計算されたVer305プランは比較から外す。
+            # Ver305の定義を「Ver304土台＋推奨のみ変更」に固定するため。
+            con.execute("""
+                UPDATE v187_mixed_plan_runs
+                   SET include_in_live_stats=0
+                 WHERE race_key=? AND COALESCE(app_version,'')='Ver305'
+                   AND COALESCE(plan_origin,'')<>?
+            """,(str(race_key),_V305_REC_ONLY_ORIGIN))
+
+            con.execute("""
+                INSERT INTO v187_mixed_plan_runs
+                (race_key,plan_hash,points,cost_yen,grade,cover,black,low,
+                 hit_average_multiple,model_expected_multiple,model_return_rate,role_count,
+                 created_at,app_version,logic_version,race_date,venue,race_no,starter_count,
+                 plan_origin,source_prediction_version,include_in_live_stats)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                ON CONFLICT(race_key,plan_hash) DO UPDATE SET
+                  points=excluded.points,cost_yen=excluded.cost_yen,grade=excluded.grade,
+                  cover=excluded.cover,black=excluded.black,low=excluded.low,
+                  hit_average_multiple=excluded.hit_average_multiple,
+                  model_expected_multiple=excluded.model_expected_multiple,
+                  model_return_rate=excluded.model_return_rate,role_count=excluded.role_count,
+                  created_at=excluded.created_at,app_version='Ver305',
+                  logic_version=excluded.logic_version,race_date=excluded.race_date,
+                  venue=excluded.venue,race_no=excluded.race_no,starter_count=excluded.starter_count,
+                  plan_origin=excluded.plan_origin,source_prediction_version='Ver304',
+                  include_in_live_stats=1
+            """,(
+                str(race_key),dst_hash,int(src.get('points') or 0),int(src.get('cost_yen') or 0),
+                src.get('grade'),src.get('cover'),src.get('black'),src.get('low'),
+                src.get('hit_average_multiple'),src.get('model_expected_multiple'),src.get('model_return_rate'),
+                src.get('role_count'),now,'Ver305','Ver304-base+Ver305-rec-only',
+                src.get('race_date'),src.get('venue'),src.get('race_no'),src.get('starter_count'),
+                _V305_REC_ONLY_ORIGIN,'Ver304'
+            ))
+
+            con.execute("DELETE FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?",(race_key,dst_hash))
+            con.execute("""
+                INSERT INTO v187_mixed_plan_tickets
+                (race_key,plan_hash,bet_type,combination,probability,odds,role)
+                SELECT race_key,?,bet_type,combination,probability,odds,role
+                  FROM v187_mixed_plan_tickets
+                 WHERE race_key=? AND plan_hash=?
+            """,(dst_hash,race_key,src_hash))
+
+            # 実績も同じ買い目なのでそのままコピー。
+            fb=con.execute("""
+                SELECT * FROM v187_mixed_plan_feedback
+                 WHERE race_key=? AND plan_hash=?
+            """,(race_key,src_hash)).fetchone()
+            if fb:
+                con.execute("""
+                    INSERT INTO v187_mixed_plan_feedback
+                    (race_key,plan_hash,hit,black_hit,gami_hit,payout_yen,cost_yen,
+                     realized_multiple,return_rate,winning_types,evaluated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(race_key,plan_hash) DO UPDATE SET
+                      hit=excluded.hit,black_hit=excluded.black_hit,gami_hit=excluded.gami_hit,
+                      payout_yen=excluded.payout_yen,cost_yen=excluded.cost_yen,
+                      realized_multiple=excluded.realized_multiple,return_rate=excluded.return_rate,
+                      winning_types=excluded.winning_types,evaluated_at=excluded.evaluated_at
+                """,(
+                    race_key,dst_hash,fb['hit'],fb['black_hit'],fb['gami_hit'],fb['payout_yen'],fb['cost_yen'],
+                    fb['realized_multiple'],fb['return_rate'],fb['winning_types'],fb['evaluated_at']
+                ))
+
+            con.execute("DELETE FROM v187_mixed_ticket_feedback WHERE race_key=? AND plan_hash=?",(race_key,dst_hash))
+            con.execute("""
+                INSERT INTO v187_mixed_ticket_feedback
+                (race_key,plan_hash,bet_type,combination,hit,payout_yen)
+                SELECT race_key,?,bet_type,combination,hit,payout_yen
+                  FROM v187_mixed_ticket_feedback
+                 WHERE race_key=? AND plan_hash=?
+            """,(dst_hash,race_key,src_hash))
+
+            trows=con.execute("""
+                SELECT bet_type,probability,odds
+                  FROM v187_mixed_plan_tickets
+                 WHERE race_key=? AND plan_hash=?
+            """,(race_key,dst_hash)).fetchall()
+            rec=_v305_live_recommendation({"tickets":[
+                {"type":str(r['bet_type'] or ''),"probability":float(r['probability'] or 0),"odds":float(r['odds'] or 0)}
+                for r in trows
+            ]})
+
+            src_audit=con.execute("""
+                SELECT adjusted_return_rate,cover,hole_count
+                  FROM v300_recommendation_audit
+                 WHERE race_key=? AND plan_hash=?
+            """,(race_key,src_hash)).fetchone()
+            adj=float(src_audit['adjusted_return_rate'] or 0) if src_audit else float(src.get('model_return_rate') or 0)
+            cov=float(src_audit['cover'] or 0) if src_audit else float(src.get('cover') or 0)
+            holes=int(src_audit['hole_count'] or 0) if src_audit else 0
+            con.execute("""
+                INSERT INTO v300_recommendation_audit
+                (race_key,plan_hash,recommendation_label,recommendation_score,
+                 adjusted_return_rate,cover,max_ev,hole_count,reasons_json,app_version,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(race_key,plan_hash) DO UPDATE SET
+                  recommendation_label=excluded.recommendation_label,
+                  recommendation_score=excluded.recommendation_score,
+                  adjusted_return_rate=excluded.adjusted_return_rate,
+                  cover=excluded.cover,max_ev=excluded.max_ev,hole_count=excluded.hole_count,
+                  reasons_json=excluded.reasons_json,app_version='Ver305',created_at=excluded.created_at
+            """,(
+                race_key,dst_hash,str(rec.get('label') or '見送り'),
+                10 if rec.get('recommended') else (5 if rec.get('candidate') else 0),
+                adj,cov,float(rec.get('max_ev') or 0),holes,
+                json.dumps(["Ver304買い目固定 / Ver305推奨のみ: "+str(rec.get('reason') or '')],ensure_ascii=False),
+                'Ver305',now
+            ))
+            con.commit()
+
+        return {
+            "ok":True,"race_key":race_key,"source_plan_hash":src_hash,"plan_hash":dst_hash,
+            "points":int(src.get('points') or 0),"cost_yen":int(src.get('cost_yen') or 0),
+            "recommendation":rec,
+            "source_version":"Ver304","app_version":"Ver305",
+        }
+    except Exception as exc:
+        return {"ok":False,"reason":f"{type(exc).__name__}: {exc}"}
+
+
+def _v305_clone_ver304_laps(db_path: str, race_key: str) -> dict:
+    """比較用のVer305周回隊列をVer304保存値からコピー。"""
+    m=re.match(r'^(\d{8})_(.+?)_(\d+)R$',str(race_key or ''))
+    if not m:
+        return {"ok":False,"reason":"race_key形式外"}
+    d8,venue,rno=m.groups()
+    date=f"{d8[:4]}-{d8[4:6]}-{d8[6:8]}"
+    try:
+        with sqlite3.connect(str(db_path),timeout=30.0) as con:
+            rows=con.execute("""
+                SELECT lap_no,predicted_order,support,is_backtest
+                  FROM v252_lap_prediction_snapshots
+                 WHERE substr(race_date,1,10)=? AND venue=?
+                   AND REPLACE(CAST(race_no AS TEXT),'R','')=?
+                   AND app_version='Ver304'
+                 ORDER BY created_at DESC,snapshot_id DESC
+            """,(date,venue,str(int(rno)))).fetchall()
+            if not rows:
+                return {"ok":False,"reason":"Ver304周回なし"}
+            # 同じlapは最新1件。
+            latest={}
+            for lap,order,support,is_bt in rows:
+                if int(lap) not in latest:
+                    latest[int(lap)]=(order,support,is_bt)
+            con.execute("""
+                DELETE FROM v252_lap_prediction_snapshots
+                 WHERE substr(race_date,1,10)=? AND venue=?
+                   AND REPLACE(CAST(race_no AS TEXT),'R','')=?
+                   AND app_version='Ver305'
+            """,(date,venue,str(int(rno))))
+            now=_v228_now_jst_iso()
+            for lap,(order,support,is_bt) in sorted(latest.items()):
+                con.execute("""
+                    INSERT INTO v252_lap_prediction_snapshots
+                    (race_date,venue,race_no,lap_no,predicted_order,support,app_version,is_backtest,created_at)
+                    VALUES (?,?,?,?,?,?, 'Ver305', ?, ?)
+                """,(date,venue,str(int(rno)),int(lap),str(order),support,int(is_bt or 0),now))
+            con.commit()
+        return {"ok":True,"saved_laps":len(latest)}
+    except Exception as exc:
+        return {"ok":False,"reason":f"{type(exc).__name__}: {exc}"}
+
+
+def _v305_clone_ver304_history(db_path: str, race_key: str) -> dict:
+    """Ver304の保存prediction_viewをVer305履歴として複製。再計算しない。"""
+    try:
+        _v231_ensure_prediction_history_table(db_path)
+        with sqlite3.connect(str(db_path)) as con:
+            row=con.execute("""
+                SELECT history_id FROM v231_prediction_history
+                 WHERE race_key=? AND app_version='Ver304'
+                 ORDER BY history_id DESC LIMIT 1
+            """,(race_key,)).fetchone()
+        if not row:
+            return {"ok":False,"reason":"Ver304予測履歴なし"}
+        view,raw,venue_override,hm=_v231_load_prediction_history(db_path,int(row[0]))
+        if not view:
+            return {"ok":False,"reason":"Ver304 payload読込失敗"}
+        cloned=dict(view)
+        cloned['app_version']='Ver305'
+        cloned['source_prediction_version']='Ver304'
+        cloned['v305_recommendation_only']=True
+        cloned['v305_base_version']='Ver304'
+        cloned['prediction_time']=_v228_now_jst_iso()
+        trials=int(cloned.get('trials') or hm.get('trials') or 20000)
+        seed=int(cloned.get('seed') or hm.get('seed') or 20260719)
+        cloned['settings_hash']=_v231_settings_hash(trials,seed,cloned.get('excluded') or [])
+        hid=_v231_save_prediction_history(db_path,race_key,raw,venue_override,cloned,trials,seed)
+        return {"ok":bool(hid),"history_id":int(hid or 0),"view":cloned}
+    except Exception as exc:
+        return {"ok":False,"reason":f"{type(exc).__name__}: {exc}"}
+
+
+def _v305_repair_existing_rec_only_comparison(db_path: str) -> dict:
+    """既に再計算してしまったVer305比較データを、Ver304固定土台へ安全に置換。"""
+    out={"races":0,"plans":0,"laps":0,"errors":[]}
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            keys=[str(r[0]) for r in con.execute("""
+                SELECT DISTINCT race_key FROM v187_mixed_plan_runs
+                 WHERE app_version='Ver304' AND COALESCE(include_in_live_stats,1)=1
+            """).fetchall() if r and r[0]]
+        for rk in keys:
+            p=_v305_clone_ver304_plan_as_rec_only(db_path,rk)
+            l=_v305_clone_ver304_laps(db_path,rk)
+            if p.get('ok'): out['plans']+=1
+            if l.get('ok'): out['laps']+=1
+            if not p.get('ok') and len(out['errors'])<20: out['errors'].append(f"{rk} plan: {p.get('reason')}")
+            out['races']+=1
+        return out
+    except Exception as exc:
+        out['errors'].append(f"{type(exc).__name__}: {exc}")
+        return out
+
+
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
     """6〜8車立て向けの役割分担型・回収率合成。
 
@@ -13964,7 +14286,7 @@ def show_v184_eight_car_mixed_plan(
             st.info(_lr_msg301)
         st.caption(
             "判定根拠：" + str(_live_rec301.get("reason","")) +
-            "　※Ver301ではこの判定を予測時の推奨表示として使用します。買い目自体は変更しません。"
+            "　※Ver305ではVer304の基礎予測・6周展開・買い目を変更せず、推奨ラベルだけ変更します。"
         )
     if _rec_audit300:
         _lab300=str(_rec_audit300.get("label","△検証中"))
@@ -14806,6 +15128,18 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
 
 def _v215_render_return_dashboard(db_path: str) -> None:
     st.markdown("## 📊 回収率重視プラン実績")
+    try:
+        _stamp305fix=(str(db_path),Path(str(db_path)).stat().st_mtime_ns,"Ver305-rec-only-fix1")
+        if st.session_state.get("_v305_rec_only_fix_stamp") != _stamp305fix:
+            _fix305=_v305_repair_existing_rec_only_comparison(str(db_path))
+            st.session_state["_v305_rec_only_fix_stamp"]=(str(db_path),Path(str(db_path)).stat().st_mtime_ns,"Ver305-rec-only-fix1")
+            if int(_fix305.get("plans",0) or 0)>0:
+                st.caption(
+                    f"Ver305比較をVer304土台固定へ補正済み：{_fix305.get('plans',0)}R。"
+                    "基礎予測・6周展開・買い目はVer304と同一、推奨判定だけVer305です。"
+                )
+    except Exception as _exc305fix:
+        st.caption(f"Ver305比較固定の自動補正をスキップ: {type(_exc305fix).__name__}")
     st.caption("Ver305の◎強推奨は、Ver301のEV候補条件に加えて4券種以上の支持一致を必須化。従来条件だけのものは○候補として分離します。")
     st.caption("✅ Ver302 集計修正3適用済み：復元実績は元予測Verへ統一")
     try:
@@ -18685,6 +19019,21 @@ if selected_main_page == "✅ 結果登録・解析":
         on_change=_v163_save_input,
         args=(result_race_no_key, "v163_saved_result_race_no"),
     )
+    # Ver305 hotfix4: 軽量通常結果で本文Rを取得できる場合、古い補助入力値は無視する。
+    _v305_body_race_no = None
+    try:
+        if result_text and "通常-結果" in result_text:
+            _v305_body_race_no = engine._v305_detect_compact_result_race_no(result_text)
+    except Exception:
+        _v305_body_race_no = None
+    if _v305_body_race_no is not None:
+        if str(race_no_override or "").strip() and str(race_no_override).strip() != str(_v305_body_race_no):
+            c2.caption(
+                f"保存済みの補助入力 {race_no_override}R は無視します。本文から {_v305_body_race_no}R を検出しました。"
+            )
+        else:
+            c2.caption(f"本文から {_v305_body_race_no}R を自動検出")
+        race_no_override = ""
 
     if st.button("結果を解析", use_container_width=True):
         if not venue_override:

@@ -19746,3 +19746,45 @@ def v35_parse_result_text(text, venue_override="", race_no_override=""):
         )
     return meta, rows, laps, payouts
 
+
+
+# ============================================================
+# Ver305 result-input hotfix4:
+# 軽量結果の本文Rを最優先。古い補助入力Rで上書きしない。
+# ============================================================
+
+_v305_prev_result_text_fix4 = v35_parse_result_text
+
+
+def _v305_detect_compact_result_race_no(text):
+    """『日付 レース 距離 天候』表の対象Rだけを返す。下部1R〜12Rナビは見ない。"""
+    compact = re.sub(r"\s+", " ", v15_clean_text(text))
+    m = re.search(
+        r"日付\s*レース\s*距離\s*天候\s*"
+        r"\d{1,2}月\s*\d{1,2}日(?:\([^)]*\))?\s*"
+        r"[^\s]*?(\d{1,2})R\s*\d{4}m\s*(?:晴|曇|雨|小雨|雪)",
+        compact,
+    )
+    return int(m.group(1)) if m else None
+
+
+def v35_parse_result_text(text, venue_override="", race_no_override=""):
+    # 軽量通常結果は、本文表のRを最優先する。
+    if _v305_is_compact_result(text):
+        body_race_no = _v305_detect_compact_result_race_no(text)
+        # 重要: 本文からRが取れたら、過去に保存された手動補助入力は渡さない。
+        effective_override = "" if body_race_no is not None else race_no_override
+        meta = _v305_compact_result_meta_strict(text, venue_override, effective_override)
+        if body_race_no is not None:
+            meta["レース"] = int(body_race_no)
+        rows = _v305_compact_result_rows_strict(text)
+        laps = _v305_parse_compact_laps(text)
+        payouts = _v305_parse_compact_payouts(text)
+        if not meta.get("開催日") or not meta.get("開催場") or not meta.get("レース"):
+            raise ValueError(
+                f"メタ情報不足: 開催日={meta.get('開催日')} / "
+                f"開催場={meta.get('開催場')} / R={meta.get('レース')}"
+            )
+        return meta, rows, laps, payouts
+
+    return _v305_prev_result_text_fix4(text, venue_override, race_no_override)
