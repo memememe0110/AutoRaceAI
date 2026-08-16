@@ -3452,6 +3452,21 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             trials=int(h.get('trials') or (view or {}).get('trials') or 20000)
             seed=int(h.get('seed') or (view or {}).get('seed') or 20260719)
             excluded=[int(x) for x in ((view or {}).get('excluded') or [])]
+
+            # Ver305 reproducibility guard:
+            # 保存時の学習状態があるレースは、その状態を復元してから再計算する。
+            _state305=(view or {}).get("model_state_snapshot_v305")
+            _state_restored305=False
+            _state_source_hash305=""
+            _state_current_hash305=""
+            try:
+                _state_current_hash305=engine.v305_model_state_fingerprint(db_path)
+                if isinstance(_state305,dict) and _state305.get("state_hash"):
+                    _state_source_hash305=str(_state305.get("state_hash") or "")
+                    _state_restored305=bool(engine.v305_set_model_state_override(_state305))
+            except Exception:
+                _state_restored305=False
+
             prediction_text=str(raw_text)
             if str(venue_override or '').strip():
                 prediction_text=f"開催場: {str(venue_override).strip()}\n"+prediction_text
@@ -3467,6 +3482,10 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             meta['壁補正監査']=wall_audit
             meta['6周展開シミュレーション']=wall_audit
             finish_prob=engine.v30_finish_probabilities(df,bets,trials)
+            try:
+                engine.v305_clear_model_state_override()
+            except Exception:
+                pass
             _v273_audit_keep={
                 c:df[c].copy() for c in df.columns if str(c).startswith("Ver273_")
             }
@@ -3491,6 +3510,12 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 'input_source_v304':str(h.get('_v304_input_source') or 'v231_prediction_history'),
                 'input_reconstructed_v304':bool(h.get('_v304_input_source')=='result_prerace_safe_rebuild'),
                 'input_rebuild_audit_v304':h.get('_v304_rebuild_audit') if isinstance(h.get('_v304_rebuild_audit'),dict) else {},
+                'model_state_restored_v305':bool(_state_restored305),
+                'source_model_state_hash_v305':str(_state_source_hash305 or ''),
+                'current_model_state_hash_before_rerun_v305':str(_state_current_hash305 or ''),
+                'legacy_model_state_missing_v305':not bool(
+                    isinstance(_state305,dict) and _state305.get("state_hash")
+                ),
             }
             hid=_v231_save_prediction_history(db_path,race_key,raw_text,venue_override,prediction_view,trials,seed)
             if callable(progress_cb):
@@ -3550,6 +3575,10 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         except Exception as exc:
             out['errors'].append(f"{label}: {type(exc).__name__}: {exc}")
         finally:
+            try:
+                engine.v305_clear_model_state_override()
+            except Exception:
+                pass
             if callable(progress_cb):
                 progress_cb(idx,total,label)
     out['race_processing_seconds_v276']=round(time_module.perf_counter()-_run_t0_v276,3)
@@ -7407,6 +7436,21 @@ def _v231_save_prediction_history(db_path: str, race_key: str, raw_text: str, ve
     race_key = str(race_key or "").strip()
     if not race_key or not isinstance(view, dict):
         return 0
+    # Ver305 reproducibility guard:
+    # 予測時点の動的学習状態をpayloadへ保存。以後の再シミュで現在DBの学習状態へ
+    # 勝手に置き換わらないようにする。
+    if not isinstance(view.get("model_state_snapshot_v305"), dict):
+        try:
+            view = dict(view)
+            view["model_state_snapshot_v305"] = engine.v305_capture_model_state_snapshot(
+                view.get("meta") or {}, db_path
+            )
+        except Exception as _state_exc305:
+            view = dict(view)
+            view["model_state_snapshot_v305"] = {
+                "schema": "capture_failed",
+                "error": f"{type(_state_exc305).__name__}: {_state_exc305}",
+            }
     _v231_ensure_prediction_history_table(db_path)
     now = _v228_now_jst_iso()
     app_version = str(view.get("app_version") or _V231_APP_VERSION)
@@ -17620,6 +17664,10 @@ def _v278_render_background_quick_page(db_path: str) -> None:
     _pop304={}
     st.subheader("⏱️ 再シミュレーション")
     st.caption("ここから開始・進捗確認・停止・手動再開ができます。")
+    st.caption(
+        "🔒 再現性ガード: この修正版以降に保存した予測は、予測時の学習重み・"
+        "位置補正・同日傾向を一緒に保存し、再シミュ時に復元します。"
+    )
 
     try:
         _pop304 = _v304_roi_population_status(db_path, _V231_APP_VERSION)
@@ -18996,6 +19044,21 @@ if selected_main_page == "✅ 結果登録・解析":
         st.session_state["v238_result_restore_source"] = "manual"
     detected_result_venue = _detect_result_venue_from_title(result_text)
     c1, c2 = st.columns(2)
+    # Ver305 hotfix4: 軽量通常結果で本文Rを取得できる場合、古い補助入力値は無視する。
+    _v305_body_race_no = None
+    try:
+        if result_text and "通常-結果" in result_text:
+            _v305_body_race_no = engine._v305_detect_compact_result_race_no(result_text)
+    except Exception:
+        _v305_body_race_no = None
+    if _v305_body_race_no is not None:
+        if str(race_no_override or "").strip() and str(race_no_override).strip() != str(_v305_body_race_no):
+            c2.caption(
+                f"保存済みの補助入力 {race_no_override}R は無視します。本文から {_v305_body_race_no}R を検出しました。"
+            )
+        else:
+            c2.caption(f"本文から {_v305_body_race_no}R を自動検出")
+        race_no_override = ""
     if detected_result_venue:
         c1.success(f"開催場をタイトルから自動判定：{detected_result_venue}")
         venue_override = detected_result_venue
@@ -19019,21 +19082,6 @@ if selected_main_page == "✅ 結果登録・解析":
         on_change=_v163_save_input,
         args=(result_race_no_key, "v163_saved_result_race_no"),
     )
-    # Ver305 hotfix4: 軽量通常結果で本文Rを取得できる場合、古い補助入力値は無視する。
-    _v305_body_race_no = None
-    try:
-        if result_text and "通常-結果" in result_text:
-            _v305_body_race_no = engine._v305_detect_compact_result_race_no(result_text)
-    except Exception:
-        _v305_body_race_no = None
-    if _v305_body_race_no is not None:
-        if str(race_no_override or "").strip() and str(race_no_override).strip() != str(_v305_body_race_no):
-            c2.caption(
-                f"保存済みの補助入力 {race_no_override}R は無視します。本文から {_v305_body_race_no}R を検出しました。"
-            )
-        else:
-            c2.caption(f"本文から {_v305_body_race_no}R を自動検出")
-        race_no_override = ""
 
     if st.button("結果を解析", use_container_width=True):
         if not venue_override:

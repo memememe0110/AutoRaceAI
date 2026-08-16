@@ -19788,3 +19788,194 @@ def v35_parse_result_text(text, venue_override="", race_no_override=""):
         return meta, rows, laps, payouts
 
     return _v305_prev_result_text_fix4(text, venue_override, race_no_override)
+
+
+# ============================================================
+# Ver305 reproducibility infrastructure:
+# 学習状態スナップショット + 再シミュレーション再現性ガード
+# ============================================================
+
+V305_MODEL_STATE_REPRO_GUARD = "2026-08-17-v1"
+_V305_MODEL_STATE_OVERRIDE = None
+
+# Preserve current implementations.
+_v305_base_v40_get_weights = v40_get_weights
+_v305_base_v141_get_heat_weights = v141_get_heat_weights
+_v305_base_v142_get_aux_factors = v142_get_aux_factors
+_v305_base_v151_get_factor = v151_get_factor
+_v305_base_v152_get_factor = v152_get_factor
+_v305_base_v190_weight_validation_profile = v190_weight_validation_profile
+_v305_base_v198_position_bias_profile = v198_position_bias_profile
+_v305_base_v197_same_day_trend_profile = v197_same_day_trend_profile
+
+
+def _v305_json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _v305_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_v305_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return float(value)
+    if isinstance(value, (int, str, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _v305_learning_table_signature(db_path=DB_PATH):
+    """学習DBが予測保存時から変わったかを安価に検出する署名。"""
+    targets = {
+        "adaptive_weights": ("updated_at",),
+        "result_races": ("registered_at",),
+        "prediction_snapshots": ("created_at",),
+        "v151_player_race_context_profiles": ("updated_at",),
+        "v152_player_overtake_matchups": ("updated_at",),
+    }
+    out = {}
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            tables = {
+                str(r[0]) for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            for table, time_cols in targets.items():
+                if table not in tables:
+                    out[table] = {"exists": False}
+                    continue
+                cols = {
+                    str(r[1]) for r in con.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                count = int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+                row = {"exists": True, "count": count}
+                for col in time_cols:
+                    if col in cols:
+                        try:
+                            row[f"max_{col}"] = str(
+                                con.execute(f"SELECT MAX({col}) FROM {table}").fetchone()[0] or ""
+                            )
+                        except Exception:
+                            row[f"max_{col}"] = ""
+                out[table] = row
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def v305_model_state_fingerprint(db_path=DB_PATH):
+    """現在の動的学習状態の比較用hash。"""
+    try:
+        payload = {
+            "base_weights": _v305_json_safe(_v305_base_v40_get_weights(db_path)),
+            "heat_weights": _v305_json_safe(_v305_base_v141_get_heat_weights(db_path)),
+            "aux_factors": _v305_json_safe(_v305_base_v142_get_aux_factors(db_path)),
+            "race_context_factor": float(_v305_base_v151_get_factor(db_path)),
+            "overtake_factor": float(_v305_base_v152_get_factor(db_path)),
+            "tables": _v305_learning_table_signature(db_path),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def v305_capture_model_state_snapshot(meta=None, db_path=DB_PATH):
+    """予測時に使った動的学習状態を保存する。通常予測値は変更しない。"""
+    meta = dict(meta or {})
+    state = {
+        "schema": V305_MODEL_STATE_REPRO_GUARD,
+        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "race_date": str(meta.get("開催日") or meta.get("日付") or ""),
+        "race_no": v61_race_no(meta.get("レース") or meta.get("R") or meta.get("race_no")),
+        "learning_boundary": dict(globals().get("VER61_LEARNING_BOUNDARY") or {}),
+        "base_weights": _v305_json_safe(_v305_base_v40_get_weights(db_path)),
+        "heat_weights": _v305_json_safe(_v305_base_v141_get_heat_weights(db_path)),
+        "aux_factors": _v305_json_safe(_v305_base_v142_get_aux_factors(db_path)),
+        "race_context_factor": float(_v305_base_v151_get_factor(db_path)),
+        "overtake_factor": float(_v305_base_v152_get_factor(db_path)),
+        "v190_profile": _v305_json_safe(_v305_base_v190_weight_validation_profile(db_path)),
+        "v198_profile": _v305_json_safe(_v305_base_v198_position_bias_profile(db_path)),
+        "v197_day_trend": _v305_json_safe(_v305_base_v197_same_day_trend_profile(meta, db_path)),
+        "table_signature": _v305_learning_table_signature(db_path),
+    }
+    raw = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    state["state_hash"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return state
+
+
+def v305_set_model_state_override(state):
+    global _V305_MODEL_STATE_OVERRIDE
+    _V305_MODEL_STATE_OVERRIDE = dict(state or {}) if isinstance(state, dict) else None
+    return bool(_V305_MODEL_STATE_OVERRIDE)
+
+
+def v305_clear_model_state_override():
+    global _V305_MODEL_STATE_OVERRIDE
+    _V305_MODEL_STATE_OVERRIDE = None
+
+
+def v305_model_state_override_active():
+    return isinstance(_V305_MODEL_STATE_OVERRIDE, dict) and bool(_V305_MODEL_STATE_OVERRIDE)
+
+
+# Core getters that were confirmed to drift with the current DB.
+def v40_get_weights(db_path=DB_PATH):
+    s = _V305_MODEL_STATE_OVERRIDE or {}
+    if isinstance(s.get("base_weights"), dict):
+        return {str(k): float(v) for k, v in s["base_weights"].items()}
+    return _v305_base_v40_get_weights(db_path)
+
+
+def v141_get_heat_weights(db_path=DB_PATH):
+    s = _V305_MODEL_STATE_OVERRIDE or {}
+    if isinstance(s.get("heat_weights"), dict):
+        return {str(k): float(v) for k, v in s["heat_weights"].items()}
+    return _v305_base_v141_get_heat_weights(db_path)
+
+
+def v142_get_aux_factors(db_path=DB_PATH):
+    s = _V305_MODEL_STATE_OVERRIDE or {}
+    if isinstance(s.get("aux_factors"), dict):
+        return {str(k): float(v) for k, v in s["aux_factors"].items()}
+    return _v305_base_v142_get_aux_factors(db_path)
+
+
+def v151_get_factor(db_path=DB_PATH):
+    s = _V305_MODEL_STATE_OVERRIDE or {}
+    if s.get("race_context_factor") is not None:
+        return float(s["race_context_factor"])
+    return _v305_base_v151_get_factor(db_path)
+
+
+def v152_get_factor(db_path=DB_PATH):
+    s = _V305_MODEL_STATE_OVERRIDE or {}
+    if s.get("overtake_factor") is not None:
+        return float(s["overtake_factor"])
+    return _v305_base_v152_get_factor(db_path)
+
+
+def v190_weight_validation_profile(db_path=DB_PATH, force=False):
+    s = _V305_MODEL_STATE_OVERRIDE or {}
+    if isinstance(s.get("v190_profile"), dict):
+        return dict(s["v190_profile"])
+    return _v305_base_v190_weight_validation_profile(db_path, force=force)
+
+
+def v198_position_bias_profile(db_path=DB_PATH):
+    s = _V305_MODEL_STATE_OVERRIDE or {}
+    if isinstance(s.get("v198_profile"), dict):
+        return dict(s["v198_profile"])
+    return _v305_base_v198_position_bias_profile(db_path)
+
+
+def v197_same_day_trend_profile(meta=None, db_path=DB_PATH):
+    s = _V305_MODEL_STATE_OVERRIDE or {}
+    if isinstance(s.get("v197_day_trend"), dict):
+        return dict(s["v197_day_trend"])
+    return _v305_base_v197_same_day_trend_profile(meta, db_path)
+
