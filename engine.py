@@ -19355,3 +19355,167 @@ def v35_parse_result_text(text, venue_override="", race_no_override=""):
         raise ValueError("開催日・開催場・レース番号を取得できませんでした。")
     return meta,rows,laps,payouts
 
+
+
+# ============================================================
+# Ver305 result-input hotfix2:
+# iPhoneコピーで「着 / 事 / 車」の空欄列が潰れる形式に対応
+# ============================================================
+
+_v305_prev_compact_entries_fix2 = _v305_parse_compact_result_entries
+
+
+def _v305_parse_compact_result_entries(text):
+    start_candidates = [
+        text.find("着\t事\t車"),
+        text.find("着 事 車"),
+        text.find("着　事　車"),
+        text.find("競走車名"),
+    ]
+    start_candidates = [x for x in start_candidates if x >= 0]
+    start = min(start_candidates) if start_candidates else 0
+
+    ends = [p for p in [text.find("払戻金", start), text.find("グランドノート", start)] if p >= 0]
+    end = min(ends) if ends else len(text)
+    block = text[start:end]
+
+    # タブは空欄列を保持するため一旦そのまま解析し、
+    # 併せて空行除去版も作る。
+    raw_lines = [x.rstrip("\r") for x in block.splitlines()]
+    lines = [re.sub(r"[\u3000]+", " ", x).strip() for x in raw_lines]
+    lines = [x for x in lines if x]
+
+    rows = []
+    i = 0
+
+    def _is_finish_car_same(line):
+        # 1\t\t1 / 1  1 / 1 1
+        nums = re.findall(r"(?<!\d)([1-8])(?!\d)", line)
+        if len(nums) == 2 and re.fullmatch(r"[\s\t1-8]+", line):
+            return int(nums[0]), int(nums[1])
+        return None
+
+    def _looks_name(s):
+        if not s or len(s) > 40:
+            return False
+        if re.fullmatch(r"[0-9.\-Rr\s]+", s):
+            return False
+        bad = {"着", "事", "車", "選手名", "競走車名", "H", "試T", "競T", "ST", "異", "早見"}
+        return s not in bad
+
+    while i < len(lines):
+        finish = car = None
+
+        same = _is_finish_car_same(lines[i])
+        if same:
+            finish, car = same
+            i += 1
+        else:
+            # iPhoneコピーで「1」「1」が別行になるケース
+            if (
+                re.fullmatch(r"[1-8]", lines[i])
+                and i + 1 < len(lines)
+                and re.fullmatch(r"[1-8]", lines[i + 1])
+            ):
+                finish = int(lines[i])
+                car = int(lines[i + 1])
+                i += 2
+            else:
+                i += 1
+                continue
+
+        # 選手名
+        name = ""
+        while i < len(lines):
+            if _looks_name(lines[i]):
+                name = lines[i]
+                i += 1
+                break
+            i += 1
+        if not name:
+            continue
+
+        # 競走車名。次が数値行なら車名なしとして扱う。
+        car_name = ""
+        if i < len(lines) and not re.match(r"^-?\d+\s+", lines[i]):
+            car_name = lines[i]
+            i += 1
+
+        # 数値行がタブで1行のケース
+        vals = None
+        if i < len(lines):
+            vals = lines[i]
+
+        # 数値が1項目ずつ改行されるケースもまとめる。
+        if not vals or not re.match(r"^-?\d+\s+", vals):
+            toks = []
+            j = i
+            while j < len(lines) and len(toks) < 6:
+                s = lines[j]
+                if re.fullmatch(r"-?\d+|(?:再)?\d\.\d{2,3}|-", s):
+                    toks.append(s)
+                    j += 1
+                    continue
+                break
+            if len(toks) >= 4:
+                vals = " ".join(toks)
+                i = j
+
+        vm = re.match(
+            r"^(-?\d+)\s+(?:再)?(\d\.\d{2,3}|-)\s+(\d\.\d{3}|0(?:\.000)?)\s+([+-]?\d?\.\d{2,3}|-)(?:\s+(.*))?$",
+            vals or ""
+        )
+        if not vm:
+            # この候補だけ失敗しても次の選手へ進む
+            continue
+
+        handicap = int(vm.group(1))
+        trial = np.nan if vm.group(2) == "-" else float(vm.group(2))
+        race_t = np.nan if vm.group(3) in {"0", "0.000"} else float(vm.group(3))
+        st_time = np.nan if vm.group(4) == "-" else float(vm.group(4))
+        tail = (vm.group(5) or "").strip()
+
+        # 数値行を通常の1行として読んだ場合は進める
+        if i < len(lines) and lines[i] == vals:
+            i += 1
+
+        # 直後の「1R」などは早見なので事故扱いしない
+        if i < len(lines) and re.fullmatch(r"\d{1,2}R", lines[i]):
+            i += 1
+
+        accident = re.sub(r"(?:^|\s)\d{1,2}R\s*$", "", tail).strip()
+
+        rows.append({
+            "着順": finish,
+            "車番": car,
+            "選手名": v15_normalize_name(name),
+            "所属": "",
+            "ハンデ": handicap,
+            "試走T": trial,
+            "競走T": race_t,
+            "ST": st_time,
+            "人気": np.nan,
+            "事故": accident,
+            "結果区分": "通常" if not accident else accident,
+            "競走車名": car_name,
+        })
+
+    # 車番重複を除いて着順順に
+    if rows:
+        seen = set()
+        unique = []
+        for r in sorted(rows, key=lambda x: x["着順"]):
+            if r["車番"] in seen:
+                continue
+            seen.add(r["車番"])
+            unique.append(r)
+        rows = unique
+
+    if len(rows) < 3:
+        raise ValueError(
+            f"軽量『通常-結果』の着順表を解析できませんでした。"
+            f"解析できた車数: {len(rows)}。"
+            "『着 事 車 選手名』から払戻金まで含めて貼り付けてください。"
+        )
+    return pd.DataFrame(rows)
+
