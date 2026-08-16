@@ -3214,8 +3214,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                     GROUP BY race_key
                 ) x ON h.history_id=x.max_history_id
                 ORDER BY h.prediction_time DESC,h.history_id DESC
-                LIMIT ?
-            """,(max(1,int(limit)),)).fetchall()
+            """).fetchall()
         histories=[dict(r) for r in _rows289]
     except Exception:
         histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
@@ -3326,6 +3325,11 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             _before290=len(unique)
             unique=[h for h in unique if str(h.get('race_key') or '').strip() not in _already_complete290]
             out['skipped_current'] += int(_before290-len(unique))
+
+    # Ver304 hotfix:
+    # 「保存履歴の最新limit件」を先に切るのではなく、現行Ver完了済みを除いた後でlimitを適用。
+    # これで古い未処理レースが候補外へ押し出されるのを防ぐ。
+    unique = unique[:max(1, int(limit))]
     total=len(unique)
     out['prepare_seconds_v276']=round(time_module.perf_counter()-_prep_t0_v276,3)
     _run_t0_v276=time_module.perf_counter()
@@ -10870,13 +10874,73 @@ def _v304_all_calculable_race_keys(db_path):
                     ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
                  WHERE COALESCE(r.include_in_live_stats,1)=1
                    AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
-                   AND f.invest_yen IS NOT NULL
+                   AND f.cost_yen IS NOT NULL
                    AND f.payout_yen IS NOT NULL
             """).fetchall()
         return {str(x[0]) for x in rows if x and x[0]}
     except Exception:
         return set()
 
+
+
+def _v304_roi_population_status(db_path, current_ver):
+    """回収率計算可能な全レースと、現行Ver採点済み・残りを数える。"""
+    out = {
+        "all_calculable": 0,
+        "current_evaluated": 0,
+        "remaining": 0,
+        "replayable_remaining": 0,
+        "no_saved_history_remaining": 0,
+    }
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            all_rows = con.execute("""
+                SELECT DISTINCT r.race_key
+                  FROM v187_mixed_plan_runs r
+                  JOIN v187_mixed_plan_feedback f
+                    ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                 WHERE COALESCE(r.include_in_live_stats,1)=1
+                   AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
+                   AND f.cost_yen IS NOT NULL
+                   AND f.payout_yen IS NOT NULL
+            """).fetchall()
+            all_keys = {str(x[0]) for x in all_rows if x and x[0]}
+
+            cur_rows = con.execute("""
+                SELECT DISTINCT r.race_key
+                  FROM v187_mixed_plan_runs r
+                  JOIN v187_mixed_plan_feedback f
+                    ON f.race_key=r.race_key AND f.plan_hash=r.plan_hash
+                 WHERE COALESCE(NULLIF(r.app_version,''),'Unknown')=?
+                   AND COALESCE(r.include_in_live_stats,1)=1
+                   AND COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
+                   AND f.cost_yen IS NOT NULL
+                   AND f.payout_yen IS NOT NULL
+            """, (str(current_ver or ""),)).fetchall()
+            cur_keys = {str(x[0]) for x in cur_rows if x and x[0]}
+
+            try:
+                hist_rows = con.execute("""
+                    SELECT DISTINCT race_key
+                      FROM v231_prediction_history
+                     WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+                """).fetchall()
+                hist_keys = {str(x[0]) for x in hist_rows if x and x[0]}
+            except Exception:
+                hist_keys = set()
+
+        remaining = all_keys - cur_keys
+        replayable = remaining & hist_keys
+        out.update(
+            all_calculable=len(all_keys),
+            current_evaluated=len(all_keys & cur_keys),
+            remaining=len(remaining),
+            replayable_remaining=len(replayable),
+            no_saved_history_remaining=len(remaining - hist_keys),
+        )
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
 
 def _v304_common_race_keys_for_versions(db_path, versions):
     """指定Verすべてに回収率実績がある race_key の共通集合を返す。"""
@@ -16580,9 +16644,26 @@ def _v278_render_background_quick_page(db_path: str) -> None:
     st.subheader("⏱️ 再シミュレーション")
     st.caption("ここから開始・進捗確認・停止・手動再開ができます。")
 
+    try:
+        _pop304 = _v304_roi_population_status(db_path, _V231_APP_VERSION)
+        if not _pop304.get("error"):
+            st.info(
+                f"回収率計算可能 {_pop304['all_calculable']}R ｜ "
+                f"{_V231_APP_VERSION}採点済み {_pop304['current_evaluated']}R ｜ "
+                f"残り {_pop304['remaining']}R"
+            )
+            if int(_pop304.get("no_saved_history_remaining", 0) or 0) > 0:
+                st.caption(
+                    f"残りのうち保存予測履歴から一括再シミュレーション可能 "
+                    f"{_pop304['replayable_remaining']}R / "
+                    f"元の保存予測履歴なし {_pop304['no_saved_history_remaining']}R。"
+                )
+    except Exception:
+        pass
+
     limit_count=st.number_input(
         "再シミュレーションする保存レース数",
-        min_value=1,max_value=300,value=80,step=10,
+        min_value=1,max_value=300,value=200,step=10,
         key="v278_quick_limit"
     )
     if "v278_quick_force" not in st.session_state:
@@ -19455,10 +19536,10 @@ if selected_main_page == "🗃️ 登録情報確認":
 
                             st.markdown(f"#### ⏱️ 保存済み予測を時系列順に{_V231_APP_VERSION}で再シミュレーション＋回収率採点")
                             st.caption("保存レースを開催日→開催場→Rの順に並べ、当時その時点より前に判明していた結果だけで再計算します。同日も1R→2R→3R…の順です。強制再シミュレーションONなら、同じVerの既存履歴があっても新しい履歴として再保存します。")
-                            _v262_batch_limit=st.number_input("一括再シミュレーションする保存レース数",min_value=1,max_value=300,value=80,step=10,key="v262_batch_rerun_limit")
+                            _v262_batch_limit=st.number_input("一括再シミュレーションする保存レース数",min_value=1,max_value=300,value=200,step=10,key="v262_batch_rerun_limit")
                             _v262_force_current=st.checkbox(
                                 f"{_V231_APP_VERSION}保存済みレースも強制再シミュレーション",
-                                value=True,
+                                value=False,
                                 key="v262_force_current_rerun",
                                 help="ONの場合、同じVerの保存履歴が既にあっても再計算して新しい履歴を保存します。"
                             )
