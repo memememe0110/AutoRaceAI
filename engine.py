@@ -20062,3 +20062,33 @@ def v35_parse_result_text(text, venue_override="", race_no_override=""):
 
     return _v305_prev_result_text_fix5(text, venue_override, race_no_override)
 
+
+
+V305_COMPACT_RESULT_BUILD = "Ver305-fix6-direct"
+
+def v305_validate_compact_result_parse(text, venue_override="", race_no_override=""):
+    """軽量結果parserの自己診断。画面検証用。"""
+    body_r = _v305_detect_compact_result_race_no(text)
+    effective = "" if body_r is not None else race_no_override
+    meta = _v305_compact_result_meta_strict(text, venue_override, effective)
+    if body_r is not None:
+        meta["レース"] = int(body_r)
+    rows = _v305_compact_result_rows_strict(text)
+    laps = _v305_parse_compact_laps(text)
+    payouts = _v305_parse_compact_payouts(text)
+    missing = {}
+    for col in ["ハンデ","試走T","競走T","ST"]:
+        if col not in rows.columns:
+            missing[col] = len(rows)
+        else:
+            missing[col] = int(rows[col].isna().sum())
+    return {
+        "build": V305_COMPACT_RESULT_BUILD,
+        "date": meta.get("開催日"),
+        "venue": meta.get("開催場"),
+        "race_no": meta.get("レース"),
+        "rows": int(len(rows)),
+        "laps": int(len(laps)),
+        "payouts": int(len(payouts)),
+        "missing": missing,
+    }

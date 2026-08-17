@@ -18949,6 +18949,7 @@ elif selected_main_page == "🏁 予測":
 
 if selected_main_page == "✅ 結果登録・解析":
     st.subheader("公式結果を登録して予測と比較")
+    st.caption("🧩 結果parser build: Ver305-fix6-direct")
     _show_sticky_notice("result_register_notice")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
@@ -19088,9 +19089,47 @@ if selected_main_page == "✅ 結果登録・解析":
             st.warning("開催場を選択してください。")
         else:
             try:
-                meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(
-                    result_text, venue_override, race_no_override
-                )
+                # Ver305 fix6:
+                # 軽量「通常-結果」はengineのdispatch順や古いaliasに依存せず、
+                # app側から専用parserを直接呼ぶ。legacy parserへの落下を完全に遮断。
+                _fix6_compact = False
+                try:
+                    _fix6_compact = bool(
+                        engine._v305_is_compact_result_strict_header(result_text)
+                    )
+                except Exception:
+                    _fix6_compact = False
+
+                if _fix6_compact:
+                    _fix6_body_r = None
+                    try:
+                        _fix6_body_r = engine._v305_detect_compact_result_race_no(result_text)
+                    except Exception:
+                        _fix6_body_r = None
+
+                    # 本文Rを取れた場合、保存済み補助Rは絶対に渡さない。
+                    _fix6_r_override = "" if _fix6_body_r is not None else race_no_override
+                    meta_r = engine._v305_compact_result_meta_strict(
+                        result_text, venue_override, _fix6_r_override
+                    )
+                    if _fix6_body_r is not None:
+                        meta_r["レース"] = int(_fix6_body_r)
+
+                    rows_r = engine._v305_compact_result_rows_strict(result_text)
+                    laps_r = engine._v305_parse_compact_laps(result_text)
+                    payouts_r = engine._v305_parse_compact_payouts(result_text)
+                    meta_r = dict(meta_r or {})
+                    meta_r["_結果解析形式"] = "compact_result_v305_fix6_direct"
+                    meta_r["_本文R優先"] = bool(_fix6_body_r is not None)
+                    st.success(
+                        f"🧩 軽量結果専用parser fix6で解析："
+                        f"{meta_r.get('開催日')} / {meta_r.get('開催場')} / "
+                        f"{meta_r.get('レース')}R / {len(rows_r)}車"
+                    )
+                else:
+                    meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(
+                        result_text, venue_override, race_no_override
+                    )
                 meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(
                     result_text, meta_r, rows_r
                 )
