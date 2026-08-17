@@ -18949,7 +18949,7 @@ elif selected_main_page == "🏁 予測":
 
 if selected_main_page == "✅ 結果登録・解析":
     st.subheader("公式結果を登録して予測と比較")
-    st.caption("🧩 結果parser build: Ver305-fix6-direct")
+    st.caption("🧩 結果parser build: Ver305-fix7-state-reset")
     _show_sticky_notice("result_register_notice")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
@@ -19032,34 +19032,30 @@ if selected_main_page == "✅ 結果登録・解析":
     result_version = st.session_state["result_input_version"]
     result_text_key = f"official_result_text_{result_version}"
     _v163_restore_input(result_text_key, "v163_saved_result_text", "")
+    def _v305_fix7_result_text_changed():
+        _v163_save_input(result_text_key, "v163_saved_result_text")
+        # 貼り付け内容が変わったら、前回解析結果を即破棄する。
+        # 解析失敗時に古い1R/NaNが残像表示されるのを防止。
+        for _k in [
+            "v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts",
+            "v224_nonstarter_numbers", "v227_poststart_incidents", "v305_result_parse_text_hash",
+        ]:
+            st.session_state.pop(_k, None)
+
     result_text = st.text_area(
         "公式結果ページを全文貼り付け",
         height=620,
         key=result_text_key,
         placeholder="6R\n確定\n2026年7月21日(火)\n…\n着順 車番 選手名\n…\nグランドノート\n…\n払戻金\n…",
-        on_change=_v163_save_input,
-        args=(result_text_key, "v163_saved_result_text"),
+        on_change=_v305_fix7_result_text_changed,
     )
 
     if result_text and "v238_result_restore_source" not in st.session_state:
         st.session_state["v238_result_restore_source"] = "manual"
     detected_result_venue = _detect_result_venue_from_title(result_text)
     c1, c2 = st.columns(2)
-    # Ver305 hotfix4: 軽量通常結果で本文Rを取得できる場合、古い補助入力値は無視する。
-    _v305_body_race_no = None
-    try:
-        if result_text and "通常-結果" in result_text:
-            _v305_body_race_no = engine._v305_detect_compact_result_race_no(result_text)
-    except Exception:
-        _v305_body_race_no = None
-    if _v305_body_race_no is not None:
-        if str(race_no_override or "").strip() and str(race_no_override).strip() != str(_v305_body_race_no):
-            c2.caption(
-                f"保存済みの補助入力 {race_no_override}R は無視します。本文から {_v305_body_race_no}R を検出しました。"
-            )
-        else:
-            c2.caption(f"本文から {_v305_body_race_no}R を自動検出")
-        race_no_override = ""
+
+    # 開催場を先に確定
     if detected_result_venue:
         c1.success(f"開催場をタイトルから自動判定：{detected_result_venue}")
         venue_override = detected_result_venue
@@ -19075,6 +19071,9 @@ if selected_main_page == "✅ 結果登録・解析":
             args=(result_venue_key, "v163_saved_result_venue"),
         )
         c1.caption("選手の所属LGは開催場判定に使用しません。")
+
+    # 補助R入力を一度取得したあとで本文Rを判定する。
+    # 以前はこの順番が逆で、本文6Rを取った後に保存済み1Rが復活していた。
     result_race_no_key = f"result_race_no_{result_version}"
     _v163_restore_input(result_race_no_key, "v163_saved_result_race_no", "")
     race_no_override = c2.text_input(
@@ -19084,7 +19083,38 @@ if selected_main_page == "✅ 結果登録・解析":
         args=(result_race_no_key, "v163_saved_result_race_no"),
     )
 
+    _v305_body_race_no = None
+    _v305_compact_detected = False
+    try:
+        if result_text:
+            _v305_compact_detected = bool(
+                engine._v305_is_compact_result_strict_header(result_text)
+            )
+            if _v305_compact_detected:
+                _v305_body_race_no = engine._v305_detect_compact_result_race_no(result_text)
+    except Exception:
+        _v305_compact_detected = False
+        _v305_body_race_no = None
+
+    if _v305_body_race_no is not None:
+        if str(race_no_override or "").strip() and str(race_no_override).strip() != str(_v305_body_race_no):
+            c2.warning(
+                f"補助入力 {race_no_override}R は使用しません。本文の {_v305_body_race_no}R を優先します。"
+            )
+        else:
+            c2.caption(f"本文から {_v305_body_race_no}R を自動検出")
+        # parserへは古い補助Rを絶対に渡さない。
+        race_no_override = ""
+
     if st.button("結果を解析", use_container_width=True):
+        # fix7: 解析開始時点で旧解析結果を破棄する。
+        # 今回の解析が失敗しても過去の1R/NaNは再表示しない。
+        for _k in [
+            "v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts",
+            "v224_nonstarter_numbers", "v227_poststart_incidents", "v305_result_parse_text_hash",
+        ]:
+            st.session_state.pop(_k, None)
+
         if not venue_override:
             st.warning("開催場を選択してください。")
         else:
@@ -19092,13 +19122,7 @@ if selected_main_page == "✅ 結果登録・解析":
                 # Ver305 fix6:
                 # 軽量「通常-結果」はengineのdispatch順や古いaliasに依存せず、
                 # app側から専用parserを直接呼ぶ。legacy parserへの落下を完全に遮断。
-                _fix6_compact = False
-                try:
-                    _fix6_compact = bool(
-                        engine._v305_is_compact_result_strict_header(result_text)
-                    )
-                except Exception:
-                    _fix6_compact = False
+                _fix6_compact = bool(_v305_compact_detected)
 
                 if _fix6_compact:
                     _fix6_body_r = None
@@ -19122,9 +19146,9 @@ if selected_main_page == "✅ 結果登録・解析":
                     meta_r["_結果解析形式"] = "compact_result_v305_fix6_direct"
                     meta_r["_本文R優先"] = bool(_fix6_body_r is not None)
                     st.success(
-                        f"🧩 軽量結果専用parser fix6で解析："
-                        f"{meta_r.get('開催日')} / {meta_r.get('開催場')} / "
-                        f"{meta_r.get('レース')}R / {len(rows_r)}車"
+                        f"🧩 軽量結果parser fix7：{meta_r.get('開催日')} / "
+                        f"{meta_r.get('開催場')} / {meta_r.get('レース')}R / {len(rows_r)}車 / "
+                        f"周回{len(laps_r)}行 / 払戻{len(payouts_r)}行"
                     )
                 else:
                     meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(
@@ -19140,8 +19164,20 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.session_state["v35_result_rows"] = rows_r
                 st.session_state["v35_result_laps"] = laps_r
                 st.session_state["v35_result_payouts"] = payouts_r
+                st.session_state["v305_result_parse_text_hash"] = hashlib.sha256(
+                    str(result_text or "").encode("utf-8")
+                ).hexdigest()
             except Exception as exc:
+                # 失敗時は空のまま。前回結果を見せない。
                 st.error(f"結果解析エラー: {exc}")
+
+    _current_result_text_hash = hashlib.sha256(
+        str(result_text or "").encode("utf-8")
+    ).hexdigest() if result_text else ""
+    _parsed_result_text_hash = str(st.session_state.get("v305_result_parse_text_hash") or "")
+    if _parsed_result_text_hash and _parsed_result_text_hash != _current_result_text_hash:
+        for _k in ["v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts"]:
+            st.session_state.pop(_k, None)
 
     meta_r = st.session_state.get("v35_result_meta")
     rows_r = st.session_state.get("v35_result_rows")
