@@ -9428,27 +9428,45 @@ def _v121_extract_started_and_incident_cars(text, finished_rows=None):
     lines = [x for x in lines if x]
 
     incident_words = (
-        "競走中止", "落妨", "落車", "反妨", "反則", "周誤", "周回誤認",
-        "他落", "故障", "妨害", "失格", "再試走", "戒告"
+        "競走中止", "落妨", "落車", "反妨", "反則妨害", "反則", "周誤", "周回誤認",
+        "他落", "故障", "妨害失格", "妨害", "失格", "再試走", "戒告"
     )
     nonstarters = ("欠車", "出走取消", "参加解除", "欠場")
     incidents = {}
 
     for i, line in enumerate(lines):
         car = None
-        # 公式縦表示: 「-」の次の行が車番。横表示「- 1」にも対応。
-        m = re.match(r"^[-－—–]\s*([1-8])(?:\s|$)", line)
+        # 公式縦表示の異常着順行を広めに許容する。
+        # 例: 「－ 5」「－ 反妨 5」「－\t反妨\t5」、または「－」の次行に事故語/車番。
+        m = re.match(r"^[-－—–]\s*(?:([^0-9\s]+)\s+)?([1-8])(?:\s|$)", line)
+        inline_status = ""
         if m:
-            car = int(m.group(1))
-        elif re.fullmatch(r"[-－—–]", line) and i + 1 < len(lines) and re.fullmatch(r"[1-8]", lines[i + 1]):
-            car = int(lines[i + 1])
+            inline_status = str(m.group(1) or "").strip()
+            car = int(m.group(2))
+        elif re.fullmatch(r"[-－—–]", line):
+            # 次行が直接車番、または「反妨 5」のような事故語+車番でも拾う。
+            if i + 1 < len(lines):
+                n1 = lines[i + 1]
+                if re.fullmatch(r"[1-8]", n1):
+                    car = int(n1)
+                else:
+                    m2 = re.match(r"^([^0-9\s]+)\s+([1-8])(?:\s|$)", n1)
+                    if m2:
+                        inline_status = str(m2.group(1) or "").strip()
+                        car = int(m2.group(2))
+            # iPhoneコピーで「－」「反妨」「5」が3行に割れるケース。
+            if car is None and i + 2 < len(lines):
+                n1, n2 = lines[i + 1], lines[i + 2]
+                if any(w in n1 for w in incident_words) and re.fullmatch(r"[1-8]", n2):
+                    inline_status = n1
+                    car = int(n2)
         if car is None:
             continue
 
         nearby = " ".join(lines[i:min(len(lines), i + 8)])
         if any(w in nearby for w in nonstarters):
             continue
-        status = next((w for w in incident_words if w in nearby), "競走中止等")
+        status = next((w for w in incident_words if w in (inline_status + " " + nearby)), "競走中止等")
         incidents[car] = status
 
     started = sorted(finished | set(incidents))
@@ -20054,9 +20072,19 @@ def v35_parse_result_text(text, venue_override="", race_no_override=""):
                 f"開催場={meta.get('開催場')} / R={meta.get('レース')}"
             )
 
-        # 監査用。画面・保存側で専用parser使用を確認できる。
+        # 着順が「－」になる発走後事故車（反妨・落車・競走中止・失格等）は
+        # 完走rowsには混ぜず、metaの発走車番/事故車として保持する。
+        # これにより「予測8車・結果7車」を欠車と誤判定せず、事故レースとして登録できる。
+        started_cars, incident_cars = _v121_extract_started_and_incident_cars(text, rows)
         meta = dict(meta)
-        meta["_結果解析形式"] = "compact_result_v305_fix5"
+        meta["発走車番"] = started_cars
+        meta["発走後事故車"] = incident_cars
+        meta["完走車数"] = int(rows["車番"].nunique()) if "車番" in rows.columns else int(len(rows))
+        if incident_cars:
+            meta = _v302_enrich_incident_meta(meta, rows)
+
+        # 監査用。画面・保存側で専用parser使用を確認できる。
+        meta["_結果解析形式"] = "compact_result_v305_fix8_incident"
         meta["_本文R優先"] = bool(body_race_no is not None)
         return meta, rows, laps, payouts
 
@@ -20064,7 +20092,7 @@ def v35_parse_result_text(text, venue_override="", race_no_override=""):
 
 
 
-V305_COMPACT_RESULT_BUILD = "Ver305-fix6-direct"
+V305_COMPACT_RESULT_BUILD = "Ver305-fix8-incident"
 
 def v305_validate_compact_result_parse(text, venue_override="", race_no_override=""):
     """軽量結果parserの自己診断。画面検証用。"""
@@ -20076,6 +20104,7 @@ def v305_validate_compact_result_parse(text, venue_override="", race_no_override
     rows = _v305_compact_result_rows_strict(text)
     laps = _v305_parse_compact_laps(text)
     payouts = _v305_parse_compact_payouts(text)
+    started_cars, incident_cars = _v121_extract_started_and_incident_cars(text, rows)
     missing = {}
     for col in ["ハンデ","試走T","競走T","ST"]:
         if col not in rows.columns:
@@ -20090,5 +20119,7 @@ def v305_validate_compact_result_parse(text, venue_override="", race_no_override
         "rows": int(len(rows)),
         "laps": int(len(laps)),
         "payouts": int(len(payouts)),
+        "started_cars": started_cars,
+        "incident_cars": incident_cars,
         "missing": missing,
     }

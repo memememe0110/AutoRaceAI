@@ -18949,7 +18949,7 @@ elif selected_main_page == "🏁 予測":
 
 if selected_main_page == "✅ 結果登録・解析":
     st.subheader("公式結果を登録して予測と比較")
-    st.caption("🧩 結果parser build: Ver305-fix7-state-reset")
+    st.caption("🧩 結果parser build: Ver305-fix8-incident")
     _show_sticky_notice("result_register_notice")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
