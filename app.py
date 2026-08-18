@@ -6952,6 +6952,17 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
     )
     for m in pat.finditer(normalized):
         found.append({"車番": int(m.group(1)), "理由": str(m.group(3))})
+
+    # Ver305 fix10: 公式の「－ 反妨 5」のように、事故種別が車番より前へ
+    # 出る通常-結果形式を直接認識する。fix9までは「5 ... 反妨」しか拾えず、
+    # 5番が結果7車扱いのままVer117へ流れていた。
+    status_first_pat = re.compile(
+        rf"(?:^|\n)\s*[－—–-]?\s*({words})\s+([1-8])(?=\s|$)",
+        re.MULTILINE,
+    )
+    for m in status_first_pat.finditer(normalized):
+        found.append({"車番": int(m.group(2)), "理由": str(m.group(1))})
+
     if not found:
         line_pat = re.compile(rf"(?:^|\n)\s*-?\s*([1-8])\b[^\n]{{0,240}}?({words})", re.MULTILINE)
         for m in line_pat.finditer(normalized):
@@ -7784,12 +7795,15 @@ def _v238_result_safety_check(db_path: str, race_key: str, rows: pd.DataFrame) -
                 old_r = old_by.get(car)
                 if not old_r:
                     continue
-                if race_c and old_r.get("race_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[race_c]]), errors="coerce").iloc[0]):
-                    errors.append(f"{car}番の競走タイムが既存データから消えます。")
-                if st_c and old_r.get("start_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[st_c]]), errors="coerce").iloc[0]):
-                    errors.append(f"{car}番のSTが既存データから消えます。")
                 old_status = str(old_r.get("result_status") or "通常")
                 new_status = str(r[status_c] if status_c else "通常")
+                _new_abnormal = any(k in new_status for k in ["欠車","取消","除外","反妨","反則","失格","落車","中止","周誤","故障"])
+                # 反妨・落車等は公式上、競走Tが空欄になるのが正常。
+                # 異常行を「詳細値消失」として登録停止しない。STは値がある場合そのまま保存する。
+                if (not _new_abnormal) and race_c and old_r.get("race_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[race_c]]), errors="coerce").iloc[0]):
+                    errors.append(f"{car}番の競走タイムが既存データから消えます。")
+                if (not _new_abnormal) and st_c and old_r.get("start_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[st_c]]), errors="coerce").iloc[0]):
+                    errors.append(f"{car}番のSTが既存データから消えます。")
                 if old_status != "通常" and not any(k in new_status for k in ["欠車","取消","除外","反妨","反則","失格","落車","中止","周誤"]):
                     errors.append(f"{car}番の異常情報「{old_status}」が通常扱いへ変わります。")
     except Exception as exc:
