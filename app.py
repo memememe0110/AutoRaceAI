@@ -6965,11 +6965,35 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
     meta_out=dict(meta or {})
     if unique:
         reasons = {str(int(x["車番"])): str(x["理由"]) for x in unique}
+        incident_numbers = sorted({int(x["車番"]) for x in unique})
         reason_text = " / ".join(f"{k}番 {v}" for k, v in reasons.items())
+
+        # Ver305 fix9:
+        # compact結果parserは着順が付いた車だけをrowsへ返すため、反妨・落車などは
+        # rowsに存在しない。このままだとVer117の「予測車番 vs 結果車番」照合で
+        # 欠車と誤認される。発走後事故車は実際には発走しているため、照合用の
+        # 発走車番へ必ず加える。欠車・出走取消などの事前除外は加えない。
+        finished_numbers = []
+        try:
+            _rows = st.session_state.get("v35_result_rows")
+            if isinstance(_rows, pd.DataFrame) and "車番" in _rows.columns:
+                finished_numbers = pd.to_numeric(_rows["車番"], errors="coerce").dropna().astype(int).tolist()
+        except Exception:
+            finished_numbers = []
+        # 呼出し時点ではsession_stateへまだrowsを保存していない場合があるため、
+        # metaに既存の発走車番があれば併用し、最終的には登録直前にも補完する。
+        existing_started = meta_out.get("発走車番", []) or []
+        try:
+            existing_started = [int(x) for x in existing_started if x is not None]
+        except Exception:
+            existing_started = []
+        meta_out["発走車番"] = sorted(set(existing_started) | set(finished_numbers) | set(incident_numbers))
+        meta_out["発走後事故車"] = {int(k): str(v) for k, v in ((int(k), v) for k, v in reasons.items())}
+
         # engineの旧版・新版で参照名が異なっても、学習側へ流れないよう共通ゲートを多重指定する。
         meta_out.update({
             "発走後事故": True,
-            "発走後事故車番": sorted({int(x["車番"]) for x in unique}),
+            "発走後事故車番": incident_numbers,
             "発走後事故理由": reasons,
             "事故レース": True,
             "事故あり": True,
@@ -18949,7 +18973,7 @@ elif selected_main_page == "🏁 予測":
 
 if selected_main_page == "✅ 結果登録・解析":
     st.subheader("公式結果を登録して予測と比較")
-    st.caption("🧩 結果parser build: Ver305-fix8-incident")
+    st.caption("🧩 結果parser build: Ver305-fix7-state-reset")
     _show_sticky_notice("result_register_notice")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
@@ -19158,6 +19182,25 @@ if selected_main_page == "✅ 結果登録・解析":
                     result_text, meta_r, rows_r
                 )
                 meta_r, poststart_incidents = _v227_detect_poststart_incidents(result_text, meta_r)
+
+                # Ver305 fix9: 解析直後に「完走車 + 発走後事故車」を発走車番として確定。
+                # 反妨等は着順表には出ないが、欠車ではないのでVer117照合では出走扱い。
+                try:
+                    _finished_cars = set(
+                        pd.to_numeric(rows_r.get("車番"), errors="coerce").dropna().astype(int).tolist()
+                    ) if isinstance(rows_r, pd.DataFrame) and "車番" in rows_r.columns else set()
+                    _incident_cars = {int(x.get("車番")) for x in (poststart_incidents or []) if x.get("車番") is not None}
+                    _nonstarter_cars = {int(x) for x in (nonstarter_numbers or [])}
+                    meta_r["発走車番"] = sorted((_finished_cars | _incident_cars) - _nonstarter_cars)
+                    meta_r["発走後事故車"] = {
+                        int(x.get("車番")): str(x.get("理由") or "発走後事故")
+                        for x in (poststart_incidents or []) if x.get("車番") is not None
+                    }
+                    meta_r["完走車数"] = len(_finished_cars)
+                    meta_r["実出走数"] = len(meta_r["発走車番"])
+                except Exception:
+                    pass
+
                 st.session_state["v224_nonstarter_numbers"] = nonstarter_numbers
                 st.session_state["v227_poststart_incidents"] = poststart_incidents
                 st.session_state["v35_result_meta"] = meta_r
@@ -19246,6 +19289,26 @@ if selected_main_page == "✅ 結果登録・解析":
                 "このレースは予測精度評価・選手履歴学習・展開学習・重み更新の対象外です。"
                 "結果、払戻金、実際の回収率判定は保存します。"
             )
+
+        # Ver305 fix9: 結果解析後に、従来どおり欠車・事故車を目で確認できる一覧を残す。
+        _status_rows = []
+        for _car in nonstarter_numbers:
+            _reason_map = meta_r.get("事前除外理由", {}) if isinstance(meta_r, dict) else {}
+            _status_rows.append({
+                "車番": int(_car),
+                "区分": "欠車・発走前除外",
+                "理由": str(_reason_map.get(str(int(_car)), "欠車・発走前除外")),
+            })
+        for _item in poststart_incidents:
+            _status_rows.append({
+                "車番": int(_item.get("車番")),
+                "区分": "発走後事故・反則",
+                "理由": str(_item.get("理由") or "発走後事故"),
+            })
+        if _status_rows:
+            st.subheader("欠車・事故車")
+            st.dataframe(pd.DataFrame(_status_rows), use_container_width=True, hide_index=True)
+
         st.subheader("着順・タイム")
         st.dataframe(rows_r, use_container_width=True, hide_index=True)
 
