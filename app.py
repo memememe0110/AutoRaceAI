@@ -6952,17 +6952,6 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
     )
     for m in pat.finditer(normalized):
         found.append({"車番": int(m.group(1)), "理由": str(m.group(3))})
-
-    # Ver305 fix10: 公式の「－ 反妨 5」のように、事故種別が車番より前へ
-    # 出る通常-結果形式を直接認識する。fix9までは「5 ... 反妨」しか拾えず、
-    # 5番が結果7車扱いのままVer117へ流れていた。
-    status_first_pat = re.compile(
-        rf"(?:^|\n)\s*[－—–-]?\s*({words})\s+([1-8])(?=\s|$)",
-        re.MULTILINE,
-    )
-    for m in status_first_pat.finditer(normalized):
-        found.append({"車番": int(m.group(2)), "理由": str(m.group(1))})
-
     if not found:
         line_pat = re.compile(rf"(?:^|\n)\s*-?\s*([1-8])\b[^\n]{{0,240}}?({words})", re.MULTILINE)
         for m in line_pat.finditer(normalized):
@@ -6976,35 +6965,11 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
     meta_out=dict(meta or {})
     if unique:
         reasons = {str(int(x["車番"])): str(x["理由"]) for x in unique}
-        incident_numbers = sorted({int(x["車番"]) for x in unique})
         reason_text = " / ".join(f"{k}番 {v}" for k, v in reasons.items())
-
-        # Ver305 fix9:
-        # compact結果parserは着順が付いた車だけをrowsへ返すため、反妨・落車などは
-        # rowsに存在しない。このままだとVer117の「予測車番 vs 結果車番」照合で
-        # 欠車と誤認される。発走後事故車は実際には発走しているため、照合用の
-        # 発走車番へ必ず加える。欠車・出走取消などの事前除外は加えない。
-        finished_numbers = []
-        try:
-            _rows = st.session_state.get("v35_result_rows")
-            if isinstance(_rows, pd.DataFrame) and "車番" in _rows.columns:
-                finished_numbers = pd.to_numeric(_rows["車番"], errors="coerce").dropna().astype(int).tolist()
-        except Exception:
-            finished_numbers = []
-        # 呼出し時点ではsession_stateへまだrowsを保存していない場合があるため、
-        # metaに既存の発走車番があれば併用し、最終的には登録直前にも補完する。
-        existing_started = meta_out.get("発走車番", []) or []
-        try:
-            existing_started = [int(x) for x in existing_started if x is not None]
-        except Exception:
-            existing_started = []
-        meta_out["発走車番"] = sorted(set(existing_started) | set(finished_numbers) | set(incident_numbers))
-        meta_out["発走後事故車"] = {int(k): str(v) for k, v in ((int(k), v) for k, v in reasons.items())}
-
         # engineの旧版・新版で参照名が異なっても、学習側へ流れないよう共通ゲートを多重指定する。
         meta_out.update({
             "発走後事故": True,
-            "発走後事故車番": incident_numbers,
+            "発走後事故車番": sorted({int(x["車番"]) for x in unique}),
             "発走後事故理由": reasons,
             "事故レース": True,
             "事故あり": True,
@@ -7795,15 +7760,12 @@ def _v238_result_safety_check(db_path: str, race_key: str, rows: pd.DataFrame) -
                 old_r = old_by.get(car)
                 if not old_r:
                     continue
+                if race_c and old_r.get("race_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[race_c]]), errors="coerce").iloc[0]):
+                    errors.append(f"{car}番の競走タイムが既存データから消えます。")
+                if st_c and old_r.get("start_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[st_c]]), errors="coerce").iloc[0]):
+                    errors.append(f"{car}番のSTが既存データから消えます。")
                 old_status = str(old_r.get("result_status") or "通常")
                 new_status = str(r[status_c] if status_c else "通常")
-                _new_abnormal = any(k in new_status for k in ["欠車","取消","除外","反妨","反則","失格","落車","中止","周誤","故障"])
-                # 反妨・落車等は公式上、競走Tが空欄になるのが正常。
-                # 異常行を「詳細値消失」として登録停止しない。STは値がある場合そのまま保存する。
-                if (not _new_abnormal) and race_c and old_r.get("race_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[race_c]]), errors="coerce").iloc[0]):
-                    errors.append(f"{car}番の競走タイムが既存データから消えます。")
-                if (not _new_abnormal) and st_c and old_r.get("start_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[st_c]]), errors="coerce").iloc[0]):
-                    errors.append(f"{car}番のSTが既存データから消えます。")
                 if old_status != "通常" and not any(k in new_status for k in ["欠車","取消","除外","反妨","反則","失格","落車","中止","周誤"]):
                     errors.append(f"{car}番の異常情報「{old_status}」が通常扱いへ変わります。")
     except Exception as exc:
@@ -16302,11 +16264,11 @@ def _v282_push_chunked_db(
 
 
 
-def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
-    """Ver284: 保存時と同じ3段取得で分割DBを復元し、part単位+全体を厳密検証する。"""
+def _v282_pull_chunked_db(previous: bool = False) -> tuple[bool, bytes | None, str]:
+    """分割DBを復元し、part単位+全体を厳密検証する。previous=Trueなら直前正常世代を読む。"""
     cfg = github_config()
     repo_api = f"https://api.github.com/repos/{cfg['repo']}/contents/"
-    mp = _v282_chunk_manifest_path()
+    mp = (str(github_config()["path"]).lstrip("/") + ".chunks.previous.json") if previous else _v282_chunk_manifest_path()
     read_branch = _v282_db_read_branch()
 
     def _fetch284(path284: str) -> tuple[bool, bytes | None, str]:
@@ -16499,6 +16461,12 @@ def _v278_consistent_db_snapshot_bytes(db_path: str) -> bytes:
             with sqlite3.connect(str(snap_path), timeout=60.0) as dst:
                 src.backup(dst)
                 dst.commit()
+        # backup APIで作った一時コピーを、元DBとは別接続で完全検証してからbytes化する。
+        with sqlite3.connect(str(snap_path), timeout=60.0) as verify:
+            verify.execute("PRAGMA busy_timeout=60000")
+            qc=verify.execute("PRAGMA quick_check").fetchone()
+            if not qc or str(qc[0]).strip().lower()!="ok":
+                raise sqlite3.DatabaseError("スナップショットquick_check失敗: "+str(qc[0] if qc else "no result"))
         data=snap_path.read_bytes()
         if not data.startswith(b"SQLite format 3\x00"):
             raise RuntimeError("SQLiteスナップショットの生成に失敗しました")
@@ -17209,7 +17177,47 @@ if not st.session_state.get("v284_boot_github_restore_checked",False):
                                 else:
                                     st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時復元失敗: "+str(_boot_install_msg284)
                     elif _boot_msg284!="manifestなし":
-                        st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時検証失敗: "+str(_boot_msg284)
+                        # Ver305 safety hotfix:
+                        # currentのSHAがmanifest通りでもSQLite内部が壊れている場合は、
+                        # currentを採用せず previous 正常世代を検証して自動フォールバックする。
+                        _prev_ok305,_prev_bytes305,_prev_msg305=_v282_pull_chunked_db(previous=True)
+                        if _prev_ok305 and isinstance(_prev_bytes305,(bytes,bytearray)):
+                            _prev_fp305=_v283_db_fingerprint_bytes(bytes(_prev_bytes305))
+                            _prev_not_older305=False
+                            if _prev_fp305.get("ok"):
+                                if _boot_local284.get("ok"):
+                                    _prev_cmp305=_v283_compare_db_fingerprints(
+                                        _prev_fp305,_boot_local284.get("fingerprint") or {}
+                                    )
+                                    _prev_not_older305=bool(_prev_cmp305.get("safe"))
+                                else:
+                                    _prev_not_older305=True
+                            if _prev_not_older305:
+                                _prev_install_ok305,_prev_install_msg305=_v276_atomic_install_db_bytes(
+                                    bytes(_prev_bytes305),"起動時GitHub previous正常世代復元"
+                                )
+                                if _prev_install_ok305:
+                                    st.session_state["v284_boot_github_restored"]=True
+                                    st.session_state["v284_boot_github_restore_note"]=(
+                                        "GitHub currentのSQLite整合性異常を検出したため、"
+                                        "直前の正常previous世代へ自動フォールバックしました。"
+                                    )
+                                    st.session_state.pop("_v290_identity_cache",None)
+                                else:
+                                    st.session_state["v284_boot_github_restore_error"]=(
+                                        "GitHub currentの起動時検証失敗: "+str(_boot_msg284)
+                                        +" / previous復元失敗: "+str(_prev_install_msg305)
+                                    )
+                            else:
+                                st.session_state["v284_boot_github_restore_error"]=(
+                                    "GitHub currentの起動時検証失敗: "+str(_boot_msg284)
+                                    +" / previous世代は現在DBを完全包含しないため自動復元しませんでした。"
+                                )
+                        else:
+                            st.session_state["v284_boot_github_restore_error"]=(
+                                "GitHub currentの起動時検証失敗: "+str(_boot_msg284)
+                                +" / previous正常世代も取得できません: "+str(_prev_msg305)
+                            )
             elif _manifest_msg290!="manifestなし":
                 st.session_state["v284_boot_github_restore_error"]="GitHub current manifest確認失敗: "+str(_manifest_msg290)
     except Exception as _boot_exc284:
@@ -19196,25 +19204,6 @@ if selected_main_page == "✅ 結果登録・解析":
                     result_text, meta_r, rows_r
                 )
                 meta_r, poststart_incidents = _v227_detect_poststart_incidents(result_text, meta_r)
-
-                # Ver305 fix9: 解析直後に「完走車 + 発走後事故車」を発走車番として確定。
-                # 反妨等は着順表には出ないが、欠車ではないのでVer117照合では出走扱い。
-                try:
-                    _finished_cars = set(
-                        pd.to_numeric(rows_r.get("車番"), errors="coerce").dropna().astype(int).tolist()
-                    ) if isinstance(rows_r, pd.DataFrame) and "車番" in rows_r.columns else set()
-                    _incident_cars = {int(x.get("車番")) for x in (poststart_incidents or []) if x.get("車番") is not None}
-                    _nonstarter_cars = {int(x) for x in (nonstarter_numbers or [])}
-                    meta_r["発走車番"] = sorted((_finished_cars | _incident_cars) - _nonstarter_cars)
-                    meta_r["発走後事故車"] = {
-                        int(x.get("車番")): str(x.get("理由") or "発走後事故")
-                        for x in (poststart_incidents or []) if x.get("車番") is not None
-                    }
-                    meta_r["完走車数"] = len(_finished_cars)
-                    meta_r["実出走数"] = len(meta_r["発走車番"])
-                except Exception:
-                    pass
-
                 st.session_state["v224_nonstarter_numbers"] = nonstarter_numbers
                 st.session_state["v227_poststart_incidents"] = poststart_incidents
                 st.session_state["v35_result_meta"] = meta_r
@@ -19303,26 +19292,6 @@ if selected_main_page == "✅ 結果登録・解析":
                 "このレースは予測精度評価・選手履歴学習・展開学習・重み更新の対象外です。"
                 "結果、払戻金、実際の回収率判定は保存します。"
             )
-
-        # Ver305 fix9: 結果解析後に、従来どおり欠車・事故車を目で確認できる一覧を残す。
-        _status_rows = []
-        for _car in nonstarter_numbers:
-            _reason_map = meta_r.get("事前除外理由", {}) if isinstance(meta_r, dict) else {}
-            _status_rows.append({
-                "車番": int(_car),
-                "区分": "欠車・発走前除外",
-                "理由": str(_reason_map.get(str(int(_car)), "欠車・発走前除外")),
-            })
-        for _item in poststart_incidents:
-            _status_rows.append({
-                "車番": int(_item.get("車番")),
-                "区分": "発走後事故・反則",
-                "理由": str(_item.get("理由") or "発走後事故"),
-            })
-        if _status_rows:
-            st.subheader("欠車・事故車")
-            st.dataframe(pd.DataFrame(_status_rows), use_container_width=True, hide_index=True)
-
         st.subheader("着順・タイム")
         st.dataframe(rows_r, use_container_width=True, hide_index=True)
 
