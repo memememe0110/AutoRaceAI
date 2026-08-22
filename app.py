@@ -5679,6 +5679,13 @@ def _v276_mark_retrial_from_prediction_text(entries, raw_text):
             return entries
         out = entries.copy()
         flags = {}
+        _car_col0 = next((c for c in ("車番", "car_no", "car") if c in out.columns), None)
+        if _car_col0 is not None and "再試走" in out.columns:
+            for _, _r0 in out.iterrows():
+                try:
+                    flags[int(float(_r0[_car_col0]))] = bool(_r0.get("再試走", False))
+                except Exception:
+                    pass
         text = str(raw_text or "")
         # 本物の選手見出し行だけを起点にブロック化する。
         # 「2\t着順 2-1-0-15」のような車級/着順行を車番見出しと誤認しないよう、
@@ -5702,7 +5709,29 @@ def _v276_mark_retrial_from_prediction_text(entries, raw_text):
                 r"(?:ST\s*(?:[+-]?\d?\.\d{2,3}|-)\s*|(?:試走T|試)\s*)(?:再試|再)\s*[3-9]\.\d{2,3}",
                 block, re.I
             ))
-            flags[car] = is_retrial
+            flags[car] = bool(flags.get(car, False) or is_retrial)
+
+        # 軽量公式表では車番が単独行になるため、その形式も直接確認する。
+        try:
+            _lines276 = [x.strip() for x in text.splitlines()]
+            _starts276 = []
+            for _i276, _line276 in enumerate(_lines276):
+                if not re.fullmatch(r"[1-8]", _line276):
+                    continue
+                _following276 = [x for x in _lines276[_i276+1:_i276+10] if x]
+                if any(re.search(r"(川口|伊勢崎|浜松|山陽|飯塚)\s*\d{1,2}期", x) for x in _following276):
+                    _starts276.append((_i276, int(_line276)))
+            for _n276, (_s276, _car276) in enumerate(_starts276):
+                _e276 = _starts276[_n276+1][0] if _n276+1 < len(_starts276) else len(_lines276)
+                _block276 = " ".join(_lines276[_s276:_e276])
+                if re.search(
+                    r"(?:^|\s)(?:0|10|20|30|40|50|60|70|80)\s+"
+                    r"(?:再試走|再試|再)\s*[3-9]\.\d{2,3}\s+\d{2,3}(?:\s|$)",
+                    _block276
+                ):
+                    flags[_car276] = True
+        except Exception:
+            pass
 
         # 念のため、原文に再試走表記があるのに上で紐付かなかった場合は、
         # その位置より直前にある本物の選手見出しへ紐付ける。
@@ -16264,11 +16293,11 @@ def _v282_push_chunked_db(
 
 
 
-def _v282_pull_chunked_db(previous: bool = False) -> tuple[bool, bytes | None, str]:
-    """分割DBを復元し、part単位+全体を厳密検証する。previous=Trueなら直前正常世代を読む。"""
+def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
+    """Ver284: 保存時と同じ3段取得で分割DBを復元し、part単位+全体を厳密検証する。"""
     cfg = github_config()
     repo_api = f"https://api.github.com/repos/{cfg['repo']}/contents/"
-    mp = (str(github_config()["path"]).lstrip("/") + ".chunks.previous.json") if previous else _v282_chunk_manifest_path()
+    mp = _v282_chunk_manifest_path()
     read_branch = _v282_db_read_branch()
 
     def _fetch284(path284: str) -> tuple[bool, bytes | None, str]:
@@ -16461,12 +16490,6 @@ def _v278_consistent_db_snapshot_bytes(db_path: str) -> bytes:
             with sqlite3.connect(str(snap_path), timeout=60.0) as dst:
                 src.backup(dst)
                 dst.commit()
-        # backup APIで作った一時コピーを、元DBとは別接続で完全検証してからbytes化する。
-        with sqlite3.connect(str(snap_path), timeout=60.0) as verify:
-            verify.execute("PRAGMA busy_timeout=60000")
-            qc=verify.execute("PRAGMA quick_check").fetchone()
-            if not qc or str(qc[0]).strip().lower()!="ok":
-                raise sqlite3.DatabaseError("スナップショットquick_check失敗: "+str(qc[0] if qc else "no result"))
         data=snap_path.read_bytes()
         if not data.startswith(b"SQLite format 3\x00"):
             raise RuntimeError("SQLiteスナップショットの生成に失敗しました")
@@ -17177,47 +17200,7 @@ if not st.session_state.get("v284_boot_github_restore_checked",False):
                                 else:
                                     st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時復元失敗: "+str(_boot_install_msg284)
                     elif _boot_msg284!="manifestなし":
-                        # Ver305 safety hotfix:
-                        # currentのSHAがmanifest通りでもSQLite内部が壊れている場合は、
-                        # currentを採用せず previous 正常世代を検証して自動フォールバックする。
-                        _prev_ok305,_prev_bytes305,_prev_msg305=_v282_pull_chunked_db(previous=True)
-                        if _prev_ok305 and isinstance(_prev_bytes305,(bytes,bytearray)):
-                            _prev_fp305=_v283_db_fingerprint_bytes(bytes(_prev_bytes305))
-                            _prev_not_older305=False
-                            if _prev_fp305.get("ok"):
-                                if _boot_local284.get("ok"):
-                                    _prev_cmp305=_v283_compare_db_fingerprints(
-                                        _prev_fp305,_boot_local284.get("fingerprint") or {}
-                                    )
-                                    _prev_not_older305=bool(_prev_cmp305.get("safe"))
-                                else:
-                                    _prev_not_older305=True
-                            if _prev_not_older305:
-                                _prev_install_ok305,_prev_install_msg305=_v276_atomic_install_db_bytes(
-                                    bytes(_prev_bytes305),"起動時GitHub previous正常世代復元"
-                                )
-                                if _prev_install_ok305:
-                                    st.session_state["v284_boot_github_restored"]=True
-                                    st.session_state["v284_boot_github_restore_note"]=(
-                                        "GitHub currentのSQLite整合性異常を検出したため、"
-                                        "直前の正常previous世代へ自動フォールバックしました。"
-                                    )
-                                    st.session_state.pop("_v290_identity_cache",None)
-                                else:
-                                    st.session_state["v284_boot_github_restore_error"]=(
-                                        "GitHub currentの起動時検証失敗: "+str(_boot_msg284)
-                                        +" / previous復元失敗: "+str(_prev_install_msg305)
-                                    )
-                            else:
-                                st.session_state["v284_boot_github_restore_error"]=(
-                                    "GitHub currentの起動時検証失敗: "+str(_boot_msg284)
-                                    +" / previous世代は現在DBを完全包含しないため自動復元しませんでした。"
-                                )
-                        else:
-                            st.session_state["v284_boot_github_restore_error"]=(
-                                "GitHub currentの起動時検証失敗: "+str(_boot_msg284)
-                                +" / previous正常世代も取得できません: "+str(_prev_msg305)
-                            )
+                        st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時検証失敗: "+str(_boot_msg284)
             elif _manifest_msg290!="manifestなし":
                 st.session_state["v284_boot_github_restore_error"]="GitHub current manifest確認失敗: "+str(_manifest_msg290)
     except Exception as _boot_exc284:

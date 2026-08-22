@@ -13490,19 +13490,21 @@ def _v305_parse_compact_official_entry(block):
     grade_num=v15_int(v15_first_match([r"(\d)級"],compact))
 
     # 「0 3.45 105」のような当日列を、ランク行より後だけから取得。
-    handicap=None; trial=np.nan; trial_dev=np.nan
+    handicap=None; trial=np.nan; trial_dev=np.nan; retrial=False
     rank_idx=next((i for i,x in enumerate(lines) if re.search(r"\b[SAB]-\d+\b",x)),None)
     if rank_idx is not None:
         tail=" ".join(lines[rank_idx+1:rank_idx+8])
         seq=re.search(
-            r"(?:^|\s)(0|10|20|30|40|50|60|70|80)\s+(?:再)?([3-9]\.\d{2,3}|-)\s+(\d{2,3})(?:\s|$)",
+            r"(?:^|\s)(0|10|20|30|40|50|60|70|80)\s+"
+            r"((?:再試走|再試|再)?)([3-9]\.\d{2,3}|-)\s+(\d{2,3})(?:\s|$)",
             tail
         )
         if seq:
             handicap=int(seq.group(1))
-            if seq.group(2)!="-":
-                trial=float(seq.group(2))
-            trial_dev=int(seq.group(3))/1000.0
+            retrial=bool(seq.group(2))
+            if seq.group(3)!="-":
+                trial=float(seq.group(3))
+            trial_dev=int(seq.group(4))/1000.0
 
     # 上記が改行で崩れた時は、ランク後の先頭3トークンだけを見る。
     if handicap is None and rank_idx is not None:
@@ -13511,10 +13513,12 @@ def _v305_parse_compact_official_entry(block):
             tokens.extend(x.split())
         for i,t in enumerate(tokens):
             if re.fullmatch(r"(0|10|20|30|40|50|60|70|80)",t):
-                if i+2<len(tokens) and re.fullmatch(r"(?:再)?[3-9]\.\d{2,3}|-",tokens[i+1]) and re.fullmatch(r"\d{2,3}",tokens[i+2]):
+                if i+2<len(tokens) and re.fullmatch(r"(?:(?:再試走|再試|再))?[3-9]\.\d{2,3}|-",tokens[i+1]) and re.fullmatch(r"\d{2,3}",tokens[i+2]):
                     handicap=int(t)
-                    if tokens[i+1]!="-" :
-                        trial=float(tokens[i+1].replace("再",""))
+                    _trial_token=tokens[i+1]
+                    retrial=bool(re.match(r"^(?:再試走|再試|再)", _trial_token))
+                    if _trial_token!="-" :
+                        trial=float(re.sub(r"^(?:再試走|再試|再)", "", _trial_token))
                     trial_dev=int(tokens[i+2])/1000.0
                     break
 
@@ -13533,6 +13537,8 @@ def _v305_parse_compact_official_entry(block):
         "近10走2連":two_rate,"近10走3連":three_rate,
         "2連対率":two_rate,"3連対率":three_rate,
         "車名":car_name,
+        "再試走":bool(retrial),
+        "試走種別":"再試走" if retrial else "通常試走",
         "_raw":"\n".join(lines),
         "_input_format":"official_compact_v305",
     }
@@ -15499,20 +15505,7 @@ def v117_prediction_result_entry_count_check(meta, results, db_path=DB_PATH):
         result_cars |= {int(x) for x in meta_started if x is not None}
     except Exception:
         pass
-
-    # Ver305 fix9: app側compact parserの旧保存状態でも救済する。
-    # 「発走後事故車」のdictだけでなく、既存の「発走後事故車番」listも照合対象へ含める。
     incident_cars = (meta or {}).get("発走後事故車", {}) if isinstance(meta, dict) else {}
-    incident_numbers = (meta or {}).get("発走後事故車番", []) if isinstance(meta, dict) else []
-    try:
-        if isinstance(incident_cars, dict):
-            result_cars |= {int(x) for x in incident_cars.keys() if x is not None}
-        result_cars |= {int(x) for x in incident_numbers if x is not None}
-    except Exception:
-        pass
-    if (not incident_cars) and incident_numbers:
-        reasons = (meta or {}).get("発走後事故理由", {}) if isinstance(meta, dict) else {}
-        incident_cars = {int(x): str(reasons.get(str(int(x)), reasons.get(int(x), "発走後事故"))) for x in incident_numbers}
     with sqlite3.connect(str(db_path)) as con:
         pred_rows = con.execute(
             "SELECT car_no FROM prediction_snapshots WHERE race_key=? ORDER BY car_no",
@@ -18948,46 +18941,14 @@ def _v302_mark_and_scrub_one_race(meta, results, db_path=DB_PATH):
                        WHERE race_key=?""", (reason, reason, key))
         # 事故車が結果明細に存在する場合は「通常」のまま残さない。
         for car, status in incident_map.items():
-            # fix10: parserで取得できた反妨行の試走T/ST/H/選手名をDBにも残す。
-            _src = None
-            try:
-                if isinstance(results, pd.DataFrame) and "車番" in results.columns:
-                    _mask = pd.to_numeric(results["車番"], errors="coerce").eq(int(car))
-                    if _mask.any():
-                        _src = results.loc[_mask].iloc[0]
-            except Exception:
-                _src = None
-            def _val(*names):
-                if _src is None:
-                    return None
-                for n in names:
-                    if n in _src.index:
-                        v = _src.get(n)
-                        if pd.notna(v):
-                            return v
-                return None
-            _name = _val("選手名", "player_name")
-            _trial = _val("試走T", "trial_time")
-            _race = _val("競走T", "race_time")
-            _st = _val("ST", "start_time")
-            _handicap = _val("ハンデ", "handicap")
-            cur = con.execute("""UPDATE result_entries SET result_status=?,
-                               player_name=COALESCE(?,player_name),
-                               trial_time=COALESCE(?,trial_time),
-                               race_time=COALESCE(?,race_time),
-                               start_time=COALESCE(?,start_time),
-                               handicap=COALESCE(?,handicap)
-                               WHERE race_key=? AND car_no=?""",
-                              (str(status), _name, _trial, _race, _st, _handicap, key, int(car)))
+            cur = con.execute("UPDATE result_entries SET result_status=? WHERE race_key=? AND car_no=?", (str(status), key, int(car)))
             if (cur.rowcount or 0) == 0:
                 try:
-                    if not _name:
-                        pred = con.execute("SELECT player_name FROM prediction_snapshots WHERE race_key=? AND car_no=? LIMIT 1", (key, int(car))).fetchone()
-                        _name = pred[0] if pred else None
+                    pred = con.execute("SELECT player_name FROM prediction_snapshots WHERE race_key=? AND car_no=? LIMIT 1", (key, int(car))).fetchone()
+                    name = pred[0] if pred else None
                     con.execute("""INSERT OR IGNORE INTO result_entries
                         (race_key,car_no,player_name,finish,trial_time,race_time,start_time,handicap,result_status)
-                        VALUES(?,?,?,?,?,?,?,?,?)""",
-                        (key, int(car), _name, None, _trial, _race, _st, _handicap, str(status)))
+                        VALUES(?,?,?,?,?,?,?,?,?)""", (key, int(car), name, None, None, None, None, None, str(status)))
                 except sqlite3.Error:
                     pass
         # 事故レースから生成された直接学習物だけを除去。結果・払戻・買い目実績は残す。
@@ -19675,49 +19636,6 @@ def _v305_compact_result_rows_strict(text):
 
     while i < len(lines):
         finish = car = None
-
-        # Ver305 fix10: 「－ 反妨 5」のような着順なし事故行も、
-        # 結果解析DataFrameへ正式な1行として残す。
-        # 例: － 反妨 5 / 田中 崇太 / トゥモロー・Ｓ / 30 3.44 0.10
-        _inc_words = r"反妨|反則妨害|妨害失格|反則失格|落車|他落|落妨|競走中止|周回誤認|周誤|失格|故障"
-        inc = re.fullmatch(rf"[－—–-]?\s*({_inc_words})\s+([1-8])", lines[i])
-        if inc:
-            incident_reason = str(inc.group(1))
-            car = int(inc.group(2))
-            i += 1
-            if i >= len(lines):
-                break
-            name = lines[i]; i += 1
-            car_name = ""
-            if i < len(lines):
-                # 数値行は H 試T ST の3項目、または H 試T 競T ST の4項目。
-                _parts = lines[i].split()
-                _looks_numeric = bool(_parts and re.fullmatch(r"-?\d+", _parts[0]))
-                if not _looks_numeric:
-                    car_name = lines[i]; i += 1
-            if i >= len(lines):
-                raise ValueError(f"{car}番 {incident_reason} のH/試T/STを解析できませんでした。")
-            toks = lines[i].split()
-            if len(toks) < 3 or not re.fullmatch(r"-?\d+", toks[0]):
-                raise ValueError(f"{car}番 {incident_reason} のH/試T/STを解析できませんでした: {lines[i]}")
-            handicap = int(toks[0])
-            trial = np.nan if toks[1] == "-" else float(str(toks[1]).replace("再", ""))
-            race_t = np.nan
-            if len(toks) == 3:
-                st = np.nan if toks[2] == "-" else float(toks[2])
-                tail = ""
-            else:
-                race_t = np.nan if toks[2] in {"-","0","0.000"} else float(toks[2])
-                st = np.nan if toks[3] == "-" else float(toks[3])
-                tail = " ".join(toks[4:]).strip()
-            i += 1
-            rows.append({
-                "着順": np.nan, "車番": car, "選手名": v15_normalize_name(name),
-                "所属": "", "ハンデ": handicap, "試走T": trial, "競走T": race_t,
-                "ST": st, "人気": np.nan, "事故": incident_reason, "結果区分": incident_reason,
-                "競走車名": car_name,
-            })
-            continue
 
         # パターンA: "1 1"
         m = re.fullmatch(r"([1-8])\s+([1-8])", lines[i])
