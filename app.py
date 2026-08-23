@@ -16035,10 +16035,14 @@ def _v282_push_chunked_db(
     fingerprint: dict | None = None,
     preserve_previous_manifest: bool = False,
 ) -> tuple[bool, str]:
-    """Ver283: DBをA/B二世代スロットで分割保存する。
+    """Ver305-safe-backup: 不変chunk再利用型の安全分割保存。
 
-    現在manifestがAなら次はBへ全partを書き終えてからmanifestを切替える。
-    途中失敗しても現在manifestが指す旧世代は壊さない。
+    原則:
+    - 既存partは上書き・削除しない。
+    - 新DBとSHA256が同じpartは current/previous の既存partをそのまま参照。
+    - 変更partだけ content-addressed path へ新規保存。
+    - 全chunk準備完了後にだけ manifest を切替。
+    - current manifestはpreviousへ退避し、復元可能な旧世代を保持。
     """
     cfg=github_config()
     repo_api=f"https://api.github.com/repos/{cfg['repo']}/contents/"
@@ -16049,248 +16053,234 @@ def _v282_push_chunked_db(
     base_path=str(cfg["path"]).lstrip("/")
 
     current_ok,current_manifest,_=_v283_get_chunk_manifest(branch=branch,previous=False)
-    _prev_ok_gen284,_prev_manifest_gen284,_=_v283_get_chunk_manifest(branch=branch,previous=True)
-    current_slot=str((current_manifest or {}).get("slot") or "")
-    next_slot="B" if current_slot=="A" else "A"
+    prev_ok,prev_manifest,_=_v283_get_chunk_manifest(branch=branch,previous=True)
+
     generation=max(
         int((current_manifest or {}).get("generation") or 0),
-        int((_prev_manifest_gen284 or {}).get("generation") or 0) if _prev_ok_gen284 else 0,
+        int((prev_manifest or {}).get("generation") or 0) if prev_ok else 0,
     )+1
 
     chunks=[snapshot_bytes[i:i+chunk_size] for i in range(0,len(snapshot_bytes),chunk_size)]
-    import hashlib
     digest=hashlib.sha256(snapshot_bytes).hexdigest()
 
-    # Ver294 UI/速度修正:
-    # 以前のmanifestにGit blob SHAがあれば更新前GETを省略する。
-    # GitHub PUT応答のcontent.shaをローカル計算Git blob SHAと照合し、
-    # 全partを再ダウンロードする二重転送を不要にする。
-    _known_git_sha294={}
-    for _m294 in (current_manifest or {}, _prev_manifest_gen284 or {}):
-        _parts294=list((_m294 or {}).get("parts") or [])
-        _shas294=list((_m294 or {}).get("part_git_sha1") or [])
-        if len(_parts294)==len(_shas294):
-            for _p294,_s294 in zip(_parts294,_shas294):
-                if _p294 and _s294:
-                    _known_git_sha294[str(_p294)]=str(_s294)
+    # バイト列が現行GitHub正本と完全一致なら、世代更新すら不要。
+    if (
+        current_ok
+        and str((current_manifest or {}).get("sha256") or "") == digest
+        and int((current_manifest or {}).get("size") or -1) == len(snapshot_bytes)
+    ):
+        try:
+            st.session_state["v305_remote_db_cache"]={
+                "branch":branch,
+                "generation":int((current_manifest or {}).get("generation") or 0),
+                "sha256":digest,
+                "size":len(snapshot_bytes),
+                "bytes":bytes(snapshot_bytes),
+            }
+        except Exception:
+            pass
+        return True,(
+            f"DB登録成功｜GitHub DBは既に同一世代です "
+            f"（{len(snapshot_bytes)/1024/1024:.1f}MB / 転送0part）"
+        )
 
-    _saved_git_sha294={}
-
-    def _git_blob_sha294(data: bytes) -> str:
-        import hashlib as _hashlib294
+    def _git_blob_sha(data: bytes) -> str:
         header=f"blob {len(data)}\0".encode("utf-8")
-        return _hashlib294.sha1(header+data).hexdigest()
+        return hashlib.sha1(header+data).hexdigest()
 
-    def put_file(path: str, data: bytes, message: str) -> tuple[bool,str]:
-        encoded=urllib.parse.quote(path,safe="/")
-        url=repo_api+encoded
+    def _get_meta(path: str) -> tuple[int,dict]:
+        url=repo_api+urllib.parse.quote(path,safe="/")+"?ref="+urllib.parse.quote(branch)
+        status,body=github_request(url)
+        return status,body if isinstance(body,dict) else {}
+
+    def _put_mutable(path: str, data: bytes, message: str) -> tuple[bool,str,str]:
+        """manifest等の可変ファイル。既存SHAを取得して安全更新。"""
+        url=repo_api+urllib.parse.quote(path,safe="/")
+        status,old=_get_meta(path)
         payload={
             "message":message,
             "content":base64.b64encode(data).decode("ascii"),
             "branch":branch,
         }
-
-        # 前世代manifestにSHAがあれば、更新対象の存在確認GETを省略。
-        _old_sha294=_known_git_sha294.get(str(path))
-        if _old_sha294:
-            payload["sha"]=_old_sha294
-        else:
-            q=url+"?ref="+urllib.parse.quote(branch)
-            s,old=github_request(q)
-            if s==200 and old.get("sha"):
-                payload["sha"]=old["sha"]
-            elif s!=404:
-                return False,str(old.get("message",s))
+        if status==200 and old.get("sha"):
+            payload["sha"]=str(old["sha"])
+        elif status!=404:
+            return False,str(old.get("message",status)),""
 
         ps,body=github_request(url,method="PUT",payload=payload)
         if ps not in (200,201):
-            return False,str(body.get("message",ps))
+            return False,str(body.get("message",ps) if isinstance(body,dict) else ps),""
+        returned=str(((body or {}).get("content") or {}).get("sha") or "")
+        if not returned:
+            return False,"GitHub PUT応答にcontent.shaがありません",""
+        return True,"ok",returned
 
-        _expected_sha294=_git_blob_sha294(data)
-        _returned_sha294=str(((body or {}).get("content") or {}).get("sha") or "")
-        if _returned_sha294:
-            # Ver295 hotfix:
-            # HTTP 200/201 + GitHubが返したcontent.shaを保存成功の正本とする。
-            # ローカル計算SHAとの差だけで保存失敗にしない。
-            # 次回更新時はこのGitHub実SHAをmanifestから再利用する。
-            _saved_git_sha294[str(path)]=_returned_sha294
-            return True,"ok"
+    def _ensure_immutable_chunk(path: str, data: bytes) -> tuple[bool,str,str,bool]:
+        """content-addressed part。存在すればGit blob SHA一致時のみ再利用。"""
+        expected_git_sha=_git_blob_sha(data)
+        status,old=_get_meta(path)
+        if status==200:
+            got=str(old.get("sha") or "")
+            if got != expected_git_sha:
+                return False,(
+                    f"不変chunk pathの内容SHAが不一致です: {path}"
+                ),"",False
+            return True,"既存chunk再利用",got,True
+        if status!=404:
+            return False,str(old.get("message",status)),"",False
 
-        # 応答にSHAが無い特殊時だけ1回読み戻して確認。
-        try:
-            _req294=urllib.request.Request(
-                url+"?ref="+urllib.parse.quote(branch),
-                headers={
-                    **({"Authorization":f"Bearer {cfg.get('token')}"} if cfg.get("token") else {}),
-                    "Accept":"application/vnd.github.raw+json",
-                    "User-Agent":"AutoRaceAI",
-                }
-            )
-            with urllib.request.urlopen(_req294,timeout=45) as _r294:
-                _got294=_r294.read()
-            if _got294 != data:
-                return False,"GitHub PUT後のフォールバック読み戻し不一致"
-            _saved_git_sha294[str(path)]=_expected_sha294
-            return True,"ok"
-        except Exception as _exc294:
-            return False,f"GitHub PUT後検証失敗: {type(_exc294).__name__}: {_exc294}"
+        url=repo_api+urllib.parse.quote(path,safe="/")
+        payload={
+            "message":f"{commit_message} [新規差分chunk {path.rsplit('/',1)[-1][:20]}]",
+            "content":base64.b64encode(data).decode("ascii"),
+            "branch":branch,
+        }
+        ps,body=github_request(url,method="PUT",payload=payload)
+        if ps not in (200,201):
+            return False,str(body.get("message",ps) if isinstance(body,dict) else ps),"",False
+        got=str(((body or {}).get("content") or {}).get("sha") or "")
+        if got != expected_git_sha:
+            return False,(
+                f"新規chunk Git SHA検証失敗: {path} "
+                f"({got or 'SHAなし'} != {expected_git_sha})"
+            ),"",False
+        return True,"新規chunk保存",got,False
 
-    def _cleanup_orphan_parts295(
-        active_manifest: dict,
-        previous_manifest: dict,
-        target_slot: str,
-    ) -> tuple[int,list[str]]:
-        """manifest切替成功後だけ、参照されていない旧partを削除する。
-
-        - current/previous のどちらかが参照しているpartは絶対に削除しない。
-        - 対象は今回書いたtarget_slotと同じslotのpartだけ。
-        - 削除失敗はDB保存成功を取り消さず、警告として返す。
-        """
-        protected=set()
-        for _m295 in (active_manifest or {}, previous_manifest or {}):
-            for _p295 in list((_m295 or {}).get("parts") or []):
-                if _p295:
-                    protected.add(str(_p295))
-
-        # base_path の親ディレクトリをContents APIで1回だけ列挙。
-        # Ver295 hotfix:
-        # posixpath依存を完全撤去。GitHub pathは "/" 区切りなので文字列だけで安全に分解する。
-        _base295=str(base_path or "").strip("/")
-        if "/" in _base295:
-            _parent295,_name295=_base295.rsplit("/",1)
-        else:
-            _parent295=""
-            _name295=_base295
-        _dir_url295=repo_api + urllib.parse.quote(_parent295,safe="/")
-        if _parent295:
-            _dir_url295 += "?ref=" + urllib.parse.quote(branch)
-        else:
-            _dir_url295 = repo_api.rstrip("/") + "?ref=" + urllib.parse.quote(branch)
-
-        try:
-            _s295,_rows295=github_request(_dir_url295)
-        except Exception as _exc295:
-            return 0,[f"旧part一覧取得失敗: {type(_exc295).__name__}: {_exc295}"]
-        if _s295 != 200 or not isinstance(_rows295,list):
-            return 0,[f"旧part一覧取得失敗: HTTP {_s295}"]
-
-        _prefix295=f"{_name295}.slot{target_slot}.part"
-        _deleted295=0
-        _errors295=[]
-        for _row295 in _rows295:
-            if not isinstance(_row295,dict):
+    # current/previous manifestから、同じcontent SHAの既存partを索引化。
+    # pathがslot式でも、ここから先は上書きしないので安全に再利用できる。
+    reusable={}
+    for mf in (current_manifest or {}, prev_manifest or {}):
+        parts=list((mf or {}).get("parts") or [])
+        sizes=list((mf or {}).get("part_sizes") or [])
+        shas=list((mf or {}).get("part_sha256") or [])
+        gitshas=list((mf or {}).get("part_git_sha1") or [])
+        for i,p in enumerate(parts):
+            if not p or i>=len(shas) or not str(shas[i] or ""):
                 continue
-            _nm295=str(_row295.get("name") or "")
-            _path295=str(_row295.get("path") or "")
-            _sha295=str(_row295.get("sha") or "")
-            if not _nm295.startswith(_prefix295):
-                continue
-            if _path295 in protected:
-                continue
-            if not _sha295:
-                _errors295.append(f"{_path295}: SHAなしのため削除保留")
-                continue
+            sz=int(sizes[i]) if i<len(sizes) else -1
+            gs=str(gitshas[i] or "") if i<len(gitshas) else ""
+            reusable[(str(shas[i]),sz)]=(str(p),gs)
 
-            _del_url295=repo_api+urllib.parse.quote(_path295,safe="/")
-            _payload295={
-                "message":f"{commit_message} [不要旧part削除 {_path295}]",
-                "sha":_sha295,
-                "branch":branch,
-            }
-            try:
-                _ds295,_dbody295=github_request(
-                    _del_url295,method="DELETE",payload=_payload295
-                )
-                if _ds295 in (200,204):
-                    _deleted295+=1
-                else:
-                    _msg295=(
-                        _dbody295.get("message",_ds295)
-                        if isinstance(_dbody295,dict) else _ds295
-                    )
-                    _errors295.append(f"{_path295}: {_msg295}")
-            except Exception as _exc295:
-                _errors295.append(
-                    f"{_path295}: {type(_exc295).__name__}: {_exc295}"
-                )
-        return _deleted295,_errors295
-
-    # inactive slotへ先に全partを書き込む。manifestはまだ切り替えない。
     chunk_paths=[]
+    part_sizes=[]
+    part_sha256=[]
+    part_git_sha1=[]
+    reused_count=0
+    uploaded_count=0
+
+    # chunkの準備。manifestはまだ一切変更しない。
     for idx,chunk in enumerate(chunks):
-        cp=f"{base_path}.slot{next_slot}.part{idx:03d}"
-        ok,msg=put_file(cp,chunk,f"{commit_message} [DB世代{generation} slot{next_slot} part {idx+1}/{len(chunks)}]")
+        csha=hashlib.sha256(chunk).hexdigest()
+        csize=len(chunk)
+        reuse=reusable.get((csha,csize))
+        if reuse:
+            cp,gitsha=reuse
+            # manifestにGit SHAが無い古いpartだけmetadataで確認。
+            if not gitsha:
+                status,meta=_get_meta(cp)
+                if status!=200 or not meta.get("sha"):
+                    return False,f"既存chunk再利用確認失敗 part {idx+1}/{len(chunks)}: {cp}"
+                gitsha=str(meta["sha"])
+            chunk_paths.append(cp)
+            part_sizes.append(csize)
+            part_sha256.append(csha)
+            part_git_sha1.append(gitsha)
+            reused_count+=1
+            continue
+
+        # 新しい内容だけimmutable pathへ保存。
+        # SHA256全文をpathに入れて衝突・誤上書きを避ける。
+        cp=f"{base_path}.chunks/{csha}.part"
+        ok,msg,gitsha,already=_ensure_immutable_chunk(cp,chunk)
         if not ok:
-            return False,f"分割DB slot{next_slot} part {idx+1}/{len(chunks)} 保存失敗: {msg}"
+            return False,f"差分chunk {idx+1}/{len(chunks)} 保存失敗: {msg}"
         chunk_paths.append(cp)
+        part_sizes.append(csize)
+        part_sha256.append(csha)
+        part_git_sha1.append(gitsha)
+        if already:
+            reused_count+=1
+        else:
+            uploaded_count+=1
 
-    # Ver294高速化:
-    # 各partはPUT応答のGit blob SHAで内容一致を確認済み。
-    # 以前はここで全partをもう一度GitHubからダウンロードしていたため、
-    # 80MB級DBではアップロード後に同容量を再転送して待ち時間が長かった。
-    # PUT時SHA検証に置き換え、二重転送を廃止する。
-    if len(_saved_git_sha294) != len(chunk_paths):
-        return False,(
-            f"GitHub保存を未完了として中止しました。"
-            f"part SHA確認数 {_saved_git_sha294.__len__()}/{len(chunk_paths)}。"
-            "current manifestは切り替えていません。"
-        )
+    # 全partのローカル再構成検証。
+    # 再利用partはmanifestに記録されたSHAと同じ内容なので、
+    # 新規partはGit blob SHAまで一致確認済み。
+    if len(chunk_paths)!=len(chunks):
+        return False,"差分chunk準備数が一致しません。manifestは切り替えていません。"
 
-    fp=fingerprint if isinstance(fingerprint,dict) and fingerprint.get("ok") else _v283_db_fingerprint_bytes(snapshot_bytes)
+    fp=(
+        fingerprint
+        if isinstance(fingerprint,dict) and fingerprint.get("ok")
+        else _v283_db_fingerprint_bytes(snapshot_bytes)
+    )
+    if not isinstance(fp,dict) or not fp.get("ok"):
+        return False,"DB fingerprintが不正です。manifestは切り替えていません。"
+
     manifest={
-        "format":"AutoRaceAI-sqlite-chunks-v2",
+        "format":"AutoRaceAI-sqlite-chunks-v3-immutable",
         "generation":generation,
-        "slot":next_slot,
+        "slot":"IMMUTABLE",
         "size":len(snapshot_bytes),
         "sha256":digest,
         "parts":chunk_paths,
-        "part_sizes":[len(c) for c in chunks],
-        "part_sha256":[hashlib.sha256(c).hexdigest() for c in chunks],
-        "part_git_sha1":[_saved_git_sha294.get(p,"") for p in chunk_paths],
+        "part_sizes":part_sizes,
+        "part_sha256":part_sha256,
+        "part_git_sha1":part_git_sha1,
         "verified_readback":False,
         "verified_upload_git_sha":True,
+        "immutable_chunks":True,
+        "reused_parts":int(reused_count),
+        "uploaded_parts":int(uploaded_count),
         "stats":fp,
         "app_version":str(_V231_APP_VERSION),
         "saved_at":_v228_now_jst_iso(),
         "commit_message":str(commit_message),
     }
 
-    # 通常時は現在世代をpreviousへ退避。
-    # Ver284復旧保存時はcurrent分割実体が壊れているため、正常なprevious manifestを上書きしない。
+    # currentをpreviousへ退避。復旧モードでは既存previousを温存。
     if current_ok and current_manifest and not preserve_previous_manifest:
-        prev_bytes=json.dumps(current_manifest,ensure_ascii=False,sort_keys=True).encode("utf-8")
-        ok,msg=put_file(
-            base_path+".chunks.previous.json",prev_bytes,
-            f"{commit_message} [previous manifest 世代{current_manifest.get('generation','旧')}]"
+        prev_bytes=json.dumps(
+            current_manifest,ensure_ascii=False,sort_keys=True
+        ).encode("utf-8")
+        ok,msg,_=_put_mutable(
+            base_path+".chunks.previous.json",
+            prev_bytes,
+            f"{commit_message} [previous manifest 世代{current_manifest.get('generation','旧')}]",
         )
         if not ok:
             return False,f"previous manifest保存失敗: {msg}"
 
-    manifest_bytes=json.dumps(manifest,ensure_ascii=False,sort_keys=True).encode("utf-8")
-    ok,msg=put_file(_v282_chunk_manifest_path(),manifest_bytes,f"{commit_message} [manifest 世代{generation}]")
+    # 最後の最後にcurrent manifestを切替。
+    manifest_bytes=json.dumps(
+        manifest,ensure_ascii=False,sort_keys=True
+    ).encode("utf-8")
+    ok,msg,_=_put_mutable(
+        _v282_chunk_manifest_path(),
+        manifest_bytes,
+        f"{commit_message} [manifest 世代{generation} immutable]",
+    )
     if not ok:
         return False,f"分割DB manifest保存失敗: {msg}"
 
-    # Ver295: manifest切替が完全成功した後にだけ旧余剰partを掃除する。
-    # previousとして実際に保持されるmanifestを明示して、参照中partは保護する。
-    if current_ok and current_manifest and not preserve_previous_manifest:
-        _previous_after295=dict(current_manifest)
-    else:
-        _previous_after295=dict(_prev_manifest_gen284 or {}) if _prev_ok_gen284 else {}
-
-    _deleted_orphans295,_cleanup_errors295=_cleanup_orphan_parts295(
-        manifest,_previous_after295,next_slot
-    )
-    _cleanup_note295=f" / 旧余剰part削除{int(_deleted_orphans295)}件"
-    if _cleanup_errors295:
-        _cleanup_note295 += f" / 削除保留{len(_cleanup_errors295)}件"
+    # 次回保存の包含確認用cache。manifest世代が同じ場合だけ利用される。
+    try:
+        st.session_state["v305_remote_db_cache"]={
+            "branch":branch,
+            "generation":generation,
+            "sha256":digest,
+            "size":len(snapshot_bytes),
+            "bytes":bytes(snapshot_bytes),
+        }
+    except Exception:
+        pass
 
     return True,(
-        f"DB登録成功｜GitHub分割保存成功 "
-        f"（DB世代{generation} / slot{next_slot} / {len(snapshot_bytes)/1024/1024:.1f}MB / {len(chunks)}分割 / 全part Git SHA検証済み"
-        f"{_cleanup_note295}）"
+        f"DB登録成功｜GitHub差分保存成功 "
+        f"（DB世代{generation} / {len(snapshot_bytes)/1024/1024:.1f}MB / "
+        f"{len(chunks)}part中 再利用{reused_count} / 新規転送{uploaded_count} / "
+        f"全part SHA保護 / 旧chunk非破壊）"
     )
-
 
 
 def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
@@ -16441,6 +16431,18 @@ def pull_db_from_github() -> tuple[bool, str]:
             if not ok:
                 return False, "GitHub上の分割DBは採用しませんでした。現在のDBは保護されています。\n" + msg
             st.session_state.pop("loaded_db_hash", None)
+            try:
+                _mfok305,_mf305,_=_v283_get_chunk_manifest(branch=_v282_db_read_branch(),previous=False)
+                if _mfok305:
+                    st.session_state["v305_remote_db_cache"]={
+                        "branch":_v282_db_read_branch(),
+                        "generation":int((_mf305 or {}).get("generation") or 0),
+                        "sha256":hashlib.sha256(data).hexdigest(),
+                        "size":len(data),
+                        "bytes":bytes(data),
+                    }
+            except Exception:
+                pass
             return True, f"GitHubから分割DBを安全に取得しました（{len(data) / 1024 / 1024:.2f} MB / 旧WAL・SHM除去済み）"
         except Exception as exc:
             return False, f"GitHub分割DB取得エラー: {type(exc).__name__}: {exc}"
@@ -16787,6 +16789,52 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
         shutil.rmtree(tmp_dir,ignore_errors=True)
 
 
+def _v305_remote_db_for_push() -> tuple[bool,bytes|None,str]:
+    """GitHub current manifestが直前保存時と同じなら、検証済みcacheを再利用。
+
+    外部端末等がGitHub DBを更新するとgeneration/sha256が変わるため、
+    cacheは自動失効して従来の全part読込へ戻る。
+    """
+    branch=_v282_db_read_branch()
+    mf_ok,mf,mf_msg=_v283_get_chunk_manifest(branch=branch,previous=False)
+    cache=st.session_state.get("v305_remote_db_cache")
+
+    if mf_ok and isinstance(cache,dict):
+        try:
+            same=(
+                str(cache.get("branch") or "")==str(branch)
+                and int(cache.get("generation") or -1)==int((mf or {}).get("generation") or -2)
+                and str(cache.get("sha256") or "")==str((mf or {}).get("sha256") or "")
+                and int(cache.get("size") or -1)==int((mf or {}).get("size") or -2)
+                and isinstance(cache.get("bytes"),(bytes,bytearray))
+            )
+            if same:
+                data=bytes(cache["bytes"])
+                if (
+                    len(data)==int((mf or {}).get("size") or -1)
+                    and hashlib.sha256(data).hexdigest()==str((mf or {}).get("sha256") or "")
+                ):
+                    fp=_v283_db_fingerprint_bytes(data)
+                    if fp.get("ok"):
+                        return True,data,"直前GitHub正本cache（manifest世代/SHA一致）"
+        except Exception:
+            pass
+
+    ok,data,msg=_v282_pull_chunked_db()
+    if ok and data is not None and mf_ok:
+        try:
+            st.session_state["v305_remote_db_cache"]={
+                "branch":branch,
+                "generation":int((mf or {}).get("generation") or 0),
+                "sha256":str((mf or {}).get("sha256") or ""),
+                "size":len(data),
+                "bytes":bytes(data),
+            }
+        except Exception:
+            pass
+    return ok,data,msg
+
+
 def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     # 保存ボタン押下時にも、アップロード正本よりDBが後退していないか最終確認。
     _pin284=st.session_state.get("v284_uploaded_master_identity")
@@ -16828,7 +16876,11 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
 
     # GitHub current DBと行単位の包含関係を比較。
     # 件数だけではなく、どちらにしか存在しない自然キーがあるかで判断する。
-    _remote_chunk_ok284,_remote_bytes284,_remote_chunk_msg284=_v282_pull_chunked_db()
+    # Ver305 safe delta backup:
+    # manifestが直前保存と同一なら検証済みGitHub正本cacheを利用し、
+    # 132MB級の全part再ダウンロードを省略する。
+    # manifestが外部更新されていれば自動的に全part読込へ戻る。
+    _remote_chunk_ok284,_remote_bytes284,_remote_chunk_msg284=_v305_remote_db_for_push()
     if _remote_chunk_ok284 and _remote_bytes284 is not None:
         _relpush284=_v284_db_containment(snapshot_bytes,_remote_bytes284)
         _rpush284=str(_relpush284.get("relation") or "unknown")
