@@ -16940,14 +16940,32 @@ def _v305_remote_db_for_push() -> tuple[bool,bytes|None,str]:
 def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     # 保存ボタン押下時にも、アップロード正本よりDBが後退していないか最終確認。
     _pin284=st.session_state.get("v284_uploaded_master_identity")
+    _deferred_guard284=[]
     if isinstance(_pin284,dict) and _pin284.get("ok"):
         _nowpin284=_v284_current_db_identity()
+        if not _nowpin284.get("ok"):
+            return False,"GitHub保存を中止しました。保存直前のDB識別情報を取得できません。"
+        if str(_nowpin284.get("path")) != str(_pin284.get("path")):
+            return False,(
+                "GitHub保存を中止しました。DB参照先が変更されています。"
+                f" {str(_pin284.get('path'))} → {str(_nowpin284.get('path'))}"
+            )
         _badpin284,_why284=_v284_db_identity_regressed(_nowpin284,_pin284)
         if _badpin284:
-            return False,"GitHub保存を中止しました。保存直前にDBがアップロード正本より後退しています。\n- "+"\n- ".join(map(str,_why284))
+            # Ver305自動統合:
+            # 件数減少だけでは保存禁止にしない。後段でGitHub current実体と
+            # 自然キーの行単位包含を確認し、divergedならsafe-unionする。
+            _deferred_guard284.extend(list(_why284 or []))
+
     _guard284=st.session_state.get("v284_db_identity_block") or []
+    _hard_guard284=[
+        str(x) for x in _guard284
+        if "DBパス変更:" in str(x) or "DB識別情報を取得できません" in str(x)
+    ]
+    if _hard_guard284:
+        return False,"DB参照先固定ガードが作動中のためGitHub保存を禁止しました。\n- "+"\n- ".join(_hard_guard284)
     if _guard284:
-        return False,"DB参照先固定ガードが作動中のためGitHub保存を禁止しました。\n- "+"\n- ".join(map(str,_guard284))
+        _deferred_guard284.extend([str(x) for x in _guard284 if str(x) not in _hard_guard284])
     ready,message=github_ready()
     if not ready:
         return False,message
@@ -17134,6 +17152,8 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     _merge_notice284=st.session_state.pop("v284_last_auto_merge_message",None)
     if _ok_push284 and _merge_notice284:
         _msg_push284 += "｜"+str(_merge_notice284)
+    if _ok_push284 and _deferred_guard284:
+        _msg_push284 += "｜件数差は固定停止せずGitHub実体との行単位包含確認を通過"
     return _ok_push284,_msg_push284
 
 
@@ -17284,9 +17304,12 @@ if (not _v296_bg_fast_rerun) and isinstance(_v284_pinned_bytes,(bytes,bytearray)
         _v284_restore_needed=True
     else:
         _v284_regressed,_v284_restore_reasons=_v284_db_identity_regressed(_v284_before_restore,_v284_pinned_id)
-        # 正本とSHAが違っても「増えたDB」は正常更新なので復元しない。
-        # 件数後退/DBパス変更だけを復元対象にする。
-        _v284_restore_needed=bool(_v284_regressed)
+        # Ver305自動統合:
+        # 正常な重複整理・再構成で件数が減る場合があるため、件数減少だけでは
+        # 古いpinned DBへ自動巻き戻ししない。内容差はGitHub保存時に行単位で統合する。
+        _v284_restore_needed=(
+            str(_v284_before_restore.get("path")) != str(_v284_pinned_id.get("path"))
+        )
     if _v284_restore_needed:
         _v284_restore_ok,_v284_restore_msg=_v276_atomic_install_db_bytes(bytes(_v284_pinned_bytes),"アップロード正本自動復元")
         if _v284_restore_ok:
