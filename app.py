@@ -16035,251 +16035,348 @@ def _v282_push_chunked_db(
     fingerprint: dict | None = None,
     preserve_previous_manifest: bool = False,
 ) -> tuple[bool, str]:
-    """Ver305-safe-backup: 不変chunk再利用型の安全分割保存。
+    """Ver305 atomic delta backup.
 
-    原則:
-    - 既存partは上書き・削除しない。
-    - 新DBとSHA256が同じpartは current/previous の既存partをそのまま参照。
-    - 変更partだけ content-addressed path へ新規保存。
-    - 全chunk準備完了後にだけ manifest を切替。
-    - current manifestはpreviousへ退避し、復元可能な旧世代を保持。
+    変更chunkはcontent-addressed blobとして作成し、previous/current manifestと合わせて
+    1つのGit tree/commitにまとめる。最後のbranch ref更新が成功するまで現行DB世代は不変。
+    force更新は禁止し、他端末が先にbranch更新した場合は競合として安全停止する。
     """
-    cfg=github_config()
-    repo_api=f"https://api.github.com/repos/{cfg['repo']}/contents/"
-    ok_branch,branch_msg=_v282_ensure_db_branch()
+    cfg = github_config()
+    ok_branch, branch_msg = _v282_ensure_db_branch()
     if not ok_branch:
-        return False,branch_msg
-    branch=branch_msg
-    base_path=str(cfg["path"]).lstrip("/")
+        return False, branch_msg
+    branch = str(branch_msg)
+    repo_api = f"https://api.github.com/repos/{cfg['repo']}"
+    contents_api = repo_api + "/contents/"
+    base_path = str(cfg["path"]).lstrip("/")
 
-    current_ok,current_manifest,_=_v283_get_chunk_manifest(branch=branch,previous=False)
-    prev_ok,prev_manifest,_=_v283_get_chunk_manifest(branch=branch,previous=True)
-
-    generation=max(
+    # 現在/previous manifest
+    current_ok, current_manifest, _ = _v283_get_chunk_manifest(
+        branch=branch, previous=False
+    )
+    prev_ok, prev_manifest, _ = _v283_get_chunk_manifest(
+        branch=branch, previous=True
+    )
+    generation = max(
         int((current_manifest or {}).get("generation") or 0),
         int((prev_manifest or {}).get("generation") or 0) if prev_ok else 0,
-    )+1
+    ) + 1
 
-    chunks=[snapshot_bytes[i:i+chunk_size] for i in range(0,len(snapshot_bytes),chunk_size)]
-    digest=hashlib.sha256(snapshot_bytes).hexdigest()
+    chunks = [
+        snapshot_bytes[i:i + chunk_size]
+        for i in range(0, len(snapshot_bytes), chunk_size)
+    ]
+    digest = hashlib.sha256(snapshot_bytes).hexdigest()
 
-    # バイト列が現行GitHub正本と完全一致なら、世代更新すら不要。
+    # GitHub正本とDB全体が完全一致ならcommit不要。
     if (
         current_ok
         and str((current_manifest or {}).get("sha256") or "") == digest
         and int((current_manifest or {}).get("size") or -1) == len(snapshot_bytes)
     ):
         try:
-            st.session_state["v305_remote_db_cache"]={
-                "branch":branch,
-                "generation":int((current_manifest or {}).get("generation") or 0),
-                "sha256":digest,
-                "size":len(snapshot_bytes),
-                "bytes":bytes(snapshot_bytes),
+            st.session_state["v305_remote_db_cache"] = {
+                "branch": branch,
+                "generation": int((current_manifest or {}).get("generation") or 0),
+                "sha256": digest,
+                "size": len(snapshot_bytes),
+                "bytes": bytes(snapshot_bytes),
             }
         except Exception:
             pass
-        return True,(
+        return True, (
             f"DB登録成功｜GitHub DBは既に同一世代です "
-            f"（{len(snapshot_bytes)/1024/1024:.1f}MB / 転送0part）"
+            f"（{len(snapshot_bytes)/1024/1024:.1f}MB / Git更新0回）"
         )
 
-    def _git_blob_sha(data: bytes) -> str:
-        header=f"blob {len(data)}\0".encode("utf-8")
-        return hashlib.sha1(header+data).hexdigest()
+    fp = (
+        fingerprint
+        if isinstance(fingerprint, dict) and fingerprint.get("ok")
+        else _v283_db_fingerprint_bytes(snapshot_bytes)
+    )
+    if not isinstance(fp, dict) or not fp.get("ok"):
+        return False, "GitHub保存を中止しました。DB fingerprint確認に失敗しました。"
 
-    def _get_meta(path: str) -> tuple[int,dict]:
-        url=repo_api+urllib.parse.quote(path,safe="/")+"?ref="+urllib.parse.quote(branch)
-        status,body=github_request(url)
-        return status,body if isinstance(body,dict) else {}
-
-    def _put_mutable(path: str, data: bytes, message: str) -> tuple[bool,str,str]:
-        """manifest等の可変ファイル。既存SHAを取得して安全更新。"""
-        url=repo_api+urllib.parse.quote(path,safe="/")
-        status,old=_get_meta(path)
-        payload={
-            "message":message,
-            "content":base64.b64encode(data).decode("ascii"),
-            "branch":branch,
-        }
-        if status==200 and old.get("sha"):
-            payload["sha"]=str(old["sha"])
-        elif status!=404:
-            return False,str(old.get("message",status)),""
-
-        ps,body=github_request(url,method="PUT",payload=payload)
-        if ps not in (200,201):
-            return False,str(body.get("message",ps) if isinstance(body,dict) else ps),""
-        returned=str(((body or {}).get("content") or {}).get("sha") or "")
-        if not returned:
-            return False,"GitHub PUT応答にcontent.shaがありません",""
-        return True,"ok",returned
-
-    def _ensure_immutable_chunk(path: str, data: bytes) -> tuple[bool,str,str,bool]:
-        """content-addressed part。存在すればGit blob SHA一致時のみ再利用。"""
-        expected_git_sha=_git_blob_sha(data)
-        status,old=_get_meta(path)
-        if status==200:
-            got=str(old.get("sha") or "")
-            if got != expected_git_sha:
-                return False,(
-                    f"不変chunk pathの内容SHAが不一致です: {path}"
-                ),"",False
-            return True,"既存chunk再利用",got,True
-        if status!=404:
-            return False,str(old.get("message",status)),"",False
-
-        url=repo_api+urllib.parse.quote(path,safe="/")
-        payload={
-            "message":f"{commit_message} [新規差分chunk {path.rsplit('/',1)[-1][:20]}]",
-            "content":base64.b64encode(data).decode("ascii"),
-            "branch":branch,
-        }
-        ps,body=github_request(url,method="PUT",payload=payload)
-        if ps not in (200,201):
-            return False,str(body.get("message",ps) if isinstance(body,dict) else ps),"",False
-        got=str(((body or {}).get("content") or {}).get("sha") or "")
-        if got != expected_git_sha:
-            return False,(
-                f"新規chunk Git SHA検証失敗: {path} "
-                f"({got or 'SHAなし'} != {expected_git_sha})"
-            ),"",False
-        return True,"新規chunk保存",got,False
-
-    # current/previous manifestから、同じcontent SHAの既存partを索引化。
-    # pathがslot式でも、ここから先は上書きしないので安全に再利用できる。
-    reusable={}
+    # current/previous manifestの既存content-addressed partを再利用。
+    reusable = {}
     for mf in (current_manifest or {}, prev_manifest or {}):
-        parts=list((mf or {}).get("parts") or [])
-        sizes=list((mf or {}).get("part_sizes") or [])
-        shas=list((mf or {}).get("part_sha256") or [])
-        gitshas=list((mf or {}).get("part_git_sha1") or [])
-        for i,p in enumerate(parts):
-            if not p or i>=len(shas) or not str(shas[i] or ""):
+        parts = list((mf or {}).get("parts") or [])
+        sizes = list((mf or {}).get("part_sizes") or [])
+        shas = list((mf or {}).get("part_sha256") or [])
+        gitshas = list((mf or {}).get("part_git_sha1") or [])
+        for i, p in enumerate(parts):
+            if not p or i >= len(shas) or not str(shas[i] or ""):
                 continue
-            sz=int(sizes[i]) if i<len(sizes) else -1
-            gs=str(gitshas[i] or "") if i<len(gitshas) else ""
-            reusable[(str(shas[i]),sz)]=(str(p),gs)
+            sz = int(sizes[i]) if i < len(sizes) else -1
+            gs = str(gitshas[i] or "") if i < len(gitshas) else ""
+            reusable[(str(shas[i]), sz)] = (str(p), gs)
 
-    chunk_paths=[]
-    part_sizes=[]
-    part_sha256=[]
-    part_git_sha1=[]
-    reused_count=0
-    uploaded_count=0
+    # ----------------------------------------------------------
+    # Git Data API helpers
+    # ----------------------------------------------------------
+    def _api(path: str, method="GET", payload=None):
+        return github_request(repo_api + path, method=method, payload=payload)
 
-    # chunkの準備。manifestはまだ一切変更しない。
-    for idx,chunk in enumerate(chunks):
-        csha=hashlib.sha256(chunk).hexdigest()
-        csize=len(chunk)
-        reuse=reusable.get((csha,csize))
+    # HEADを固定。ここから最後のref更新まで、このSHAを親にする。
+    ref_path = "/git/ref/heads/" + urllib.parse.quote(branch, safe="")
+    rs, ref_obj = _api(ref_path)
+    if rs != 200 or not isinstance(ref_obj, dict):
+        return False, f"GitHub保存を中止しました。branch HEAD取得失敗: {ref_obj}"
+    head_sha = str(((ref_obj.get("object") or {}).get("sha")) or "")
+    if not head_sha:
+        return False, "GitHub保存を中止しました。branch HEAD SHAを取得できません。"
+
+    cs, commit_obj = _api("/git/commits/" + urllib.parse.quote(head_sha, safe=""))
+    if cs != 200 or not isinstance(commit_obj, dict):
+        return False, "GitHub保存を中止しました。現在commit取得に失敗しました。"
+    base_tree_sha = str(((commit_obj.get("tree") or {}).get("sha")) or "")
+    if not base_tree_sha:
+        return False, "GitHub保存を中止しました。base tree SHAを取得できません。"
+
+    # Git blob作成。blobの作成だけではbranchから参照されず、途中失敗しても現行世代は無傷。
+    def _create_blob(data: bytes) -> tuple[bool, str, str]:
+        bs, body = _api(
+            "/git/blobs",
+            method="POST",
+            payload={
+                "content": base64.b64encode(data).decode("ascii"),
+                "encoding": "base64",
+            },
+        )
+        if bs != 201 or not isinstance(body, dict) or not body.get("sha"):
+            return False, "", str(
+                body.get("message", bs) if isinstance(body, dict) else bs
+            )
+        return True, str(body["sha"]), "ok"
+
+    # 既存partでgit blob SHAがmanifestにない場合だけContents metadataで補完。
+    def _content_git_sha(path: str) -> tuple[bool, str]:
+        url = contents_api + urllib.parse.quote(path, safe="/")
+        status, body = github_request(
+            url + "?ref=" + urllib.parse.quote(branch)
+        )
+        if status != 200 or not isinstance(body, dict) or not body.get("sha"):
+            return False, ""
+        return True, str(body["sha"])
+
+    chunk_paths = []
+    part_sizes = []
+    part_sha256 = []
+    part_git_sha1 = []
+    tree_entries = []
+    reused_count = 0
+    new_blob_count = 0
+
+    for idx, chunk in enumerate(chunks):
+        csha = hashlib.sha256(chunk).hexdigest()
+        csize = len(chunk)
+        reuse = reusable.get((csha, csize))
+
         if reuse:
-            cp,gitsha=reuse
-            # manifestにGit SHAが無い古いpartだけmetadataで確認。
+            cp, gitsha = reuse
             if not gitsha:
-                status,meta=_get_meta(cp)
-                if status!=200 or not meta.get("sha"):
-                    return False,f"既存chunk再利用確認失敗 part {idx+1}/{len(chunks)}: {cp}"
-                gitsha=str(meta["sha"])
+                ok_meta, gitsha = _content_git_sha(cp)
+                if not ok_meta:
+                    return False, (
+                        f"GitHub保存を中止しました。既存part {idx+1}/{len(chunks)} "
+                        "のSHA確認に失敗しました。"
+                    )
             chunk_paths.append(cp)
             part_sizes.append(csize)
             part_sha256.append(csha)
             part_git_sha1.append(gitsha)
-            reused_count+=1
+            reused_count += 1
             continue
 
-        # 新しい内容だけimmutable pathへ保存。
-        # SHA256全文をpathに入れて衝突・誤上書きを避ける。
-        cp=f"{base_path}.chunks/{csha}.part"
-        ok,msg,gitsha,already=_ensure_immutable_chunk(cp,chunk)
-        if not ok:
-            return False,f"差分chunk {idx+1}/{len(chunks)} 保存失敗: {msg}"
+        # 新partはSHA名。既存pathを上書きしない。
+        cp = f"{base_path}.chunks/{csha}.part"
+
+        # 同一SHA pathが既にGitに存在する場合は再利用。
+        ok_meta, existing_gitsha = _content_git_sha(cp)
+        if ok_meta:
+            expected_blob_sha = hashlib.sha1(
+                f"blob {len(chunk)}\0".encode("utf-8") + chunk
+            ).hexdigest()
+            if existing_gitsha != expected_blob_sha:
+                return False, (
+                    "GitHub保存を中止しました。content-addressed partのSHA衝突を検出しました: "
+                    + cp
+                )
+            gitsha = existing_gitsha
+            reused_count += 1
+        else:
+            ok_blob, gitsha, blob_msg = _create_blob(chunk)
+            if not ok_blob:
+                return False, (
+                    f"GitHub保存を中止しました。差分blob {idx+1}/{len(chunks)} "
+                    f"作成失敗: {blob_msg}"
+                )
+            tree_entries.append({
+                "path": cp,
+                "mode": "100644",
+                "type": "blob",
+                "sha": gitsha,
+            })
+            new_blob_count += 1
+
         chunk_paths.append(cp)
         part_sizes.append(csize)
         part_sha256.append(csha)
         part_git_sha1.append(gitsha)
-        if already:
-            reused_count+=1
-        else:
-            uploaded_count+=1
 
-    # 全partのローカル再構成検証。
-    # 再利用partはmanifestに記録されたSHAと同じ内容なので、
-    # 新規partはGit blob SHAまで一致確認済み。
-    if len(chunk_paths)!=len(chunks):
-        return False,"差分chunk準備数が一致しません。manifestは切り替えていません。"
-
-    fp=(
-        fingerprint
-        if isinstance(fingerprint,dict) and fingerprint.get("ok")
-        else _v283_db_fingerprint_bytes(snapshot_bytes)
-    )
-    if not isinstance(fp,dict) or not fp.get("ok"):
-        return False,"DB fingerprintが不正です。manifestは切り替えていません。"
-
-    manifest={
-        "format":"AutoRaceAI-sqlite-chunks-v3-immutable",
-        "generation":generation,
-        "slot":"IMMUTABLE",
-        "size":len(snapshot_bytes),
-        "sha256":digest,
-        "parts":chunk_paths,
-        "part_sizes":part_sizes,
-        "part_sha256":part_sha256,
-        "part_git_sha1":part_git_sha1,
-        "verified_readback":False,
-        "verified_upload_git_sha":True,
-        "immutable_chunks":True,
-        "reused_parts":int(reused_count),
-        "uploaded_parts":int(uploaded_count),
-        "stats":fp,
-        "app_version":str(_V231_APP_VERSION),
-        "saved_at":_v228_now_jst_iso(),
-        "commit_message":str(commit_message),
+    manifest = {
+        "format": "AutoRaceAI-sqlite-chunks-v4-atomic",
+        "generation": generation,
+        "slot": "IMMUTABLE",
+        "size": len(snapshot_bytes),
+        "sha256": digest,
+        "parts": chunk_paths,
+        "part_sizes": part_sizes,
+        "part_sha256": part_sha256,
+        "part_git_sha1": part_git_sha1,
+        "verified_readback": False,
+        "verified_upload_git_sha": True,
+        "immutable_chunks": True,
+        "atomic_git_commit": True,
+        "reused_parts": int(reused_count),
+        "uploaded_parts": int(new_blob_count),
+        "stats": fp,
+        "app_version": str(_V231_APP_VERSION),
+        "saved_at": _v228_now_jst_iso(),
+        "commit_message": str(commit_message),
     }
 
-    # currentをpreviousへ退避。復旧モードでは既存previousを温存。
+    # current manifestをpreviousとして同じcommitへ入れる。
     if current_ok and current_manifest and not preserve_previous_manifest:
-        prev_bytes=json.dumps(
-            current_manifest,ensure_ascii=False,sort_keys=True
-        ).encode("utf-8")
-        ok,msg,_=_put_mutable(
-            base_path+".chunks.previous.json",
-            prev_bytes,
-            f"{commit_message} [previous manifest 世代{current_manifest.get('generation','旧')}]",
-        )
-        if not ok:
-            return False,f"previous manifest保存失敗: {msg}"
+        previous_after = dict(current_manifest)
+    elif prev_ok and prev_manifest:
+        previous_after = dict(prev_manifest)
+    else:
+        previous_after = None
 
-    # 最後の最後にcurrent manifestを切替。
-    manifest_bytes=json.dumps(
-        manifest,ensure_ascii=False,sort_keys=True
+    # manifest blobを作る。
+    manifest_bytes = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True
     ).encode("utf-8")
-    ok,msg,_=_put_mutable(
-        _v282_chunk_manifest_path(),
-        manifest_bytes,
-        f"{commit_message} [manifest 世代{generation} immutable]",
-    )
-    if not ok:
-        return False,f"分割DB manifest保存失敗: {msg}"
+    ok_blob, manifest_blob_sha, msg_blob = _create_blob(manifest_bytes)
+    if not ok_blob:
+        return False, f"manifest blob作成失敗: {msg_blob}"
+    tree_entries.append({
+        "path": _v282_chunk_manifest_path(),
+        "mode": "100644",
+        "type": "blob",
+        "sha": manifest_blob_sha,
+    })
 
-    # 次回保存の包含確認用cache。manifest世代が同じ場合だけ利用される。
+    if previous_after is not None:
+        prev_bytes = json.dumps(
+            previous_after, ensure_ascii=False, sort_keys=True
+        ).encode("utf-8")
+        ok_blob, prev_blob_sha, msg_blob = _create_blob(prev_bytes)
+        if not ok_blob:
+            return False, f"previous manifest blob作成失敗: {msg_blob}"
+        tree_entries.append({
+            "path": base_path + ".chunks.previous.json",
+            "mode": "100644",
+            "type": "blob",
+            "sha": prev_blob_sha,
+        })
+
+    # 1つのtreeを作成。base_treeでDB以外のファイルも完全保持。
+    ts, tree_obj = _api(
+        "/git/trees",
+        method="POST",
+        payload={
+            "base_tree": base_tree_sha,
+            "tree": tree_entries,
+        },
+    )
+    if ts != 201 or not isinstance(tree_obj, dict) or not tree_obj.get("sha"):
+        return False, (
+            "GitHub保存を中止しました。atomic tree作成に失敗しました。"
+            " 現行DB世代は変更していません。"
+        )
+    new_tree_sha = str(tree_obj["sha"])
+
+    # 1つのcommit。親は最初に固定したHEAD。
+    cts, new_commit = _api(
+        "/git/commits",
+        method="POST",
+        payload={
+            "message": f"{commit_message} [DB世代{generation} atomic]",
+            "tree": new_tree_sha,
+            "parents": [head_sha],
+        },
+    )
+    if (
+        cts != 201
+        or not isinstance(new_commit, dict)
+        or not new_commit.get("sha")
+    ):
+        return False, (
+            "GitHub保存を中止しました。atomic commit作成に失敗しました。"
+            " 現行DB世代は変更していません。"
+        )
+    new_commit_sha = str(new_commit["sha"])
+
+    # 競合確認。別端末がこの間にbranchを更新していたら停止。
+    rs2, ref_obj2 = _api(ref_path)
+    latest_head = str(
+        (((ref_obj2 or {}).get("object") or {}).get("sha")) or ""
+    ) if rs2 == 200 else ""
+    if latest_head != head_sha:
+        return False, (
+            "GitHub保存を中止しました。保存準備中に別のGitHub更新を検出しました。"
+            " 強制上書きはしていません。もう一度DB登録を実行してください。"
+        )
+
+    # 最後の1操作だけが公開切替。force=False。
+    us, update_body = _api(
+        ref_path,
+        method="PATCH",
+        payload={
+            "sha": new_commit_sha,
+            "force": False,
+        },
+    )
+    if us != 200:
+        return False, (
+            "GitHub保存を中止しました。branch切替に失敗しました。"
+            " 現行DB世代は維持されています: "
+            + str(
+                update_body.get("message", us)
+                if isinstance(update_body, dict) else us
+            )
+        )
+
+    # 切替後manifestの最低限確認。commit SHAまで一致確認。
+    rs3, ref_obj3 = _api(ref_path)
+    final_head = str(
+        (((ref_obj3 or {}).get("object") or {}).get("sha")) or ""
+    ) if rs3 == 200 else ""
+    if final_head != new_commit_sha:
+        return False, (
+            "GitHub branch更新後のcommit確認に失敗しました。"
+            " 次回保存時に再確認してください。"
+        )
+
+    # 次回包含確認用cache。
     try:
-        st.session_state["v305_remote_db_cache"]={
-            "branch":branch,
-            "generation":generation,
-            "sha256":digest,
-            "size":len(snapshot_bytes),
-            "bytes":bytes(snapshot_bytes),
+        st.session_state["v305_remote_db_cache"] = {
+            "branch": branch,
+            "generation": generation,
+            "sha256": digest,
+            "size": len(snapshot_bytes),
+            "bytes": bytes(snapshot_bytes),
         }
     except Exception:
         pass
 
-    return True,(
-        f"DB登録成功｜GitHub差分保存成功 "
+    return True, (
+        f"DB登録成功｜GitHub原子的差分保存成功 "
         f"（DB世代{generation} / {len(snapshot_bytes)/1024/1024:.1f}MB / "
-        f"{len(chunks)}part中 再利用{reused_count} / 新規転送{uploaded_count} / "
-        f"全part SHA保護 / 旧chunk非破壊）"
+        f"{len(chunks)}part中 再利用{reused_count} / 新規blob{new_blob_count} / "
+        f"Git commit 1回 / force上書きなし / 旧世代保持）"
     )
 
 
