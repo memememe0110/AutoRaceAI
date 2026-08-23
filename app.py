@@ -16118,8 +16118,12 @@ def _v282_push_chunked_db(
         return github_request(repo_api + path, method=method, payload=payload)
 
     # HEADを固定。ここから最後のref更新まで、このSHAを親にする。
-    ref_path = "/git/ref/heads/" + urllib.parse.quote(branch, safe="")
-    rs, ref_obj = _api(ref_path)
+    # GitHub Git Data API:
+    # GET  は /git/ref/heads/<branch>
+    # PATCHは /git/refs/heads/<branch> （refs が複数形）
+    ref_get_path = "/git/ref/heads/" + urllib.parse.quote(branch, safe="")
+    ref_update_path = "/git/refs/heads/" + urllib.parse.quote(branch, safe="")
+    rs, ref_obj = _api(ref_get_path)
     if rs != 200 or not isinstance(ref_obj, dict):
         return False, f"GitHub保存を中止しました。branch HEAD取得失敗: {ref_obj}"
     head_sha = str(((ref_obj.get("object") or {}).get("sha")) or "")
@@ -16320,7 +16324,7 @@ def _v282_push_chunked_db(
     new_commit_sha = str(new_commit["sha"])
 
     # 競合確認。別端末がこの間にbranchを更新していたら停止。
-    rs2, ref_obj2 = _api(ref_path)
+    rs2, ref_obj2 = _api(ref_get_path)
     latest_head = str(
         (((ref_obj2 or {}).get("object") or {}).get("sha")) or ""
     ) if rs2 == 200 else ""
@@ -16332,7 +16336,7 @@ def _v282_push_chunked_db(
 
     # 最後の1操作だけが公開切替。force=False。
     us, update_body = _api(
-        ref_path,
+        ref_update_path,
         method="PATCH",
         payload={
             "sha": new_commit_sha,
@@ -16340,17 +16344,18 @@ def _v282_push_chunked_db(
         },
     )
     if us != 200:
+        _update_msg = (
+            update_body.get("message", us)
+            if isinstance(update_body, dict) else us
+        )
         return False, (
             "GitHub保存を中止しました。branch切替に失敗しました。"
-            " 現行DB世代は維持されています: "
-            + str(
-                update_body.get("message", us)
-                if isinstance(update_body, dict) else us
-            )
+            " 現行DB世代は維持されています。"
+            f" HTTP {us}: {_update_msg}"
         )
 
     # 切替後manifestの最低限確認。commit SHAまで一致確認。
-    rs3, ref_obj3 = _api(ref_path)
+    rs3, ref_obj3 = _api(ref_get_path)
     final_head = str(
         (((ref_obj3 or {}).get("object") or {}).get("sha")) or ""
     ) if rs3 == 200 else ""
