@@ -20098,3 +20098,62 @@ def v305_validate_compact_result_parse(text, venue_override="", race_no_override
         "payouts": int(len(payouts)),
         "missing": missing,
     }
+
+# Ver305: 複勝「無投票」継続行の券種誤認修正
+def _v305_parse_compact_payouts(text):
+    if "払戻金" not in text:
+        return pd.DataFrame(columns=["券種","組合せ","払戻金","人気"])
+    block=text.split("払戻金",1)[1]
+    if "グランドノート" in block:
+        block=block.split("グランドノート",1)[0]
+    lines=[re.sub(r"[\t\u3000]+"," ",x).strip() for x in block.splitlines()]
+    lines=[x for x in lines if x]
+    known={"単勝","複勝","2連複","2連単","ワイド","3連複","3連単"}
+    rows=[]; current=""
+    for line in lines:
+        if line in {"賭式 払戻金 人気","賭式","払戻金","人気","返還"}:
+            continue
+        km=re.match(r"^(単勝|複勝|2連複|2連単|ワイド|3連複|3連単)(?:\s+|$)",line)
+        if km:
+            current=km.group(1)
+        nm=re.match(
+            r"^(?:(単勝|複勝|2連複|2連単|ワイド|3連複|3連単)\s+)?"
+            r"([1-8](?:[-=][1-8]){0,2})\s+無投票$",
+            line
+        )
+        if nm:
+            if nm.group(1):
+                current=nm.group(1)
+            continue
+        m=re.match(
+            r"^(?:(単勝|複勝|2連複|2連単|ワイド|3連複|3連単)\s+)?"
+            r"([1-8](?:[-=][1-8]){0,2})\s+([\d,]+)円\s+(\d+)(?:人気)?$",
+            line
+        )
+        if not m:
+            continue
+        if m.group(1):
+            current=m.group(1)
+        if current not in known:
+            continue
+        combo=m.group(2)
+        if current in {"2連単","3連単"}:
+            combo=combo.replace("-","→")
+        elif current in {"2連複","3連複","ワイド"}:
+            combo=combo.replace("=","-")
+        rows.append({
+            "券種":current,
+            "組合せ":combo,
+            "払戻金":int(m.group(3).replace(",","")),
+            "人気":int(m.group(4)),
+        })
+    # UNIQUE保護: 同一キー同値なら1行、不一致なら安全停止
+    seen={}; unique=[]
+    for r in rows:
+        k=(r["券種"],r["組合せ"])
+        if k not in seen:
+            seen[k]=r; unique.append(r); continue
+        old=seen[k]
+        if old["払戻金"]!=r["払戻金"] or old["人気"]!=r["人気"]:
+            raise ValueError(f"払戻データ重複不一致: {k[0]} {k[1]}")
+    return pd.DataFrame(unique,columns=["券種","組合せ","払戻金","人気"])
