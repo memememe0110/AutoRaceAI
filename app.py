@@ -17613,6 +17613,59 @@ with st.sidebar:
             st.session_state.pop("_v296_sidebar_manifest_cache",None)
             st.session_state.pop("_v290_identity_cache",None)
             st.rerun()
+
+    # Ver305: GitHub DBを現在DBへ反映せず、取得だけして端末保存する。
+    # diverged解消用の比較・手動統合に使える。現在DBは一切変更しない。
+    _gh_export_cache305=st.session_state.get("_v305_github_export_only")
+    if st.button(
+        "📥 GitHub DBを取得だけ（現在DBは変更しない）",
+        use_container_width=True,
+        disabled=(not ready) or _bg_busy_sidebar,
+        help="GitHub上のcurrent DBを検証して取得します。現在の端末DBへは反映しません。",
+        key="v305_prepare_github_export_only",
+    ):
+        try:
+            with st.spinner("GitHub DBを取得・SHA/SQLite整合性確認しています…"):
+                _gh_ok305,_gh_bytes305,_gh_msg305=_v282_pull_chunked_db()
+            if not _gh_ok305 or _gh_bytes305 is None:
+                raise RuntimeError(str(_gh_msg305))
+            _gh_fp305=_v283_db_fingerprint_bytes(_gh_bytes305)
+            if not _gh_fp305.get("ok"):
+                raise RuntimeError(str(_gh_fp305.get("reason") or "GitHub DB指紋確認失敗"))
+            st.session_state["_v305_github_export_only"]={
+                "bytes":bytes(_gh_bytes305),
+                "msg":str(_gh_msg305),
+            }
+            _gh_export_cache305=st.session_state["_v305_github_export_only"]
+            st.success(
+                f"GitHub DBを取得しました。現在DBは変更していません。"
+                f" {len(_gh_bytes305)/1024/1024:.2f} MB"
+            )
+        except Exception as _gh_exc305:
+            st.session_state.pop("_v305_github_export_only",None)
+            _gh_export_cache305=None
+            st.error(
+                "GitHub DB取得のみでエラー: "
+                f"{type(_gh_exc305).__name__}: {_gh_exc305}"
+            )
+
+    if (
+        isinstance(_gh_export_cache305,dict)
+        and isinstance(_gh_export_cache305.get("bytes"),(bytes,bytearray))
+    ):
+        _gh_dl305=bytes(_gh_export_cache305["bytes"])
+        st.download_button(
+            "⬇️ GitHub DBを端末へ保存（現在DBは変更しない）",
+            _gh_dl305,
+            file_name="autorace_players_github_current.sqlite3",
+            mime="application/octet-stream",
+            use_container_width=True,
+            key="v305_download_github_export_only",
+        )
+        st.caption(
+            f"GitHub current取得済み: {len(_gh_dl305)/1024/1024:.2f} MB "
+            "｜端末DBへの反映なし"
+        )
     if st.button("現在のDBをGitHubへ保存", use_container_width=True, disabled=not ready,
                  help="DB専用branchへ保存するため、Streamlit本体の再デプロイは発生しません。"):
         ok, msg = push_db_to_github("AutoRaceAI: DBを手動保存")
