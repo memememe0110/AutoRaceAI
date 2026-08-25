@@ -16937,6 +16937,207 @@ def _v305_remote_db_for_push() -> tuple[bool,bytes|None,str]:
     return ok,data,msg
 
 
+
+def _v305_sanitize_remote_for_safe_sync(
+    local_bytes: bytes, remote_bytes: bytes
+) -> tuple[bool, bytes | None, dict]:
+    """GitHub側に残った明確な旧誤登録/修正前重複だけを比較対象から除外する。
+
+    実DB/GitHub DBそのものはここでは変更しない。
+    除外対象:
+    - player_name が None/null/空の選手・結果・履歴
+    - race_history の修正前行で、端末側に同選手・同日・同場の
+      より具体的な訂正版が存在するもの
+    それ以外のGitHub固有行は一切除外しない。
+    """
+    report={"ok":False,"removed":{},"reason":""}
+    if not (
+        isinstance(local_bytes,(bytes,bytearray))
+        and bytes(local_bytes).startswith(b"SQLite format 3\x00")
+        and isinstance(remote_bytes,(bytes,bytearray))
+        and bytes(remote_bytes).startswith(b"SQLite format 3\x00")
+    ):
+        report["reason"]="SQLite形式ではありません"
+        return False,None,report
+
+    tmp_dir=Path(tempfile.mkdtemp(prefix="autorace_remote_sanitize_"))
+    lp=tmp_dir/"local.sqlite3"
+    rp=tmp_dir/"remote.sqlite3"
+    try:
+        lp.write_bytes(bytes(local_bytes))
+        rp.write_bytes(bytes(remote_bytes))
+
+        def _valid_name305(v):
+            s=str(v or "").strip()
+            return bool(s) and s.lower() not in ("none","null","nan")
+
+        def _race_no305(v):
+            if v is None:
+                return None
+            m=re.search(r"(?<!\d)(\d{1,2})(?:R)?(?!\d)",str(v))
+            return int(m.group(1)) if m else None
+
+        def _same_num305(a,b,tol=1e-9):
+            if a is None and b is None:
+                return True
+            try:
+                return abs(float(a)-float(b))<=tol
+            except Exception:
+                return str(a or "")==str(b or "")
+
+        with sqlite3.connect(str(lp),timeout=60.0) as lc, sqlite3.connect(str(rp),timeout=60.0) as rc:
+            lc.row_factory=sqlite3.Row
+            rc.row_factory=sqlite3.Row
+            rc.execute("PRAGMA journal_mode=DELETE")
+
+            lt={str(r[0]) for r in lc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            rt={str(r[0]) for r in rc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+            # 1) 明確な不正選手名だけ除外
+            invalid_remote_ids=[]
+            if "players" in rt:
+                invalid_remote_ids=[
+                    int(r["player_id"])
+                    for r in rc.execute("SELECT player_id,player_name FROM players")
+                    if r["player_id"] is not None and not _valid_name305(r["player_name"])
+                ]
+
+            if invalid_remote_ids and "race_history" in rt:
+                qs=",".join("?" for _ in invalid_remote_ids)
+                n=rc.execute(
+                    f"DELETE FROM race_history WHERE player_id IN ({qs})",
+                    tuple(invalid_remote_ids)
+                ).rowcount
+                if n:
+                    report["removed"]["race_history_invalid_player"]=int(n)
+
+            if "result_entries" in rt:
+                n=rc.execute(
+                    """DELETE FROM result_entries
+                       WHERE player_name IS NULL
+                          OR TRIM(player_name)=''
+                          OR LOWER(TRIM(player_name)) IN ('none','null','nan')"""
+                ).rowcount
+                if n:
+                    report["removed"]["result_entries_invalid_player"]=int(n)
+
+            if "v15_player_history_imports" in rt:
+                n=rc.execute(
+                    """DELETE FROM v15_player_history_imports
+                       WHERE player_name IS NULL
+                          OR TRIM(player_name)=''
+                          OR LOWER(TRIM(player_name)) IN ('none','null','nan')"""
+                ).rowcount
+                if n:
+                    report["removed"]["v15_invalid_player"]=int(n)
+
+            if invalid_remote_ids and "players" in rt:
+                qs=",".join("?" for _ in invalid_remote_ids)
+                n=rc.execute(
+                    f"DELETE FROM players WHERE player_id IN ({qs})",
+                    tuple(invalid_remote_ids)
+                ).rowcount
+                if n:
+                    report["removed"]["players_invalid"]=int(n)
+
+            rc.commit()
+
+            # 2) race_history の「修正前行」を厳格条件で除外
+            if all(t in lt for t in ("players","race_history")) and all(t in rt for t in ("players","race_history")):
+                local_name={
+                    int(r["player_id"]):str(r["player_name"] or "").strip()
+                    for r in lc.execute("SELECT player_id,player_name FROM players")
+                    if r["player_id"] is not None
+                }
+                remote_name={
+                    int(r["player_id"]):str(r["player_name"] or "").strip()
+                    for r in rc.execute("SELECT player_id,player_name FROM players")
+                    if r["player_id"] is not None
+                }
+
+                local_by={}
+                for r in lc.execute("SELECT * FROM race_history"):
+                    nm=local_name.get(int(r["player_id"])) if r["player_id"] is not None else ""
+                    if not _valid_name305(nm):
+                        continue
+                    local_by.setdefault((nm,str(r["race_date"] or ""),str(r["venue"] or "")),[]).append(r)
+
+                local_keys={
+                    str(r[0]) for r in lc.execute(
+                        "SELECT record_key FROM race_history WHERE record_key IS NOT NULL"
+                    )
+                }
+
+                remove_keys=[]
+                for rr in rc.execute("SELECT * FROM race_history"):
+                    rk=str(rr["record_key"] or "")
+                    if not rk or rk in local_keys:
+                        continue
+                    nm=remote_name.get(int(rr["player_id"])) if rr["player_id"] is not None else ""
+                    if not _valid_name305(nm):
+                        continue
+
+                    candidates=local_by.get(
+                        (nm,str(rr["race_date"] or ""),str(rr["venue"] or "")),[]
+                    )
+                    remote_r=_race_no305(rr["race_no"])
+
+                    for lr in candidates:
+                        local_r=_race_no305(lr["race_no"])
+
+                        # 修正前: Rが欠落、訂正版: 数字Rあり。
+                        # ハンデ/試走/競走/STまで同一のときだけ旧行を除外。
+                        core_same=(
+                            str(lr["handicap"] or "")==str(rr["handicap"] or "")
+                            and _same_num305(lr["trial_time"],rr["trial_time"])
+                            and _same_num305(lr["race_time"],rr["race_time"])
+                            and _same_num305(lr["start_time"],rr["start_time"])
+                        )
+                        if core_same and remote_r is None and local_r is not None:
+                            remove_keys.append(rk)
+                            break
+
+                        # race_no欄へ「一般戦」など種別が誤混入した旧行。
+                        # 同選手・同日・同場・同ハンデで、後から登録された
+                        # 非学習/事故等の訂正版がある場合だけ除外。
+                        remote_label_invalid=(
+                            rr["race_no"] is not None
+                            and str(rr["race_no"]).strip()!=""
+                            and remote_r is None
+                        )
+                        if remote_label_invalid and str(lr["handicap"] or "")==str(rr["handicap"] or ""):
+                            newer=str(lr["created_at"] or "") > str(rr["created_at"] or "")
+                            corrected=(
+                                str(lr["result_status"] or "")!=str(rr["result_status"] or "")
+                                or int(lr["use_for_model"] or 0)==0
+                            )
+                            if newer and corrected:
+                                remove_keys.append(rk)
+                                break
+
+                if remove_keys:
+                    rc.executemany(
+                        "DELETE FROM race_history WHERE record_key=?",
+                        [(k,) for k in sorted(set(remove_keys))]
+                    )
+                    report["removed"]["race_history_superseded"]=len(set(remove_keys))
+                    rc.commit()
+
+            chk=rc.execute("PRAGMA integrity_check").fetchone()
+            if not chk or str(chk[0]).lower()!="ok":
+                report["reason"]="サニタイズ後GitHub比較DBのintegrity_check失敗"
+                return False,None,report
+
+        clean=rp.read_bytes()
+        report["ok"]=True
+        return True,clean,report
+    except Exception as exc:
+        report["reason"]=f"{type(exc).__name__}: {exc}"
+        return False,None,report
+    finally:
+        shutil.rmtree(tmp_dir,ignore_errors=True)
+
+
 def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     # 保存ボタン押下時にも、アップロード正本よりDBが後退していないか最終確認。
     _pin284=st.session_state.get("v284_uploaded_master_identity")
@@ -17001,15 +17202,26 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
     # 132MB級の全part再ダウンロードを省略する。
     # manifestが外部更新されていれば自動的に全part読込へ戻る。
     _remote_chunk_ok284,_remote_bytes284,_remote_chunk_msg284=_v305_remote_db_for_push()
+    _remote_compare_bytes284=_remote_bytes284
+    _remote_sanitize_report305={}
     if _remote_chunk_ok284 and _remote_bytes284 is not None:
-        _relpush284=_v284_db_containment(snapshot_bytes,_remote_bytes284)
+        _san_ok305,_san_bytes305,_remote_sanitize_report305=_v305_sanitize_remote_for_safe_sync(
+            snapshot_bytes,_remote_bytes284
+        )
+        if not _san_ok305 or _san_bytes305 is None:
+            return False,(
+                "GitHub保存を中止しました。GitHub旧誤登録の安全判定に失敗しました: "
+                +str((_remote_sanitize_report305 or {}).get("reason") or "不明")
+            )
+        _remote_compare_bytes284=bytes(_san_bytes305)
+        _relpush284=_v284_db_containment(snapshot_bytes,_remote_compare_bytes284)
         _rpush284=str(_relpush284.get("relation") or "unknown")
         if _rpush284=="baseline_contains":
             # Ver298 DB同期改善:
             # GitHub currentが端末DBを完全包含する場合、端末をGitHubへ上書きすると
             # GitHub固有行を失うため、保存停止だけでなくGitHub正本を自動採用する。
             # remote_bytesはmanifest検証・SHA検証済みの分割DB復元結果。
-            _adopt_fp298=_v283_db_fingerprint_bytes(_remote_bytes284)
+            _adopt_fp298=_v283_db_fingerprint_bytes(_remote_compare_bytes284)
             if not _adopt_fp298.get("ok"):
                 return False,(
                     "GitHub DBの自動採用を中止しました。復元DBの指紋確認に失敗しました: "+
@@ -17017,7 +17229,7 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
                 )
 
             # 念のため採用直前にも包含関係を再確認。
-            _relcheck298=_v284_db_containment(snapshot_bytes,_remote_bytes284)
+            _relcheck298=_v284_db_containment(snapshot_bytes,_remote_compare_bytes284)
             if str(_relcheck298.get("relation") or "")!="baseline_contains":
                 return False,(
                     "GitHub DBの自動採用を中止しました。採用直前の包含関係が変化しました。\n"+
@@ -17025,7 +17237,7 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
                 )
 
             _install_ok298,_install_msg298=_v276_atomic_install_db_bytes(
-                _remote_bytes284,"GitHub完全包含正本"
+                _remote_compare_bytes284,"GitHub完全包含正本"
             )
             if not _install_ok298:
                 return False,"GitHub完全包含正本の端末DBへの反映に失敗しました: "+str(_install_msg298)
@@ -17038,7 +17250,7 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
                     "GitHub正本は端末へ反映しましたが、反映後スナップショット確認に失敗しました: "+
                     f"{type(_snap_exc298).__name__}: {_snap_exc298}"
                 )
-            _post_rel298=_v284_db_containment(_installed_bytes298,_remote_bytes284)
+            _post_rel298=_v284_db_containment(_installed_bytes298,_remote_compare_bytes284)
             if str(_post_rel298.get("relation") or "")!="equal":
                 return False,(
                     "GitHub正本は端末へ反映しましたが、反映後の完全一致確認に失敗しました。\n"+
@@ -17046,8 +17258,8 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
                 )
 
             # 以後の再描画・端末保存・固定監視も同じ正本を参照するよう更新。
-            st.session_state["v284_uploaded_master_bytes"]=bytes(_remote_bytes284)
-            st.session_state["v284_uploaded_master_sha256"]=hashlib.sha256(_remote_bytes284).hexdigest()
+            st.session_state["v284_uploaded_master_bytes"]=bytes(_remote_compare_bytes284)
+            st.session_state["v284_uploaded_master_sha256"]=hashlib.sha256(_remote_compare_bytes284).hexdigest()
             _adopt_identity298=_v284_current_db_identity()
             if _adopt_identity298.get("ok"):
                 st.session_state["v284_uploaded_master_identity"]=_adopt_identity298
@@ -17067,7 +17279,7 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
             )
         if _rpush284=="diverged":
             _merge_ok284,_merged_bytes284,_merge_report284=_v284_safe_union_merge_db_bytes(
-                snapshot_bytes,_remote_bytes284
+                snapshot_bytes,_remote_compare_bytes284
             )
             if not _merge_ok284 or _merged_bytes284 is None:
                 return False,(
@@ -17154,6 +17366,12 @@ def push_db_to_github(commit_message: str) -> tuple[bool, str]:
         _msg_push284 += "｜"+str(_merge_notice284)
     if _ok_push284 and _deferred_guard284:
         _msg_push284 += "｜件数差は固定停止せずGitHub実体との行単位包含確認を通過"
+    if _ok_push284 and isinstance(_remote_sanitize_report305,dict):
+        _removed305=(_remote_sanitize_report305.get("removed") or {})
+        if _removed305:
+            _msg_push284 += "｜GitHub旧誤登録を比較対象から安全除外: "+", ".join(
+                f"{k} {v}件" for k,v in sorted(_removed305.items())
+            )
     return _ok_push284,_msg_push284
 
 
