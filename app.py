@@ -9494,8 +9494,7 @@ def show_odds_comparison(title: str, bets: dict, key: str, trials: int, widget_k
                 if total <= 0:
                     st.error("オッズを読み取れませんでした。タブ区切りの表をそのまま貼り付けてください。")
                 else:
-                    for parsed_key, values in parsed.items():
-                        st.session_state[f"saved_odds_{namespace}_{parsed_key}"] = values
+                    v218_store_parsed_odds(namespace, parsed)
                     st.success(
                         f"読込完了：三連単{len(parsed['3tan'])}件、三連複{len(parsed['3fuku'])}件、"
                         f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件、"
@@ -9858,10 +9857,22 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
     return result
 
 def v218_store_parsed_odds(namespace: str, parsed: dict) -> int:
-    total = sum(len(values) for values in parsed.values())
+    """読み込んだオッズをセッションへ完全置換する。
+
+    Ver305訂正入力修正:
+    前回入力にしか存在しない券種・組合せを残さない。
+    """
+    _all_keys305 = ("3tan","3fuku","2tansho","2fuku","tansho","fukusho","wide")
+    total = sum(len((parsed or {}).get(k, {}) or {}) for k in _all_keys305)
     if total > 0:
-        for parsed_key, values in parsed.items():
+        for parsed_key in _all_keys305:
+            values = dict((parsed or {}).get(parsed_key, {}) or {})
             st.session_state[f"saved_odds_{namespace}_{parsed_key}"] = values
+        # 「自動復元中」の表示状態は、明示入力でいったん解除。
+        st.session_state[f"v221_restored_snapshot_{namespace}"] = ""
+        st.session_state[f"v305_odds_revision_{namespace}"] = (
+            int(st.session_state.get(f"v305_odds_revision_{namespace}", 0) or 0) + 1
+        )
     return total
 
 
@@ -9895,44 +9906,76 @@ def _v221_ensure_odds_tables(db_path: str) -> None:
 
 
 def _v221_save_all_odds(db_path: str, race_key: str, parsed: dict, source: str) -> str:
-    """4券種の全オッズを重複排除しつつ履歴保存する。"""
+    """全券種オッズを履歴保存。再入力した内容を必ず最新状態として扱う。"""
     race_key = str(race_key or '').strip()
     if not race_key:
         return ''
+    _keys305 = ('3tan','3fuku','2tansho','2fuku','tansho','fukusho','wide')
     clean = {}
-    for bet_key in ('3tan', '3fuku', '2tansho', '2fuku', 'tansho', 'fukusho', 'wide'):
-        values = parsed.get(bet_key, {}) or {}
-        clean[bet_key] = {str(k): float(v) for k, v in values.items() if v is not None and float(v) > 0}
+    for bet_key in _keys305:
+        values = (parsed or {}).get(bet_key, {}) or {}
+        clean[bet_key] = {
+            str(k): float(v)
+            for k, v in values.items()
+            if v is not None and float(v) > 0
+        }
     if sum(len(v) for v in clean.values()) <= 0:
         return ''
-    payload = [(bk, combo, round(odd, 4)) for bk in clean for combo, odd in sorted(clean[bk].items())]
-    snapshot_id = hashlib.sha1(json.dumps(payload, ensure_ascii=False).encode('utf-8')).hexdigest()[:20]
-    now = _v228_now_jst_iso()
+
+    payload = [
+        (bk, combo, round(odd, 4))
+        for bk in clean
+        for combo, odd in sorted(clean[bk].items())
+    ]
+    snapshot_id = hashlib.sha1(
+        json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    ).hexdigest()[:20]
+
+    # 同じ秒に訂正しても順序が曖昧にならないようμ秒まで保存。
+    now = datetime.now(_V228_JST).isoformat(timespec="microseconds")
     _v221_ensure_odds_tables(db_path)
-    with sqlite3.connect(db_path) as con:
+
+    with sqlite3.connect(db_path, timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
         con.execute("""
-            INSERT OR IGNORE INTO v221_odds_runs
-            (race_key,snapshot_id,source,created_at,count_3tan,count_3fuku,count_2tansho,count_2fuku)
+            INSERT INTO v221_odds_runs
+            (race_key,snapshot_id,source,created_at,
+             count_3tan,count_3fuku,count_2tansho,count_2fuku)
             VALUES (?,?,?,?,?,?,?,?)
-        """, (race_key, snapshot_id, str(source or ''), now,
-              len(clean['3tan']), len(clean['3fuku']), len(clean['2tansho']), len(clean['2fuku'])))
-        exists = con.execute(
-            'SELECT 1 FROM v221_odds_values WHERE race_key=? AND snapshot_id=? LIMIT 1',
+            ON CONFLICT(race_key,snapshot_id) DO UPDATE SET
+                source=excluded.source,
+                created_at=excluded.created_at,
+                count_3tan=excluded.count_3tan,
+                count_3fuku=excluded.count_3fuku,
+                count_2tansho=excluded.count_2tansho,
+                count_2fuku=excluded.count_2fuku
+        """, (
+            race_key, snapshot_id, str(source or ''), now,
+            len(clean['3tan']), len(clean['3fuku']),
+            len(clean['2tansho']), len(clean['2fuku'])
+        ))
+
+        # 同じsnapshot_idでも、途中保存/旧版の欠損を残さず完全一致させる。
+        con.execute(
+            "DELETE FROM v221_odds_values WHERE race_key=? AND snapshot_id=?",
             (race_key, snapshot_id),
-        ).fetchone()
-        if not exists:
-            rows = [(race_key, snapshot_id, bk, combo, odd)
-                    for bk, vals in clean.items() for combo, odd in vals.items()]
-            con.executemany("""
-                INSERT OR REPLACE INTO v221_odds_values
-                (race_key,snapshot_id,bet_key,combination,odds) VALUES (?,?,?,?,?)
-            """, rows)
+        )
+        rows = [
+            (race_key, snapshot_id, bk, combo, odd)
+            for bk, vals in clean.items()
+            for combo, odd in vals.items()
+        ]
+        con.executemany("""
+            INSERT INTO v221_odds_values
+            (race_key,snapshot_id,bet_key,combination,odds)
+            VALUES (?,?,?,?,?)
+        """, rows)
         con.commit()
     return snapshot_id
 
 
 def _v221_load_odds_snapshot(db_path: str, race_key: str, snapshot_id: str = '') -> tuple[dict, dict]:
-    empty = {'3tan': {}, '3fuku': {}, '2tansho': {}, '2fuku': {}, 'tansho': {}, 'wide': {}}
+    empty = {'3tan': {}, '3fuku': {}, '2tansho': {}, '2fuku': {}, 'tansho': {}, 'fukusho': {}, 'wide': {}}
     race_key = str(race_key or '').strip()
     if not race_key:
         return empty, {}
@@ -9947,7 +9990,7 @@ def _v221_load_odds_snapshot(db_path: str, race_key: str, snapshot_id: str = '')
                 ).fetchone()
             else:
                 run = con.execute(
-                    'SELECT * FROM v221_odds_runs WHERE race_key=? ORDER BY created_at DESC LIMIT 1',
+                    'SELECT * FROM v221_odds_runs WHERE race_key=? ORDER BY created_at DESC, snapshot_id DESC LIMIT 1',
                     (race_key,),
                 ).fetchone()
             if not run:
@@ -9972,7 +10015,7 @@ def _v221_list_odds_snapshots(db_path: str, race_key: str, limit: int = 8) -> li
             con.row_factory = sqlite3.Row
             rows = con.execute("""
                 SELECT * FROM v221_odds_runs WHERE race_key=?
-                ORDER BY created_at DESC LIMIT ?
+                ORDER BY created_at DESC, snapshot_id DESC LIMIT ?
             """, (str(race_key or ''), int(limit))).fetchall()
         return [dict(r) for r in rows]
     except Exception:
@@ -9983,7 +10026,7 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
     """重い診断より先に、HTMLまたは公式オッズ表から全券種オッズを読み込む。"""
     st.markdown('<div id="quick-odds-input"></div>', unsafe_allow_html=True)
     st.subheader("オッズ一括入力")
-    st.caption("AutoRace.JPの保存HTMLなら、3連単・3連複・2連単・2連複・ワイド・単勝・複勝の7券種を自動入力できます。読み込んだ全オッズはDBへ保存されます。")
+    st.caption("AutoRace.JPの保存HTMLなら7券種を自動入力できます。同じレースへ再入力した場合は、その入力を最新の訂正版としてオッズ・EV・回収率合成を更新します。")
 
     # セッションにオッズがない場合は、このレースの最新保存分を自動復元する。
     odds_store_keys = [f"saved_odds_{namespace}_{k}" for k in ('3tan','3fuku','2tansho','2fuku','tansho','fukusho','wide')]
@@ -10045,7 +10088,11 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
             st.error("HTMLからオッズを読み取れませんでした。オッズ表が表示された状態で保存したHTMLを使用してください。")
         else:
             if race_key:
-                _v221_save_all_odds(engine.DB_PATH, race_key, parsed, f"HTML/TXT:{getattr(html_file, 'name', '') or '貼付'}")
+                _sid305 = _v221_save_all_odds(
+                    engine.DB_PATH, race_key, parsed,
+                    f"HTML/TXT:{getattr(html_file, 'name', '') or '貼付'}"
+                )
+                st.session_state[f"v305_odds_refresh_pending_{race_key}"] = str(_sid305 or "")
             st.success(
                 f"HTML読込完了・DB保存済み：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
                 f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
@@ -10067,7 +10114,10 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
             st.error("オッズを読み取れませんでした。タブ区切りの表をそのまま貼り付けてください。")
         else:
             if race_key:
-                _v221_save_all_odds(engine.DB_PATH, race_key, parsed, "人気表貼付")
+                _sid305 = _v221_save_all_odds(
+                    engine.DB_PATH, race_key, parsed, "人気表貼付"
+                )
+                st.session_state[f"v305_odds_refresh_pending_{race_key}"] = str(_sid305 or "")
             st.success(
                 f"読込完了・DB保存済み：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
                 f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
@@ -14228,6 +14278,37 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
     result["role_lines"] = role_lines
     return result
 
+def _v305_supersede_live_plan_after_odds_refresh(
+    db_path: str, race_key: str, app_version: str, new_plan_hash: str = ""
+) -> None:
+    """明示的なオッズ訂正時だけ、同Verの旧liveプランを現行実績から外す。
+
+    行自体は削除しない。new_plan_hashが既存hashでも最新として再有効化する。
+    """
+    if not race_key:
+        return
+    _v187_ensure_mixed_learning_tables(db_path)
+    now = datetime.now(_V228_JST).isoformat(timespec="microseconds")
+    with sqlite3.connect(db_path, timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""
+            UPDATE v187_mixed_plan_runs
+               SET include_in_live_stats=0
+             WHERE race_key=?
+               AND COALESCE(app_version,'')=?
+               AND COALESCE(plan_origin,'live')='live'
+               AND COALESCE(include_in_live_stats,1)=1
+        """, (str(race_key), str(app_version or APP_VERSION)))
+        if new_plan_hash:
+            con.execute("""
+                UPDATE v187_mixed_plan_runs
+                   SET include_in_live_stats=1,
+                       created_at=?
+                 WHERE race_key=? AND plan_hash=?
+            """, (now, str(race_key), str(new_plan_hash)))
+        con.commit()
+
+
 def show_v184_eight_car_mixed_plan(
     bets: dict, trials: int, meta: dict, odds_maps: dict, race_key: str = "",
     app_version: str | None = None, save_enabled: bool = True,
@@ -14250,7 +14331,27 @@ def show_v184_eight_car_mixed_plan(
         _live_rec301 = {}
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH) or 0
     st.markdown(f"#### 🧩 {int(starter_count)}車向け・黒字的中重視の回収率合成")
+
+    _odds_refresh_key305 = f"v305_odds_refresh_pending_{race_key}"
+    _odds_refresh_pending305 = bool(
+        race_key and st.session_state.get(_odds_refresh_key305) is not None
+    )
+
     if not result.get("available"):
+        # 訂正版オッズで「構成なし」になった場合、間違った旧プランを
+        # 最新live実績として残さない。
+        if (
+            _odds_refresh_pending305
+            and save_enabled
+            and include_in_live_stats
+            and str(plan_origin or "live") == "live"
+        ):
+            try:
+                _v305_supersede_live_plan_after_odds_refresh(
+                    engine.DB_PATH, str(race_key), str(app_version or APP_VERSION), ""
+                )
+            finally:
+                st.session_state.pop(_odds_refresh_key305, None)
         st.caption(result.get("reason", "オッズを読み込むと表示します。"))
         return
     saved_hash = ""
@@ -14283,6 +14384,17 @@ def show_v184_eight_car_mixed_plan(
                     engine.DB_PATH, str(race_key), str(saved_hash), _save_audit301,
                     app_version=(app_version or APP_VERSION),
                 )
+
+            if (
+                _odds_refresh_pending305
+                and include_in_live_stats
+                and str(plan_origin or "live") == "live"
+            ):
+                _v305_supersede_live_plan_after_odds_refresh(
+                    engine.DB_PATH, str(race_key),
+                    str(app_version or APP_VERSION), str(saved_hash or "")
+                )
+                st.session_state.pop(_odds_refresh_key305, None)
     except Exception as exc:
         st.warning(f"合成プランをDBへ保存できませんでした: {exc}")
 
