@@ -10093,6 +10093,7 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
                     f"HTML/TXT:{getattr(html_file, 'name', '') or '貼付'}"
                 )
                 st.session_state[f"v305_odds_refresh_pending_{race_key}"] = str(_sid305 or "")
+                st.session_state[f"v305_odds_refresh_notice_{race_key}"] = True
             st.success(
                 f"HTML読込完了・DB保存済み：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
                 f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
@@ -10118,6 +10119,7 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
                     engine.DB_PATH, race_key, parsed, "人気表貼付"
                 )
                 st.session_state[f"v305_odds_refresh_pending_{race_key}"] = str(_sid305 or "")
+                st.session_state[f"v305_odds_refresh_notice_{race_key}"] = True
             st.success(
                 f"読込完了・DB保存済み：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
                 f"2連単{len(parsed['2tansho'])}件、2連複{len(parsed['2fuku'])}件"
@@ -14278,34 +14280,41 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
     result["role_lines"] = role_lines
     return result
 
-def _v305_supersede_live_plan_after_odds_refresh(
+def _v305_supersede_plan_after_odds_refresh(
     db_path: str, race_key: str, app_version: str, new_plan_hash: str = ""
 ) -> None:
-    """明示的なオッズ訂正時だけ、同Verの旧liveプランを現行実績から外す。
+    """オッズ訂正時、同一レース・同一予測Verの現行プランを1つへ統一する。
 
-    行自体は削除しない。new_plan_hashが既存hashでも最新として再有効化する。
+    通常予測(live)だけでなく復元表示(source_version_restore /
+    current_version_restore)も対象。過去行は削除せずinclude_in_live_stats=0へ退避する。
     """
     if not race_key:
         return
     _v187_ensure_mixed_learning_tables(db_path)
     now = datetime.now(_V228_JST).isoformat(timespec="microseconds")
+    _ver305 = str(app_version or APP_VERSION)
     with sqlite3.connect(db_path, timeout=30.0) as con:
         con.execute("PRAGMA busy_timeout=30000")
+
+        # 同じレース・同じ予測Verは、生成経路に関係なく現行1プランだけにする。
         con.execute("""
             UPDATE v187_mixed_plan_runs
                SET include_in_live_stats=0
              WHERE race_key=?
                AND COALESCE(app_version,'')=?
-               AND COALESCE(plan_origin,'live')='live'
                AND COALESCE(include_in_live_stats,1)=1
-        """, (str(race_key), str(app_version or APP_VERSION)))
+        """, (str(race_key), _ver305))
+
         if new_plan_hash:
+            # 同一hashの再入力でもcreated_atを更新して訂正版を最新扱いにする。
             con.execute("""
                 UPDATE v187_mixed_plan_runs
                    SET include_in_live_stats=1,
                        created_at=?
-                 WHERE race_key=? AND plan_hash=?
-            """, (now, str(race_key), str(new_plan_hash)))
+                 WHERE race_key=?
+                   AND plan_hash=?
+                   AND COALESCE(app_version,'')=?
+            """, (now, str(race_key), str(new_plan_hash), _ver305))
         con.commit()
 
 
@@ -14344,10 +14353,9 @@ def show_v184_eight_car_mixed_plan(
             _odds_refresh_pending305
             and save_enabled
             and include_in_live_stats
-            and str(plan_origin or "live") == "live"
         ):
             try:
-                _v305_supersede_live_plan_after_odds_refresh(
+                _v305_supersede_plan_after_odds_refresh(
                     engine.DB_PATH, str(race_key), str(app_version or APP_VERSION), ""
                 )
             finally:
@@ -14388,9 +14396,8 @@ def show_v184_eight_car_mixed_plan(
             if (
                 _odds_refresh_pending305
                 and include_in_live_stats
-                and str(plan_origin or "live") == "live"
             ):
-                _v305_supersede_live_plan_after_odds_refresh(
+                _v305_supersede_plan_after_odds_refresh(
                     engine.DB_PATH, str(race_key),
                     str(app_version or APP_VERSION), str(saved_hash or "")
                 )
@@ -19065,6 +19072,8 @@ elif selected_main_page == "🏁 予測":
             odds_namespace = re.sub(r"[^0-9A-Za-z_-]+", "_", str(race_key))[-80:] or "current"
             # Ver207: DB全体診断や詳細表より先に、オッズ入力と回収率重視の買い目を最優先表示する。
             v202_quick_bulk_odds_input(odds_namespace, race_key=race_key)
+            if st.session_state.pop(f"v305_odds_refresh_notice_{race_key}", False):
+                st.success("✅ 訂正版オッズを現在状態へ反映しました。EV・回収率合成を再計算しています。")
             fast_odds_maps = {
                 "3tan": st.session_state.get(f"saved_odds_{odds_namespace}_3tan", {}),
                 "3fuku": st.session_state.get(f"saved_odds_{odds_namespace}_3fuku", {}),
