@@ -10092,7 +10092,10 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
                     engine.DB_PATH, race_key, parsed,
                     f"HTML/TXT:{getattr(html_file, 'name', '') or '貼付'}"
                 )
+                # 訂正入力はDBへ保存した「そのsnapshot」を次runで強制復元する。
+                # Streamlitの古いsession値や自動復元順序に左右されないようにする。
                 st.session_state[f"v305_odds_refresh_pending_{race_key}"] = str(_sid305 or "")
+                st.session_state[f"v305_force_odds_snapshot_{race_key}"] = str(_sid305 or "")
                 st.session_state[f"v305_odds_refresh_notice_{race_key}"] = True
             st.success(
                 f"HTML読込完了・DB保存済み：3連単{len(parsed['3tan'])}件、3連複{len(parsed['3fuku'])}件、"
@@ -19072,8 +19075,25 @@ elif selected_main_page == "🏁 予測":
             odds_namespace = re.sub(r"[^0-9A-Za-z_-]+", "_", str(race_key))[-80:] or "current"
             # Ver207: DB全体診断や詳細表より先に、オッズ入力と回収率重視の買い目を最優先表示する。
             v202_quick_bulk_odds_input(odds_namespace, race_key=race_key)
+
+            # Ver305訂正入力・確定修正:
+            # 読込直後は保存したsnapshotをDBから読み直し、7券種をsessionへ完全置換。
+            # これで「DBは更新されたが画面計算だけ旧オッズ」の状態を防ぐ。
+            _force_sid305 = str(st.session_state.get(f"v305_force_odds_snapshot_{race_key}") or "")
+            if _force_sid305:
+                _forced_odds305, _forced_run305 = _v221_load_odds_snapshot(
+                    engine.DB_PATH, str(race_key), _force_sid305
+                )
+                if sum(len(v) for v in _forced_odds305.values()) > 0:
+                    for _bk305 in ("3tan","3fuku","2tansho","2fuku","tansho","fukusho","wide"):
+                        st.session_state[f"saved_odds_{odds_namespace}_{_bk305}"] = dict(
+                            _forced_odds305.get(_bk305, {}) or {}
+                        )
+                    st.session_state[f"v221_restored_snapshot_{odds_namespace}"] = ""
+                    st.session_state.pop(f"v305_force_odds_snapshot_{race_key}", None)
+
             if st.session_state.pop(f"v305_odds_refresh_notice_{race_key}", False):
-                st.success("✅ 訂正版オッズを現在状態へ反映しました。EV・回収率合成を再計算しています。")
+                st.success("✅ 訂正版オッズを現在状態へ反映しました。EV・回収率合成を再計算しました。")
             fast_odds_maps = {
                 "3tan": st.session_state.get(f"saved_odds_{odds_namespace}_3tan", {}),
                 "3fuku": st.session_state.get(f"saved_odds_{odds_namespace}_3fuku", {}),
