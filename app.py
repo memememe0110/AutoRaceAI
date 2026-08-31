@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver305"
+APP_VERSION = "Ver306"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver305"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver306"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -12898,7 +12898,10 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 remaining.remove(cand)
 
     snapshots = []
-    if len(plan) >= 6:
+    # Ver306: 2〜5点で最適化が自然終了した場合も、有効な小点数構成として保持する。
+    # 従来は6点以上にならないと snapshots が空のままになり、
+    # オッズ訂正後などに候補が4点まで絞られたレースで表示自体が消えていた。
+    if len(plan) >= 2:
         snapshots.append((list(plan), evaluate(plan)))
 
     # 基本上限は12点。13〜14点目は黒字側が明確に伸びる場合だけ例外採用する。
@@ -12936,11 +12939,11 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             break
         plan.append(cand)
         remaining.remove(cand)
-        if len(plan) >= 6:
+        if len(plan) >= 2:
             snapshots.append((list(plan), evaluate(plan)))
 
     if not snapshots:
-        return {"available": False, "reason": "役割の異なる券を組み合わせた有効な構成を作れませんでした。"}
+        return {"available": False, "reason": "有効な構成候補を作れませんでした。"}
 
     # Ver191: 最高評価に近い構成から、黒字的中率と期待倍率を優先して選ぶ。
     best_score = max(m["score"] for _, m in snapshots)
