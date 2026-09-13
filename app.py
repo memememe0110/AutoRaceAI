@@ -12176,34 +12176,54 @@ def _v305_live_recommendation(result: dict) -> dict:
 
 
 def _v305_auto_backfill_current_recommendation(db_path: str) -> dict:
-    """Ver305プランだけをVer305基準で監査補完。旧Verの監査は書き換えない。"""
+    """現在APP_VERSIONの全プランを現行推奨基準で監査補完する。
+
+    Ver306修正:
+    - Ver305固定ではなくAPP_VERSIONを対象にする
+    - 再シミュレーション済みプランも全件補完
+    - 既存の古い/部分監査も現行基準へ更新
+    - adjusted_return_rate / cover / hole_countも保存済みプランから再構成
+    """
     _v187_ensure_mixed_learning_tables(db_path)
+    target_version = str(APP_VERSION or _V231_APP_VERSION or "Ver306")
+    calibration = _v195_return_calibration(db_path)
+    factor = float(calibration.get("factor", 1.0) or 1.0)
+
     done = 0
     skipped = 0
     errors = []
+
     with sqlite3.connect(str(db_path), timeout=30.0) as con:
         con.execute("PRAGMA busy_timeout=30000")
         rows = con.execute("""
-            SELECT r.race_key,r.plan_hash,COALESCE(r.app_version,'')
-              FROM v187_mixed_plan_runs r
-             WHERE COALESCE(r.include_in_live_stats,1)=1
-               AND COALESCE(r.app_version,'')='Ver305'
-               AND NOT (
+            SELECT
+                r.race_key,
+                r.plan_hash,
+                COALESCE(r.app_version,''),
+                COALESCE(r.cover,0),
+                COALESCE(r.model_return_rate,0)
+            FROM v187_mixed_plan_runs r
+            WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND COALESCE(r.app_version,'')=?
+              AND NOT (
                     COALESCE(r.plan_origin,'live')='current_version_restore'
                     AND COALESCE(NULLIF(r.app_version,''),'Unknown')
-                        <> COALESCE(NULLIF(r.source_prediction_version,''),
-                                    COALESCE(NULLIF(r.app_version,''),'Unknown'))
-               )
-             ORDER BY r.created_at
-        """).fetchall()
+                        <> COALESCE(
+                            NULLIF(r.source_prediction_version,''),
+                            COALESCE(NULLIF(r.app_version,''),'Unknown')
+                        )
+              )
+            ORDER BY r.created_at
+        """, (target_version,)).fetchall()
 
-        for race_key, plan_hash, app_ver in rows:
+        for race_key, plan_hash, app_ver, cover, model_rr in rows:
             try:
                 tickets = con.execute("""
-                    SELECT bet_type,probability,odds
-                      FROM v187_mixed_plan_tickets
-                     WHERE race_key=? AND plan_hash=?
+                    SELECT bet_type, probability, odds, role
+                    FROM v187_mixed_plan_tickets
+                    WHERE race_key=? AND plan_hash=?
                 """, (race_key, plan_hash)).fetchall()
+
                 if not tickets:
                     skipped += 1
                     continue
@@ -12214,60 +12234,72 @@ def _v305_auto_backfill_current_recommendation(db_path: str) -> dict:
                         "probability": float(prob or 0.0),
                         "odds": float(od or 0.0),
                     }
-                    for bt, prob, od in tickets
+                    for bt, prob, od, _role in tickets
                 ]
                 rec = _v305_live_recommendation({"tickets": rec_tickets})
 
-                prev = con.execute("""
-                    SELECT adjusted_return_rate,cover,hole_count
-                      FROM v300_recommendation_audit
-                     WHERE race_key=? AND plan_hash=?
-                """, (race_key, plan_hash)).fetchone()
-                adjusted = float(prev[0] or 0.0) if prev else 0.0
-                cover = float(prev[1] or 0.0) if prev else 0.0
-                hole_count = int(prev[2] or 0) if prev else 0
+                hole_count = sum(
+                    1 for _bt, _prob, _od, role in tickets
+                    if "中穴価値候補" in str(role or "")
+                )
+                adjusted = float(model_rr or 0.0) * factor
+                cv = float(cover or 0.0)
+
+                reasons = [
+                    f"{target_version}現行推奨判定: "
+                    + str(rec.get("reason") or "")
+                ]
 
                 con.execute("""
                     INSERT INTO v300_recommendation_audit
-                    (race_key,plan_hash,recommendation_label,recommendation_score,
-                     adjusted_return_rate,cover,max_ev,hole_count,reasons_json,app_version,created_at)
+                    (
+                        race_key,plan_hash,recommendation_label,
+                        recommendation_score,adjusted_return_rate,
+                        cover,max_ev,hole_count,reasons_json,
+                        app_version,created_at
+                    )
                     VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(race_key,plan_hash) DO UPDATE SET
                         recommendation_label=excluded.recommendation_label,
                         recommendation_score=excluded.recommendation_score,
+                        adjusted_return_rate=excluded.adjusted_return_rate,
+                        cover=excluded.cover,
                         max_ev=excluded.max_ev,
+                        hole_count=excluded.hole_count,
                         reasons_json=excluded.reasons_json,
                         app_version=excluded.app_version,
                         created_at=excluded.created_at
                 """, (
-                    str(race_key), str(plan_hash),
+                    str(race_key),
+                    str(plan_hash),
                     str(rec.get("label") or "見送り"),
-                    10 if rec.get("recommended") else (5 if rec.get("candidate") else 0),
-                    adjusted, cover,
+                    10 if rec.get("recommended")
+                    else (5 if rec.get("candidate") else 0),
+                    adjusted,
+                    cv,
                     float(rec.get("max_ev", 0.0) or 0.0),
-                    hole_count,
-                    json.dumps(
-                        ["Ver305安定性判定: " + str(rec.get("reason") or "")],
-                        ensure_ascii=False,
-                    ),
-                    str(app_ver or "Ver305"),
+                    int(hole_count),
+                    json.dumps(reasons, ensure_ascii=False),
+                    str(app_ver or target_version),
                     _v228_now_jst_iso(),
                 ))
                 done += 1
+
             except Exception as exc:
-                if len(errors) < 20:
-                    errors.append(f"{race_key}: {type(exc).__name__}: {exc}")
+                if len(errors) < 30:
+                    errors.append(
+                        f"{race_key}: {type(exc).__name__}: {exc}"
+                    )
+
         con.commit()
-    return {"done": done, "skipped": skipped, "errors": errors}
 
-
-
-# ============================================================
-# Ver305 hotfix: recommendation-only comparison mode
-# Ver304の基礎予測・6周展開・買い目を固定し、Ver305では推奨だけ変更する。
-# ============================================================
-_V305_REC_ONLY_BASE_VERSION = "Ver304"
-_V305_REC_ONLY_ORIGIN = "v305_rec_only_from_ver304"
+    return {
+        "done": done,
+        "skipped": skipped,
+        "errors": errors,
+        "factor": factor,
+        "target_version": target_version,
+    }
 
 
 def _v305_rec_only_hash(race_key: str, source_plan_hash: str) -> str:
@@ -15338,7 +15370,11 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 )
     except Exception as _exc305fix:
         st.caption(f"Ver305比較固定の自動補正をスキップ: {type(_exc305fix).__name__}")
-    st.caption("Ver305の◎強推奨は、Ver301のEV候補条件に加えて4券種以上の支持一致を必須化。従来条件だけのものは○候補として分離します。")
+    st.caption(
+        f"{str(APP_VERSION or _V231_APP_VERSION)}の◎強推奨は、"
+        "Ver301のEV候補条件に加えて4券種以上の支持一致を必須化。"
+        "従来条件だけのものは○候補として分離します。"
+    )
     st.caption("✅ Ver302 集計修正3適用済み：復元実績は元予測Verへ統一")
     try:
         _stamp301=(str(db_path),Path(str(db_path)).stat().st_mtime_ns)
@@ -15347,14 +15383,26 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             st.session_state["_v301_auto_rec_backfill_stamp"]=_stamp301
             if _bf301.get("done",0)>0:
                 st.caption(f"推奨判定を保存済みプランから自動補完済み：{_bf301['done']}件（Ver302含む・再シミュレーションなし）")
-        _stamp305=(str(db_path),Path(str(db_path)).stat().st_mtime_ns,"Ver305")
+        _current_rec_ver305=str(APP_VERSION or _V231_APP_VERSION or "Ver306")
+        _stamp305=(
+            str(db_path),
+            Path(str(db_path)).stat().st_mtime_ns,
+            _current_rec_ver305,
+            "current-rec-backfill-v306-fix1",
+        )
         if st.session_state.get("_v305_auto_rec_backfill_stamp") != _stamp305:
             _bf305=_v305_auto_backfill_current_recommendation(str(db_path))
-            st.session_state["_v305_auto_rec_backfill_stamp"]=_stamp305
+            # 補完でDBのmtimeが変わるため、書込後のmtimeをstampへ保存する。
+            st.session_state["_v305_auto_rec_backfill_stamp"]=(
+                str(db_path),
+                Path(str(db_path)).stat().st_mtime_ns,
+                _current_rec_ver305,
+                "current-rec-backfill-v306-fix1",
+            )
             if _bf305.get("done",0)>0:
                 st.caption(
-                    f"Ver305推奨判定を4券種安定性基準で補完済み："
-                    f"{_bf305['done']}件（旧Ver監査は変更なし）"
+                    f"{_current_rec_ver305}推奨判定を現行基準で補完済み："
+                    f"{_bf305['done']}件（◎・○・見送りを再集計）"
                 )
     except Exception as _bf301_exc:
         st.warning("Ver301推奨の自動振り分けに失敗しました: "+_runtime_exception_text(_bf301_exc))
@@ -15422,7 +15470,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             if all_s['hit_rate'] is not None else f"的中判定対象なし / 収支 {all_s['profit']:+,}円"
         )
     with c2:
-        st.markdown("**推奨のみ（Ver301 ◎強推奨）**")
+        st.markdown("**推奨のみ（◎強推奨）**")
         if rec_s['races']:
             st.caption(
                 f"{rec_s['races']}R・的中率 {rec_s['hit_rate']:.1f}% / 黒字率 {rec_s['black_rate']:.1f}% / ガミ率 {rec_s['gami_rate']:.1f}% / 収支 {rec_s['profit']:+,}円"
