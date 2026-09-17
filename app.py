@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver307"
+APP_VERSION = "Ver308"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver307"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver308"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -14369,11 +14369,10 @@ def show_v184_eight_car_mixed_plan(
     # Ver305: 現行Verは4券種安定性ゲート。旧Ver復元は当時のVer301基準を維持。
     _rec_target_ver = str(app_version or APP_VERSION)
     if result.get("available"):
-        _live_rec301 = (
-            _v305_live_recommendation(result)
-            if _rec_target_ver == "Ver305"
-            else _v301_live_recommendation(result)
-        )
+        # Ver308: 推奨判定はVer305の安定性ロジックへ確実に復帰。
+        # Ver307以前はAPP_VERSIONがVer305でないため、条件分岐だけでVer301へ落ちていた。
+        # 現行版でもVer305のEV＋4券種支持条件をそのまま使用する。
+        _live_rec301 = _v305_live_recommendation(result)
     else:
         _live_rec301 = {}
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH) or 0
@@ -14423,7 +14422,7 @@ def show_v184_eight_car_mixed_plan(
                         else (5 if _live_rec301.get("candidate") else 0)
                     )
                     _save_audit301["reasons"]=list(_save_audit301.get("reasons") or []) + [
-                        ("Ver305安定性推奨: " if _rec_target_ver=="Ver305" else "Ver301実運用推奨: ")
+                        "Ver305互換・安定性推奨: "
                         + str(_live_rec301.get("reason",""))
                     ]
                 _v300_save_recommendation_audit(
