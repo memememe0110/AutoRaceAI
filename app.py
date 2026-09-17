@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver308"
+APP_VERSION = "Ver309"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver308"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver309"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -2478,6 +2478,36 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             ),
             result_blob=sqlite3.Binary(blob),
         )
+        # Ver309: 再シミュレーション中に保留したGitHub保存を、完了後に1回だけ実行。
+        # ここではバックグラウンドjobをcompleted/cancelledへ更新済みなので、
+        # push_db_to_github()の通常の再シミュレーション中ガードには掛からない。
+        try:
+            _gh309_ok, _gh309_msg = push_db_to_github(
+                "AutoRaceAI: 再シミュレーション完了後のDB一括保存"
+            )
+            result["github_deferred_save_ok"] = bool(_gh309_ok)
+            result["github_deferred_save_message"] = str(_gh309_msg or "")
+            if not _gh309_ok:
+                # GitHub保存失敗で再シミュレーション自体をfailed扱いにはしない。
+                _v278_bg_update(
+                    db_path, job_id,
+                    message=(
+                        "再シミュレーションは完了しました。GitHub一括保存は未完了です。 "
+                        + str(_gh309_msg or "")
+                    ),
+                )
+        except Exception as _gh309_exc:
+            result["github_deferred_save_ok"] = False
+            result["github_deferred_save_message"] = (
+                f"{type(_gh309_exc).__name__}: {_gh309_exc}"
+            )
+            _v278_bg_update(
+                db_path, job_id,
+                message=(
+                    "再シミュレーションは完了しました。GitHub一括保存でエラーが発生しました。 "
+                    + result["github_deferred_save_message"]
+                ),
+            )
         if not cancelled:
             _v276_send_rerun_complete_notification(result)
     except Exception as exc:
@@ -12930,10 +12960,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 remaining.remove(cand)
 
     snapshots = []
-    # Ver306: 2〜5点で最適化が自然終了した場合も、有効な小点数構成として保持する。
-    # 従来は6点以上にならないと snapshots が空のままになり、
-    # オッズ訂正後などに候補が4点まで絞られたレースで表示自体が消えていた。
-    if len(plan) >= 2:
+    # Ver305: 6点以上の構成だけを推奨判定の母集団として評価する。
+    if len(plan) >= 6:
         snapshots.append((list(plan), evaluate(plan)))
 
     # 基本上限は12点。13〜14点目は黒字側が明確に伸びる場合だけ例外採用する。
@@ -12971,11 +12999,11 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             break
         plan.append(cand)
         remaining.remove(cand)
-        if len(plan) >= 2:
+        if len(plan) >= 6:
             snapshots.append((list(plan), evaluate(plan)))
 
     if not snapshots:
-        return {"available": False, "reason": "有効な構成候補を作れませんでした。"}
+        return {"available": False, "reason": "役割の異なる券を組み合わせた有効な構成を作れませんでした。"}
 
     # Ver191: 最高評価に近い構成から、黒字的中率と期待倍率を優先して選ぶ。
     best_score = max(m["score"] for _, m in snapshots)
@@ -14369,7 +14397,7 @@ def show_v184_eight_car_mixed_plan(
     # Ver305: 現行Verは4券種安定性ゲート。旧Ver復元は当時のVer301基準を維持。
     _rec_target_ver = str(app_version or APP_VERSION)
     if result.get("available"):
-        # Ver308: 推奨判定はVer305の安定性ロジックへ確実に復帰。
+        # Ver309: Ver305基準の買い目生成と推奨判定を比較用に固定。
         # Ver307以前はAPP_VERSIONがVer305でないため、条件分岐だけでVer301へ落ちていた。
         # 現行版でもVer305のEV＋4券種支持条件をそのまま使用する。
         _live_rec301 = _v305_live_recommendation(result)
@@ -17310,7 +17338,21 @@ def _v305_sanitize_remote_for_safe_sync(
         shutil.rmtree(tmp_dir,ignore_errors=True)
 
 
-def push_db_to_github(commit_message: str) -> tuple[bool, str]:
+def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = False) -> tuple[bool, str]:
+    # Ver309: バックグラウンド再シミュレーション中はGitHub同期を行わない。
+    # ローカルSQLiteへの登録・更新はそのまま継続し、再シミュレーション終了後に
+    # まとめて1回だけGitHubへ保存する。これにより待機中の選手履歴登録などが
+    # GitHub通信・DB統合処理で何度も停止するのを防ぐ。
+    if not _allow_during_resimulation:
+        try:
+            _bg_running309 = _v278_bg_has_running_job(engine.DB_PATH)
+        except Exception:
+            _bg_running309 = False
+        if _bg_running309:
+            return True, (
+                "GitHub保存は保留しました。再シミュレーション終了後に更新済みDBをまとめて保存します。"
+            )
+
     # 保存ボタン押下時にも、アップロード正本よりDBが後退していないか最終確認。
     _pin284=st.session_state.get("v284_uploaded_master_identity")
     _deferred_guard284=[]
@@ -21577,7 +21619,7 @@ if selected_main_page == "🗃️ 登録情報確認":
             st.error(f"登録情報の確認エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
 
-    st.caption("GitHub保存にはStreamlit Secretsの設定が必要です。トークンはコードやGitHubへ直接書かないでください。")
+    st.caption("再シミュレーション中のGitHub保存は保留し、終了後に更新済みDBをまとめて1回だけ保存します。通常の履歴登録はローカルDBへそのまま登録されます。\n\nGitHub保存にはStreamlit Secretsの設定が必要です。トークンはコードやGitHubへ直接書かないでください。")
 
 
 
