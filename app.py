@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver306"
+APP_VERSION = "Ver307"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver306"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver307"  # Ver280: 川口4日実測ベースの予測改善
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -12178,7 +12178,7 @@ def _v305_live_recommendation(result: dict) -> dict:
 def _v305_auto_backfill_current_recommendation(db_path: str) -> dict:
     """現在APP_VERSIONの全プランを現行推奨基準で監査補完する。
 
-    Ver306修正:
+    Ver307（Ver306の表示不具合修正は維持）:
     - Ver305固定ではなくAPP_VERSIONを対象にする
     - 再シミュレーション済みプランも全件補完
     - 既存の古い/部分監査も現行基準へ更新
