@@ -41,7 +41,7 @@ APP_VERSION = "Ver310"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver310"  # Ver310: 推奨判定差分の原因特定用診断出力
+_V231_APP_VERSION = "Ver310"  # Ver310: bets診断のタプルキー対応・復元後ハッシュ追加
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -2419,7 +2419,7 @@ def _v284_backfill_transition_audit_from_latest_histories(db_path: str, app_vers
         return result
 
 
-def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool, resume_done_offset: int = 0, resume_total_target: int = 0) -> None:
+def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool, resume_done_offset: int = 0, resume_total_target: int = 0, diagnostic_auto: bool = False) -> None:
     try:
         _v278_bg_update(
             db_path, job_id,
@@ -2448,6 +2448,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             int(limit_count),
             _progress,
             force_current=bool(force_current),
+            diagnostic_auto=bool(diagnostic_auto),
             cancel_cb=lambda: _v278_bg_cancel_requested(db_path,job_id),
             pause_cb=lambda: _v278_bg_pause_loop(db_path,job_id),
         )
@@ -2526,7 +2527,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
         except Exception:
             pass
 
-def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
+def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnostic_auto: bool = False) -> dict:
     _v278_bg_ensure_table(db_path)
     if _v278_bg_has_running_job(db_path):
         return {"ok":False,"reason":"すでにバックグラウンド再シミュレーションが動いています。"}
@@ -2581,7 +2582,7 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool) -> dict:
         job_id=int(cur.lastrowid or 0)
     th=threading.Thread(
         target=_v278_bg_worker,
-        args=(str(db_path),job_id,int(limit_count),bool(force_current)),
+        args=(str(db_path),job_id,int(limit_count),bool(force_current),0,0,bool(diagnostic_auto)),
         daemon=True,
         name=f"autorace-bg-rerun-{job_id}",
     )
@@ -3234,7 +3235,28 @@ def _v279_bg_prediction_load_completed(db_path: str, job: dict) -> tuple[dict,st
         return {},"",""
 
 
-def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None, pause_cb=None) -> dict:
+def _v310_auto_diagnostic_race_keys(db_path: str, current_ver: str, limit: int) -> list[str]:
+    """直前2版で買い目差分が大きいレースを自動選定する。"""
+    m=re.match(r'^Ver(\d+)$',str(current_ver or ''))
+    if not m: return []
+    n=int(m.group(1)); newer=f'Ver{n-1}'; older=f'Ver{n-2}'
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            keys=[r[0] for r in con.execute('SELECT DISTINCT race_key FROM v187_mixed_plan_runs WHERE app_version=?',(newer,))]
+            scored=[]
+            for rk in keys:
+                rows={v:con.execute('SELECT plan_hash FROM v187_mixed_plan_runs WHERE race_key=? AND app_version=? ORDER BY created_at DESC LIMIT 1',(rk,v)).fetchone() for v in (older,newer)}
+                if not all(rows.values()): continue
+                def sig(v):
+                    return [(r[0],r[1],round(float(r[2] or 0),5)) for r in con.execute('SELECT bet_type,combination,probability FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?',(rk,rows[v][0]))]
+                a,b=sig(older),sig(newer); diff=len(set(a)^set(b))+abs(len(a)-len(b))*2
+                if diff: scored.append((diff,str(rk)))
+            return [rk for _d,rk in sorted(scored,reverse=True)[:max(1,int(limit))]]
+    except Exception:
+        return []
+
+
+def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None, pause_cb=None, diagnostic_auto: bool = False) -> dict:
     out={
         "checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[],
         "roi_evaluated":0,"roi_no_odds":0,"roi_no_payout":0,
@@ -3291,6 +3313,13 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         if not rk or rk in seen:
             continue
         seen.add(rk); unique.append(h)
+    if diagnostic_auto:
+        _diag_keys310=set(_v310_auto_diagnostic_race_keys(db_path,current_ver,max(1,int(limit))))
+        unique=[h for h in unique if str(h.get('race_key') or '').strip() in _diag_keys310]
+        if not unique:
+            out['message']='自動診断対象の版間買い目差分が見つかりません。'
+            out['candidate_total']=0
+            return out
     # Ver276 speed: race_key から日付・場・Rを直接読める通常ケースでは、
     # 並び替えのためだけに圧縮payloadを展開しない。旧形式だけ従来処理へフォールバックする。
     _prep_t0_v276=time_module.perf_counter()
@@ -11063,8 +11092,17 @@ def _v215_race_meta_from_key(race_key: str, db_path: str) -> dict:
 
 
 def _v310_fingerprint(obj) -> str:
+    def _jsonable(x):
+        if isinstance(x, dict):
+            return {str(k): _jsonable(v) for k,v in x.items()}
+        if isinstance(x, (list,tuple)):
+            return [_jsonable(v) for v in x]
+        if hasattr(x, 'item'):
+            try: return x.item()
+            except Exception: pass
+        return x
     try:
-        raw = json.dumps(obj or {}, ensure_ascii=False, sort_keys=True, default=str, separators=(',', ':'))
+        raw = json.dumps(_jsonable(obj or {}), ensure_ascii=False, sort_keys=True, default=str, separators=(',', ':'))
         return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:20]
     except Exception:
         return ''
@@ -11081,7 +11119,10 @@ def _v310_save_diagnostic(db_path: str, race_key: str, view: dict, source_versio
             if not isinstance(vals, dict):
                 continue
             for combo, prob in vals.items():
-                try: rows.append((float(prob), str(typ), str(combo)))
+                try:
+                    if isinstance(prob, dict):
+                        prob = prob.get('probability', prob.get('p', prob.get('successes', 0)))
+                    rows.append((float(prob), str(typ), json.dumps(combo, ensure_ascii=False, default=str)))
                 except Exception: pass
         return [{'type':t,'combo':c,'probability':round(p,6)} for p,t,c in sorted(rows, reverse=True)[:30]]
     _v187_ensure_mixed_learning_tables(db_path)
@@ -21464,6 +21505,11 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 key="v262_force_current_rerun",
                                 help="ONの場合、同じVerの保存履歴が既にあっても再計算して新しい履歴を保存します。"
                             )
+                            _v310_auto_diag=st.checkbox(
+                                "🔎 買い目差分の大きいレースを自動選択して診断",
+                                value=False, key="v310_auto_diagnostic",
+                                help="直前2版の保存買い目を比較し、差分が大きいレースだけを指定件数分再シミュレーションします。"
+                            )
                             _bg278=_v278_bg_get_job(engine.DB_PATH)
                             _bg278_running=bool(_bg278 and str(_bg278.get("status") or "") in ("queued","running","cancel_requested"))
 
@@ -21508,6 +21554,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                         engine.DB_PATH,
                                         int(_v262_batch_limit),
                                         bool(_v262_force_current),
+                                        diagnostic_auto=bool(_v310_auto_diag),
                                     )
                                     if _started278.get("ok"):
                                         st.success(
