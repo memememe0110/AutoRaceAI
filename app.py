@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver309"
+APP_VERSION = "Ver310"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver309"  # Ver280: 川口4日実測ベースの予測改善
+_V231_APP_VERSION = "Ver310"  # Ver310: 推奨判定差分の原因特定用診断出力
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -3251,18 +3251,27 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         _v231_ensure_prediction_history_table(db_path)
         with sqlite3.connect(str(db_path),timeout=30.0) as _con289:
             _con289.row_factory=sqlite3.Row
+            # 現行版を明示的に優先する。同一レースの別版を「最新履歴」という
+            # 理由だけで拾うと、Ver309の再実行がVer308/307の学習状態・設定を
+            # 入力にしてしまい、版間比較の入力が混ざる。
             _rows289=_con289.execute("""
-                SELECT h.history_id,h.race_key,h.race_label,h.app_version,h.simulation_mode,
-                       h.settings_hash,h.prediction_time,h.trials,h.seed
-                FROM v231_prediction_history h
-                JOIN (
-                    SELECT race_key,MAX(history_id) AS max_history_id
-                    FROM v231_prediction_history
-                    WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
-                    GROUP BY race_key
-                ) x ON h.history_id=x.max_history_id
-                ORDER BY h.prediction_time DESC,h.history_id DESC
-            """).fetchall()
+                WITH ranked AS (
+                    SELECT h.history_id,h.race_key,h.race_label,h.app_version,h.simulation_mode,
+                           h.settings_hash,h.prediction_time,h.trials,h.seed,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY h.race_key
+                               ORDER BY CASE WHEN h.app_version=? THEN 0 ELSE 1 END,
+                                        h.history_id DESC
+                           ) AS rn
+                    FROM v231_prediction_history h
+                    WHERE h.race_key IS NOT NULL AND TRIM(h.race_key)<>''
+                )
+                SELECT history_id,race_key,race_label,app_version,simulation_mode,
+                       settings_hash,prediction_time,trials,seed
+                FROM ranked
+                WHERE rn=1
+                ORDER BY prediction_time DESC,history_id DESC
+            """, (current_ver,)).fetchall()
         histories=[dict(r) for r in _rows289]
     except Exception:
         histories=_v231_list_prediction_histories(db_path,max(1,int(limit)))
@@ -3503,6 +3512,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             if callable(progress_cb):
                 progress_cb(idx-1,total,label+"｜①基礎予測中")
             df,bets,output,entries,meta=engine.ver16_run_prediction(prediction_text,trials,seed,manual_excluded=excluded)
+            _bets_before_lap310 = dict(bets or {})
             if callable(progress_cb):
                 progress_cb(idx-1,total,label+"｜②6周展開中")
             entries=_v276_mark_retrial_from_prediction_text(entries,prediction_text)
@@ -3511,6 +3521,15 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             df,bets,wall_audit=_v230_six_lap_simulation(df,bets,entries,meta,trials,seed)
             meta['壁補正監査']=wall_audit
             meta['6周展開シミュレーション']=wall_audit
+            try:
+                _v310_save_diagnostic(
+                    db_path, str(race_key0),
+                    {'meta':meta}, src_ver, _state_restored305,
+                    _state_source_hash305, _state_current_hash305,
+                    _bets_before_lap310, dict(bets or {}), wall_audit, trials, seed,
+                )
+            except Exception:
+                pass
             finish_prob=engine.v30_finish_probabilities(df,bets,trials)
             try:
                 engine.v305_clear_model_state_override()
@@ -3543,6 +3562,15 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 'model_state_restored_v305':bool(_state_restored305),
                 'source_model_state_hash_v305':str(_state_source_hash305 or ''),
                 'current_model_state_hash_before_rerun_v305':str(_state_current_hash305 or ''),
+                'v310_diagnostic':{
+                    'source_prediction_version':str(src_ver or ''),
+                    'model_state_restored':bool(_state_restored305),
+                    'source_model_state_hash':str(_state_source_hash305 or ''),
+                    'current_model_state_hash':str(_state_current_hash305 or ''),
+                    'trials':int(trials or 0),'seed':int(seed or 0),
+                    'bets_before_lap_hash':_v310_fingerprint(_bets_before_lap310) if '_v310_fingerprint' in globals() else '',
+                    'bets_after_lap_hash':_v310_fingerprint(bets) if '_v310_fingerprint' in globals() else '',
+                },
                 'legacy_model_state_missing_v305':not bool(
                     isinstance(_state305,dict) and _state305.get("state_hash")
                 ),
@@ -11032,6 +11060,56 @@ def _v215_race_meta_from_key(race_key: str, db_path: str) -> dict:
     except Exception:
         pass
     return out
+
+
+def _v310_fingerprint(obj) -> str:
+    try:
+        raw = json.dumps(obj or {}, ensure_ascii=False, sort_keys=True, default=str, separators=(',', ':'))
+        return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:20]
+    except Exception:
+        return ''
+
+
+def _v310_save_diagnostic(db_path: str, race_key: str, view: dict, source_version: str,
+                          restored: bool, source_hash: str, current_hash: str,
+                          bets_before_lap: dict, bets_after_lap: dict,
+                          wall_audit: dict, trials: int, seed: int) -> None:
+    """Ver310: 買い目差分の発生段階を後から特定できる診断情報を保存する。"""
+    def _top(obj):
+        rows=[]
+        for typ, vals in (obj or {}).items():
+            if not isinstance(vals, dict):
+                continue
+            for combo, prob in vals.items():
+                try: rows.append((float(prob), str(typ), str(combo)))
+                except Exception: pass
+        return [{'type':t,'combo':c,'probability':round(p,6)} for p,t,c in sorted(rows, reverse=True)[:30]]
+    _v187_ensure_mixed_learning_tables(db_path)
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute('''CREATE TABLE IF NOT EXISTS v310_plan_diagnostics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, race_key TEXT NOT NULL,
+            app_version TEXT, source_prediction_version TEXT, created_at TEXT,
+            trials INTEGER, seed INTEGER, model_state_restored INTEGER,
+            source_model_state_hash TEXT, current_model_state_hash TEXT,
+            bets_before_lap_hash TEXT, bets_after_lap_hash TEXT,
+            bets_before_lap_top_json TEXT, bets_after_lap_top_json TEXT,
+            wall_audit_json TEXT, input_meta_json TEXT
+        )''')
+        con.execute('''INSERT INTO v310_plan_diagnostics
+            (race_key,app_version,source_prediction_version,created_at,trials,seed,
+             model_state_restored,source_model_state_hash,current_model_state_hash,
+             bets_before_lap_hash,bets_after_lap_hash,bets_before_lap_top_json,
+             bets_after_lap_top_json,wall_audit_json,input_meta_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (
+            str(race_key), str(_V231_APP_VERSION), str(source_version or ''), _v228_now_jst_iso(),
+            int(trials or 0), int(seed or 0), int(bool(restored)), str(source_hash or ''),
+            str(current_hash or ''), _v310_fingerprint(bets_before_lap), _v310_fingerprint(bets_after_lap),
+            json.dumps(_top(bets_before_lap), ensure_ascii=False),
+            json.dumps(_top(bets_after_lap), ensure_ascii=False),
+            json.dumps(wall_audit or {}, ensure_ascii=False, default=str),
+            json.dumps({'source_version':str(source_version or ''),'race_key':str(race_key)}, ensure_ascii=False),
+        ))
+        con.commit()
 
 
 def _v187_save_mixed_plan(
