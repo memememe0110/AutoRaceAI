@@ -18114,10 +18114,10 @@ with st.sidebar:
     seed = st.number_input("乱数シード", min_value=0, value=20260719, step=1)
     model_mode = st.selectbox(
         "モデル方式",
-        ["Champion（Ver305近似・固定）", "Challenger（最新学習状態）"],
+        ["Champion（Ver305近似・継続学習）", "Challenger（最新学習状態）"],
         index=0,
         key="v311_model_mode",
-        help="Championは固定補正値で再現性を優先し、Challengerは最新の学習DB状態を使用します。",
+        help="ChampionはVer305近似の初期状態から独立して継続学習し、Challengerは最新の学習DB状態を使用します。",
     )
     use_champion_model = model_mode.startswith("Champion")
     st.divider()
