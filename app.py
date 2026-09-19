@@ -16386,10 +16386,13 @@ def _v282_push_chunked_db(
         int((prev_manifest or {}).get("generation") or 0) if prev_ok else 0,
     ) + 1
 
-    chunks = [
-        snapshot_bytes[i:i + chunk_size]
+    # Do not materialize every slice: for a 222MB DB that creates another
+    # full-size bytes allocation and can crash the Streamlit process.
+    total_chunks = (len(snapshot_bytes) + chunk_size - 1) // chunk_size
+    chunks = (
+        memoryview(snapshot_bytes)[i:i + chunk_size]
         for i in range(0, len(snapshot_bytes), chunk_size)
-    ]
+    )
     digest = hashlib.sha256(snapshot_bytes).hexdigest()
 
     # GitHub正本とDB全体が完全一致ならcommit不要。
@@ -16506,7 +16509,7 @@ def _v282_push_chunked_db(
                 ok_meta, gitsha = _content_git_sha(cp)
                 if not ok_meta:
                     return False, (
-                        f"GitHub保存を中止しました。既存part {idx+1}/{len(chunks)} "
+                        f"GitHub保存を中止しました。既存part {idx+1}/{total_chunks} "
                         "のSHA確認に失敗しました。"
                     )
             chunk_paths.append(cp)
@@ -16536,7 +16539,7 @@ def _v282_push_chunked_db(
             ok_blob, gitsha, blob_msg = _create_blob(chunk)
             if not ok_blob:
                 return False, (
-                    f"GitHub保存を中止しました。差分blob {idx+1}/{len(chunks)} "
+                    f"GitHub保存を中止しました。差分blob {idx+1}/{total_chunks} "
                     f"作成失敗: {blob_msg}"
                 )
             tree_entries.append({
