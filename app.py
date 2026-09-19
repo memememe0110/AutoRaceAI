@@ -12245,6 +12245,24 @@ def _v301_live_recommendation(result: dict) -> dict:
 
 
 
+def _safe_ev_multiple(probability_pct, odds):
+    """EV倍率の共通計算。欠損・NaN・無限大・不正な値を安全に除外する。
+
+    probability は 0〜100(%)、odds は倍率として扱う。
+    この関数はEVの閾値や推奨条件を変更せず、算出値の一貫性だけを担保する。
+    """
+    try:
+        p = float(probability_pct or 0.0)
+        o = float(odds or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(p) or not np.isfinite(o) or p <= 0.0 or o <= 0.0:
+        return 0.0
+    # 確率はパーセント値。保存値が範囲外ならEV計算へ流さない。
+    p = float(np.clip(p, 0.0, 100.0))
+    return (p / 100.0) * o
+
+
 def _v305_live_recommendation(result: dict) -> dict:
     """Ver305 強推奨判定。
 
@@ -12268,7 +12286,7 @@ def _v305_live_recommendation(result: dict) -> dict:
     for t in tickets:
         p = float(t.get("ev_probability", t.get("probability", 0.0)) or 0.0)
         od = float(t.get("odds", 0.0) or 0.0)
-        evs.append((p / 100.0) * od)
+        evs.append(_safe_ev_multiple(p, od))
     max_ev = max(evs) if evs else 0.0
 
     # Ver301の候補条件はそのまま。
@@ -12988,8 +13006,10 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         # Ver295: 期待値評価専用の校正済み期待払戻。
         # cover/black/lowは元の展開シミュレーション確率のまま維持する。
         ev_expected_return = sum(
-            (float(t.get("ev_probability",t.get("probability",0.0)) or 0.0)/100.0)
-            * float(t.get("odds",0.0) or 0.0) * 100.0
+            _safe_ev_multiple(
+                t.get("ev_probability", t.get("probability", 0.0)),
+                t.get("odds", 0.0),
+            ) * 100.0
             for t in plan
         )
         ev_expected_multiple = ev_expected_return / cost if cost else 0.0
@@ -13416,7 +13436,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 break
             odds = float(ticket.get("odds", 0.0) or 0.0)
             prob = float(ticket.get("probability", 0.0) or 0.0)
-            standalone_ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
+            standalone_ev = _safe_ev_multiple(ticket.get("ev_probability", prob), odds)
             payout_ratio = (odds * 100.0 / float(base.get("cost", 1.0))) if base.get("cost") else 0.0
 
             # 2.0倍以下はEV100%未満なら無条件除外。
@@ -13465,7 +13485,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
             odds = float(ticket.get("odds", 0.0) or 0.0)
             prob = float(ticket.get("probability", 0.0) or 0.0)
-            standalone_ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
+            standalone_ev = _safe_ev_multiple(ticket.get("ev_probability", prob), odds)
             payout_ratio = (odds * 100.0 / float(before.get("cost", 1.0))) if before.get("cost") else 0.0
             cover_loss = float(before["cover"] - after["cover"])
             black_delta = float(after["black"] - before["black"])
@@ -13890,7 +13910,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
                 odds = float(cand.get("odds", 0.0) or 0.0)
                 probability = float(cand.get("probability", 0.0) or 0.0)
-                standalone_ev = float(cand.get("ev_probability",probability) or probability) / 100.0 * odds
+                standalone_ev = _safe_ev_multiple(cand.get("ev_probability", probability), odds)
                 if odds <= 0 or standalone_ev < 1.00:
                     continue
 
@@ -13969,7 +13989,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
         probability = float(cand.get("probability", 0.0) or 0.0)
         odds = float(cand.get("odds", 0.0) or 0.0)
-        standalone_ev = float(cand.get("ev_probability",probability) or probability) / 100.0 * odds
+        standalone_ev = _safe_ev_multiple(cand.get("ev_probability", probability), odds)
         add_metrics = evaluate(selected + [cand])
         cover_gain = add_metrics["cover"] - base_for_residual["cover"]
         black_gain = add_metrics["black"] - base_for_residual["black"]
@@ -14065,7 +14085,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
             prob = float(ticket.get("probability", 0.0) or 0.0)
             odds = float(ticket.get("odds", 0.0) or 0.0)
-            standalone_ev = (float(ticket.get("ev_probability",prob) or prob) / 100.0) * odds
+            standalone_ev = _safe_ev_multiple(ticket.get("ev_probability", prob), odds)
             key = (
                 return_delta,
                 black_delta,
