@@ -1,5 +1,5 @@
 from __future__ import annotations
-import io, math, re, sqlite3, hashlib, time, traceback
+import io, json, math, re, sqlite3, hashlib, time, traceback
 from collections import Counter
 from datetime import datetime, date
 from pathlib import Path
@@ -19927,6 +19927,32 @@ def v305_clear_model_state_override():
 
 def v305_model_state_override_active():
     return isinstance(_V305_MODEL_STATE_OVERRIDE, dict) and bool(_V305_MODEL_STATE_OVERRIDE)
+
+
+_V311_CHAMPION_STATE_CACHE = None
+
+
+def v311_load_champion_state():
+    """Load the fixed Ver.305-era champion state without changing the DB."""
+    global _V311_CHAMPION_STATE_CACHE
+    if isinstance(_V311_CHAMPION_STATE_CACHE, dict):
+        return dict(_V311_CHAMPION_STATE_CACHE)
+    path = APP_DIR / "ver305_champion_state.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or not state.get("state_hash"):
+            return {}
+        state["champion_source"] = "Ver305_approx_from_first_Ver306_snapshot_2026-08-31"
+        _V311_CHAMPION_STATE_CACHE = dict(state)
+        return dict(state)
+    except Exception:
+        return {}
+
+
+def v311_set_champion_model_state():
+    """Use the fixed champion state for a normal prediction run."""
+    state = v311_load_champion_state()
+    return bool(state) and v305_set_model_state_override(state)
 
 
 # Core getters that were confirmed to drift with the current DB.

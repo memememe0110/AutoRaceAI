@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver310"
+APP_VERSION = "Ver311"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver310"  # Ver310: bets診断のタプルキー対応・復元後ハッシュ追加
+_V231_APP_VERSION = "Ver311"  # Ver311: Ver305近似チャンピオンモデル固定
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -3069,6 +3069,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
         _v276_foreground_prediction_event.set()
         with _V276ForegroundPredictionPriority(db_path):
             _t0=time_module.perf_counter()
+            _champion311_applied=bool(engine.v311_set_champion_model_state())
             df,bets,output,entries,meta=engine.ver16_run_prediction(
                 prediction_text,trials,seed,manual_excluded=excluded
             )
@@ -3082,6 +3083,10 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             # 単発バックグラウンド予測の進捗はv278_background_jobsへ直接更新する。
             meta["壁補正監査"]=wall_audit
             meta["6周展開シミュレーション"]=wall_audit
+            try:
+                engine.v305_clear_model_state_override()
+            except Exception:
+                pass
             _t1=time_module.perf_counter()
             _v278_bg_update(db_path,job_id,done_count=2,current_label="確率集計",message="着順・券種別確率を集計しています。")
 
@@ -18107,6 +18112,14 @@ with st.sidebar:
     st.header("予測設定")
     trials = st.selectbox("試行回数", [3000, 10000, 20000], index=2)
     seed = st.number_input("乱数シード", min_value=0, value=20260719, step=1)
+    model_mode = st.selectbox(
+        "モデル方式",
+        ["Champion（Ver305近似・固定）", "Challenger（最新学習状態）"],
+        index=0,
+        key="v311_model_mode",
+        help="Championは固定補正値で再現性を優先し、Challengerは最新の学習DB状態を使用します。",
+    )
+    use_champion_model = model_mode.startswith("Champion")
     st.divider()
     st.subheader("履歴DB")
     if st.session_state.pop("v284_db_auto_restored",False):
@@ -19129,6 +19142,9 @@ elif selected_main_page == "🏁 予測":
             with _V276ForegroundPredictionPriority(engine.DB_PATH):
                 with st.spinner("高速6周イベントシミュレーションを実行中…"):
                     _t0 = time_module.perf_counter()
+                    _champion311_applied = bool(use_champion_model and engine.v311_set_champion_model_state())
+                    if not use_champion_model:
+                        engine.v305_clear_model_state_override()
                     df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
                     entries = _v276_mark_retrial_from_prediction_text(entries, prediction_text)
                     df = _v276_copy_retrial_to_prediction_df(df, entries)
@@ -19153,6 +19169,10 @@ elif selected_main_page == "🏁 予測":
                         except Exception:
                             pass
                     _t2 = time_module.perf_counter()
+                    try:
+                        engine.v305_clear_model_state_override()
+                    except Exception:
+                        pass
             _v276_foreground_prediction_event.clear()
             # オッズ欄の表示に必要なレースキーだけ同期保存。
             _t_save0 = time_module.perf_counter()
@@ -19194,6 +19214,8 @@ elif selected_main_page == "🏁 予測":
                 "settings_hash": _v231_settings_hash(int(trials), int(seed), [int(x) for x in manual_excluded]),
                 "prediction_time": _v228_now_jst_iso(),
                 "seed": int(seed),
+                "model_mode": "Ver305_champion_approx_fixed" if _champion311_applied else "latest_learning_challenger",
+                "model_baseline_source": "ver305_champion_state.json (first Ver306 snapshot, 2026-08-31)",
                 "rerun_from_restored": bool(st.session_state.get("v261_rerun_requested", False)),
                 "rerun_source_version": (
                     str(_restored_view_for_rerun.get("_v231_source_app_version") or _restored_view_for_rerun.get("app_version") or "")
