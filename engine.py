@@ -19955,6 +19955,72 @@ def v311_set_champion_model_state():
     return bool(state) and v305_set_model_state_override(state)
 
 
+def v311_roll_champion_state_after_registration(adjustment, meta=None):
+    """Advance the Champion state using the same post-result learning formulas.
+
+    The Challenger DB remains the source of evidence, while the Champion's own
+    weights are used as the ``before`` values.  This preserves two independent
+    model trajectories instead of replacing the Champion with current DB state.
+    """
+    global _V311_CHAMPION_STATE_CACHE
+    state = v311_load_champion_state()
+    if not isinstance(state, dict) or not isinstance(adjustment, dict):
+        return {"ok": False, "reason": "state_or_adjustment_missing"}
+    if adjustment.get("duplicate") or not isinstance(adjustment.get("evidence"), dict):
+        return {"ok": False, "reason": "no_new_learning_evidence"}
+
+    evidence = dict(adjustment.get("evidence") or {})
+    champion_base = {str(k): float(v) for k, v in (state.get("base_weights") or {}).items()}
+    champion_heat = {str(k): float(v) for k, v in (state.get("heat_weights") or {}).items()}
+    if set(champion_base) != set(V40_DEFAULT_WEIGHTS) or set(champion_heat) != set(V141_HEAT_DEFAULT_WEIGHTS):
+        return {"ok": False, "reason": "champion_schema_mismatch"}
+
+    before_base = dict(champion_base)
+    before_heat = dict(champion_heat)
+    champion_base = _v141_move_weights(champion_base, V40_DEFAULT_WEIGHTS, evidence, max_step=0.0025)
+    stats = adjustment.get("learning_stats") or {}
+    if int(stats.get("hot_race_count", 0) or 0) >= 3:
+        champion_heat = _v141_move_weights(champion_heat, V141_HEAT_DEFAULT_WEIGHTS, evidence, max_step=0.0040)
+
+    aux_result = adjustment.get("aux_calibration") or {}
+    aux_evidence = aux_result.get("evidence") if isinstance(aux_result, dict) else None
+    aux_stats = aux_result.get("learning_stats") if isinstance(aux_result, dict) else None
+    champion_aux = {str(k): float(v) for k, v in (state.get("aux_factors") or {}).items()}
+    before_aux = dict(champion_aux)
+    if isinstance(aux_evidence, dict) and isinstance(aux_stats, dict):
+        for name in champion_aux:
+            count = int((aux_stats.get("usable") or {}).get(name, 0) or 0)
+            if count < 3:
+                continue
+            target = float(np.clip(1.0 + float(aux_evidence.get(name, 0.0)) * 0.35, 0.55, 1.45))
+            step = float(np.clip((target - champion_aux[name]) * 0.12, -0.030, 0.030))
+            champion_aux[name] = float(np.clip(champion_aux[name] + step, 0.50, 1.50))
+
+    state["base_weights"] = champion_base
+    state["heat_weights"] = champion_heat
+    state["aux_factors"] = champion_aux
+    state["rolling_updates"] = int(state.get("rolling_updates", 0) or 0) + 1
+    state["last_rolling_update"] = datetime.now().isoformat(timespec="seconds")
+    state["last_rolling_race_key"] = v34_race_key(meta or {})
+    payload = {k: v for k, v in state.items() if k not in {"state_hash", "champion_source"}}
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    state["state_hash"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    path = APP_DIR / "ver305_champion_state.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    _V311_CHAMPION_STATE_CACHE = dict(state)
+    return {
+        "ok": True,
+        "rolling_updates": state["rolling_updates"],
+        "race_key": state["last_rolling_race_key"],
+        "base_changed": before_base != champion_base,
+        "heat_changed": before_heat != champion_heat,
+        "aux_changed": before_aux != champion_aux,
+        "state_hash": state["state_hash"],
+    }
+
+
 # Core getters that were confirmed to drift with the current DB.
 def v40_get_weights(db_path=DB_PATH):
     s = _V305_MODEL_STATE_OVERRIDE or {}

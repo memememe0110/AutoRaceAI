@@ -18114,10 +18114,10 @@ with st.sidebar:
     seed = st.number_input("乱数シード", min_value=0, value=20260719, step=1)
     model_mode = st.selectbox(
         "モデル方式",
-        ["Champion（Ver305近似・固定）", "Challenger（最新学習状態）"],
+        ["Champion（Ver305近似・継続学習）", "Challenger（最新学習状態）"],
         index=0,
         key="v311_model_mode",
-        help="Championは固定補正値で再現性を優先し、Challengerは最新の学習DB状態を使用します。",
+        help="ChampionはVer305近似の初期状態から独立して継続学習し、Challengerは最新の学習DB状態を使用します。",
     )
     use_champion_model = model_mode.startswith("Champion")
     st.divider()
@@ -19214,7 +19214,7 @@ elif selected_main_page == "🏁 予測":
                 "settings_hash": _v231_settings_hash(int(trials), int(seed), [int(x) for x in manual_excluded]),
                 "prediction_time": _v228_now_jst_iso(),
                 "seed": int(seed),
-                "model_mode": "Ver305_champion_approx_fixed" if _champion311_applied else "latest_learning_challenger",
+                "model_mode": "Ver305_champion_approx_rolling" if _champion311_applied else "latest_learning_challenger",
                 "model_baseline_source": "ver305_champion_state.json (first Ver306 snapshot, 2026-08-31)",
                 "rerun_from_restored": bool(st.session_state.get("v261_rerun_requested", False)),
                 "rerun_source_version": (
@@ -20166,6 +20166,11 @@ if selected_main_page == "✅ 結果登録・解析":
                         global_transition_recalc_v287=_v287_recalculate_global_transition_calibration(engine.DB_PATH)
                     else:
                         global_transition_recalc_v287={"ok":False,"source_races":0,"calibrations":0,"reason":"学習対象外"}
+                    rolling_champion_result = {"ok": False, "reason": "duplicate_or_replaced"}
+                    if not registration.get("duplicate") and not registration.get("replaced"):
+                        rolling_champion_result = engine.v311_roll_champion_state_after_registration(
+                            adjustment, meta_r
+                        )
                     ticket_analysis = engine.v67_analyze_ticket_result(meta_r, rows_r, engine.DB_PATH)
                     # Ver255管理修正: 予測時に保存済みのプランだけを、結果登録後に払戻と照合する。
                     # 復元表示だけでは新規保存せず、結果登録時点で元バージョンのまま回収率へ反映する。
@@ -20195,6 +20200,11 @@ if selected_main_page == "✅ 結果登録・解析":
                         )
                     elif _gr287.get("reason") and _gr287.get("reason")!="学習対象外":
                         st.warning("Ver287全体補正の再計算に失敗しました: "+str(_gr287.get("reason")))
+                    if isinstance(locals().get("rolling_champion_result"), dict) and rolling_champion_result.get("ok"):
+                        st.caption(
+                            f"Champion学習を更新しました：{int(rolling_champion_result.get('rolling_updates', 0))}回目 "
+                            f"（{rolling_champion_result.get('race_key') or key}）"
+                        )
                     if int(locals().get("incident_saved_count", 0) or 0) > 0:
                         st.caption(
                             f"🧾 発走後事故・反則を{int(incident_saved_count)}件、選手別事故履歴へ種類別保存しました。"
