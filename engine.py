@@ -19152,7 +19152,7 @@ def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH)
         _ch_key, _ch_comparison, _ch_analysis, _ch_adjustment, _ch_registration = output
         _ch_learning_ok = not bool((_ch_registration or {}).get("learning_excluded")) and not bool((_ch_analysis or {}).get("学習対象外"))
         if _ch_learning_ok:
-            v311_update_champion_after_result(meta2, db_path, learning_eligible=True)
+            v311_update_champion_after_result(meta2, db_path, learning_eligible=True, adjustment=_ch_adjustment)
     except Exception:
         pass
     return output
@@ -19184,7 +19184,7 @@ def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_pat
         _ch_key, _ch_comparison, _ch_analysis, _ch_adjustment, _ch_registration = output
         _ch_learning_ok = not bool((_ch_registration or {}).get("learning_excluded")) and not bool((_ch_analysis or {}).get("学習対象外"))
         if _ch_learning_ok:
-            v311_update_champion_after_result(meta2, db_path, learning_eligible=True)
+            v311_update_champion_after_result(meta2, db_path, learning_eligible=True, adjustment=_ch_adjustment)
     except Exception:
         pass
     return output
@@ -19969,20 +19969,51 @@ def v311_set_champion_model_state():
     return bool(state) and v305_set_model_state_override(state)
 
 
-def v311_update_champion_after_result(meta=None, db_path=DB_PATH, learning_eligible=True):
-    """結果登録後、Ver305と同じ学習更新後の状態をChampion側へ反映する。
-
-    初期値は同梱のVer305状態を使用し、結果登録で学習対象となったレースだけ、
-    現在DBに反映された学習状態を新しいChampion状態として保存する。
-    """
+def v311_update_champion_after_result(meta=None, db_path=DB_PATH, learning_eligible=True, adjustment=None):
+    """結果登録の差分だけをChampion自身の状態へ適用する。"""
     if not learning_eligible:
         return {"ok": False, "updated": False, "reason": "学習対象外レース"}
     try:
-        state = v305_capture_model_state_snapshot(meta or {}, db_path)
+        if not isinstance(adjustment, dict) or adjustment.get("duplicate"):
+            return {"ok": False, "updated": False, "reason": "新規学習差分なし"}
+        state = v311_load_champion_state()
         if not isinstance(state, dict) or not state.get("state_hash"):
             return {"ok": False, "updated": False, "reason": "Champion状態の取得に失敗"}
-        state["champion_source"] = "Ver305_learning_continuation"
-        state["updated_from_result"] = True
+        changed = False
+        before = adjustment.get("before") or {}
+        after = adjustment.get("after") or {}
+        for field, names in (("base_weights", set(state.get("base_weights", {}))),
+                             ("heat_weights", set(state.get("heat_weights", {})))):
+            current = dict(state.get(field) or {})
+            for name in names:
+                if name in before and name in after:
+                    delta = float(after[name]) - float(before[name])
+                    current[name] = float(current[name]) + delta
+                    changed = changed or delta != 0.0
+            state[field] = current
+        aux = adjustment.get("aux_calibration") or {}
+        aux_before, aux_after = aux.get("before") or {}, aux.get("after") or {}
+        current_aux = dict(state.get("aux_factors") or {})
+        for name in current_aux:
+            if name in aux_before and name in aux_after:
+                delta = float(aux_after[name]) - float(aux_before[name])
+                current_aux[name] = float(current_aux[name]) + delta
+                changed = changed or delta != 0.0
+        state["aux_factors"] = current_aux
+        ctx = adjustment.get("race_context_calibration") or {}
+        if ctx.get("before") is not None and ctx.get("after") is not None:
+            delta = float(ctx["after"]) - float(ctx["before"])
+            state["race_context_factor"] = float(state.get("race_context_factor", 1.0)) + delta
+            changed = changed or delta != 0.0
+        if not changed:
+            return {"ok": False, "updated": False, "reason": "補正値の変化なし"}
+        state["champion_source"] = "Ver305_learning_continuation_independent"
+        state["rolling_updates"] = int(state.get("rolling_updates", 0) or 0) + 1
+        state["last_rolling_update"] = datetime.now().isoformat(timespec="seconds")
+        state["last_rolling_race_key"] = v34_race_key(meta or {})
+        payload = {k: v for k, v in state.items() if k not in {"state_hash", "champion_source"}}
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        state["state_hash"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         path = APP_DIR / "ver305_champion_state.json"
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -19993,6 +20024,7 @@ def v311_update_champion_after_result(meta=None, db_path=DB_PATH, learning_eligi
             "ok": True,
             "updated": True,
             "state_hash": state.get("state_hash"),
+            "rolling_updates": state.get("rolling_updates"),
             "race_date": state.get("race_date"),
             "race_no": state.get("race_no"),
             "captured_at": state.get("captured_at"),
