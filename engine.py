@@ -19148,6 +19148,13 @@ def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH)
             return key, comparison, analysis, adjustment, registration
         except Exception:
             pass
+    try:
+        _ch_key, _ch_comparison, _ch_analysis, _ch_adjustment, _ch_registration = output
+        _ch_learning_ok = not bool((_ch_registration or {}).get("learning_excluded")) and not bool((_ch_analysis or {}).get("学習対象外"))
+        if _ch_learning_ok:
+            v311_update_champion_after_result(meta2, db_path, learning_eligible=True)
+    except Exception:
+        pass
     return output
 
 
@@ -19173,6 +19180,13 @@ def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_pat
             return key, comparison, analysis, adjustment, registration
         except Exception:
             pass
+    try:
+        _ch_key, _ch_comparison, _ch_analysis, _ch_adjustment, _ch_registration = output
+        _ch_learning_ok = not bool((_ch_registration or {}).get("learning_excluded")) and not bool((_ch_analysis or {}).get("学習対象外"))
+        if _ch_learning_ok:
+            v311_update_champion_after_result(meta2, db_path, learning_eligible=True)
+    except Exception:
+        pass
     return output
 
 
@@ -19953,6 +19967,38 @@ def v311_set_champion_model_state():
     """Use the fixed champion state for a normal prediction run."""
     state = v311_load_champion_state()
     return bool(state) and v305_set_model_state_override(state)
+
+
+def v311_update_champion_after_result(meta=None, db_path=DB_PATH, learning_eligible=True):
+    """結果登録後、Ver305と同じ学習更新後の状態をChampion側へ反映する。
+
+    初期値は同梱のVer305状態を使用し、結果登録で学習対象となったレースだけ、
+    現在DBに反映された学習状態を新しいChampion状態として保存する。
+    """
+    if not learning_eligible:
+        return {"ok": False, "updated": False, "reason": "学習対象外レース"}
+    try:
+        state = v305_capture_model_state_snapshot(meta or {}, db_path)
+        if not isinstance(state, dict) or not state.get("state_hash"):
+            return {"ok": False, "updated": False, "reason": "Champion状態の取得に失敗"}
+        state["champion_source"] = "Ver305_learning_continuation"
+        state["updated_from_result"] = True
+        path = APP_DIR / "ver305_champion_state.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        global _V311_CHAMPION_STATE_CACHE
+        _V311_CHAMPION_STATE_CACHE = dict(state)
+        return {
+            "ok": True,
+            "updated": True,
+            "state_hash": state.get("state_hash"),
+            "race_date": state.get("race_date"),
+            "race_no": state.get("race_no"),
+            "captured_at": state.get("captured_at"),
+        }
+    except Exception as exc:
+        return {"ok": False, "updated": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
 # Core getters that were confirmed to drift with the current DB.
