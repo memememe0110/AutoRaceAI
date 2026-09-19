@@ -1,0 +1,7 @@
+[server]
+# Ver313: allow the History DB uploader to receive the 222MB+ SQLite backup.
+maxUploadSize = 512
+maxMessageSize = 1024
+
+[runner]
+fastReruns = true

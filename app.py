@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver312"
+APP_VERSION = "Ver313"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver312"  # Ver312: Ver305近似チャンピオンモデル固定
+_V231_APP_VERSION = "Ver313"  # Ver313: 200MB超SQLiteアップロード許容・バックアップ復元
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -18155,7 +18155,7 @@ with st.sidebar:
     db_file = st.file_uploader(
         "autorace_players.sqlite3を選択",
         type=None,
-        help="iPhoneの『ファイル』からSQLite本体を選択してください。ZIPのままでは読み込めません。",
+        help="200MB超のSQLite本体にも対応します。iPhoneの『ファイル』からSQLite本体を選択してください。ZIPのままでは読み込めません。アップロード完了まで画面を閉じないでください。",
     )
     if db_file is not None:
         ok, message = install_uploaded_db(db_file)
