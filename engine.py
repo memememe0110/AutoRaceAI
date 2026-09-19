@@ -19152,7 +19152,7 @@ def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH)
         _ch_key, _ch_comparison, _ch_analysis, _ch_adjustment, _ch_registration = output
         _ch_learning_ok = not bool((_ch_registration or {}).get("learning_excluded")) and not bool((_ch_analysis or {}).get("学習対象外"))
         if _ch_learning_ok:
-            v311_update_champion_after_result(meta2, db_path, learning_eligible=True)
+            v311_update_champion_after_result(meta2, db_path, learning_eligible=True, adjustment=_ch_adjustment)
     except Exception:
         pass
     return output
@@ -19184,7 +19184,7 @@ def v70_replace_registered_result(meta, results, laps=None, payouts=None, db_pat
         _ch_key, _ch_comparison, _ch_analysis, _ch_adjustment, _ch_registration = output
         _ch_learning_ok = not bool((_ch_registration or {}).get("learning_excluded")) and not bool((_ch_analysis or {}).get("学習対象外"))
         if _ch_learning_ok:
-            v311_update_champion_after_result(meta2, db_path, learning_eligible=True)
+            v311_update_champion_after_result(meta2, db_path, learning_eligible=True, adjustment=_ch_adjustment)
     except Exception:
         pass
     return output
