@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver314"
+APP_VERSION = "Ver315"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver314"  # Ver314: 推奨EV帯 + 再シム15RごとGitHub自動途中保存
+_V231_APP_VERSION = "Ver315"  # Ver315: 推奨にカバー<=45・参考回収率<45を追加
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -12338,14 +12338,11 @@ def _safe_ev_multiple(probability_pct, odds):
 
 
 def _v305_live_recommendation(result: dict) -> dict:
-    """Ver314 強推奨判定（回収率優先）。
+    """Ver315 強推奨判定（回収率優先）。
 
-    過去実績（Ver305/Ver313 CSV）から:
-    - 高EV帯・「回収率100%候補」は実績回収が低い（逆指標）
-    - 最大EV 1.0〜2.0 かつ買い目点数≤10 の帯が安定して黒字寄り
-
-    Ver301の券種支持条件は○候補の参考として残し、
-    ◎強推奨は回収率重視のEV帯＋点数上限を必須とする。
+    Ver314: 最大EV 1.0〜2.0 かつ点数≤10
+    Ver315: 加えてカバー≤45・参考回収率<45
+      （Ver314実績でこの2条件を外すと外れ10本・-6,300円、的中7本は全て残る）
     """
     tickets = list(result.get("tickets") or [])
     bet_types = {
@@ -12370,14 +12367,21 @@ def _v305_live_recommendation(result: dict) -> dict:
         (1.70 < max_ev <= 2.10 and support_count >= 3)
     )
 
-    # Ver314: ◎は回収率実績がまとまっていた帯だけ
-    # EV 1.0〜2.0 / 点数(買い目数) 1〜10
-    V314_EV_MIN = 1.0
-    V314_EV_MAX = 2.0
-    V314_MAX_TICKETS = 10
-    in_ev_band = (V314_EV_MIN <= max_ev <= V314_EV_MAX)
-    tickets_ok = (1 <= ticket_count <= V314_MAX_TICKETS)
-    strong = bool(in_ev_band and tickets_ok)
+    # Ver315: ◎は回収率実績がまとまっていた帯だけ
+    V315_EV_MIN = 1.0
+    V315_EV_MAX = 2.0
+    V315_MAX_TICKETS = 10
+    V315_MAX_COVER = 45.0
+    V315_MAX_REF_RR = 45.0
+    cover = float(result.get("cover", 0.0) or 0.0)
+    ref_rr = float(
+        result.get("adjusted_return_rate", result.get("model_return_rate", 0.0)) or 0.0
+    )
+    in_ev_band = (V315_EV_MIN <= max_ev <= V315_EV_MAX)
+    tickets_ok = (1 <= ticket_count <= V315_MAX_TICKETS)
+    cover_ok = (cover <= V315_MAX_COVER)
+    ref_ok = (ref_rr < V315_MAX_REF_RR) if ref_rr > 0 else True
+    strong = bool(in_ev_band and tickets_ok and cover_ok and ref_ok)
 
     if strong:
         return {
@@ -12389,14 +12393,15 @@ def _v305_live_recommendation(result: dict) -> dict:
             "support_count": int(support_count),
             "ticket_count": int(ticket_count),
             "reason": (
-                f"Ver314: 最大EV {max_ev:.2f}（{V314_EV_MIN:.1f}〜{V314_EV_MAX:.1f}）"
-                f" / 点数{ticket_count}≦{V314_MAX_TICKETS}。"
-                "回収率優先のEV帯条件を通過"
+                f"Ver315: 最大EV {max_ev:.2f}（{V315_EV_MIN:.1f}〜{V315_EV_MAX:.1f}）"
+                f" / 点数{ticket_count}≦{V315_MAX_TICKETS}"
+                f" / カバー{cover:.1f}≦{V315_MAX_COVER:.0f}"
+                f" / 参考回収{ref_rr:.1f}<{V315_MAX_REF_RR:.0f}"
             ),
-            "rule": "v314_ev_band",
+            "rule": "v315_ev_cover_ref",
         }
 
-    if legacy_candidate and max_ev <= V314_EV_MAX:
+    if legacy_candidate and max_ev <= V315_EV_MAX:
         return {
             "recommended": False,
             "candidate": True,
@@ -12407,21 +12412,25 @@ def _v305_live_recommendation(result: dict) -> dict:
             "ticket_count": int(ticket_count),
             "reason": (
                 f"Ver301候補条件は通過（最大EV {max_ev:.2f} / {support_count}券種）"
-                f"だが、Ver314の◎条件（EV帯+点数≦{V314_MAX_TICKETS}）には未達"
+                f"だが、Ver315の◎条件には未達"
             ),
-            "rule": "v314_ev_band",
+            "rule": "v315_ev_cover_ref",
         }
 
-    if max_ev > V314_EV_MAX:
-        why = f"最大EV {max_ev:.2f} > {V314_EV_MAX:.1f}（高EVは実績回収が低いため除外）"
-    elif max_ev < V314_EV_MIN and ticket_count > 0:
-        why = f"最大EV {max_ev:.2f} < {V314_EV_MIN:.1f}"
-    elif ticket_count > V314_MAX_TICKETS:
-        why = f"点数{ticket_count} > {V314_MAX_TICKETS}"
+    if max_ev > V315_EV_MAX:
+        why = f"最大EV {max_ev:.2f} > {V315_EV_MAX:.1f}（高EVは実績回収が低いため除外）"
+    elif max_ev < V315_EV_MIN and ticket_count > 0:
+        why = f"最大EV {max_ev:.2f} < {V315_EV_MIN:.1f}"
+    elif ticket_count > V315_MAX_TICKETS:
+        why = f"点数{ticket_count} > {V315_MAX_TICKETS}"
     elif ticket_count <= 0:
         why = "買い目なし"
+    elif not cover_ok:
+        why = f"カバー {cover:.1f} > {V315_MAX_COVER:.0f}（広めすぎて実績回収が低い）"
+    elif not ref_ok:
+        why = f"参考回収率 {ref_rr:.1f} ≥ {V315_MAX_REF_RR:.0f}（高参考回収は逆指標）"
     elif legacy_candidate:
-        why = f"Ver301候補だが点数またはEV帯がVer314条件外（点数{ticket_count}）"
+        why = f"Ver301候補だがVer315条件外（点数{ticket_count}）"
     else:
         why = "強推奨候補条件未達"
 
@@ -12434,7 +12443,7 @@ def _v305_live_recommendation(result: dict) -> dict:
         "support_count": int(support_count),
         "ticket_count": int(ticket_count),
         "reason": why,
-        "rule": "v314_ev_band",
+        "rule": "v315_ev_cover_ref",
     }
 
 
@@ -12499,7 +12508,11 @@ def _v305_auto_backfill_current_recommendation(db_path: str) -> dict:
                     }
                     for bt, prob, od, _role in tickets
                 ]
-                rec = _v305_live_recommendation({"tickets": rec_tickets})
+                rec = _v305_live_recommendation({
+                    "tickets": rec_tickets,
+                    "cover": float(cover or 0.0),
+                    "adjusted_return_rate": float(model_rr or 0.0) * float(factor or 1.0),
+                })
 
                 hole_count = sum(
                     1 for _bt, _prob, _od, role in tickets
@@ -12695,7 +12708,8 @@ def _v305_clone_ver304_plan_as_rec_only(db_path: str, race_key: str) -> dict:
             rec=_v305_live_recommendation({"tickets":[
                 {"type":str(r['bet_type'] or ''),"probability":float(r['probability'] or 0),"odds":float(r['odds'] or 0)}
                 for r in trows
-            ]})
+            ], "cover": float(src.get('cover') or 0) if src else 0.0,
+               "adjusted_return_rate": float(src.get('model_return_rate') or 0) if src else 0.0})
 
             src_audit=con.execute("""
                 SELECT adjusted_return_rate,cover,hole_count
@@ -15628,7 +15642,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             if int(_fix305.get("plans",0) or 0)>0:
                 st.caption(
                     f"Ver305比較をVer304土台固定へ補正済み：{_fix305.get('plans',0)}R。"
-                    "基礎予測・6周展開・買い目はVer304系と同一、推奨判定はVer314（EV帯1.0-2.0・点数≤10）です。"
+                    "基礎予測・6周展開・買い目はVer304系と同一、推奨判定はVer315（EV帯1.0-2.0・点数≤10・カバー≤45・参考回収率<45）です。"
                 )
     except Exception as _exc305fix:
         st.caption(f"Ver305比較固定の自動補正をスキップ: {type(_exc305fix).__name__}")
