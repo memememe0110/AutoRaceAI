@@ -12578,6 +12578,172 @@ def _v305_auto_backfill_current_recommendation(db_path: str) -> dict:
     }
 
 
+def _v315_relabel_hash(race_key: str, source_plan_hash: str) -> str:
+    raw = f"Ver315-relabel|{race_key}|{source_plan_hash}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _v315_promote_ver314_without_resim(db_path: str) -> dict:
+    """Ver314の保存済み買い目・実績をコピーし、推奨だけVer315基準で付け直す。
+
+    再シミュレーションはしない。Ver314行はそのまま残す。
+    """
+    _v187_ensure_mixed_learning_tables(db_path)
+    src_ver = "Ver314"
+    dst_ver = str(APP_VERSION or "Ver315")
+    calibration = _v195_return_calibration(db_path)
+    factor = float(calibration.get("factor", 1.0) or 1.0)
+    out = {"copied": 0, "skipped": 0, "errors": [], "recommended": 0, "target_version": dst_ver}
+    now = _v228_now_jst_iso()
+
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.row_factory = sqlite3.Row
+        src_rows = con.execute("""
+            SELECT r.*
+              FROM v187_mixed_plan_runs r
+             WHERE COALESCE(r.app_version,'')=?
+               AND COALESCE(r.include_in_live_stats,1)=1
+               AND COALESCE(r.plan_origin,'live') NOT IN
+                   ('current_version_restore','recommendation_relabel')
+             ORDER BY r.created_at
+        """, (src_ver,)).fetchall()
+
+        for src in src_rows:
+            race_key = str(src["race_key"] or "")
+            src_hash = str(src["plan_hash"] or "")
+            if not race_key or not src_hash:
+                out["skipped"] += 1
+                continue
+            dst_hash = _v315_relabel_hash(race_key, src_hash)
+            try:
+                exists = con.execute("""
+                    SELECT 1 FROM v187_mixed_plan_runs
+                     WHERE race_key=? AND plan_hash=?
+                """, (race_key, dst_hash)).fetchone()
+                if exists:
+                    out["skipped"] += 1
+                    continue
+
+                con.execute("""
+                    INSERT INTO v187_mixed_plan_runs (
+                        race_key, plan_hash, points, cost_yen, grade, cover, black, low,
+                        hit_average_multiple, model_expected_multiple, model_return_rate,
+                        role_count, created_at, app_version, logic_version, race_date,
+                        venue, race_no, starter_count, plan_origin,
+                        source_prediction_version, include_in_live_stats
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+                """, (
+                    race_key, dst_hash,
+                    src["points"], src["cost_yen"], src["grade"],
+                    src["cover"], src["black"], src["low"],
+                    src["hit_average_multiple"], src["model_expected_multiple"],
+                    src["model_return_rate"], src["role_count"], now,
+                    dst_ver, src["logic_version"] if "logic_version" in src.keys() else None,
+                    src["race_date"] if "race_date" in src.keys() else None,
+                    src["venue"] if "venue" in src.keys() else None,
+                    src["race_no"] if "race_no" in src.keys() else None,
+                    src["starter_count"] if "starter_count" in src.keys() else None,
+                    "recommendation_relabel", src_ver,
+                ))
+
+                trows = con.execute("""
+                    SELECT bet_type, combination, probability, odds, role
+                      FROM v187_mixed_plan_tickets
+                     WHERE race_key=? AND plan_hash=?
+                """, (race_key, src_hash)).fetchall()
+                for t in trows:
+                    con.execute("""
+                        INSERT OR IGNORE INTO v187_mixed_plan_tickets
+                        (race_key, plan_hash, bet_type, combination, probability, odds, role)
+                        VALUES (?,?,?,?,?,?,?)
+                    """, (race_key, dst_hash, t["bet_type"], t["combination"],
+                          t["probability"], t["odds"], t["role"]))
+
+                fb = con.execute("""
+                    SELECT * FROM v187_mixed_plan_feedback
+                     WHERE race_key=? AND plan_hash=?
+                """, (race_key, src_hash)).fetchone()
+                if fb:
+                    con.execute("""
+                        INSERT OR REPLACE INTO v187_mixed_plan_feedback (
+                            race_key, plan_hash, hit, black_hit, gami_hit,
+                            payout_yen, cost_yen, realized_multiple, return_rate,
+                            winning_types, evaluated_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        race_key, dst_hash, fb["hit"], fb["black_hit"], fb["gami_hit"],
+                        fb["payout_yen"], fb["cost_yen"], fb["realized_multiple"],
+                        fb["return_rate"], fb["winning_types"], fb["evaluated_at"],
+                    ))
+
+                tfb = con.execute("""
+                    SELECT bet_type, combination, hit, payout_yen
+                      FROM v187_mixed_ticket_feedback
+                     WHERE race_key=? AND plan_hash=?
+                """, (race_key, src_hash)).fetchall()
+                for t in tfb:
+                    con.execute("""
+                        INSERT OR IGNORE INTO v187_mixed_ticket_feedback
+                        (race_key, plan_hash, bet_type, combination, hit, payout_yen)
+                        VALUES (?,?,?,?,?,?)
+                    """, (race_key, dst_hash, t["bet_type"], t["combination"],
+                          t["hit"], t["payout_yen"]))
+
+                rec = _v305_live_recommendation({
+                    "tickets": [
+                        {
+                            "type": str(t["bet_type"] or ""),
+                            "probability": float(t["probability"] or 0),
+                            "odds": float(t["odds"] or 0),
+                        }
+                        for t in trows
+                    ],
+                    "cover": float(src["cover"] or 0),
+                    "adjusted_return_rate": float(src["model_return_rate"] or 0) * factor,
+                })
+                if rec.get("recommended"):
+                    out["recommended"] += 1
+                hole_count = sum(
+                    1 for t in trows
+                    if "中穴価値候補" in str(t["role"] or "")
+                )
+                con.execute("""
+                    INSERT INTO v300_recommendation_audit
+                    (race_key, plan_hash, recommendation_label, recommendation_score,
+                     adjusted_return_rate, cover, max_ev, hole_count, reasons_json,
+                     app_version, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(race_key, plan_hash) DO UPDATE SET
+                        recommendation_label=excluded.recommendation_label,
+                        recommendation_score=excluded.recommendation_score,
+                        adjusted_return_rate=excluded.adjusted_return_rate,
+                        cover=excluded.cover, max_ev=excluded.max_ev,
+                        hole_count=excluded.hole_count,
+                        reasons_json=excluded.reasons_json,
+                        app_version=excluded.app_version,
+                        created_at=excluded.created_at
+                """, (
+                    race_key, dst_hash,
+                    str(rec.get("label") or "見送り"),
+                    10 if rec.get("recommended") else (5 if rec.get("candidate") else 0),
+                    float(src["model_return_rate"] or 0) * factor,
+                    float(src["cover"] or 0),
+                    float(rec.get("max_ev", 0) or 0),
+                    int(hole_count),
+                    json.dumps([str(rec.get("reason") or "")], ensure_ascii=False),
+                    dst_ver, now,
+                ))
+                out["copied"] += 1
+            except Exception as exc:
+                out["skipped"] += 1
+                if len(out["errors"]) < 20:
+                    out["errors"].append(f"{race_key}: {type(exc).__name__}: {exc}")
+
+        con.commit()
+    return out
+
+
 def _v305_rec_only_hash(race_key: str, source_plan_hash: str) -> str:
     raw=f"Ver305-rec-only|{race_key}|{source_plan_hash}".encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
@@ -15682,6 +15848,36 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 )
     except Exception as _bf301_exc:
         st.warning("Ver301推奨の自動振り分けに失敗しました: "+_runtime_exception_text(_bf301_exc))
+    st.caption("Ver314の買い目はそのまま、推奨判定だけVer315にするコピーもできます（再シミュレーションなし）。")
+    if st.button(
+        "📎 Ver314実績をVer315としてコピー（再シミュレーションなし）",
+        use_container_width=True,
+        key="v315_promote_ver314_without_resim",
+    ):
+        with st.spinner("Ver314の買い目・収支をコピーし、推奨だけVer315基準で付け直しています…"):
+            _promo315 = _v315_promote_ver314_without_resim(str(db_path))
+        if _promo315.get("errors"):
+            st.warning(
+                f"コピー {_promo315.get('copied',0)}件 / スキップ {_promo315.get('skipped',0)}件 / "
+                f"エラー {len(_promo315['errors'])}件"
+            )
+            with st.expander("エラー詳細", expanded=False):
+                st.code("\n".join(_promo315["errors"][:30]))
+        else:
+            st.success(
+                f"Ver315へ {_promo315.get('copied',0)}件コピーしました。"
+                f"うち◎ {_promo315.get('recommended',0)}件。"
+                "買い目と払戻はVer314と同じです。バージョン絞り込みで Ver315 を選んでください。"
+            )
+        try:
+            if int(_promo315.get("copied", 0) or 0) > 0:
+                _ok315, _msg315 = push_db_to_github(
+                    f"AutoRaceAI: Ver314実績をVer315へ再シムなしコピー {_promo315.get('copied',0)}件"
+                )
+                (st.success if _ok315 else st.warning)(_msg315)
+        except Exception as _push315_exc:
+            st.warning("GitHub保存をスキップ: " + _runtime_exception_text(_push315_exc))
+        st.rerun()
     st.caption("各レース・各バージョンで最後に保存されたプランを、予測時点の買い目のまま別々に集計します。")
     df = _v215_return_dashboard_rows(db_path)
     if df.empty:
