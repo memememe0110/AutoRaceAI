@@ -63,7 +63,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Ver314: 再シミュレーション中のGitHub自動途中保存間隔（レース数）
 # 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
-_V314_AUTOSAVE_EVERY_N = 15
+_V314_AUTOSAVE_EVERY_N = 40
 
 # Ver302: 保存済み事故レースの学習混入を起動時に軽量監査。
 # raw archive / result rows / result races が変わっていなければsignature一致で即終了。
@@ -2473,7 +2473,13 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                     _ok_as, _msg_as = push_db_to_github(
                         f"AutoRaceAI: 再シム途中自動保存 {_done_show}/{_total_show}",
                         _allow_during_resimulation=True,
+                        _lightweight=True,
                     )
+                    try:
+                        import gc as _gc_as
+                        _gc_as.collect()
+                    except Exception:
+                        pass
                     if _ok_as:
                         _last_gh_save_at[0] = int(_done_show)
                         _gh_autosave_log.append({
@@ -17567,7 +17573,7 @@ def _v305_sanitize_remote_for_safe_sync(
         shutil.rmtree(tmp_dir,ignore_errors=True)
 
 
-def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = False) -> tuple[bool, str]:
+def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = False, _lightweight: bool = False) -> tuple[bool, str]:
     # Ver309: バックグラウンド再シミュレーション中はGitHub同期を行わない。
     # ローカルSQLiteへの登録・更新はそのまま継続し、再シミュレーション終了後に
     # まとめて1回だけGitHubへ保存する。これにより待機中の選手履歴登録などが
@@ -17644,7 +17650,11 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
     # manifestが直前保存と同一なら検証済みGitHub正本cacheを利用し、
     # 132MB級の全part再ダウンロードを省略する。
     # manifestが外部更新されていれば自動的に全part読込へ戻る。
-    _remote_chunk_ok284,_remote_bytes284,_remote_chunk_msg284=_v305_remote_db_for_push()
+    # Ver314: 途中自動保存はリモートDB全取得を省略（メモリ節約）
+    if _lightweight:
+        _remote_chunk_ok284, _remote_bytes284, _remote_chunk_msg284 = False, None, "manifestなし"
+    else:
+        _remote_chunk_ok284,_remote_bytes284,_remote_chunk_msg284=_v305_remote_db_for_push()
     _remote_compare_bytes284=_remote_bytes284
     _remote_sanitize_report305={}
     if _remote_chunk_ok284 and _remote_bytes284 is not None:
@@ -20649,6 +20659,324 @@ if selected_main_page == "👤 選手情報登録":
 
     parsed = st.session_state.get("parsed_player_history")
     if isinstance(parsed, pd.DataFrame) and not parsed.empty:
+        st.success(f"{len(parsed)}件を解析しました。先に表を編集してから一括登録してください。")
+        st.caption(
+            "競合チェックより先に、R・レース名・着順などを自由に入力できます。"
+            "登録ボタンを押したタイミングで保存と競合処理を行います。"
+            "同日に複数レースがある場合は、それぞれ別行のまま登録されます。"
+        )
+        edit_cols = [c for c in [
+            "選手名", "開催日", "開催場", "レース", "レース名", "レース種別", "着順",
+            "天候", "走路", "走路温度", "気温", "湿度", "車番", "ハンデ", "距離", "周回数",
+            "人気", "競走T", "試走T", "ST",
+        ] if c in parsed.columns]
+        # 入力優先: フォーム内で編集 → 送信時だけ処理（スマホでも途中再実行しにくい）
+        with st.form(f"player_history_edit_form_{player_version}", clear_on_submit=False):
+            edited = st.data_editor(
+                parsed[edit_cols],
+                use_container_width=True,
+                hide_index=True,
+                height=min(520, 48 + 36 * max(len(parsed), 1)),
+                key=f"player_history_editor_{player_version}",
+                column_config={
+                    "開催場": st.column_config.SelectboxColumn(
+                        "開催場", options=["川口", "伊勢崎", "浜松", "飯塚", "山陽"]
+                    ),
+                    "レース": st.column_config.NumberColumn("R", min_value=1, max_value=12, step=1),
+                    "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=8, step=1),
+                },
+            )
+            save_submitted = st.form_submit_button(
+                "入力内容を一括登録（完了後にGitHubへバックアップ）",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if save_submitted:
+            _pause278 = {}
+            try:
+                # 編集内容を解析結果へ反映
+                work = parsed.copy()
+                for c in edited.columns:
+                    if c in work.columns:
+                        work[c] = edited[c].values
+                    else:
+                        work[c] = edited[c].values
+                st.session_state["parsed_player_history"] = work
+
+                with st.spinner("バックグラウンド処理との調整中…"):
+                    _pause278 = _v278_pause_background_for_foreground(engine.DB_PATH)
+                if _pause278.get("reason") == "timeout_proceed":
+                    st.info(
+                        "再シミュレーションがレース処理中のため、完全停止前に登録を続行します。"
+                    )
+
+                with st.spinner("SQLiteへ一括保存しています…"):
+                    report = engine.v47_save_player_history(work, db_path=engine.DB_PATH)
+
+                changed = int(report.get("changed") or 0)
+                skipped = int(report.get("skipped") or 0)
+                pending_df = report.get("pending")
+                pending_left = int(report.get("pending_count") or 0)
+                pending_saved = 0
+
+                # まだ残る行は、ユーザーが入力した内容のまま追加登録を試す
+                if isinstance(pending_df, pd.DataFrame) and not pending_df.empty:
+                    repaired = pending_df.copy()
+                    if "重複処理" in repaired.columns:
+                        need = repaired["重複処理"].fillna("選択してください").astype(str).isin(
+                            ["", "選択してください", "nan", "None"]
+                        )
+                        # 競合より登録優先: 既定は新規登録
+                        repaired.loc[need, "重複処理"] = "入力したRで新規登録"
+                        repaired["_v58_duplicate_confirmed"] = True
+                    try:
+                        report2 = engine.v131_save_pending_player_history(
+                            repaired, db_path=engine.DB_PATH
+                        )
+                        pending_df = report2.get("pending")
+                        pending_saved = int(
+                            report2.get("verified")
+                            or report2.get("changed")
+                            or report2.get("saved")
+                            or 0
+                        )
+                        pending_left = int(report2.get("pending_count") or 0)
+                        changed += pending_saved
+                    except Exception as _pend_exc:
+                        st.warning(
+                            f"追加登録で一部エラー: {type(_pend_exc).__name__}: {_pend_exc}"
+                        )
+
+                # まだ残る行だけ表に戻して再入力できるようにする
+                if isinstance(pending_df, pd.DataFrame) and not pending_df.empty and pending_left > 0:
+                    st.session_state["parsed_player_history"] = pending_df
+                    st.session_state["pending_player_history"] = pending_df
+                else:
+                    st.session_state["parsed_player_history"] = work
+                    st.session_state.pop("pending_player_history", None)
+
+                text = (
+                    f"読込 {report.get('read', len(work))}件｜追加・更新 {changed}件"
+                    + (f"（追加登録 {pending_saved}件）" if pending_saved else "")
+                    + f"｜重複スキップ {skipped}件"
+                    + f"（数値完全一致 {report.get('exact_duplicate_skipped', 0)}件）"
+                    + f"｜残り {pending_left}件"
+                )
+                if changed:
+                    with st.spinner("GitHubへバックアップしています…"):
+                        ok, msg = push_db_to_github(
+                            f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新"
+                        )
+                    full_text = text + (f"｜{msg}" if msg else "")
+                    level = "success" if ok else "warning"
+                elif pending_left:
+                    full_text = text + "｜残りの行は表に戻してあるので、入力して再度一括登録してください。"
+                    level = "warning"
+                else:
+                    full_text = text + "｜新規登録対象はありませんでした。"
+                    level = "info"
+
+                if report.get("race_context_updated"):
+                    rs = report.get("race_context_refresh", {})
+                    full_text += f"｜レース種別適性 {rs.get('profiles', 0)}件を再分析"
+                elif report.get("race_context_refresh_error"):
+                    full_text += "｜適性再分析エラー: " + str(report.get("race_context_refresh_error"))
+                    if level == "success":
+                        level = "warning"
+
+                _set_sticky_notice("player_register_notice", level, full_text)
+                getattr(st, level, st.info)(full_text)
+                if pending_left:
+                    st.rerun()
+            except Exception as exc:
+                error_message = f"登録エラー: {type(exc).__name__}: {exc}"
+                _set_sticky_notice("player_register_notice", "error", error_message)
+                st.error(error_message)
+                st.exception(exc)
+            finally:
+                _v278_resume_background_after_foreground(engine.DB_PATH, _pause278)
+
+
+if selected_main_page == "🗃️ 登録情報確認":
+    st.subheader("🧾 反妨など事故履歴の一括登録")
+    st.caption("保存済みの元結果本文を走査し、反妨・反則妨害・落車・競走中止・周誤・失格などを選手別履歴へ一括登録します。予測補正にはまだ使用しません。")
+    if st.button("保存済み結果から事故履歴を一括登録", use_container_width=True, key="v280_backfill_incidents"):
+        with st.spinner("保存済みの元結果本文を確認しています…"):
+            st.session_state["v280_backfill_report"]=_v280_backfill_incident_history(engine.DB_PATH)
+    _br=st.session_state.get("v280_backfill_report")
+    if isinstance(_br,dict):
+        if _br.get("fatal"):
+            st.warning(f"一括登録を完了できませんでした：{_br.get('fatal')}")
+        else:
+            st.success(f"確認 {_br.get('対象',0)}R｜事故検出 {_br.get('検出レース',0)}R｜保存 {_br.get('保存件数',0)}件｜エラー {_br.get('エラー',0)}件")
+    st.divider()
+    st.subheader("全結果バックテスト・重み最適化")
+    st.caption("単発レースの結果だけでなく、予測時に保存した特徴と登録済み結果をまとめて比較します。古い約70%で候補を探し、新しい約30%でも悪化しない候補だけを提案します。")
+    candidate_count = st.slider("試す重み候補数", 200, 3000, 800, 100, key="v74_candidate_count")
+    if st.button("🧠 全結果から重みを最適化", use_container_width=True, key="v74_optimize"):
+        with st.spinner("登録済みレースをバックテスト中です…"):
+            st.session_state["v74_optimization"] = engine.v74_optimize_weights(engine.DB_PATH, candidate_count)
+    opt = st.session_state.get("v74_optimization")
+    if opt:
+        if not opt.get("ok"):
+            st.warning(opt.get("message", "最適化できませんでした。"))
+        else:
+            c1,c2,c3=st.columns(3)
+            c1.metric("全レース", opt["race_count"])
+            c2.metric("探索用", opt["train_count"])
+            c3.metric("検証用", opt["validation_count"])
+            st.markdown("#### 重みの提案")
+            st.dataframe(opt["weights"], use_container_width=True, hide_index=True, column_config={
+                "現在":st.column_config.NumberColumn(format="%.4f"),
+                "提案":st.column_config.NumberColumn(format="%.4f"),
+                "変化":st.column_config.NumberColumn(format="%+.4f"),
+            })
+            st.markdown("#### バックテスト比較")
+            st.dataframe(opt["comparison"], use_container_width=True, hide_index=True, column_config={
+                "現在":st.column_config.NumberColumn(format="%.3f"),
+                "提案":st.column_config.NumberColumn(format="%.3f"),
+                "改善方向の差":st.column_config.NumberColumn(format="%+.3f"),
+            })
+            valid_before=opt["before_validation"].get("objective",0) or 0
+            valid_after=opt["proposed_validation"].get("objective",0) or 0
+            if valid_after > valid_before + 1e-6:
+                st.success(f"新しい約30%の検証レースでも総合評価が {valid_before*100:.2f} → {valid_after*100:.2f} に改善しました。")
+            else:
+                st.info("検証レースで明確な改善候補が見つからなかったため、現在値に近い提案です。無理に重みを動かしません。")
+            confirm_apply=st.checkbox("提案重みを適用する", key=f"v74_apply_confirm_{opt.get('optimization_id')}")
+            if st.button("✅ 提案重みを適用", use_container_width=True, disabled=not confirm_apply, key=f"v74_apply_{opt.get('optimization_id')}"):
+                ok,msg=engine.v74_apply_optimized_weights(opt["optimization_id"],engine.DB_PATH)
+                (st.success if ok else st.warning)(msg)
+                if ok:
+                    st.session_state.pop("v74_optimization",None)
+                    st.rerun()
+    # Ver271安定化: 学習テーブルの読込失敗でアプリ全体を落とさない。
+    # DB本体の予測・結果テーブルと、重み学習の補助テーブルは切り離して扱う。
+    try:
+        hist74=engine.v74_optimization_history(engine.DB_PATH,20)
+        if not hist74.empty:
+            with st.expander("過去の最適化履歴", expanded=False):
+                st.dataframe(hist74,use_container_width=True,hide_index=True)
+    except sqlite3.DatabaseError as exc:
+        st.warning(
+            "最適化履歴テーブルを読み込めませんでした。"
+            "予測DB全体が壊れているとは限りません。"
+            f"（{type(exc).__name__}: {exc}）"
+        )
+    except Exception as exc:
+        st.warning(f"最適化履歴の読込をスキップしました: {type(exc).__name__}: {exc}")
+
+    st.divider()
+    st.subheader("学習重み・変更履歴")
+    try:
+        _v270_weights_df=engine.v40_current_weights(engine.DB_PATH)
+        st.dataframe(_v270_weights_df, use_container_width=True, hide_index=True,
+            column_config={"現在の重み":st.column_config.NumberColumn(format="%.4f"),"初期値":st.column_config.NumberColumn(format="%.4f"),"初期値からの差":st.column_config.NumberColumn(format="%+.4f")})
+    except sqlite3.DatabaseError as exc:
+        st.warning(
+            "学習重みテーブルを読み込めないため、この表示だけスキップしました。"
+            f"（{type(exc).__name__}: {exc}）"
+        )
+    except Exception as exc:
+        st.warning(f"学習重み表示をスキップしました: {type(exc).__name__}: {exc}")
+
+    try:
+        history_df=engine.v39_weight_history(engine.DB_PATH,100)
+        if history_df.empty:
+            st.caption("重み変更履歴はまだありません。")
+        else:
+            st.dataframe(history_df,use_container_width=True,hide_index=True)
+    except sqlite3.DatabaseError as exc:
+        st.warning(
+            "重み変更履歴テーブルを読み込めないため、この表示だけスキップしました。"
+            f"（{type(exc).__name__}: {exc}）"
+        )
+    except Exception as exc:
+        st.warning(f"重み変更履歴の表示をスキップしました: {type(exc).__name__}: {exc}")
+    st.subheader("結果登録履歴・取り消し")
+    reg_history = engine.v41_registration_history(engine.DB_PATH, 50)
+    if reg_history.empty:
+        st.caption("v4.1で登録した結果はまだありません。")
+    else:
+        st.dataframe(reg_history, use_container_width=True, hide_index=True)
+        active_rows = reg_history[reg_history["状態"] == "登録中"] if "状態" in reg_history.columns else reg_history
+        if not active_rows.empty:
+            labels = active_rows["レースID"].astype(str).tolist()
+            selected_key = st.selectbox("登録結果をもう一度見る", labels, key="registration_detail_key")
+            if st.button("📖 選択した登録結果を開く", use_container_width=True):
+                st.session_state["opened_registration_key"] = selected_key
+        opened_key = st.session_state.get("opened_registration_key")
+        if opened_key:
+            detail = engine.v41_registration_detail(opened_key, engine.DB_PATH)
+            st.markdown(f"### 登録結果詳細：{opened_key}")
+            if not detail["race"].empty:
+                st.dataframe(detail["race"], use_container_width=True, hide_index=True)
+            st.subheader("着順・タイム")
+            st.dataframe(detail["entries"], use_container_width=True, hide_index=True)
+            if not detail["laps"].empty:
+                st.subheader("周回順位")
+                st.dataframe(detail["laps"], use_container_width=True, hide_index=True)
+            if not detail["payouts"].empty:
+                st.subheader("払戻金")
+                st.dataframe(detail["payouts"], use_container_width=True, hide_index=True)
+            if not detail["feedback"].empty:
+                st.subheader("予測比較・解析保存内容")
+                st.dataframe(detail["feedback"], use_container_width=True, hide_index=True)
+    confirm_undo = st.checkbox("最後の結果登録を取り消すことを確認しました", key="confirm_v41_undo")
+    if st.button("↩ 最後の結果登録を取り消す", use_container_width=True, disabled=not confirm_undo):
+        ok,msg=engine.v41_undo_last_registration(engine.DB_PATH)
+        if ok:
+            push_ok, push_msg = push_db_to_github("AutoRaceAI: 最後の結果登録を取り消し")
+            st.success(msg)
+            (st.success if push_ok else st.warning)(push_msg)
+        else:
+            st.warning(msg)
+
+def _v146_reset_player_input():
+    st.session_state["player_input_version"] = int(st.session_state.get("player_input_version", 0)) + 1
+    for key in ["parsed_player_history", "player_register_notice", "player_registration_lookup"]:
+        st.session_state.pop(key, None)
+    _v163_clear_saved_inputs("v163_saved_player_name", "v163_saved_player_history")
+    st.session_state["player_register_notice"] = {"level":"success", "message":"選手入力だけをリセットしました。"}
+
+if selected_main_page == "👤 選手情報登録":
+    st.subheader("選手情報を登録")
+    _show_sticky_notice("player_register_notice")
+    st.session_state.setdefault("player_input_version", 0)
+    st.button(
+        "🗑️ 選手入力をリセット", use_container_width=True, key="reset_player_input",
+        on_click=_v146_reset_player_input,
+    )
+    player_version = st.session_state["player_input_version"]
+    player_name_key = f"player_name_input_{player_version}"
+    _v163_restore_input(player_name_key, "v163_saved_player_name", "")
+    player_name = st.text_input(
+        "選手名", placeholder="例：横田翔", key=player_name_key,
+        on_change=_v163_save_input,
+        args=(player_name_key, "v163_saved_player_name"),
+    )
+    show_player_registration_status(player_name)
+    player_history_key = f"player_history_text_{player_version}"
+    _v163_restore_input(player_history_key, "v163_saved_player_history", "")
+    history_text = st.text_area(
+        "公式プロフィールの直近履歴を貼り付け",
+        height=520,
+        placeholder="前走\n4\n2026年7月21日\n伊勢崎\n予選\n…",
+        key=player_history_key,
+        on_change=_v163_save_input,
+        args=(player_history_key, "v163_saved_player_history"),
+    )
+
+    if st.button("貼り付け内容を解析", use_container_width=True):
+        if not player_name.strip() or not history_text.strip():
+            st.warning("選手名と履歴を入力してください。")
+        else:
+            parsed = engine.v15_parse_player_history(history_text, player_name=player_name.strip())
+            st.session_state["parsed_player_history"] = parsed
+
+    parsed = st.session_state.get("parsed_player_history")
+    if isinstance(parsed, pd.DataFrame) and not parsed.empty:
         st.success(f"{len(parsed)}件を解析しました。登録前に内容を確認してください。")
         preview_cols = [c for c in [
             "選手名", "開催日", "開催場", "レース", "レース名", "レース種別", "着順", "天候", "走路",
@@ -20686,22 +21014,16 @@ if selected_main_page == "👤 選手情報登録":
                             need = repaired["重複処理"].fillna("選択してください").astype(str).isin(
                                 ["", "選択してください", "nan", "None"]
                             )
-                            # R候補がある衝突行は既定で既存Rへ統合
+                            # Ver314: 同日別レースを消さないため、既定は「入力したRで新規登録」
+                            # （既存Rへ統合はユーザーが明示選択したときのみ）
                             if "保留理由" in repaired.columns:
                                 conflict = repaired["保留理由"].astype(str).str.contains(
                                     "Rが異なります", na=False
                                 )
                             else:
                                 conflict = pd.Series(False, index=repaired.index)
-                            has_cand = False
-                            if "R候補" in repaired.columns:
-                                has_cand = (
-                                    repaired["R候補"].notna()
-                                    & repaired["R候補"].astype(str).str.strip().ne("")
-                                    & repaired["R候補"].astype(str).str.lower().ne("nan")
-                                )
-                            auto_mask = need & conflict & has_cand
-                            repaired.loc[auto_mask, "重複処理"] = "既存Rへ統合"
+                            auto_mask = need & conflict
+                            repaired.loc[auto_mask, "重複処理"] = "入力したRで新規登録"
                             unresolved = conflict & repaired["重複処理"].fillna(
                                 "選択してください"
                             ).astype(str).isin(["", "選択してください", "nan", "None"])
@@ -20774,7 +21096,7 @@ if selected_main_page == "👤 選手情報登録":
         st.caption(
             "上の「DBへ登録」で登録できなかった行だけがここに残ります。"
             "Rや重複処理を入力・選択したうえで、下の一括登録を押してください。"
-            "R候補がある重複は、未選択なら既定で「既存Rへ統合」として扱います。"
+            "Rが異なる重複は、未選択なら既定で「入力したRで新規登録」です（同日別レースを消さないため）。"
         )
         edit_cols = [c for c in ["選手名","開催日","開催場","レース","R候補","重複処理","レース名","着順","車番","走路","ハンデ","試走T","競走T","ST","保留理由"] if c in pending.columns]
         # 不足行の編集はフォーム内に固定する。
@@ -21939,7 +22261,7 @@ if selected_main_page == "🗃️ 登録情報確認":
             st.error(f"登録情報の確認エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
 
-    st.caption("再シミュレーション中は約15レースごとにGitHubへ自動途中保存し、終了後にも最終保存します。通常の履歴登録はローカルDBへそのまま登録されます。\n\nGitHub保存にはStreamlit Secretsの設定が必要です。トークンはコードやGitHubへ直接書かないでください。")
+    st.caption("再シミュレーション中は約40レースごとにGitHubへ軽量自動途中保存し、終了後にも最終保存します。通常の履歴登録はローカルDBへそのまま登録されます。\n\nGitHub保存にはStreamlit Secretsの設定が必要です。トークンはコードやGitHubへ直接書かないでください。")
 
 
 

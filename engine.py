@@ -7374,11 +7374,38 @@ def v15_save_player_history(df, db_path=DB_PATH):
                 # 一致する候補が1件だけなら、タイム欠損を含む取消行も同じ履歴へまとめる。
                 matched = _v48_find_same_race_without_r(candidates, incoming_identity)
                 if matched is None:
+                    # Ver314: 同日・同レース名だけでは統合しない。
+                    # 例: 同日「予選」が2本あると、2本目の着順・タイムが1本目へ上書きされていた。
+                    # レース名一致は「既存側の着順・タイムが欠損している補完」のときだけ使う。
                     race_name_key = _v55_race_name_key(race_name)
                     stable_matches = []
                     for existing in candidates:
-                        existing_name_key = _v55_race_name_key(existing["race_name"] if "race_name" in existing.keys() else None)
+                        existing_name_key = _v55_race_name_key(
+                            existing["race_name"] if "race_name" in existing.keys() else None
+                        )
                         if not race_name_key or existing_name_key != race_name_key:
+                            continue
+                        try:
+                            ex_finish = existing["finish"]
+                        except Exception:
+                            ex_finish = None
+                        try:
+                            ex_trial = existing["trial_time"]
+                        except Exception:
+                            ex_trial = None
+                        try:
+                            ex_rtime = existing["race_time"]
+                        except Exception:
+                            ex_rtime = None
+                        existing_incomplete = (
+                            ex_finish is None
+                            or ex_trial is None
+                            or (isinstance(ex_trial, (int, float)) and float(ex_trial) <= 0)
+                            or ex_rtime is None
+                            or (isinstance(ex_rtime, (int, float)) and float(ex_rtime) <= 0)
+                        )
+                        if not existing_incomplete:
+                            # 既存も完走データなら別レースとして扱う
                             continue
                         stable_matches.append(existing)
                     matched = stable_matches[0] if len(stable_matches) == 1 else None
