@@ -62,8 +62,8 @@ _V284_V252_SEMANTIC_CONTAINMENT = "2026-08-10-v3"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Ver314: 再シミュレーション中のGitHub自動途中保存間隔（レース数）
-# 50R前後は落ちにくい実績があるため、余裕を見て20Rごとに保存する。
-_V314_AUTOSAVE_EVERY_N = 20
+# 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
+_V314_AUTOSAVE_EVERY_N = 15
 
 # Ver302: 保存済み事故レースの学習混入を起動時に軽量監査。
 # raw archive / result rows / result races が変わっていなければsignature一致で即終了。
@@ -2272,8 +2272,14 @@ def _v278_bg_pause_loop(db_path: str, job_id: int) -> None:
         time_module.sleep(0.25)
     _v278_bg_update(db_path, job_id, status="running", message="バックグラウンド再シミュレーションを再開しました。")
 
-def _v278_pause_background_for_foreground(db_path: str, timeout_sec: float = 90.0) -> dict:
-    """DB登録前にバックグラウンド処理をレース境界で止める。"""
+def _v278_pause_background_for_foreground(db_path: str, timeout_sec: float = 180.0) -> dict:
+    """DB登録前にバックグラウンド処理をレース境界で止める。
+
+    Ver314:
+    - 最大180秒まで「paused」を待つ
+    - タイムアウトしても pause 要求は残したまま登録を続行可能にする
+      （再シム側は現在レース終了後に止まる。登録を拒否しない）
+    """
     job=_v278_bg_get_job(db_path)
     if not job or str(job.get("status") or "") not in ("queued","running","pause_requested","paused"):
         return {"paused":False,"job_id":0,"reason":"no_running_job"}
@@ -2288,8 +2294,13 @@ def _v278_pause_background_for_foreground(db_path: str, timeout_sec: float = 90.
         if status in ("completed","cancelled","failed"):
             return {"paused":False,"job_id":job_id,"reason":status}
         time_module.sleep(0.25)
-    # タイムアウト時は無理に同時書込せず、登録側に明示する
-    return {"paused":False,"job_id":job_id,"reason":"timeout"}
+    # タイムアウト: 拒否せず続行。pause要求は有効のまま（次のレース境界で停止）
+    return {
+        "paused": False,
+        "job_id": job_id,
+        "reason": "timeout_proceed",
+        "pause_requested": True,
+    }
 
 def _v278_resume_background_after_foreground(db_path: str, pause_info: dict) -> None:
     try:
@@ -20651,24 +20662,86 @@ if selected_main_page == "👤 選手情報登録":
             try:
                 with st.spinner("バックグラウンド処理とのDB競合を確認しています…"):
                     _pause278=_v278_pause_background_for_foreground(engine.DB_PATH)
-                if _pause278.get("reason")=="timeout":
-                    raise RuntimeError("再シミュレーションの現在レースがまだ処理中です。DB競合防止のため登録を中断しました。少し待ってもう一度登録してください。")
+                if _pause278.get("reason")=="timeout_proceed":
+                    st.info(
+                        "再シミュレーションがレース処理中のため完全停止前に登録を続行します。"
+                        "再シムは現在レース終了後に一時停止します。"
+                    )
                 with st.spinner("① SQLiteへ選手履歴を保存しています…"):
                     report = engine.v47_save_player_history(parsed, db_path=engine.DB_PATH)
-                st.session_state["pending_player_history"] = report["pending"]
-                changed, skipped, pending_count = report["changed"], report["skipped"], report["pending_count"]
+                changed = int(report.get("changed") or 0)
+                skipped = int(report.get("skipped") or 0)
+                pending_df = report.get("pending")
+                pending_count = int(report.get("pending_count") or 0)
+                pending_saved = 0
+                pending_left = pending_count
+
+                # Ver314: 不足行も同じ登録ボタン内で続けて保存する。
+                # R重複で未選択のものは「既存Rへ統合」を既定にし、ユーザー選択待ちを減らす。
+                # 本当に補完が必要な行だけ pending に残す。
+                if isinstance(pending_df, pd.DataFrame) and not pending_df.empty:
+                    with st.spinner("①b 不足行を同じ処理で登録しています…"):
+                        repaired = pending_df.copy()
+                        if "重複処理" in repaired.columns:
+                            need = repaired["重複処理"].fillna("選択してください").astype(str).isin(
+                                ["", "選択してください", "nan", "None"]
+                            )
+                            # R候補がある衝突行は既定で既存Rへ統合
+                            if "保留理由" in repaired.columns:
+                                conflict = repaired["保留理由"].astype(str).str.contains(
+                                    "Rが異なります", na=False
+                                )
+                            else:
+                                conflict = pd.Series(False, index=repaired.index)
+                            has_cand = False
+                            if "R候補" in repaired.columns:
+                                has_cand = (
+                                    repaired["R候補"].notna()
+                                    & repaired["R候補"].astype(str).str.strip().ne("")
+                                    & repaired["R候補"].astype(str).str.lower().ne("nan")
+                                )
+                            auto_mask = need & conflict & has_cand
+                            repaired.loc[auto_mask, "重複処理"] = "既存Rへ統合"
+                            unresolved = conflict & repaired["重複処理"].fillna(
+                                "選択してください"
+                            ).astype(str).isin(["", "選択してください", "nan", "None"])
+                            repaired["_v58_duplicate_confirmed"] = ~unresolved
+                        try:
+                            report2 = engine.v131_save_pending_player_history(
+                                repaired, db_path=engine.DB_PATH
+                            )
+                            pending_df = report2.get("pending")
+                            pending_saved = int(
+                                report2.get("verified")
+                                or report2.get("changed")
+                                or report2.get("saved")
+                                or 0
+                            )
+                            pending_left = int(report2.get("pending_count") or 0)
+                            changed += pending_saved
+                        except Exception as _pend_exc:
+                            st.warning(
+                                "不足行の追加登録でエラー: "
+                                + f"{type(_pend_exc).__name__}: {_pend_exc}"
+                            )
+
+                st.session_state["pending_player_history"] = pending_df
                 text = (
-                    f"読込 {report['read']}件｜追加・更新 {changed}件｜"
-                    f"重複処理 {skipped}件（数値完全一致 {report.get('exact_duplicate_skipped', 0)}件）｜"
-                    f"保留 {pending_count}件"
+                    f"読込 {report.get('read', 0)}件｜追加・更新 {changed}件"
+                    + (f"（うち不足行 {pending_saved}件）" if pending_saved else "")
+                    + f"｜重複処理 {skipped}件"
+                    + f"（数値完全一致 {report.get('exact_duplicate_skipped', 0)}件）"
+                    + f"｜残り保留 {pending_left}件"
                 )
                 if changed:
                     with st.spinner("② DB登録完了。GitHubへ高速バックアップしています（DB保存済み）…"):
-                        ok, msg = push_db_to_github(f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新")
+                        ok, msg = push_db_to_github(
+                            f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新"
+                        )
                     full_text = text + (f"｜{msg}" if msg else "")
                     level = "success" if ok else "warning"
-                elif pending_count:
-                    full_text = text + "｜必須項目を補完すると不足行だけ登録できます。"
+                elif pending_left:
+                    full_text = text + "｜手動選択が必要な行だけ下の「入力待ち」に残しています。"
                     level = "warning"
                 else:
                     full_text = text + "｜新規登録対象はありませんでした。"
@@ -20697,8 +20770,12 @@ if selected_main_page == "👤 選手情報登録":
 
     pending = st.session_state.get("pending_player_history")
     if isinstance(pending, pd.DataFrame) and not pending.empty:
-        st.markdown("### ⚠️ R・必須項目の入力待ち")
-        st.caption("R候補は参考表示です。数値が完全一致していてRだけ違う場合は、「既存Rへ統合」または「入力したRで新規登録」を選択してください。Rを空欄のままにすると保留されます。")
+        st.markdown("### ⚠️ 入力が必要な行（残り）")
+        st.caption(
+            "上の「DBへ登録」で登録できなかった行だけがここに残ります。"
+            "Rや重複処理を入力・選択したうえで、下の一括登録を押してください。"
+            "R候補がある重複は、未選択なら既定で「既存Rへ統合」として扱います。"
+        )
         edit_cols = [c for c in ["選手名","開催日","開催場","レース","R候補","重複処理","レース名","着順","車番","走路","ハンデ","試走T","競走T","ST","保留理由"] if c in pending.columns]
         # 不足行の編集はフォーム内に固定する。
         # 文字入力や選択変更だけではアプリ全体を再実行せず、登録ボタンでまとめて送信する。
@@ -20717,7 +20794,7 @@ if selected_main_page == "👤 選手情報登録":
                 },
             )
             save_pending_submitted = st.form_submit_button(
-                "不足行だけ登録", type="primary", use_container_width=True
+                "入力済みを一括登録", type="primary", use_container_width=True
             )
 
         if save_pending_submitted:
@@ -20757,8 +20834,10 @@ if selected_main_page == "👤 選手情報登録":
                         _stage = "バックグラウンド処理の一時停止"
                         pending_status.write("③ 再シミュレーションとのDB競合を避けるため書込タイミングを調整しています")
                         _pending_pause278=_v278_pause_background_for_foreground(engine.DB_PATH)
-                        if _pending_pause278.get("reason")=="timeout":
-                            raise RuntimeError("再シミュレーションの現在レースが処理中のため、DB競合防止で不足行登録を中断しました。")
+                        if _pending_pause278.get("reason")=="timeout_proceed":
+                            st.info(
+                                "再シミュレーションがレース処理中のため完全停止前に不足行登録を続行します。"
+                            )
                         try:
                             _stage = "SQLiteへの保存"
                             pending_status.write("④ SQLiteへ不足行を保存しています")
