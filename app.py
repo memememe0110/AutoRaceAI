@@ -41,7 +41,7 @@ APP_VERSION = "Ver314"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver314"  # Ver314: 推奨ゲートを回収率優先（EV帯1.0-2.0・点数<=10）に変更
+_V231_APP_VERSION = "Ver314"  # Ver314: 推奨EV帯 + 再シム15RごとGitHub自動途中保存
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -60,6 +60,10 @@ _V302_DIVERGED_TABLE_MERGE_FIX = "2026-08-15-v1"
 _V302_WAL_MERGE_CHECKPOINT_FIX = "2026-08-15-v1"
 _V284_V252_SEMANTIC_CONTAINMENT = "2026-08-10-v3"
 _V231_SIMULATION_MODE = SIMULATION_MODE
+
+# Ver314: 再シミュレーション中のGitHub自動途中保存間隔（レース数）
+# 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
+_V314_AUTOSAVE_EVERY_N = 15
 
 # Ver302: 保存済み事故レースの学習混入を起動時に軽量監査。
 # raw archive / result rows / result races が変わっていなければsignature一致で即終了。
@@ -2427,6 +2431,11 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             started_at=_v228_now_jst_iso(),
             message="対象レースを整理しています。"
         )
+        # Ver314: 一定レースごとにGitHubへ自動保存（クラッシュ時の消失を防ぐ）
+        _autosave_every = int(globals().get("_V314_AUTOSAVE_EVERY_N") or 15)
+        _last_gh_save_at = [0]  # list for closure mutability
+        _gh_autosave_log = []
+
         def _progress(done,total,label):
             _done_raw=int(done or 0)
             _total_raw=int(total or 0)
@@ -2435,12 +2444,53 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             if _total_show <= 0:
                 _total_show=int(resume_done_offset or 0)+_total_raw
             _total_show=max(_total_show,_done_show)
+            _msg = f"{_done_show}/{_total_show}｜{str(label or '')}"
+            # 途中自動保存: N件処理ごと（例: 15, 30, 45...）
+            if (
+                _autosave_every > 0
+                and _done_show > 0
+                and (_done_show - int(_last_gh_save_at[0])) >= _autosave_every
+            ):
+                try:
+                    _v278_bg_update(
+                        db_path, job_id,
+                        done_count=_done_show,
+                        total_count=_total_show,
+                        current_label=str(label or ""),
+                        message=_msg + f"｜GitHub自動保存中({_done_show}R)...",
+                    )
+                    _ok_as, _msg_as = push_db_to_github(
+                        f"AutoRaceAI: 再シム途中自動保存 {_done_show}/{_total_show}",
+                        _allow_during_resimulation=True,
+                    )
+                    if _ok_as:
+                        _last_gh_save_at[0] = int(_done_show)
+                        _gh_autosave_log.append({
+                            "at": int(_done_show),
+                            "ok": True,
+                            "message": str(_msg_as or "")[:200],
+                        })
+                        _msg = _msg + f"｜✓自動保存済({_done_show}R)"
+                    else:
+                        _gh_autosave_log.append({
+                            "at": int(_done_show),
+                            "ok": False,
+                            "message": str(_msg_as or "")[:200],
+                        })
+                        _msg = _msg + "｜⚠自動保存失敗(後で再試行)"
+                except Exception as _as_exc:
+                    _gh_autosave_log.append({
+                        "at": int(_done_show),
+                        "ok": False,
+                        "message": f"{type(_as_exc).__name__}: {_as_exc}"[:200],
+                    })
+                    _msg = _msg + "｜⚠自動保存エラー"
             _v278_bg_update(
                 db_path, job_id,
                 done_count=_done_show,
                 total_count=_total_show,
                 current_label=str(label or ""),
-                message=f"{_done_show}/{_total_show}｜{str(label or '')}"
+                message=_msg,
             )
 
         result=_v262_batch_rerun_saved_histories(
@@ -2452,6 +2502,13 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             cancel_cb=lambda: _v278_bg_cancel_requested(db_path,job_id),
             pause_cb=lambda: _v278_bg_pause_loop(db_path,job_id),
         )
+        try:
+            result["github_autosave_count"] = sum(1 for x in _gh_autosave_log if x.get("ok"))
+            result["github_autosave_fail_count"] = sum(1 for x in _gh_autosave_log if not x.get("ok"))
+            result["github_autosave_log"] = list(_gh_autosave_log)
+            result["github_autosave_every_n"] = int(_autosave_every)
+        except Exception:
+            pass
         # Ver284 hotfix: 各レースの最新payloadには監査集計が保存されているため、
         # batch終了時（停止時を含む）に必ず監査3表へ同期する。
         _audit_backfill284=_v284_backfill_transition_audit_from_latest_histories(
@@ -2484,7 +2541,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
         # push_db_to_github()の通常の再シミュレーション中ガードには掛からない。
         try:
             _gh309_ok, _gh309_msg = push_db_to_github(
-                "AutoRaceAI: 再シミュレーション完了後のDB一括保存"
+                "AutoRaceAI: 再シミュレーション完了後のDB最終保存"
             )
             result["github_deferred_save_ok"] = bool(_gh309_ok)
             result["github_deferred_save_message"] = str(_gh309_msg or "")
@@ -21803,7 +21860,7 @@ if selected_main_page == "🗃️ 登録情報確認":
             st.error(f"登録情報の確認エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
 
-    st.caption("再シミュレーション中のGitHub保存は保留し、終了後に更新済みDBをまとめて1回だけ保存します。通常の履歴登録はローカルDBへそのまま登録されます。\n\nGitHub保存にはStreamlit Secretsの設定が必要です。トークンはコードやGitHubへ直接書かないでください。")
+    st.caption("再シミュレーション中は約15レースごとにGitHubへ自動途中保存し、終了後にも最終保存します。通常の履歴登録はローカルDBへそのまま登録されます。\n\nGitHub保存にはStreamlit Secretsの設定が必要です。トークンはコードやGitHubへ直接書かないでください。")
 
 
 
