@@ -8280,6 +8280,49 @@ GENERAL_REMINDER_JST = ZoneInfo("Asia/Tokyo")
 
 
 RESULT_VENUES = ["飯塚", "山陽", "浜松", "川口", "伊勢崎"]
+PREDICTION_VENUES = ["川口", "伊勢崎", "浜松", "山陽", "飯塚"]
+_V315_EVENT_VENUE_MAP = (
+    ("プレミアムカップ", "伊勢崎"),
+    ("共同通信社杯", "伊勢崎"),
+    ("浜松記念", "浜松"),
+    ("Ｇ２浜松記念", "浜松"),
+    ("G2浜松記念", "浜松"),
+    ("川口記念", "川口"),
+    ("飯塚記念", "飯塚"),
+)
+
+
+def _v315_header_before_entries(text: str) -> str:
+    source = str(text or "")
+    parts = re.split(
+        r"(?:選手名\(LG\)|予想印はログイン|予想印\s*車|出走表オッズ結果|着順\s*車番)",
+        source,
+        maxsplit=1,
+    )
+    return parts[0] if parts else source
+
+
+def _v315_detect_prediction_venue(text: str) -> tuple[str, str]:
+    """出走表ヘッダーと開催名から開催場を推定する。選手所属LGは使わない。"""
+    header = _v315_header_before_entries(text)
+    normalized = re.sub(r"[\s　]+", "", header)
+    for token, venue in _V315_EVENT_VENUE_MAP:
+        if token in normalized or token in str(text or ""):
+            return venue, "開催名"
+    venue_patterns = [
+        ("川口", ["川口市営", "川口ナイトレース", "川口ナイター", "川口開催"]),
+        ("伊勢崎", ["伊勢崎市営", "伊勢崎ナイトレース", "伊勢崎ナイター", "伊勢崎開催"]),
+        ("浜松", ["浜松市営", "浜松記念", "浜松開催"]),
+        ("山陽", ["山陽小野田市営", "山陽市営", "山陽ミッドナイト", "山陽開催"]),
+        ("飯塚", ["飯塚市営", "飯塚ミッドナイト", "飯塚開催"]),
+    ]
+    for venue, patterns in venue_patterns:
+        if any(p in normalized for p in patterns):
+            return venue, "タイトル"
+    header_hits = [v for v in PREDICTION_VENUES if v in normalized]
+    if len(header_hits) == 1:
+        return header_hits[0], "タイトル"
+    return "", ""
 
 def _detect_result_venue_from_title(text: str) -> str:
     """結果ページの開催タイトル部分だけから開催場を判定する。
@@ -12024,6 +12067,7 @@ def _v195_return_calibration(db_path: str) -> dict:
                 JOIN v187_mixed_plan_runs r
                   ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
                 WHERE COALESCE(r.include_in_live_stats,1)=1
+              AND COALESCE(r.plan_origin,'live') NOT IN ('current_version_restore','recommendation_relabel')
               AND NOT (COALESCE(r.plan_origin,'live')='current_version_restore' AND COALESCE(NULLIF(r.app_version,''),'Unknown') <> COALESCE(NULLIF(r.source_prediction_version,''),COALESCE(NULLIF(r.app_version,''),'Unknown')))
             """).fetchone()
         n, payout, cost, model_payout = row if row else (0,0,0,0)
@@ -14799,6 +14843,92 @@ def _v305_supersede_plan_after_odds_refresh(
         con.commit()
 
 
+def _v315_parse_combo_cars(combo: str) -> list[str]:
+    s = str(combo or "").strip().replace("→", "-").replace(">", "-").replace("＝", "-")
+    s = s.replace("=", "-")
+    parts = [p for p in re.split(r"[-‐‑–—,、/ ]+", s) if p]
+    cars = []
+    for p in parts:
+        m = re.sub(r"\D+", "", p)
+        if m:
+            cars.append(str(int(m)))
+    return cars
+
+
+def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[str]:
+    """買い目を軸・流し・フォーメーションへ圧縮する。買い目自体は変えない。"""
+    parsed = []
+    for c in combos:
+        cars = _v315_parse_combo_cars(c)
+        if cars:
+            parsed.append(cars)
+    if not parsed:
+        return []
+
+    n = max(len(x) for x in parsed)
+    parsed = [x for x in parsed if len(x) == n]
+    if not parsed:
+        return []
+
+    lines = []
+    if ticket_type in ("三連複", "2連複") and n in (2, 3):
+        cars = sorted({c for row in parsed for c in row}, key=lambda x: int(x))
+        from itertools import combinations
+        full = list(combinations(cars, n))
+        have = {tuple(sorted(row, key=lambda x: int(x))) for row in parsed}
+        if have and len(have) == len(full):
+            lines.append("BOX " + "-".join(cars) + f"（{len(parsed)}点）")
+            return lines
+
+    if n == 3:
+        from collections import defaultdict
+        by12 = defaultdict(list)
+        for a, b, c in parsed:
+            by12[(a, b)].append(c)
+        grouped = []
+        singles = []
+        for (a, b), thirds in sorted(by12.items(), key=lambda x: (-len(x[1]), int(x[0][0]), int(x[0][1]))):
+            thirds = sorted(set(thirds), key=lambda x: int(x))
+            if len(thirds) >= 2:
+                grouped.append(f"{a}-{b}-{''.join(thirds)}")
+            else:
+                singles.append(f"{a}-{b}-{thirds[0]}")
+        lines.extend(grouped)
+        # 1着軸でまとめられる残り
+        leftover = [ _v315_parse_combo_cars(s) for s in singles ]
+        by1 = defaultdict(list)
+        for row in leftover:
+            if len(row) == 3:
+                by1[row[0]].append((row[1], row[2]))
+        used = set()
+        extra = []
+        for a, rest in sorted(by1.items(), key=lambda x: (-len(x[1]), int(x[0]))):
+            if len(rest) >= 2:
+                extra.append(f"{a}軸 " + " / ".join(f"{b}-{c}" for b, c in rest))
+                used.add(a)
+        lines.extend(extra)
+        for a, rest in by1.items():
+            if a not in used:
+                for b, c in rest:
+                    lines.append(f"{a}-{b}-{c}")
+        return lines
+
+    if n == 2:
+        from collections import defaultdict
+        by1 = defaultdict(list)
+        for a, b in parsed:
+            by1[a].append(b)
+        for a, seconds in sorted(by1.items(), key=lambda x: (-len(x[1]), int(x[0]))):
+            seconds = sorted(set(seconds), key=lambda x: int(x))
+            if len(seconds) >= 2:
+                lines.append(f"{a}-{''.join(seconds)}")
+            else:
+                lines.append(f"{a}-{seconds[0]}")
+        return lines
+
+    return [ "-".join(x) for x in parsed ]
+
+
 def show_v184_eight_car_mixed_plan(
     bets: dict, trials: int, meta: dict, odds_maps: dict, race_key: str = "",
     app_version: str | None = None, save_enabled: bool = True,
@@ -15112,7 +15242,7 @@ def show_v184_eight_car_mixed_plan(
     else:
         st.info(result["reason"])
     st.caption(" / ".join(result.get("role_lines", [])))
-    st.markdown("##### 買い目ごとの詳細")
+    st.markdown("##### 買い目まとめ")
     order = ("三連単", "三連複", "2連単", "2連複", "ワイド", "単勝", "複勝")
     for ticket_type in order:
         rows = result["grouped"].get(ticket_type, [])
@@ -15131,7 +15261,11 @@ def show_v184_eight_car_mixed_plan(
             ticket_lines.append(
                 f"{combo}  ({r['odds']:.1f}倍 / モデル{r['probability']:.2f}%{protect_note}{note})"
             )
-        st.code("\n".join(ticket_lines), language=None)
+        summary_lines = _v315_summarize_ticket_combos(ticket_type, combos)
+        if summary_lines:
+            st.code("\n".join(summary_lines), language=None)
+        with st.expander(f"{v205_ticket_display_name(ticket_type)} の点ごと詳細（オッズ）", expanded=False):
+            st.code("\n".join(ticket_lines), language=None)
 
     # Ver296 UI監査表示:
     # 計算済みの値を読むだけ。選定・期待値・確率・保存内容には一切反映しない。
@@ -19212,30 +19346,48 @@ elif selected_main_page == "🏁 予測":
         args=(prediction_text_key, "v163_saved_prediction_text"),
     )
 
-    # 本文から開催場を取得できない場合だけ、予測用の補助入力を表示する。
+    # 開催場はヘッダー／開催名から推定し、選手所属LGは使わない。
+    # 誤判定しやすいので、常に手動選択できるようにする。
     prediction_venue_override = ""
     detected_prediction_venue = ""
+    detected_prediction_venue_src = ""
     if text.strip():
-        try:
-            detected_meta = engine.v15_parse_race_meta(text) or {}
-            detected_prediction_venue = str(detected_meta.get("開催場") or "").strip()
-        except Exception:
-            detected_prediction_venue = ""
+        detected_prediction_venue, detected_prediction_venue_src = _v315_detect_prediction_venue(text)
+        if not detected_prediction_venue:
+            try:
+                detected_meta = engine.v15_parse_race_meta(text) or {}
+                engine_venue = str(detected_meta.get("開催場") or "").strip()
+                # 選手欄の所属LG（遠藤(浜松)など）だけの判定は捨てる
+                header = _v315_header_before_entries(text)
+                if engine_venue and engine_venue in header and f"({engine_venue})" not in header.replace("（", "(").replace("）", ")"):
+                    detected_prediction_venue = engine_venue
+                    detected_prediction_venue_src = "解析"
+            except Exception:
+                pass
 
-        if detected_prediction_venue:
-            st.caption(f"開催場を自動取得: {detected_prediction_venue}")
-        else:
-            prediction_venue_key = f"prediction_venue_override_{prediction_version}"
-            _v163_restore_input(prediction_venue_key, "v163_saved_prediction_venue", "")
-            prediction_venue_override = st.selectbox(
-                "開催場（出走表から取得できないため選択してください）",
-                options=["", "川口", "伊勢崎", "浜松", "山陽", "飯塚"],
-                format_func=lambda value: "選択してください" if value == "" else value,
-                key=prediction_venue_key,
-                on_change=_v163_save_input,
-                args=(prediction_venue_key, "v163_saved_prediction_venue"),
-            )
-            st.caption("選手の所属場は開催場として使いません。実際の開催場を選択してください。")
+    prediction_venue_key = f"prediction_venue_override_{prediction_version}"
+    _v163_restore_input(prediction_venue_key, "v163_saved_prediction_venue", detected_prediction_venue or "")
+    venue_options = ["", "川口", "伊勢崎", "浜松", "山陽", "飯塚"]
+    prediction_venue_override = st.selectbox(
+        "開催場",
+        options=venue_options,
+        format_func=lambda value: (
+            "選択してください" if value == "" else value
+        ),
+        key=prediction_venue_key,
+        on_change=_v163_save_input,
+        args=(prediction_venue_key, "v163_saved_prediction_venue"),
+    )
+    if detected_prediction_venue:
+        st.caption(
+            f"自動判定: {detected_prediction_venue}"
+            + (f"（{detected_prediction_venue_src}）" if detected_prediction_venue_src else "")
+            + "。違う場合は上で選び直してください。選手の所属場は使いません。"
+        )
+    else:
+        st.caption("出走表から開催場を確定できません。上で実際の開催場を選んでください。")
+    if not prediction_venue_override and detected_prediction_venue:
+        prediction_venue_override = detected_prediction_venue
 
     # 出走表の事前解析は入力中に毎回走らせず、確認ボタンを押した時だけ実行する。
     preview_key = hashlib.sha1(text.encode("utf-8")).hexdigest() if text.strip() else ""
