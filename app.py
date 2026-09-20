@@ -14589,7 +14589,10 @@ def v205_ticket_display_name(ticket_type: str) -> str:
 
 
 def v207_build_mixed_formation_sections(result: dict):
-    """回収率重視の最終買い目を、画面最上段で使えるコピー形式へ整形する。"""
+    """回収率重視の最終買い目を、画面最上段で使えるコピー形式へ整形する。
+
+    流し（4-5-36）と、両方の向きがある折り返し（5=7-4 / 4=5）を使う。
+    """
     sections = []
     notes = []
     for ticket_type in ("三連単", "三連複", "2連単", "2連複", "ワイド", "単勝", "複勝"):
@@ -14597,19 +14600,11 @@ def v207_build_mixed_formation_sections(result: dict):
         combos = [str(r.get("combo", "")).strip() for r in rows if str(r.get("combo", "")).strip()]
         if not combos:
             continue
-        if ticket_type in ("ワイド", "単勝", "複勝"):
-            formations = combos
-        else:
-            try:
-                formations = engine.v67_compress_formations(combos, ticket_type)
-                if ticket_type == "三連単":
-                    formations = v203_standard_trifecta_formations(formations, combos)
-            except Exception as exc:
-                formations = []
-                notes.append(f"{v205_ticket_display_name(ticket_type)}: フォーメーション変換に失敗したため個別表記を使用（{exc}）")
-            if not formations:
-                formations = combos
-                notes.append(f"{v205_ticket_display_name(ticket_type)}: 圧縮できない組み合わせは個別表記のまま出力")
+        formations = _v315_summarize_ticket_combos(ticket_type, combos)
+        if not formations:
+            formations = [c.replace("=", "-") for c in combos]
+        if len(formations) == len(combos) and ticket_type in ("三連単", "三連複", "2連単", "2連複"):
+            notes.append(f"{v205_ticket_display_name(ticket_type)}: 流し・折り返しにできない組み合わせは個別表記")
         sections.append(
             f"{v205_ticket_display_name(ticket_type)} {len(combos)}点\n" + "\n".join(str(x) for x in formations)
         )
@@ -14856,12 +14851,19 @@ def _v315_parse_combo_cars(combo: str) -> list[str]:
 
 
 def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[str]:
-    """買い目を軸・流し・フォーメーションへ圧縮する。買い目自体は変えない。"""
+    """買い目を流し・折り返しへ圧縮する。買い目自体は変えない。
+
+    例: 4-5-36（3着流し） / 5=7-4（1・2着折り返し） / 4=5（2連単折り返し）
+    = は両方の向きが実際にあるときだけ使う。
+    """
+    from collections import defaultdict
+    from itertools import combinations
+
     parsed = []
     for c in combos:
         cars = _v315_parse_combo_cars(c)
         if cars:
-            parsed.append(cars)
+            parsed.append(tuple(cars))
     if not parsed:
         return []
 
@@ -14873,60 +14875,141 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
     lines = []
     if ticket_type in ("三連複", "2連複") and n in (2, 3):
         cars = sorted({c for row in parsed for c in row}, key=lambda x: int(x))
-        from itertools import combinations
         full = list(combinations(cars, n))
         have = {tuple(sorted(row, key=lambda x: int(x))) for row in parsed}
         if have and len(have) == len(full):
             lines.append("BOX " + "-".join(cars) + f"（{len(parsed)}点）")
             return lines
 
+    if n == 3 and ticket_type in ("三連単",):
+        unused = set(parsed)
+        thirds_ab = defaultdict(set)
+        for a, b, c in parsed:
+            thirds_ab[(a, b)].add(c)
+
+        fold12 = []
+        seen_pair = set()
+        for a, b in list(thirds_ab):
+            key = tuple(sorted((a, b), key=int))
+            if key in seen_pair:
+                continue
+            common = sorted(thirds_ab[(a, b)] & thirds_ab.get((b, a), set()), key=int)
+            if common:
+                fold12.append((len(common), key[0], key[1], common))
+                seen_pair.add(key)
+        fold12.sort(key=lambda x: (-x[0], int(x[1]), int(x[2])))
+        for _, a, b, thirds in fold12:
+            keep = [t for t in thirds if (a, b, t) in unused and (b, a, t) in unused]
+            if not keep:
+                continue
+            lines.append(f"{a}={b}-{''.join(keep)}")
+            for t in keep:
+                unused.discard((a, b, t))
+                unused.discard((b, a, t))
+
+        fold23_units = []
+        seen23 = set()
+        for a, b, c in list(unused):
+            if (a, c, b) not in unused:
+                continue
+            lo, hi = (b, c) if int(b) <= int(c) else (c, b)
+            key = (a, lo, hi)
+            if key in seen23:
+                continue
+            seen23.add(key)
+            fold23_units.append((a, lo, hi))
+        by_axis = defaultdict(set)
+        for a, lo, hi in fold23_units:
+            by_axis[(a, lo)].add(hi)
+            by_axis[(a, hi)].add(lo)
+        for (a, mid), others in sorted(by_axis.items(), key=lambda x: (-len(x[1]), int(x[0][0]), int(x[0][1]))):
+            keep = []
+            for o in sorted(others, key=int):
+                t1, t2 = (a, mid, o), (a, o, mid)
+                if t1 in unused and t2 in unused:
+                    keep.append(o)
+            if not keep:
+                continue
+            lines.append(f"{a}-{mid}={''.join(keep)}")
+            for o in keep:
+                unused.discard((a, mid, o))
+                unused.discard((a, o, mid))
+
+        by12 = defaultdict(list)
+        for a, b, c in unused:
+            by12[(a, b)].append(c)
+        for (a, b), thirds in sorted(by12.items(), key=lambda x: (-len(x[1]), int(x[0][0]), int(x[0][1]))):
+            thirds = sorted(set(thirds), key=int)
+            if len(thirds) >= 2:
+                lines.append(f"{a}-{b}-{''.join(thirds)}")
+            else:
+                lines.append(f"{a}-{b}-{thirds[0]}")
+        return lines
+
     if n == 3:
-        from collections import defaultdict
         by12 = defaultdict(list)
         for a, b, c in parsed:
             by12[(a, b)].append(c)
-        grouped = []
-        singles = []
         for (a, b), thirds in sorted(by12.items(), key=lambda x: (-len(x[1]), int(x[0][0]), int(x[0][1]))):
-            thirds = sorted(set(thirds), key=lambda x: int(x))
+            thirds = sorted(set(thirds), key=int)
             if len(thirds) >= 2:
-                grouped.append(f"{a}-{b}-{''.join(thirds)}")
+                lines.append(f"{a}-{b}-{''.join(thirds)}")
             else:
-                singles.append(f"{a}-{b}-{thirds[0]}")
-        lines.extend(grouped)
-        # 1着軸でまとめられる残り
-        leftover = [ _v315_parse_combo_cars(s) for s in singles ]
-        by1 = defaultdict(list)
-        for row in leftover:
-            if len(row) == 3:
-                by1[row[0]].append((row[1], row[2]))
-        used = set()
-        extra = []
-        for a, rest in sorted(by1.items(), key=lambda x: (-len(x[1]), int(x[0]))):
-            if len(rest) >= 2:
-                extra.append(f"{a}軸 " + " / ".join(f"{b}-{c}" for b, c in rest))
-                used.add(a)
-        lines.extend(extra)
-        for a, rest in by1.items():
-            if a not in used:
-                for b, c in rest:
-                    lines.append(f"{a}-{b}-{c}")
+                lines.append(f"{a}-{b}-{thirds[0]}")
         return lines
 
     if n == 2:
-        from collections import defaultdict
+        if ticket_type in ("2連複", "ワイド"):
+            pairs = [tuple(sorted(row, key=lambda x: int(x))) for row in parsed]
+            by_car = defaultdict(list)
+            for a, b in pairs:
+                by_car[a].append(b)
+                by_car[b].append(a)
+            used = set()
+            for axis, partners in sorted(by_car.items(), key=lambda x: (-len(set(x[1])), int(x[0]))):
+                partners = sorted(
+                    {p for p in partners if tuple(sorted((axis, p), key=int)) not in used},
+                    key=int,
+                )
+                if len(partners) >= 2:
+                    lines.append(f"{axis}-{''.join(partners)}")
+                    for p in partners:
+                        used.add(tuple(sorted((axis, p), key=int)))
+            for a, b in pairs:
+                key = tuple(sorted((a, b), key=int))
+                if key not in used:
+                    lines.append(f"{a}-{b}")
+                    used.add(key)
+            return lines
+
+        unused = set(parsed)
+        fold_pairs = []
+        seen = set()
+        for a, b in list(unused):
+            key = tuple(sorted((a, b), key=int))
+            if key in seen:
+                continue
+            seen.add(key)
+            if (b, a) in unused and (a, b) in unused:
+                fold_pairs.append(key)
+        fold_pairs.sort(key=lambda x: (int(x[0]), int(x[1])))
+        for a, b in fold_pairs:
+            if (a, b) in unused and (b, a) in unused:
+                lines.append(f"{a}={b}")
+                unused.discard((a, b))
+                unused.discard((b, a))
         by1 = defaultdict(list)
-        for a, b in parsed:
+        for a, b in unused:
             by1[a].append(b)
         for a, seconds in sorted(by1.items(), key=lambda x: (-len(x[1]), int(x[0]))):
-            seconds = sorted(set(seconds), key=lambda x: int(x))
+            seconds = sorted(set(seconds), key=int)
             if len(seconds) >= 2:
                 lines.append(f"{a}-{''.join(seconds)}")
             else:
                 lines.append(f"{a}-{seconds[0]}")
         return lines
 
-    return [ "-".join(x) for x in parsed ]
+    return ["-".join(x) for x in parsed]
 
 
 def show_v184_eight_car_mixed_plan(
@@ -21048,8 +21131,9 @@ if selected_main_page == "👤 選手情報登録":
                     "着順": st.column_config.NumberColumn("着順", min_value=1, max_value=8, step=1),
                 },
             )
+            st.caption("GitHubバックアップは毎回しません。何人か登録してから下のボタンでまとめて保存できます。")
             save_submitted = st.form_submit_button(
-                "入力内容を一括登録（完了後にGitHubへバックアップ）",
+                "入力内容を一括登録（ローカルDBのみ）",
                 type="primary",
                 use_container_width=True,
             )
@@ -21126,12 +21210,15 @@ if selected_main_page == "👤 選手情報登録":
                     + f"｜残り {pending_left}件"
                 )
                 if changed:
-                    with st.spinner("GitHubへバックアップしています…"):
-                        ok, msg = push_db_to_github(
-                            f"AutoRaceAI: {player_name.strip()} の履歴を{changed}件追加・更新"
-                        )
-                    full_text = text + (f"｜{msg}" if msg else "")
-                    level = "success" if ok else "warning"
+                    st.session_state["_v315_player_unsaved_github"] = int(
+                        st.session_state.get("_v315_player_unsaved_github", 0) or 0
+                    ) + changed
+                    full_text = (
+                        text
+                        + "｜ローカルDBへ保存済み。"
+                        + "GitHubは選手をまとめて登録してから、下のボタンかサイドバーの『現在のDBをGitHubへ保存』で一度だけバックアップしてください。"
+                    )
+                    level = "success"
                 elif pending_left:
                     full_text = text + "｜残りの行は表に戻してあるので、入力して再度一括登録してください。"
                     level = "warning"
@@ -21158,6 +21245,24 @@ if selected_main_page == "👤 選手情報登録":
                 st.exception(exc)
             finally:
                 _v278_resume_background_after_foreground(engine.DB_PATH, _pause278)
+
+    _unsaved315 = int(st.session_state.get("_v315_player_unsaved_github", 0) or 0)
+    if _unsaved315 > 0:
+        st.warning(f"GitHub未バックアップの選手履歴が {_unsaved315}件あります。まとめて保存できます。")
+    if st.button(
+        "📦 選手履歴をGitHubへまとめてバックアップ",
+        use_container_width=True,
+        key="v315_player_history_github_backup",
+    ):
+        with st.spinner("GitHubへバックアップしています…"):
+            ok, msg = push_db_to_github(
+                f"AutoRaceAI: 選手履歴をまとめてバックアップ（{_unsaved315}件相当）"
+            )
+        if ok:
+            st.session_state["_v315_player_unsaved_github"] = 0
+            st.success(msg)
+        else:
+            st.warning(msg)
 
 
 if selected_main_page == "🗃️ 登録情報確認":
