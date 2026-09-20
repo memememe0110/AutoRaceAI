@@ -62,8 +62,8 @@ _V284_V252_SEMANTIC_CONTAINMENT = "2026-08-10-v3"
 _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Ver314: 再シミュレーション中のGitHub自動途中保存間隔（レース数）
-# 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
-_V314_AUTOSAVE_EVERY_N = 15
+# 50R前後は落ちにくい実績があるため、余裕を見て20Rごとに保存する。
+_V314_AUTOSAVE_EVERY_N = 20
 
 # Ver302: 保存済み事故レースの学習混入を起動時に軽量監査。
 # raw archive / result rows / result races が変わっていなければsignature一致で即終了。
