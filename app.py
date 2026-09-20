@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver313"
+APP_VERSION = "Ver314"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver313"  # Ver313: 200MB超SQLiteアップロード許容・バックアップ復元
+_V231_APP_VERSION = "Ver314"  # Ver314: 推奨ゲートを回収率優先（EV帯1.0-2.0・点数<=10）に変更
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -12264,15 +12264,14 @@ def _safe_ev_multiple(probability_pct, odds):
 
 
 def _v305_live_recommendation(result: dict) -> dict:
-    """Ver305 強推奨判定。
+    """Ver314 強推奨判定（回収率優先）。
 
-    Ver301のEV条件を候補条件として維持しつつ、
-    ◎強推奨は4券種以上の独立した支持がある場合だけに限定する。
+    過去実績（Ver305/Ver313 CSV）から:
+    - 高EV帯・「回収率100%候補」は実績回収が低い（逆指標）
+    - 最大EV 1.0〜2.0 かつ買い目点数≤10 の帯が安定して黒字寄り
 
-    狙い:
-    ・過去数Rの当たり外れへ合わせてEV閾値を細かく最適化しない
-    ・最終プランが複数券種で同じ方向を支持する「安定性」だけを追加
-    ・従来条件は○候補として残し、情報を捨てない
+    Ver301の券種支持条件は○候補の参考として残し、
+    ◎強推奨は回収率重視のEV帯＋点数上限を必須とする。
     """
     tickets = list(result.get("tickets") or [])
     bet_types = {
@@ -12281,6 +12280,7 @@ def _v305_live_recommendation(result: dict) -> dict:
         if str(t.get("type") or "")
     }
     support_count = len(bet_types)
+    ticket_count = len(tickets)
 
     evs = []
     for t in tickets:
@@ -12289,15 +12289,21 @@ def _v305_live_recommendation(result: dict) -> dict:
         evs.append(_safe_ev_multiple(p, od))
     max_ev = max(evs) if evs else 0.0
 
-    # Ver301の候補条件はそのまま。
+    # Ver301の候補条件（参考・○候補用）
     legacy_candidate = (
         (max_ev <= 1.70 and support_count >= 2)
         or
         (1.70 < max_ev <= 2.10 and support_count >= 3)
     )
 
-    # Ver305: ◎だけは4券種以上の一致を必須にする。
-    strong = bool(legacy_candidate and support_count >= 4)
+    # Ver314: ◎は回収率実績がまとまっていた帯だけ
+    # EV 1.0〜2.0 / 点数(買い目数) 1〜10
+    V314_EV_MIN = 1.0
+    V314_EV_MAX = 2.0
+    V314_MAX_TICKETS = 10
+    in_ev_band = (V314_EV_MIN <= max_ev <= V314_EV_MAX)
+    tickets_ok = (1 <= ticket_count <= V314_MAX_TICKETS)
+    strong = bool(in_ev_band and tickets_ok)
 
     if strong:
         return {
@@ -12307,13 +12313,16 @@ def _v305_live_recommendation(result: dict) -> dict:
             "icon": "🔥",
             "max_ev": float(max_ev),
             "support_count": int(support_count),
+            "ticket_count": int(ticket_count),
             "reason": (
-                f"最大EV {max_ev:.2f} / {support_count}券種支持。"
-                "Ver301候補条件＋4券種以上の安定性条件を通過"
+                f"Ver314: 最大EV {max_ev:.2f}（{V314_EV_MIN:.1f}〜{V314_EV_MAX:.1f}）"
+                f" / 点数{ticket_count}≦{V314_MAX_TICKETS}。"
+                "回収率優先のEV帯条件を通過"
             ),
+            "rule": "v314_ev_band",
         }
 
-    if legacy_candidate:
+    if legacy_candidate and max_ev <= V314_EV_MAX:
         return {
             "recommended": False,
             "candidate": True,
@@ -12321,18 +12330,24 @@ def _v305_live_recommendation(result: dict) -> dict:
             "icon": "○",
             "max_ev": float(max_ev),
             "support_count": int(support_count),
+            "ticket_count": int(ticket_count),
             "reason": (
-                f"Ver301候補条件は通過（最大EV {max_ev:.2f} / {support_count}券種支持）"
-                "だが、◎に必要な4券種支持には未達"
+                f"Ver301候補条件は通過（最大EV {max_ev:.2f} / {support_count}券種）"
+                f"だが、Ver314の◎条件（EV帯+点数≦{V314_MAX_TICKETS}）には未達"
             ),
+            "rule": "v314_ev_band",
         }
 
-    if max_ev > 2.10:
-        why = f"最大EV {max_ev:.2f} > 2.10"
-    elif max_ev <= 1.70 and support_count < 2:
-        why = f"最大EVは{max_ev:.2f}だが券種支持が{support_count}"
-    elif 1.70 < max_ev <= 2.10 and support_count < 3:
-        why = f"最大EV {max_ev:.2f}に対して券種支持が{support_count}"
+    if max_ev > V314_EV_MAX:
+        why = f"最大EV {max_ev:.2f} > {V314_EV_MAX:.1f}（高EVは実績回収が低いため除外）"
+    elif max_ev < V314_EV_MIN and ticket_count > 0:
+        why = f"最大EV {max_ev:.2f} < {V314_EV_MIN:.1f}"
+    elif ticket_count > V314_MAX_TICKETS:
+        why = f"点数{ticket_count} > {V314_MAX_TICKETS}"
+    elif ticket_count <= 0:
+        why = "買い目なし"
+    elif legacy_candidate:
+        why = f"Ver301候補だが点数またはEV帯がVer314条件外（点数{ticket_count}）"
     else:
         why = "強推奨候補条件未達"
 
@@ -12343,7 +12358,9 @@ def _v305_live_recommendation(result: dict) -> dict:
         "icon": "—",
         "max_ev": float(max_ev),
         "support_count": int(support_count),
+        "ticket_count": int(ticket_count),
         "reason": why,
+        "rule": "v314_ev_band",
     }
 
 
@@ -15537,14 +15554,14 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             if int(_fix305.get("plans",0) or 0)>0:
                 st.caption(
                     f"Ver305比較をVer304土台固定へ補正済み：{_fix305.get('plans',0)}R。"
-                    "基礎予測・6周展開・買い目はVer304と同一、推奨判定だけVer305です。"
+                    "基礎予測・6周展開・買い目はVer304系と同一、推奨判定はVer314（EV帯1.0-2.0・点数≤10）です。"
                 )
     except Exception as _exc305fix:
         st.caption(f"Ver305比較固定の自動補正をスキップ: {type(_exc305fix).__name__}")
     st.caption(
         f"{str(APP_VERSION or _V231_APP_VERSION)}の◎強推奨は、"
-        "Ver301のEV候補条件に加えて4券種以上の支持一致を必須化。"
-        "従来条件だけのものは○候補として分離します。"
+        "最大EV 1.0〜2.0 かつ買い目点数≤10（回収率優先）。"
+        "高EV帯は実績が弱いため推奨から除外し、従来Ver301条件は○候補として残します。"
     )
     st.caption("✅ Ver302 集計修正3適用済み：復元実績は元予測Verへ統一")
     try:
