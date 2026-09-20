@@ -14603,7 +14603,11 @@ def v207_build_mixed_formation_sections(result: dict):
         formations = _v315_summarize_ticket_combos(ticket_type, combos)
         if not formations:
             formations = [c.replace("=", "-") for c in combos]
-        if len(formations) == len(combos) and ticket_type in ("三連単", "三連複", "2連単", "2連複"):
+        if (
+            len(combos) >= 3
+            and len(formations) == len(combos)
+            and ticket_type in ("三連単", "三連複", "2連単")
+        ):
             notes.append(f"{v205_ticket_display_name(ticket_type)}: 流し・折り返しにできない組み合わせは個別表記")
         sections.append(
             f"{v205_ticket_display_name(ticket_type)} {len(combos)}点\n" + "\n".join(str(x) for x in formations)
@@ -14857,7 +14861,7 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
     = は両方の向きが実際にあるときだけ使う。
     """
     from collections import defaultdict
-    from itertools import combinations
+    from itertools import combinations, permutations
 
     parsed = []
     for c in combos:
@@ -14873,16 +14877,22 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
         return []
 
     lines = []
-    if ticket_type in ("三連複", "2連複") and n in (2, 3):
-        cars = sorted({c for row in parsed for c in row}, key=lambda x: int(x))
-        full = list(combinations(cars, n))
-        have = {tuple(sorted(row, key=lambda x: int(x))) for row in parsed}
-        if have and len(have) == len(full):
-            lines.append("BOX " + "-".join(cars) + f"（{len(parsed)}点）")
-            return lines
-
     if n == 3 and ticket_type in ("三連単",):
         unused = set(parsed)
+        cars_all = sorted({c for row in parsed for c in row}, key=int)
+        box_cands = []
+        for trio in combinations(cars_all, 3):
+            perms = set(permutations(trio, 3))
+            if perms.issubset(unused):
+                box_cands.append((trio, perms))
+        box_cands.sort(key=lambda x: -len(x[1]))
+        for trio, perms in box_cands:
+            if not perms.issubset(unused):
+                continue
+            lines.append("".join(trio) + "BOX")
+            unused -= perms
+        if not unused:
+            return lines
         thirds_ab = defaultdict(set)
         for a, b, c in parsed:
             thirds_ab[(a, b)].add(c)
