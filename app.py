@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver315"
+APP_VERSION = "Ver317"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver315"  # Ver315: 推奨にカバー<=45・参考回収率<45を追加
+_V231_APP_VERSION = "Ver317"  # Ver317: 同ハンデは早め決着（前残り+早仕掛け）。波乱は潰しすぎない。湿/良の時間補正分離と壁の日付カットは継続。
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -1110,12 +1110,13 @@ def _v248_logit(p: float) -> float:
     p = max(1e-5, min(1.0 - 1e-5, float(p)))
     return float(np.log(p / (1.0 - p)))
 
-def _v248_wall_calibration(db_path: str | None = None) -> dict:
+def _v248_wall_calibration(db_path: str | None = None, cutoff_date: str = "") -> dict:
     path = str(db_path or _v230_db_path())
+    cutoff = str(cutoff_date or "").strip()[:10]
     try:
-        stamp = (path, int(Path(path).stat().st_mtime_ns))
+        stamp = (path, int(Path(path).stat().st_mtime_ns), cutoff)
     except Exception:
-        stamp = (path, 0)
+        stamp = (path, 0, cutoff)
     if stamp in _V248_WALL_CALIBRATION_CACHE:
         return dict(_V248_WALL_CALIBRATION_CACHE[stamp])
     result = {
@@ -1161,6 +1162,8 @@ def _v248_wall_calibration(db_path: str | None = None) -> dict:
             _V248_WALL_CALIBRATION_CACHE.clear(); _V248_WALL_CALIBRATION_CACHE[stamp] = dict(result); return result
         data = data.merge(races, on="race_key", how="inner")
         data["race_date"] = pd.to_datetime(data["race_date"], errors="coerce")
+        if cutoff:
+            data = data[data["race_date"] < pd.Timestamp(cutoff)].copy()
         data = data.sort_values(["race_date", "race_no", "race_key", "lap"])
         race_order = data[["race_key", "race_date", "race_no"]].drop_duplicates().sort_values(["race_date", "race_no", "race_key"])
         if len(race_order) < 40 or len(data) < 1200:
@@ -5260,14 +5263,20 @@ def _v264_blended_scenario_prior(empirical, feedback):
 
 # Ver265: 予測タイムの土台を、過去の「競走T－試走T」実測残差で校正する。
 # 同日以降は使わず、開催場→選手→ハンデ帯の順で縮小して過学習を抑える。
-def _v265_time_residual_calibration(db_path: str | None, venue: str = "", cutoff_date: str = "") -> dict:
-    empty={"enabled":False,"venue":str(venue or ""),"samples":0,"player_expected":{},"handicap_expected":{},"venue_expected":None,"global_expected":None}
+def _v316_surface_is_wet(value) -> bool:
+    s=str(value or "")
+    return ("湿" in s) or ("雨" in s) or (s.lower() in ("wet","rain"))
+
+
+def _v265_time_residual_calibration(db_path: str | None, venue: str = "", cutoff_date: str = "", surface: str = "") -> dict:
+    empty={"enabled":False,"venue":str(venue or ""),"samples":0,"player_expected":{},"handicap_expected":{},"venue_expected":None,"global_expected":None,
+           "surface_mode":"dry","wet_excluded":0}
     if not db_path or not os.path.exists(str(db_path)):
         return empty
     try:
         with sqlite3.connect(str(db_path)) as con:
             q='''
-                SELECT h.race_date,h.venue,h.handicap,h.trial_time,h.race_time,p.player_name
+                SELECT h.race_date,h.venue,h.handicap,h.trial_time,h.race_time,p.player_name,h.surface
                 FROM race_history h
                 LEFT JOIN players p ON p.player_id=h.player_id
                 WHERE COALESCE(h.use_for_model,1)=1
@@ -5282,9 +5291,18 @@ def _v265_time_residual_calibration(db_path: str | None, venue: str = "", cutoff
             rows=con.execute(q,params).fetchall()
     except Exception as e:
         out=dict(empty); out['error']=str(e); return out
+    want_wet=_v316_surface_is_wet(surface)
     vals=[]
-    for rd,v,h,tt,rt,nm in rows:
+    wet_excluded=0
+    for row in rows:
         try:
+            rd,v,h,tt,rt,nm=row[:6]
+            surf=row[6] if len(row)>6 else ""
+            is_wet=_v316_surface_is_wet(surf)
+            if want_wet != is_wet:
+                if (not want_wet) and is_wet:
+                    wet_excluded += 1
+                continue
             d=float(rt)-float(tt)
             if not (0.015 <= d <= 0.220):
                 continue
@@ -5295,7 +5313,9 @@ def _v265_time_residual_calibration(db_path: str | None, venue: str = "", cutoff
         except Exception:
             continue
     if len(vals)<20:
-        out=dict(empty); out['samples']=len(vals); return out
+        out=dict(empty); out['samples']=len(vals); out['wet_excluded']=wet_excluded
+        out['surface_mode']='wet' if want_wet else 'dry'
+        return out
     import statistics
     all_d=[x[3] for x in vals]
     global_med=float(statistics.median(all_d))
@@ -5323,7 +5343,8 @@ def _v265_time_residual_calibration(db_path: str | None, venue: str = "", cutoff
     return {"enabled":True,"venue":str(venue or ''),"samples":len(vals),"venue_samples":venue_n,
             "global_expected":global_med,"venue_expected":venue_expected,
             "player_expected":player_expected,"handicap_expected":handicap_expected,
-            "note":"過去日の通常結果のみ。競走T−試走Tを中央値＋縮小で校正。"}
+            "surface_mode":"wet" if want_wet else "dry","wet_excluded":int(wet_excluded),
+            "note":"過去日の通常結果のみ。良/湿を分けて競走T−試走Tを中央値＋縮小で校正。"}
 
 
 def _v265_time_adjustment_seconds(cal: dict, player_name: str, handicap_value: float, current_trial: float, current_pred: float) -> tuple[float,float,int]:
@@ -6276,6 +6297,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         strength[c]=0.30*np.log(base+0.040)+bonus-(tt-3.40)*_trial_weight280
         raw=np.mean([_v230_num(r.get(k),0.0) for k in ("混戦突破適性","展開適性点","実戦能力点") if k in r.index] or [0.0])
         breakthrough[c]=raw
+    _hvals316=[int(handicap.get(c,0) or 0) for c in cars]
+    _hspread316=(max(_hvals316)-min(_hvals316)) if _hvals316 else 0
+    _same_h316=bool(_hspread316<=10)
     # 正規化
     vals=np.array(list(strength.values()),dtype=float); mu=float(vals.mean()); sd=float(vals.std() or 1.0)
     # 少数車の小差を標準化だけで巨大差へしない。縮小して上限を設ける。
@@ -6290,6 +6314,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     _trial_mu290=float(_trial_vals290.mean()) if len(_trial_vals290) else 3.40
     _trial_sd290=float(_trial_vals290.std()) if len(_trial_vals290) else 0.02
     if _trial_sd290 < 0.006: _trial_sd290=0.006
+    if _same_h316:
+        _trial_sd290=max(_trial_sd290,0.020)
     _st_vals290=np.array([float(stmean[c]) for c in cars],dtype=float)
     _st_mu290=float(_st_vals290.mean()) if len(_st_vals290) else 0.16
     _st_sd290=float(_st_vals290.std()) if len(_st_vals290) else 0.03
@@ -6312,6 +6338,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             -1.6,1.6
         ))
     venue=str((meta or {}).get("開催場") or (meta or {}).get("venue") or "")
+    race_date=str((meta or {}).get("開催日") or (meta or {}).get("race_date") or "")[:10]
+    race_surface=str((meta or {}).get("走路") or (meta or {}).get("走路状況") or (meta or {}).get("surface") or (meta or {}).get("track_condition") or "")
     _v242_prepare_started=time_module.perf_counter()
     profiles=_v230_hist_profiles(venue,names)
     # Ver290: 過去の1周目上げ幅を初速proxyへ小さく追加（当日試走/STが主役）。
@@ -6328,10 +6356,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         ))
     transition_profiles=_v240_transition_profiles(venue,names)
     matchups=_v230_matchup_map(names)
-    wall_calibration=_v248_wall_calibration(_v230_db_path())
+    wall_calibration=_v248_wall_calibration(_v230_db_path(), race_date)
     venue_wall_delta=float((wall_calibration.get("venue_delta") or {}).get(venue,0.0)) if wall_calibration.get("enabled") else 0.0
     lap_wall_delta=wall_calibration.get("lap_delta") or {}
-    race_date=str((meta or {}).get("開催日") or (meta or {}).get("race_date") or "")[:10]
     try:
         _race_no_v292_m=re.search(r"\d+",str((meta or {}).get("R") or (meta or {}).get("レース") or (meta or {}).get("race_no") or ""))
         _race_no_v292=int(_race_no_v292_m.group()) if _race_no_v292_m else 0
@@ -6357,7 +6384,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     player_lap_delta=player_lap_calibration.get("player_delta") or {}
     player_actual_calibration=_v258_player_actual_lap_calibration(_v230_db_path(), venue, race_date)
     player_actual_delta=player_actual_calibration.get("player_delta") or {}
-    time_residual_v265=_v265_time_residual_calibration(_v230_db_path(), venue, race_date)
+    time_residual_v265=_v265_time_residual_calibration(_v230_db_path(), venue, race_date, race_surface)
     _race_no_v269 = 0
     try:
         _race_no_raw = str(meta.get("R") or meta.get("レース") or meta.get("レース番号") or meta.get("race_no") or meta.get("race") or "")
@@ -6415,6 +6442,16 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
     scenario_feedback_v264=_v264_feedback_scenario_adjustment(_v230_db_path(), venue, race_date)
     scenario_branch_prior_v264=_v264_blended_scenario_prior(scenario_prior, scenario_feedback_v264)
+    if _same_h316 and isinstance(scenario_branch_prior_v264, dict) and scenario_branch_prior_v264:
+        # 213R公式ノート: 同ハンデG1は前残り8%・早仕掛け39%・波乱36%。
+        # 前残りだけ厚くせず、1〜2周で決まる型を足す。波乱は残す。
+        _boosted316=dict(scenario_branch_prior_v264)
+        _boosted316["前残り型"]=float(_boosted316.get("前残り型",0.0))+0.12
+        _boosted316["早仕掛け型"]=float(_boosted316.get("早仕掛け型",0.0))+0.20
+        _boosted316["後半追込型"]=float(_boosted316.get("後半追込型",0.0))*0.70
+        _boosted316["波乱型"]=float(_boosted316.get("波乱型",0.0))*0.90
+        _z316=sum(float(v) for v in _boosted316.values()) or 1.0
+        scenario_branch_prior_v264={k:float(v)/_z316 for k,v in _boosted316.items()}
     # Ver285: 展開頻度は触らず、同じ展開型で周回内入替がズレた分だけ学習。
     same_scenario_transition_v285=_v285_same_scenario_transition_calibration(
         _v230_db_path(), venue, race_date
@@ -6621,6 +6658,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     front_hold += leader_hold_delta * max(0.25, 1.0 - 0.13*(lap-1))
                 weak_front_bonus=0.34*max(0.0,speed_edge-0.25)
                 late_pressure=0.03*(lap-1)
+                if _same_h316:
+                    late_pressure*=0.45
+                    if i==1:
+                        front_hold += 0.07
                 empirical_pass_delta = venue_wall_delta + float(lap_wall_delta.get(lap, 0.0))
                 # 直前の追い抜き成功は次の壁突破を少し後押しする。ただし毎周減衰させる。
                 chain_bonus=min(0.42, momentum.get(chaser,0.0))
@@ -6683,6 +6724,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     pass
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
+                if _same_h316:
+                    p*=(0.88 if lap==2 else (0.75 if lap>=3 else 1.0))
+                    p=max(0.035,min(0.88,p))
                 # Ver272: Ver271の3～4周目補正を実際の追い抜き確率へ接続。
                 try:
                     _mid_factor272=_mid_factor_cache276.get((chaser,lap),1.0)
@@ -6988,6 +7032,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         "predicted_lap_orders": modal_laps,
         "actual_lap_comparison": lap_comparison,
         "lap_snapshot_save": lap_snapshot_save,
+        "v316_same_handicap_front_hold": {
+            "enabled": bool(_same_h316),
+            "handicap_spread": int(_hspread316),
+            "surface": race_surface,
+            "time_cal_surface": (time_residual_v265 or {}).get("surface_mode"),
+            "wet_excluded_from_dry_cal": (time_residual_v265 or {}).get("wet_excluded"),
+        },
         "scenario_prior_v263": scenario_prior,
         "scenario_feedback_v264": scenario_feedback_v264,
         "scenario_branch_prior_v264": scenario_branch_prior_v264,
@@ -9558,7 +9609,9 @@ def show_v67_self_evaluation(meta: dict) -> None:
         )
         st.caption("★付きの黄色い行が強調対象です。『★ ここまで』が現在の強調境界です。")
 
-        formations = engine.v67_compress_formations(highlighted["組み合わせ"].tolist(), bet_type)
+        formations = _v315_summarize_ticket_combos(bet_type, highlighted["組み合わせ"].tolist())
+        if not formations:
+            formations = engine.v67_compress_formations(highlighted["組み合わせ"].tolist(), bet_type)
         if formations:
             st.markdown("#### 強調範囲のまとめ・一括コピー")
             formation_text = "\n".join(str(line) for line in formations)
@@ -9618,9 +9671,13 @@ def show_v67_self_evaluation(meta: dict) -> None:
                 if cap_enabled:
                     copy_table = copy_table.head(int(cap_points)).copy()
 
-                copy_formations = engine.v67_compress_formations(
-                    copy_table["組み合わせ"].tolist(), copy_bet_type
+                copy_formations = _v315_summarize_ticket_combos(
+                    copy_bet_type, copy_table["組み合わせ"].tolist()
                 )
+                if not copy_formations:
+                    copy_formations = engine.v67_compress_formations(
+                        copy_table["組み合わせ"].tolist(), copy_bet_type
+                    )
                 if not copy_formations:
                     generated_notes.append(f"{copy_bet_type}: フォーメーション作成不可")
                     continue
@@ -14937,6 +14994,14 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
     from collections import defaultdict
     from itertools import combinations, permutations
 
+    ticket_type = {
+        "3連単": "三連単", "三連単": "三連単",
+        "3連複": "三連複", "三連複": "三連複",
+        "2連単": "2連単", "二連単": "2連単",
+        "2連複": "2連複", "二連複": "2連複",
+        "ワイド": "ワイド", "単勝": "単勝", "複勝": "複勝",
+    }.get(str(ticket_type), str(ticket_type))
+
     parsed = []
     for c in combos:
         cars = _v315_parse_combo_cars(c)
@@ -15355,11 +15420,12 @@ def show_v184_eight_car_mixed_plan(
             )
             st.caption("根拠：" + "／".join(item.get("support", [])))
         if residual_copy:
+            residual_lines = _v315_summarize_ticket_combos("三連単", residual_copy) or residual_copy
             v73_copy_box(
                 "余裕がある場合の3連単追加候補",
-                "3連単 追加候補\n" + "\n".join(residual_copy),
+                f"3連単 追加候補 {len(residual_copy)}点\n" + "\n".join(residual_lines),
                 f"v206_residual_trifecta_{race_key}_{saved_hash}",
-                height=max(125, 82 + 27 * len(residual_copy)),
+                height=max(125, 82 + 27 * len(residual_lines)),
             )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("合成的中率", f"{result['cover']:.2f}%")
