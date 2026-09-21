@@ -7132,6 +7132,48 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
         meta_out["予測照合用出走数"] = int(len(out))
     return meta_out, out, sorted(set(added))
 
+
+def _v315_detect_kessha_cars(result_text: str, rows: pd.DataFrame | None = None) -> list[int]:
+    """結果本文と解析表から欠車・発走前除外の車番を取る。"""
+    found: set[int] = set()
+    raw = str(result_text or "")
+    normalized = re.sub(r"[\t\u3000]+", " ", raw)
+    words = r"欠車|発走除外|競走除外|出走取消|出走取り消し"
+    for m in re.finditer(
+        rf"(?:^|\n)\s*[-－]\s*([1-8])\b[\s\S]{{0,280}}?(?:/\s*)?({words})",
+        normalized,
+        flags=re.MULTILINE,
+    ):
+        found.add(int(m.group(1)))
+    for m in re.finditer(rf"\b([1-8])\s*番?[^\n]{{0,80}}(?:/\s*)?({words})", normalized):
+        found.add(int(m.group(1)))
+    if isinstance(rows, pd.DataFrame) and not rows.empty and "車番" in rows.columns:
+        cars = pd.to_numeric(rows["車番"], errors="coerce")
+        status_cols = [c for c in ("事故", "異常", "異", "備考", "事故内容", "着順") if c in rows.columns]
+        for idx, car in cars.items():
+            if pd.isna(car):
+                continue
+            blob = " ".join(str(rows.at[idx, c]) for c in status_cols)
+            if re.search(words, blob):
+                found.add(int(car))
+            finish = rows.at[idx, "着順"] if "着順" in rows.columns else None
+            race_t = rows.at[idx, "競走T"] if "競走T" in rows.columns else None
+            try:
+                finish_s = str(finish).strip()
+            except Exception:
+                finish_s = ""
+            if finish_s in {"-", "－", "欠車", "None", "nan"}:
+                if re.search(words, raw) or (pd.to_numeric(pd.Series([race_t]), errors="coerce").fillna(1).iloc[0] == 0):
+                    found.add(int(car))
+    return sorted(found)
+
+
+def _v315_drop_kessha_rows(rows: pd.DataFrame, kessha: list[int]) -> pd.DataFrame:
+    if not isinstance(rows, pd.DataFrame) or rows.empty or not kessha or "車番" not in rows.columns:
+        return rows
+    cars = pd.to_numeric(rows["車番"], errors="coerce")
+    return rows.loc[~cars.isin(set(int(x) for x in kessha))].copy()
+
 # Ver227: 発走後の事故・反則は、結果と回収率だけ保存し、予測精度・AI学習から除外する。
 def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict, list[dict]]:
     raw = str(result_text or "")
@@ -20578,6 +20620,13 @@ if selected_main_page == "✅ 結果登録・解析":
                 meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(
                     result_text, meta_r, rows_r
                 )
+                extra_kessha = _v315_detect_kessha_cars(result_text, rows_r)
+                nonstarter_numbers = sorted(set(int(x) for x in (nonstarter_numbers or [])) | set(extra_kessha))
+                if nonstarter_numbers:
+                    meta_r = dict(meta_r or {})
+                    meta_r["欠車車番"] = nonstarter_numbers
+                    meta_r["事前除外車番"] = nonstarter_numbers
+                    meta_r["比較対象外車番"] = nonstarter_numbers
                 meta_r, poststart_incidents = _v227_detect_poststart_incidents(result_text, meta_r)
                 st.session_state["v224_nonstarter_numbers"] = nonstarter_numbers
                 st.session_state["v227_poststart_incidents"] = poststart_incidents
@@ -20722,13 +20771,26 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.session_state["v35_result_meta"] = meta_r
                 st.session_state["v227_poststart_incidents"] = poststart_incidents
                 with st.spinner("① SQLiteへ保存 → ② 予測差・展開を解析しています…"):
+                    kessha_nums = _v315_detect_kessha_cars(
+                        result_text,
+                        rows_r,
+                    )
+                    sess_kessha = st.session_state.get("v224_nonstarter_numbers") or []
+                    kessha_nums = sorted(set(int(x) for x in kessha_nums) | set(int(x) for x in sess_kessha))
+                    rows_for_engine = _v315_drop_kessha_rows(rows_r, kessha_nums)
+                    meta_for_engine = dict(meta_r or {})
+                    if kessha_nums:
+                        meta_for_engine["欠車車番"] = kessha_nums
+                        meta_for_engine["事前除外車番"] = kessha_nums
+                        meta_for_engine["比較対象外車番"] = kessha_nums
+                        meta_for_engine["実出走数"] = int(len(rows_for_engine))
                     if replace_registered:
                         key, comparison, analysis, adjustment, registration = engine.v70_replace_registered_result(
-                            meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
+                            meta_for_engine, rows_for_engine, laps_r, payouts_r, engine.DB_PATH
                         )
                     else:
                         key, comparison, analysis, adjustment, registration = engine.v41_register_result(
-                            meta_r, rows_r, laps_r, payouts_r, engine.DB_PATH
+                            meta_for_engine, rows_for_engine, laps_r, payouts_r, engine.DB_PATH
                         )
                     # Ver287: 1Rの結果だけで補正せず、結果登録のたびに登録済み全体を再集計。
                     # 学習対象外レースでは予測補正の再計算を行わない。
