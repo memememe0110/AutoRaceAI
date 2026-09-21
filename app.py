@@ -13531,7 +13531,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 "protected_add_notes": [],
                 "protected_count": 0,
                 "residual_trifecta_candidates": [],
-                "hard_race_info": hard_race_info,
+                "hard_race_info": {"enabled": False},
                 "tri_seed_cover": float(tri_seed_metrics.get("cover", 0.0)),
                 "tri_seed_black": float(tri_seed_metrics.get("black", 0.0)),
                 **evaluate(seed_plan),
