@@ -13504,6 +13504,38 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             snapshots.append((list(plan), evaluate(plan)))
 
     if not snapshots:
+        # 6点合成が作れなくても、三連単土台があればそれを出す（空欄より実買い目を優先）。
+        if plan and len(tri_candidates) >= 2:
+            seed_plan = list(plan) if len(plan) >= 2 else list(tri_candidates[: min(4, len(tri_candidates))])
+            return {
+                "available": True,
+                "grade": "三連単土台のみ",
+                "icon": "⚠️",
+                "reason": (
+                    "4券種の6点合成は黒字改善条件を満たせませんでした。"
+                    f"三連単の上位{len(seed_plan)}点だけ表示します。"
+                ),
+                "multiple_grade": "合成未成立",
+                "tickets": seed_plan,
+                "grouped": {"三連単": list(seed_plan)},
+                "role_lines": [f"三連単{len(seed_plan)}点：合成未成立のため土台のみ"],
+                "learning": learning,
+                "pool_summary": pool_summary,
+                "tri_seed_points": int(len(seed_plan)),
+                "replacement_notes": [],
+                "gami_prune_notes": [],
+                "v259_overlap_prune_notes": [],
+                "v260_refill_notes": [],
+                "low_odds_floor_notes": [],
+                "solo_gami_exclusion_notes": [],
+                "protected_add_notes": [],
+                "protected_count": 0,
+                "residual_trifecta_candidates": [],
+                "hard_race_info": hard_race_info,
+                "tri_seed_cover": float(tri_seed_metrics.get("cover", 0.0)),
+                "tri_seed_black": float(tri_seed_metrics.get("black", 0.0)),
+                **evaluate(seed_plan),
+            }
         return {"available": False, "reason": "役割の異なる券を組み合わせた有効な構成を作れませんでした。"}
 
     # Ver191: 最高評価に近い構成から、黒字的中率と期待倍率を優先して選ぶ。
