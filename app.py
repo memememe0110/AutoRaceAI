@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver318"
+APP_VERSION = "Ver319"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver318"  # Ver318: 同ハンデの早め決着補正を登録済み結果から学習。件数が足りなければVer317の固定値。
+_V231_APP_VERSION = "Ver319"  # Ver319: 壁は予測日前のみ（少件数は過去分で学習）。同ハンデ寄せは外す。時間補正は良/湿分離。
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -1167,10 +1167,34 @@ def _v248_wall_calibration(db_path: str | None = None, cutoff_date: str = "") ->
             data = data[data["race_date"] < pd.Timestamp(cutoff)].copy()
         data = data.sort_values(["race_date", "race_no", "race_key", "lap"])
         race_order = data[["race_key", "race_date", "race_no"]].drop_duplicates().sort_values(["race_date", "race_no", "race_key"])
-        if len(race_order) < 40 or len(data) < 1200:
+        # 日付カット後は件数が減る。未来は使わず、過去が少ないときは検証分割せずに学習する。
+        if len(race_order) < 8 or len(data) < 80:
             result["sample_transitions"] = int(len(data))
-            result["reason"] = "時系列検証に必要な周回履歴が不足"
+            result["reason"] = "予測日前の周回履歴が少なすぎるため固定係数"
             _V248_WALL_CALIBRATION_CACHE.clear(); _V248_WALL_CALIBRATION_CACHE[stamp] = dict(result); return result
+        use_holdout = bool(len(race_order) >= 40 and len(data) >= 1200)
+        if not use_holdout:
+            train = data.copy()
+            gp = float((train["passed"].sum() + 20.0) / (len(train) + 40.0))
+            gl = _v248_logit(gp)
+            def _group_delta_small(col: str, alpha: float) -> dict:
+                agg = train.groupby(col)["passed"].agg(["sum", "count"])
+                out = {}
+                for key, row in agg.iterrows():
+                    p = float((row["sum"] + alpha * gp) / (row["count"] + alpha))
+                    out[key] = float(np.clip(_v248_logit(p) - gl, -0.28, 0.28))
+                return out
+            venue_delta = _group_delta_small("venue", 80.0)
+            lap_delta = _group_delta_small("lap", 100.0)
+            result.update({
+                "enabled": True, "global_logit": gl, "venue_delta": venue_delta,
+                "lap_delta": lap_delta, "sample_transitions": int(len(data)),
+                "validation_transitions": 0, "baseline_logloss": None,
+                "calibrated_logloss": None,
+                "reason": f"予測日前{len(race_order)}R/{int(len(data))}遷移を検証なしで学習（未来は未使用）",
+            })
+            _V248_WALL_CALIBRATION_CACHE.clear(); _V248_WALL_CALIBRATION_CACHE[stamp] = dict(result)
+            return result
         split = max(25, min(len(race_order) - 12, int(round(len(race_order) * 0.70))))
         train_keys = set(race_order.iloc[:split]["race_key"].astype(str))
         valid_keys = set(race_order.iloc[split:]["race_key"].astype(str))
@@ -6441,8 +6465,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     _trial_mu290=float(_trial_vals290.mean()) if len(_trial_vals290) else 3.40
     _trial_sd290=float(_trial_vals290.std()) if len(_trial_vals290) else 0.02
     if _trial_sd290 < 0.006: _trial_sd290=0.006
-    if _same_h316:
-        _trial_sd290=max(_trial_sd290,0.020)
+    # Ver320: 同ハンデの試走偏差かさ上げは通常開催の◎を崩したため無効。
     _st_vals290=np.array([float(stmean[c]) for c in cars],dtype=float)
     _st_mu290=float(_st_vals290.mean()) if len(_st_vals290) else 0.16
     _st_sd290=float(_st_vals290.std()) if len(_st_vals290) else 0.03
@@ -6569,17 +6592,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
     scenario_feedback_v264=_v264_feedback_scenario_adjustment(_v230_db_path(), venue, race_date)
     scenario_branch_prior_v264=_v264_blended_scenario_prior(scenario_prior, scenario_feedback_v264)
-    flow318=_v318_same_handicap_flow_calibration(_v230_db_path(), race_date, race_surface)
-    if _same_h316 and isinstance(scenario_branch_prior_v264, dict) and scenario_branch_prior_v264:
-        _boosted316=dict(scenario_branch_prior_v264)
-        _add318=(flow318.get("prior_add") or {})
-        _scl318=(flow318.get("type_scale") or {})
-        _boosted316["前残り型"]=float(_boosted316.get("前残り型",0.0))+float(_add318.get("前残り型",0.12))
-        _boosted316["早仕掛け型"]=float(_boosted316.get("早仕掛け型",0.0))+float(_add318.get("早仕掛け型",0.20))
-        _boosted316["後半追込型"]=float(_boosted316.get("後半追込型",0.0))*float(_scl318.get("後半追込型",0.70))
-        _boosted316["波乱型"]=float(_boosted316.get("波乱型",0.0))*float(_scl318.get("波乱型",0.90))
-        _z316=sum(float(v) for v in _boosted316.values()) or 1.0
-        scenario_branch_prior_v264={k:float(v)/_z316 for k,v in _boosted316.items()}
+    flow318={"learned":False,"reason":"Ver320: 同ハンデ寄せは通常開催◎を崩したため未適用"}
+    # Ver320: 展開priorの同ハンデ上書きはしない。
     # Ver285: 展開頻度は触らず、同じ展開型で周回内入替がズレた分だけ学習。
     same_scenario_transition_v285=_v285_same_scenario_transition_calibration(
         _v230_db_path(), venue, race_date
@@ -6786,10 +6800,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     front_hold += leader_hold_delta * max(0.25, 1.0 - 0.13*(lap-1))
                 weak_front_bonus=0.34*max(0.0,speed_edge-0.25)
                 late_pressure=0.03*(lap-1)
-                if _same_h316:
-                    late_pressure*=float((flow318 or {}).get("late_pressure_scale",0.45))
-                    if i==1:
-                        front_hold += float((flow318 or {}).get("front_hold_add",0.07))
+                # Ver320: 同ハンデの前残り寄せ（終盤抑制・先頭加算）はしない。
                 empirical_pass_delta = venue_wall_delta + float(lap_wall_delta.get(lap, 0.0))
                 # 直前の追い抜き成功は次の壁突破を少し後押しする。ただし毎周減衰させる。
                 chain_bonus=min(0.42, momentum.get(chaser,0.0))
@@ -6852,12 +6863,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     pass
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
-                if _same_h316:
-                    if lap==2:
-                        p*=float((flow318 or {}).get("pass_lap2",0.88))
-                    elif lap>=3:
-                        p*=float((flow318 or {}).get("pass_lap3",0.75))
-                    p=max(0.035,min(0.88,p))
+                # Ver320: 同ハンデの追い抜き抑制はしない。
                 # Ver272: Ver271の3～4周目補正を実際の追い抜き確率へ接続。
                 try:
                     _mid_factor272=_mid_factor_cache276.get((chaser,lap),1.0)
