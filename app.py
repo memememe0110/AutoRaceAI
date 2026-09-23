@@ -8587,16 +8587,19 @@ def _v319_list_oddspark_meetings(ymd: str) -> list[dict]:
 
 def _v319_list_oddspark_races(ymd: str, place_cd: str) -> list[int]:
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    place_cd = str(place_cd or "").zfill(2)
     nos = set()
-    for url in (
-        f"https://www.oddspark.com/autorace/RaceList.do?raceDy={ymd}&placeCd={place_cd}",
-        f"https://www.oddspark.com/autorace/RaceResult.do?raceDy={ymd}&placeCd={place_cd}",
-    ):
-        try:
-            html = _v319_http_get(url)
-            nos |= {int(x) for x in re.findall(r"raceNo=(\d+)", html) if str(x).isdigit()}
-        except Exception:
-            continue
+    url = f"https://www.oddspark.com/autorace/RaceList.do?raceDy={ymd}&placeCd={place_cd}"
+    try:
+        html = _v319_http_get(url, timeout=12)
+    except Exception:
+        return []
+    for dy, cd, n in re.findall(r"raceDy=(\d+)[^\"']{0,120}placeCd=(\d+)[^\"']{0,80}raceNo=(\d+)", html):
+        if dy == ymd and str(cd).zfill(2) == place_cd and n.isdigit():
+            nos.add(int(n))
+    for cd, dy, n in re.findall(r"placeCd=(\d+)[^\"']{0,120}raceDy=(\d+)[^\"']{0,80}raceNo=(\d+)", html):
+        if dy == ymd and str(cd).zfill(2) == place_cd and n.isdigit():
+            nos.add(int(n))
     return [n for n in sorted(nos) if 1 <= n <= 12]
 
 
@@ -8617,7 +8620,7 @@ def _v319_result_page_alive(ymd: str, venue: str, race_no: int) -> bool:
 
 
 def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[int]:
-    """実在する結果だけ。空の12Rは入れない。"""
+    """RaceListの当日リンクだけ。結果ページは1枚ずつ取りに行かない。"""
     place = _V319_OP_PLACE.get(str(venue) or "")
     found = []
     if place:
@@ -8625,19 +8628,10 @@ def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[in
             found = _v319_list_oddspark_races(ymd, place)
         except Exception:
             found = []
-    last_try = max(found) if found else int(max_races or 12)
-    last_try = min(max(int(last_try), 1), int(max_races or 12))
-    out = []
-    miss = 0
-    for n in range(1, last_try + 1):
-        if _v319_result_page_alive(ymd, venue, n):
-            out.append(n)
-            miss = 0
-        else:
-            miss += 1
-            if out and miss >= 2:
-                break
-    return out
+    found = [n for n in found if 1 <= int(n) <= int(max_races or 12)]
+    if found:
+        return found
+    return list(range(1, min(int(max_races or 12), 9) + 1))
 
 
 def _v319_html_cells(row_html: str) -> list[str]:
