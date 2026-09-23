@@ -9337,6 +9337,54 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
     return pd.DataFrame(hist)
 
 
+def _v319_history_from_results(
+    db_path: str, player_name: str, before_ymd: str, before_venue: str, before_race: int
+) -> pd.DataFrame:
+    key = _v319_norm_player_name(player_name)
+    if not key:
+        return pd.DataFrame()
+    try:
+        with sqlite3.connect(str(db_path), timeout=15) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "result_races" not in tables or "result_entries" not in tables:
+                return pd.DataFrame()
+            rows = con.execute(
+                """
+                SELECT rr.race_date, rr.venue, rr.race_no,
+                       re.finish, re.handicap, re.race_time, re.start_time,
+                       re.player_name
+                FROM result_entries re
+                JOIN result_races rr ON rr.race_key=re.race_key
+                WHERE replace(replace(COALESCE(re.player_name,''),' ',''),'　','')=?
+                """,
+                (key,),
+            ).fetchall()
+    except Exception:
+        return pd.DataFrame()
+    out = []
+    for race_date, venue, race_no, finish, hand, race_t, st, pname in rows:
+        rec = {
+            "選手名": pname or player_name,
+            "開催日": str(race_date or "")[:10],
+            "開催場": venue,
+            "レース": race_no,
+            "レース名": "",
+            "レース種別": "",
+            "着順": finish,
+            "走路": "",
+            "天候": "",
+            "ハンデ": hand or 0,
+            "試走T": "",
+            "競走T": race_t,
+            "ST": st,
+            "事故": "",
+        }
+        if before_ymd and not _v319_hist_row_before(rec, before_ymd, before_venue, before_race):
+            continue
+        out.append(rec)
+    return pd.DataFrame(out)
+
+
 def _v319_hist_row_before(row, ymd: str, venue: str, race_no: int) -> bool:
     ds = _v319_ymd_digits(row.get("開催日") if hasattr(row, "get") else "")
     cur = _v319_ymd_digits(ymd)
@@ -9400,13 +9448,37 @@ def _v319_fill_player_histories(
                         skipped += 1
                         details.append(f"{name}:当該R以前は追加なし")
                     continue
-            if have <= 0:
-                work = df.copy()
-                if "開催日" in work.columns:
-                    work["_ymd"] = work["開催日"].map(_v319_ymd_digits)
-                    work = work.sort_values("_ymd", ascending=False, kind="mergesort")
-                    work = work.drop(columns=["_ymd"])
-                df = work.head(int(min_rows or 30))
+            if have < int(min_rows or 30):
+                extra = _v319_history_from_results(
+                    db_path, name, before_ymd or latest, before_venue, before_race
+                )
+                if extra is not None and not extra.empty:
+                    df = pd.concat([df, extra], ignore_index=True)
+                keep = []
+                seen = set(have_keys)
+                for _, r in df.iterrows():
+                    ds = _v319_ymd_digits(r.get("開催日"))
+                    vn = str(r.get("開催場") or "").replace("　", "").strip()
+                    try:
+                        rn = int(r.get("レース") or 0)
+                    except Exception:
+                        rn = 0
+                    key = (ds, vn, rn)
+                    if not ds or key in seen:
+                        continue
+                    if before_ymd and not _v319_hist_row_before(r, before_ymd, before_venue, before_race):
+                        continue
+                    seen.add(key)
+                    keep.append(r)
+                if not keep:
+                    skipped += 1
+                    details.append(f"{name}:不足だが追加0 既存{have}")
+                    continue
+                work = pd.DataFrame(keep)
+                work["_ymd"] = work["開催日"].map(_v319_ymd_digits)
+                work = work.sort_values("_ymd", ascending=False, kind="mergesort").drop(columns=["_ymd"])
+                need = max(int(min_rows or 30) - have, 0)
+                df = work.head(need if need else len(work))
             elif latest or have_keys:
                 keep = []
                 for _, r in df.iterrows():
@@ -9422,7 +9494,7 @@ def _v319_fill_player_histories(
                         keep.append(r)
                 if keep:
                     df = pd.DataFrame(keep)
-                elif have > 0:
+                else:
                     skipped += 1
                     details.append(f"{name}:最新済{latest or have}")
                     continue
