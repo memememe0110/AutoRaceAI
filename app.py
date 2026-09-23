@@ -8036,14 +8036,33 @@ def _v280_build_result_view_for_prediction(db_path: str, race_key: str, predicti
         car_col = "車" if "車" in p.columns else ("車番" if "車番" in p.columns else None)
         if not car_col:
             return {}
-        p["車番"] = pd.to_numeric(p[car_col], errors="coerce")
+        p["車番"] = pd.to_numeric(p[car_col], errors="coerce").astype("Int64")
+        actual["車番"] = pd.to_numeric(actual["車番"], errors="coerce").astype("Int64")
+        entries = prediction_view.get("entries")
+        if isinstance(entries, pd.DataFrame) and not entries.empty and "車番" in entries.columns:
+            have = set(int(x) for x in p["車番"].dropna().tolist())
+            extra = []
+            for _, r in entries.iterrows():
+                try:
+                    c = int(float(r.get("車番")))
+                except Exception:
+                    continue
+                if c not in have:
+                    extra.append({"車番": c})
+                    have.add(c)
+            if extra:
+                p = pd.concat([p, pd.DataFrame(extra)], ignore_index=True)
         # 保存済み確率から順位を再現。これは再シミュレーションではなく、その履歴の保存値を使う。
-        if "本番1着率" in p.columns:
-            p["predicted_rank"] = pd.to_numeric(p["本番1着率"], errors="coerce").rank(method="first", ascending=False).astype("Int64")
-            p["win_prob"] = pd.to_numeric(p["本番1着率"], errors="coerce")
-        elif "勝率" in p.columns:
-            p["predicted_rank"] = pd.to_numeric(p["勝率"], errors="coerce").rank(method="first", ascending=False).astype("Int64")
-            p["win_prob"] = pd.to_numeric(p["勝率"], errors="coerce")
+        win_s = None
+        for col in ("本番1着率", "勝率", "1着率"):
+            if col in p.columns:
+                win_s = pd.to_numeric(p[col], errors="coerce")
+                if win_s.notna().any():
+                    break
+                win_s = None
+        if win_s is not None:
+            p["win_prob"] = win_s
+            p["predicted_rank"] = win_s.rank(method="first", ascending=False).astype("Int64")
         elif "改善後順位" in p.columns:
             p["predicted_rank"] = pd.to_numeric(p["改善後順位"], errors="coerce").astype("Int64")
         else:
@@ -8873,6 +8892,53 @@ def _v319_save_official_odds(db_path: str, race_key: str, parsed: dict) -> int:
     return int(sum(len(v) for v in (parsed or {}).values())) if sid else 0
 
 
+def _v319_load_latest_prediction_view(db_path: str, race_key: str) -> dict:
+    try:
+        with sqlite3.connect(str(db_path), timeout=15) as con:
+            row = con.execute(
+                "SELECT history_id FROM v231_prediction_history WHERE race_key=? ORDER BY history_id DESC LIMIT 1",
+                (str(race_key),),
+            ).fetchone()
+        if not row:
+            return {}
+        view, *_rest = _v231_load_prediction_history(db_path, int(row[0]))
+        return view if isinstance(view, dict) else {}
+    except Exception:
+        return {}
+
+
+def _v319_apply_odds_and_plan(db_path: str, ymd: str, venue: str, race_no: int, race_key: str, view: dict | None = None) -> dict:
+    """公式オッズを保存し、回収率重視プランを作って結果照合する。"""
+    parsed = _v319_fetch_official_odds(ymd, venue, race_no)
+    n_odds = _v319_save_official_odds(db_path, race_key, parsed)
+    view = view if isinstance(view, dict) and view else _v319_load_latest_prediction_view(db_path, race_key)
+    bets = (view or {}).get("bets")
+    meta = (view or {}).get("meta") or {}
+    trials = int((view or {}).get("trials") or 20000)
+    plan_hash = ""
+    if isinstance(bets, dict) and bets and n_odds:
+        result = v184_eight_car_mixed_plan(bets, trials, meta, parsed)
+        result = v277_provisional_merge_7types(result, bets, trials, parsed)
+        if isinstance(result, dict) and result.get("available"):
+            plan_hash = str(_v187_save_mixed_plan(
+                db_path, str(race_key), result, app_version=APP_VERSION,
+                plan_origin="official_import",
+                source_prediction_version=str((view or {}).get("app_version") or APP_VERSION),
+                include_in_live_stats=True,
+            ) or "")
+            if plan_hash:
+                _v305_supersede_plan_after_odds_refresh(db_path, str(race_key), APP_VERSION, plan_hash)
+                try:
+                    _v212_recalculate_plan_feedback(db_path, str(race_key), plan_hash)
+                except Exception:
+                    pass
+    try:
+        _v187_sync_mixed_feedback(db_path)
+    except Exception:
+        pass
+    return {"odds": n_odds, "plan_hash": plan_hash}
+
+
 def _v319_norm_player_name(name: str) -> str:
     return re.sub(r"[\s　]+", "", str(name or ""))
 
@@ -8907,39 +8973,145 @@ def _v319_parse_sprace_players(html: str) -> list[dict]:
     return out
 
 
+def _v319_td_text(td_html: str) -> str:
+    t = re.sub(r"(?i)<br\s*/?>", "\n", td_html or "")
+    t = re.sub(r"(?is)<[^>]+>", " ", t)
+    t = t.replace("&nbsp;", " ").replace("&amp;", "&")
+    t = re.sub(r"&#(\d+);", lambda mm: chr(int(mm.group(1))), t)
+    t = re.sub(r"[ \t]+", " ", t)
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    return "\n".join(lines)
+
+
+def _v319_parse_sprace_car_rows(html: str) -> list[dict]:
+    rows = []
+    seen = set()
+    for m in re.finditer(
+        r'<td class="stcNameFull[^"]*"[\s\S]*?param="(\d+)"[\s\S]*?playerCd=(\d+)[^>]*>\s*<strong>([^<]+)</strong>\s*\(([^)]+)\)([\s\S]*?)</td>',
+        html,
+    ):
+        car = int(m.group(1))
+        if car in seen:
+            continue
+        seen.add(car)
+        name = re.sub(r"^[◎○▲△×注\s]+", "", m.group(3).strip())
+        lg = m.group(4).strip()
+        name_td = _v319_td_text(m.group(0))
+        age = ""
+        am = re.search(r"(\d+歳/\d+期)", name_td)
+        if am:
+            age = am.group(1)
+        hand, st = "0", ""
+        hm = re.search(r"(\d+)m/ST([\d.]+)", name_td)
+        if hm:
+            hand, st = hm.group(1), hm.group(2)
+        # 同じTR内の後続セル
+        tr_end = html.find("</tr>", m.end())
+        rest = html[m.end(): tr_end if tr_end > m.end() else m.end() + 4000]
+        tds = [_v319_td_text(td) for td in re.findall(r"(?is)<td[^>]*>([\s\S]*?)</td>", rest)]
+        trial = dev = rank = avg_r = best_r = finish10 = rate2 = rate3 = car_name = ""
+        # 短縮名, 試走T/偏差, ランク, V, 良10走, 近10走, 車名
+        if len(tds) >= 2:
+            tm = re.search(r"(3\.\d{2})", tds[1])
+            dm = re.search(r"(0\.\d{2,3})", tds[1])
+            if tm:
+                trial = tm.group(1)
+            if dm:
+                dev = dm.group(1)
+        if len(tds) >= 3:
+            rm = re.search(r"([ABS]-[0-9]+)", tds[2])
+            if rm:
+                rank = rm.group(1)
+        if len(tds) >= 5:
+            am2 = re.search(r"平均競走T\s*([\d.]+)", tds[4])
+            bm = re.search(r"最高競走T\s*([\d.]+)", tds[4])
+            if am2:
+                avg_r = am2.group(1)
+            if bm:
+                best_r = bm.group(1)
+        if len(tds) >= 6:
+            fm = re.search(r"着順\s*([0-9\-]+)", tds[5])
+            r2 = re.search(r"2連\s*([\d.]+)%", tds[5])
+            r3 = re.search(r"3連\s*([\d.]+)%", tds[5])
+            if fm:
+                finish10 = fm.group(1)
+            if r2:
+                rate2 = r2.group(1)
+            if r3:
+                rate3 = r3.group(1)
+        if len(tds) >= 7:
+            first = tds[6].split("\n")[0].strip()
+            if first and not re.fullmatch(r"[\d.]+", first):
+                car_name = first
+        if not trial:
+            tm = re.search(r"試\s*([\d.]+)", name_td + "\n" + "\n".join(tds[:3]))
+            if tm:
+                trial = tm.group(1)
+        rows.append({
+            "car": car, "player_cd": m.group(2), "name": name, "lg": lg, "age": age,
+            "hand": hand, "st": st, "trial": trial, "dev": dev, "rank": rank,
+            "avg_r": avg_r, "best_r": best_r, "finish10": finish10,
+            "rate2": rate2, "rate3": rate3, "car_name": car_name,
+            "name_key": _v319_norm_player_name(name),
+        })
+    return rows
+
+
 def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int, ymd: str) -> str:
     raw = _v319_html_to_text(html)
-    start = raw.find(f"{int(race_no)}R")
-    if start < 0:
-        start = raw.find("確定")
-    body = raw[start:] if start >= 0 else raw
-    cut = body.find("基本情報")
-    if cut > 80:
-        body = body[:cut]
-    # 公式貼付に近い本文を残しつつ、解析しやすい車行も末尾に足す
     dm = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日(?:\([^)]+\))?)", raw)
     date_s = dm.group(1) if dm else f"{ymd[:4]}年{int(ymd[4:6])}月{int(ymd[6:8])}日"
-    cars = _v319_parse_sprace_players(html)
-    extra = [f"{int(race_no)}R", "確定", date_s, str(venue or "")]
+    title_m = re.search(r"(令和[^\n]{4,40})", raw)
+    kind_m = re.search(r"(予選|一般戦|選抜|優勝戦|準決|初日|最終日)[^\n]{0,20}3100m", raw)
+    sm = re.search(r"(良走路|湿走路|斑走路)", raw)
+    tm = re.search(r"/(\d+(?:\.\d+)?)℃", raw)
+    am = re.search(r"気温：\s*([\d.]+)", raw)
+    hm = re.search(r"湿度：\s*([\d.]+)", raw)
+    cars = _v319_parse_sprace_car_rows(html) or _v319_parse_sprace_players(html)
+    ncar = max(len(cars), 1)
+    lines = [
+        f"{int(race_no)}R",
+        "確定",
+        "締切済",
+        date_s,
+        title_m.group(1).strip() if title_m else "",
+        kind_m.group(0).strip() if kind_m else "予選 3100m(6周)",
+        f"3100m {ncar}車 6周",
+        f"{sm.group(1) if sm else '良走路'}" + (f" /{tm.group(1)}℃" if tm else ""),
+    ]
+    if am:
+        lines.append(f"気温：{am.group(1)}℃")
+    if hm:
+        lines.append(f"湿度：{hm.group(1)}%")
+    lines.append("出走表")
     for p in cars:
-        car = int(p["car"])
-        chunks = [html[m.start(): m.start() + 900] for m in re.finditer(rf'param="{car}"', html)]
-        block = "\n".join(chunks)
-        hand = "0"
-        trial = ""
-        st = ""
-        hm2 = re.search(r"(\d+)m/ST([\d.]+)", block)
-        if hm2:
-            hand, st = hm2.group(1), hm2.group(2)
-        tm3 = re.search(r"試\s*([\d.]+)", block)
-        if tm3:
-            trial = tm3.group(1)
-        name = p["name"]
-        line = f"{car}\t{name}\nハンデ{hand}m/ST{st or '-'}"
-        if trial:
-            line += f"\t{trial}"
-        extra.append(line)
-    return (body.strip() + "\n" + "\n".join(extra)).strip()
+        lg = p.get("lg") or venue
+        name = p.get("name") or ""
+        lines.append(f"{p.get('car')}\t{name}({lg})")
+        if p.get("age"):
+            lines.append(p["age"])
+        hand = p.get("hand") or "0"
+        st = p.get("st") or ""
+        trial = p.get("trial") or ""
+        lines.append(f"ハンデ{hand}m/ST{st or '-'}\t{trial}".rstrip())
+        if p.get("dev") or p.get("rank"):
+            lines.append(f"{p.get('dev') or ''}\t{p.get('rank') or ''}".strip())
+        if p.get("avg_r") or p.get("best_r"):
+            bit = []
+            if p.get("avg_r"):
+                bit.append(f"平均競走T {p['avg_r']}")
+            if p.get("best_r"):
+                bit.append(f"最高競走T {p['best_r']}")
+            lines.append(" ".join(bit))
+        if p.get("finish10"):
+            lines.append(f"着順 {p['finish10']}")
+        if p.get("rate2"):
+            lines.append(f"2連 {p['rate2']}%")
+        if p.get("rate3"):
+            lines.append(f"3連 {p['rate3']}%")
+        if p.get("car_name"):
+            lines.append(p["car_name"])
+    return "\n".join([ln for ln in lines if ln is not None])
 
 
 def _v319_player_history_count(db_path: str, player_name: str) -> int:
@@ -9103,13 +9275,18 @@ def _v319_result_exists(db_path: str, ymd: str, venue: str, race_no: int) -> boo
 
 
 def _v319_prediction_exists(db_path: str, race_key: str) -> bool:
+    """保存済み予測一覧に出る履歴があるときだけ予測済みとみなす。"""
     try:
         with sqlite3.connect(str(db_path), timeout=10) as con:
-            n = con.execute(
-                "SELECT COUNT(*) FROM prediction_snapshots WHERE race_key=?",
-                (str(race_key),),
-            ).fetchone()
-            return bool(n and int(n[0] or 0) > 0)
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "v231_prediction_history" in tables:
+                n = con.execute(
+                    "SELECT COUNT(*) FROM v231_prediction_history WHERE race_key=?",
+                    (str(race_key),),
+                ).fetchone()
+                if n and int(n[0] or 0) > 0:
+                    return True
+            return False
     except Exception:
         return False
 
@@ -9140,6 +9317,32 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
     df, bets, wall_audit = _v230_six_lap_simulation(df, bets, entries, meta, int(trials), int(seed))
     meta["壁補正監査"] = wall_audit
     meta["6周展開シミュレーション"] = wall_audit
+    try:
+        if isinstance(df, pd.DataFrame) and isinstance(entries, pd.DataFrame) and not entries.empty:
+            car_col = "車" if isinstance(df, pd.DataFrame) and "車" in df.columns else "車番"
+            have = set()
+            if car_col in df.columns:
+                have = set(pd.to_numeric(df[car_col], errors="coerce").dropna().astype(int).tolist())
+            miss = []
+            for _, r in entries.iterrows():
+                try:
+                    c = int(float(r.get("車番")))
+                except Exception:
+                    continue
+                if c not in have:
+                    row = {col: None for col in df.columns}
+                    if car_col in row:
+                        row[car_col] = c
+                    if "車番" in row:
+                        row["車番"] = c
+                    if "選手名" in row:
+                        row["選手名"] = r.get("選手名")
+                    miss.append(row)
+                    have.add(c)
+            if miss:
+                df = pd.concat([df, pd.DataFrame(miss)], ignore_index=True)
+    except Exception:
+        pass
     try:
         engine.v305_clear_model_state_override()
     except Exception:
@@ -9293,7 +9496,7 @@ def _v319_import_one_race(
     hist_msg = ""
     try:
         sp_html = _v319_fetch_sprace_html(ymd, venue, race_no)
-        players = _v319_parse_sprace_players(sp_html)
+        players = _v319_parse_sprace_car_rows(sp_html) or _v319_parse_sprace_players(sp_html)
         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
         if players:
             filled = _v319_fill_player_histories(db_path, players, min_rows=30)
@@ -9313,30 +9516,24 @@ def _v319_import_one_race(
     if exists and skip_existing and not replace:
         odds_msg = ""
         try:
-            parsed_odds = _v319_fetch_official_odds(ymd, venue, race_no)
-            n_odds = _v319_save_official_odds(db_path, key_guess, parsed_odds)
-            odds_msg = f" / オッズ{n_odds}件"
+            applied = _v319_apply_odds_and_plan(db_path, ymd, venue, race_no, key_guess)
+            odds_msg = f" / オッズ{applied.get('odds') or 0}件"
+            if applied.get("plan_hash"):
+                odds_msg += " / 回収率プラン保存"
         except Exception as exc:
             odds_msg = f" / オッズ失敗:{type(exc).__name__}"
-        try:
-            _v187_sync_mixed_feedback(db_path)
-        except Exception:
-            pass
         return {"status": "skip", "message": "登録済み" + hist_msg + pred_msg + odds_msg, "key": key_guess}
     raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
     saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
     key = str(saved.get("key") or key_guess)
     odds_msg = ""
     try:
-        parsed_odds = _v319_fetch_official_odds(ymd, venue, race_no)
-        n_odds = _v319_save_official_odds(db_path, key, parsed_odds)
-        odds_msg = f" / オッズ{n_odds}件"
+        applied = _v319_apply_odds_and_plan(db_path, ymd, venue, race_no, key)
+        odds_msg = f" / オッズ{applied.get('odds') or 0}件"
+        if applied.get("plan_hash"):
+            odds_msg += " / 回収率プラン保存"
     except Exception as exc:
         odds_msg = f" / オッズ失敗:{type(exc).__name__}"
-    try:
-        _v187_sync_mixed_feedback(db_path)
-    except Exception:
-        pass
     return {"status": "ok", "message": key + hist_msg + pred_msg + odds_msg, "key": key}
 
 
