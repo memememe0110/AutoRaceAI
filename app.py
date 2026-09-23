@@ -2986,7 +2986,7 @@ def _v279_bg_prediction_any_active(db_path: str) -> bool:
             con.execute("PRAGMA busy_timeout=30000")
             row=con.execute("""
                 SELECT COUNT(*) FROM v278_background_jobs
-                WHERE job_type IN ('normal_prediction','batch_rerun')
+                WHERE job_type IN ('normal_prediction','batch_rerun','official_import')
                   AND status IN ('queued','running','pause_requested','paused','cancel_requested')
             """).fetchone()
         return bool(int(row[0] or 0))
@@ -8562,6 +8562,20 @@ def _v319_list_oddspark_races(ymd: str, place_cd: str) -> list[int]:
     return [n for n in nos if 1 <= n <= 12]
 
 
+def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[int]:
+    """常に1Rから昇順。サイトに出ている最大Rまで。"""
+    place = _V319_OP_PLACE.get(str(venue) or "")
+    found = []
+    if place:
+        try:
+            found = _v319_list_oddspark_races(ymd, place)
+        except Exception:
+            found = []
+    last = max(found) if found else int(max_races or 12)
+    last = min(max(int(last), 1), int(max_races or 12))
+    return list(range(1, last + 1))
+
+
 def _v319_html_cells(row_html: str) -> list[str]:
     cells = []
     for cell in re.findall(r"(?is)<t[dh][^>]*>(.*?)</t[dh]>", row_html):
@@ -8719,6 +8733,188 @@ def _v319_fetch_oddspark_result(ymd: str, venue: str, race_no: int) -> str:
     return _v319_normalize_oddspark_result_text(html, venue, int(race_no), ymd)
 
 
+def _v319_norm_player_name(name: str) -> str:
+    return re.sub(r"[\s　]+", "", str(name or ""))
+
+
+def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int) -> str:
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    place = _V319_OP_PLACE.get(str(venue) or "")
+    if not ymd or not place:
+        raise ValueError("開催日または開催場が不正です")
+    url = (
+        "https://sp.oddspark.com/autorace/SpRaceInfo.do"
+        f"?kaisaiBi={ymd}&joCode={place}&joCd={place}&raceNo={int(race_no)}"
+    )
+    return _v319_http_get(url)
+
+
+def _v319_parse_sprace_players(html: str) -> list[dict]:
+    out = []
+    seen = set()
+    for m in re.finditer(
+        r'param="(\d+)"\s+href="/autorace/SpPlayerDetail\.do\?playerCd=(\d+)[^"]*">\s*<strong>([^<]+)</strong>',
+        html,
+    ):
+        car, pcd, name = int(m.group(1)), m.group(2), m.group(3).strip()
+        key = (car, pcd)
+        if key in seen:
+            continue
+        seen.add(key)
+        if "　" not in name and len(name) <= 3:
+            continue
+        out.append({"car": car, "player_cd": pcd, "name": name, "name_key": _v319_norm_player_name(name)})
+    return out
+
+
+def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int, ymd: str) -> str:
+    raw = _v319_html_to_text(html)
+    dm = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日(?:\([^)]+\))?)", raw)
+    date_s = dm.group(1) if dm else f"{ymd[:4]}年{int(ymd[4:6])}月{int(ymd[6:8])}日"
+    sm = re.search(r"(良走路|湿走路|斑走路)", raw)
+    surface = sm.group(1) if sm else "良走路"
+    tm = re.search(r"/(\d+(?:\.\d+)?)℃", raw)
+    track_temp = tm.group(1) if tm else ""
+    am = re.search(r"気温：\s*([\d.]+)", raw)
+    hm = re.search(r"湿度：\s*([\d.]+)", raw)
+    cars = _v319_parse_sprace_players(html)
+    lines = [
+        f"{int(race_no)}R",
+        date_s,
+        str(venue or ""),
+        f"3100m {max(len(cars), 1)}車 6周",
+        f"{surface}" + (f" /{track_temp}℃" if track_temp else ""),
+    ]
+    if am:
+        lines.append(f"気温：{am.group(1)}℃")
+    if hm:
+        lines.append(f"湿度：{hm.group(1)}%")
+    for p in cars:
+        car = int(p["car"])
+        chunks = [html[m.start(): m.start() + 900] for m in re.finditer(rf'param="{car}"', html)]
+        block = "\n".join(chunks)
+        hand = "0"
+        trial = ""
+        hm2 = re.search(r"(\d+)m/ST", block)
+        if hm2:
+            hand = hm2.group(1)
+        tm3 = re.search(r"試\s*([\d.]+)", block)
+        if tm3:
+            trial = tm3.group(1)
+        name = re.sub(r"[\s　]+", "", p["name"])
+        if trial:
+            lines.append(f"{car} {name} {hand}m {trial}")
+        else:
+            lines.append(f"{car} {name} {hand}m")
+    return "\n".join(lines)
+
+
+def _v319_player_history_count(db_path: str, player_name: str) -> int:
+    key = _v319_norm_player_name(player_name)
+    if not key:
+        return 0
+    try:
+        with sqlite3.connect(str(db_path), timeout=15) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            n = 0
+            if "v15_player_history_imports" in tables:
+                row = con.execute(
+                    "SELECT COUNT(*) FROM v15_player_history_imports WHERE replace(replace(COALESCE(player_name,''),' ',''),'　','')=?",
+                    (key,),
+                ).fetchone()
+                n = max(n, int(row[0] or 0))
+            return n
+    except Exception:
+        return 0
+
+
+def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFrame:
+    url = f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={player_cd}&historyDispType=d"
+    html = _v319_http_get(url)
+    tables = re.findall(r"(?is)<table[^>]*>(.*?)</table>", html)
+    hist = []
+    for table in tables:
+        rows = re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", table)
+        if not rows:
+            continue
+        head = _v319_html_cells(rows[0])
+        if "着順" not in "".join(head) or "試走T" not in "".join(head):
+            continue
+        for row in rows[1:]:
+            cells = _v319_html_cells(row)
+            if len(cells) < 10:
+                continue
+            d, ven, rname, rno, hand, kind, weather, finish, trial, race_t = cells[:10]
+            st = cells[10] if len(cells) > 10 else ""
+            if "映像" in rname:
+                rname = re.sub(r"\s*\d*\s*レース映像", "", rname).strip()
+            dm = re.match(r"(\d{2})/(\d{2})/(\d{2})", d.replace("-", "/"))
+            if not dm:
+                continue
+            yy = int(dm.group(1))
+            year = 2000 + yy if yy < 80 else 1900 + yy
+            date_s = f"{year}-{dm.group(2)}-{dm.group(3)}"
+            surf, sky = weather, ""
+            wm = re.match(r"([^(]+)(?:\(([^)]+)\))?", weather or "")
+            if wm:
+                surf = (wm.group(1) or "").strip()
+                sky = (wm.group(2) or "").strip()
+            if surf in ("良", "湿", "斑"):
+                surf = surf + "走路"
+            fin = None
+            if re.fullmatch(r"\d+", str(finish or "")):
+                fin = int(finish)
+            hnum = 0
+            if re.search(r"\d+", str(hand or "")):
+                hnum = int(re.search(r"\d+", str(hand)).group())
+            hist.append({
+                "選手名": player_name,
+                "開催日": date_s,
+                "開催場": ven,
+                "レース": int(rno) if re.fullmatch(r"\d+", str(rno or "")) else None,
+                "レース名": rname,
+                "レース種別": kind,
+                "着順": fin,
+                "走路": surf,
+                "天候": sky,
+                "ハンデ": hnum,
+                "試走T": trial,
+                "競走T": race_t,
+                "ST": st,
+            })
+    return pd.DataFrame(hist)
+
+
+def _v319_fill_player_histories(db_path: str, players: list[dict], min_rows: int = 30) -> dict:
+    added = 0
+    skipped = 0
+    errors = 0
+    details = []
+    for p in players:
+        name = p.get("name") or ""
+        pcd = p.get("player_cd") or ""
+        have = _v319_player_history_count(db_path, name)
+        if have >= int(min_rows):
+            skipped += 1
+            details.append(f"{name}:既存{have}")
+            continue
+        try:
+            df = _v319_fetch_player_history_df(pcd, name)
+            if df is None or df.empty:
+                errors += 1
+                details.append(f"{name}:履歴0件")
+                continue
+            report = engine.v47_save_player_history(df, db_path=db_path)
+            changed = int((report or {}).get("changed") or 0)
+            added += changed
+            details.append(f"{name}:{have}→+{changed}")
+            time_module.sleep(0.25)
+        except Exception as exc:
+            errors += 1
+            details.append(f"{name}:{type(exc).__name__}")
+    return {"added": added, "skipped": skipped, "errors": errors, "details": details}
+
+
 def _v319_result_exists(db_path: str, ymd: str, venue: str, race_no: int) -> bool:
     key = f"{ymd}_{venue}_{int(race_no)}R"
     try:
@@ -8744,9 +8940,12 @@ def _v319_prediction_exists(db_path: str, race_key: str) -> bool:
         return False
 
 
-def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719) -> dict:
-    """結果からレース前項目だけ再構成して予測し、補正・回収照合の土台を作る。"""
-    text, audit = _v304_build_safe_prediction_text_from_result(db_path, race_key)
+def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719, raw_text: str = "") -> dict:
+    """出走表（SP）があればそれを使い、なければ結果のレース前項目だけで予測する。"""
+    text = str(raw_text or "").strip()
+    audit = {"source": "sprace"} if text else {}
+    if not text:
+        text, audit = _v304_build_safe_prediction_text_from_result(db_path, race_key)
     if not text:
         return {"ok": False, "reason": str((audit or {}).get("reason") or "再構成失敗")}
     prediction_text = f"開催場: {venue}\n" + text if venue else text
@@ -8853,47 +9052,24 @@ def _v319_import_official_results(
         report["error"] = 1
         report["details"].append({"status": "error", "message": "開催日または開催場が不正です"})
         return report
-    try:
-        races = _v319_list_oddspark_races(ymd, place)
-    except Exception as exc:
-        report["error"] = 1
-        report["details"].append({"status": "error", "message": f"開催一覧の取得失敗: {exc}"})
-        return report
-    if not races:
-        races = list(range(1, int(max_races) + 1))
-    races = [n for n in races if n <= int(max_races)]
+    races = _v319_ordered_race_nos(ymd, venue, max_races)
     for n in races:
         item = {"venue": venue, "R": n, "status": "", "message": ""}
         try:
-            exists = _v319_result_exists(db_path, ymd, venue, n)
-            key_guess = f"{ymd}_{venue}_{int(n)}R"
-            if exists and skip_existing and not replace:
-                item["status"] = "skip"
-                item["message"] = "登録済み"
-                if predict_if_missing and not _v319_prediction_exists(db_path, key_guess):
-                    pred = _v319_run_prerace_prediction(db_path, key_guess, venue, trials=int(trials), seed=int(seed))
-                    item["message"] += " / 予測 " + ("OK" if pred.get("ok") else str(pred.get("reason") or "失敗"))
-                    try:
-                        _v187_sync_mixed_feedback(db_path)
-                    except Exception:
-                        pass
+            one = _v319_import_one_race(
+                db_path, ymd, venue, n,
+                skip_existing=skip_existing, replace=replace,
+                predict_if_missing=predict_if_missing,
+                trials=int(trials), seed=int(seed),
+            )
+            item["status"] = one.get("status") or "ok"
+            item["message"] = one.get("message") or ""
+            if item["status"] == "skip":
                 report["skip"] += 1
-                report["details"].append(item)
-                continue
-            raw = _v319_fetch_oddspark_result(ymd, venue, n)
-            saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
-            key = str(saved.get("key") or key_guess)
-            pred_msg = ""
-            if predict_if_missing and not _v319_prediction_exists(db_path, key):
-                pred = _v319_run_prerace_prediction(db_path, key, venue, trials=int(trials), seed=int(seed))
-                pred_msg = " / 予測OK" if pred.get("ok") else f" / 予測失敗:{pred.get('reason')}"
-                try:
-                    _v187_sync_mixed_feedback(db_path)
-                except Exception:
-                    pass
-            item["status"] = "ok"
-            item["message"] = key + pred_msg
-            report["ok"] += 1
+            elif item["status"] == "error":
+                report["error"] += 1
+            else:
+                report["ok"] += 1
         except Exception as exc:
             item["status"] = "error"
             item["message"] = f"{type(exc).__name__}: {exc}"
@@ -8905,6 +9081,176 @@ def _v319_import_official_results(
     except Exception:
         pass
     return report
+
+
+def _v319_import_one_race(
+    db_path: str, ymd: str, venue: str, race_no: int,
+    skip_existing: bool, replace: bool, predict_if_missing: bool, trials: int, seed: int,
+) -> dict:
+    exists = _v319_result_exists(db_path, ymd, venue, race_no)
+    key_guess = f"{ymd}_{venue}_{int(race_no)}R"
+    card_text = ""
+    hist_msg = ""
+    try:
+        sp_html = _v319_fetch_sprace_html(ymd, venue, race_no)
+        players = _v319_parse_sprace_players(sp_html)
+        card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
+        if players:
+            filled = _v319_fill_player_histories(db_path, players, min_rows=30)
+            if filled.get("added"):
+                hist_msg = f" / 履歴+{filled.get('added')}"
+    except Exception as exc:
+        hist_msg = f" / 出走表取得失敗:{type(exc).__name__}"
+    if exists and skip_existing and not replace:
+        msg = "登録済み" + hist_msg
+        if predict_if_missing and not _v319_prediction_exists(db_path, key_guess):
+            pred = _v319_run_prerace_prediction(
+                db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text
+            )
+            msg += " / 予測 " + ("OK" if pred.get("ok") else str(pred.get("reason") or "失敗"))
+            try:
+                _v187_sync_mixed_feedback(db_path)
+            except Exception:
+                pass
+        return {"status": "skip", "message": msg, "key": key_guess}
+    raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+    saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
+    key = str(saved.get("key") or key_guess)
+    pred_msg = ""
+    if predict_if_missing and not _v319_prediction_exists(db_path, key):
+        pred = _v319_run_prerace_prediction(
+            db_path, key, venue, trials=int(trials), seed=int(seed), raw_text=card_text
+        )
+        pred_msg = " / 予測OK" if pred.get("ok") else f" / 予測失敗:{pred.get('reason')}"
+        try:
+            _v187_sync_mixed_feedback(db_path)
+        except Exception:
+            pass
+    return {"status": "ok", "message": key + hist_msg + pred_msg, "key": key}
+
+
+def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
+    details = []
+    ok = skip = err = 0
+    try:
+        _v278_bg_update(
+            db_path, job_id, status="running",
+            started_at=_v228_now_jst_iso(),
+            current_label="開催確認",
+            message="対象レースを数えています",
+        )
+        ymd = str(req.get("ymd") or "")
+        venues = list(req.get("venues") or [])
+        targets = []
+        for vn in venues:
+            for n in _v319_ordered_race_nos(ymd, vn, int(req.get("max_races") or 12)):
+                targets.append((vn, int(n)))
+        total = len(targets)
+        _v278_bg_update(db_path, job_id, total_count=total, current_label=f"{total}R 見つかりました")
+        for i, (vn, n) in enumerate(targets, 1):
+            _v278_bg_pause_loop(db_path, job_id)
+            if _v278_bg_cancel_requested(db_path, job_id):
+                _v278_bg_update(
+                    db_path, job_id, status="cancelled",
+                    finished_at=_v228_now_jst_iso(),
+                    current_label="中止",
+                    message=f"{i-1}/{total} まで処理して中止",
+                )
+                return
+            _v278_bg_update(
+                db_path, job_id,
+                current_label=f"{vn} {n}R",
+                message=f"{i-1}/{total} 完了｜今は取得と登録",
+                done_count=i - 1,
+            )
+            item = {"venue": vn, "R": n, "status": "", "message": ""}
+            try:
+                one = _v319_import_one_race(
+                    db_path, ymd, vn, n,
+                    skip_existing=bool(req.get("skip_existing")),
+                    replace=bool(req.get("replace")),
+                    predict_if_missing=bool(req.get("predict_if_missing")),
+                    trials=int(req.get("trials") or 20000),
+                    seed=int(req.get("seed") or 20260719),
+                )
+                item["status"] = one.get("status") or "ok"
+                item["message"] = one.get("message") or ""
+                if item["status"] == "skip":
+                    skip += 1
+                else:
+                    ok += 1
+            except Exception as exc:
+                item["status"] = "error"
+                item["message"] = f"{type(exc).__name__}: {exc}"
+                err += 1
+            details.append(item)
+            _v278_bg_update(
+                db_path, job_id,
+                done_count=i,
+                current_label=f"{vn} {n}R {item['status']}",
+                message=f"{i}/{total}｜登録{ok} スキップ{skip} エラー{err}",
+            )
+            time_module.sleep(0.2)
+        try:
+            _v287_recalculate_global_transition_calibration(db_path)
+        except Exception:
+            pass
+        blob = zlib.compress(pickle.dumps({"ok": ok, "skip": skip, "error": err, "details": details}, protocol=4), 6)
+        _v278_bg_update(
+            db_path, job_id,
+            status="completed",
+            finished_at=_v228_now_jst_iso(),
+            done_count=total,
+            current_label="完了",
+            message=f"登録{ok} / スキップ{skip} / エラー{err}",
+            result_blob=blob,
+        )
+    except Exception as exc:
+        _v278_bg_update(
+            db_path, job_id,
+            status="failed",
+            finished_at=_v228_now_jst_iso(),
+            error_text=f"{type(exc).__name__}: {exc}",
+            message=f"失敗: {exc}",
+        )
+
+
+def _v319_bg_import_start(
+    db_path: str, ymd: str, venues: list[str],
+    skip_existing: bool, replace: bool, predict_if_missing: bool,
+    trials: int, seed: int,
+) -> dict:
+    _v278_bg_ensure_table(db_path)
+    if _v279_bg_prediction_any_active(db_path):
+        return {"ok": False, "reason": "別の予測・再シミュレーション・取込が動いています。完了後に開始してください。"}
+    if not venues:
+        return {"ok": False, "reason": "開催場がありません。"}
+    now = _v228_now_jst_iso()
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        cur = con.execute("""
+            INSERT INTO v278_background_jobs(
+                job_type,app_version,status,created_at,updated_at,limit_count,force_current,
+                done_count,total_count,current_label,message
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            "official_import", str(_V231_APP_VERSION), "queued", now, now, len(venues), 0,
+            0, 0, "準備中", f"{ymd} {','.join(venues)} をバックグラウンド取込します",
+        ))
+        con.commit()
+        job_id = int(cur.lastrowid or 0)
+    req = {
+        "ymd": ymd, "venues": list(venues),
+        "skip_existing": bool(skip_existing), "replace": bool(replace),
+        "predict_if_missing": bool(predict_if_missing),
+        "trials": int(trials), "seed": int(seed), "max_races": 12,
+    }
+    th = threading.Thread(
+        target=_v319_bg_import_worker, args=(str(db_path), job_id, req),
+        daemon=True, name=f"autorace-bg-import-{job_id}",
+    )
+    th.start()
+    return {"ok": True, "job_id": job_id}
 
 
 RESULT_VENUES = ["飯塚", "山陽", "浜松", "川口", "伊勢崎"]
@@ -19098,10 +19444,42 @@ if "github_pull_done" not in st.session_state:
     st.session_state["github_pull_message"] = (True, "起動時のGitHub DB自動読込は安全のため停止中です。必要な場合だけ『GitHubからDBを再読込』を押してください。")
 
 
+def _v278_bg_get_latest_active(db_path: str) -> dict:
+    try:
+        _v278_bg_ensure_table(db_path)
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA busy_timeout=30000")
+            row = con.execute("""
+                SELECT * FROM v278_background_jobs
+                WHERE status IN ('queued','running','pause_requested','paused','cancel_requested')
+                ORDER BY job_id DESC LIMIT 1
+            """).fetchone()
+            if not row:
+                row = con.execute("""
+                    SELECT * FROM v278_background_jobs
+                    ORDER BY job_id DESC LIMIT 1
+                """).fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def _v278_job_kind_label(job: dict) -> str:
+    t = str((job or {}).get("job_type") or "")
+    if t == "official_import":
+        return "公式取込"
+    if t == "normal_prediction":
+        return "予測"
+    if t == "restored_rerun_prediction":
+        return "再予測"
+    return "再シミュレーション"
+
+
 def _v278_render_bg_compact(location: str = "main") -> None:
     """どの画面でも軽く確認できるバックグラウンド進捗。自動ポーリングはしない。"""
     try:
-        job=_v278_bg_get_job(engine.DB_PATH)
+        job=_v278_bg_get_latest_active(engine.DB_PATH) or _v278_bg_get_job(engine.DB_PATH)
     except Exception:
         job={}
     if not job:
@@ -19114,15 +19492,19 @@ def _v278_render_bg_compact(location: str = "main") -> None:
     label=str(job.get("current_label") or "")
     frac=(float(done)/float(total)) if total else 0.0
 
+    kind = _v278_job_kind_label(job)
+    msg = str(job.get("message") or "")
     if location=="sidebar":
         if status in ("queued","running","pause_requested","paused","cancel_requested"):
-            st.markdown("#### ⏱️ 再シミュレーション")
+            st.markdown(f"#### ⏱️ {kind}")
             if total>0:
                 st.progress(min(1.0,max(0.0,frac)),text=f"{done}/{total}")
             else:
-                st.info("準備中… 対象レースを確認しています")
+                st.info("準備中… 対象を確認しています")
             if label:
                 st.caption(label)
+            if msg:
+                st.caption(msg)
             if status=="paused":
                 st.caption("⏸ DB登録を優先して一時停止中")
             elif status=="pause_requested":
@@ -19133,16 +19515,18 @@ def _v278_render_bg_compact(location: str = "main") -> None:
         icon="⏸️" if status in ("paused","pause_requested") else "⏱️"
         if total>0:
             st.info(
-                f"{icon} 再シミュレーション {done}/{total}"
+                f"{icon} {kind} {done}/{total}"
                 + (f"｜{label}" if label else "")
                 + ("｜DB登録優先で一時停止中" if status=="paused" else "")
             )
         else:
-            st.info(f"{icon} 再シミュレーション準備中｜対象レースを確認しています")
+            st.info(f"{icon} {kind}準備中｜対象を確認しています")
+        if msg:
+            st.caption(msg)
     elif status=="completed":
-        st.success(f"✅ 再シミュレーション完了 {done}/{total}")
+        st.success(f"✅ {kind}完了 {done}/{total}" + (f"｜{label}" if label else ""))
     elif status=="failed":
-        st.warning("⚠️ バックグラウンド再シミュレーションでエラーがあります。再シミュレーション画面で確認してください。")
+        st.warning(f"⚠️ バックグラウンド{kind}でエラーがあります。")
 
 
 
@@ -21202,7 +21586,7 @@ if selected_main_page == "✅ 結果登録・解析":
     st.session_state.setdefault("result_input_version", 0)
 
     with st.expander("公式結果を自動取得して登録", expanded=False):
-        st.caption("未予測ならサイドバーの試行回数・乱数シード・Champion設定で予測してから結果照合します。通常の予測と同じ値です。")
+        st.caption("予測はSP出走表（ハンデ・試走）を使います。選手履歴が30件未満ならプロフィールから足してから予測します。")
         dcol, vcol = st.columns(2)
         fetch_date = dcol.date_input("開催日", value=date.today(), key="v319_op_fetch_date")
         fetch_venue = vcol.selectbox("開催場", ["開催を探す"] + RESULT_VENUES, key="v319_op_fetch_venue")
@@ -21219,11 +21603,29 @@ if selected_main_page == "✅ 結果登録・解析":
         meets = st.session_state.get("v319_op_meetings") or []
         if meets:
             st.write("取得できた開催: " + "、".join(f"{m['venue']}" for m in meets))
-        if st.button("結果を取得して登録", type="primary", use_container_width=True, key="v319_op_import"):
-            ymd = fetch_date.strftime("%Y%m%d")
-            venues = [fetch_venue] if fetch_venue in RESULT_VENUES else [m["venue"] for m in meets]
+        b1, b2 = st.columns(2)
+        ymd = fetch_date.strftime("%Y%m%d")
+        venues = [fetch_venue] if fetch_venue in RESULT_VENUES else [m["venue"] for m in meets]
+        with b1:
+            start_fg = st.button("今すぐ取得して登録", use_container_width=True, key="v319_op_import")
+        with b2:
+            start_bg = st.button("バックグラウンドで取得", type="primary", use_container_width=True, key="v319_op_import_bg")
+        if start_fg or start_bg:
             if not venues:
                 st.warning("開催場を選ぶか、先に開催確認してください。")
+            elif start_bg:
+                started = _v319_bg_import_start(
+                    engine.DB_PATH, ymd, venues,
+                    skip_existing=bool(skip_existing and not replace_existing),
+                    replace=bool(replace_existing),
+                    predict_if_missing=bool(predict_missing),
+                    trials=int(trials), seed=int(seed),
+                )
+                if started.get("ok"):
+                    st.success(f"バックグラウンド取込を開始しました（ジョブ {started.get('job_id')}）。画面を離れても進みます。")
+                    st.rerun()
+                else:
+                    st.warning(started.get("reason") or "開始できませんでした")
             else:
                 all_rep = {"ok": 0, "skip": 0, "error": 0, "details": []}
                 with st.spinner(f"{ymd} {','.join(venues)} を取得しています…"):
@@ -21245,6 +21647,39 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.session_state["v319_op_last_report"] = all_rep
                 st.success(f"登録 {all_rep['ok']} / スキップ {all_rep['skip']} / エラー {all_rep['error']}")
                 st.caption("GitHubへは自動保存しません。問題なければサイドバーのDB保存を使ってください。")
+
+        job_imp = _v278_bg_get_latest_active(engine.DB_PATH)
+        if str((job_imp or {}).get("job_type") or "") == "official_import":
+            st.markdown("#### 取込の進捗")
+            done = int(job_imp.get("done_count") or 0)
+            total = int(job_imp.get("total_count") or 0)
+            status = str(job_imp.get("status") or "")
+            if total > 0:
+                st.progress(min(1.0, max(0.0, done / float(total))), text=f"{done}/{total}R")
+            else:
+                st.info("対象レースを数えています…")
+            st.caption(
+                f"今：{job_imp.get('current_label') or '-'} ｜ "
+                f"{job_imp.get('message') or status}"
+            )
+            cprog1, cprog2 = st.columns(2)
+            if cprog1.button("進捗を更新", use_container_width=True, key="v319_op_refresh_job"):
+                st.rerun()
+            if status in ("queued", "running", "paused", "pause_requested") and cprog2.button(
+                "取込を中止", use_container_width=True, key="v319_op_cancel_job"
+            ):
+                try:
+                    _v278_bg_request_cancel(engine.DB_PATH, int(job_imp.get("job_id") or 0))
+                    st.warning("現在のレースのあとで中止します。")
+                    st.rerun()
+                except Exception as exc:
+                    st.warning(str(exc))
+            blob = job_imp.get("result_blob")
+            if status == "completed" and blob:
+                try:
+                    st.session_state["v319_op_last_report"] = pickle.loads(zlib.decompress(bytes(blob)))
+                except Exception:
+                    pass
         last_rep = st.session_state.get("v319_op_last_report")
         if last_rep:
             st.dataframe(pd.DataFrame(last_rep.get("details") or []), use_container_width=True, hide_index=True)
