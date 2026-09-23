@@ -8062,7 +8062,9 @@ def _v280_build_result_view_for_prediction(db_path: str, race_key: str, predicti
                 win_s = None
         if win_s is not None:
             p["win_prob"] = win_s
-            p["predicted_rank"] = win_s.rank(method="first", ascending=False).astype("Int64")
+        if "win_prob" in p.columns:
+            p["win_prob"] = pd.to_numeric(p["win_prob"], errors="coerce").fillna(0.0)
+            p["predicted_rank"] = p["win_prob"].rank(method="first", ascending=False).astype("Int64")
         elif "改善後順位" in p.columns:
             p["predicted_rank"] = pd.to_numeric(p["改善後順位"], errors="coerce").astype("Int64")
         else:
@@ -8547,7 +8549,7 @@ def _v319_http_get(url: str, timeout: int = 20) -> str:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; AutoRaceAI/319; +https://autorace.jp/)",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
             "Accept-Language": "ja,en;q=0.8",
         },
     )
@@ -8585,10 +8587,17 @@ def _v319_list_oddspark_meetings(ymd: str) -> list[dict]:
 
 def _v319_list_oddspark_races(ymd: str, place_cd: str) -> list[int]:
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
-    url = f"https://www.oddspark.com/autorace/RaceResult.do?raceDy={ymd}&placeCd={place_cd}"
-    html = _v319_http_get(url)
-    nos = sorted({int(x) for x in re.findall(r"raceNo=(\d+)", html) if str(x).isdigit()})
-    return [n for n in nos if 1 <= n <= 12]
+    nos = set()
+    for url in (
+        f"https://www.oddspark.com/autorace/RaceList.do?raceDy={ymd}&placeCd={place_cd}",
+        f"https://www.oddspark.com/autorace/RaceResult.do?raceDy={ymd}&placeCd={place_cd}",
+    ):
+        try:
+            html = _v319_http_get(url)
+            nos |= {int(x) for x in re.findall(r"raceNo=(\d+)", html) if str(x).isdigit()}
+        except Exception:
+            continue
+    return [n for n in sorted(nos) if 1 <= n <= 12]
 
 
 def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[int]:
@@ -8679,18 +8688,30 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
             pay_rows.extend(body)
 
     for cells in finish_rows:
-        if len(cells) < 8:
+        if len(cells) < 6:
             continue
-        pos, acc, car = cells[0], cells[1], cells[2]
-        name = re.sub(r"\s+", "", cells[3] if len(cells) > 3 else "")
-        lg = cells[5] if len(cells) > 5 else venue
-        hand = re.sub(r"[^0-9]", "", cells[6] if len(cells) > 6 else "") or "0"
-        trial = cells[7] if len(cells) > 7 else "0.00"
-        race_t = cells[8] if len(cells) > 8 else "0.000"
-        st = cells[9] if len(cells) > 9 else "0.00"
-        abn = cells[10] if len(cells) > 10 else ""
-        pop = cells[11] if len(cells) > 11 else "-"
-        if acc == "欠車" or pos in ("-", "欠"):
+        # 事故列が空だと 着,車,選手名… になる
+        if re.fullmatch(r"\d+", cells[1] or "") and not re.fullmatch(r"\d+", cells[2] or ""):
+            pos, acc, car = cells[0], "", cells[1]
+            name = re.sub(r"\s+", "", cells[2])
+            lg = cells[4] if len(cells) > 4 else venue
+            hand = re.sub(r"[^0-9]", "", cells[5] if len(cells) > 5 else "") or "0"
+            trial = cells[6] if len(cells) > 6 else "0.00"
+            race_t = cells[7] if len(cells) > 7 else "0.000"
+            st = cells[8] if len(cells) > 8 else "0.00"
+            abn = ""
+            pop = cells[9] if len(cells) > 9 else "-"
+        else:
+            pos, acc, car = cells[0], cells[1], cells[2]
+            name = re.sub(r"\s+", "", cells[3] if len(cells) > 3 else "")
+            lg = cells[5] if len(cells) > 5 else venue
+            hand = re.sub(r"[^0-9]", "", cells[6] if len(cells) > 6 else "") or "0"
+            trial = cells[7] if len(cells) > 7 else "0.00"
+            race_t = cells[8] if len(cells) > 8 else "0.000"
+            st = cells[9] if len(cells) > 9 else "0.00"
+            abn = cells[10] if len(cells) > 10 else ""
+            pop = cells[11] if len(cells) > 11 else "-"
+        if acc == "欠車" or pos in ("-", "欠") or "欠車" in acc:
             lines.append(f"-\t{car}\t{name}")
             lines.append(f"{lg}/{hand}m/{trial}\t0.000(-)")
             lines.append("0.00 /欠車")
@@ -8731,10 +8752,12 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
         for v in rest:
             if "円" in v:
                 break
-            if re.fullmatch(r"\d+", v or ""):
-                before.append(v)
+            nums = re.findall(r"\d+", v or "")
+            if nums:
+                before.extend(nums)
         if kind and yen and before:
-            lines.append(f"{kind}\t{'-'.join(before)}\t{yen}")
+            sep = "→" if kind in ("2連単", "3連単") else "-"
+            lines.append(f"{kind}\t{sep.join(before)}\t{yen}")
     pay_txt = re.sub(r"\s*-\s*", "-", raw.replace("\t", " "))
     pay_txt = re.sub(r"\s+", " ", pay_txt)
     existing = "\n".join(lines)
@@ -8955,6 +8978,37 @@ def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int) -> str:
     return _v319_http_get(url)
 
 
+_V319_WX_CACHE: dict[str, dict] = {}
+
+
+def _v319_race_weather(ymd: str, venue: str, race_no: int) -> dict:
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    try:
+        rno = int(race_no)
+    except Exception:
+        rno = 0
+    key = f"{ymd}_{venue}_{rno}"
+    if key in _V319_WX_CACHE:
+        return _V319_WX_CACHE[key]
+    out = {"走": "", "気": "", "湿": ""}
+    if ymd and venue and rno:
+        try:
+            raw = _v319_html_to_text(_v319_fetch_sprace_html(ymd, venue, rno))
+            m = re.search(r"(?:良走路|湿走路|斑走路)\s*/\s*(\d+(?:\.\d+)?)\s*℃", raw)
+            if m:
+                out["走"] = m.group(1)
+            m = re.search(r"気温：\s*(\d+(?:\.\d+)?)", raw)
+            if m:
+                out["気"] = m.group(1)
+            m = re.search(r"湿度：\s*(\d+(?:\.\d+)?)", raw)
+            if m:
+                out["湿"] = m.group(1)
+        except Exception:
+            pass
+    _V319_WX_CACHE[key] = out
+    return out
+
+
 def _v319_parse_sprace_players(html: str) -> list[dict]:
     out = []
     seen = set()
@@ -9143,14 +9197,36 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
         if not rows:
             continue
         head = _v319_html_cells(rows[0])
-        if "着順" not in "".join(head) or "試走T" not in "".join(head):
+        headj = "".join(head)
+        if "着順" not in headj or ("試走" not in headj and "年月日" not in headj):
             continue
+        def _col(names):
+            for n in names:
+                for i, h in enumerate(head):
+                    if n in h:
+                        return i
+            return None
+        i_d = _col(["年月日", "日付"])
+        i_v = _col(["開催場"])
+        i_nm = _col(["レース名"])
+        i_r = _col(["R"])
+        i_h = _col(["H", "ハンデ"])
+        i_k = _col(["種別"])
+        i_w = _col(["走路", "天候"])
+        i_f = _col(["着順"])
+        i_t = _col(["試走"])
+        i_rt = _col(["競走"])
+        i_st = _col(["ST"])
         for row in rows[1:]:
             cells = _v319_html_cells(row)
-            if len(cells) < 10:
+            if i_d is None or i_d >= len(cells) or i_f is None or i_f >= len(cells):
                 continue
-            d, ven, rname, rno, hand, kind, weather, finish, trial, race_t = cells[:10]
-            st = cells[10] if len(cells) > 10 else ""
+            def _at(i, default=""):
+                return cells[i] if i is not None and i < len(cells) else default
+            d, ven, rname = _at(i_d), _at(i_v), _at(i_nm)
+            rno, hand, kind, weather = _at(i_r), _at(i_h), _at(i_k), _at(i_w)
+            finish, trial, race_t, st = _at(i_f), _at(i_t), _at(i_rt), _at(i_st)
+            acc = _at(_col(["異", "事故"]))
             if "映像" in rname:
                 rname = re.sub(r"\s*\d*\s*レース映像", "", rname).strip()
             dm = re.match(r"(\d{2})/(\d{2})/(\d{2})", d.replace("-", "/"))
@@ -9186,6 +9262,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
                 "試走T": trial,
                 "競走T": race_t,
                 "ST": st,
+                "事故": acc,
             })
     return pd.DataFrame(hist)
 
@@ -9209,31 +9286,56 @@ def _v319_fill_player_histories(db_path: str, players: list[dict], min_rows: int
                 errors += 1
                 details.append(f"{name}:履歴0件")
                 continue
-            lines = [str(name), "直近履歴"]
-            for _, r in df.iterrows():
+            lines = [str(name)]
+            for n, (_, r) in enumerate(df.iterrows()):
+                if n == 0:
+                    lines.append("前走")
+                elif n == 1:
+                    lines.append("前々走")
+                else:
+                    lines.append(f"{n+1}走前")
+                acc = str(r.get("事故") or "")
+                fin = r.get("着順")
+                if "欠責" in acc:
+                    lines.append("欠責")
+                elif "欠車" in acc:
+                    lines.append("欠車")
+                elif pd.notna(fin) and str(fin).strip() and str(fin).replace(".0","",1).isdigit():
+                    lines.append(str(int(float(fin))))
+                else:
+                    lines.append(str(fin or "欠車"))
                 ds = str(r.get("開催日") or "")
                 dm = re.match(r"(\d{4})-(\d{2})-(\d{2})", ds)
-                date_jp = f"{dm.group(1)}年{int(dm.group(2))}月{int(dm.group(3))}日" if dm else ds
-                fin = r.get("着順")
-                lines.append(f"{int(fin)}着" if pd.notna(fin) and str(fin).strip() else "着外")
-                lines.append(date_jp)
+                lines.append(f"{dm.group(1)}年{int(dm.group(2))}月{int(dm.group(3))}日" if dm else ds)
                 lines.append(str(r.get("開催場") or ""))
-                if r.get("レース"):
-                    lines.append(f"{int(r.get('レース'))}R")
-                if r.get("レース名"):
-                    lines.append(str(r.get("レース名")))
                 if r.get("レース種別"):
                     lines.append(str(r.get("レース種別")))
-                lines.append(str(r.get("走路") or "良走路"))
-                if r.get("天候"):
-                    lines.append(str(r.get("天候")))
-                lines.append(f"ハンデ{int(r.get('ハンデ') or 0)}m")
-                if r.get("試走T"):
-                    lines.append(f"試走T {r.get('試走T')}")
-                if r.get("競走T"):
-                    lines.append(f"競走T {r.get('競走T')}")
-                if r.get("ST"):
-                    lines.append(f"ST {r.get('ST')}")
+                sky = str(r.get("天候") or "").replace("走路", "")
+                if sky:
+                    lines.append(sky)
+                surf = str(r.get("走路") or "良").replace("走路", "")
+                lines.append(surf or "良")
+                ymd_wx = re.sub(r"[^0-9]", "", ds)
+                wx = _v319_race_weather(ymd_wx, str(r.get("開催場") or ""), r.get("レース") or 0)
+                if wx.get("走"):
+                    lines.append(f"走{wx['走']}")
+                if wx.get("気"):
+                    lines.append(f"気{wx['気']}")
+                if wx.get("湿"):
+                    lines.append(f"湿{wx['湿']}")
+                hnum = int(r.get("ハンデ") or 0)
+                lines.append(f"1番{hnum}m" if hnum else "1番-m")
+                lines.append("3100m(6周)")
+                race_t = str(r.get("競走T") or "0.000").replace("試", "")
+                trial = str(r.get("試走T") or "-")
+                stv = str(r.get("ST") or "0.00")
+                lines.append(race_t if race_t else "0.000")
+                lines.append(f"試{trial}" if not str(trial).startswith("試") else str(trial))
+                lines.append(f"ST{stv}" if not str(stv).upper().startswith("ST") else str(stv))
+                if "F" in acc or acc in {"F", "フライング"}:
+                    lines.append("F")
+                elif acc and acc not in {"欠責", "欠車", "-", ""}:
+                    lines.append(acc)
             parsed = None
             try:
                 parsed = engine.v15_parse_player_history("\n".join(lines), player_name=str(name).strip())
@@ -9431,10 +9533,64 @@ def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, repla
     except Exception:
         pass
     try:
+        _v319_upsert_payouts_from_text(db_path, str(key), raw_text)
+    except Exception:
+        pass
+    try:
         _v187_sync_mixed_feedback(db_path)
     except Exception:
         pass
     return {"key": str(key), "cars": int(len(rows_for_engine)), "laps": int(len(laps_r) if laps_r is not None else 0)}
+
+
+def _v319_upsert_payouts_from_text(db_path: str, race_key: str, raw_text: str) -> int:
+    if not race_key:
+        return 0
+    body = str(raw_text or "")
+    idx = body.find("払戻金")
+    if idx >= 0:
+        body = body[idx:]
+    rows = []
+    kind = ""
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.match(r"^(単勝|複勝|2連複|2連単|ワイド|3連複|3連単)\s+(\S+)\s+([\d,]+)円", line)
+        if m:
+            kind = m.group(1)
+            combo = m.group(2).replace("→", "-").replace(" ", "")
+            yen = int(m.group(3).replace(",", ""))
+            rows.append((kind, combo, yen))
+            continue
+        m2 = re.match(r"^(\S+)\s+([\d,]+)円", line)
+        if m2 and kind in ("複勝", "ワイド"):
+            combo = m2.group(1).replace("→", "-").replace(" ", "")
+            yen = int(m2.group(2).replace(",", ""))
+            rows.append((kind, combo, yen))
+    if not rows:
+        return 0
+    with sqlite3.connect(str(db_path), timeout=20) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS result_payouts (
+                race_key TEXT NOT NULL,
+                bet_type TEXT NOT NULL,
+                combination TEXT NOT NULL,
+                payout_yen INTEGER NOT NULL,
+                PRIMARY KEY (race_key, bet_type, combination)
+            )
+        """)
+        for kind, combo, yen in rows:
+            bt = _v212_norm_bet_type(kind)
+            comb = _v187_norm_combo(bt, combo)
+            if not comb or yen <= 0:
+                continue
+            con.execute(
+                "INSERT OR REPLACE INTO result_payouts(race_key,bet_type,combination,payout_yen) VALUES (?,?,?,?)",
+                (str(race_key), bt, comb, int(yen)),
+            )
+        con.commit()
+    return len(rows)
 
 
 def _v319_import_official_results(
@@ -9515,6 +9671,11 @@ def _v319_import_one_race(
         )
     if exists and skip_existing and not replace:
         odds_msg = ""
+        try:
+            raw_pay = _v319_fetch_oddspark_result(ymd, venue, race_no)
+            _v319_upsert_payouts_from_text(db_path, key_guess, raw_pay)
+        except Exception:
+            pass
         try:
             applied = _v319_apply_odds_and_plan(db_path, ymd, venue, race_no, key_guess)
             odds_msg = f" / オッズ{applied.get('odds') or 0}件"
