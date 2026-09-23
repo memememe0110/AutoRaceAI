@@ -8545,17 +8545,38 @@ _V319_AR_PLACE_SLUG = {"川口": "kawaguchi", "伊勢崎": "isesaki", "浜松": 
 _V319_OP_PLACE_REV = {v: k for k, v in _V319_OP_PLACE.items()}
 
 
-def _v319_http_get(url: str, timeout: int = 20) -> str:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            "Accept-Language": "ja,en;q=0.8",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=int(timeout or 20)) as resp:
-        raw = resp.read()
-    return raw.decode("utf-8", errors="replace")
+def _v319_http_get(url: str, timeout: int = 20, retries: int = 4) -> str:
+    """HTTP GET with transient retries. Does not hold a DB transaction."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Accept-Language": "ja,en;q=0.8",
+    }
+    delays = (1.0, 3.0, 8.0)
+    last_exc: BaseException | None = None
+    attempts = max(1, int(retries or 1))
+    for attempt in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=int(timeout or 20)) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
+                raw = resp.read()
+            if status in (408, 425, 429, 500, 502, 503, 504):
+                raise urllib.error.HTTPError(url, status, f"HTTP {status}", hdrs=None, fp=None)
+            text_body = raw.decode("utf-8", errors="replace")
+            if not str(text_body or "").strip():
+                raise ValueError("empty HTML")
+            return text_body
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if int(getattr(exc, "code", 0) or 0) in (400, 401, 403, 404, 410):
+                raise
+        except (TimeoutError, urllib.error.URLError, ConnectionResetError, ValueError, OSError) as exc:
+            last_exc = exc
+        if attempt + 1 < attempts:
+            time_module.sleep(delays[min(attempt, len(delays) - 1)])
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"HTTP GET failed: {url}")
 
 
 def _v319_html_to_text(html: str) -> str:
@@ -9879,6 +9900,13 @@ def _v319_import_one_race(
     skip_existing: bool, replace: bool, predict_if_missing: bool, trials: int, seed: int,
     on_step=None,
 ) -> dict:
+    """1レース単位の自動取得。
+
+    順序固定:
+      出走表 → 選手履歴 → 予測(+検証) → オッズ → 結果登録
+    履歴失敗時は予測・結果を実行せず failed で返す。
+    予測またはオッズ未完了なら結果登録しない。
+    """
     def _step(msg: str) -> None:
         if on_step:
             try:
@@ -9886,73 +9914,281 @@ def _v319_import_one_race(
             except Exception:
                 pass
 
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    venue = str(venue or "").strip()
+    race_no = int(race_no)
+    key_guess = f"{ymd}_{venue}_{race_no}R"
     exists = _v319_result_exists(db_path, ymd, venue, race_no)
-    key_guess = f"{ymd}_{venue}_{int(race_no)}R"
     card_text = ""
     hist_msg = ""
+    pred_msg = ""
+    odds_msg = ""
     players = []
     sp_html = ""
+
+    # --- 1) 出走表 ---
     try:
         _step("出走表")
         sp_html = _v319_fetch_sprace_html(ymd, venue, race_no)
+        if not str(sp_html or "").strip():
+            return {
+                "status": "error",
+                "phase": "fetch_card",
+                "message": f"{venue} {race_no}R：出走表が空です。予測と結果登録は実行していません。",
+                "key": key_guess,
+                "next_action": "retry",
+            }
         players = _v319_parse_sprace_car_rows(sp_html) or _v319_parse_sprace_players(sp_html)
         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
-        if players:
-            _step("選手履歴")
-            filled = _v319_fill_player_histories(
-                db_path, players, min_rows=30,
-                before_ymd=ymd, before_venue=venue, before_race=int(race_no),
-            )
-            hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
+        if not players:
+            return {
+                "status": "error",
+                "phase": "fetch_card",
+                "message": f"{venue} {race_no}R：出走表から選手を取得できませんでした。予測と結果登録は実行していません。",
+                "key": key_guess,
+                "next_action": "retry",
+            }
     except Exception as exc:
-        hist_msg = f" / 出走表取得失敗:{type(exc).__name__}"
-    pred_msg = ""
-    if predict_if_missing and not _v319_prediction_exists(db_path, key_guess):
+        return {
+            "status": "error",
+            "phase": "fetch_card",
+            "message": (
+                f"{venue} {race_no}R：出走表取得に失敗しました。"
+                f" 予測と結果登録は実行していません。"
+                f" ({type(exc).__name__}: {exc})"
+            ),
+            "key": key_guess,
+            "next_action": "retry",
+        }
+
+    # --- 2) 選手履歴（失敗時は予測しない） ---
+    try:
+        _step("選手履歴")
+        filled = _v319_fill_player_histories(
+            db_path, players, min_rows=30,
+            before_ymd=ymd, before_venue=venue, before_race=race_no,
+        )
+        hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
+        err_n = int(filled.get("errors") or 0)
+        # 履歴0件の選手が残る場合だけハード失敗（既存十分で一時取得失敗は警告継続）
+        missing = []
+        for p in players:
+            nm = str(p.get("name") or "").strip()
+            if not nm:
+                continue
+            if int(_v319_player_history_count(db_path, nm) or 0) <= 0:
+                missing.append(nm)
+        any_have = any(
+            int(_v319_player_history_count(db_path, str(p.get("name") or "")) or 0) > 0
+            for p in players if str(p.get("name") or "").strip()
+        )
+        if missing or (err_n > 0 and int(filled.get("added") or 0) <= 0 and not any_have):
+            detail = " / ".join(str(x) for x in (filled.get("details") or [])[:6])
+            who = ", ".join(missing[:4]) if missing else "全員"
+            return {
+                "status": "error",
+                "phase": "save_player_history",
+                "message": (
+                    f"{venue} {race_no}R：選手履歴登録に失敗しました（{who}）。"
+                    f" 予測と結果登録は実行していません。"
+                    f" 失敗段階：選手履歴保存"
+                    f"{hist_msg}"
+                    + (f"｜{detail}" if detail else "")
+                ),
+                "key": key_guess,
+                "player_history_saved": False,
+                "next_action": "retry",
+            }
+        if err_n > 0:
+            hist_msg += f" / 履歴警告{err_n}"
+    except Exception as exc:
+        return {
+            "status": "error",
+            "phase": "save_player_history",
+            "message": (
+                f"{venue} {race_no}R：選手履歴登録に失敗しました。"
+                f" 予測と結果登録は実行していません。"
+                f" ({type(exc).__name__}: {exc})"
+            ),
+            "key": key_guess,
+            "player_history_saved": False,
+            "next_action": "retry",
+        }
+
+    # --- 3) 予測（未保存時）＋保存後検証 ---
+    pred_ok = _v319_prediction_exists(db_path, key_guess)
+    if predict_if_missing and not pred_ok:
         _step("予測中")
         try:
-            if not str(card_text or "").strip() and players:
+            if not str(card_text or "").strip():
                 card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
             pred = _v319_run_prerace_prediction(
                 db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text
             )
-            pred_msg = (
-                f" / 予測OK 履歴{pred.get('history_id') or ''}"
-                if pred.get("ok")
-                else f" / 予測失敗:{pred.get('reason')}"
-            )
+            if not pred.get("ok"):
+                return {
+                    "status": "error",
+                    "phase": "run_prediction",
+                    "message": (
+                        f"{venue} {race_no}R：予測に失敗しました。"
+                        f" オッズ入力と結果登録は実行していません。"
+                        f" ({pred.get('reason') or '不明'})"
+                        f"{hist_msg}"
+                    ),
+                    "key": key_guess,
+                    "player_history_saved": True,
+                    "next_action": "retry",
+                }
+            if not _v319_prediction_exists(db_path, key_guess):
+                return {
+                    "status": "error",
+                    "phase": "verify_prediction",
+                    "message": (
+                        f"{venue} {race_no}R：予測履歴が保存後に確認できません。"
+                        f" オッズ入力と結果登録は実行していません。"
+                        f"{hist_msg}"
+                    ),
+                    "key": key_guess,
+                    "player_history_saved": True,
+                    "next_action": "retry",
+                }
+            pred_ok = True
+            pred_msg = f" / 予測OK 履歴{pred.get('history_id') or ''}"
         except Exception as exc:
-            pred_msg = f" / 予測失敗:{type(exc).__name__}:{exc}"
+            return {
+                "status": "error",
+                "phase": "run_prediction",
+                "message": (
+                    f"{venue} {race_no}R：予測に失敗しました。"
+                    f" オッズ入力と結果登録は実行していません。"
+                    f" ({type(exc).__name__}: {exc})"
+                    f"{hist_msg}"
+                ),
+                "key": key_guess,
+                "player_history_saved": True,
+                "next_action": "retry",
+            }
+    elif pred_ok:
+        pred_msg = " / 予測済"
+
+    if not _v319_prediction_exists(db_path, key_guess):
+        return {
+            "status": "error",
+            "phase": "verify_prediction",
+            "message": (
+                f"{venue} {race_no}R：予測未登録のため結果登録を禁止します。"
+                f"{hist_msg}{pred_msg}"
+            ),
+            "key": key_guess,
+            "player_history_saved": True,
+            "next_action": "retry",
+        }
+
+    # --- 4) オッズ入力・保存確認（結果の前に必須） ---
+    _step("オッズ")
+    try:
+        applied = _v319_apply_odds_and_plan(db_path, ymd, venue, race_no, key_guess)
+        odds_n = int(applied.get("odds") or 0)
+        odds_msg = f" / オッズ{odds_n}件"
+        if applied.get("plan_hash"):
+            odds_msg += " / 回収率プラン保存"
+        if odds_n <= 0:
+            return {
+                "status": "error",
+                "phase": "save_odds",
+                "message": (
+                    f"{venue} {race_no}R：オッズ未登録のため結果登録を禁止します。"
+                    f"{hist_msg}{pred_msg}{odds_msg}"
+                ),
+                "key": key_guess,
+                "player_history_saved": True,
+                "next_action": "retry",
+            }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "phase": "save_odds",
+            "message": (
+                f"{venue} {race_no}R：オッズ取得に失敗しました。"
+                f" 結果登録は実行していません。"
+                f" ({type(exc).__name__}: {exc})"
+                f"{hist_msg}{pred_msg}"
+            ),
+            "key": key_guess,
+            "player_history_saved": True,
+            "next_action": "retry",
+        }
+
+    # --- 5) 結果登録（登録済みスキップは払戻補完のみ） ---
     if exists and skip_existing and not replace:
-        odds_msg = ""
         try:
             raw_pay = _v319_fetch_oddspark_result(ymd, venue, race_no)
             _v319_upsert_payouts_from_text(db_path, key_guess, raw_pay)
-        except Exception:
-            pass
-        try:
-            applied = _v319_apply_odds_and_plan(db_path, ymd, venue, race_no, key_guess)
-            odds_msg = f" / オッズ{applied.get('odds') or 0}件"
-            if applied.get("plan_hash"):
-                odds_msg += " / 回収率プラン保存"
         except Exception as exc:
-            odds_msg = f" / オッズ失敗:{type(exc).__name__}"
-        return {"status": "skip", "message": "登録済み" + hist_msg + pred_msg + odds_msg, "key": key_guess}
+            odds_msg += f" / 払戻補完失敗:{type(exc).__name__}"
+        return {
+            "status": "skip",
+            "phase": "completed",
+            "message": "登録済み" + hist_msg + pred_msg + odds_msg,
+            "key": key_guess,
+        }
+
     _step("結果登録")
-    raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+    try:
+        raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "phase": "fetch_result",
+            "message": (
+                f"{venue} {race_no}R：結果ページ取得に失敗しました。"
+                f" ({type(exc).__name__}: {exc})"
+                f"{hist_msg}{pred_msg}{odds_msg}"
+            ),
+            "key": key_guess,
+            "next_action": "retry",
+        }
     raw_s = str(raw or "")
     if "着" not in raw_s and "払戻" not in raw_s:
-        return {"status": "skip", "message": "結果なし", "key": key_guess}
-    saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
-    key = str(saved.get("key") or key_guess)
-    odds_msg = ""
+        return {
+            "status": "skip",
+            "phase": "fetch_result",
+            "message": "結果なし" + hist_msg + pred_msg + odds_msg,
+            "key": key_guess,
+        }
     try:
-        applied = _v319_apply_odds_and_plan(db_path, ymd, venue, race_no, key)
-        odds_msg = f" / オッズ{applied.get('odds') or 0}件"
-        if applied.get("plan_hash"):
-            odds_msg += " / 回収率プラン保存"
+        saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
     except Exception as exc:
-        odds_msg = f" / オッズ失敗:{type(exc).__name__}"
-    return {"status": "ok", "message": key + hist_msg + pred_msg + odds_msg, "key": key}
+        return {
+            "status": "error",
+            "phase": "save_result",
+            "message": (
+                f"{venue} {race_no}R：結果登録に失敗しました。"
+                f" ({type(exc).__name__}: {exc})"
+                f"{hist_msg}{pred_msg}{odds_msg}"
+            ),
+            "key": key_guess,
+            "next_action": "retry",
+        }
+    key = str(saved.get("key") or key_guess)
+    if not _v319_result_exists(db_path, ymd, venue, race_no):
+        return {
+            "status": "error",
+            "phase": "verify_complete",
+            "message": (
+                f"{venue} {race_no}R：結果保存後に確認できません。"
+                f"{hist_msg}{pred_msg}{odds_msg}"
+            ),
+            "key": key,
+            "next_action": "retry",
+        }
+    return {
+        "status": "ok",
+        "phase": "completed",
+        "message": key + hist_msg + pred_msg + odds_msg,
+        "key": key,
+    }
+
 
 
 def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
@@ -10020,34 +10256,52 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 )
                 item["status"] = one.get("status") or "ok"
                 item["message"] = one.get("message") or ""
-                if item["status"] == "skip":
+                item["phase"] = one.get("phase") or ""
+                st_one = str(item["status"] or "")
+                if st_one == "skip":
                     skip += 1
+                elif st_one in ("error", "failed"):
+                    err += 1
                 else:
                     ok += 1
             except Exception as exc:
                 item["status"] = "error"
+                item["phase"] = "exception"
                 item["message"] = f"{type(exc).__name__}: {exc}"
                 err += 1
             details.append(item)
+            fail_hint = ""
+            if str(item.get("status") or "") in ("error", "failed"):
+                fail_hint = f"｜失敗:{vn}{n}R"
             _v278_bg_update(
                 db_path, job_id,
                 done_count=i,
                 current_label=f"{vn} {n}R {item['status']}",
-                message=f"{i}/{total}｜登録{ok} スキップ{skip} エラー{err}",
+                message=f"{i}/{total}｜登録{ok} スキップ{skip} エラー{err}{fail_hint}",
             )
             time_module.sleep(0.2)
         try:
             _v287_recalculate_global_transition_calibration(db_path)
         except Exception:
             pass
-        blob = zlib.compress(pickle.dumps({"ok": ok, "skip": skip, "error": err, "details": details}, protocol=4), 6)
+        failed_keys = [
+            f"{d.get('venue','')}{d.get('R','')}R"
+            for d in details
+            if str(d.get("status") or "") in ("error", "failed")
+        ]
+        fail_summary = ("｜失敗: " + ", ".join(failed_keys[:8])) if failed_keys else ""
+        blob = zlib.compress(pickle.dumps({
+            "ok": ok, "skip": skip, "error": err, "details": details,
+            "failed_keys": failed_keys,
+            "summary": f"自動取得が完了しました。完了：{ok}R / スキップ：{skip}R / 失敗：{err}R",
+        }, protocol=4), 6)
         _v278_bg_update(
             db_path, job_id,
             status="completed",
             finished_at=_v228_now_jst_iso(),
             done_count=total,
             current_label="完了",
-            message=f"登録{ok} / スキップ{skip} / エラー{err}",
+            message=f"自動取得完了｜完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}",
             result_blob=blob,
         )
     except Exception as exc:
@@ -22439,7 +22693,7 @@ if selected_main_page == "✅ 結果登録・解析":
     st.session_state.setdefault("result_input_version", 0)
 
     with st.expander("公式結果を自動取得して登録", expanded=False):
-        st.caption("順番は出走表→選手履歴30走→予測保存→結果登録です。結果の1走だけを履歴にはしません。")
+        st.caption("順番は出走表→選手履歴→予測保存確認→オッズ→結果登録です。履歴失敗時は予測しません。全レース終了時に集計通知します。")
         dcol, vcol = st.columns(2)
         fetch_date = dcol.date_input("開催日", value=date.today(), key="v319_op_fetch_date")
         fetch_venue = vcol.selectbox("開催場", ["開催を探す"] + RESULT_VENUES, key="v319_op_fetch_venue")
@@ -22498,7 +22752,21 @@ if selected_main_page == "✅ 結果登録・解析":
                         all_rep["error"] += int(rep.get("error") or 0)
                         all_rep["details"].extend(rep.get("details") or [])
                 st.session_state["v319_op_last_report"] = all_rep
-                st.success(f"登録 {all_rep['ok']} / スキップ {all_rep['skip']} / エラー {all_rep['error']}")
+                failed_items = [
+                    d for d in (all_rep.get("details") or [])
+                    if str(d.get("status") or "") in ("error", "failed")
+                ]
+                st.success(
+                    f"自動取得が完了しました。完了：{all_rep['ok']}R / スキップ：{all_rep['skip']}R / 失敗：{all_rep['error']}R"
+                )
+                if failed_items:
+                    st.warning(
+                        "失敗レース: "
+                        + " / ".join(
+                            f"{d.get('venue','')}{d.get('R','')}R {d.get('message','')}"
+                            for d in failed_items[:8]
+                        )
+                    )
                 st.caption("GitHubへは自動保存しません。問題なければサイドバーのDB保存を使ってください。")
 
         job_imp = _v278_bg_get_latest_active(engine.DB_PATH)
