@@ -8553,7 +8553,7 @@ def _v319_http_get(url: str, timeout: int = 20) -> str:
             "Accept-Language": "ja,en;q=0.8",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=int(timeout or 20)) as resp:
         raw = resp.read()
     return raw.decode("utf-8", errors="replace")
 
@@ -8600,8 +8600,24 @@ def _v319_list_oddspark_races(ymd: str, place_cd: str) -> list[int]:
     return [n for n in sorted(nos) if 1 <= n <= 12]
 
 
+def _v319_result_page_alive(ymd: str, venue: str, race_no: int) -> bool:
+    try:
+        html = _v319_http_get(
+            "https://www.oddspark.com/autorace/RaceResult.do"
+            f"?raceDy={re.sub(r'[^0-9]','',str(ymd))}"
+            f"&placeCd={_V319_OP_PLACE.get(str(venue) or '')}"
+            f"&raceNo={int(race_no)}",
+            timeout=12,
+        )
+    except Exception:
+        return False
+    if "該当するレースはありません" in html or "データがありません" in html:
+        return False
+    return ("払戻" in html or "着" in html) and ("選手" in html or "車" in html)
+
+
 def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[int]:
-    """常に1Rから昇順。サイトに出ている最大Rまで。"""
+    """実在する結果だけ。空の12Rは入れない。"""
     place = _V319_OP_PLACE.get(str(venue) or "")
     found = []
     if place:
@@ -8609,9 +8625,19 @@ def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[in
             found = _v319_list_oddspark_races(ymd, place)
         except Exception:
             found = []
-    last = max(found) if found else int(max_races or 12)
-    last = min(max(int(last), 1), int(max_races or 12))
-    return list(range(1, last + 1))
+    last_try = max(found) if found else int(max_races or 12)
+    last_try = min(max(int(last_try), 1), int(max_races or 12))
+    out = []
+    miss = 0
+    for n in range(1, last_try + 1):
+        if _v319_result_page_alive(ymd, venue, n):
+            out.append(n)
+            miss = 0
+        else:
+            miss += 1
+            if out and miss >= 2:
+                break
+    return out
 
 
 def _v319_html_cells(row_html: str) -> list[str]:
@@ -8979,6 +9005,13 @@ def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int) -> str:
 
 
 _V319_WX_CACHE: dict[str, dict] = {}
+_V319_WX_FETCHES = 0
+_V319_WX_FETCH_LIMIT = 15
+
+
+def _v319_wx_reset_budget() -> None:
+    global _V319_WX_FETCHES
+    _V319_WX_FETCHES = 0
 
 
 def _v319_race_weather(ymd: str, venue: str, race_no: int) -> dict:
@@ -8991,7 +9024,9 @@ def _v319_race_weather(ymd: str, venue: str, race_no: int) -> dict:
     if key in _V319_WX_CACHE:
         return _V319_WX_CACHE[key]
     out = {"走": "", "気": "", "湿": ""}
-    if ymd and venue and rno:
+    global _V319_WX_FETCHES
+    if ymd and venue and rno and _V319_WX_FETCHES < _V319_WX_FETCH_LIMIT:
+        _V319_WX_FETCHES += 1
         try:
             raw = _v319_html_to_text(_v319_fetch_sprace_html(ymd, venue, rno))
             m = re.search(r"(?:良走路|湿走路|斑走路)\s*/\s*(\d+(?:\.\d+)?)\s*℃", raw)
@@ -9645,22 +9680,35 @@ def _v319_import_official_results(
 def _v319_import_one_race(
     db_path: str, ymd: str, venue: str, race_no: int,
     skip_existing: bool, replace: bool, predict_if_missing: bool, trials: int, seed: int,
+    on_step=None,
 ) -> dict:
+    def _step(msg: str) -> None:
+        if on_step:
+            try:
+                on_step(str(msg))
+            except Exception:
+                pass
+
     exists = _v319_result_exists(db_path, ymd, venue, race_no)
     key_guess = f"{ymd}_{venue}_{int(race_no)}R"
+    if not exists and not _v319_result_page_alive(ymd, venue, race_no):
+        return {"status": "skip", "message": "結果なし", "key": key_guess}
     card_text = ""
     hist_msg = ""
     try:
+        _step("出走表")
         sp_html = _v319_fetch_sprace_html(ymd, venue, race_no)
         players = _v319_parse_sprace_car_rows(sp_html) or _v319_parse_sprace_players(sp_html)
         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
         if players:
+            _step("選手履歴")
             filled = _v319_fill_player_histories(db_path, players, min_rows=30)
             hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
     except Exception as exc:
         hist_msg = f" / 出走表取得失敗:{type(exc).__name__}"
     pred_msg = ""
     if predict_if_missing and not _v319_prediction_exists(db_path, key_guess):
+        _step("予測中")
         pred = _v319_run_prerace_prediction(
             db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text
         )
@@ -9684,6 +9732,7 @@ def _v319_import_one_race(
         except Exception as exc:
             odds_msg = f" / オッズ失敗:{type(exc).__name__}"
         return {"status": "skip", "message": "登録済み" + hist_msg + pred_msg + odds_msg, "key": key_guess}
+    _step("結果登録")
     raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
     saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
     key = str(saved.get("key") or key_guess)
@@ -9722,6 +9771,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             for n in _v319_ordered_race_nos(ymd, vn, int(req.get("max_races") or 12)):
                 targets.append((vn, int(n)))
         total = len(targets)
+        _v319_wx_reset_budget()
         _v278_bg_update(db_path, job_id, total_count=total, current_label=f"{total}R 見つかりました")
         for i, (vn, n) in enumerate(targets, 1):
             _v278_bg_pause_loop(db_path, job_id)
@@ -9748,6 +9798,12 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     predict_if_missing=bool(req.get("predict_if_missing")),
                     trials=int(req.get("trials") or 20000),
                     seed=int(req.get("seed") or 20260719),
+                    on_step=lambda msg, vn=vn, n=n, i=i, total=total: _v278_bg_update(
+                        db_path, job_id,
+                        current_label=f"{vn} {n}R",
+                        message=f"{i-1}/{total} 完了｜今は{msg}",
+                        done_count=i - 1,
+                    ),
                 )
                 item["status"] = one.get("status") or "ok"
                 item["message"] = one.get("message") or ""
