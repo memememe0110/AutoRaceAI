@@ -8620,7 +8620,7 @@ def _v319_result_page_alive(ymd: str, venue: str, race_no: int) -> bool:
 
 
 def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[int]:
-    """RaceListの当日リンクだけ。結果ページは1枚ずつ取りに行かない。"""
+    """1Rから当日の最大Rまで連番。抜けた1Rは補う。"""
     place = _V319_OP_PLACE.get(str(venue) or "")
     found = []
     if place:
@@ -8628,9 +8628,9 @@ def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[in
             found = _v319_list_oddspark_races(ymd, place)
         except Exception:
             found = []
-    found = [n for n in found if 1 <= int(n) <= int(max_races or 12)]
+    found = [int(n) for n in found if 1 <= int(n) <= int(max_races or 12)]
     if found:
-        return found
+        return list(range(1, max(found) + 1))
     return list(range(1, min(int(max_races or 12), 9) + 1))
 
 
@@ -9197,6 +9197,47 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
     return "\n".join([ln for ln in lines if ln is not None])
 
 
+def _v319_ymd_digits(value) -> str:
+    return re.sub(r"[^0-9]", "", str(value or ""))[:8]
+
+
+def _v319_player_history_state(db_path: str, player_name: str) -> dict:
+    key = _v319_norm_player_name(player_name)
+    out = {"count": 0, "latest": "", "keys": set()}
+    if not key:
+        return out
+    try:
+        with sqlite3.connect(str(db_path), timeout=15) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "v15_player_history_imports" not in tables:
+                return out
+            cols = {r[1] for r in con.execute("PRAGMA table_info(v15_player_history_imports)").fetchall()}
+            date_c = "race_date" if "race_date" in cols else ("開催日" if "開催日" in cols else None)
+            ven_c = "venue" if "venue" in cols else ("開催場" if "開催場" in cols else None)
+            rno_c = "race_no" if "race_no" in cols else ("レース" if "レース" in cols else None)
+            rows = con.execute(
+                "SELECT * FROM v15_player_history_imports WHERE replace(replace(COALESCE(player_name,''),' ',''),'　','')=?",
+                (key,),
+            ).fetchall()
+            names = [d[0] for d in con.execute("PRAGMA table_info(v15_player_history_imports)").fetchall()]
+            out["count"] = len(rows)
+            for row in rows:
+                rec = dict(zip(names, row))
+                ds = _v319_ymd_digits(rec.get(date_c) if date_c else rec.get("race_date"))
+                if ds and ds > out["latest"]:
+                    out["latest"] = ds
+                vn = str(rec.get(ven_c) or rec.get("venue") or "").replace("　", "").strip()
+                try:
+                    rn = int(rec.get(rno_c) or rec.get("race_no") or 0)
+                except Exception:
+                    rn = 0
+                if ds:
+                    out["keys"].add((ds, vn, rn))
+    except Exception:
+        pass
+    return out
+
+
 def _v319_player_history_count(db_path: str, player_name: str) -> int:
     key = _v319_norm_player_name(player_name)
     if not key:
@@ -9304,17 +9345,42 @@ def _v319_fill_player_histories(db_path: str, players: list[dict], min_rows: int
     for p in players:
         name = p.get("name") or ""
         pcd = p.get("player_cd") or ""
-        have = _v319_player_history_count(db_path, name)
-        if have >= int(min_rows):
-            skipped += 1
-            details.append(f"{name}:既存{have}")
-            continue
+        state = _v319_player_history_state(db_path, name)
+        have = int(state.get("count") or 0)
+        latest = str(state.get("latest") or "")
+        have_keys = state.get("keys") or set()
         try:
             df = _v319_fetch_player_history_df(pcd, name)
             if df is None or df.empty:
                 errors += 1
                 details.append(f"{name}:履歴0件")
                 continue
+            if have <= 0:
+                work = df.copy()
+                if "開催日" in work.columns:
+                    work["_ymd"] = work["開催日"].map(_v319_ymd_digits)
+                    work = work.sort_values("_ymd", ascending=False, kind="mergesort")
+                    work = work.drop(columns=["_ymd"])
+                df = work.head(int(min_rows or 30))
+            elif latest or have_keys:
+                keep = []
+                for _, r in df.iterrows():
+                    ds = _v319_ymd_digits(r.get("開催日"))
+                    vn = str(r.get("開催場") or "").replace("　", "").strip()
+                    try:
+                        rn = int(r.get("レース") or 0)
+                    except Exception:
+                        rn = 0
+                    if not ds:
+                        continue
+                    if ds > latest or (ds, vn, rn) not in have_keys:
+                        keep.append(r)
+                if keep:
+                    df = pd.DataFrame(keep)
+                elif have > 0:
+                    skipped += 1
+                    details.append(f"{name}:最新済{latest or have}")
+                    continue
             lines = [str(name)]
             for n, (_, r) in enumerate(df.iterrows()):
                 if n == 0:
@@ -9392,13 +9458,27 @@ def _v319_fill_player_histories(db_path: str, players: list[dict], min_rows: int
     return {"added": added, "skipped": skipped, "errors": errors, "details": details}
 
 
+def _v319_race_key_candidates(ymd: str, venue: str, race_no: int) -> list[str]:
+    ymd = _v319_ymd_digits(ymd)
+    ymd_d = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}" if len(ymd) == 8 else ymd
+    n = int(race_no)
+    return [
+        f"{ymd}_{venue}_{n}R",
+        f"{ymd_d}_{venue}_{n}R",
+        f"{ymd}_{venue}_{n}",
+        f"{ymd_d}_{venue}_{n}",
+    ]
+
+
 def _v319_result_exists(db_path: str, ymd: str, venue: str, race_no: int) -> bool:
-    key = f"{ymd}_{venue}_{int(race_no)}R"
+    keys = _v319_race_key_candidates(ymd, venue, race_no)
     try:
         with sqlite3.connect(str(db_path), timeout=10) as con:
+            ph = ",".join("?" * len(keys))
             n = con.execute(
-                "SELECT COUNT(*) FROM result_races WHERE race_key=? OR (replace(race_date,'-','')=? AND venue=? AND CAST(race_no AS INTEGER)=?)",
-                (key, ymd, venue, int(race_no)),
+                f"SELECT COUNT(*) FROM result_races WHERE race_key IN ({ph}) "
+                "OR (replace(replace(COALESCE(race_date,''),'-',''),'/','')=? AND venue=? AND CAST(race_no AS INTEGER)=?)",
+                (*keys, _v319_ymd_digits(ymd), venue, int(race_no)),
             ).fetchone()
             return bool(n and int(n[0] or 0) > 0)
     except Exception:
@@ -9411,9 +9491,15 @@ def _v319_prediction_exists(db_path: str, race_key: str) -> bool:
         with sqlite3.connect(str(db_path), timeout=10) as con:
             tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             if "v231_prediction_history" in tables:
+                keys = [str(race_key)]
+                m = re.match(r"(\d{4})-?(\d{2})-?(\d{2})_(.+)_(\d+)R?", str(race_key))
+                if m:
+                    ymd = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                    keys = _v319_race_key_candidates(ymd, m.group(4), m.group(5))
+                ph = ",".join("?" * len(keys))
                 n = con.execute(
-                    "SELECT COUNT(*) FROM v231_prediction_history WHERE race_key=?",
-                    (str(race_key),),
+                    f"SELECT COUNT(*) FROM v231_prediction_history WHERE race_key IN ({ph})",
+                    tuple(keys),
                 ).fetchone()
                 if n and int(n[0] or 0) > 0:
                     return True
@@ -9685,8 +9771,6 @@ def _v319_import_one_race(
 
     exists = _v319_result_exists(db_path, ymd, venue, race_no)
     key_guess = f"{ymd}_{venue}_{int(race_no)}R"
-    if not exists and not _v319_result_page_alive(ymd, venue, race_no):
-        return {"status": "skip", "message": "結果なし", "key": key_guess}
     card_text = ""
     hist_msg = ""
     try:
@@ -9728,6 +9812,9 @@ def _v319_import_one_race(
         return {"status": "skip", "message": "登録済み" + hist_msg + pred_msg + odds_msg, "key": key_guess}
     _step("結果登録")
     raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+    raw_s = str(raw or "")
+    if "着" not in raw_s and "払戻" not in raw_s:
+        return {"status": "skip", "message": "結果なし", "key": key_guess}
     saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
     key = str(saved.get("key") or key_guess)
     odds_msg = ""
@@ -9761,9 +9848,14 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
         ymd = str(req.get("ymd") or "")
         venues = list(req.get("venues") or [])
         targets = []
+        seen = set()
         for vn in venues:
             for n in _v319_ordered_race_nos(ymd, vn, int(req.get("max_races") or 12)):
-                targets.append((vn, int(n)))
+                item = (str(vn), int(n))
+                if item in seen:
+                    continue
+                seen.add(item)
+                targets.append(item)
         total = len(targets)
         _v319_wx_reset_budget()
         _v278_bg_update(db_path, job_id, total_count=total, current_label=f"{total}R 見つかりました")
