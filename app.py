@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver317"
+APP_VERSION = "Ver316"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver317"  # Ver317: 同ハンデは早め決着（前残り+早仕掛け）。波乱は潰しすぎない。湿/良の時間補正分離と壁の日付カットは継続。
+_V231_APP_VERSION = "Ver316"  # Ver316: 同ハンデは前残り寄り。湿を良の時間補正に混ぜない。壁補正に日付カット。
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -6443,13 +6443,10 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     scenario_feedback_v264=_v264_feedback_scenario_adjustment(_v230_db_path(), venue, race_date)
     scenario_branch_prior_v264=_v264_blended_scenario_prior(scenario_prior, scenario_feedback_v264)
     if _same_h316 and isinstance(scenario_branch_prior_v264, dict) and scenario_branch_prior_v264:
-        # 213R公式ノート: 同ハンデG1は前残り8%・早仕掛け39%・波乱36%。
-        # 前残りだけ厚くせず、1〜2周で決まる型を足す。波乱は残す。
         _boosted316=dict(scenario_branch_prior_v264)
-        _boosted316["前残り型"]=float(_boosted316.get("前残り型",0.0))+0.12
-        _boosted316["早仕掛け型"]=float(_boosted316.get("早仕掛け型",0.0))+0.20
-        _boosted316["後半追込型"]=float(_boosted316.get("後半追込型",0.0))*0.70
-        _boosted316["波乱型"]=float(_boosted316.get("波乱型",0.0))*0.90
+        _boosted316["前残り型"]=float(_boosted316.get("前残り型",0.0))+0.28
+        _boosted316["後半追込型"]=float(_boosted316.get("後半追込型",0.0))*0.55
+        _boosted316["波乱型"]=float(_boosted316.get("波乱型",0.0))*0.55
         _z316=sum(float(v) for v in _boosted316.values()) or 1.0
         scenario_branch_prior_v264={k:float(v)/_z316 for k,v in _boosted316.items()}
     # Ver285: 展開頻度は触らず、同じ展開型で周回内入替がズレた分だけ学習。
@@ -6659,9 +6656,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 weak_front_bonus=0.34*max(0.0,speed_edge-0.25)
                 late_pressure=0.03*(lap-1)
                 if _same_h316:
-                    late_pressure*=0.45
+                    late_pressure*=0.25
                     if i==1:
-                        front_hold += 0.07
+                        front_hold += 0.12
                 empirical_pass_delta = venue_wall_delta + float(lap_wall_delta.get(lap, 0.0))
                 # 直前の追い抜き成功は次の壁突破を少し後押しする。ただし毎周減衰させる。
                 chain_bonus=min(0.42, momentum.get(chaser,0.0))
@@ -6725,7 +6722,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
                 if _same_h316:
-                    p*=(0.88 if lap==2 else (0.75 if lap>=3 else 1.0))
+                    p*=(0.80 if lap==2 else (0.62 if lap>=3 else 1.0))
                     p=max(0.035,min(0.88,p))
                 # Ver272: Ver271の3～4周目補正を実際の追い抜き確率へ接続。
                 try:
