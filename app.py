@@ -8510,6 +8510,403 @@ def v73_copy_box(title: str, text: str, key: str, height: int = 145) -> None:
 GENERAL_REMINDER_JST = ZoneInfo("Asia/Tokyo")
 
 
+_V319_OP_PLACE = {"川口": "02", "伊勢崎": "03", "浜松": "04", "飯塚": "05", "山陽": "06"}
+_V319_OP_PLACE_REV = {v: k for k, v in _V319_OP_PLACE.items()}
+
+
+def _v319_http_get(url: str, timeout: int = 20) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; AutoRaceAI/319; +https://autorace.jp/)",
+            "Accept-Language": "ja,en;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return raw.decode("utf-8", errors="replace")
+
+
+def _v319_html_to_text(html: str) -> str:
+    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    html = re.sub(r"(?i)<br\s*/?>", "\n", html)
+    html = re.sub(r"(?i)</(p|div|tr|h\d|li|table)>", "\n", html)
+    html = re.sub(r"(?i)<td[^>]*>", "\t", html)
+    html = re.sub(r"(?i)<[^>]+>", " ", html)
+    html = html.replace("&nbsp;", " ").replace("&amp;", "&")
+    html = re.sub(r"[ \t]+", " ", html)
+    html = re.sub(r" *\n *", "\n", html)
+    html = re.sub(r"\n{3,}", "\n\n", html)
+    return html
+
+
+def _v319_list_oddspark_meetings(ymd: str) -> list[dict]:
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    if len(ymd) != 8:
+        return []
+    url = f"https://www.oddspark.com/autorace/KaisaiRaceList.do?raceDy={ymd}"
+    html = _v319_http_get(url)
+    found = []
+    for cd in sorted(set(re.findall(r"placeCd=(\d+)", html))):
+        venue = _V319_OP_PLACE_REV.get(cd)
+        if venue:
+            found.append({"venue": venue, "place_cd": cd, "ymd": ymd})
+    return found
+
+
+def _v319_list_oddspark_races(ymd: str, place_cd: str) -> list[int]:
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    url = f"https://www.oddspark.com/autorace/RaceResult.do?raceDy={ymd}&placeCd={place_cd}"
+    html = _v319_http_get(url)
+    nos = sorted({int(x) for x in re.findall(r"raceNo=(\d+)", html) if str(x).isdigit()})
+    return [n for n in nos if 1 <= n <= 12]
+
+
+def _v319_html_cells(row_html: str) -> list[str]:
+    cells = []
+    for cell in re.findall(r"(?is)<t[dh][^>]*>(.*?)</t[dh]>", row_html):
+        cell = re.sub(r"(?is)<br\s*/?>", " ", cell)
+        cell = re.sub(r"(?is)<[^>]+>", "", cell)
+        cell = cell.replace("&nbsp;", " ").replace("&amp;", "&").replace("&#12288;", " ")
+        cell = re.sub(r"&#(\d+);", lambda mm: chr(int(mm.group(1))), cell)
+        cell = re.sub(r"\s+", " ", cell).strip()
+        cells.append(cell)
+    return cells
+
+
+def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ymd: str) -> str:
+    raw = _v319_html_to_text(html)
+    # 日付
+    date_s = ""
+    m = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日(?:\([^)]+\))?)", raw)
+    if m:
+        date_s = m.group(1)
+    else:
+        date_s = f"{ymd[:4]}年{int(ymd[4:6])}月{int(ymd[6:8])}日"
+    weather = ""
+    wm = re.search(r"天候：\s*(\S+)", raw)
+    if wm:
+        weather = wm.group(1)
+    surface = ""
+    sm = re.search(r"走路状況：\s*(\S+)", raw)
+    if sm:
+        surface = sm.group(1)
+    track_temp = ""
+    tm = re.search(r"走路温度：\s*([\d.]+)", raw)
+    if tm:
+        track_temp = tm.group(1)
+    air = ""
+    am = re.search(r"気温：\s*([\d.]+)", raw)
+    if am:
+        air = am.group(1)
+    hum = ""
+    hm = re.search(r"湿度：\s*([\d.]+)", raw)
+    if hm:
+        hum = hm.group(1)
+
+    lines = [f"{int(race_no)}R", "確定", "締切済", date_s, str(venue or "")]
+    if surface:
+        extra = f"{surface}"
+        if track_temp:
+            extra += f" /{track_temp}℃"
+        lines.append(extra)
+    if weather:
+        lines.append(weather)
+    if air:
+        lines.append(f"気温：{air}℃")
+    if hum:
+        lines.append(f"湿度：{hum}%")
+    lines.append("着順	車番	選手名")
+    lines.append("LG/ハンデ/試走T	競走T（人気）")
+    lines.append("ST/事故")
+
+    tables = re.findall(r"(?is)<table[^>]*>(.*?)</table>", html)
+    finish_rows, lap_rows, pay_rows = [], [], []
+    for table in tables:
+        rows = re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", table)
+        if not rows:
+            continue
+        head = " ".join(_v319_html_cells(rows[0]))
+        body = [_v319_html_cells(r) for r in rows]
+        if "着" in head and "車" in head and "選手" in head:
+            finish_rows = [_v319_html_cells(r) for r in rows[1:]]
+        elif "周回" in head or "1位" in head:
+            lap_rows = body
+        elif any(k in head for k in ("単勝", "払戻", "2連", "ワイド", "3連")):
+            pay_rows.extend(body)
+
+    for cells in finish_rows:
+        if len(cells) < 8:
+            continue
+        pos, acc, car = cells[0], cells[1], cells[2]
+        name = re.sub(r"\s+", "", cells[3] if len(cells) > 3 else "")
+        lg = cells[5] if len(cells) > 5 else venue
+        hand = re.sub(r"[^0-9]", "", cells[6] if len(cells) > 6 else "") or "0"
+        trial = cells[7] if len(cells) > 7 else "0.00"
+        race_t = cells[8] if len(cells) > 8 else "0.000"
+        st = cells[9] if len(cells) > 9 else "0.00"
+        abn = cells[10] if len(cells) > 10 else ""
+        pop = cells[11] if len(cells) > 11 else "-"
+        if acc == "欠車" or pos in ("-", "欠"):
+            lines.append(f"-\t{car}\t{name}")
+            lines.append(f"{lg}/{hand}m/{trial}\t0.000(-)")
+            lines.append("0.00 /欠車")
+            continue
+        flag = f" /{abn}" if abn else ""
+        lines.append(f"{pos}\t{car}\t{name}")
+        lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop}){flag}")
+        lines.append(str(st))
+
+    if lap_rows:
+        lines.append("グランドノート")
+        lines.append("周回・順位	1	2	3	4	5	6	7	8")
+        for cells in lap_rows[1:]:
+            if not cells:
+                continue
+            label = cells[0].replace("通過", "")
+            if "ゴール" in label:
+                label = "ゴール線"
+            cars = "\t".join(c for c in cells[1:] if re.fullmatch(r"\d+", c or ""))
+            if cars:
+                lines.append(f"{label}\t{cars}")
+
+    lines.append("払戻金")
+    kind = ""
+    for cells in pay_rows:
+        vals = [c for c in cells if c]
+        if not vals:
+            continue
+        if vals[0] in ("単勝", "複勝", "2連複", "2連単", "ワイド", "3連複", "3連単"):
+            kind = vals[0]
+            rest = vals[1:]
+        else:
+            rest = vals
+        if not kind:
+            continue
+        yen = next((v for v in rest if "円" in v), "")
+        before = []
+        for v in rest:
+            if "円" in v:
+                break
+            if re.fullmatch(r"\d+", v or ""):
+                before.append(v)
+        if kind and yen and before:
+            lines.append(f"{kind}\t{'-'.join(before)}\t{yen}")
+    pay_txt = re.sub(r"\s*-\s*", "-", raw.replace("\t", " "))
+    pay_txt = re.sub(r"\s+", " ", pay_txt)
+    existing = "\n".join(lines)
+    for pk in ["2連複", "2連単", "ワイド", "3連複", "3連単"]:
+        for mm in re.finditer(rf"{pk}\s+([0-9\-]+)\s+([\d,]+)円", pay_txt):
+            row = f"{pk}\t{mm.group(1)}\t{mm.group(2)}円"
+            if row not in existing:
+                lines.append(row)
+                existing += "\n" + row
+    return "\n".join(lines)
+
+
+def _v319_fetch_oddspark_result(ymd: str, venue: str, race_no: int) -> str:
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    place = _V319_OP_PLACE.get(str(venue))
+    if not ymd or not place:
+        raise ValueError("開催日または開催場が不正です")
+    url = (
+        "https://www.oddspark.com/autorace/RaceResult.do"
+        f"?raceDy={ymd}&placeCd={place}&raceNo={int(race_no)}"
+    )
+    html = _v319_http_get(url)
+    if "着" not in html and "払戻" not in html:
+        raise ValueError("結果ページを取得できませんでした")
+    return _v319_normalize_oddspark_result_text(html, venue, int(race_no), ymd)
+
+
+def _v319_result_exists(db_path: str, ymd: str, venue: str, race_no: int) -> bool:
+    key = f"{ymd}_{venue}_{int(race_no)}R"
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as con:
+            n = con.execute(
+                "SELECT COUNT(*) FROM result_races WHERE race_key=? OR (replace(race_date,'-','')=? AND venue=? AND CAST(race_no AS INTEGER)=?)",
+                (key, ymd, venue, int(race_no)),
+            ).fetchone()
+            return bool(n and int(n[0] or 0) > 0)
+    except Exception:
+        return False
+
+
+def _v319_prediction_exists(db_path: str, race_key: str) -> bool:
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as con:
+            n = con.execute(
+                "SELECT COUNT(*) FROM prediction_snapshots WHERE race_key=?",
+                (str(race_key),),
+            ).fetchone()
+            return bool(n and int(n[0] or 0) > 0)
+    except Exception:
+        return False
+
+
+def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719) -> dict:
+    """結果からレース前項目だけ再構成して予測し、補正・回収照合の土台を作る。"""
+    text, audit = _v304_build_safe_prediction_text_from_result(db_path, race_key)
+    if not text:
+        return {"ok": False, "reason": str((audit or {}).get("reason") or "再構成失敗")}
+    prediction_text = f"開催場: {venue}\n" + text if venue else text
+    seed = int(seed if seed is not None else 20260719)
+    try:
+        if bool(globals().get("use_champion_model", True)):
+            engine.v311_set_champion_model_state()
+        else:
+            engine.v305_clear_model_state_override()
+    except Exception:
+        pass
+    df, bets, output, entries, meta = engine.ver16_run_prediction(
+        prediction_text, int(trials), int(seed), manual_excluded=[]
+    )
+    entries = _v276_mark_retrial_from_prediction_text(entries, prediction_text)
+    df = _v276_copy_retrial_to_prediction_df(df, entries)
+    meta = dict(meta or {})
+    df, bets, wall_audit = _v230_six_lap_simulation(df, bets, entries, meta, int(trials), int(seed))
+    meta["壁補正監査"] = wall_audit
+    meta["6周展開シミュレーション"] = wall_audit
+    try:
+        engine.v305_clear_model_state_override()
+    except Exception:
+        pass
+    finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
+    df = _v284_apply_simulation_joint_ranks(df, wall_audit)
+    saved_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, db_path)
+    view = {
+        "df": df, "bets": bets, "output": output, "entries": entries, "meta": meta,
+        "finish_prob": finish_prob, "race_key": saved_key or race_key,
+        "trials": int(trials), "excluded": [], "app_version": _V231_APP_VERSION,
+        "simulation_mode": _V231_SIMULATION_MODE,
+        "prediction_time": _v228_now_jst_iso(), "seed": int(seed),
+        "settings_hash": _v231_settings_hash(int(trials), int(seed), []),
+    }
+    try:
+        _v231_save_prediction_history(db_path, saved_key or race_key, text, venue, view, int(trials), int(seed))
+        _v222_save_prediction_restore(db_path, saved_key or race_key, text, venue, view)
+    except Exception:
+        pass
+    try:
+        _v217_deferred_prediction_db_save(meta, bets, int(trials), df)
+    except Exception:
+        pass
+    return {"ok": True, "race_key": saved_key or race_key, "trials": int(trials)}
+
+
+def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, replace: bool = False) -> dict:
+    meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(raw_text, venue, "")
+    meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(raw_text, meta_r, rows_r)
+    extra = _v315_detect_kessha_cars(raw_text, rows_r)
+    kessha = sorted(set(int(x) for x in (nonstarter_numbers or [])) | set(extra))
+    meta_r = dict(meta_r or {})
+    if kessha:
+        meta_r["欠車車番"] = kessha
+        meta_r["事前除外車番"] = kessha
+        meta_r["比較対象外車番"] = kessha
+    meta_r, _inc = _v227_detect_poststart_incidents(raw_text, meta_r)
+    rows_for_engine = _v315_drop_kessha_rows(rows_r, kessha)
+    if kessha:
+        meta_r["実出走数"] = int(len(rows_for_engine))
+    if replace:
+        key, *_rest = engine.v70_replace_registered_result(
+            meta_r, rows_for_engine, laps_r, payouts_r, db_path
+        )
+    else:
+        key, *_rest = engine.v41_register_result(
+            meta_r, rows_for_engine, laps_r, payouts_r, db_path
+        )
+    try:
+        _v238_save_exact_raw_result(db_path, str(key), raw_text, source="oddspark_auto")
+    except Exception:
+        pass
+    try:
+        _v279_save_player_incident_history(db_path, str(key), meta_r, rows_r, _inc)
+    except Exception:
+        pass
+    try:
+        engine.v67_analyze_ticket_result(meta_r, rows_r, db_path)
+    except Exception:
+        pass
+    try:
+        _v187_sync_mixed_feedback(db_path)
+    except Exception:
+        pass
+    return {"key": str(key), "cars": int(len(rows_for_engine)), "laps": int(len(laps_r) if laps_r is not None else 0)}
+
+
+def _v319_import_official_results(
+    db_path: str,
+    ymd: str,
+    venue: str,
+    skip_existing: bool = True,
+    replace: bool = False,
+    max_races: int = 12,
+    predict_if_missing: bool = True,
+    trials: int = 20000,
+    seed: int = 20260719,
+) -> dict:
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    place = _V319_OP_PLACE.get(str(venue))
+    report = {"ok": 0, "skip": 0, "error": 0, "details": []}
+    if not ymd or not place:
+        report["error"] = 1
+        report["details"].append({"status": "error", "message": "開催日または開催場が不正です"})
+        return report
+    try:
+        races = _v319_list_oddspark_races(ymd, place)
+    except Exception as exc:
+        report["error"] = 1
+        report["details"].append({"status": "error", "message": f"開催一覧の取得失敗: {exc}"})
+        return report
+    if not races:
+        races = list(range(1, int(max_races) + 1))
+    races = [n for n in races if n <= int(max_races)]
+    for n in races:
+        item = {"venue": venue, "R": n, "status": "", "message": ""}
+        try:
+            exists = _v319_result_exists(db_path, ymd, venue, n)
+            key_guess = f"{ymd}_{venue}_{int(n)}R"
+            if exists and skip_existing and not replace:
+                item["status"] = "skip"
+                item["message"] = "登録済み"
+                if predict_if_missing and not _v319_prediction_exists(db_path, key_guess):
+                    pred = _v319_run_prerace_prediction(db_path, key_guess, venue, trials=int(trials), seed=int(seed))
+                    item["message"] += " / 予測 " + ("OK" if pred.get("ok") else str(pred.get("reason") or "失敗"))
+                    try:
+                        _v187_sync_mixed_feedback(db_path)
+                    except Exception:
+                        pass
+                report["skip"] += 1
+                report["details"].append(item)
+                continue
+            raw = _v319_fetch_oddspark_result(ymd, venue, n)
+            saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
+            key = str(saved.get("key") or key_guess)
+            pred_msg = ""
+            if predict_if_missing and not _v319_prediction_exists(db_path, key):
+                pred = _v319_run_prerace_prediction(db_path, key, venue, trials=int(trials), seed=int(seed))
+                pred_msg = " / 予測OK" if pred.get("ok") else f" / 予測失敗:{pred.get('reason')}"
+                try:
+                    _v187_sync_mixed_feedback(db_path)
+                except Exception:
+                    pass
+            item["status"] = "ok"
+            item["message"] = key + pred_msg
+            report["ok"] += 1
+        except Exception as exc:
+            item["status"] = "error"
+            item["message"] = f"{type(exc).__name__}: {exc}"
+            report["error"] += 1
+        report["details"].append(item)
+        time_module.sleep(0.35)
+    try:
+        _v287_recalculate_global_transition_calibration(db_path)
+    except Exception:
+        pass
+    return report
+
+
 RESULT_VENUES = ["飯塚", "山陽", "浜松", "川口", "伊勢崎"]
 PREDICTION_VENUES = ["川口", "伊勢崎", "浜松", "山陽", "飯塚"]
 _V315_EVENT_VENUE_MAP = (
@@ -20803,6 +21200,54 @@ if selected_main_page == "✅ 結果登録・解析":
     _show_sticky_notice("result_register_notice")
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
+
+    with st.expander("公式結果を自動取得して登録", expanded=False):
+        st.caption("未予測ならサイドバーの試行回数・乱数シード・Champion設定で予測してから結果照合します。通常の予測と同じ値です。")
+        dcol, vcol = st.columns(2)
+        fetch_date = dcol.date_input("開催日", value=date.today(), key="v319_op_fetch_date")
+        fetch_venue = vcol.selectbox("開催場", ["開催を探す"] + RESULT_VENUES, key="v319_op_fetch_venue")
+        skip_existing = st.checkbox("登録済みは飛ばす", value=True, key="v319_op_skip_existing")
+        replace_existing = st.checkbox("登録済みを置き換える", value=False, key="v319_op_replace_existing")
+        predict_missing = st.checkbox("未予測なら予測して補正を更新", value=True, key="v319_op_predict_missing")
+        if st.button("この日の開催を確認", use_container_width=True, key="v319_op_list_meetings"):
+            try:
+                ymd = fetch_date.strftime("%Y%m%d")
+                meets = _v319_list_oddspark_meetings(ymd)
+                st.session_state["v319_op_meetings"] = meets
+            except Exception as exc:
+                st.error(f"開催一覧の取得に失敗: {exc}")
+        meets = st.session_state.get("v319_op_meetings") or []
+        if meets:
+            st.write("取得できた開催: " + "、".join(f"{m['venue']}" for m in meets))
+        if st.button("結果を取得して登録", type="primary", use_container_width=True, key="v319_op_import"):
+            ymd = fetch_date.strftime("%Y%m%d")
+            venues = [fetch_venue] if fetch_venue in RESULT_VENUES else [m["venue"] for m in meets]
+            if not venues:
+                st.warning("開催場を選ぶか、先に開催確認してください。")
+            else:
+                all_rep = {"ok": 0, "skip": 0, "error": 0, "details": []}
+                with st.spinner(f"{ymd} {','.join(venues)} を取得しています…"):
+                    for vn in venues:
+                        rep = _v319_import_official_results(
+                            engine.DB_PATH,
+                            ymd,
+                            vn,
+                            skip_existing=bool(skip_existing and not replace_existing),
+                            replace=bool(replace_existing),
+                            predict_if_missing=bool(predict_missing),
+                            trials=int(trials),
+                            seed=int(seed),
+                        )
+                        all_rep["ok"] += int(rep.get("ok") or 0)
+                        all_rep["skip"] += int(rep.get("skip") or 0)
+                        all_rep["error"] += int(rep.get("error") or 0)
+                        all_rep["details"].extend(rep.get("details") or [])
+                st.session_state["v319_op_last_report"] = all_rep
+                st.success(f"登録 {all_rep['ok']} / スキップ {all_rep['skip']} / エラー {all_rep['error']}")
+                st.caption("GitHubへは自動保存しません。問題なければサイドバーのDB保存を使ってください。")
+        last_rep = st.session_state.get("v319_op_last_report")
+        if last_rep:
+            st.dataframe(pd.DataFrame(last_rep.get("details") or []), use_container_width=True, hide_index=True)
 
     saved_results = _v233_list_saved_results(engine.DB_PATH, 250)
     if saved_results:
