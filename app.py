@@ -14,6 +14,7 @@ import tempfile
 import zipfile
 import threading
 import traceback
+import http.cookiejar
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2215,9 +2216,16 @@ def _v278_bg_get_job(db_path: str, job_id: int | None = None) -> dict:
             else:
                 row=con.execute("""
                     SELECT * FROM v278_background_jobs
-                    WHERE job_type='batch_rerun'
+                    WHERE status IN ('queued','running','pause_requested','paused','cancel_requested')
+                      AND job_type IN ('batch_rerun','official_import','normal_prediction')
                     ORDER BY job_id DESC LIMIT 1
                 """).fetchone()
+                if not row:
+                    row=con.execute("""
+                        SELECT * FROM v278_background_jobs
+                        WHERE job_type IN ('batch_rerun','official_import')
+                        ORDER BY job_id DESC LIMIT 1
+                    """).fetchone()
         if not row:
             return {}
         d=dict(row)
@@ -2240,7 +2248,7 @@ def _v278_bg_has_running_job(db_path: str) -> bool:
             con.execute("PRAGMA busy_timeout=30000")
             row=con.execute("""
                 SELECT COUNT(*) FROM v278_background_jobs
-                WHERE job_type='batch_rerun' AND status IN ('queued','running','pause_requested','paused','cancel_requested')
+                WHERE job_type IN ('batch_rerun','official_import') AND status IN ('queued','running','pause_requested','paused','cancel_requested')
             """).fetchone()
         return bool(int(row[0] or 0))
     except Exception:
@@ -8511,6 +8519,8 @@ GENERAL_REMINDER_JST = ZoneInfo("Asia/Tokyo")
 
 
 _V319_OP_PLACE = {"川口": "02", "伊勢崎": "03", "浜松": "04", "飯塚": "05", "山陽": "06"}
+_V319_AR_PLACE_CODE = {"川口": 2, "伊勢崎": 3, "浜松": 4, "飯塚": 5, "山陽": 6}
+_V319_AR_PLACE_SLUG = {"川口": "kawaguchi", "伊勢崎": "isesaki", "浜松": "hamamatsu", "飯塚": "iizuka", "山陽": "sanyou"}
 _V319_OP_PLACE_REV = {v: k for k, v in _V319_OP_PLACE.items()}
 
 
@@ -8733,6 +8743,136 @@ def _v319_fetch_oddspark_result(ymd: str, venue: str, race_no: int) -> str:
     return _v319_normalize_oddspark_result_text(html, venue, int(race_no), ymd)
 
 
+def _v319_float_odd(val) -> float | None:
+    if isinstance(val, dict):
+        nums = []
+        for k in ("min", "max", "odds"):
+            if val.get(k) not in (None, "", "-"):
+                try:
+                    nums.append(float(str(val.get(k)).replace(",", "")))
+                except Exception:
+                    pass
+        return min(nums) if nums else None
+    try:
+        s = str(val or "").replace(",", "").strip()
+        if not s or s in {"-", "–"}:
+            return None
+        n = float(s)
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _v319_official_odds_to_parsed(body: dict) -> dict:
+    parsed = {"3tan": {}, "3fuku": {}, "2tansho": {}, "2fuku": {}, "tansho": {}, "fukusho": {}, "wide": {}}
+    tns = body.get("tnsOddsList") or {}
+    for a, o in tns.items():
+        n = _v319_float_odd(o)
+        if n:
+            parsed["tansho"][str(a)] = n
+    fns = body.get("fnsOddsList") or {}
+    for a, o in fns.items():
+        n = _v319_float_odd(o)
+        if n:
+            parsed["fukusho"][str(a)] = n
+    rtw = body.get("rtwOddsList") or {}
+    for a, inner in rtw.items():
+        if not isinstance(inner, dict):
+            continue
+        for b, o in inner.items():
+            n = _v319_float_odd(o)
+            if n:
+                parsed["2tansho"][f"{a}-{b}"] = n
+    rfw = body.get("rfwOddsList") or {}
+    for a, inner in rfw.items():
+        if not isinstance(inner, dict):
+            continue
+        for b, o in inner.items():
+            n = _v319_float_odd(o)
+            if n:
+                combo = "-".join(sorted((str(a), str(b)), key=int))
+                parsed["2fuku"][combo] = n
+    wid = body.get("widOddsList") or {}
+    for a, inner in wid.items():
+        if not isinstance(inner, dict):
+            continue
+        for b, o in inner.items():
+            n = _v319_float_odd(o)
+            if n:
+                combo = "-".join(sorted((str(a), str(b)), key=int))
+                parsed["wide"][combo] = n
+    rt3 = body.get("rt3OddsList") or {}
+    for a, mid in rt3.items():
+        if not isinstance(mid, dict):
+            continue
+        for b, inner in mid.items():
+            if not isinstance(inner, dict):
+                continue
+            for c, o in inner.items():
+                n = _v319_float_odd(o)
+                if n:
+                    parsed["3tan"][f"{a}-{b}-{c}"] = n
+    rf3 = body.get("rf3OddsList") or {}
+    for a, mid in rf3.items():
+        if not isinstance(mid, dict):
+            continue
+        for b, inner in mid.items():
+            if not isinstance(inner, dict):
+                continue
+            for c, o in inner.items():
+                n = _v319_float_odd(o)
+                if n:
+                    combo = "-".join(sorted((str(a), str(b), str(c)), key=int))
+                    parsed["3fuku"][combo] = n
+    return parsed
+
+
+def _v319_fetch_official_odds(ymd: str, venue: str, race_no: int) -> dict:
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    code = _V319_AR_PLACE_CODE.get(str(venue) or "")
+    slug = _V319_AR_PLACE_SLUG.get(str(venue) or "")
+    if len(ymd) != 8 or not code or not slug:
+        raise ValueError("開催日または開催場が不正です")
+    date_s = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+    page_url = f"https://autorace.jp/race_info/Odds/{slug}/{date_s}_{int(race_no)}/pop"
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    page = opener.open(
+        urllib.request.Request(page_url, headers={"User-Agent": "Mozilla/5.0"}),
+        timeout=20,
+    ).read().decode("utf-8", "replace")
+    token_m = re.search(r'csrf-token" content="([^"]+)"', page)
+    token = token_m.group(1) if token_m else ""
+    payload = json.dumps({"placeCode": int(code), "raceDate": date_s, "raceNo": int(race_no)}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://autorace.jp/race_info/Odds",
+        data=payload,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-CSRF-TOKEN": token,
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": page_url,
+            "Origin": "https://autorace.jp",
+        },
+        method="POST",
+    )
+    raw = opener.open(req, timeout=25).read().decode("utf-8", "replace")
+    data = json.loads(raw)
+    if str(data.get("result") or "") != "Success":
+        raise ValueError(str((data.get("errors") or ["オッズ取得失敗"])[0]))
+    parsed = _v319_official_odds_to_parsed(data.get("body") or {})
+    if sum(len(v) for v in parsed.values()) <= 0:
+        raise ValueError("オッズが空です")
+    return parsed
+
+
+def _v319_save_official_odds(db_path: str, race_key: str, parsed: dict) -> int:
+    sid = _v221_save_all_odds(db_path, race_key, parsed, source="autorace_official")
+    return int(sum(len(v) for v in (parsed or {}).values())) if sid else 0
+
+
 def _v319_norm_player_name(name: str) -> str:
     return re.sub(r"[\s　]+", "", str(name or ""))
 
@@ -8769,44 +8909,37 @@ def _v319_parse_sprace_players(html: str) -> list[dict]:
 
 def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int, ymd: str) -> str:
     raw = _v319_html_to_text(html)
+    start = raw.find(f"{int(race_no)}R")
+    if start < 0:
+        start = raw.find("確定")
+    body = raw[start:] if start >= 0 else raw
+    cut = body.find("基本情報")
+    if cut > 80:
+        body = body[:cut]
+    # 公式貼付に近い本文を残しつつ、解析しやすい車行も末尾に足す
     dm = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日(?:\([^)]+\))?)", raw)
     date_s = dm.group(1) if dm else f"{ymd[:4]}年{int(ymd[4:6])}月{int(ymd[6:8])}日"
-    sm = re.search(r"(良走路|湿走路|斑走路)", raw)
-    surface = sm.group(1) if sm else "良走路"
-    tm = re.search(r"/(\d+(?:\.\d+)?)℃", raw)
-    track_temp = tm.group(1) if tm else ""
-    am = re.search(r"気温：\s*([\d.]+)", raw)
-    hm = re.search(r"湿度：\s*([\d.]+)", raw)
     cars = _v319_parse_sprace_players(html)
-    lines = [
-        f"{int(race_no)}R",
-        date_s,
-        str(venue or ""),
-        f"3100m {max(len(cars), 1)}車 6周",
-        f"{surface}" + (f" /{track_temp}℃" if track_temp else ""),
-    ]
-    if am:
-        lines.append(f"気温：{am.group(1)}℃")
-    if hm:
-        lines.append(f"湿度：{hm.group(1)}%")
+    extra = [f"{int(race_no)}R", "確定", date_s, str(venue or "")]
     for p in cars:
         car = int(p["car"])
         chunks = [html[m.start(): m.start() + 900] for m in re.finditer(rf'param="{car}"', html)]
         block = "\n".join(chunks)
         hand = "0"
         trial = ""
-        hm2 = re.search(r"(\d+)m/ST", block)
+        st = ""
+        hm2 = re.search(r"(\d+)m/ST([\d.]+)", block)
         if hm2:
-            hand = hm2.group(1)
+            hand, st = hm2.group(1), hm2.group(2)
         tm3 = re.search(r"試\s*([\d.]+)", block)
         if tm3:
             trial = tm3.group(1)
-        name = re.sub(r"[\s　]+", "", p["name"])
+        name = p["name"]
+        line = f"{car}\t{name}\nハンデ{hand}m/ST{st or '-'}"
         if trial:
-            lines.append(f"{car} {name} {hand}m {trial}")
-        else:
-            lines.append(f"{car} {name} {hand}m")
-    return "\n".join(lines)
+            line += f"\t{trial}"
+        extra.append(line)
+    return (body.strip() + "\n" + "\n".join(extra)).strip()
 
 
 def _v319_player_history_count(db_path: str, player_name: str) -> int:
@@ -8904,10 +9037,51 @@ def _v319_fill_player_histories(db_path: str, players: list[dict], min_rows: int
                 errors += 1
                 details.append(f"{name}:履歴0件")
                 continue
-            report = engine.v47_save_player_history(df, db_path=db_path)
-            changed = int((report or {}).get("changed") or 0)
-            added += changed
-            details.append(f"{name}:{have}→+{changed}")
+            lines = [str(name), "直近履歴"]
+            for _, r in df.iterrows():
+                ds = str(r.get("開催日") or "")
+                dm = re.match(r"(\d{4})-(\d{2})-(\d{2})", ds)
+                date_jp = f"{dm.group(1)}年{int(dm.group(2))}月{int(dm.group(3))}日" if dm else ds
+                fin = r.get("着順")
+                lines.append(f"{int(fin)}着" if pd.notna(fin) and str(fin).strip() else "着外")
+                lines.append(date_jp)
+                lines.append(str(r.get("開催場") or ""))
+                if r.get("レース"):
+                    lines.append(f"{int(r.get('レース'))}R")
+                if r.get("レース名"):
+                    lines.append(str(r.get("レース名")))
+                if r.get("レース種別"):
+                    lines.append(str(r.get("レース種別")))
+                lines.append(str(r.get("走路") or "良走路"))
+                if r.get("天候"):
+                    lines.append(str(r.get("天候")))
+                lines.append(f"ハンデ{int(r.get('ハンデ') or 0)}m")
+                if r.get("試走T"):
+                    lines.append(f"試走T {r.get('試走T')}")
+                if r.get("競走T"):
+                    lines.append(f"競走T {r.get('競走T')}")
+                if r.get("ST"):
+                    lines.append(f"ST {r.get('ST')}")
+            parsed = None
+            try:
+                parsed = engine.v15_parse_player_history("\n".join(lines), player_name=str(name).strip())
+            except Exception:
+                parsed = df
+            if not isinstance(parsed, pd.DataFrame) or parsed.empty:
+                parsed = df
+            if len(parsed) < 20 and len(df) >= 20:
+                parsed = df
+            report = engine.v47_save_player_history(parsed, db_path=db_path)
+            changed = int((report or {}).get("changed") or (report or {}).get("saved") or 0)
+            if changed <= 1 and len(parsed) >= 10:
+                try:
+                    report2 = engine.v131_save_pending_player_history(parsed, db_path=db_path)
+                    changed += int((report2 or {}).get("changed") or (report2 or {}).get("saved") or 0)
+                except Exception:
+                    pass
+            after = _v319_player_history_count(db_path, name)
+            added += max(changed, max(0, after - have))
+            details.append(f"{name}:{have}→{after}(+{len(parsed)}件解析)")
             time_module.sleep(0.25)
         except Exception as exc:
             errors += 1
@@ -8972,25 +9146,51 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
         pass
     finish_prob = engine.v30_finish_probabilities(df, bets, int(trials))
     df = _v284_apply_simulation_joint_ranks(df, wall_audit)
-    saved_key = engine.v34_save_prediction_snapshot(meta, df, finish_prob, db_path)
+    km = re.match(r"(\d{8})_(.+)_(\d+)R$", str(race_key or ""))
+    if km:
+        meta["開催日"] = meta.get("開催日") or f"{km.group(1)[:4]}-{km.group(1)[4:6]}-{km.group(1)[6:8]}"
+        meta["開催場"] = meta.get("開催場") or km.group(2)
+        meta["レース"] = meta.get("レース") or int(km.group(3))
+    if venue:
+        meta["開催場"] = meta.get("開催場") or venue
+    saved_key = ""
+    try:
+        saved_key = str(engine.v34_save_prediction_snapshot(meta, df, finish_prob, db_path) or "")
+    except Exception:
+        saved_key = ""
+    key = saved_key or str(race_key or "")
     view = {
         "df": df, "bets": bets, "output": output, "entries": entries, "meta": meta,
-        "finish_prob": finish_prob, "race_key": saved_key or race_key,
+        "finish_prob": finish_prob, "race_key": key,
         "trials": int(trials), "excluded": [], "app_version": _V231_APP_VERSION,
         "simulation_mode": _V231_SIMULATION_MODE,
         "prediction_time": _v228_now_jst_iso(), "seed": int(seed),
         "settings_hash": _v231_settings_hash(int(trials), int(seed), []),
     }
+    history_id = 0
+    save_err = ""
     try:
-        _v231_save_prediction_history(db_path, saved_key or race_key, text, venue, view, int(trials), int(seed))
-        _v222_save_prediction_restore(db_path, saved_key or race_key, text, venue, view)
-    except Exception:
-        pass
+        history_id = int(_v231_save_prediction_history(db_path, key, text, venue, view, int(trials), int(seed)) or 0)
+        _v222_save_prediction_restore(db_path, key, text, venue, view)
+    except Exception as exc:
+        save_err = f"{type(exc).__name__}: {exc}"
+        try:
+            slim = {
+                "meta": meta, "race_key": key, "trials": int(trials), "seed": int(seed),
+                "app_version": _V231_APP_VERSION, "prediction_time": view["prediction_time"],
+                "df": df, "bets": bets, "entries": entries, "finish_prob": finish_prob,
+            }
+            history_id = int(_v231_save_prediction_history(db_path, key, text, venue, slim, int(trials), int(seed)) or 0)
+            save_err = ""
+        except Exception as exc2:
+            save_err = f"{type(exc2).__name__}: {exc2}"
     try:
         _v217_deferred_prediction_db_save(meta, bets, int(trials), df)
     except Exception:
         pass
-    return {"ok": True, "race_key": saved_key or race_key, "trials": int(trials)}
+    if not history_id:
+        return {"ok": False, "reason": save_err or "予測履歴の保存に失敗", "race_key": key}
+    return {"ok": True, "race_key": key, "trials": int(trials), "history_id": history_id}
 
 
 def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, replace: bool = False) -> dict:
@@ -9097,42 +9297,60 @@ def _v319_import_one_race(
         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
         if players:
             filled = _v319_fill_player_histories(db_path, players, min_rows=30)
-            if filled.get("added"):
-                hist_msg = f" / 履歴+{filled.get('added')}"
+            hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
     except Exception as exc:
         hist_msg = f" / 出走表取得失敗:{type(exc).__name__}"
-    if exists and skip_existing and not replace:
-        msg = "登録済み" + hist_msg
-        if predict_if_missing and not _v319_prediction_exists(db_path, key_guess):
-            pred = _v319_run_prerace_prediction(
-                db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text
-            )
-            msg += " / 予測 " + ("OK" if pred.get("ok") else str(pred.get("reason") or "失敗"))
-            try:
-                _v187_sync_mixed_feedback(db_path)
-            except Exception:
-                pass
-        return {"status": "skip", "message": msg, "key": key_guess}
-    raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
-    saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
-    key = str(saved.get("key") or key_guess)
     pred_msg = ""
-    if predict_if_missing and not _v319_prediction_exists(db_path, key):
+    if predict_if_missing and not _v319_prediction_exists(db_path, key_guess):
         pred = _v319_run_prerace_prediction(
-            db_path, key, venue, trials=int(trials), seed=int(seed), raw_text=card_text
+            db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text
         )
-        pred_msg = " / 予測OK" if pred.get("ok") else f" / 予測失敗:{pred.get('reason')}"
+        pred_msg = (
+            f" / 予測OK 履歴{pred.get('history_id') or ''}"
+            if pred.get("ok")
+            else f" / 予測失敗:{pred.get('reason')}"
+        )
+    if exists and skip_existing and not replace:
+        odds_msg = ""
+        try:
+            parsed_odds = _v319_fetch_official_odds(ymd, venue, race_no)
+            n_odds = _v319_save_official_odds(db_path, key_guess, parsed_odds)
+            odds_msg = f" / オッズ{n_odds}件"
+        except Exception as exc:
+            odds_msg = f" / オッズ失敗:{type(exc).__name__}"
         try:
             _v187_sync_mixed_feedback(db_path)
         except Exception:
             pass
-    return {"status": "ok", "message": key + hist_msg + pred_msg, "key": key}
+        return {"status": "skip", "message": "登録済み" + hist_msg + pred_msg + odds_msg, "key": key_guess}
+    raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+    saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
+    key = str(saved.get("key") or key_guess)
+    odds_msg = ""
+    try:
+        parsed_odds = _v319_fetch_official_odds(ymd, venue, race_no)
+        n_odds = _v319_save_official_odds(db_path, key, parsed_odds)
+        odds_msg = f" / オッズ{n_odds}件"
+    except Exception as exc:
+        odds_msg = f" / オッズ失敗:{type(exc).__name__}"
+    try:
+        _v187_sync_mixed_feedback(db_path)
+    except Exception:
+        pass
+    return {"status": "ok", "message": key + hist_msg + pred_msg + odds_msg, "key": key}
 
 
 def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
     details = []
     ok = skip = err = 0
     try:
+        try:
+            _v278_bg_update(
+                db_path, job_id,
+                result_blob=zlib.compress(pickle.dumps({"req": req, "details": []}, protocol=4), 6),
+            )
+        except Exception:
+            pass
         _v278_bg_update(
             db_path, job_id, status="running",
             started_at=_v228_now_jst_iso(),
@@ -9213,6 +9431,12 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             error_text=f"{type(exc).__name__}: {exc}",
             message=f"失敗: {exc}",
         )
+    finally:
+        try:
+            with _V278_BG_LOCK:
+                _V278_BG_THREADS.pop(int(job_id), None)
+        except Exception:
+            pass
 
 
 def _v319_bg_import_start(
@@ -9249,6 +9473,8 @@ def _v319_bg_import_start(
         target=_v319_bg_import_worker, args=(str(db_path), job_id, req),
         daemon=True, name=f"autorace-bg-import-{job_id}",
     )
+    with _V278_BG_LOCK:
+        _V278_BG_THREADS[job_id] = th
     th.start()
     return {"ok": True, "job_id": job_id}
 
@@ -21586,7 +21812,7 @@ if selected_main_page == "✅ 結果登録・解析":
     st.session_state.setdefault("result_input_version", 0)
 
     with st.expander("公式結果を自動取得して登録", expanded=False):
-        st.caption("予測はSP出走表（ハンデ・試走）を使います。選手履歴が30件未満ならプロフィールから足してから予測します。")
+        st.caption("順番は出走表→選手履歴30走→予測保存→結果登録です。結果の1走だけを履歴にはしません。")
         dcol, vcol = st.columns(2)
         fetch_date = dcol.date_input("開催日", value=date.today(), key="v319_op_fetch_date")
         fetch_venue = vcol.selectbox("開催場", ["開催を探す"] + RESULT_VENUES, key="v319_op_fetch_venue")
