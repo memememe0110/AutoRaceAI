@@ -37,11 +37,11 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver316"
+APP_VERSION = "Ver319"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver316"  # Ver316: 同ハンデは前残り寄り。湿を良の時間補正に混ぜない。壁補正に日付カット。
+_V231_APP_VERSION = "Ver319"  # Ver319: 壁は予測日前のみ（少件数は過去分で学習）。同ハンデ寄せは外す。時間補正は良/湿分離。
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -89,6 +89,7 @@ def _runtime_clear_prediction_caches() -> None:
         _V258_PLAYER_ACTUAL_CACHE,
         _V250_FLOW_CALIBRATION_CACHE,
         _V263_SCENARIO_PRIOR_CACHE,
+        _V318_SAMEH_FLOW_CACHE,
         _V264_SCENARIO_FEEDBACK_CACHE,
         _V292_TRIAL_GAP_GATE_CACHE,
         _V294_FRONT_ST_GUARD_CACHE,
@@ -1166,10 +1167,34 @@ def _v248_wall_calibration(db_path: str | None = None, cutoff_date: str = "") ->
             data = data[data["race_date"] < pd.Timestamp(cutoff)].copy()
         data = data.sort_values(["race_date", "race_no", "race_key", "lap"])
         race_order = data[["race_key", "race_date", "race_no"]].drop_duplicates().sort_values(["race_date", "race_no", "race_key"])
-        if len(race_order) < 40 or len(data) < 1200:
+        # 日付カット後は件数が減る。未来は使わず、過去が少ないときは検証分割せずに学習する。
+        if len(race_order) < 8 or len(data) < 80:
             result["sample_transitions"] = int(len(data))
-            result["reason"] = "時系列検証に必要な周回履歴が不足"
+            result["reason"] = "予測日前の周回履歴が少なすぎるため固定係数"
             _V248_WALL_CALIBRATION_CACHE.clear(); _V248_WALL_CALIBRATION_CACHE[stamp] = dict(result); return result
+        use_holdout = bool(len(race_order) >= 40 and len(data) >= 1200)
+        if not use_holdout:
+            train = data.copy()
+            gp = float((train["passed"].sum() + 20.0) / (len(train) + 40.0))
+            gl = _v248_logit(gp)
+            def _group_delta_small(col: str, alpha: float) -> dict:
+                agg = train.groupby(col)["passed"].agg(["sum", "count"])
+                out = {}
+                for key, row in agg.iterrows():
+                    p = float((row["sum"] + alpha * gp) / (row["count"] + alpha))
+                    out[key] = float(np.clip(_v248_logit(p) - gl, -0.28, 0.28))
+                return out
+            venue_delta = _group_delta_small("venue", 80.0)
+            lap_delta = _group_delta_small("lap", 100.0)
+            result.update({
+                "enabled": True, "global_logit": gl, "venue_delta": venue_delta,
+                "lap_delta": lap_delta, "sample_transitions": int(len(data)),
+                "validation_transitions": 0, "baseline_logloss": None,
+                "calibrated_logloss": None,
+                "reason": f"予測日前{len(race_order)}R/{int(len(data))}遷移を検証なしで学習（未来は未使用）",
+            })
+            _V248_WALL_CALIBRATION_CACHE.clear(); _V248_WALL_CALIBRATION_CACHE[stamp] = dict(result)
+            return result
         split = max(25, min(len(race_order) - 12, int(round(len(race_order) * 0.70))))
         train_keys = set(race_order.iloc[:split]["race_key"].astype(str))
         valid_keys = set(race_order.iloc[split:]["race_key"].astype(str))
@@ -5078,6 +5103,22 @@ def _v250_flow_calibration(db_path: str | None = None, venue: str = "", cutoff_d
 # Ver263: 実測グランドノートから「展開タイプ」を学習し、
 # シミュレーション内の複数展開ルートを弱く確率校正する。
 _V263_SCENARIO_PRIOR_CACHE = {}
+_V318_SAMEH_FLOW_CACHE = {}
+
+_V318_FLOW_FALLBACK = {
+    "learned": False,
+    "samples": 0,
+    "matched_samples": 0,
+    "surface_mode": "dry",
+    "type_rates": {},
+    "prior_add": {"前残り型": 0.12, "早仕掛け型": 0.20},
+    "type_scale": {"後半追込型": 0.70, "波乱型": 0.90},
+    "pass_lap2": 0.88,
+    "pass_lap3": 0.75,
+    "late_pressure_scale": 0.45,
+    "front_hold_add": 0.07,
+    "reason": "同ハンデの学習件数が足りないため固定値",
+}
 
 def _v263_scenario_type_from_laps(laps):
     try:
@@ -5167,6 +5208,116 @@ def _v263_scenario_prior(db_path, venue='', cutoff=''):
     except Exception as exc:
         out['reason']=f'展開タイプ学習失敗: {exc}'
     _V263_SCENARIO_PRIOR_CACHE[key]=dict(out)
+    return out
+
+
+def _v318_same_handicap_flow_calibration(db_path: str | None, cutoff_date: str = "", surface: str = "") -> dict:
+    """同ハンデ戦の展開比率を、予測日より前の登録結果から学習する。"""
+    cutoff = str(cutoff_date or "").strip()[:10]
+    want_wet = _v316_surface_is_wet(surface)
+    path = str(db_path or "")
+    try:
+        stamp = (path, int(Path(path).stat().st_mtime_ns) if path and Path(path).exists() else 0, cutoff, int(want_wet))
+    except Exception:
+        stamp = (path, 0, cutoff, int(want_wet))
+    if stamp in _V318_SAMEH_FLOW_CACHE:
+        return dict(_V318_SAMEH_FLOW_CACHE[stamp])
+    out = dict(_V318_FLOW_FALLBACK)
+    out["surface_mode"] = "wet" if want_wet else "dry"
+    if not path or not Path(path).exists():
+        out["reason"] = "DBなし"
+        _V318_SAMEH_FLOW_CACHE[stamp] = dict(out)
+        return out
+    try:
+        with sqlite3.connect(path) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if not {"result_races", "result_entries", "result_laps"} <= tables:
+                out["reason"] = "結果テーブル不足"
+                _V318_SAMEH_FLOW_CACHE[stamp] = dict(out)
+                return out
+            rr_cols = {r[1] for r in con.execute("PRAGMA table_info(result_races)").fetchall()}
+            surf_expr = "rr.surface" if "surface" in rr_cols else (
+                "rr.track_condition" if "track_condition" in rr_cols else "''"
+            )
+            q = f'''
+                SELECT rr.race_key, rr.race_date, {surf_expr} AS surface,
+                       re.car_no, re.handicap, rl.lap_no, rl.position
+                FROM result_races rr
+                JOIN result_entries re ON re.race_key=rr.race_key
+                LEFT JOIN result_laps rl ON rl.race_key=rr.race_key AND rl.car_no=re.car_no
+                WHERE COALESCE(rr.learning_eligible,1)=1
+            '''
+            df = pd.read_sql_query(q, con)
+    except Exception as exc:
+        out["reason"] = f"読込失敗: {exc}"
+        _V318_SAMEH_FLOW_CACHE[stamp] = dict(out)
+        return out
+    if df is None or df.empty:
+        out["reason"] = "結果0件"
+        _V318_SAMEH_FLOW_CACHE[stamp] = dict(out)
+        return out
+    if cutoff:
+        df = df[df["race_date"].astype(str).str[:10] < cutoff].copy()
+    types = ["前残り型", "早仕掛け型", "中盤入替型", "後半追込型", "波乱型"]
+    same_rows = []
+    all_types = []
+    for _, g in df.groupby("race_key"):
+        hs = pd.to_numeric(g["handicap"], errors="coerce").dropna()
+        if hs.empty:
+            continue
+        spread = float(hs.max() - hs.min())
+        laps = []
+        lg = g.dropna(subset=["lap_no", "position"])
+        if not lg.empty:
+            for _, one in lg.groupby("lap_no", sort=True):
+                order = tuple(int(x) for x in one.sort_values("position")["car_no"].tolist())
+                if order:
+                    laps.append(order)
+        typ = _v263_scenario_type_from_laps(laps)
+        if typ == "不明":
+            continue
+        wet = _v316_surface_is_wet(g["surface"].iloc[0] if "surface" in g.columns else "")
+        all_types.append(typ)
+        if spread <= 10:
+            same_rows.append({"typ": typ, "wet": wet})
+    n_same = len(same_rows)
+    out["samples"] = n_same
+    if n_same < 8:
+        out["reason"] = f"同ハンデ{n_same}Rで固定値（8R未満）"
+        _V318_SAMEH_FLOW_CACHE[stamp] = dict(out)
+        return out
+    matched = [r for r in same_rows if bool(r["wet"]) == bool(want_wet)]
+    use = matched if len(matched) >= 8 else same_rows
+    out["matched_samples"] = len(matched)
+    n = len(use)
+    counts = {t: 0 for t in types}
+    for r in use:
+        counts[r["typ"]] = counts.get(r["typ"], 0) + 1
+    rates = {t: (counts[t] + 1.0) / (n + len(types)) for t in types}
+    z = sum(rates.values()) or 1.0
+    rates = {k: v / z for k, v in rates.items()}
+    early = float(rates.get("前残り型", 0.0) + rates.get("早仕掛け型", 0.0))
+    out.update({
+        "learned": True,
+        "type_rates": {k: round(v, 4) for k, v in rates.items()},
+        "prior_add": {
+            "前残り型": float(np.clip(0.40 * rates.get("前残り型", 0.0), 0.04, 0.18)),
+            "早仕掛け型": float(np.clip(0.50 * rates.get("早仕掛け型", 0.0), 0.06, 0.24)),
+        },
+        "type_scale": {
+            "後半追込型": float(np.clip(0.55 + 1.10 * rates.get("後半追込型", 0.0), 0.55, 1.00)),
+            "波乱型": float(np.clip(0.70 + 0.55 * rates.get("波乱型", 0.0), 0.70, 1.00)),
+        },
+        "pass_lap2": float(np.clip(0.96 - 0.20 * early, 0.82, 0.94)),
+        "pass_lap3": float(np.clip(0.92 - 0.40 * early, 0.70, 0.90)),
+        "late_pressure_scale": float(np.clip(0.70 - 0.50 * early, 0.35, 0.70)),
+        "front_hold_add": float(np.clip(0.04 + 0.10 * rates.get("前残り型", 0.0), 0.04, 0.10)),
+        "reason": (
+            f"{cutoff or '最新'}より前の同ハンデ{n_same}R"
+            f"（{'湿' if want_wet else '良'}一致{len(matched)}R, 使用{n}R）から学習"
+        ),
+    })
+    _V318_SAMEH_FLOW_CACHE[stamp] = dict(out)
     return out
 
 def _v263_save_scenario_feedback(db_path, meta, dist, actual_type, closest_similarity, closest_route):
@@ -6314,8 +6465,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     _trial_mu290=float(_trial_vals290.mean()) if len(_trial_vals290) else 3.40
     _trial_sd290=float(_trial_vals290.std()) if len(_trial_vals290) else 0.02
     if _trial_sd290 < 0.006: _trial_sd290=0.006
-    if _same_h316:
-        _trial_sd290=max(_trial_sd290,0.020)
+    # Ver320: 同ハンデの試走偏差かさ上げは通常開催の◎を崩したため無効。
     _st_vals290=np.array([float(stmean[c]) for c in cars],dtype=float)
     _st_mu290=float(_st_vals290.mean()) if len(_st_vals290) else 0.16
     _st_sd290=float(_st_vals290.std()) if len(_st_vals290) else 0.03
@@ -6442,13 +6592,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     scenario_prior=_v263_scenario_prior(_v230_db_path(), venue, race_date)
     scenario_feedback_v264=_v264_feedback_scenario_adjustment(_v230_db_path(), venue, race_date)
     scenario_branch_prior_v264=_v264_blended_scenario_prior(scenario_prior, scenario_feedback_v264)
-    if _same_h316 and isinstance(scenario_branch_prior_v264, dict) and scenario_branch_prior_v264:
-        _boosted316=dict(scenario_branch_prior_v264)
-        _boosted316["前残り型"]=float(_boosted316.get("前残り型",0.0))+0.28
-        _boosted316["後半追込型"]=float(_boosted316.get("後半追込型",0.0))*0.55
-        _boosted316["波乱型"]=float(_boosted316.get("波乱型",0.0))*0.55
-        _z316=sum(float(v) for v in _boosted316.values()) or 1.0
-        scenario_branch_prior_v264={k:float(v)/_z316 for k,v in _boosted316.items()}
+    flow318={"learned":False,"reason":"Ver320: 同ハンデ寄せは通常開催◎を崩したため未適用"}
+    # Ver320: 展開priorの同ハンデ上書きはしない。
     # Ver285: 展開頻度は触らず、同じ展開型で周回内入替がズレた分だけ学習。
     same_scenario_transition_v285=_v285_same_scenario_transition_calibration(
         _v230_db_path(), venue, race_date
@@ -6655,10 +6800,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     front_hold += leader_hold_delta * max(0.25, 1.0 - 0.13*(lap-1))
                 weak_front_bonus=0.34*max(0.0,speed_edge-0.25)
                 late_pressure=0.03*(lap-1)
-                if _same_h316:
-                    late_pressure*=0.25
-                    if i==1:
-                        front_hold += 0.12
+                # Ver320: 同ハンデの前残り寄せ（終盤抑制・先頭加算）はしない。
                 empirical_pass_delta = venue_wall_delta + float(lap_wall_delta.get(lap, 0.0))
                 # 直前の追い抜き成功は次の壁突破を少し後押しする。ただし毎周減衰させる。
                 chain_bonus=min(0.42, momentum.get(chaser,0.0))
@@ -6721,9 +6863,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     pass
                 p=1/(1+np.exp(-logit))
                 p=max(0.035,min(0.88,p))
-                if _same_h316:
-                    p*=(0.80 if lap==2 else (0.62 if lap>=3 else 1.0))
-                    p=max(0.035,min(0.88,p))
+                # Ver320: 同ハンデの追い抜き抑制はしない。
                 # Ver272: Ver271の3～4周目補正を実際の追い抜き確率へ接続。
                 try:
                     _mid_factor272=_mid_factor_cache276.get((chaser,lap),1.0)
@@ -7035,6 +7175,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             "surface": race_surface,
             "time_cal_surface": (time_residual_v265 or {}).get("surface_mode"),
             "wet_excluded_from_dry_cal": (time_residual_v265 or {}).get("wet_excluded"),
+            "flow318": flow318,
         },
         "scenario_prior_v263": scenario_prior,
         "scenario_feedback_v264": scenario_feedback_v264,
@@ -15836,6 +15977,131 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
     return df
 
 
+def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataFrame:
+    """回収率実績を、ハンデ・走路・展開まで付けて分析用CSVにする。"""
+    if filtered is None or filtered.empty:
+        return pd.DataFrame()
+    base = filtered.copy()
+    if "race_date" in base.columns:
+        base["日付"] = pd.to_datetime(base["race_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    keys = [str(k) for k in base.get("race_key", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()]
+    race_meta = pd.DataFrame()
+    handi = pd.DataFrame()
+    flow = pd.DataFrame()
+    if keys and db_path and Path(str(db_path)).exists():
+        ph = ",".join(["?"] * len(keys))
+        try:
+            with sqlite3.connect(str(db_path), timeout=30.0) as con:
+                rr_cols = {str(r[1]) for r in con.execute("PRAGMA table_info(result_races)").fetchall()}
+                pick = ["rr.race_key"]
+                for c in ("surface", "track_condition", "weather", "temperature", "track_temp", "humidity"):
+                    if c in rr_cols:
+                        pick.append(f"rr.{c}")
+                race_meta = pd.read_sql_query(
+                    f"SELECT {', '.join(pick)} FROM result_races rr WHERE rr.race_key IN ({ph})",
+                    con, params=keys,
+                )
+                handi = pd.read_sql_query(
+                    f"""
+                    SELECT race_key,
+                           COUNT(*) AS 出走数,
+                           MIN(CAST(handicap AS REAL)) AS ハンデ最小,
+                           MAX(CAST(handicap AS REAL)) AS ハンデ最大,
+                           COUNT(DISTINCT CAST(handicap AS TEXT)) AS ハンデ種類,
+                           MAX(CASE WHEN finish=1 THEN car_no END) AS 1着車,
+                           MAX(CASE WHEN finish=2 THEN car_no END) AS 2着車,
+                           MAX(CASE WHEN finish=3 THEN car_no END) AS 3着車
+                    FROM result_entries
+                    WHERE race_key IN ({ph})
+                      AND COALESCE(result_status,'通常') NOT IN ('欠車','出走取消','発走除外')
+                    GROUP BY race_key
+                    """,
+                    con, params=keys,
+                )
+                laps = pd.read_sql_query(
+                    f"SELECT race_key,lap_no,position,car_no FROM result_laps WHERE race_key IN ({ph})",
+                    con, params=keys,
+                )
+            if laps is not None and not laps.empty:
+                rows = []
+                for rk, g in laps.groupby("race_key"):
+                    orders = []
+                    for _, lg in g.groupby("lap_no", sort=True):
+                        order = tuple(int(x) for x in lg.sort_values("position")["car_no"].tolist())
+                        if order:
+                            orders.append(order)
+                    typ = _v263_scenario_type_from_laps(orders) if orders else "不明"
+                    rows.append({
+                        "race_key": str(rk),
+                        "展開型": typ,
+                        "1周先頭": (orders[0][0] if orders and orders[0] else None),
+                        "ゴール先頭": (orders[-1][0] if orders and orders[-1] else None),
+                    })
+                flow = pd.DataFrame(rows)
+        except Exception:
+            pass
+    out = base.copy()
+    if not race_meta.empty:
+        out = out.merge(race_meta, on="race_key", how="left")
+    if not handi.empty:
+        out = out.merge(handi, on="race_key", how="left")
+    if not flow.empty:
+        out = out.merge(flow, on="race_key", how="left")
+    if "ハンデ最大" in out.columns and "ハンデ最小" in out.columns:
+        out["ハンデ差"] = pd.to_numeric(out["ハンデ最大"], errors="coerce") - pd.to_numeric(out["ハンデ最小"], errors="coerce")
+        out["同ハンデ"] = (pd.to_numeric(out["ハンデ差"], errors="coerce") <= 10).map({True: 1, False: 0})
+    surf = out["surface"] if "surface" in out.columns else pd.Series("", index=out.index)
+    if "track_condition" in out.columns:
+        surf = surf.fillna("").astype(str)
+        tc = out["track_condition"].fillna("").astype(str)
+        surf = surf.where(surf.str.len() > 0, tc)
+    out["走路"] = surf.astype(str) if not isinstance(surf, str) else surf
+    try:
+        out["湿走路"] = out["走路"].map(lambda x: 1 if _v316_surface_is_wet(x) else 0)
+    except Exception:
+        out["湿走路"] = out["走路"].astype(str).str.contains("湿").astype(int)
+    rec = out.get("new_recommendation_label", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["推奨フラグ"] = rec.str.contains("◎").astype(int)
+    out["的中フラグ"] = pd.to_numeric(out.get("black_hit", 0), errors="coerce").fillna(0).astype(int)
+    out["判定"] = out.apply(
+        lambda r: "◎黒字" if r.get("black_hit") else ("△ガミ" if r.get("gami_hit") else "×外れ"),
+        axis=1,
+    )
+    rename = {
+        "venue": "開催場",
+        "race_no": "R",
+        "points": "点数",
+        "cost_yen": "購入額",
+        "payout_yen": "払戻額",
+        "return_rate": "回収率",
+        "app_version": "バージョン",
+        "grade": "元判定",
+        "new_recommendation_label": "新推奨",
+        "new_recommendation_score": "推奨スコア",
+        "new_adjusted_return_rate": "新判定参考回収率",
+        "new_recommendation_cover": "新判定カバー",
+        "new_recommendation_max_ev": "新判定最大EV",
+        "new_recommendation_hole_count": "中穴候補数",
+        "weather": "天候",
+        "temperature": "気温",
+        "track_temp": "走路温度",
+        "humidity": "湿度",
+        "winning_types": "的中券種",
+    }
+    out = out.rename(columns=rename)
+    prefer = [
+        "日付", "開催場", "R", "race_key", "バージョン",
+        "推奨区分", "新推奨", "推奨フラグ", "推奨スコア",
+        "新判定参考回収率", "新判定カバー", "新判定最大EV", "中穴候補数", "点数",
+        "購入額", "払戻額", "回収率", "収支", "判定", "的中フラグ", "的中券種", "元判定",
+        "走路", "湿走路", "天候", "気温", "走路温度", "湿度",
+        "出走数", "ハンデ最小", "ハンデ最大", "ハンデ差", "ハンデ種類", "同ハンデ",
+        "展開型", "1周先頭", "ゴール先頭", "1着車", "2着車", "3着車",
+    ]
+    cols = [c for c in prefer if c in out.columns] + [c for c in out.columns if c not in prefer and c not in ("race_date", "month", "hit", "black_hit", "gami_hit", "全返還", "logic_version", "model_return_rate", "created_at", "evaluated_at", "surface", "track_condition")]
+    return out[cols]
+
+
 def _v216_summary_values(df: pd.DataFrame) -> dict:
     """全体・推奨のみ・推奨外の実績を同じ基準で返す。"""
     def one(part: pd.DataFrame) -> dict:
@@ -16480,7 +16746,33 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             "new_adjusted_return_rate":"新判定参考回収率","new_recommendation_cover":"新判定カバー",
             "new_recommendation_max_ev":"新判定最大EV","new_recommendation_hole_count":"中穴候補数",
         })
-        st.dataframe(detail.sort_values(["日付","開催場","R"], ascending=[False,True,True]), use_container_width=True, hide_index=True)
+        detail = detail.sort_values(["日付","開催場","R"], ascending=[False,True,True])
+        st.dataframe(detail, use_container_width=True, hide_index=True)
+        st.download_button(
+            "明細CSV（画面と同じ）",
+            detail.to_csv(index=False).encode("utf-8-sig"),
+            file_name="return_detail.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="v319_return_detail_csv",
+        )
+
+    analysis_df = _v319_analysis_export_rows(str(db_path), filtered)
+    st.markdown("### 分析用CSV")
+    st.caption("ハンデ差・走路・展開型・着順を付けたレース単位です。Excelやこちらでの分析用。")
+    if analysis_df.empty:
+        st.info("分析用に結合できる結果がありません。")
+    else:
+        st.dataframe(analysis_df.head(30), use_container_width=True, hide_index=True)
+        st.caption(f"{len(analysis_df)}R / {len(analysis_df.columns)}列")
+        st.download_button(
+            "分析用CSVを保存",
+            analysis_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="return_analysis.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="v319_return_analysis_csv",
+        )
 
 
 def _v226_prediction_condition_rows(db_path: str) -> pd.DataFrame:
