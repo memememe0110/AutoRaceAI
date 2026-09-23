@@ -9337,7 +9337,38 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
     return pd.DataFrame(hist)
 
 
-def _v319_fill_player_histories(db_path: str, players: list[dict], min_rows: int = 30) -> dict:
+def _v319_hist_row_before(row, ymd: str, venue: str, race_no: int) -> bool:
+    ds = _v319_ymd_digits(row.get("開催日") if hasattr(row, "get") else "")
+    cur = _v319_ymd_digits(ymd)
+    if not ds or not cur:
+        return False
+    if ds < cur:
+        return True
+    if ds > cur:
+        return False
+    vn = str((row.get("開催場") if hasattr(row, "get") else "") or "").replace("　", "").strip()
+    cur_v = str(venue or "").replace("　", "").strip()
+    try:
+        rn = int(row.get("レース") or 0)
+    except Exception:
+        rn = 0
+    if vn and cur_v and vn != cur_v:
+        return True
+    try:
+        cap = int(race_no or 0)
+    except Exception:
+        cap = 0
+    return cap > 0 and rn > 0 and rn < cap
+
+
+def _v319_fill_player_histories(
+    db_path: str,
+    players: list[dict],
+    min_rows: int = 30,
+    before_ymd: str = "",
+    before_venue: str = "",
+    before_race: int = 0,
+) -> dict:
     added = 0
     skipped = 0
     errors = 0
@@ -9355,6 +9386,20 @@ def _v319_fill_player_histories(db_path: str, players: list[dict], min_rows: int
                 errors += 1
                 details.append(f"{name}:履歴0件")
                 continue
+            if before_ymd:
+                before_rows = [
+                    r for _, r in df.iterrows()
+                    if _v319_hist_row_before(r, before_ymd, before_venue, before_race)
+                ]
+                df = pd.DataFrame(before_rows)
+                if df.empty:
+                    if have <= 0:
+                        errors += 1
+                        details.append(f"{name}:当該R以前の履歴0件")
+                    else:
+                        skipped += 1
+                        details.append(f"{name}:当該R以前は追加なし")
+                    continue
             if have <= 0:
                 work = df.copy()
                 if "開催日" in work.columns:
@@ -9578,7 +9623,7 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
         saved_key = str(engine.v34_save_prediction_snapshot(meta, df, finish_prob, db_path) or "")
     except Exception:
         saved_key = ""
-    key = saved_key or str(race_key or "")
+    key = str(race_key or "").strip() or saved_key
     view = {
         "df": df, "bets": bets, "output": output, "entries": entries, "meta": meta,
         "finish_prob": finish_prob, "race_key": key,
@@ -9773,6 +9818,8 @@ def _v319_import_one_race(
     key_guess = f"{ymd}_{venue}_{int(race_no)}R"
     card_text = ""
     hist_msg = ""
+    players = []
+    sp_html = ""
     try:
         _step("出走表")
         sp_html = _v319_fetch_sprace_html(ymd, venue, race_no)
@@ -9780,21 +9827,29 @@ def _v319_import_one_race(
         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
         if players:
             _step("選手履歴")
-            filled = _v319_fill_player_histories(db_path, players, min_rows=30)
+            filled = _v319_fill_player_histories(
+                db_path, players, min_rows=30,
+                before_ymd=ymd, before_venue=venue, before_race=int(race_no),
+            )
             hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
     except Exception as exc:
         hist_msg = f" / 出走表取得失敗:{type(exc).__name__}"
     pred_msg = ""
     if predict_if_missing and not _v319_prediction_exists(db_path, key_guess):
         _step("予測中")
-        pred = _v319_run_prerace_prediction(
-            db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text
-        )
-        pred_msg = (
-            f" / 予測OK 履歴{pred.get('history_id') or ''}"
-            if pred.get("ok")
-            else f" / 予測失敗:{pred.get('reason')}"
-        )
+        try:
+            if not str(card_text or "").strip() and players:
+                card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
+            pred = _v319_run_prerace_prediction(
+                db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text
+            )
+            pred_msg = (
+                f" / 予測OK 履歴{pred.get('history_id') or ''}"
+                if pred.get("ok")
+                else f" / 予測失敗:{pred.get('reason')}"
+            )
+        except Exception as exc:
+            pred_msg = f" / 予測失敗:{type(exc).__name__}:{exc}"
     if exists and skip_existing and not replace:
         odds_msg = ""
         try:
