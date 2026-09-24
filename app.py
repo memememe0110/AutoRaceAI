@@ -9022,11 +9022,13 @@ def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int) -> str:
 _V319_WX_CACHE: dict[str, dict] = {}
 _V319_WX_FETCHES = 0
 _V319_WX_FETCH_LIMIT = 15
+_V319_HIST_REFRESHED: set[str] = set()
 
 
 def _v319_wx_reset_budget() -> None:
-    global _V319_WX_FETCHES
+    global _V319_WX_FETCHES, _V319_HIST_REFRESHED
     _V319_WX_FETCHES = 0
+    _V319_HIST_REFRESHED = set()
 
 
 def _v319_race_weather(ymd: str, venue: str, race_no: int) -> dict:
@@ -9356,7 +9358,124 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
                 "ST": st,
                 "事故": acc,
             })
-    return pd.DataFrame(hist)
+
+def _v319_fetch_sp_player_history_enrich(player_cd: str) -> list[dict]:
+    """SP版選手詳細から車番・天候・走路温度などを取得（Rは無いので日付+場で突合）。"""
+    url = (
+        "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
+        f"?playerCd={player_cd}&historyDispType=d"
+    )
+    try:
+        html = _v319_http_get(url, timeout=18, retries=2)
+    except Exception:
+        return []
+    out = []
+    # compact: 「2 2026年9月15日 浜松 … 走28.0 気25.0 湿82.0 2番10m」
+    pat = re.compile(
+        r"(?P<fin>\d+|欠車|欠責|他落|失格)\s+"
+        r"(?P<y>\d{4})年(?P<m>\d{1,2})月(?P<d>\d{1,2})日\s+"
+        r"(?P<ven>川口|伊勢崎|浜松|飯塚|山陽)\s+"
+        r"(?P<body>.{5,120}?)(?=(?:\d+|欠車|欠責|他落|失格)\s+\d{4}年|$)",
+        re.S,
+    )
+    text_body = _v319_html_to_text(html)
+    for m in pat.finditer(text_body):
+        body = re.sub(r"\s+", " ", m.group("body")).strip()
+        car, hand = 0, 0
+        cm = re.search(r"(\d+)番(\d+)m", body)
+        if cm:
+            car, hand = int(cm.group(1)), int(cm.group(2))
+        else:
+            cm2 = re.search(r"(\d+)番-m", body)
+            if cm2:
+                car = int(cm2.group(1))
+        sky = ""
+        for w in ("小雨", "雨", "雪", "曇", "晴"):
+            if w in body:
+                sky = w
+                break
+        surf = ""
+        for s in ("斑", "湿", "良"):
+            if re.search(rf"(?<![走気湿]){s}(?![走気湿度0-9.])", body) or f"{s}走路" in body:
+                surf = s + "走路"
+                break
+        wx_track = wx_air = wx_hum = ""
+        tm = re.search(r"走([\d.]+)", body)
+        if tm:
+            wx_track = tm.group(1)
+        am = re.search(r"気([\d.]+)", body)
+        if am:
+            wx_air = am.group(1)
+        hm = re.search(r"湿([\d.]+)", body)
+        if hm:
+            wx_hum = hm.group(1)
+        date_s = f"{m.group('y')}-{int(m.group('m')):02d}-{int(m.group('d')):02d}"
+        fin_s = m.group("fin")
+        fin = int(fin_s) if re.fullmatch(r"\d+", fin_s) else None
+        out.append({
+            "開催日": date_s,
+            "開催場": m.group("ven"),
+            "着順": fin,
+            "車番": car,
+            "ハンデ": hand,
+            "天候": sky,
+            "走路": surf,
+            "走": wx_track,
+            "気": wx_air,
+            "湿": wx_hum,
+        })
+    return out
+
+
+def _v319_merge_sp_enrich(df: pd.DataFrame, enrich: list[dict]) -> pd.DataFrame:
+    """PC版履歴（R付き）に SP版の車番・天候を日付+場(+着順)で補完。"""
+    if df is None or df.empty or not enrich:
+        return df
+    df = df.copy()
+    if "車番" not in df.columns:
+        df["車番"] = 0
+    for col in ("走", "気", "湿"):
+        if col not in df.columns:
+            df[col] = ""
+    # index enrich by (date, venue)
+    buckets: dict[tuple, list] = {}
+    for e in enrich:
+        key = (_v319_ymd_digits(e.get("開催日")), str(e.get("開催場") or "").strip())
+        buckets.setdefault(key, []).append(e)
+    for i, r in df.iterrows():
+        key = (_v319_ymd_digits(r.get("開催日")), str(r.get("開催場") or "").strip())
+        cands = buckets.get(key) or []
+        if not cands:
+            continue
+        pick = None
+        try:
+            fin = int(r.get("着順")) if pd.notna(r.get("着順")) else None
+        except Exception:
+            fin = None
+        if fin is not None:
+            for e in cands:
+                if e.get("着順") == fin:
+                    pick = e
+                    break
+        if pick is None:
+            pick = cands[0]
+        if int(df.at[i, "車番"] or 0) <= 0 and int(pick.get("車番") or 0) > 0:
+            df.at[i, "車番"] = int(pick["車番"])
+        if not str(df.at[i, "天候"] or "").strip() and pick.get("天候"):
+            df.at[i, "天候"] = pick["天候"]
+        if not str(df.at[i, "走路"] or "").strip() and pick.get("走路"):
+            df.at[i, "走路"] = pick["走路"]
+        for col in ("走", "気", "湿"):
+            if not str(df.at[i, col] or "").strip() and pick.get(col):
+                df.at[i, col] = pick[col]
+        # ハンデ0でSP側にあるなら補完
+        try:
+            if int(df.at[i, "ハンデ"] or 0) <= 0 and int(pick.get("ハンデ") or 0) > 0:
+                df.at[i, "ハンデ"] = int(pick["ハンデ"])
+        except Exception:
+            pass
+    return df
+
 
 
 def _v319_history_from_results(
@@ -9449,8 +9568,13 @@ def _v319_hist_row_key(row) -> tuple:
     return (ds, vn, rn)
 
 
-def _v319_build_player_history_lines(player_name: str, df: pd.DataFrame) -> list[str]:
-    """履歴テキスト生成。同名レース識別のため R番号を必ず入れる。"""
+def _v319_build_player_history_lines(
+    player_name: str, df: pd.DataFrame, *, fetch_weather: bool = False
+) -> list[str]:
+    """履歴テキスト生成。同名レース識別のため R番号を必ず入れる。
+
+    fetch_weather=False（既定）: 自動取込中のHTTP連打を避ける。
+    """
     lines = [str(player_name)]
     for n, (_, r) in enumerate(df.iterrows()):
         if n == 0:
@@ -9477,18 +9601,15 @@ def _v319_build_player_history_lines(player_name: str, df: pd.DataFrame) -> list
             rn = int(r.get("レース") or 0)
         except Exception:
             rn = 0
-        # 開催場 + R番号（同名レースでも区別できるように）
         if rn > 0:
             lines.append(f"{venue} {rn}R" if venue else f"{rn}R")
         elif venue:
             lines.append(venue)
         rname = str(r.get("レース名") or "").strip()
         rname = re.sub(r"\s*\d*\s*レース映像", "", rname).strip()
-        # 長い開催名は種別寄りに短縮
         if not rname and r.get("レース種別"):
             rname = str(r.get("レース種別") or "").strip()
         if rname:
-            # 先頭の「令和…開催」等は残しつつ長すぎたら末尾寄り
             short = re.sub(r"^令和[^\s　]*[市営]*\s*", "", rname)
             short = re.sub(r"\s*\d+\s*/\s*\d+[～~]?", "", short)
             short = short.strip() or rname
@@ -9502,17 +9623,23 @@ def _v319_build_player_history_lines(player_name: str, df: pd.DataFrame) -> list
             lines.append(sky)
         surf = str(r.get("走路") or "良").replace("走路", "")
         lines.append(surf or "良")
-        ymd_wx = re.sub(r"[^0-9]", "", ds)
-        try:
-            wx = _v319_race_weather(ymd_wx, venue, rn or 0)
-        except Exception:
-            wx = {}
-        if wx.get("走"):
-            lines.append(f"走{wx['走']}")
-        if wx.get("気"):
-            lines.append(f"気{wx['気']}")
-        if wx.get("湿"):
-            lines.append(f"湿{wx['湿']}")
+        # SP補完の走/気/湿があれば使う（HTTPしない）
+        for col, prefix in (("走", "走"), ("気", "気"), ("湿", "湿")):
+            val = str(r.get(col) or "").strip()
+            if val:
+                lines.append(f"{prefix}{val}")
+        if fetch_weather and not any(str(r.get(c) or "").strip() for c in ("走", "気", "湿")):
+            ymd_wx = re.sub(r"[^0-9]", "", ds)
+            try:
+                wx = _v319_race_weather(ymd_wx, venue, rn or 0)
+            except Exception:
+                wx = {}
+            if wx.get("走"):
+                lines.append(f"走{wx['走']}")
+            if wx.get("気"):
+                lines.append(f"気{wx['気']}")
+            if wx.get("湿"):
+                lines.append(f"湿{wx['湿']}")
         try:
             hnum = int(r.get("ハンデ") or 0)
         except Exception:
@@ -9521,7 +9648,6 @@ def _v319_build_player_history_lines(player_name: str, df: pd.DataFrame) -> list
             car = int(r.get("車番") or 0)
         except Exception:
             car = 0
-        # 車番が分かるときは「2番10m」、不明ならハンデのみ
         if car > 0:
             lines.append(f"{car}番{hnum}m" if hnum else f"{car}番-m")
         elif hnum:
@@ -9542,6 +9668,7 @@ def _v319_build_player_history_lines(player_name: str, df: pd.DataFrame) -> list
     return lines
 
 
+
 def _v319_fill_player_histories(
     db_path: str,
     players: list[dict],
@@ -9550,12 +9677,13 @@ def _v319_fill_player_histories(
     before_venue: str = "",
     before_race: int = 0,
 ) -> dict:
-    """選手履歴を公式ページから取得して保存。
+    """選手履歴を公式PC版 PlayerDetail から取得して保存。
 
-    - 件数不足・R番号欠落（誤登録）があれば公式から再取得して上書き
-    - 履歴テキストに R番号を必ず含め、同名レースを区別
-    - 結果DBにあれば車番を補完
+    - R番号は公式テーブルの R 列から取得（SP版にはRが無い）
+    - 件数不足・R欠落・公式欠けがあれば再取込（選手ごとに1プロセス1回まで）
+    - 天候HTTPは自動取込では叩かない（途中停止の主因だった）
     """
+    global _V319_HIST_REFRESHED
     added = 0
     skipped = 0
     errors = 0
@@ -9563,14 +9691,19 @@ def _v319_fill_player_histories(
     min_rows = int(min_rows or 30)
     for p in players:
         name = p.get("name") or ""
-        pcd = p.get("player_cd") or ""
+        pcd = str(p.get("player_cd") or "").strip()
         state = _v319_player_history_state(db_path, name)
         have = int(state.get("count") or 0)
         latest = str(state.get("latest") or "")
         have_keys = set(state.get("keys") or set())
-        # R番号=0 のキーは誤登録とみなす
         dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
+        cache_key = pcd or _v319_norm_player_name(name)
+        already_refreshed = cache_key in _V319_HIST_REFRESHED
         try:
+            if not pcd:
+                errors += 1
+                details.append(f"{name}:playerCdなし")
+                continue
             df = _v319_fetch_player_history_df(pcd, name)
             if df is None or df.empty:
                 if have <= 0:
@@ -9582,6 +9715,27 @@ def _v319_fill_player_histories(
                 continue
             if "車番" not in df.columns:
                 df["車番"] = 0
+            # SP版の車番・天候を補完（RはPC版のまま）
+            try:
+                enrich = _v319_fetch_sp_player_history_enrich(pcd)
+                if enrich:
+                    df = _v319_merge_sp_enrich(df, enrich)
+            except Exception:
+                pass
+            # Rを数値化（drop_duplicates用）
+            def _rn(v):
+                try:
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return 0
+                    s = str(v).strip()
+                    if re.fullmatch(r"\d+", s):
+                        return int(s)
+                except Exception:
+                    pass
+                return 0
+            df = df.copy()
+            df["レース"] = df["レース"].map(_rn) if "レース" in df.columns else 0
+
             if before_ymd:
                 before_rows = [
                     r for _, r in df.iterrows()
@@ -9596,29 +9750,29 @@ def _v319_fill_player_histories(
                         skipped += 1
                         details.append(f"{name}:当該R以前は追加なし")
                     continue
-            # 結果DBから車番・不足分を補完
+
             extra = _v319_history_from_results(
                 db_path, name, before_ymd or latest, before_venue, before_race
             )
             if extra is not None and not extra.empty:
                 if "車番" not in extra.columns:
                     extra["車番"] = 0
+                extra = extra.copy()
+                extra["レース"] = extra["レース"].map(_rn) if "レース" in extra.columns else 0
                 df = pd.concat([df, extra], ignore_index=True)
 
-            # 公式側キー
             official_keys = set()
             for _, r in df.iterrows():
                 k = _v319_hist_row_key(r)
-                if k[0]:
+                if k[0] and k[2] > 0:
                     official_keys.add(k)
 
             missing_official = official_keys - have_keys
-            # 誤登録 or 件数不足 or 公式にあるのに欠けている → 再取込
-            need_refresh = (
-                have < min_rows
-                or bool(dirty_keys)
-                or (len(missing_official) >= 1 and have < min_rows + 5)
-                or (len(missing_official) >= 3)
+            # 再取込条件（厳しすぎない）
+            need_refresh = (not already_refreshed) and (
+                (have < min_rows and (bool(dirty_keys) or len(missing_official) >= 1 or have < 15))
+                or (len(dirty_keys) >= 3)
+                or (have < 10)
             )
 
             keep = []
@@ -9632,32 +9786,36 @@ def _v319_fill_player_histories(
                 seen.add(k)
                 if need_refresh:
                     keep.append(r)
-                else:
-                    # 正常時は未登録キーのみ追加
-                    if k not in have_keys:
-                        keep.append(r)
+                elif k not in have_keys:
+                    keep.append(r)
             if not keep:
                 skipped += 1
                 details.append(f"{name}:最新済{latest or have}")
                 continue
 
             work = pd.DataFrame(keep)
-            # 車番: 同じキーで車番>0の行を優先
             if "車番" in work.columns:
                 work["_car"] = pd.to_numeric(work["車番"], errors="coerce").fillna(0).astype(int)
-                work = work.sort_values("_car", ascending=False, kind="mergesort")
-                work = work.drop_duplicates(subset=["開催日", "開催場", "レース"], keep="first")
-                work = work.drop(columns=["_car"], errors="ignore")
+            else:
+                work["_car"] = 0
+            work["レース"] = work["レース"].map(_rn)
+            work = work.sort_values("_car", ascending=False, kind="mergesort")
+            # 同日同場同Rは1件に（車番あり優先）
+            work["_ds"] = work["開催日"].map(lambda x: _v319_ymd_digits(x))
+            work["_vn"] = work["開催場"].map(lambda x: str(x or "").replace("　", "").strip())
+            work = work.drop_duplicates(subset=["_ds", "_vn", "レース"], keep="first")
+            work = work.drop(columns=["_car", "_ds", "_vn"], errors="ignore")
             work["_ymd"] = work["開催日"].map(_v319_ymd_digits)
             work = work.sort_values("_ymd", ascending=False, kind="mergesort").drop(columns=["_ymd"])
-            # 再取込時は min_rows 件（足りなければ全件）を流す
-            if need_refresh:
-                take_n = max(min_rows, min(len(work), max(min_rows, 35)))
-                df_use = work.head(take_n)
-            else:
-                df_use = work.head(max(min_rows - have, len(work)))
 
-            lines = _v319_build_player_history_lines(name, df_use)
+            if need_refresh:
+                df_use = work.head(max(min_rows, min(len(work), 35)))
+            else:
+                need = max(min_rows - have, 1)
+                df_use = work.head(max(need, len(work)))
+
+            # 天候HTTPなし（停止防止）
+            lines = _v319_build_player_history_lines(name, df_use, fetch_weather=False)
             parsed = None
             try:
                 parsed = engine.v15_parse_player_history("\n".join(lines), player_name=str(name).strip())
@@ -9665,13 +9823,12 @@ def _v319_fill_player_histories(
                 parsed = df_use
             if not isinstance(parsed, pd.DataFrame) or parsed.empty:
                 parsed = df_use
-            # パースでRが落ちていたら元DFを優先（件数維持）
-            if len(parsed) < max(10, int(len(df_use) * 0.6)) and len(df_use) >= 10:
+            if len(parsed) < max(8, int(len(df_use) * 0.5)) and len(df_use) >= 8:
                 parsed = df_use
 
             report = engine.v47_save_player_history(parsed, db_path=db_path)
             changed = int((report or {}).get("changed") or (report or {}).get("saved") or 0)
-            if changed <= 1 and len(parsed) >= 10:
+            if changed <= 1 and len(parsed) >= 8:
                 try:
                     report2 = engine.v131_save_pending_player_history(parsed, db_path=db_path)
                     changed += int((report2 or {}).get("changed") or (report2 or {}).get("saved") or 0)
@@ -9680,9 +9837,12 @@ def _v319_fill_player_histories(
             after = _v319_player_history_count(db_path, name)
             delta = max(changed, max(0, after - have))
             added += delta
+            if need_refresh:
+                _V319_HIST_REFRESHED.add(cache_key)
             tag = "再取込" if need_refresh else "追加"
-            details.append(f"{name}:{have}→{after}({tag}+{len(parsed)}件 R付与)")
-            time_module.sleep(0.25)
+            r_ok = int((df_use["レース"] > 0).sum()) if "レース" in df_use.columns else 0
+            details.append(f"{name}:{have}→{after}({tag}{len(parsed)}件/R付{r_ok})")
+            time_module.sleep(0.15)
         except Exception as exc:
             errors += 1
             details.append(f"{name}:{type(exc).__name__}:{exc}")
@@ -10064,7 +10224,7 @@ def _v319_import_one_race(
         )
         hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
         err_n = int(filled.get("errors") or 0)
-        # 履歴0件の選手が残る場合だけハード失敗（既存十分で一時取得失敗は警告継続）
+        # 1人でも履歴0 or 取込エラーなら予測しない（通知して終了）
         missing = []
         for p in players:
             nm = str(p.get("name") or "").strip()
@@ -10072,19 +10232,15 @@ def _v319_import_one_race(
                 continue
             if int(_v319_player_history_count(db_path, nm) or 0) <= 0:
                 missing.append(nm)
-        any_have = any(
-            int(_v319_player_history_count(db_path, str(p.get("name") or "")) or 0) > 0
-            for p in players if str(p.get("name") or "").strip()
-        )
-        if missing or (err_n > 0 and int(filled.get("added") or 0) <= 0 and not any_have):
-            detail = " / ".join(str(x) for x in (filled.get("details") or [])[:6])
-            who = ", ".join(missing[:4]) if missing else "全員"
+        if missing or err_n > 0:
+            detail = " / ".join(str(x) for x in (filled.get("details") or [])[:8])
+            who = ", ".join(missing[:5]) if missing else "取込エラーあり"
             return {
                 "status": "error",
                 "phase": "save_player_history",
                 "message": (
-                    f"{venue} {race_no}R：選手履歴登録に失敗しました（{who}）。"
-                    f" 予測と結果登録は実行していません。"
+                    f"{venue} {race_no}R：選手履歴が不完全なため予測・結果登録を中止しました。"
+                    f" 不足選手：{who}。"
                     f" 失敗段階：選手履歴保存"
                     f"{hist_msg}"
                     + (f"｜{detail}" if detail else "")
@@ -10092,9 +10248,12 @@ def _v319_import_one_race(
                 "key": key_guess,
                 "player_history_saved": False,
                 "next_action": "retry",
+                "notify": True,
+                "notify_message": (
+                    f"【履歴失敗】{venue}{race_no}R：{who}の履歴が不足/失敗。"
+                    f" 予測は実行していません。"
+                ),
             }
-        if err_n > 0:
-            hist_msg += f" / 履歴警告{err_n}"
     except Exception as exc:
         return {
             "status": "error",
@@ -10351,6 +10510,8 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 item["status"] = one.get("status") or "ok"
                 item["message"] = one.get("message") or ""
                 item["phase"] = one.get("phase") or ""
+                if one.get("notify_message"):
+                    item["notify_message"] = one.get("notify_message")
                 st_one = str(item["status"] or "")
                 if st_one == "skip":
                     skip += 1
