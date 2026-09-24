@@ -9708,10 +9708,11 @@ def _v319_build_player_history_lines(
             rn = int(r.get("レース") or 0)
         except Exception:
             rn = 0
-        if rn > 0:
-            lines.append(f"{venue} {rn}R" if venue else f"{rn}R")
-        elif venue:
+        # 公式貼付形式: 開催場と R を別行（結合するとパーサがRを落とす）
+        if venue:
             lines.append(venue)
+        if 1 <= rn <= 12:
+            lines.append(f"{rn}R")
         rname = str(r.get("レース名") or "").strip()
         rname = re.sub(r"\s*\d*\s*レース映像", "", rname).strip()
         if not rname and r.get("レース種別"):
@@ -9912,34 +9913,107 @@ def _v319_fill_player_histories(
                 need = max(min_rows - have, 1)
                 df_use = work.head(max(need, len(work)))
 
-            # 天候HTTPなし（停止防止）
+            # 公式貼付フォーマット → 解析。失敗時はDF直接。pendingは手動UIと同じ確定処理。
             lines = _v319_build_player_history_lines(name, df_use, fetch_weather=False)
             parsed = None
             try:
-                parsed = engine.v15_parse_player_history("\n".join(lines), player_name=str(name).strip())
+                parsed = engine.v15_parse_player_history(
+                    "\n".join(lines), player_name=str(name).strip()
+                )
             except Exception:
-                parsed = df_use
+                parsed = None
             if not isinstance(parsed, pd.DataFrame) or parsed.empty:
-                parsed = df_use
-            if len(parsed) < max(8, int(len(df_use) * 0.5)) and len(df_use) >= 8:
-                parsed = df_use
-
-            report = engine.v47_save_player_history(parsed, db_path=db_path)
-            changed = int((report or {}).get("changed") or (report or {}).get("saved") or 0)
-            if changed <= 1 and len(parsed) >= 8:
+                parsed = df_use.copy()
+            elif len(parsed) < max(8, int(len(df_use) * 0.5)) and len(df_use) >= 8:
+                parsed = df_use.copy()
+            else:
+                # 解析でRが落ちたらPC版から戻す
                 try:
-                    report2 = engine.v131_save_pending_player_history(parsed, db_path=db_path)
-                    changed += int((report2 or {}).get("changed") or (report2 or {}).get("saved") or 0)
+                    src = df_use.copy()
+                    src["_ds"] = src["開催日"].map(_v319_ymd_digits)
+                    src["_vn"] = src["開催場"].map(lambda x: str(x or "").replace("　", "").strip())
+                    rmap = {}
+                    for _, sr in src.iterrows():
+                        try:
+                            rv = int(sr.get("レース") or 0)
+                        except Exception:
+                            rv = 0
+                        if rv > 0:
+                            rmap[(sr["_ds"], sr["_vn"])] = rv
+                    if "レース" not in parsed.columns:
+                        parsed = parsed.copy()
+                        parsed["レース"] = 0
+                    for i, pr in parsed.iterrows():
+                        cur = 0
+                        try:
+                            cur = int(pd.to_numeric(pr.get("レース"), errors="coerce") or 0)
+                        except Exception:
+                            cur = 0
+                        if cur <= 0:
+                            k = (_v319_ymd_digits(pr.get("開催日")), str(pr.get("開催場") or "").replace("　", "").strip())
+                            if k in rmap:
+                                parsed.at[i, "レース"] = rmap[k]
                 except Exception:
                     pass
+
+            parsed = parsed.copy()
+            if "選手名" not in parsed.columns:
+                parsed["選手名"] = name
+            else:
+                parsed["選手名"] = parsed["選手名"].fillna(name)
+                parsed.loc[parsed["選手名"].astype(str).str.strip().isin(["", "nan", "None"]), "選手名"] = name
+
+            report = engine.v47_save_player_history(parsed, db_path=db_path) or {}
+            changed = int(report.get("changed") or report.get("saved") or 0)
+            pending_df = report.get("pending")
+            pending_left = int(report.get("pending_count") or 0)
+
+            # 手動登録と同じ: pending → 「入力したRで新規登録」で確定
+            if isinstance(pending_df, pd.DataFrame) and not pending_df.empty:
+                repaired = pending_df.copy()
+                if "重複処理" not in repaired.columns:
+                    repaired["重複処理"] = "入力したRで新規登録"
+                else:
+                    need = repaired["重複処理"].fillna("選択してください").astype(str).isin(
+                        ["", "選択してください", "nan", "None"]
+                    )
+                    repaired.loc[need, "重複処理"] = "入力したRで新規登録"
+                repaired["_v58_duplicate_confirmed"] = True
+                try:
+                    report2 = engine.v131_save_pending_player_history(repaired, db_path=db_path) or {}
+                    changed += int(
+                        report2.get("verified") or report2.get("changed") or report2.get("saved") or 0
+                    )
+                    pending_left = int(report2.get("pending_count") or 0)
+                except Exception as _pend_exc:
+                    details.append(f"{name}:pending失敗:{type(_pend_exc).__name__}")
+
+            if changed <= 0 and len(parsed) >= 5:
+                try:
+                    work2 = parsed.copy()
+                    work2["重複処理"] = "入力したRで新規登録"
+                    work2["_v58_duplicate_confirmed"] = True
+                    report3 = engine.v131_save_pending_player_history(work2, db_path=db_path) or {}
+                    changed += int(
+                        report3.get("verified") or report3.get("changed") or report3.get("saved") or 0
+                    )
+                    pending_left = int(report3.get("pending_count") or pending_left or 0)
+                except Exception:
+                    pass
+
             after = _v319_player_history_count(db_path, name)
             delta = max(changed, max(0, after - have))
             added += delta
             if need_refresh:
                 _V319_HIST_REFRESHED.add(cache_key)
             tag = "再取込" if need_refresh else "追加"
-            r_ok = int((df_use["レース"] > 0).sum()) if "レース" in df_use.columns else 0
-            details.append(f"{name}:{have}→{after}({tag}{len(parsed)}件/R付{r_ok})")
+            try:
+                r_ok = int((pd.to_numeric(parsed["レース"], errors="coerce").fillna(0) > 0).sum()) if "レース" in parsed.columns else 0
+            except Exception:
+                r_ok = 0
+            pend_s = f"/未確定{pending_left}" if pending_left else ""
+            details.append(f"{name}:{have}→{after}({tag}{len(parsed)}件/R付{r_ok}/保存{changed}{pend_s})")
+            time_module.sleep(0.15)
             time_module.sleep(0.15)
         except Exception as exc:
             errors += 1
