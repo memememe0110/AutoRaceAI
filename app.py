@@ -10085,14 +10085,22 @@ def _v319_prediction_entry_count(db_path: str, race_key: str) -> int:
                 ymd = f"{m.group(1)}{m.group(2)}{m.group(3)}"
                 keys = _v319_race_key_candidates(ymd, m.group(4), m.group(5))
             ph = ",".join("?" * len(keys))
-            cols = {r[1] for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
-            # スナップショット行数
-            if "v231_prediction_entry_snapshots" in tables or "v231_prediction_snapshots" in tables:
-                snap = "v231_prediction_entry_snapshots" if "v231_prediction_entry_snapshots" in tables else "v231_prediction_snapshots"
+            # 1) snapshot tables
+            for snap in (
+                "v231_prediction_entry_snapshots",
+                "v231_prediction_snapshots",
+                "v231_prediction_entry",
+            ):
+                if snap not in tables:
+                    continue
                 try:
+                    scols = {r[1] for r in con.execute(f"PRAGMA table_info({snap})").fetchall()}
+                    car_c = "car_no" if "car_no" in scols else ("車番" if "車番" in scols else None)
+                    if not car_c:
+                        continue
                     n = con.execute(
                         f"""
-                        SELECT COUNT(DISTINCT s.car_no) FROM {snap} s
+                        SELECT COUNT(DISTINCT s.{car_c}) FROM {snap} s
                         JOIN v231_prediction_history h ON h.history_id=s.history_id
                         WHERE h.race_key IN ({ph})
                         """,
@@ -10102,50 +10110,117 @@ def _v319_prediction_entry_count(db_path: str, race_key: str) -> int:
                         return int(n[0])
                 except Exception:
                     pass
-            # payload / view_json から
-            for col in ("view_json", "payload_json", "payload", "meta_json"):
+            cols = {r[1] for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+            # 2) blob / json columns
+            for col in ("view_blob", "view_json", "payload_json", "payload", "meta_json", "result_blob"):
                 if col not in cols:
                     continue
                 row = con.execute(
                     f"SELECT {col} FROM v231_prediction_history WHERE race_key IN ({ph}) ORDER BY history_id DESC LIMIT 1",
                     tuple(keys),
                 ).fetchone()
-                if not row or not row[0]:
+                if not row or row[0] is None:
                     continue
                 raw = row[0]
+                obj = None
                 if isinstance(raw, (bytes, bytearray)):
-                    try:
-                        import pickle as _pkl
-                        obj = _pkl.loads(raw)
-                    except Exception:
+                    for loader in (
+                        lambda b: pickle.loads(b),
+                        lambda b: json.loads(zlib.decompress(b).decode("utf-8", "replace")),
+                        lambda b: json.loads(b.decode("utf-8", "replace")),
+                    ):
                         try:
-                            obj = json.loads(raw.decode("utf-8", "replace"))
+                            obj = loader(raw)
+                            break
                         except Exception:
                             continue
-                else:
+                elif isinstance(raw, str):
                     try:
-                        obj = json.loads(raw) if isinstance(raw, str) and raw[:1] in "{[" else raw
+                        obj = json.loads(raw)
                     except Exception:
-                        continue
-                if isinstance(obj, dict):
-                    for k in ("entries", "df", "finish_prob"):
-                        v = obj.get(k)
-                        if isinstance(v, pd.DataFrame) and not v.empty:
-                            return int(len(v))
-                        if isinstance(v, list) and v:
-                            return int(len(v))
-                        if isinstance(v, dict) and v:
-                            return int(len(v))
-                    meta = obj.get("meta") or {}
-                    for mk in ("出走数", "実出走数", "予測照合用出走数", "n_cars"):
-                        if meta.get(mk):
-                            try:
-                                return int(meta[mk])
-                            except Exception:
-                                pass
+                        obj = None
+                if not isinstance(obj, dict):
+                    continue
+                for k in ("entries", "df", "finish_prob"):
+                    v = obj.get(k)
+                    if isinstance(v, pd.DataFrame) and not v.empty:
+                        return int(len(v))
+                    if isinstance(v, list) and v:
+                        return int(len(v))
+                    if isinstance(v, dict) and v:
+                        return int(len(v))
+                meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else obj
+                for mk in ("出走数", "実出走数", "予測照合用出走数", "n_cars", "entry_count"):
+                    if meta.get(mk) is not None:
+                        try:
+                            n = int(meta[mk])
+                            if n > 0:
+                                return n
+                        except Exception:
+                            pass
+                # raw_text から「N車」
+                for tk in ("raw_text", "prediction_text", "text"):
+                    t = str(obj.get(tk) or "")
+                    mm = re.search(r"(\d+)\s*車", t)
+                    if mm:
+                        return int(mm.group(1))
+            # 3) raw_text column on history
+            for col in ("raw_text", "prediction_text", "input_text"):
+                if col not in cols:
+                    continue
+                row = con.execute(
+                    f"SELECT {col} FROM v231_prediction_history WHERE race_key IN ({ph}) ORDER BY history_id DESC LIMIT 1",
+                    tuple(keys),
+                ).fetchone()
+                if row and row[0]:
+                    mm = re.search(r"(\d+)\s*車", str(row[0]))
+                    if mm:
+                        return int(mm.group(1))
+                    # 車番行の最大
+                    cars = re.findall(r"(?m)^([1-8])\t", str(row[0]))
+                    if cars:
+                        return max(int(c) for c in cars)
     except Exception:
         return 0
     return 0
+
+
+def _v319_clear_prediction(db_path: str, race_key: str) -> None:
+    """古い誤予測を消して再予測できるようにする。"""
+    try:
+        keys = [str(race_key)]
+        m = re.match(r"(\d{4})-?(\d{2})-?(\d{2})_(.+)_(\d+)R?", str(race_key))
+        if m:
+            ymd = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+            keys = _v319_race_key_candidates(ymd, m.group(4), m.group(5))
+        with sqlite3.connect(str(db_path), timeout=15) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "v231_prediction_history" not in tables:
+                return
+            ph = ",".join("?" * len(keys))
+            ids = [r[0] for r in con.execute(
+                f"SELECT history_id FROM v231_prediction_history WHERE race_key IN ({ph})",
+                tuple(keys),
+            ).fetchall()]
+            for snap in (
+                "v231_prediction_entry_snapshots",
+                "v231_prediction_snapshots",
+                "v231_prediction_entry",
+            ):
+                if snap in tables and ids:
+                    try:
+                        q = ",".join("?" * len(ids))
+                        con.execute(f"DELETE FROM {snap} WHERE history_id IN ({q})", tuple(ids))
+                    except Exception:
+                        pass
+            con.execute(
+                f"DELETE FROM v231_prediction_history WHERE race_key IN ({ph})",
+                tuple(keys),
+            )
+            con.commit()
+    except Exception:
+        pass
+
 
 
 def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719, raw_text: str = "") -> dict:
@@ -10519,12 +10594,29 @@ def _v319_import_one_race(
     # --- 3) 予測（未保存時）＋出走数不一致なら再予測 ---
     pred_ok = _v319_prediction_exists(db_path, key_guess)
     card_n = len(players or [])
+    if not card_n and card_text:
+        mm = re.search(r"(\d+)\s*車", str(card_text))
+        if mm:
+            card_n = int(mm.group(1))
     if pred_ok and card_n > 0:
         pred_n = _v319_prediction_entry_count(db_path, key_guess)
+        # 台数が取れた不一致、または台数不明でも出走表の最大車番と食い違う可能性に備えて
+        # 「車」表記と players 件数で判定
         if pred_n > 0 and pred_n != card_n:
-            # 例: 予測8車・出走表7車 → 結果登録不能になるので作り直す
+            try:
+                _v319_clear_prediction(db_path, key_guess)
+            except Exception:
+                pass
             pred_ok = False
             pred_msg = f" / 予測台数不一致{pred_n}→{card_n}で再予測"
+        elif pred_n <= 0:
+            # 台数不明の古い予測は信用せず、カードがあるなら再予測
+            try:
+                _v319_clear_prediction(db_path, key_guess)
+            except Exception:
+                pass
+            pred_ok = False
+            pred_msg = f" / 予測台数不明のため再予測({card_n}車)"
     if predict_if_missing and not pred_ok:
         _step("予測中")
         try:
@@ -10667,17 +10759,45 @@ def _v319_import_one_race(
     try:
         saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
     except Exception as exc:
-        return {
-            "status": "error",
-            "phase": "save_result",
-            "message": (
-                f"{venue} {race_no}R：結果登録に失敗しました。"
-                f" ({type(exc).__name__}: {exc})"
-                f"{hist_msg}{pred_msg}{odds_msg}"
-            ),
-            "key": key_guess,
-            "next_action": "retry",
-        }
+        emsg = f"{type(exc).__name__}: {exc}"
+        # 予測8車・結果7車などの不一致 → 出走表で再予測して1回だけリトライ
+        if ("出走数が一致しない" in emsg) or ("結果にない車番" in emsg) or ("予測=" in emsg and "結果=" in emsg):
+            try:
+                _step("台数不一致→再予測")
+                if not str(card_text or "").strip():
+                    card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
+                _v319_clear_prediction(db_path, key_guess)
+                pred = _v319_run_prerace_prediction(
+                    db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text
+                )
+                if not pred.get("ok"):
+                    raise RuntimeError(pred.get("reason") or "再予測失敗")
+                pred_msg += " / 結果前に再予測"
+                saved = _v319_register_fetched_result(db_path, raw, venue, replace=True)
+            except Exception as exc2:
+                return {
+                    "status": "error",
+                    "phase": "save_result",
+                    "message": (
+                        f"{venue} {race_no}R：結果登録に失敗しました。"
+                        f" ({emsg}｜再予測後:{type(exc2).__name__}: {exc2})"
+                        f"{hist_msg}{pred_msg}{odds_msg}"
+                    ),
+                    "key": key_guess,
+                    "next_action": "retry",
+                }
+        else:
+            return {
+                "status": "error",
+                "phase": "save_result",
+                "message": (
+                    f"{venue} {race_no}R：結果登録に失敗しました。"
+                    f" ({emsg})"
+                    f"{hist_msg}{pred_msg}{odds_msg}"
+                ),
+                "key": key_guess,
+                "next_action": "retry",
+            }
     key = str(saved.get("key") or key_guess)
     if not _v319_result_exists(db_path, ymd, venue, race_no):
         return {
