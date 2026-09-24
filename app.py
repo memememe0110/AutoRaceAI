@@ -9280,10 +9280,9 @@ def _v319_player_history_count(db_path: str, player_name: str) -> int:
         return 0
 
 
-def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFrame:
-    url = f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={player_cd}&historyDispType=d"
-    html = _v319_http_get(url)
-    tables = re.findall(r"(?is)<table[^>]*>(.*?)</table>", html)
+def _v319_parse_pc_player_history_html(html: str, player_name: str) -> list[dict]:
+    """PC版 PlayerDetail HTML → 履歴行（R列あり）。"""
+    tables = re.findall(r"(?is)<table[^>]*>(.*?)</table>", html or "")
     hist = []
     for table in tables:
         rows = re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", table)
@@ -9293,12 +9292,14 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
         headj = "".join(head)
         if "着順" not in headj or ("試走" not in headj and "年月日" not in headj):
             continue
+
         def _col(names):
             for n in names:
                 for i, h in enumerate(head):
                     if n in h:
                         return i
             return None
+
         i_d = _col(["年月日", "日付"])
         i_v = _col(["開催場"])
         i_nm = _col(["レース名"])
@@ -9314,15 +9315,17 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
             cells = _v319_html_cells(row)
             if i_d is None or i_d >= len(cells) or i_f is None or i_f >= len(cells):
                 continue
+
             def _at(i, default=""):
                 return cells[i] if i is not None and i < len(cells) else default
+
             d, ven, rname = _at(i_d), _at(i_v), _at(i_nm)
             rno, hand, kind, weather = _at(i_r), _at(i_h), _at(i_k), _at(i_w)
             finish, trial, race_t, st = _at(i_f), _at(i_t), _at(i_rt), _at(i_st)
             acc = _at(_col(["異", "事故"]))
-            if "映像" in rname:
+            if "映像" in (rname or ""):
                 rname = re.sub(r"\s*\d*\s*レース映像", "", rname).strip()
-            dm = re.match(r"(\d{2})/(\d{2})/(\d{2})", d.replace("-", "/"))
+            dm = re.match(r"(\d{2})/(\d{2})/(\d{2})", str(d or "").replace("-", "/"))
             if not dm:
                 continue
             yy = int(dm.group(1))
@@ -9345,7 +9348,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
                 "選手名": player_name,
                 "開催日": date_s,
                 "開催場": ven,
-                "レース": int(rno) if re.fullmatch(r"\d+", str(rno or "")) else None,
+                "レース": int(rno) if re.fullmatch(r"\d+", str(rno or "")) else 0,
                 "レース名": rname,
                 "レース種別": kind,
                 "着順": fin,
@@ -9357,28 +9360,24 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
                 "競走T": race_t,
                 "ST": st,
                 "事故": acc,
+                "走": "",
+                "気": "",
+                "湿": "",
             })
+    return hist
 
-def _v319_fetch_sp_player_history_enrich(player_cd: str) -> list[dict]:
-    """SP版選手詳細から車番・天候・走路温度などを取得（Rは無いので日付+場で突合）。"""
-    url = (
-        "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
-        f"?playerCd={player_cd}&historyDispType=d"
-    )
-    try:
-        html = _v319_http_get(url, timeout=18, retries=2)
-    except Exception:
-        return []
+
+def _v319_parse_sp_player_history_rows(html: str, player_name: str) -> list[dict]:
+    """SP版から履歴行を構築（車番・天候あり。Rは0のことが多い）。"""
+    text_body = _v319_html_to_text(html or "")
     out = []
-    # compact: 「2 2026年9月15日 浜松 … 走28.0 気25.0 湿82.0 2番10m」
     pat = re.compile(
-        r"(?P<fin>\d+|欠車|欠責|他落|失格)\s+"
+        r"(?P<fin>\d+|欠車|欠責|他落|失格|落車)\s+"
         r"(?P<y>\d{4})年(?P<m>\d{1,2})月(?P<d>\d{1,2})日\s+"
         r"(?P<ven>川口|伊勢崎|浜松|飯塚|山陽)\s+"
-        r"(?P<body>.{5,120}?)(?=(?:\d+|欠車|欠責|他落|失格)\s+\d{4}年|$)",
+        r"(?P<body>.{5,160}?)(?=(?:\d+|欠車|欠責|他落|失格|落車)\s+\d{4}年|$)",
         re.S,
     )
-    text_body = _v319_html_to_text(html)
     for m in pat.finditer(text_body):
         body = re.sub(r"\s+", " ", m.group("body")).strip()
         car, hand = 0, 0
@@ -9409,22 +9408,112 @@ def _v319_fetch_sp_player_history_enrich(player_cd: str) -> list[dict]:
         hm = re.search(r"湿([\d.]+)", body)
         if hm:
             wx_hum = hm.group(1)
+        race_t = trial = st = ""
+        # 末尾の 競走T 試T ST
+        times = re.findall(r"(?<![走気湿番\d])(\d\.\d{2,3})", body)
+        # 人気の数字を除外しにくいので「3.xxx」を競走、試を優先
+        tm2 = re.search(r"試\s*([\d.]+)", body)
+        if tm2:
+            trial = tm2.group(1)
+        stm = re.search(r"ST\s*([\d.]+)", body, re.I)
+        if stm:
+            st = stm.group(1)
+        # 競走タイム: 試の前にある 3.xxx を優先
+        rt_m = re.search(r"(?<![走気湿\d])(3\.\d{3}|4\.\d{3}|0\.000)(?!\d)", body)
+        if rt_m:
+            race_t = rt_m.group(1)
+        # レース名: 場の直後〜天候の前
+        rname = body
+        for cut in ("小雨", "雨", "雪", "曇", "晴", "走", "気", "湿", "番"):
+            idx = rname.find(cut)
+            if idx > 0:
+                rname = rname[:idx].strip()
+                break
+        rname = re.sub(r"\d+人気.*$", "", rname).strip()
         date_s = f"{m.group('y')}-{int(m.group('m')):02d}-{int(m.group('d')):02d}"
         fin_s = m.group("fin")
         fin = int(fin_s) if re.fullmatch(r"\d+", fin_s) else None
+        acc = "" if fin is not None else fin_s
         out.append({
+            "選手名": player_name,
             "開催日": date_s,
             "開催場": m.group("ven"),
+            "レース": 0,
+            "レース名": rname,
+            "レース種別": "",
             "着順": fin,
-            "車番": car,
-            "ハンデ": hand,
-            "天候": sky,
             "走路": surf,
+            "天候": sky,
+            "ハンデ": hand,
+            "車番": car,
+            "試走T": trial,
+            "競走T": race_t,
+            "ST": st,
+            "事故": acc,
             "走": wx_track,
             "気": wx_air,
             "湿": wx_hum,
         })
     return out
+
+
+def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFrame:
+    """PC版を優先、空ならSP版にフォールバック。RはPC版のみ確実。"""
+    pcd = str(player_cd or "").strip()
+    name = str(player_name or "").strip()
+    hist: list[dict] = []
+    pc_err = ""
+    # 1) PC版
+    if pcd:
+        for url in (
+            f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}&historyDispType=d",
+            f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}",
+        ):
+            try:
+                html = _v319_http_get(url, timeout=25, retries=3)
+                hist = _v319_parse_pc_player_history_html(html, name)
+                if hist:
+                    break
+            except Exception as exc:
+                pc_err = f"{type(exc).__name__}:{exc}"
+                hist = []
+    # 2) SP版フォールバック（またはPCに車番補完用）
+    sp_rows: list[dict] = []
+    if pcd:
+        try:
+            sp_url = (
+                "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
+                f"?playerCd={pcd}&historyDispType=d"
+            )
+            sp_html = _v319_http_get(sp_url, timeout=20, retries=2)
+            sp_rows = _v319_parse_sp_player_history_rows(sp_html, name)
+        except Exception:
+            sp_rows = []
+    if not hist and sp_rows:
+        hist = sp_rows
+    elif hist and sp_rows:
+        # 車番・天候を突合
+        df = pd.DataFrame(hist)
+        df = _v319_merge_sp_enrich(df, sp_rows)
+        return df
+    if not hist:
+        # 空のまま。呼び出し側で詳細を出す
+        return pd.DataFrame()
+    return pd.DataFrame(hist)
+
+
+def _v319_fetch_sp_player_history_enrich(player_cd: str) -> list[dict]:
+    """互換: SP版行を enrich 形式で返す。"""
+    try:
+        sp_url = (
+            "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
+            f"?playerCd={player_cd}&historyDispType=d"
+        )
+        sp_html = _v319_http_get(sp_url, timeout=18, retries=2)
+        rows = _v319_parse_sp_player_history_rows(sp_html, "")
+        return rows
+    except Exception:
+        return []
 
 
 def _v319_merge_sp_enrich(df: pd.DataFrame, enrich: list[dict]) -> pd.DataFrame:
@@ -9437,7 +9526,6 @@ def _v319_merge_sp_enrich(df: pd.DataFrame, enrich: list[dict]) -> pd.DataFrame:
     for col in ("走", "気", "湿"):
         if col not in df.columns:
             df[col] = ""
-    # index enrich by (date, venue)
     buckets: dict[tuple, list] = {}
     for e in enrich:
         key = (_v319_ymd_digits(e.get("開催日")), str(e.get("開催場") or "").strip())
@@ -9454,9 +9542,12 @@ def _v319_merge_sp_enrich(df: pd.DataFrame, enrich: list[dict]) -> pd.DataFrame:
             fin = None
         if fin is not None:
             for e in cands:
-                if e.get("着順") == fin:
-                    pick = e
-                    break
+                try:
+                    if e.get("着順") == fin:
+                        pick = e
+                        break
+                except Exception:
+                    pass
         if pick is None:
             pick = cands[0]
         if int(df.at[i, "車番"] or 0) <= 0 and int(pick.get("車番") or 0) > 0:
@@ -9468,12 +9559,15 @@ def _v319_merge_sp_enrich(df: pd.DataFrame, enrich: list[dict]) -> pd.DataFrame:
         for col in ("走", "気", "湿"):
             if not str(df.at[i, col] or "").strip() and pick.get(col):
                 df.at[i, col] = pick[col]
-        # ハンデ0でSP側にあるなら補完
         try:
             if int(df.at[i, "ハンデ"] or 0) <= 0 and int(pick.get("ハンデ") or 0) > 0:
                 df.at[i, "ハンデ"] = int(pick["ハンデ"])
         except Exception:
             pass
+        # 競走Tなどが空ならSPから
+        for col in ("試走T", "競走T", "ST", "レース名"):
+            if col in df.columns and not str(df.at[i, col] or "").strip() and pick.get(col):
+                df.at[i, col] = pick[col]
     return df
 
 
@@ -9559,13 +9653,26 @@ def _v319_hist_row_before(row, ymd: str, venue: str, race_no: int) -> bool:
 
 
 def _v319_hist_row_key(row) -> tuple:
+    """一意キー (開催日, 場, R)。R不明時は着順・車番から仮Rを作って同日複数を残す。"""
     ds = _v319_ymd_digits(row.get("開催日") if hasattr(row, "get") else "")
     vn = str((row.get("開催場") if hasattr(row, "get") else "") or "").replace("　", "").strip()
     try:
         rn = int(row.get("レース") or 0)
     except Exception:
         rn = 0
-    return (ds, vn, rn)
+    if rn > 0:
+        return (ds, vn, rn)
+    try:
+        fin = int(row.get("着順")) if row.get("着順") is not None and str(row.get("着順")).replace(".0","").strip().isdigit() else 0
+    except Exception:
+        fin = 0
+    try:
+        car = int(row.get("車番") or 0)
+    except Exception:
+        car = 0
+    # 仮R: 900+着順 または 800+車番（DBの実R 1-12 と衝突しない）
+    fake = 900 + max(fin, 0) if fin else (800 + max(car, 0) if car else 700)
+    return (ds, vn, int(fake))
 
 
 def _v319_build_player_history_lines(
@@ -9708,20 +9815,13 @@ def _v319_fill_player_histories(
             if df is None or df.empty:
                 if have <= 0:
                     errors += 1
-                    details.append(f"{name}:履歴0件")
+                    details.append(f"{name}:履歴0件(cd={pcd or '-'})")
                 else:
                     skipped += 1
                     details.append(f"{name}:公式0件/既存{have}")
                 continue
             if "車番" not in df.columns:
                 df["車番"] = 0
-            # SP版の車番・天候を補完（RはPC版のまま）
-            try:
-                enrich = _v319_fetch_sp_player_history_enrich(pcd)
-                if enrich:
-                    df = _v319_merge_sp_enrich(df, enrich)
-            except Exception:
-                pass
             # Rを数値化（drop_duplicates用）
             def _rn(v):
                 try:
@@ -9799,12 +9899,10 @@ def _v319_fill_player_histories(
             else:
                 work["_car"] = 0
             work["レース"] = work["レース"].map(_rn)
-            work = work.sort_values("_car", ascending=False, kind="mergesort")
-            # 同日同場同Rは1件に（車番あり優先）
-            work["_ds"] = work["開催日"].map(lambda x: _v319_ymd_digits(x))
-            work["_vn"] = work["開催場"].map(lambda x: str(x or "").replace("　", "").strip())
-            work = work.drop_duplicates(subset=["_ds", "_vn", "レース"], keep="first")
-            work = work.drop(columns=["_car", "_ds", "_vn"], errors="ignore")
+            work = work.sort_values(["_car"], ascending=False, kind="mergesort")
+            work["_key"] = work.apply(lambda r: _v319_hist_row_key(r), axis=1)
+            work = work.drop_duplicates(subset=["_key"], keep="first")
+            work = work.drop(columns=["_car", "_key"], errors="ignore")
             work["_ymd"] = work["開催日"].map(_v319_ymd_digits)
             work = work.sort_values("_ymd", ascending=False, kind="mergesort").drop(columns=["_ymd"])
 
