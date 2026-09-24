@@ -10072,6 +10072,82 @@ def _v319_prediction_exists(db_path: str, race_key: str) -> bool:
         return False
 
 
+def _v319_prediction_entry_count(db_path: str, race_key: str) -> int:
+    """保存済み予測の出走台数。不明なら0。"""
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "v231_prediction_history" not in tables:
+                return 0
+            keys = [str(race_key)]
+            m = re.match(r"(\d{4})-?(\d{2})-?(\d{2})_(.+)_(\d+)R?", str(race_key))
+            if m:
+                ymd = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                keys = _v319_race_key_candidates(ymd, m.group(4), m.group(5))
+            ph = ",".join("?" * len(keys))
+            cols = {r[1] for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+            # スナップショット行数
+            if "v231_prediction_entry_snapshots" in tables or "v231_prediction_snapshots" in tables:
+                snap = "v231_prediction_entry_snapshots" if "v231_prediction_entry_snapshots" in tables else "v231_prediction_snapshots"
+                try:
+                    n = con.execute(
+                        f"""
+                        SELECT COUNT(DISTINCT s.car_no) FROM {snap} s
+                        JOIN v231_prediction_history h ON h.history_id=s.history_id
+                        WHERE h.race_key IN ({ph})
+                        """,
+                        tuple(keys),
+                    ).fetchone()
+                    if n and int(n[0] or 0) > 0:
+                        return int(n[0])
+                except Exception:
+                    pass
+            # payload / view_json から
+            for col in ("view_json", "payload_json", "payload", "meta_json"):
+                if col not in cols:
+                    continue
+                row = con.execute(
+                    f"SELECT {col} FROM v231_prediction_history WHERE race_key IN ({ph}) ORDER BY history_id DESC LIMIT 1",
+                    tuple(keys),
+                ).fetchone()
+                if not row or not row[0]:
+                    continue
+                raw = row[0]
+                if isinstance(raw, (bytes, bytearray)):
+                    try:
+                        import pickle as _pkl
+                        obj = _pkl.loads(raw)
+                    except Exception:
+                        try:
+                            obj = json.loads(raw.decode("utf-8", "replace"))
+                        except Exception:
+                            continue
+                else:
+                    try:
+                        obj = json.loads(raw) if isinstance(raw, str) and raw[:1] in "{[" else raw
+                    except Exception:
+                        continue
+                if isinstance(obj, dict):
+                    for k in ("entries", "df", "finish_prob"):
+                        v = obj.get(k)
+                        if isinstance(v, pd.DataFrame) and not v.empty:
+                            return int(len(v))
+                        if isinstance(v, list) and v:
+                            return int(len(v))
+                        if isinstance(v, dict) and v:
+                            return int(len(v))
+                    meta = obj.get("meta") or {}
+                    for mk in ("出走数", "実出走数", "予測照合用出走数", "n_cars"):
+                        if meta.get(mk):
+                            try:
+                                return int(meta[mk])
+                            except Exception:
+                                pass
+    except Exception:
+        return 0
+    return 0
+
+
 def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719, raw_text: str = "") -> dict:
     """出走表（SP）があればそれを使い、なければ結果のレース前項目だけで予測する。"""
     text = str(raw_text or "").strip()
@@ -10440,8 +10516,15 @@ def _v319_import_one_race(
             "next_action": "retry",
         }
 
-    # --- 3) 予測（未保存時）＋保存後検証 ---
+    # --- 3) 予測（未保存時）＋出走数不一致なら再予測 ---
     pred_ok = _v319_prediction_exists(db_path, key_guess)
+    card_n = len(players or [])
+    if pred_ok and card_n > 0:
+        pred_n = _v319_prediction_entry_count(db_path, key_guess)
+        if pred_n > 0 and pred_n != card_n:
+            # 例: 予測8車・出走表7車 → 結果登録不能になるので作り直す
+            pred_ok = False
+            pred_msg = f" / 予測台数不一致{pred_n}→{card_n}で再予測"
     if predict_if_missing and not pred_ok:
         _step("予測中")
         try:
@@ -10650,11 +10733,18 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
         for i, (vn, n) in enumerate(targets, 1):
             _v278_bg_pause_loop(db_path, job_id)
             if _v278_bg_cancel_requested(db_path, job_id):
+                blob = zlib.compress(pickle.dumps({
+                    "ok": ok, "skip": skip, "error": err, "details": details,
+                    "cancelled": True,
+                    "summary": f"中止｜完了{ok} / スキップ{skip} / 失敗{err}（{i-1}/{total}まで）",
+                }, protocol=4), 6)
                 _v278_bg_update(
                     db_path, job_id, status="cancelled",
                     finished_at=_v228_now_jst_iso(),
+                    done_count=max(0, i - 1),
                     current_label="中止",
-                    message=f"{i-1}/{total} まで処理して中止",
+                    message=f"今：中止｜{i-1}/{total}まで処理して中止｜登録{ok} スキップ{skip} エラー{err}",
+                    result_blob=blob,
                 )
                 return
             _v278_bg_update(
@@ -10700,11 +10790,18 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             fail_hint = ""
             if str(item.get("status") or "") in ("error", "failed"):
                 fail_hint = f"｜失敗:{vn}{n}R"
+            # 1レース完了ごとに途中結果を保存（中止・途中でもUIから見られる）
+            mid_blob = zlib.compress(pickle.dumps({
+                "ok": ok, "skip": skip, "error": err, "details": list(details),
+                "partial": True,
+                "summary": f"途中経過 {i}/{total}｜登録{ok} スキップ{skip} エラー{err}",
+            }, protocol=4), 6)
             _v278_bg_update(
                 db_path, job_id,
                 done_count=i,
                 current_label=f"{vn} {n}R {item['status']}",
                 message=f"{i}/{total}｜登録{ok} スキップ{skip} エラー{err}{fail_hint}",
+                result_blob=mid_blob,
             )
             time_module.sleep(0.2)
         try:
@@ -23223,14 +23320,38 @@ if selected_main_page == "✅ 結果登録・解析":
                 except Exception as exc:
                     st.warning(str(exc))
             blob = job_imp.get("result_blob")
-            if status == "completed" and blob:
+            # 完了・中止・失敗・実行中いずれも、途中結果があれば表示用に取り込む
+            if blob and status in ("completed", "cancelled", "failed", "running", "paused"):
                 try:
-                    st.session_state["v319_op_last_report"] = pickle.loads(zlib.decompress(bytes(blob)))
+                    rep = pickle.loads(zlib.decompress(bytes(blob)))
+                    if isinstance(rep, dict) and rep.get("details") is not None:
+                        st.session_state["v319_op_last_report"] = rep
                 except Exception:
                     pass
+            if status == "cancelled":
+                st.warning(
+                    job_imp.get("message")
+                    or "取込を中止しました。下にここまでの結果を表示します。"
+                )
         last_rep = st.session_state.get("v319_op_last_report")
         if last_rep:
-            st.dataframe(pd.DataFrame(last_rep.get("details") or []), use_container_width=True, hide_index=True)
+            st.markdown("#### 取込結果（レースごと）")
+            if last_rep.get("summary"):
+                st.caption(str(last_rep.get("summary")))
+            det = last_rep.get("details") or []
+            if det:
+                st.dataframe(pd.DataFrame(det), use_container_width=True, hide_index=True)
+                try:
+                    csv_bytes = pd.DataFrame(det).to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "この結果をCSVダウンロード",
+                        data=csv_bytes,
+                        file_name=f"import_partial_{_v228_now_jst_iso()[:10]}.csv",
+                        mime="text/csv",
+                        key="v319_op_partial_csv",
+                    )
+                except Exception:
+                    pass
 
     saved_results = _v233_list_saved_results(engine.DB_PATH, 250)
     if saved_results:
