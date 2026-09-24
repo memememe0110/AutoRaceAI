@@ -9194,6 +9194,8 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
         lg = p.get("lg") or venue
         name = p.get("name") or ""
         lines.append(f"{p.get('car')}\t{name}({lg})")
+        if p.get("kessha"):
+            lines.append("欠車")
         if p.get("age"):
             lines.append(p["age"])
         hand = p.get("hand") or "0"
@@ -10234,7 +10236,7 @@ def _v319_clear_prediction(db_path: str, race_key: str) -> None:
 
 
 
-def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719, raw_text: str = "") -> dict:
+def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719, raw_text: str = "", manual_excluded: list | None = None) -> dict:
     """出走表（SP）があればそれを使い、なければ結果のレース前項目だけで予測する。"""
     text = str(raw_text or "").strip()
     audit = {"source": "sprace"} if text else {}
@@ -10251,9 +10253,16 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
             engine.v305_clear_model_state_override()
     except Exception:
         pass
+    excl = sorted(set(int(x) for x in (manual_excluded or []) if str(x).strip().isdigit() or isinstance(x, int)))
+    auto_k = _v319_detect_kessha_from_card_text(prediction_text)
+    excl = sorted(set(excl) | set(auto_k))
     df, bets, output, entries, meta = engine.ver16_run_prediction(
-        prediction_text, int(trials), int(seed), manual_excluded=[]
+        prediction_text, int(trials), int(seed), manual_excluded=excl
     )
+    if excl:
+        meta = dict(meta or {})
+        meta["欠車車番"] = excl
+        meta["事前除外車番"] = excl
     entries = _v276_mark_retrial_from_prediction_text(entries, prediction_text)
     df = _v276_copy_retrial_to_prediction_df(df, entries)
     meta = dict(meta or {})
@@ -10506,6 +10515,7 @@ def _v319_import_one_race(
     venue = str(venue or "").strip()
     race_no = int(race_no)
     key_guess = f"{ymd}_{venue}_{race_no}R"
+    kessha_cars: list[int] = []
     exists = _v319_result_exists(db_path, ymd, venue, race_no)
     card_text = ""
     hist_msg = ""
@@ -10528,6 +10538,10 @@ def _v319_import_one_race(
             }
         players = _v319_parse_sprace_car_rows(sp_html) or _v319_parse_sprace_players(sp_html)
         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
+        kessha_cars = sorted(set(
+            _v319_detect_kessha_from_players(players)
+            + _v319_detect_kessha_from_card_text(card_text)
+        ))
         if not players:
             return {
                 "status": "error",
@@ -10633,9 +10647,7 @@ def _v319_import_one_race(
         try:
             if not str(card_text or "").strip():
                 card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
-            pred = _v319_run_prerace_prediction(
-                db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text
-            )
+            pred = _v319_run_prerace_prediction(db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text, manual_excluded=kessha_cars)
             if not pred.get("ok"):
                 return {
                     "status": "error",
@@ -10778,9 +10790,7 @@ def _v319_import_one_race(
                 if not str(card_text or "").strip():
                     card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
                 _v319_clear_prediction(db_path, key_guess)
-                pred = _v319_run_prerace_prediction(
-                    db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text
-                )
+                pred = _v319_run_prerace_prediction(db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text, manual_excluded=kessha_cars)
                 if not pred.get("ok"):
                     raise RuntimeError(pred.get("reason") or "再予測失敗")
                 pred_msg += " / 結果前に再予測"
@@ -22519,7 +22529,8 @@ elif selected_main_page == "🏁 予測":
 
     manual_excluded = []
     if text.strip():
-        auto_excluded = {int(car): "手動指定" for car in manual_excluded}
+        _auto_kessha = _v319_detect_kessha_from_card_text(text)
+        auto_excluded = {int(car): "出走表の欠車表記" for car in _auto_kessha}
         # 車番候補はヘッダの出走数から軽量生成。詳細パーサーを入力のたびに実行しない。
         count_match = re.search(r"([1-8])車", text)
         expected_count = int(count_match.group(1)) if count_match else 8
