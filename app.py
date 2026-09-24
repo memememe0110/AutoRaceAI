@@ -7371,6 +7371,47 @@ def _v315_drop_kessha_rows(rows: pd.DataFrame, kessha: list[int]) -> pd.DataFram
     cars = pd.to_numeric(rows["車番"], errors="coerce")
     return rows.loc[~cars.isin(set(int(x) for x in kessha))].copy()
 
+
+def _v319_detect_kessha_from_card_text(text: str) -> list[int]:
+    """出走表テキストから欠車・出走取消の車番を抽出。"""
+    s = str(text or "")
+    if not s.strip():
+        return []
+    found: set[int] = set()
+    for m in re.finditer(
+        r"(?m)^(?:予想印\s*)?([1-8])\s*[\t\s]+[^\n]{0,80}\n[^\n]*欠車",
+        s,
+    ):
+        found.add(int(m.group(1)))
+    for m in re.finditer(r"(?m)^(?:予想印\s*)?([1-8])\s*[\t\s]+[^\n]{0,60}欠車", s):
+        found.add(int(m.group(1)))
+    for m in re.finditer(r"([1-8])\s*番[^\n]{0,40}欠車", s):
+        found.add(int(m.group(1)))
+    for m in re.finditer(
+        r"(?m)^([1-8])\t[^\n]+\n(?:[^\n]*\n){0,3}[^\n]*欠車",
+        s,
+    ):
+        found.add(int(m.group(1)))
+    for m in re.finditer(r"(?m)^([1-8])\s+.*欠車", s):
+        found.add(int(m.group(1)))
+    return sorted(found)
+
+
+def _v319_detect_kessha_from_players(players: list) -> list[int]:
+    """出走表パース結果から欠車車番を取る。"""
+    out = []
+    for p in players or []:
+        if not isinstance(p, dict):
+            continue
+        if p.get("kessha") or p.get("欠車"):
+            try:
+                out.append(int(p.get("car")))
+            except Exception:
+                pass
+    return sorted(set(out))
+
+
+
 # Ver227: 発走後の事故・反則は、結果と回収率だけ保存し、予測精度・AI学習から除外する。
 def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict, list[dict]]:
     raw = str(result_text or "")
