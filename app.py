@@ -9812,6 +9812,19 @@ def _v319_fill_player_histories(
                 errors += 1
                 details.append(f"{name}:playerCdなし")
                 continue
+            before_d = _v319_ymd_digits(before_ymd)
+            latest_d = _v319_ymd_digits(latest)
+            # 件数十分・汚れなし・最新日が当該レース日以上 → HTTPも保存もスキップ
+            # （毎Rで全員分を取り直して上書きしていたのが遅さの主因）
+            if (
+                have >= min_rows
+                and not dirty_keys
+                and (not before_d or (latest_d and latest_d >= before_d))
+            ):
+                skipped += 1
+                details.append(f"{name}:充足{have}件スキップ(最新{latest_d or '-'})")
+                continue
+            # 件数十分でも最新が古いときだけ差分取得（全件上書きしない）
             df = _v319_fetch_player_history_df(pcd, name)
             if df is None or df.empty:
                 if have <= 0:
@@ -9869,11 +9882,9 @@ def _v319_fill_player_histories(
                     official_keys.add(k)
 
             missing_official = official_keys - have_keys
-            # 再取込条件（厳しすぎない）
-            need_refresh = (not already_refreshed) and (
-                (have < min_rows and (bool(dirty_keys) or len(missing_official) >= 1 or have < 15))
-                or (len(dirty_keys) >= 3)
-                or (have < 10)
+            # 全件再取込は不足時のみ。十分なら差分追加だけ（上書きしない）
+            need_refresh = (not already_refreshed) and have < min_rows and (
+                bool(dirty_keys) or len(missing_official) >= 1 or have < 15
             )
 
             keep = []
