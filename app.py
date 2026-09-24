@@ -9064,12 +9064,14 @@ _V319_WX_CACHE: dict[str, dict] = {}
 _V319_WX_FETCHES = 0
 _V319_WX_FETCH_LIMIT = 15
 _V319_HIST_REFRESHED: set[str] = set()
+_V319_HIST_SKIPPED: set[str] = set()
 
 
 def _v319_wx_reset_budget() -> None:
-    global _V319_WX_FETCHES, _V319_HIST_REFRESHED
+    global _V319_WX_FETCHES, _V319_HIST_REFRESHED, _V319_HIST_SKIPPED
     _V319_WX_FETCHES = 0
     _V319_HIST_REFRESHED = set()
+    _V319_HIST_SKIPPED = set()
 
 
 def _v319_race_weather(ymd: str, venue: str, race_no: int) -> dict:
@@ -9194,12 +9196,19 @@ def _v319_parse_sprace_car_rows(html: str) -> list[dict]:
             tm = re.search(r"試\s*([\d.]+)", name_td + "\n" + "\n".join(tds[:3]))
             if tm:
                 trial = tm.group(1)
+        # 欠車: SP HTML は span.alert
+        blob_k = (name_td or "") + "\n" + (m.group(0) or "")
+        is_kessha = bool(
+            re.search(r"欠車|出走取消|発走除外|競走除外", blob_k)
+            or ("欠車" in (m.group(0) or "") and "alert" in (m.group(0) or "").lower())
+        )
         rows.append({
             "car": car, "player_cd": m.group(2), "name": name, "lg": lg, "age": age,
             "hand": hand, "st": st, "trial": trial, "dev": dev, "rank": rank,
             "avg_r": avg_r, "best_r": best_r, "finish10": finish10,
             "rate2": rate2, "rate3": rate3, "car_name": car_name,
             "name_key": _v319_norm_player_name(name),
+            "kessha": bool(is_kessha),
         })
     return rows
 
@@ -9215,7 +9224,8 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
     am = re.search(r"気温：\s*([\d.]+)", raw)
     hm = re.search(r"湿度：\s*([\d.]+)", raw)
     cars = _v319_parse_sprace_car_rows(html) or _v319_parse_sprace_players(html)
-    ncar = max(len(cars), 1)
+    starters = [c for c in (cars or []) if not c.get("kessha")]
+    ncar = max(len(starters) if starters else len(cars or []), 1)
     lines = [
         f"{int(race_no)}R",
         "確定",
@@ -9834,7 +9844,7 @@ def _v319_fill_player_histories(
     - 件数不足・R欠落・公式欠けがあれば再取込（選手ごとに1プロセス1回まで）
     - 天候HTTPは自動取込では叩かない（途中停止の主因だった）
     """
-    global _V319_HIST_REFRESHED
+    global _V319_HIST_REFRESHED, _V319_HIST_SKIPPED
     added = 0
     skipped = 0
     errors = 0
@@ -9850,6 +9860,7 @@ def _v319_fill_player_histories(
         dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
         cache_key = pcd or _v319_norm_player_name(name)
         already_refreshed = cache_key in _V319_HIST_REFRESHED
+        already_skipped = cache_key in _V319_HIST_SKIPPED
         try:
             if not pcd:
                 errors += 1
@@ -9857,17 +9868,36 @@ def _v319_fill_player_histories(
                 continue
             before_d = _v319_ymd_digits(before_ymd)
             latest_d = _v319_ymd_digits(latest)
-            # 件数十分・汚れなし・最新日が当該レース日以上 → HTTPも保存もスキップ
-            # （毎Rで全員分を取り直して上書きしていたのが遅さの主因）
-            if (
-                have >= min_rows
-                and not dirty_keys
-                and (not before_d or (latest_d and latest_d >= before_d))
-            ):
+            # --- 高速スキップ（HTTPゼロ）---
+            # 1) このプロセスで一度スキップ/充足確認済み
+            # 2) 件数十分（dirtyは無視：R=0が数件あっても再取得しない）
+            # 3) 最新日がレース日と同じか新しい、または最新が空でも件数十分ならスキップ
+            if have >= min_rows and (already_skipped or already_refreshed):
                 skipped += 1
-                details.append(f"{name}:充足{have}件スキップ(最新{latest_d or '-'})")
+                details.append(f"{name}:充足{have}件キャッシュスキップ")
+                _V319_HIST_SKIPPED.add(cache_key)
                 continue
-            # 件数十分でも最新が古いときだけ差分取得（全件上書きしない）
+            if have >= min_rows:
+                # 同日バッチの2R目以降は最新日が before 未満でも、1回取れば十分
+                # → ここでは件数十分なら原則スキップ。差分が必要なら下の「最新が古い」だけ例外。
+                days_behind = 0
+                if before_d and latest_d and latest_d < before_d:
+                    try:
+                        from datetime import datetime as _dt
+                        days_behind = (
+                            _dt.strptime(before_d, "%Y%m%d") - _dt.strptime(latest_d, "%Y%m%d")
+                        ).days
+                    except Exception:
+                        days_behind = 1
+                # 最新がレース日より2日以上古いときだけ差分取得。それ以外はスキップ。
+                if days_behind <= 1:
+                    skipped += 1
+                    details.append(
+                        f"{name}:充足{have}件スキップ(最新{latest_d or '-'})"
+                    )
+                    _V319_HIST_SKIPPED.add(cache_key)
+                    continue
+            # 件数不足、または最新が2日以上古い → 取得
             df = _v319_fetch_player_history_df(pcd, name)
             if df is None or df.empty:
                 if have <= 0:
@@ -10060,6 +10090,8 @@ def _v319_fill_player_histories(
             added += delta
             if need_refresh:
                 _V319_HIST_REFRESHED.add(cache_key)
+            if after >= min_rows or have >= min_rows:
+                _V319_HIST_SKIPPED.add(cache_key)
             tag = "再取込" if need_refresh else "追加"
             try:
                 r_ok = int((pd.to_numeric(parsed["レース"], errors="coerce").fillna(0) > 0).sum()) if "レース" in parsed.columns else 0
