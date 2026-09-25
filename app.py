@@ -66,12 +66,9 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 # 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
 _V314_AUTOSAVE_EVERY_N = 40
 
-# Ver302: 保存済み事故レースの学習混入を起動時に軽量監査。
-# raw archive / result rows / result races が変わっていなければsignature一致で即終了。
-try:
-    V302_STARTUP_ACCIDENT_REPAIR = engine.v302_repair_existing_poststart_incidents(engine.DB_PATH)
-except Exception as _v302_startup_exc:
-    V302_STARTUP_ACCIDENT_REPAIR = {"reason": f"{type(_v302_startup_exc).__name__}: {_v302_startup_exc}", "skipped": False}
+# Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
+# 古い全バージョンを毎回走査すると起動ループ落ちの原因になる。
+V302_STARTUP_ACCIDENT_REPAIR = {"skipped": True, "reason": "起動時スキップ(Ver319)"}
 
 # Mutable runtime state.  Keep initialization centralized.
 
@@ -21639,6 +21636,83 @@ def _v305_sanitize_remote_for_safe_sync(
         shutil.rmtree(tmp_dir,ignore_errors=True)
 
 
+
+def _v319_archive_old_version_predictions(db_path: str, keep_versions: list[str] | None = None) -> dict:
+    """現行以外の予測履歴をバックアップ表へ退避し、本体から外す（起動・表示を軽くする）。"""
+    keep = set(str(v) for v in (keep_versions or [APP_VERSION, _V231_APP_VERSION]) if v)
+    keep.add("Ver319")
+    report = {"moved": 0, "tables": {}, "ok": False}
+    try:
+        with sqlite3.connect(str(db_path), timeout=60) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            # バックアップ表
+            if "v319_prediction_history_archive" not in tables:
+                con.execute("""
+                    CREATE TABLE IF NOT EXISTS v319_prediction_history_archive AS
+                    SELECT * FROM v231_prediction_history WHERE 0
+                """)
+            if "v231_prediction_history" in tables:
+                cols = [r[1] for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()]
+                if "app_version" in cols:
+                    placeholders = ",".join("?" for _ in keep) if keep else "''"
+                    # 退避
+                    n = con.execute(
+                        f"""
+                        INSERT INTO v319_prediction_history_archive
+                        SELECT * FROM v231_prediction_history
+                        WHERE COALESCE(app_version,'') NOT IN ({placeholders})
+                          AND history_id NOT IN (
+                            SELECT history_id FROM v319_prediction_history_archive
+                          )
+                        """,
+                        tuple(keep),
+                    ).rowcount
+                    d = con.execute(
+                        f"""
+                        DELETE FROM v231_prediction_history
+                        WHERE COALESCE(app_version,'') NOT IN ({placeholders})
+                        """,
+                        tuple(keep),
+                    ).rowcount
+                    report["tables"]["v231_prediction_history"] = {"archived": int(n or 0), "deleted": int(d or 0)}
+                    report["moved"] += int(d or 0)
+            # スナップショットも同様
+            if "v252_lap_prediction_snapshots" in tables:
+                cols = [r[1] for r in con.execute("PRAGMA table_info(v252_lap_prediction_snapshots)").fetchall()]
+                if "app_version" in cols:
+                    con.execute("""
+                        CREATE TABLE IF NOT EXISTS v319_lap_snapshots_archive AS
+                        SELECT * FROM v252_lap_prediction_snapshots WHERE 0
+                    """)
+                    placeholders = ",".join("?" for _ in keep)
+                    n = con.execute(
+                        f"""
+                        INSERT INTO v319_lap_snapshots_archive
+                        SELECT * FROM v252_lap_prediction_snapshots
+                        WHERE COALESCE(app_version,'') NOT IN ({placeholders})
+                        """,
+                        tuple(keep),
+                    ).rowcount
+                    d = con.execute(
+                        f"""
+                        DELETE FROM v252_lap_prediction_snapshots
+                        WHERE COALESCE(app_version,'') NOT IN ({placeholders})
+                        """,
+                        tuple(keep),
+                    ).rowcount
+                    report["tables"]["v252_lap_prediction_snapshots"] = {"archived": int(n or 0), "deleted": int(d or 0)}
+                    report["moved"] += int(d or 0)
+            con.commit()
+            try:
+                con.execute("VACUUM")
+            except Exception:
+                pass
+            report["ok"] = True
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    return report
+
+
 def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = False, _lightweight: bool = False) -> tuple[bool, str]:
     # Ver309: バックグラウンド再シミュレーション中はGitHub同期を行わない。
     # ローカルSQLiteへの登録・更新はそのまま継続し、再シミュレーション終了後に
@@ -22126,62 +22200,11 @@ if (not _v296_bg_fast_rerun) and isinstance(_v284_pinned_bytes,(bytes,bytearray)
 # 50MB級の全partダウンロードを行う。現在DBが同等/新しいなら全part取得を省略する。
 if not st.session_state.get("v284_boot_github_restore_checked",False):
     st.session_state["v284_boot_github_restore_checked"]=True
-    try:
-        _boot_ready284,_boot_ready_msg284=github_ready()
-        if _boot_ready284:
-            _manifest_ok290,_manifest290,_manifest_msg290=_v283_get_chunk_manifest(previous=False)
-            _boot_local284=_v284_current_db_identity()
-            if _manifest_ok290:
-                _boot_remote_manifest_fp290=(_manifest290 or {}).get("stats") or {}
-                _boot_remote_sha290=str((_manifest290 or {}).get("sha256") or "")
-                _boot_local_sha290=str(_boot_local284.get("sha256") or "") if _boot_local284.get("ok") else ""
-                _need_full_pull290=False
-
-                if not _boot_local284.get("ok"):
-                    _need_full_pull290=bool(_boot_remote_manifest_fp290.get("ok"))
-                elif _boot_remote_sha290 and _boot_remote_sha290==_boot_local_sha290:
-                    st.session_state["v284_boot_github_restore_note"]="GitHub currentと現在DBは同一です。"
-                elif _boot_remote_manifest_fp290.get("ok"):
-                    _boot_cmp290=_v283_compare_db_fingerprints(
-                        _boot_remote_manifest_fp290,
-                        _boot_local284.get("fingerprint") or {}
-                    )
-                    if _boot_cmp290.get("safe"):
-                        _need_full_pull290=True
-                    else:
-                        st.session_state["v284_boot_github_restore_note"]=(
-                            "GitHub currentは現在DBを完全包含しないため起動時置換を禁止しました: "
-                            +" / ".join((_boot_cmp290.get("regressions") or [])[:8])
-                        )
-
-                if _need_full_pull290:
-                    _v290_load_stage("GitHub正本を取得しています…")
-                    _boot_ok284,_boot_bytes284,_boot_msg284=_v282_pull_chunked_db()
-                    if _boot_ok284 and isinstance(_boot_bytes284,(bytes,bytearray)):
-                        _boot_remote284=_v283_db_fingerprint_bytes(bytes(_boot_bytes284))
-                        _boot_local_fp284=(_boot_local284.get("fingerprint") or {}) if _boot_local284.get("ok") else {}
-                        if _boot_local284.get("ok"):
-                            _boot_cmp284=_v283_compare_db_fingerprints(_boot_remote284,_boot_local_fp284)
-                            _boot_not_older284=bool(_boot_cmp284.get("safe"))
-                        else:
-                            _boot_not_older284=bool(_boot_remote284.get("ok"))
-                        if _boot_remote284.get("ok") and _boot_not_older284:
-                            _boot_sha_remote284=hashlib.sha256(bytes(_boot_bytes284)).hexdigest()
-                            if _boot_local_sha290 != _boot_sha_remote284:
-                                _boot_install_ok284,_boot_install_msg284=_v276_atomic_install_db_bytes(
-                                    bytes(_boot_bytes284),"起動時GitHub current正本復元"
-                                )
-                                if _boot_install_ok284:
-                                    st.session_state["v284_boot_github_restored"]=True
-                                    st.session_state.pop("_v290_identity_cache",None)
-                                else:
-                                    st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時復元失敗: "+str(_boot_install_msg284)
-                    elif _boot_msg284!="manifestなし":
-                        st.session_state["v284_boot_github_restore_error"]="GitHub currentの起動時検証失敗: "+str(_boot_msg284)
-            elif _manifest_msg290!="manifestなし":
-                st.session_state["v284_boot_github_restore_error"]="GitHub current manifest確認失敗: "+str(_manifest_msg290)
-    except Exception as _boot_exc284:
-        st.session_state["v284_boot_github_restore_error"]=f"起動時GitHub正本確認失敗: {type(_boot_exc284).__name__}: {_boot_exc284}"
+    # Ver319: 起動時のGitHub全件取得はメモリ不足で落ちるため完全停止。
+    # 必要なときだけサイドバー「GitHubから再読込」を使う。
+    st.session_state["v284_boot_github_restore_note"]=(
+        "起動時GitHub全取得は停止中です。必要ならサイドバーから手動で再読込してください。"
+    )
 
 _v290_load_stage("DB固定監視を確認しています…")
 _v284_identity_key="v284_db_identity_baseline"
@@ -22474,6 +22497,15 @@ with st.sidebar:
             f"GitHub current取得済み: {len(_gh_dl305)/1024/1024:.2f} MB "
             "｜端末DBへの反映なし"
         )
+    if st.button("古いVer予測をバックアップへ退避", use_container_width=True,
+                 help="Ver319以外の予測履歴をアーカイブ表へ移し、起動を軽くします。結果・選手履歴は消しません。"):
+        with st.spinner("古いバージョンの予測データを退避中…"):
+            _ar = _v319_archive_old_version_predictions(engine.DB_PATH)
+        if _ar.get("ok"):
+            st.success(f"退避完了: { _ar.get('moved', 0) }件 → バックアップ表")
+            st.session_state.pop("_v296_sidebar_manifest_cache", None)
+        else:
+            st.error(str(_ar.get("error") or "退避失敗"))
     if st.button("現在のDBをGitHubへ保存（軽量）", use_container_width=True, disabled=not ready,
                  help="リモートDBの全取得・統合を省略して現在DBだけを分割アップロードします。メモリ節約。再デプロイなし。"):
         with st.spinner("軽量保存中（リモート統合なし）…"):
