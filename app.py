@@ -9895,36 +9895,31 @@ def _v319_fill_player_histories(
                 continue
             before_d = _v319_ymd_digits(before_ymd)
             latest_d = _v319_ymd_digits(latest)
-            # --- 高速スキップ（HTTPゼロ）---
-            # 1) このプロセスで一度スキップ/充足確認済み
-            # 2) 件数十分（dirtyは無視：R=0が数件あっても再取得しない）
-            # 3) 最新日がレース日と同じか新しい、または最新が空でも件数十分ならスキップ
-            if have >= min_rows and (already_skipped or already_refreshed):
+            # --- スキップ条件（厳格）---
+            # 「件数十分」だけでは不十分。最新履歴日がレース日に届いていない場合は必ず差分取得。
+            # 例: 30件あっても最新が9/22なら、9/23レースの履歴は追加する。
+            up_to_date = bool(before_d and latest_d and latest_d >= before_d)
+            if not before_d:
+                up_to_date = have >= min_rows
+            if up_to_date and have >= min_rows:
                 skipped += 1
-                details.append(f"{name}:充足{have}件キャッシュスキップ")
+                details.append(
+                    f"{name}:充足{have}件スキップ(最新{latest_d or '-'}>=対象{before_d or '-'})"
+                )
                 _V319_HIST_SKIPPED.add(cache_key)
                 continue
-            if have >= min_rows:
-                # 同日バッチの2R目以降は最新日が before 未満でも、1回取れば十分
-                # → ここでは件数十分なら原則スキップ。差分が必要なら下の「最新が古い」だけ例外。
-                days_behind = 0
-                if before_d and latest_d and latest_d < before_d:
-                    try:
-                        from datetime import datetime as _dt
-                        days_behind = (
-                            _dt.strptime(before_d, "%Y%m%d") - _dt.strptime(latest_d, "%Y%m%d")
-                        ).days
-                    except Exception:
-                        days_behind = 1
-                # 最新がレース日より2日以上古いときだけ差分取得。それ以外はスキップ。
-                if days_behind <= 1:
-                    skipped += 1
-                    details.append(
-                        f"{name}:充足{have}件スキップ(最新{latest_d or '-'})"
-                    )
-                    _V319_HIST_SKIPPED.add(cache_key)
-                    continue
-            # 件数不足、または最新が2日以上古い → 取得
+            if up_to_date and (already_skipped or already_refreshed):
+                # 同日バッチで既に最新まで取った選手
+                skipped += 1
+                details.append(
+                    f"{name}:最新到達キャッシュスキップ(最新{latest_d or '-'})"
+                )
+                continue
+            # 最新がレース日より古い、または件数不足 → 公式から取得して差分追加
+            if before_d and latest_d and latest_d < before_d:
+                details.append(
+                    f"{name}:最新不足{latest_d}<{before_d}→差分取得(既存{have})"
+                )
             df = _v319_fetch_player_history_df(pcd, name)
             if df is None or df.empty:
                 if have <= 0:
@@ -10117,8 +10112,17 @@ def _v319_fill_player_histories(
             added += delta
             if need_refresh:
                 _V319_HIST_REFRESHED.add(cache_key)
-            if after >= min_rows or have >= min_rows:
-                _V319_HIST_SKIPPED.add(cache_key)
+            # 最新が対象日に届いたときだけキャッシュスキップ対象にする
+            try:
+                after_state = _v319_player_history_state(db_path, name)
+                after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
+                if before_d and after_latest and after_latest >= before_d:
+                    _V319_HIST_SKIPPED.add(cache_key)
+                elif not before_d and after >= min_rows:
+                    _V319_HIST_SKIPPED.add(cache_key)
+            except Exception:
+                if after >= min_rows:
+                    _V319_HIST_SKIPPED.add(cache_key)
             tag = "再取込" if need_refresh else "追加"
             try:
                 r_ok = int((pd.to_numeric(parsed["レース"], errors="coerce").fillna(0) > 0).sum()) if "レース" in parsed.columns else 0
