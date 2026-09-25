@@ -8849,6 +8849,21 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
             if row not in existing:
                 lines.append(row)
                 existing += "\n" + row
+    
+    # 中止・不成立を正規化テキストに残す（オッズ空時の判定用）
+    if re.search(r"レース中止|競走中止", raw) or re.search(r"(?:^|\n)\s*中止\s*(?:\n|$)", raw):
+        if "レース中止" not in existing:
+            lines.append("レース中止")
+            existing += "\nレース中止"
+    if "不成立" in raw and "不成立" not in existing:
+        lines.append("不成立")
+        for bt in ("単勝", "複勝", "2連複", "2連単", "ワイド", "3連複", "3連単"):
+            row = f"{bt}\t-\t100円\t不成立"
+            if row not in existing:
+                lines.append(row)
+                existing += "\n" + row
+    if "全返還" in raw and "全返還" not in existing:
+        lines.append("全返還")
     return "\n".join(lines)
 
 
@@ -10518,6 +10533,41 @@ def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, repla
         meta_r["事前除外車番"] = kessha
         meta_r["比較対象外車番"] = kessha
     meta_r, _inc = _v227_detect_poststart_incidents(raw_text, meta_r)
+    # 反妨など発走後事故の車番を結果行に必ず残す（予測台数照合で落ちないように）
+    try:
+        if _inc and isinstance(rows_r, pd.DataFrame):
+            have_cars = set()
+            if "車番" in rows_r.columns:
+                have_cars = set(
+                    int(x) for x in pd.to_numeric(rows_r["車番"], errors="coerce").dropna().astype(int).tolist()
+                )
+            add_rows = []
+            for item in _inc:
+                try:
+                    c = int(item.get("車番"))
+                except Exception:
+                    continue
+                if c in have_cars:
+                    # 事故列を付与
+                    if "事故" in rows_r.columns:
+                        mask = pd.to_numeric(rows_r["車番"], errors="coerce") == c
+                        rows_r.loc[mask, "事故"] = str(item.get("理由") or "反妨")
+                    continue
+                row = {col: None for col in (list(rows_r.columns) if len(rows_r.columns) else ["着順", "車番", "選手名", "競走T", "ST", "事故"])}
+                row["車番"] = c
+                row["着順"] = "-"
+                row["競走T"] = 0.0
+                row["ST"] = 0.0
+                row["事故"] = str(item.get("理由") or "反妨")
+                add_rows.append(row)
+                have_cars.add(c)
+            if add_rows:
+                rows_r = pd.concat([rows_r, pd.DataFrame(add_rows)], ignore_index=True)
+            meta_r["発走後事故車番"] = sorted({int(x.get("車番")) for x in _inc if x.get("車番") is not None})
+            # 照合用は事故車を含む（予測と同じ台数にする）
+            meta_r["予測照合用出走数"] = int(len(have_cars)) if have_cars else meta_r.get("予測照合用出走数")
+    except Exception:
+        pass
     rows_for_engine = _v315_drop_kessha_rows(rows_r, kessha)
     if kessha:
         meta_r["実出走数"] = int(len(rows_for_engine))
@@ -10903,6 +10953,21 @@ def _v319_import_one_race(
         except Exception:
             void_peek_raw = ""
         void_info = _v319_is_void_or_cancelled_result(void_peek_raw)
+        # 正規化で落ちた場合、HTML直読みのフォールバック
+        if not void_info.get("void"):
+            try:
+                place = _V319_OP_PLACE.get(str(venue))
+                ymd8 = re.sub(r"[^0-9]", "", str(ymd or ""))
+                url = (
+                    "https://www.oddspark.com/autorace/RaceResult.do"
+                    f"?raceDy={ymd8}&placeCd={place}&raceNo={int(race_no)}"
+                )
+                html_raw = _v319_http_get(url)
+                void_info = _v319_is_void_or_cancelled_result(html_raw)
+                if void_info.get("void") and not void_peek_raw:
+                    void_peek_raw = f"{int(race_no)}R\n{void_info.get('reason') or '不成立'}\n不成立\n払戻金\n"
+            except Exception:
+                pass
         if void_info.get("void"):
             odds_msg = f" / オッズ取得失敗→{void_info.get('reason') or '中止'}"
         else:
@@ -11169,13 +11234,52 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             "failed_keys": failed_keys,
             "summary": f"自動取得が完了しました。完了：{ok}R / スキップ：{skip}R / 失敗：{err}R",
         }, protocol=4), 6)
+        # 完了時: DBをGitHubへ保存 + ntfy通知
+        gh_msg = ""
+        try:
+            _v278_bg_update(
+                db_path, job_id,
+                current_label="DB保存",
+                message=f"自動取得完了後のGitHub保存中…｜完了{ok} / 失敗{err}",
+            )
+            _gh_ok, _gh_detail = push_db_to_github(
+                f"Ver319 auto-import {ymd} ok={ok} skip={skip} err={err}",
+                _allow_during_resimulation=True,
+            )
+            gh_msg = f"｜GitHub{'OK' if _gh_ok else '失敗'}"
+        except Exception as _gh_exc:
+            gh_msg = f"｜GitHub例外:{type(_gh_exc).__name__}"
+        try:
+            topic = str(__import__("os").environ.get("AUTORACE_NTFY_TOPIC", "notify") or "notify").strip()
+            body = (
+                f"自動取得完了 {ymd}\n"
+                f"完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}\n"
+                f"{gh_msg}"
+            )
+            payload = {
+                "topic": topic,
+                "title": "AutoRaceAI 自動取得完了",
+                "message": body,
+                "priority": 4,
+                "tags": ["white_check_mark"],
+            }
+            req = urllib.request.Request(
+                "https://ntfy.sh",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                resp.read()
+        except Exception:
+            pass
         _v278_bg_update(
             db_path, job_id,
             status="completed",
             finished_at=_v228_now_jst_iso(),
             done_count=total,
             current_label="完了",
-            message=f"自動取得完了｜完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}",
+            message=f"自動取得完了｜完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}{gh_msg}",
             result_blob=blob,
         )
     except Exception as exc:
