@@ -18313,14 +18313,22 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
 
     result["provisional_7type_candidates"] = optional
     result["provisional_7type_added"] = added
+    # 監査専用。ここは独立関数内なので、外側の candidates / notes を参照しない。
+    # 候補一覧は result に保持されている場合だけ利用し、無ければ空配列にする。
+    _audit_candidates = (
+        result.get("selection_candidates")
+        or result.get("candidates")
+        or result.get("tickets")
+        or []
+    )
     result["selection_audit"] = _v319_build_selection_audit(
-        plan, candidates,
-        protected_reasons=sum((list(v) for v in protected_reasons.values()), []) if isinstance(protected_reasons, dict) else protected_reasons,
-        v299_hole_notes=v299_hole_notes,
-        protected_add_notes=protected_add_notes,
-        replacement_notes=replacement_notes,
-        pair_mix_notes=pair_mix_notes,
-        low_odds_floor_notes=low_odds_floor_notes,
+        plan, _audit_candidates,
+        protected_reasons=[],
+        v299_hole_notes=[],
+        protected_add_notes=[],
+        replacement_notes=[],
+        pair_mix_notes=[],
+        low_odds_floor_notes=[],
     )
     if not added:
         return result
