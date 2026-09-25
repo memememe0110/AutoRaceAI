@@ -10421,6 +10421,92 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
     return {"ok": True, "race_key": key, "trials": int(trials), "history_id": history_id}
 
 
+
+def _v319_is_void_or_cancelled_result(text: str) -> dict:
+    """レース中止・不成立・全返還を判定。"""
+    s = str(text or "")
+    flags = {
+        "void": False,
+        "cancelled": False,
+        "no_contest": False,
+        "full_refund": False,
+        "reason": "",
+    }
+    if not s.strip():
+        return flags
+    if re.search(r"レース中止|競走中止|(?:^|\n)\s*中止\s*(?:\n|$)", s):
+        flags["cancelled"] = True
+        flags["void"] = True
+        flags["reason"] = "レース中止"
+    if re.search(r"不成立|レース不成立", s):
+        flags["no_contest"] = True
+        flags["void"] = True
+        if not flags["reason"]:
+            flags["reason"] = "不成立"
+    if re.search(r"全返還", s) or (
+        re.search(r"単勝[^\n]{0,30}不成立", s)
+        and re.search(r"3連単[^\n]{0,30}不成立", s)
+    ):
+        flags["full_refund"] = True
+        flags["void"] = True
+        if not flags["reason"]:
+            flags["reason"] = "全返還"
+    if re.search(r"着順[^\n]{0,40}\n\s*レース中止", s) or re.search(r"ST/事故\s*\n\s*レース中止", s):
+        flags["cancelled"] = True
+        flags["void"] = True
+        flags["reason"] = flags["reason"] or "レース中止"
+    return flags
+
+
+def _v319_register_void_result(
+    db_path: str, raw_text: str, venue: str, ymd: str, race_no: int, reason: str = "レース中止"
+) -> dict:
+    """中止・不成立・全返還を結果登録（学習対象外）。"""
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    key = f"{ymd}_{venue}_{int(race_no)}R"
+    date_s = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}" if len(ymd) == 8 else str(ymd)
+    meta = {
+        "開催日": date_s,
+        "開催場": venue,
+        "レース": int(race_no),
+        "レース状態": reason or "レース中止",
+        "不成立": True,
+        "レース中止": True,
+        "全返還": True,
+        "学習対象外": True,
+        "learning_excluded": True,
+        "learning_exclusion_reason": reason or "レース中止・全返還",
+        "予測精度評価対象": False,
+        "AI学習対象": False,
+        "実出走数": 0,
+    }
+    rows = pd.DataFrame(columns=["着順", "車番", "選手名", "競走T", "ST"])
+    laps = pd.DataFrame()
+    payout_rows = [
+        {"券種": bt, "組み合わせ": "全返還", "払戻金": 100}
+        for bt in ("単勝", "複勝", "2連複", "2連単", "ワイド", "3連複", "3連単")
+    ]
+    payouts = pd.DataFrame(payout_rows)
+    try:
+        key2, *_rest = engine.v41_register_result(meta, rows, laps, payouts, db_path)
+        key = str(key2 or key)
+    except Exception:
+        try:
+            key2, *_rest = engine.v70_replace_registered_result(meta, rows, laps, payouts, db_path)
+            key = str(key2 or key)
+        except Exception as exc:
+            try:
+                _v238_save_exact_raw_result(db_path, key, raw_text, source="oddspark_void")
+            except Exception:
+                pass
+            return {"key": key, "ok": False, "error": f"{type(exc).__name__}: {exc}", "void": True}
+    try:
+        _v238_save_exact_raw_result(db_path, key, raw_text, source="oddspark_void")
+    except Exception:
+        pass
+    return {"key": key, "ok": True, "void": True, "reason": reason}
+
+
 def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, replace: bool = False) -> dict:
     meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(raw_text, venue, "")
     meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(raw_text, meta_r, rows_r)
@@ -10782,38 +10868,57 @@ def _v319_import_one_race(
 
     # --- 4) オッズ入力・保存確認（結果の前に必須） ---
     _step("オッズ")
+    void_peek_raw = ""
     try:
         applied = _v319_apply_odds_and_plan(db_path, ymd, venue, race_no, key_guess)
         odds_n = int(applied.get("odds") or 0)
         odds_msg = f" / オッズ{odds_n}件"
         if applied.get("plan_hash"):
             odds_msg += " / 回収率プラン保存"
+        void_peek_raw = ""
         if odds_n <= 0:
+            try:
+                void_peek_raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+            except Exception:
+                void_peek_raw = ""
+            void_info = _v319_is_void_or_cancelled_result(void_peek_raw)
+            if void_info.get("void"):
+                odds_msg += f" / オッズなし({void_info.get('reason') or '中止'})"
+            else:
+                return {
+                    "status": "error",
+                    "phase": "save_odds",
+                    "message": (
+                        f"{venue} {race_no}R：オッズ未登録のため結果登録を禁止します。"
+                        f"{hist_msg}{pred_msg}{odds_msg}"
+                    ),
+                    "key": key_guess,
+                    "player_history_saved": True,
+                    "next_action": "retry",
+                }
+    except Exception as exc:
+        # オッズAPI失敗でも中止レースなら結果登録へ
+        try:
+            void_peek_raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+        except Exception:
+            void_peek_raw = ""
+        void_info = _v319_is_void_or_cancelled_result(void_peek_raw)
+        if void_info.get("void"):
+            odds_msg = f" / オッズ取得失敗→{void_info.get('reason') or '中止'}"
+        else:
             return {
                 "status": "error",
                 "phase": "save_odds",
                 "message": (
-                    f"{venue} {race_no}R：オッズ未登録のため結果登録を禁止します。"
-                    f"{hist_msg}{pred_msg}{odds_msg}"
+                    f"{venue} {race_no}R：オッズ取得に失敗しました。"
+                    f" 結果登録は実行していません。"
+                    f" ({type(exc).__name__}: {exc})"
+                    f"{hist_msg}{pred_msg}"
                 ),
                 "key": key_guess,
                 "player_history_saved": True,
                 "next_action": "retry",
             }
-    except Exception as exc:
-        return {
-            "status": "error",
-            "phase": "save_odds",
-            "message": (
-                f"{venue} {race_no}R：オッズ取得に失敗しました。"
-                f" 結果登録は実行していません。"
-                f" ({type(exc).__name__}: {exc})"
-                f"{hist_msg}{pred_msg}"
-            ),
-            "key": key_guess,
-            "player_history_saved": True,
-            "next_action": "retry",
-        }
 
     # --- 5) 結果登録（登録済みスキップは払戻補完のみ） ---
     if exists and skip_existing and not replace:
@@ -10830,21 +10935,52 @@ def _v319_import_one_race(
         }
 
     _step("結果登録")
-    try:
-        raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
-    except Exception as exc:
+    raw = str(void_peek_raw or "")
+    if not raw:
+        try:
+            raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "phase": "fetch_result",
+                "message": (
+                    f"{venue} {race_no}R：結果ページ取得に失敗しました。"
+                    f" ({type(exc).__name__}: {exc})"
+                    f"{hist_msg}{pred_msg}{odds_msg}"
+                ),
+                "key": key_guess,
+                "next_action": "retry",
+            }
+    raw_s = str(raw or "")
+    void_info = _v319_is_void_or_cancelled_result(raw_s)
+    if void_info.get("void"):
+        try:
+            saved = _v319_register_void_result(
+                db_path, raw_s, venue, ymd, race_no,
+                reason=str(void_info.get("reason") or "レース中止"),
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "phase": "save_result",
+                "message": (
+                    f"{venue} {race_no}R：中止・不成立の結果登録に失敗しました。"
+                    f" ({type(exc).__name__}: {exc})"
+                    f"{hist_msg}{pred_msg}{odds_msg}"
+                ),
+                "key": key_guess,
+                "next_action": "retry",
+            }
         return {
-            "status": "error",
-            "phase": "fetch_result",
+            "status": "ok",
+            "phase": "completed_void",
             "message": (
-                f"{venue} {race_no}R：結果ページ取得に失敗しました。"
-                f" ({type(exc).__name__}: {exc})"
+                f"{key_guess} / {void_info.get('reason') or 'レース中止・全返還'}"
                 f"{hist_msg}{pred_msg}{odds_msg}"
             ),
-            "key": key_guess,
-            "next_action": "retry",
+            "key": str((saved or {}).get("key") or key_guess),
+            "void": True,
         }
-    raw_s = str(raw or "")
     if "着" not in raw_s and "払戻" not in raw_s:
         return {
             "status": "skip",
