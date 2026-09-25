@@ -16488,6 +16488,32 @@ def _v305_repair_existing_rec_only_comparison(db_path: str) -> dict:
         return out
 
 
+def _v319_build_selection_audit(plan, candidates, *, protected_reasons=None, v299_hole_notes=None, protected_add_notes=None, replacement_notes=None, pair_mix_notes=None, low_odds_floor_notes=None):
+    """買い目の選定結果を監査するだけの診断情報。選定・点数・推奨判定は変更しない。
+
+    Ver319の挙動を壊さず、候補がどの段階で残った/追加された/除外されたかを
+    後から確認できるようにするための監査用ヘルパー。
+    """
+    plan=list(plan or [])
+    cand=list(candidates or [])
+    selected_ids={(str(t.get("type") or ""), str(t.get("combo") or "")) for t in plan}
+    candidate_ids={(str(t.get("type") or ""), str(t.get("combo") or "")) for t in cand}
+    selected_types=sorted({str(t.get("type") or "") for t in plan if str(t.get("type") or "")})
+    return {
+        "version": "Ver319",
+        "candidate_count": len(cand),
+        "selected_count": len(plan),
+        "selected_type_count": len(selected_types),
+        "selected_types": selected_types,
+        "selected_not_in_candidates": sorted(selected_ids-candidate_ids),
+        "protected_reasons": list(protected_reasons or []),
+        "v299_hole_notes": list(v299_hole_notes or []),
+        "protected_add_notes": list(protected_add_notes or []),
+        "replacement_notes": list(replacement_notes or []),
+        "pair_mix_notes": list(pair_mix_notes or []),
+        "low_odds_floor_notes": list(low_odds_floor_notes or []),
+    }
+
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
     """5〜8車立て向けの役割分担型・回収率合成。
 
@@ -18287,6 +18313,15 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
 
     result["provisional_7type_candidates"] = optional
     result["provisional_7type_added"] = added
+    result["selection_audit"] = _v319_build_selection_audit(
+        plan, candidates,
+        protected_reasons=sum((list(v) for v in protected_reasons.values()), []) if isinstance(protected_reasons, dict) else protected_reasons,
+        v299_hole_notes=v299_hole_notes,
+        protected_add_notes=protected_add_notes,
+        replacement_notes=replacement_notes,
+        pair_mix_notes=pair_mix_notes,
+        low_odds_floor_notes=low_odds_floor_notes,
+    )
     if not added:
         return result
 
@@ -18306,6 +18341,15 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
         if rows:
             role_lines.append(f"{v205_ticket_display_name(typ)}{len(rows)}点：{rows[0].get('role','')}")
     result["role_lines"] = role_lines
+    result["selection_audit"] = _v319_build_selection_audit(
+        plan, candidates,
+        protected_reasons=sum((list(v) for v in protected_reasons.values()), []) if isinstance(protected_reasons, dict) else protected_reasons,
+        v299_hole_notes=v299_hole_notes,
+        protected_add_notes=protected_add_notes,
+        replacement_notes=replacement_notes,
+        pair_mix_notes=pair_mix_notes,
+        low_odds_floor_notes=low_odds_floor_notes,
+    )
     return result
 
 def _v305_supersede_plan_after_odds_refresh(
