@@ -16489,15 +16489,33 @@ def _v305_repair_existing_rec_only_comparison(db_path: str) -> dict:
 
 
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
-    """6〜8車立て向けの役割分担型・回収率合成。
+    """5〜8車立て向けの役割分担型・回収率合成。
 
     車立てに応じて三連単中心度を変え、着順ずれ・3着抜け・1・2着逆転を補う。
+    5車（6車立てで1車以上欠車した実質5車を含む）は確率が集中しやすいため、
+    6車以上より三連単寄り・少点数で評価する。
     Ver191では単なる合成的中率ではなく、購入総額を超える黒字的中率を最優先する。
     低配当保険は、ほかの券種との同時的中を含めて黒字側を実際に増やす場合だけ採用する。
     """
     starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH)
-    if not starter_count or int(starter_count) not in (6, 7, 8):
-        return {"available": False, "reason": "回収率重視の合成推奨は6〜8車立てに対応しています。"}
+    # 欠車で実質5車など、meta側の出走数が取れない／ずれる場合は
+    # 三連単シミュレーションに現れた車番数を優先して補完する。
+    if not starter_count or int(starter_count) not in (5, 6, 7, 8):
+        try:
+            _cars = set()
+            for _combo in (bets.get("三連単") or {}):
+                _vals = _combo if isinstance(_combo, (tuple, list)) else (_combo,)
+                for _v in _vals:
+                    try:
+                        _cars.add(int(_v))
+                    except Exception:
+                        pass
+            if len(_cars) in (5, 6, 7, 8):
+                starter_count = len(_cars)
+        except Exception:
+            pass
+    if not starter_count or int(starter_count) not in (5, 6, 7, 8):
+        return {"available": False, "reason": "回収率重視の合成推奨は5〜8車立てに対応しています。"}
     starter_count = int(starter_count)
     _race_date295=str((meta or {}).get("開催日") or (meta or {}).get("race_date") or "")[:10]
     _ev_calibration295=_v295_ev_calibration_table(str(engine.DB_PATH),_race_date295)
@@ -16517,8 +16535,16 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             pass
     type_weights = learning.get("type_weights", {})
 
-    # 車立て別に役割を変更。6車は三連単中心、7車は準中心、8車は複数券種の補完を厚くする。
-    if starter_count == 6:
+    # 車立て別に役割を変更。5・6車は三連単中心、7車は準中心、8車は複数券種の補完を厚くする。
+    if starter_count == 5:
+        # 5車は組合せ60通りで確率が集中。三連単をさらに厚め、補完券種は少点数に抑える。
+        type_specs = {
+            "三連単": {"counter": "三連単", "odds": "3tan", "limit": 28, "cap": 10, "target_cover": None, "role": "主軸・着順まで一致"},
+            "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "cap": 2, "target_cover": 84.0, "role": "着順ずれを少点数で補完"},
+            "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 999, "cap": 2, "target_cover": 82.0, "role": "3着抜けの限定保険"},
+            "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 999, "cap": 1, "target_cover": 80.0, "role": "逆転保険・黒字時のみ"},
+        }
+    elif starter_count == 6:
         type_specs = {
             "三連単": {"counter": "三連単", "odds": "3tan", "limit": 24, "cap": 10, "target_cover": None, "role": "主軸・着順まで一致"},
             "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "cap": 3, "target_cover": 86.0, "role": "着順ずれを少点数で補完"},
@@ -16676,7 +16702,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 protect_ticket(ticket, f"三連単{idx + 1}位・高確率本線")
 
     # 三連複は広い結果を1点で拾うため、上位2点と単独確率閾値以上を保護する。
-    trio_threshold = {6: 12.0, 7: 10.0, 8: 8.0}[starter_count]
+    trio_threshold = {5: 14.0, 6: 12.0, 7: 10.0, 8: 8.0}[starter_count]
     for idx, ticket in enumerate(by_type.get("三連複", [])):
         prob = float(ticket.get("probability", 0.0))
         if idx < 2 or prob >= trio_threshold:
@@ -16692,7 +16718,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 protect_ticket(ticket, f"2連単{idx + 1}位・高確率本線")
 
     # 2連複も広い結果を拾うため上位1点を保護。2位は確率が十分高い場合に保護する。
-    quinella_threshold = {6: 15.0, 7: 12.0, 8: 10.0}[starter_count]
+    quinella_threshold = {5: 18.0, 6: 15.0, 7: 12.0, 8: 10.0}[starter_count]
     for idx, ticket in enumerate(by_type.get("2連複", [])[:2]):
         prob = float(ticket.get("probability", 0.0))
         if idx == 0 or prob >= quinella_threshold:
@@ -16706,7 +16732,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     tri_candidates = [c for c in candidates if c["type"] == "三連単"]
     if len(tri_candidates) < 2:
         return {"available": False, "reason": "三連単上位候補のオッズが2点以上必要です。"}
-    if len(candidates) < 6:
+    _min_candidates = 4 if starter_count == 5 else 6
+    if len(candidates) < _min_candidates:
         return {"available": False, "reason": "合成判定に必要なオッズ候補が不足しています。4券種表を読み込んでください。"}
 
     def evaluate(plan):
@@ -16767,7 +16794,11 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         # Ver191: 黒字的中率を主役にする。単なる的中範囲とガミ的中は強く評価しない。
         # 点数増加は購入総額そのものを押し上げるため、以前より明確に減点する。
         tri_share = (counts.get("三連単", 0) / max(1, n))
-        field_bonus = (0.34 * tri_share if starter_count == 6 else (0.12 * tri_share if starter_count == 7 else 0.0))
+        field_bonus = (
+            0.42 * tri_share if starter_count == 5
+            else (0.34 * tri_share if starter_count == 6
+                  else (0.12 * tri_share if starter_count == 7 else 0.0))
+        )
         score = 0.48 * cover + 1.22 * black - 0.72 * low + 0.55 * role_bonus - 0.16 * n + field_bonus
         black_share_of_hits = black / cover * 100.0 if cover > 0 else 0.0
         gami_share_of_hits = low / cover * 100.0 if cover > 0 else 0.0
@@ -16805,7 +16836,10 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     # Ver189: 三連単も2点固定にせず、上位2〜6点を合成全体の土台として比較する。
     # 的中範囲を優先しつつ、追加による黒字側の改善、ガミ化、点数増を同時に評価する。
     tri_seed_options = []
-    max_tri_seed = min(8 if starter_count == 6 else (7 if starter_count == 7 else 6), len(tri_candidates))
+    max_tri_seed = min(
+        9 if starter_count == 5 else (8 if starter_count == 6 else (7 if starter_count == 7 else 6)),
+        len(tri_candidates),
+    )
     for k in range(2, max_tri_seed + 1):
         seed_plan = tri_candidates[:k]
         seed_metrics = evaluate(seed_plan)
@@ -17015,7 +17049,11 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 reverse=True,
             )
             # 1〜4点への分解を比較。総点数は最大14点を維持する。
-            max_add = min(5 if starter_count == 6 else 4, len(available_tri), (12 if starter_count == 6 else 15) - len(selected))
+            max_add = min(
+                5 if starter_count in (5, 6) else 4,
+                len(available_tri),
+                (12 if starter_count in (5, 6) else 15) - len(selected),
+            )
             for k in range(1, max_add + 1):
                 tri_rows = available_tri[:k]
                 trial_plan = [t for t in selected if t is not low_ticket] + tri_rows
@@ -18791,7 +18829,7 @@ def show_v184_eight_car_mixed_plan(
                 f"{int(info.get('points', 0))}点",
                 f"累積{float(info.get('cover', 0.0)):.1f}%・{target_text}",
             )
-        st.caption("3連単以外は車立て別の累積確率候補から、合成効果・ガミ・倍率を比較して採用します。6車は3連単だけが最良なら、ほかの券種を無理に混ぜません。")
+        st.caption("3連単以外は車立て別の累積確率候補から、合成効果・ガミ・倍率を比較して採用します。5・6車は3連単だけが最良なら、ほかの券種を無理に混ぜません。")
     st.caption(
         f"3連単の初期本線は上位2〜6点を比較し、今回は{int(result.get('tri_seed_points', 2))}点を採用。"
         f"本線段階のカバー{float(result.get('tri_seed_cover', 0.0)):.2f}%・黒字側{float(result.get('tri_seed_black', 0.0)):.2f}%を基準に、"
@@ -18894,7 +18932,7 @@ def show_v184_eight_car_mixed_plan(
 
     st.caption(
         f"モデル上の全外れ率 {result['miss']:.2f}%・参考モデル回収率 {result['model_return_rate']:.1f}%・実績補正後 {result.get('adjusted_return_rate',0):.1f}% 。"
-        "車立て別に点数と券種配分を変え、黒字的中率が明確に改善する候補だけ追加します。6車は3連単中心、7車は中間、8車は補完券種を厚めに評価します。"
+        "車立て別に点数と券種配分を変え、黒字的中率が明確に改善する候補だけ追加します。5・6車は3連単中心、7車は中間、8車は補完券種を厚めに評価します。"
     )
     st.caption(
         "判定は黒字的中率を最優先し、的中時の黒字割合・ガミ割合・平均合成倍率・モデル期待倍率を使用します。"
