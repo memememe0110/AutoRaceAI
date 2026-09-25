@@ -21020,9 +21020,34 @@ def pull_db_from_github() -> tuple[bool, str]:
                     _v284_containment_message(_rel284,"GitHub","端末")
                 )
             if _relation284=="diverged":
-                return False,(
-                    "GitHub DBと端末DBの双方に固有データがあります。自動上書きせず統合が必要です。\n"+
-                    _v284_containment_message(_rel284,"GitHub","端末")
+                try:
+                    _merge_ok284, _merged_bytes284, _merge_rep284 = _v284_safe_union_merge_db_bytes(
+                        _local_bytes283, data
+                    )
+                except Exception as _mexc:
+                    return False, (
+                        "diverged統合失敗: " + type(_mexc).__name__ + ": " + str(_mexc) + chr(10)
+                        + _v284_containment_message(_rel284, "GitHub", "端末")
+                    )
+                if not _merge_ok284 or _merged_bytes284 is None:
+                    return False, (
+                        "divergedの安全統合に失敗しました。" + chr(10)
+                        + str((_merge_rep284 or {}).get("reason") or "") + chr(10)
+                        + _v284_containment_message(_rel284, "GitHub", "端末")
+                    )
+                data = bytes(_merged_bytes284)
+                ok, msg = _v276_atomic_install_db_bytes(data, "GitHub+端末の安全統合DB")
+                if not ok:
+                    return False, "統合DBの反映に失敗しました。現在のDBは保護されています。" + chr(10) + str(msg)
+                st.session_state.pop("loaded_db_hash", None)
+                _added = ((_merge_rep284 or {}).get("added") or {})
+                _add_txt = (
+                    ", ".join(f"{k}+{v}" for k, v in sorted(_added.items())[:12])
+                    if _added else "追加なし"
+                )
+                return True, (
+                    f"divergedを安全統合して反映しました（{len(data)/1024/1024:.2f} MB）。"
+                    f" 追加: {_add_txt}"
                 )
             if _relation284=="unknown":
                 return False,"GitHub DBの包含関係を安全確認できないため再読込を中止しました。"
@@ -21067,7 +21092,20 @@ def pull_db_from_github() -> tuple[bool, str]:
         if _relation284=="baseline_contains":
             return False,"GitHub DBは端末DBの古い部分集合です。端末DBを維持してください。\n"+_v284_containment_message(_rel284,"GitHub","端末")
         if _relation284=="diverged":
-            return False,"GitHub DBと端末DBの双方に固有データがあります。統合が必要です。\n"+_v284_containment_message(_rel284,"GitHub","端末")
+            try:
+                _merge_ok284, _merged_bytes284, _merge_rep284 = _v284_safe_union_merge_db_bytes(
+                    _local_bytes283, data
+                )
+            except Exception as _mexc:
+                return False, f"diverged統合失敗: {type(_mexc).__name__}: {_mexc}"
+            if not _merge_ok284 or _merged_bytes284 is None:
+                return False, "divergedの安全統合に失敗しました。"
+            data = bytes(_merged_bytes284)
+            ok, msg = _v276_atomic_install_db_bytes(data, "GitHub+端末の安全統合DB")
+            if not ok:
+                return False, "統合DBの反映に失敗: " + msg
+            st.session_state.pop("loaded_db_hash", None)
+            return True, f"divergedを安全統合して反映しました（{len(data)/1024/1024:.2f} MB）"
         if _relation284=="unknown":
             return False,"GitHub DBの包含関係を安全確認できないため再読込を中止しました。"
         ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上のDB")
@@ -21637,6 +21675,67 @@ def _v305_sanitize_remote_for_safe_sync(
 
 
 
+
+def _v319_export_and_drop_archives(db_path: str) -> dict:
+    """アーカイブ表を別ファイルへ書き出し、本体DBから削除して容量を減らす。"""
+    import tempfile
+    report = {"ok": False, "export_path": "", "bytes": 0, "dropped": []}
+    try:
+        src = Path(str(db_path))
+        out_path = src.with_name(src.stem + "_old_versions_backup.sqlite3")
+        with sqlite3.connect(str(db_path), timeout=120) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            arch_tables = [t for t in (
+                "v319_prediction_history_archive",
+                "v319_lap_snapshots_archive",
+            ) if t in tables]
+            if not arch_tables:
+                report["error"] = "アーカイブ表がありません（先に退避してください）"
+                return report
+            # 別ファイルへコピー
+            if out_path.exists():
+                out_path.unlink()
+            with sqlite3.connect(str(out_path)) as out:
+                for t in arch_tables:
+                    cols = [r[1] for r in con.execute(f"PRAGMA table_info({t})").fetchall()]
+                    if not cols:
+                        continue
+                    col_list = ",".join(cols)
+                    out.execute(f"CREATE TABLE {t} ({', '.join(c + ' TEXT' for c in cols)})")
+                    # 型は簡易。実データはrow転送
+                    out.execute(f"DROP TABLE IF EXISTS {t}")
+                    # ATTACH で高速コピー
+                pass
+            con.execute(f"ATTACH DATABASE ? AS archbak", (str(out_path),))
+            for t in arch_tables:
+                con.execute(f"CREATE TABLE archbak.{t} AS SELECT * FROM main.{t}")
+                n = con.execute(f"SELECT COUNT(*) FROM main.{t}").fetchone()[0]
+                con.execute(f"DROP TABLE IF EXISTS main.{t}")
+                report["dropped"].append(f"{t}:{n}")
+            con.commit()
+            try:
+                con.execute("DETACH DATABASE archbak")
+            except Exception:
+                pass
+            try:
+                con.execute("VACUUM")
+            except Exception as vex:
+                report["vacuum_error"] = str(vex)
+        report["ok"] = True
+        report["export_path"] = str(out_path)
+        try:
+            report["bytes"] = out_path.stat().st_size
+        except Exception:
+            report["bytes"] = 0
+        try:
+            report["main_bytes"] = Path(str(db_path)).stat().st_size
+        except Exception:
+            pass
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    return report
+
+
 def _v319_archive_old_version_predictions(db_path: str, keep_versions: list[str] | None = None) -> dict:
     """現行以外の予測履歴をバックアップ表へ退避し、本体から外す（起動・表示を軽くする）。"""
     keep = set(str(v) for v in (keep_versions or [APP_VERSION, _V231_APP_VERSION]) if v)
@@ -21997,7 +22096,21 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
 # GitHub側が古い/破損DBでも、アップロード済みの正常DBを保持する。
 if "github_pull_done" not in st.session_state:
     st.session_state["github_pull_done"] = True
-    st.session_state["github_pull_message"] = (True, "起動時のGitHub DB自動読込は安全のため停止中です。必要な場合だけ『GitHubからDBを再読込』を押してください。")
+    try:
+        _boot_sz = Path(str(engine.DB_PATH)).stat().st_size if Path(str(engine.DB_PATH)).exists() else 0
+    except Exception:
+        _boot_sz = 0
+    if _boot_sz < 5 * 1024 * 1024:
+        try:
+            _pok, _pmsg = pull_db_from_github()
+            st.session_state["github_pull_message"] = (_pok, str(_pmsg))
+        except Exception as _pexc:
+            st.session_state["github_pull_message"] = (False, f"起動時読込失敗: {type(_pexc).__name__}: {_pexc}")
+    else:
+        st.session_state["github_pull_message"] = (
+            True,
+            "起動時の強制上書きは停止中です。『GitHubからDBを再読込』でdivergedも安全統合します。",
+        )
 
 
 def _v278_bg_get_latest_active(db_path: str) -> dict:
@@ -22498,14 +22611,29 @@ with st.sidebar:
             "｜端末DBへの反映なし"
         )
     if st.button("古いVer予測をバックアップへ退避", use_container_width=True,
-                 help="Ver319以外の予測履歴をアーカイブ表へ移し、起動を軽くします。結果・選手履歴は消しません。"):
+                 help="Ver319以外の予測履歴をアーカイブ表へ移します。同じDB内なので容量はほぼ減りません。"):
         with st.spinner("古いバージョンの予測データを退避中…"):
             _ar = _v319_archive_old_version_predictions(engine.DB_PATH)
         if _ar.get("ok"):
-            st.success(f"退避完了: { _ar.get('moved', 0) }件 → バックアップ表")
+            st.success(f"退避完了: {_ar.get('moved', 0)}件 → バックアップ表（同一DB内）")
+            st.caption("容量を減らすには下の「アーカイブを別ファイルへ出して本体から削除」を実行してください。")
             st.session_state.pop("_v296_sidebar_manifest_cache", None)
         else:
             st.error(str(_ar.get("error") or "退避失敗"))
+    if st.button("アーカイブを別ファイルへ出して本体から削除", use_container_width=True,
+                 help="v319_*_archive を別sqliteへ保存し、本体DBからDROP+VACUUMします。容量削減用。"):
+        with st.spinner("アーカイブ書き出しとVACUUM中…"):
+            _ex = _v319_export_and_drop_archives(engine.DB_PATH)
+        if _ex.get("ok"):
+            mb = (_ex.get("bytes") or 0) / (1024 * 1024)
+            main_mb = (_ex.get("main_bytes") or 0) / (1024 * 1024)
+            st.success(
+                f"書き出し完了: {_ex.get('export_path')} ({mb:.1f}MB) ／ 本体DB約{main_mb:.1f}MB"
+            )
+            st.caption("別ファイルはサーバー上にあります。必要なら端末保存やGitHub前に保管してください。")
+            st.session_state.pop("_v296_sidebar_manifest_cache", None)
+        else:
+            st.error(str(_ex.get("error") or "書き出し失敗"))
     if st.button("現在のDBをGitHubへ保存（軽量）", use_container_width=True, disabled=not ready,
                  help="リモートDBの全取得・統合を省略して現在DBだけを分割アップロードします。メモリ節約。再デプロイなし。"):
         with st.spinner("軽量保存中（リモート統合なし）…"):
