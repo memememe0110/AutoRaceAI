@@ -21030,10 +21030,19 @@ def pull_db_from_github() -> tuple[bool, str]:
                         + _v284_containment_message(_rel284, "GitHub", "端末")
                     )
                 if not _merge_ok284 or _merged_bytes284 is None:
-                    return False, (
-                        "divergedの安全統合に失敗しました。" + chr(10)
-                        + str((_merge_rep284 or {}).get("reason") or "") + chr(10)
-                        + _v284_containment_message(_rel284, "GitHub", "端末")
+                    # 統合不能時はGitHub側を優先採用（履歴の本体はGitHub）
+                    ok, msg = _v276_atomic_install_db_bytes(data, "GitHub DB（統合失敗時の優先採用）")
+                    if not ok:
+                        return False, (
+                            "divergedの安全統合に失敗し、GitHub採用もできませんでした。"
+                            + chr(10) + str((_merge_rep284 or {}).get("reason") or "")
+                            + chr(10) + str(msg)
+                        )
+                    st.session_state.pop("loaded_db_hash", None)
+                    return True, (
+                        "diverged統合は一部失敗したためGitHub DBを採用しました。"
+                        + chr(10) + str((_merge_rep284 or {}).get("reason") or "")
+                        + f"（{len(data)/1024/1024:.2f} MB）"
                     )
                 data = bytes(_merged_bytes284)
                 ok, msg = _v276_atomic_install_db_bytes(data, "GitHub+端末の安全統合DB")
@@ -21099,7 +21108,11 @@ def pull_db_from_github() -> tuple[bool, str]:
             except Exception as _mexc:
                 return False, f"diverged統合失敗: {type(_mexc).__name__}: {_mexc}"
             if not _merge_ok284 or _merged_bytes284 is None:
-                return False, "divergedの安全統合に失敗しました。"
+                ok, msg = _v276_atomic_install_db_bytes(data, "GitHub DB（統合失敗時の優先採用）")
+                if not ok:
+                    return False, "diverged統合失敗かつGitHub採用失敗: " + str(msg)
+                st.session_state.pop("loaded_db_hash", None)
+                return True, f"diverged統合失敗のためGitHub DBを採用しました（{len(data)/1024/1024:.2f} MB）"
             data = bytes(_merged_bytes284)
             ok, msg = _v276_atomic_install_db_bytes(data, "GitHub+端末の安全統合DB")
             if not ok:
@@ -21281,19 +21294,56 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
             lc_tables={str(r[0]) for r in lc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             rc_tables={str(r[0]) for r in rc.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
-            # Ver295: player_idはDB枝ごとに再採番され得るため、
-            # GitHub固有race_historyを追加するときはplayer_name経由でIDを対応付ける。
+            # Ver295/Ver319: player_idは枝ごとに違うため player_name で対応。
+            # 端末にいない選手は GitHub の players 行を追加してから対応付ける。
             _remote_to_local_player_id295={}
             if "players" in lc_tables and "players" in rc_tables:
-                _local_name_to_id295={
-                    str(_name295):int(_pid295)
-                    for _pid295,_name295 in lc.execute("SELECT player_id,player_name FROM players")
-                    if _pid295 is not None and _name295 is not None
-                }
+                def _norm_pname295(n):
+                    return str(n or "").replace(" ", "").replace("　", "").strip()
+                _local_name_to_id295={}
+                for _pid295,_name295 in lc.execute("SELECT player_id,player_name FROM players"):
+                    if _pid295 is None or _name295 is None:
+                        continue
+                    _local_name_to_id295[_norm_pname295(_name295)]=int(_pid295)
+                    _local_name_to_id295[str(_name295)]=int(_pid295)
+                _lp_cols=[str(r[1]) for r in lc.execute('PRAGMA table_info("players")').fetchall()]
+                _rp_cols=[str(r[1]) for r in rc.execute('PRAGMA table_info("players")').fetchall()]
+                _common_p=[c for c in _lp_cols if c in _rp_cols and c != "player_id"]
                 for _rpid295,_rname295 in rc.execute("SELECT player_id,player_name FROM players"):
                     if _rpid295 is None or _rname295 is None:
                         continue
-                    _lpid295=_local_name_to_id295.get(str(_rname295))
+                    _lpid295=_local_name_to_id295.get(_norm_pname295(_rname295)) or _local_name_to_id295.get(str(_rname295))
+                    if _lpid295 is None:
+                        # 端末にいない選手をGitHubから追加
+                        try:
+                            _row_r=rc.execute(
+                                "SELECT * FROM players WHERE player_id=?",
+                                (int(_rpid295),)
+                            ).fetchone()
+                            if _row_r is not None:
+                                _rnames=[d[0] for d in rc.execute("PRAGMA table_info(players)").fetchall()]
+                                _rd=dict(zip(_rnames, _row_r))
+                                _ins_cols=[c for c in _common_p if c in _rd]
+                                if "player_name" in _ins_cols:
+                                    _ph=",".join("?" for _ in _ins_cols)
+                                    _qc=",".join('"'+c+'"' for c in _ins_cols)
+                                    _vals=[_rd.get(c) for c in _ins_cols]
+                                    cur=lc.execute(
+                                        f'INSERT INTO players ({_qc}) VALUES ({_ph})',
+                                        _vals,
+                                    )
+                                    _lpid295=int(cur.lastrowid or 0)
+                                    if _lpid295 <= 0:
+                                        _got=lc.execute(
+                                            "SELECT player_id FROM players WHERE player_name=? ORDER BY player_id DESC LIMIT 1",
+                                            (str(_rname295),),
+                                        ).fetchone()
+                                        _lpid295=int(_got[0]) if _got else None
+                                    if _lpid295:
+                                        _local_name_to_id295[_norm_pname295(_rname295)]=int(_lpid295)
+                                        _local_name_to_id295[str(_rname295)]=int(_lpid295)
+                        except Exception:
+                            _lpid295=None
                     if _lpid295 is not None:
                         _remote_to_local_player_id295[int(_rpid295)]=int(_lpid295)
 
