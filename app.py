@@ -8793,15 +8793,27 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
             st = cells[9] if len(cells) > 9 else "0.00"
             abn = cells[10] if len(cells) > 10 else ""
             pop = cells[11] if len(cells) > 11 else "-"
-        if acc == "欠車" or pos in ("-", "欠") or "欠車" in acc:
+        # 着順 "-" だけでは欠車にしない（反妨・失格なども "-" になる）
+        _is_kessha = (
+            acc == "欠車" or "欠車" in str(acc or "") or str(abn or "") == "欠車"
+            or (pos in ("-", "欠", "－") and ("欠車" in str(acc or "") or "欠車" in str(abn or "")))
+        )
+        if _is_kessha:
             lines.append(f"-\t{car}\t{name}")
             lines.append(f"{lg}/{hand}m/{trial}\t0.000(-)")
             lines.append("0.00 /欠車")
             continue
         flag = f" /{abn}" if abn else ""
-        lines.append(f"{pos}\t{car}\t{name}")
-        lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop}){flag}")
-        lines.append(str(st))
+        # 発走後事故（反妨等）は着順 "-" のまま残す（欠車にしない）
+        if str(pos) in ("-", "欠", "－") and abn and "欠車" not in str(abn):
+            lines.append(f"-\t{car}\t{name}")
+            lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop})")
+            st_s = str(st or "0.00")
+            lines.append(f"{st_s} /{abn}")
+        else:
+            lines.append(f"{pos}\t{car}\t{name}")
+            lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop}){flag}")
+            lines.append(str(st))
 
     if lap_rows:
         lines.append("グランドノート")
@@ -10533,41 +10545,74 @@ def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, repla
         meta_r["事前除外車番"] = kessha
         meta_r["比較対象外車番"] = kessha
     meta_r, _inc = _v227_detect_poststart_incidents(raw_text, meta_r)
-    # 反妨など発走後事故の車番を結果行に必ず残す（予測台数照合で落ちないように）
+    # 反妨等: 結果に必ず残し、着順は数値にする（engineが "-" 行を落とすため）
     try:
-        if _inc and isinstance(rows_r, pd.DataFrame):
-            have_cars = set()
-            if "車番" in rows_r.columns:
-                have_cars = set(
-                    int(x) for x in pd.to_numeric(rows_r["車番"], errors="coerce").dropna().astype(int).tolist()
-                )
-            add_rows = []
-            for item in _inc:
-                try:
-                    c = int(item.get("車番"))
-                except Exception:
-                    continue
-                if c in have_cars:
-                    # 事故列を付与
-                    if "事故" in rows_r.columns:
-                        mask = pd.to_numeric(rows_r["車番"], errors="coerce") == c
-                        rows_r.loc[mask, "事故"] = str(item.get("理由") or "反妨")
-                    continue
-                row = {col: None for col in (list(rows_r.columns) if len(rows_r.columns) else ["着順", "車番", "選手名", "競走T", "ST", "事故"])}
-                row["車番"] = c
-                row["着順"] = "-"
-                row["競走T"] = 0.0
-                row["ST"] = 0.0
-                row["事故"] = str(item.get("理由") or "反妨")
-                add_rows.append(row)
+        inc_cars = []
+        for item in (_inc or []):
+            try:
+                inc_cars.append((int(item.get("車番")), str(item.get("理由") or "反妨")))
+            except Exception:
+                pass
+        # raw からも再検出（パース漏れ対策）
+        for m in re.finditer(
+            r"(?:^|\n)\s*-?\s*([1-8])\b[^\n]{0,200}?/(?:\s*)?(反妨|反則|失格|落車|他落|周誤)",
+            str(raw_text or ""),
+            flags=re.MULTILINE,
+        ):
+            c = int(m.group(1))
+            if c not in {x[0] for x in inc_cars}:
+                inc_cars.append((c, m.group(2)))
+        if not isinstance(rows_r, pd.DataFrame):
+            rows_r = pd.DataFrame(columns=["着順", "車番", "選手名", "競走T", "ST", "事故"])
+        for col in ("着順", "車番", "選手名", "競走T", "ST", "事故"):
+            if col not in rows_r.columns:
+                rows_r[col] = None
+        have_cars = set(
+            int(x) for x in pd.to_numeric(rows_r["車番"], errors="coerce").dropna().astype(int).tolist()
+        )
+        # 既存の正常着順の最大
+        fin_nums = pd.to_numeric(rows_r["着順"], errors="coerce").dropna()
+        next_fin = int(fin_nums.max()) + 1 if len(fin_nums) else 1
+        add_rows = []
+        for c, reason in inc_cars:
+            if c in have_cars:
+                mask = pd.to_numeric(rows_r["車番"], errors="coerce") == c
+                rows_r.loc[mask, "事故"] = reason
+                # 着順が非数なら数値化（照合用）
+                cur = rows_r.loc[mask, "着順"]
+                for idx in rows_r.loc[mask].index:
+                    v = rows_r.at[idx, "着順"]
+                    try:
+                        if v is None or str(v).strip() in {"", "-", "－", "欠", "nan", "None"}:
+                            rows_r.at[idx, "着順"] = int(next_fin)
+                            next_fin += 1
+                    except Exception:
+                        rows_r.at[idx, "着順"] = int(next_fin)
+                        next_fin += 1
+            else:
+                add_rows.append({
+                    "着順": int(next_fin),
+                    "車番": int(c),
+                    "選手名": "",
+                    "競走T": 0.0,
+                    "ST": 0.0,
+                    "事故": reason,
+                })
+                next_fin += 1
                 have_cars.add(c)
-            if add_rows:
-                rows_r = pd.concat([rows_r, pd.DataFrame(add_rows)], ignore_index=True)
-            meta_r["発走後事故車番"] = sorted({int(x.get("車番")) for x in _inc if x.get("車番") is not None})
-            # 照合用は事故車を含む（予測と同じ台数にする）
-            meta_r["予測照合用出走数"] = int(len(have_cars)) if have_cars else meta_r.get("予測照合用出走数")
+        if add_rows:
+            rows_r = pd.concat([rows_r, pd.DataFrame(add_rows)], ignore_index=True)
+        if inc_cars:
+            meta_r["発走後事故"] = True
+            meta_r["発走後事故車番"] = sorted({c for c, _ in inc_cars})
+            meta_r["学習対象外"] = True
+            meta_r["learning_excluded"] = True
+            meta_r["learning_exclusion_reason"] = " / ".join(f"{c}番{r}" for c, r in inc_cars)
+            meta_r["予測照合用出走数"] = int(len(have_cars))
+            meta_r["実出走数"] = int(len(have_cars))
     except Exception:
         pass
+    # 反妨車は欠車扱いで落とさない
     rows_for_engine = _v315_drop_kessha_rows(rows_r, kessha)
     if kessha:
         meta_r["実出走数"] = int(len(rows_for_engine))
@@ -11060,15 +11105,33 @@ def _v319_import_one_race(
         # 予測8車・結果7車などの不一致 → 出走表で再予測して1回だけリトライ
         if ("出走数が一致しない" in emsg) or ("結果にない車番" in emsg) or ("予測=" in emsg and "結果=" in emsg):
             try:
-                _step("台数不一致→再予測")
-                if not str(card_text or "").strip():
-                    card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
-                _v319_clear_prediction(db_path, key_guess)
-                pred = _v319_run_prerace_prediction(db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text, manual_excluded=kessha_cars)
-                if not pred.get("ok"):
-                    raise RuntimeError(pred.get("reason") or "再予測失敗")
-                pred_msg += " / 結果前に再予測"
-                saved = _v319_register_fetched_result(db_path, raw, venue, replace=True)
+                # 反妨など発走後事故が原因の台数差なら、再予測せず結果側を強制補完して再登録
+                _inc_try = _v227_detect_poststart_incidents(str(raw or ""), {})
+                inc_list = _inc_try[1] if isinstance(_inc_try, tuple) and len(_inc_try) > 1 else []
+                missing_m = re.search(r"結果にない車番=([0-9,\s]+)", emsg)
+                missing_cars = []
+                if missing_m:
+                    missing_cars = [int(x) for x in re.findall(r"\d+", missing_m.group(1))]
+                inc_cars = []
+                for it in (inc_list or []):
+                    try:
+                        inc_cars.append(int(it.get("車番")))
+                    except Exception:
+                        pass
+                if missing_cars and inc_cars and set(missing_cars).issubset(set(inc_cars)):
+                    _step("反妨台数→結果補完")
+                    pred_msg += " / 反妨車を結果に補完"
+                    saved = _v319_register_fetched_result(db_path, raw, venue, replace=True)
+                else:
+                    _step("台数不一致→再予測")
+                    if not str(card_text or "").strip():
+                        card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
+                    _v319_clear_prediction(db_path, key_guess)
+                    pred = _v319_run_prerace_prediction(db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text, manual_excluded=kessha_cars)
+                    if not pred.get("ok"):
+                        raise RuntimeError(pred.get("reason") or "再予測失敗")
+                    pred_msg += " / 結果前に再予測"
+                    saved = _v319_register_fetched_result(db_path, raw, venue, replace=True)
             except Exception as exc2:
                 return {
                     "status": "error",
@@ -11234,27 +11297,15 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             "failed_keys": failed_keys,
             "summary": f"自動取得が完了しました。完了：{ok}R / スキップ：{skip}R / 失敗：{err}R",
         }, protocol=4), 6)
-        # 完了時: DBをGitHubへ保存 + ntfy通知
+        # 完了時: 先に通知、GitHubは軽量保存（リモート全取得なし）
+        # 重い統合保存はメモリ不足でアプリ落ちの原因になるため自動取込では使わない
         gh_msg = ""
-        try:
-            _v278_bg_update(
-                db_path, job_id,
-                current_label="DB保存",
-                message=f"自動取得完了後のGitHub保存中…｜完了{ok} / 失敗{err}",
-            )
-            _gh_ok, _gh_detail = push_db_to_github(
-                f"Ver319 auto-import {ymd} ok={ok} skip={skip} err={err}",
-                _allow_during_resimulation=True,
-            )
-            gh_msg = f"｜GitHub{'OK' if _gh_ok else '失敗'}"
-        except Exception as _gh_exc:
-            gh_msg = f"｜GitHub例外:{type(_gh_exc).__name__}"
         try:
             topic = str(__import__("os").environ.get("AUTORACE_NTFY_TOPIC", "notify") or "notify").strip()
             body = (
                 f"自動取得完了 {ymd}\n"
                 f"完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}\n"
-                f"{gh_msg}"
+                f"GitHub軽量保存を開始します"
             )
             payload = {
                 "topic": topic,
@@ -11273,6 +11324,36 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 resp.read()
         except Exception:
             pass
+        try:
+            db_sz = 0
+            try:
+                db_sz = int(Path(str(db_path)).stat().st_size)
+            except Exception:
+                db_sz = 0
+            # 約80MB超は自動保存を見送り（手動の軽量保存を推奨）
+            if db_sz > 80 * 1024 * 1024:
+                gh_msg = f"｜GitHub見送り(DB {db_sz // (1024*1024)}MB>80MB 手動保存へ)"
+                _v278_bg_update(
+                    db_path, job_id,
+                    current_label="完了",
+                    message=f"自動取得完了｜GitHubはDBが大きいため手動保存してください",
+                )
+            else:
+                _v278_bg_update(
+                    db_path, job_id,
+                    current_label="DB保存",
+                    message=f"軽量GitHub保存中…｜完了{ok} / 失敗{err}",
+                )
+                _gh_ok, _gh_detail = push_db_to_github(
+                    f"Ver319 auto-import {ymd} ok={ok} skip={skip} err={err}",
+                    _allow_during_resimulation=True,
+                    _lightweight=True,
+                )
+                gh_msg = f"｜GitHub軽量{'OK' if _gh_ok else '失敗'}"
+                if not _gh_ok and _gh_detail:
+                    gh_msg += f"({str(_gh_detail)[:80]})"
+        except Exception as _gh_exc:
+            gh_msg = f"｜GitHub例外:{type(_gh_exc).__name__}（手動保存してください）"
         _v278_bg_update(
             db_path, job_id,
             status="completed",
@@ -21338,6 +21419,31 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
     if not ok_branch:
         return False,db_branch
 
+    # 軽量保存: リモート全取得・包含統合を省略し、現在DBだけを分割アップロード
+    if _lightweight:
+        try:
+            import gc as _gc_lw
+            _gc_lw.collect()
+        except Exception:
+            pass
+        _ok_push284, _msg_push284 = _v282_push_chunked_db(
+            snapshot_bytes, commit_message,
+            fingerprint=local_fp,
+            preserve_previous_manifest=False,
+        )
+        if _ok_push284:
+            try:
+                del snapshot_bytes
+            except Exception:
+                pass
+            try:
+                import gc as _gc_lw2
+                _gc_lw2.collect()
+            except Exception:
+                pass
+            return True, ("✅ 軽量GitHub保存に成功しました（リモート統合なし）。 " + str(_msg_push284))
+        return False, ("軽量GitHub保存に失敗: " + str(_msg_push284))
+
     # GitHub current DBと行単位の包含関係を比較。
     # 件数だけではなく、どちらにしか存在しない自然キーがあるかで判断する。
     # Ver305 safe delta backup:
@@ -22077,12 +22183,21 @@ with st.sidebar:
             f"GitHub current取得済み: {len(_gh_dl305)/1024/1024:.2f} MB "
             "｜端末DBへの反映なし"
         )
-    if st.button("現在のDBをGitHubへ保存", use_container_width=True, disabled=not ready,
-                 help="DB専用branchへ保存するため、Streamlit本体の再デプロイは発生しません。"):
-        ok, msg = push_db_to_github("AutoRaceAI: DBを手動保存")
+    if st.button("現在のDBをGitHubへ保存（軽量）", use_container_width=True, disabled=not ready,
+                 help="リモートDBの全取得・統合を省略して現在DBだけを分割アップロードします。メモリ節約。再デプロイなし。"):
+        with st.spinner("軽量保存中（リモート統合なし）…"):
+            ok, msg = push_db_to_github("AutoRaceAI: DBを手動保存（軽量）", _lightweight=True)
         (st.success if ok else st.error)(msg)
         if ok:
             st.session_state.pop("_v296_sidebar_manifest_cache",None)
+    with st.expander("フル保存（重い・非推奨）", expanded=False):
+        st.caption("GitHub側DBを全取得して統合してから保存します。DBが大きいとメモリ不足で落ちることがあります。")
+        if st.button("フル統合でGitHubへ保存", use_container_width=True, disabled=not ready, key="sidebar_full_db_push"):
+            with st.spinner("フル保存中（重い）…"):
+                ok, msg = push_db_to_github("AutoRaceAI: DBを手動保存")
+            (st.success if ok else st.error)(msg)
+            if ok:
+                st.session_state.pop("_v296_sidebar_manifest_cache",None)
 
     try:
         _summary_sig296=_v290_db_stat_signature(engine.DB_PATH)
