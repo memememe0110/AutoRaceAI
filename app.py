@@ -10117,38 +10117,34 @@ def _v319_fill_player_histories(
                 continue
             before_d = _v319_ymd_digits(before_ymd)
 
-            # ========== 1) 最初に「最新履歴日 == 直近（対象レース日）」だけ確認 ==========
-            # 全行SELECTしない。COUNT + MAX(date) のみ。
+            # ========== 1) DBだけ（COUNT + 最新日） ==========
             have, latest_d = _v319_player_history_latest_fast(db_path, name)
             latest_d = _v319_ymd_digits(latest_d)
-            # 同日バッチで既に最新到達確認済み → HTTPゼロ・DBフル走査ゼロ
-            if already_skipped or (already_refreshed and before_d and cache_key in _V319_HIST_SKIPPED):
+            if already_skipped:
                 skipped += 1
-                details.append(f"{name}:最新一致キャッシュスキップ")
+                details.append(f"{name}:キャッシュスキップ")
                 continue
-            up_to_date = bool(before_d and latest_d and latest_d >= before_d)
-            if not before_d:
-                up_to_date = have >= min_rows
-            if up_to_date:
-                # 直近データと一致 → 即スキップ（差分HTTPなし）
+            # 対象レース日までDBに入っている → HTTP不要
+            if before_d and latest_d and latest_d >= before_d and have >= min_rows:
                 skipped += 1
                 details.append(
-                    f"{name}:最新一致スキップ(最新{latest_d or '-'}>=対象{before_d or '-'} / {have}件)"
+                    f"{name}:最新一致スキップ(DB{latest_d}>=対象{before_d}/{have}件)"
                 )
                 _V319_HIST_SKIPPED.add(cache_key)
                 continue
 
-            # ========== 2) 軽いHTTPで公式の最新日だけ確認 ==========
-            # 公式最新 == DB最新 → 差分なしで即終了（全件パースしない）
+            # ========== 2) 軽いHTTPで公式最新（対象日以前）を確認 ==========
+            # 前日がDB最新でも、公式に同日先のレース等がある可能性があるため必ず確認
             official_latest = ""
             try:
-                # 対象レース日より先の公式日は判定に使わない
                 official_latest = _v319_probe_official_latest_ymd(pcd, max_ymd=before_d)
             except Exception:
                 official_latest = ""
             official_latest = _v319_ymd_digits(official_latest)
             if before_d and official_latest and official_latest > before_d:
-                official_latest = before_d  # 念のため上限
+                official_latest = before_d
+
+            # 公式最新 <= DB最新 → 公式にある分は取り済み → スキップ
             if official_latest and latest_d and official_latest <= latest_d:
                 skipped += 1
                 details.append(
@@ -10156,16 +10152,16 @@ def _v319_fill_player_histories(
                 )
                 _V319_HIST_SKIPPED.add(cache_key)
                 continue
-            if official_latest and before_d and official_latest < before_d and latest_d and latest_d >= official_latest:
-                # 公式側も対象レース日まで未反映 → 取っても増えない
+            # 公式日が取れず件数十分 → 待ち回避でスキップ（取りこぼし時は手動再取込）
+            if not official_latest and have >= min_rows and latest_d:
                 skipped += 1
                 details.append(
-                    f"{name}:公式未反映スキップ(公式{official_latest}<対象{before_d})"
+                    f"{name}:公式不明スキップ(DB{latest_d}/{have}件)"
                 )
                 _V319_HIST_SKIPPED.add(cache_key)
                 continue
 
-            # ========== 3) 公式の方が新しい → 全件取得して差分追加 ==========
+            # ========== 3) 公式の方が新しい → 全件取得 ==========
             details.append(
                 f"{name}:差分取得(DB{latest_d or 'なし'}<公式{official_latest or '?'} / 対象{before_d or '-'} / 既存{have})"
             )
