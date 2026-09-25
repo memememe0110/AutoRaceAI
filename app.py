@@ -9341,6 +9341,99 @@ def _v319_player_history_state(db_path: str, player_name: str) -> dict:
     return out
 
 
+
+
+
+def _v319_probe_official_latest_ymd(player_cd: str, max_ymd: str = "") -> str:
+    """公式の最新履歴日を軽く取る（全件パースしない）。
+
+    max_ymd がある場合は、それより後（未来／対象レースより先）の日付は判定に使わない。
+    戻り値: yyyymmdd（対象日以前の公式最新）
+    """
+    pcd = str(player_cd or "").strip()
+    if not pcd:
+        return ""
+    cap = _v319_ymd_digits(max_ymd) if max_ymd else ""
+    urls = (
+        f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}&historyDispType=d",
+        f"https://sp.oddspark.com/autorace/SpPlayerDetail.do?playerCd={pcd}&historyDispType=d",
+    )
+
+    def _norm_ymd(y, mo, d) -> str:
+        try:
+            yi, mi, di = int(y), int(mo), int(d)
+        except Exception:
+            return ""
+        if yi < 100:
+            yi = 2000 + yi if yi < 80 else 1900 + yi
+        if not (2000 <= yi <= 2100 and 1 <= mi <= 12 and 1 <= di <= 31):
+            return ""
+        return f"{yi:04d}{mi:02d}{di:02d}"
+
+    for url in urls:
+        try:
+            html = _v319_http_get(url, timeout=12, retries=1)
+        except Exception:
+            continue
+        if not html:
+            continue
+        found: list[str] = []
+        for m in re.finditer(r"(20\d{2})[年/.\-](\d{1,2})[月/.\-](\d{1,2})", html):
+            ds = _norm_ymd(m.group(1), m.group(2), m.group(3))
+            if ds:
+                found.append(ds)
+        for m in re.finditer(r"(?<!\d)(\d{2})/(\d{2})/(\d{2})(?!\d)", html):
+            ds = _norm_ymd(m.group(1), m.group(2), m.group(3))
+            if ds:
+                found.append(ds)
+        if not found:
+            continue
+        # 対象レース日より先は捨てる
+        if cap:
+            found = [d for d in found if d <= cap]
+        if not found:
+            # ページ上は全部未来扱い → 対象以前の公式データなし
+            return ""
+        return max(found)
+    return ""
+
+
+
+def _v319_player_history_latest_fast(db_path: str, player_name: str) -> tuple[int, str]:
+    """件数と最新開催日だけを取る（全行SELECTしない）。戻り値: (count, yyyymmdd)。"""
+    key = _v319_norm_player_name(player_name)
+    if not key:
+        return 0, ""
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "v15_player_history_imports" not in tables:
+                return 0, ""
+            cols = {r[1] for r in con.execute("PRAGMA table_info(v15_player_history_imports)").fetchall()}
+            date_c = "race_date" if "race_date" in cols else ("開催日" if "開催日" in cols else None)
+            if not date_c:
+                return 0, ""
+            row = con.execute(
+                f"""
+                SELECT COUNT(*), MAX(replace(replace(replace(COALESCE({date_c},''),'-',''),'/',''),'.',''))
+                FROM v15_player_history_imports
+                WHERE replace(replace(COALESCE(player_name,''),' ',''),'　','')=?
+                """,
+                (key,),
+            ).fetchone()
+            if not row:
+                return 0, ""
+            cnt = int(row[0] or 0)
+            latest = re.sub(r"[^0-9]", "", str(row[1] or ""))
+            if len(latest) >= 8:
+                latest = latest[:8]
+            else:
+                latest = ""
+            return cnt, latest
+    except Exception:
+        return 0, ""
+
+
 def _v319_player_history_count(db_path: str, player_name: str) -> int:
     key = _v319_norm_player_name(player_name)
     if not key:
@@ -9755,6 +9848,133 @@ def _v319_hist_row_key(row) -> tuple:
     return (ds, vn, int(fake))
 
 
+
+def _v319_fill_missing_race_nos(df: pd.DataFrame, db_path: str = "", player_name: str = "") -> pd.DataFrame:
+    """レース番号が空/0の行を補完する。
+
+    優先順:
+      1) レース名・種別内の「N R」表記
+      2) result_entries（日付+場+選手名）
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    df = df.copy()
+    if "レース" not in df.columns:
+        df["レース"] = 0
+    # 1) テキストから
+    for i, row in df.iterrows():
+        try:
+            cur = int(pd.to_numeric(row.get("レース"), errors="coerce") or 0)
+        except Exception:
+            cur = 0
+        if 1 <= cur <= 12:
+            df.at[i, "レース"] = cur
+            continue
+        blob = " ".join(
+            str(row.get(c) or "")
+            for c in ("レース名", "レース種別", "レース")
+        )
+        m = re.search(r"(?<!\d)([1-9]|1[0-2])\s*R\b", blob, flags=re.I)
+        if not m:
+            m = re.search(r"第\s*([1-9]|1[0-2])\s*レース", blob)
+        if m:
+            df.at[i, "レース"] = int(m.group(1))
+    # 2) 結果DBから
+    if not db_path:
+        return df
+    need_idx = []
+    for i, row in df.iterrows():
+        try:
+            cur = int(pd.to_numeric(row.get("レース"), errors="coerce") or 0)
+        except Exception:
+            cur = 0
+        if cur <= 0:
+            need_idx.append(i)
+    if not need_idx:
+        return df
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory = sqlite3.Row
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "result_entries" not in tables or "result_races" not in tables:
+                return df
+            for i in need_idx:
+                row = df.loc[i]
+                ds = _v319_ymd_digits(row.get("開催日"))
+                if len(ds) == 8:
+                    date_s = f"{ds[:4]}-{ds[4:6]}-{ds[6:8]}"
+                else:
+                    date_s = str(row.get("開催日") or "")[:10]
+                vn = str(row.get("開催場") or "").replace("　", "").strip()
+                pname = str(row.get("選手名") or player_name or "").replace("　", "").replace(" ", "").strip()
+                if not date_s or not vn or not pname:
+                    continue
+                q = """
+                    SELECT rr.race_no, re.finish_order, re.car_no
+                    FROM result_entries re
+                    JOIN result_races rr ON rr.race_key = re.race_key
+                    WHERE rr.race_date = ?
+                      AND replace(replace(COALESCE(rr.venue,''),' ',''),'　','') = ?
+                      AND replace(replace(COALESCE(re.player_name,''),' ',''),'　','') = ?
+                """
+                cands = con.execute(
+                    q,
+                    (date_s, vn.replace(" ", ""), pname),
+                ).fetchall()
+                if not cands:
+                    # 日付ゆれ
+                    cands = con.execute(
+                        """
+                        SELECT rr.race_no, re.finish_order, re.car_no
+                        FROM result_entries re
+                        JOIN result_races rr ON rr.race_key = re.race_key
+                        WHERE replace(replace(COALESCE(rr.race_date,''),'-',''),'/','') = ?
+                          AND replace(replace(COALESCE(rr.venue,''),' ',''),'　','') = ?
+                          AND replace(replace(COALESCE(re.player_name,''),' ',''),'　','') = ?
+                        """,
+                        (ds, vn.replace(" ", ""), pname),
+                    ).fetchall()
+                if not cands:
+                    continue
+                pick = None
+                try:
+                    fin = int(pd.to_numeric(row.get("着順"), errors="coerce"))
+                except Exception:
+                    fin = None
+                try:
+                    car = int(pd.to_numeric(row.get("車番"), errors="coerce") or 0)
+                except Exception:
+                    car = 0
+                if fin is not None:
+                    for c in cands:
+                        try:
+                            if int(c["finish_order"] or 0) == fin:
+                                pick = c
+                                break
+                        except Exception:
+                            pass
+                if pick is None and car > 0:
+                    for c in cands:
+                        try:
+                            if int(c["car_no"] or 0) == car:
+                                pick = c
+                                break
+                        except Exception:
+                            pass
+                if pick is None and len(cands) == 1:
+                    pick = cands[0]
+                if pick is not None:
+                    try:
+                        rn = int(re.sub(r"[^0-9]", "", str(pick["race_no"] or "")) or 0)
+                        if 1 <= rn <= 12:
+                            df.at[i, "レース"] = rn
+                    except Exception:
+                        pass
+    except Exception:
+        return df
+    return df
+
+
 def _v319_build_player_history_lines(
     player_name: str, df: pd.DataFrame, *, fetch_weather: bool = False
 ) -> list[str]:
@@ -9785,9 +10005,16 @@ def _v319_build_player_history_lines(
         lines.append(f"{dm.group(1)}年{int(dm.group(2))}月{int(dm.group(3))}日" if dm else ds)
         venue = str(r.get("開催場") or "").strip()
         try:
-            rn = int(r.get("レース") or 0)
+            rn = int(pd.to_numeric(r.get("レース"), errors="coerce") or 0)
         except Exception:
             rn = 0
+        if rn <= 0:
+            blob = " ".join(str(r.get(c) or "") for c in ("レース名", "レース種別"))
+            m_rn = re.search(r"(?<!\d)([1-9]|1[0-2])\s*R\b", blob, flags=re.I)
+            if not m_rn:
+                m_rn = re.search(r"第\s*([1-9]|1[0-2])\s*レース", blob)
+            if m_rn:
+                rn = int(m_rn.group(1))
         # 公式貼付形式: 開催場と R を別行（結合するとパーサがRを落とす）
         if venue:
             lines.append(venue)
@@ -9880,11 +10107,6 @@ def _v319_fill_player_histories(
     for p in players:
         name = p.get("name") or ""
         pcd = str(p.get("player_cd") or "").strip()
-        state = _v319_player_history_state(db_path, name)
-        have = int(state.get("count") or 0)
-        latest = str(state.get("latest") or "")
-        have_keys = set(state.get("keys") or set())
-        dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
         cache_key = pcd or _v319_norm_player_name(name)
         already_refreshed = cache_key in _V319_HIST_REFRESHED
         already_skipped = cache_key in _V319_HIST_SKIPPED
@@ -9894,32 +10116,62 @@ def _v319_fill_player_histories(
                 details.append(f"{name}:playerCdなし")
                 continue
             before_d = _v319_ymd_digits(before_ymd)
-            latest_d = _v319_ymd_digits(latest)
-            # --- スキップ条件（厳格）---
-            # 「件数十分」だけでは不十分。最新履歴日がレース日に届いていない場合は必ず差分取得。
-            # 例: 30件あっても最新が9/22なら、9/23レースの履歴は追加する。
+
+            # ========== 1) 最初に「最新履歴日 == 直近（対象レース日）」だけ確認 ==========
+            # 全行SELECTしない。COUNT + MAX(date) のみ。
+            have, latest_d = _v319_player_history_latest_fast(db_path, name)
+            latest_d = _v319_ymd_digits(latest_d)
+            # 同日バッチで既に最新到達確認済み → HTTPゼロ・DBフル走査ゼロ
+            if already_skipped or (already_refreshed and before_d and cache_key in _V319_HIST_SKIPPED):
+                skipped += 1
+                details.append(f"{name}:最新一致キャッシュスキップ")
+                continue
             up_to_date = bool(before_d and latest_d and latest_d >= before_d)
             if not before_d:
                 up_to_date = have >= min_rows
-            if up_to_date and have >= min_rows:
+            if up_to_date:
+                # 直近データと一致 → 即スキップ（差分HTTPなし）
                 skipped += 1
                 details.append(
-                    f"{name}:充足{have}件スキップ(最新{latest_d or '-'}>=対象{before_d or '-'})"
+                    f"{name}:最新一致スキップ(最新{latest_d or '-'}>=対象{before_d or '-'} / {have}件)"
                 )
                 _V319_HIST_SKIPPED.add(cache_key)
                 continue
-            if up_to_date and (already_skipped or already_refreshed):
-                # 同日バッチで既に最新まで取った選手
+
+            # ========== 2) 軽いHTTPで公式の最新日だけ確認 ==========
+            # 公式最新 == DB最新 → 差分なしで即終了（全件パースしない）
+            official_latest = ""
+            try:
+                # 対象レース日より先の公式日は判定に使わない
+                official_latest = _v319_probe_official_latest_ymd(pcd, max_ymd=before_d)
+            except Exception:
+                official_latest = ""
+            official_latest = _v319_ymd_digits(official_latest)
+            if before_d and official_latest and official_latest > before_d:
+                official_latest = before_d  # 念のため上限
+            if official_latest and latest_d and official_latest <= latest_d:
                 skipped += 1
                 details.append(
-                    f"{name}:最新到達キャッシュスキップ(最新{latest_d or '-'})"
+                    f"{name}:公式最新一致スキップ(公式{official_latest}/DB{latest_d})"
                 )
+                _V319_HIST_SKIPPED.add(cache_key)
                 continue
-            # 最新がレース日より古い、または件数不足 → 公式から取得して差分追加
-            if before_d and latest_d and latest_d < before_d:
+            if official_latest and before_d and official_latest < before_d and latest_d and latest_d >= official_latest:
+                # 公式側も対象レース日まで未反映 → 取っても増えない
+                skipped += 1
                 details.append(
-                    f"{name}:最新不足{latest_d}<{before_d}→差分取得(既存{have})"
+                    f"{name}:公式未反映スキップ(公式{official_latest}<対象{before_d})"
                 )
+                _V319_HIST_SKIPPED.add(cache_key)
+                continue
+
+            # ========== 3) 公式の方が新しい → 全件取得して差分追加 ==========
+            details.append(
+                f"{name}:差分取得(DB{latest_d or 'なし'}<公式{official_latest or '?'} / 対象{before_d or '-'} / 既存{have})"
+            )
+            state = _v319_player_history_state(db_path, name)
+            have_keys = set(state.get("keys") or set())
+            dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
             df = _v319_fetch_player_history_df(pcd, name)
             if df is None or df.empty:
                 if have <= 0:
@@ -10020,6 +10272,10 @@ def _v319_fill_player_histories(
                 df_use = work.head(max(need, len(work)))
 
             # 公式貼付フォーマット → 解析。失敗時はDF直接。pendingは手動UIと同じ確定処理。
+            try:
+                df_use = _v319_fill_missing_race_nos(df_use, db_path=db_path, player_name=name)
+            except Exception:
+                pass
             lines = _v319_build_player_history_lines(name, df_use, fetch_weather=False)
             parsed = None
             try:
@@ -10068,6 +10324,41 @@ def _v319_fill_player_histories(
             else:
                 parsed["選手名"] = parsed["選手名"].fillna(name)
                 parsed.loc[parsed["選手名"].astype(str).str.strip().isin(["", "nan", "None"]), "選手名"] = name
+            try:
+                parsed = _v319_fill_missing_race_nos(parsed, db_path=db_path, player_name=name)
+            except Exception:
+                pass
+            # ソース df から R を再注入（パーサが落とした場合）
+            try:
+                if isinstance(df_use, pd.DataFrame) and not df_use.empty and "レース" in parsed.columns:
+                    src_map = {}
+                    for _, sr in df_use.iterrows():
+                        try:
+                            rv = int(pd.to_numeric(sr.get("レース"), errors="coerce") or 0)
+                        except Exception:
+                            rv = 0
+                        if rv <= 0:
+                            continue
+                        k = (
+                            _v319_ymd_digits(sr.get("開催日")),
+                            str(sr.get("開催場") or "").replace("　", "").strip(),
+                        )
+                        src_map[k] = rv
+                    for i, pr in parsed.iterrows():
+                        try:
+                            cur = int(pd.to_numeric(pr.get("レース"), errors="coerce") or 0)
+                        except Exception:
+                            cur = 0
+                        if cur > 0:
+                            continue
+                        k = (
+                            _v319_ymd_digits(pr.get("開催日")),
+                            str(pr.get("開催場") or "").replace("　", "").strip(),
+                        )
+                        if k in src_map:
+                            parsed.at[i, "レース"] = int(src_map[k])
+            except Exception:
+                pass
 
             report = engine.v47_save_player_history(parsed, db_path=db_path) or {}
             changed = int(report.get("changed") or report.get("saved") or 0)
@@ -24682,6 +24973,11 @@ if selected_main_page == "👤 選手情報登録":
             st.warning("選手名と履歴を入力してください。")
         else:
             parsed = engine.v15_parse_player_history(history_text, player_name=player_name.strip())
+            try:
+                if isinstance(parsed, pd.DataFrame):
+                    parsed = _v319_fill_missing_race_nos(parsed, db_path=engine.DB_PATH, player_name=player_name.strip())
+            except Exception:
+                pass
             st.session_state["parsed_player_history"] = parsed
 
     parsed = st.session_state.get("parsed_player_history")
