@@ -7256,11 +7256,9 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
         return meta, rows, []
 
     # 公式結果では「- 4 選手名 ... /欠車」のように掲載される。
-    # 「0.00 /停止」は出走表の欠車が結果側で停止表記になったケース（発走前除外）。
     # 改行・タブ・全角空白の揺れを許容して、事故語の直前にある車番を拾う。
     normalized = re.sub(r"[\t\u3000]+", " ", raw)
-    # Ver319 fix: 停止は競走中止（発走後）ではなく欠車（発走前）として扱う。
-    accident_words = r"欠車|発走除外|競走除外|出走取消|出走取り消し|停止"
+    accident_words = r"欠車|発走除外|競走除外|出走取消|出走取り消し"
     detected: list[tuple[int, str]] = []
 
     # まず事故語を含む周辺ブロックから「着順 - の次にある車番」を優先取得。
@@ -7271,29 +7269,13 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
     for m in block_pattern.finditer(normalized):
         car_no = int(m.group(1))
         reason = str(m.group(3))
-        # 「停止」は欠車扱いに正規化（学習除外の事故語にしない）
-        if reason == "停止":
-            reason = "欠車"
         detected.append((car_no, reason))
 
     # 保存テキストの整形によって1行化されている場合の補助。
     if not detected:
         line_pattern = re.compile(rf"-\s*([1-8])\b[^\n]{{0,220}}?({accident_words})")
         for m in line_pattern.finditer(normalized):
-            reason = str(m.group(2))
-            if reason == "停止":
-                reason = "欠車"
-            detected.append((int(m.group(1)), reason))
-
-    # 「0.00 /停止」「0.000(-) ... /停止」など、着順なし＋ゼロタイム＋停止を欠車として追加検出。
-    stop_pat = re.compile(
-        r"(?:^|\n)\s*[-－]\s*([1-8])\b[\s\S]{0,220}?0\.0{1,3}\s*(?:\([^)]*\))?\s*/\s*停止",
-        re.MULTILINE,
-    )
-    for m in stop_pat.finditer(normalized):
-        car_no = int(m.group(1))
-        if not any(c == car_no for c, _ in detected):
-            detected.append((car_no, "欠車"))
+            detected.append((int(m.group(1)), str(m.group(2))))
 
     if not detected:
         return meta, rows, []
@@ -7346,16 +7328,11 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
 
 
 def _v315_detect_kessha_cars(result_text: str, rows: pd.DataFrame | None = None) -> list[int]:
-    """結果本文と解析表から欠車・発走前除外の車番を取る。
-
-    Ver319 fix: 公式結果の「0.00 /停止」は出走表欠車の結果側表記。
-    発走後の競走中止とは分離し、欠車（事前除外）として扱う。
-    """
+    """結果本文と解析表から欠車・発走前除外の車番を取る。"""
     found: set[int] = set()
     raw = str(result_text or "")
     normalized = re.sub(r"[\t\u3000]+", " ", raw)
-    # 停止は欠車側に含める（発走後事故語には入れない）
-    words = r"欠車|発走除外|競走除外|出走取消|出走取り消し|停止"
+    words = r"欠車|発走除外|競走除外|出走取消|出走取り消し"
     for m in re.finditer(
         rf"(?:^|\n)\s*[-－]\s*([1-8])\b[\s\S]{{0,280}}?(?:/\s*)?({words})",
         normalized,
@@ -7363,13 +7340,6 @@ def _v315_detect_kessha_cars(result_text: str, rows: pd.DataFrame | None = None)
     ):
         found.add(int(m.group(1)))
     for m in re.finditer(rf"\b([1-8])\s*番?[^\n]{{0,80}}(?:/\s*)?({words})", normalized):
-        found.add(int(m.group(1)))
-    # 着順なし＋競走T=0＋/停止 の明示パターン
-    for m in re.finditer(
-        r"(?:^|\n)\s*[-－]\s*([1-8])\b[\s\S]{0,220}?0\.0{1,3}\s*(?:\([^)]*\))?\s*/\s*停止",
-        normalized,
-        flags=re.MULTILINE,
-    ):
         found.add(int(m.group(1)))
     if isinstance(rows, pd.DataFrame) and not rows.empty and "車番" in rows.columns:
         cars = pd.to_numeric(rows["車番"], errors="coerce")
@@ -7382,21 +7352,13 @@ def _v315_detect_kessha_cars(result_text: str, rows: pd.DataFrame | None = None)
                 found.add(int(car))
             finish = rows.at[idx, "着順"] if "着順" in rows.columns else None
             race_t = rows.at[idx, "競走T"] if "競走T" in rows.columns else None
-            st_v = rows.at[idx, "ST"] if "ST" in rows.columns else None
             try:
                 finish_s = str(finish).strip()
             except Exception:
                 finish_s = ""
-            race_num = pd.to_numeric(pd.Series([race_t]), errors="coerce").fillna(-1).iloc[0]
-            st_num = pd.to_numeric(pd.Series([st_v]), errors="coerce").fillna(-1).iloc[0]
-            # 着順なし＋競走T=0（＋ST=0）は欠車候補。本文に停止/欠車語がある場合は確定。
-            if finish_s in {"-", "－", "欠車", "欠", "None", "nan", ""}:
-                if re.search(words, raw) or float(race_num) == 0.0:
-                    # 競走中止等の誤ラベルも欠車へ寄せる（STも0なら発走前）
-                    if float(race_num) == 0.0 and (float(st_num) in (0.0, -1.0) or "停止" in blob or "欠車" in blob):
-                        found.add(int(car))
-                    elif re.search(words, blob) or re.search(words, raw):
-                        found.add(int(car))
+            if finish_s in {"-", "－", "欠車", "None", "nan"}:
+                if re.search(words, raw) or (pd.to_numeric(pd.Series([race_t]), errors="coerce").fillna(1).iloc[0] == 0):
+                    found.add(int(car))
     return sorted(found)
 
 
@@ -7453,7 +7415,6 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
     if not raw:
         return dict(meta or {}), []
     normalized = re.sub(r"[\t\u3000]+", " ", raw)
-    # 「停止」は欠車（事前除外）側で処理済みのため、ここには含めない。
     words = r"反妨|反則妨害|妨害失格|反則失格|落車|他落|落妨|競走中止|周回誤認|周誤|失格|故障"
     found: list[dict] = []
     # 公式結果の「- 6 選手名 ... /反妨」形式を優先。
@@ -7467,49 +7428,9 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
         line_pat = re.compile(rf"(?:^|\n)\s*-?\s*([1-8])\b[^\n]{{0,240}}?({words})", re.MULTILINE)
         for m in line_pat.finditer(normalized):
             found.append({"車番": int(m.group(1)), "理由": str(m.group(2))})
-
-    # Ver319 fix: 既に欠車・事前除外と判定された車番は発走後事故から除外する。
-    # また「0.00 /停止」だけの車は競走中止と誤認しない。
-    pre_excl: set[int] = set()
-    for key in ("欠車車番", "事前除外車番", "比較対象外車番"):
-        vals = (meta or {}).get(key) or []
-        for v in vals:
-            try:
-                pre_excl.add(int(v))
-            except Exception:
-                pass
-    # 本文の停止パターンからも事前除外を補強
-    for m in re.finditer(
-        r"(?:^|\n)\s*[-－]\s*([1-8])\b[\s\S]{0,220}?0\.0{1,3}\s*(?:\([^)]*\))?\s*/\s*停止",
-        normalized,
-        flags=re.MULTILINE,
-    ):
-        pre_excl.add(int(m.group(1)))
-    # 欠車語が付いた車番も除外
-    for m in re.finditer(
-        r"(?:^|\n)\s*[-－]\s*([1-8])\b[\s\S]{0,200}?(?:/\s*)?(?:欠車|発走除外|競走除外|出走取消)",
-        normalized,
-        flags=re.MULTILINE,
-    ):
-        pre_excl.add(int(m.group(1)))
-
-    filtered = []
-    for item in found:
-        try:
-            car = int(item.get("車番"))
-        except Exception:
-            continue
-        if car in pre_excl:
-            continue
-        # 理由が競走中止でも、同車番が停止/ゼロタイム欠車なら発走後扱いにしない
-        reason = str(item.get("理由") or "")
-        if "競走中止" in reason and car in pre_excl:
-            continue
-        filtered.append(item)
-
     unique=[]
     seen=set()
-    for item in filtered:
+    for item in found:
         key=(int(item["車番"]), str(item["理由"]))
         if key not in seen:
             seen.add(key); unique.append(item)
@@ -7539,26 +7460,6 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
             "learning_excluded": True,
             "learning_exclusion_reason": reason_text or "発走後事故・反則",
         })
-    else:
-        # 欠車のみのレースでは、engine側が付けた発走後事故フラグを落として学習対象に戻す。
-        if pre_excl:
-            for k in (
-                "発走後事故", "事故レース", "事故あり", "学習対象外", "学習除外",
-                "learning_excluded", "予測精度評価対象外",
-            ):
-                if k in meta_out and meta_out.get(k) in (True, "true", "True", 1):
-                    # 欠車だけの理由なら解除
-                    excl_reason = str(meta_out.get("learning_exclusion_reason") or meta_out.get("学習除外理由") or "")
-                    if (not excl_reason) or ("競走中止" in excl_reason) or ("停止" in excl_reason) or ("欠車" in excl_reason):
-                        meta_out[k] = False
-            if str(meta_out.get("レース状態") or "") in ("発走後事故", "事故"):
-                meta_out["レース状態"] = "通常"
-            meta_out["予測精度評価対象"] = True
-            meta_out["AI学習対象"] = True
-            meta_out.pop("発走後事故車番", None)
-            meta_out.pop("発走後事故理由", None)
-            meta_out.pop("learning_exclusion_reason", None)
-            meta_out.pop("学習除外理由", None)
     return meta_out, unique
 
 
@@ -8890,22 +8791,9 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
             abn = cells[10] if len(cells) > 10 else ""
             pop = cells[11] if len(cells) > 11 else "-"
         # 着順 "-" だけでは欠車にしない（反妨・失格なども "-" になる）
-        # Ver319 fix: 「停止」は出走表欠車の結果側表記。ゼロタイムなら欠車に正規化。
-        _abn_s = str(abn or "").strip()
-        _acc_s = str(acc or "").strip()
-        _race_zero = False
-        try:
-            _race_zero = float(str(race_t).replace(",", "") or "1") == 0.0
-        except Exception:
-            _race_zero = str(race_t).strip() in {"0", "0.0", "0.00", "0.000", ""}
         _is_kessha = (
-            _acc_s == "欠車" or "欠車" in _acc_s or _abn_s == "欠車"
-            or (pos in ("-", "欠", "－") and ("欠車" in _acc_s or "欠車" in _abn_s))
-            or (
-                pos in ("-", "欠", "－")
-                and (_abn_s == "停止" or "停止" in _abn_s or _acc_s == "停止")
-                and _race_zero
-            )
+            acc == "欠車" or "欠車" in str(acc or "") or str(abn or "") == "欠車"
+            or (pos in ("-", "欠", "－") and ("欠車" in str(acc or "") or "欠車" in str(abn or "")))
         )
         if _is_kessha:
             lines.append(f"-\t{car}\t{name}")
@@ -8914,8 +8802,7 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
             continue
         flag = f" /{abn}" if abn else ""
         # 発走後事故（反妨等）は着順 "-" のまま残す（欠車にしない）
-        # 停止は上で欠車化済み。残った停止以外の異常のみ発走後事故として残す。
-        if str(pos) in ("-", "欠", "－") and abn and "欠車" not in str(abn) and "停止" not in str(abn):
+        if str(pos) in ("-", "欠", "－") and abn and "欠車" not in str(abn):
             lines.append(f"-\t{car}\t{name}")
             lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop})")
             st_s = str(st or "0.00")
@@ -9150,7 +9037,11 @@ def _v319_load_latest_prediction_view(db_path: str, race_key: str) -> dict:
 
 
 def _v319_apply_odds_and_plan(db_path: str, ymd: str, venue: str, race_no: int, race_key: str, view: dict | None = None) -> dict:
-    """公式オッズを保存し、回収率重視プランを作って結果照合する。"""
+    """公式オッズを保存し、回収率重視プランを作って結果照合する。
+
+    Ver319 fix: プラン生成（v184/v277）の例外はオッズ保存を失敗扱いにしない。
+    以前は NameError 等でプランが落ちると「オッズ取得失敗」になり結果登録まで止まっていた。
+    """
     parsed = _v319_fetch_official_odds(ymd, venue, race_no)
     n_odds = _v319_save_official_odds(db_path, race_key, parsed)
     view = view if isinstance(view, dict) and view else _v319_load_latest_prediction_view(db_path, race_key)
@@ -9158,27 +9049,35 @@ def _v319_apply_odds_and_plan(db_path: str, ymd: str, venue: str, race_no: int, 
     meta = (view or {}).get("meta") or {}
     trials = int((view or {}).get("trials") or 20000)
     plan_hash = ""
+    plan_error = ""
     if isinstance(bets, dict) and bets and n_odds:
-        result = v184_eight_car_mixed_plan(bets, trials, meta, parsed)
-        result = v277_provisional_merge_7types(result, bets, trials, parsed)
-        if isinstance(result, dict) and result.get("available"):
-            plan_hash = str(_v187_save_mixed_plan(
-                db_path, str(race_key), result, app_version=APP_VERSION,
-                plan_origin="official_import",
-                source_prediction_version=str((view or {}).get("app_version") or APP_VERSION),
-                include_in_live_stats=True,
-            ) or "")
-            if plan_hash:
-                _v305_supersede_plan_after_odds_refresh(db_path, str(race_key), APP_VERSION, plan_hash)
-                try:
-                    _v212_recalculate_plan_feedback(db_path, str(race_key), plan_hash)
-                except Exception:
-                    pass
+        try:
+            result = v184_eight_car_mixed_plan(bets, trials, meta, parsed)
+            result = v277_provisional_merge_7types(result, bets, trials, parsed)
+            if isinstance(result, dict) and result.get("available"):
+                plan_hash = str(_v187_save_mixed_plan(
+                    db_path, str(race_key), result, app_version=APP_VERSION,
+                    plan_origin="official_import",
+                    source_prediction_version=str((view or {}).get("app_version") or APP_VERSION),
+                    include_in_live_stats=True,
+                ) or "")
+                if plan_hash:
+                    _v305_supersede_plan_after_odds_refresh(db_path, str(race_key), APP_VERSION, plan_hash)
+                    try:
+                        _v212_recalculate_plan_feedback(db_path, str(race_key), plan_hash)
+                    except Exception:
+                        pass
+        except Exception as plan_exc:
+            # オッズ本体は保存済み。プランだけスキップして結果登録へ進める。
+            plan_error = f"{type(plan_exc).__name__}: {plan_exc}"
     try:
         _v187_sync_mixed_feedback(db_path)
     except Exception:
         pass
-    return {"odds": n_odds, "plan_hash": plan_hash}
+    out = {"odds": n_odds, "plan_hash": plan_hash}
+    if plan_error:
+        out["plan_error"] = plan_error
+    return out
 
 
 def _v319_norm_player_name(name: str) -> str:
@@ -9853,165 +9752,6 @@ def _v319_merge_sp_enrich(df: pd.DataFrame, enrich: list[dict]) -> pd.DataFrame:
                 df.at[i, col] = pick[col]
     return df
 
-
-
-
-def _v319_sync_registered_result_to_player_history(
-    db_path: str,
-    race_key: str,
-    meta: dict | None = None,
-    rows: pd.DataFrame | None = None,
-) -> dict:
-    """結果登録済みレースを選手履歴へ反映する（結果登録時の補完）。
-
-    登録条件を厳密化するため、必ず
-      - 開催日・開催場・R番号が確定
-      - 車番・選手名が存在
-      - 競走Tが正の数値
-    を満たす行だけを履歴へ渡す。
-    R番号または競走Tが欠けた結果行は履歴へ登録しない。
-    発走後事故・学習対象外レースは従来どおり選手履歴を更新しない。
-    """
-    result = {
-        "ok": False,
-        "added": 0,
-        "read": 0,
-        "eligible": 0,
-        "skipped_missing_race": 0,
-        "skipped_missing_race_time": 0,
-        "skipped_incident": 0,
-        "message": "",
-    }
-    try:
-        meta = dict(meta or {})
-        if bool(meta.get("学習対象外") or meta.get("learning_excluded") or meta.get("発走後事故")):
-            result["skipped_incident"] = 1
-            result["ok"] = True
-            result["message"] = "学習対象外レースのため選手履歴補完をスキップ"
-            return result
-
-        # race_keyから基本情報を取得し、DB本体を正とする。
-        with sqlite3.connect(str(db_path), timeout=15) as con:
-            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if "result_races" not in tables or "result_entries" not in tables:
-                result["message"] = "結果テーブルなし"
-                return result
-            rr_cols = {r[1] for r in con.execute("PRAGMA table_info(result_races)").fetchall()}
-            re_cols = {r[1] for r in con.execute("PRAGMA table_info(result_entries)").fetchall()}
-            if not {"race_date", "venue", "race_no"}.issubset(rr_cols):
-                result["message"] = "結果レースのR情報が不足"
-                return result
-            name_col = "player_name" if "player_name" in re_cols else None
-            if not name_col:
-                result["message"] = "結果選手名列なし"
-                return result
-            car_col = "car_no" if "car_no" in re_cols else None
-            finish_col = "finish" if "finish" in re_cols else ("finish_order" if "finish_order" in re_cols else None)
-            hand_col = "handicap" if "handicap" in re_cols else None
-            race_time_col = "race_time" if "race_time" in re_cols else None
-            trial_col = "trial_time" if "trial_time" in re_cols else ("trial" if "trial" in re_cols else None)
-            st_col = "start_time" if "start_time" in re_cols else ("st" if "st" in re_cols else None)
-            if not race_time_col:
-                result["message"] = "競走T列なし"
-                return result
-
-            select_cols = [
-                "rr.race_date", "rr.venue", "rr.race_no",
-                f"re.{name_col}",
-                f"re.{car_col}" if car_col else "NULL",
-                f"re.{finish_col}" if finish_col else "NULL",
-                f"re.{hand_col}" if hand_col else "NULL",
-                f"re.{trial_col}" if trial_col else "NULL",
-                f"re.{race_time_col}",
-                f"re.{st_col}" if st_col else "NULL",
-            ]
-            rows_db = con.execute(
-                f"SELECT {', '.join(select_cols)} FROM result_entries re "
-                "JOIN result_races rr ON rr.race_key=re.race_key "
-                "WHERE re.race_key=?",
-                (str(race_key),),
-            ).fetchall()
-
-        result["read"] = len(rows_db)
-        if not rows_db:
-            result["message"] = "結果選手行なし"
-            return result
-
-        history_rows = []
-        for race_date, venue, race_no, pname, car_no, finish, hand, trial, race_time, st in rows_db:
-            try:
-                rn = int(race_no)
-            except Exception:
-                rn = 0
-            if rn <= 0 or rn > 12:
-                result["skipped_missing_race"] += 1
-                continue
-            name = str(pname or "").strip()
-            if not name:
-                result["skipped_missing_race"] += 1
-                continue
-            try:
-                rt = float(str(race_time).replace("秒", "").strip())
-            except Exception:
-                rt = 0.0
-            if not np.isfinite(rt) or rt <= 0.0:
-                result["skipped_missing_race_time"] += 1
-                continue
-            try:
-                car = int(float(car_no)) if car_no is not None and str(car_no).strip() else 0
-            except Exception:
-                car = 0
-            history_rows.append({
-                "選手名": name,
-                "開催日": str(race_date or "")[:10],
-                "開催場": str(venue or "").strip(),
-                "レース": rn,
-                "レース名": "",
-                "レース種別": "",
-                "着順": finish,
-                "走路": "",
-                "天候": "",
-                "車番": car,
-                "ハンデ": hand if hand is not None else 0,
-                "競走T": rt,
-                "試走T": trial if trial is not None else "",
-                "ST": st if st is not None else "",
-            })
-
-        result["eligible"] = len(history_rows)
-        if not history_rows:
-            result["ok"] = True
-            result["message"] = (
-                f"結果{len(rows_db)}行確認 / 履歴対象0行 "
-                f"(R不足{result['skipped_missing_race']} / 競走T不足{result['skipped_missing_race_time']})"
-            )
-            return result
-
-        df = pd.DataFrame(history_rows)
-        # 同一レース・選手の重複をこの処理内でも除去。
-        df = df.drop_duplicates(subset=["選手名", "開催日", "開催場", "レース"], keep="last").reset_index(drop=True)
-        report = engine.v47_save_player_history(df, db_path=db_path) or {}
-        changed = int(report.get("changed") or report.get("saved") or report.get("verified") or 0)
-        pending = report.get("pending")
-        if isinstance(pending, pd.DataFrame) and not pending.empty:
-            repaired = pending.copy()
-            repaired["重複処理"] = "入力したRで新規登録"
-            repaired["_v58_duplicate_confirmed"] = True
-            try:
-                report2 = engine.v131_save_pending_player_history(repaired, db_path=db_path) or {}
-                changed += int(report2.get("verified") or report2.get("changed") or report2.get("saved") or 0)
-            except Exception:
-                pass
-        result["added"] = changed
-        result["ok"] = True
-        result["message"] = (
-            f"結果{len(rows_db)}行→履歴対象{len(df)}行 / 新規・更新{changed}件 "
-            f"/ R不足{result['skipped_missing_race']} / 競走T不足{result['skipped_missing_race_time']}"
-        )
-        return result
-    except Exception as exc:
-        result["message"] = f"{type(exc).__name__}: {exc}"
-        return result
 
 
 def _v319_history_from_results(
@@ -11104,51 +10844,22 @@ def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, repla
         meta_r["欠車車番"] = kessha
         meta_r["事前除外車番"] = kessha
         meta_r["比較対象外車番"] = kessha
-        # engineが「競走中止等」と付けた欠車車を事前除外へ正規化
-        for col in ("事故", "異常", "異", "備考", "事故内容", "result_status"):
-            if isinstance(rows_r, pd.DataFrame) and col in rows_r.columns and "車番" in rows_r.columns:
-                mask = pd.to_numeric(rows_r["車番"], errors="coerce").isin(set(kessha))
-                rows_r.loc[mask, col] = rows_r.loc[mask, col].apply(
-                    lambda v: "欠車" if re.search(r"停止|競走中止", str(v or "")) else v
-                )
     meta_r, _inc = _v227_detect_poststart_incidents(raw_text, meta_r)
-    # 欠車車番は発走後事故リストから外す（予測台数照合・学習除外の誤爆防止）
-    if kessha and _inc:
-        kset = set(int(x) for x in kessha)
-        _inc = [it for it in _inc if int(it.get("車番") or 0) not in kset]
-        if not _inc:
-            for k in (
-                "発走後事故", "事故レース", "事故あり", "学習対象外", "学習除外",
-                "learning_excluded", "予測精度評価対象外",
-            ):
-                meta_r[k] = False
-            meta_r["レース状態"] = "通常"
-            meta_r["予測精度評価対象"] = True
-            meta_r["AI学習対象"] = True
-            meta_r.pop("発走後事故車番", None)
-            meta_r.pop("発走後事故理由", None)
-            meta_r.pop("learning_exclusion_reason", None)
-            meta_r.pop("学習除外理由", None)
     # 反妨等: 結果に必ず残し、着順は数値にする（engineが "-" 行を落とすため）
     try:
         inc_cars = []
         for item in (_inc or []):
             try:
-                c = int(item.get("車番"))
-                if kessha and c in set(int(x) for x in kessha):
-                    continue
-                inc_cars.append((c, str(item.get("理由") or "反妨")))
+                inc_cars.append((int(item.get("車番")), str(item.get("理由") or "反妨")))
             except Exception:
                 pass
-        # raw からも再検出（パース漏れ対策）※停止・欠車は対象外
+        # raw からも再検出（パース漏れ対策）
         for m in re.finditer(
             r"(?:^|\n)\s*-?\s*([1-8])\b[^\n]{0,200}?/(?:\s*)?(反妨|反則|失格|落車|他落|周誤)",
             str(raw_text or ""),
             flags=re.MULTILINE,
         ):
             c = int(m.group(1))
-            if kessha and c in set(int(x) for x in kessha):
-                continue
             if c not in {x[0] for x in inc_cars}:
                 inc_cars.append((c, m.group(2)))
         if not isinstance(rows_r, pd.DataFrame):
@@ -11559,6 +11270,9 @@ def _v319_import_one_race(
         odds_msg = f" / オッズ{odds_n}件"
         if applied.get("plan_hash"):
             odds_msg += " / 回収率プラン保存"
+        elif applied.get("plan_error"):
+            # オッズは保存済み。プラン生成だけ失敗した旨を残して結果登録へ進む。
+            odds_msg += f" / プラン生成スキップ({applied.get('plan_error')})"
         void_peek_raw = ""
         if odds_n <= 0:
             try:
@@ -11626,9 +11340,6 @@ def _v319_import_one_race(
             _v319_upsert_payouts_from_text(db_path, key_guess, raw_pay)
         except Exception as exc:
             odds_msg += f" / 払戻補完失敗:{type(exc).__name__}"
-        # Ver319 result-history sync: 登録済みレースでも、R番号＋競走Tが揃った行は履歴へ補完する。
-        hist_sync = _v319_sync_registered_result_to_player_history(db_path, key_guess)
-        hist_msg += f" / 結果履歴補完+{int(hist_sync.get('added') or 0)}"
         return {
             "status": "skip",
             "phase": "completed",
@@ -11749,12 +11460,6 @@ def _v319_import_one_race(
                 "next_action": "retry",
             }
     key = str(saved.get("key") or key_guess)
-    # Ver319 result-history sync: 結果登録を選手履歴の補完元にもする。
-    # R番号と競走Tが両方揃った結果行だけを登録し、欠損行は履歴へ入れない。
-    hist_sync = _v319_sync_registered_result_to_player_history(
-        db_path, key, meta=meta_r, rows=rows_r
-    )
-    hist_msg += f" / 結果履歴補完+{int(hist_sync.get('added') or 0)}"
     if not _v319_result_exists(db_path, ymd, venue, race_no):
         return {
             "status": "error",
@@ -16798,32 +16503,6 @@ def _v305_repair_existing_rec_only_comparison(db_path: str) -> dict:
         return out
 
 
-def _v319_build_selection_audit(plan, candidates, *, protected_reasons=None, v299_hole_notes=None, protected_add_notes=None, replacement_notes=None, pair_mix_notes=None, low_odds_floor_notes=None):
-    """買い目の選定結果を監査するだけの診断情報。選定・点数・推奨判定は変更しない。
-
-    Ver319の挙動を壊さず、候補がどの段階で残った/追加された/除外されたかを
-    後から確認できるようにするための監査用ヘルパー。
-    """
-    plan=list(plan or [])
-    cand=list(candidates or [])
-    selected_ids={(str(t.get("type") or ""), str(t.get("combo") or "")) for t in plan}
-    candidate_ids={(str(t.get("type") or ""), str(t.get("combo") or "")) for t in cand}
-    selected_types=sorted({str(t.get("type") or "") for t in plan if str(t.get("type") or "")})
-    return {
-        "version": "Ver319",
-        "candidate_count": len(cand),
-        "selected_count": len(plan),
-        "selected_type_count": len(selected_types),
-        "selected_types": selected_types,
-        "selected_not_in_candidates": sorted(selected_ids-candidate_ids),
-        "protected_reasons": list(protected_reasons or []),
-        "v299_hole_notes": list(v299_hole_notes or []),
-        "protected_add_notes": list(protected_add_notes or []),
-        "replacement_notes": list(replacement_notes or []),
-        "pair_mix_notes": list(pair_mix_notes or []),
-        "low_odds_floor_notes": list(low_odds_floor_notes or []),
-    }
-
 def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: dict) -> dict:
     """5〜8車立て向けの役割分担型・回収率合成。
 
@@ -16917,6 +16596,9 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     if not outcomes:
         return {"available": False, "reason": "三連単結果空間を作れませんでした。"}
 
+    # Ver319: 以降の置換・残余処理で NameError にならないよう先に初期化
+    candidates = []
+
     def ticket_matches(ticket, outcome):
         a, b, c = outcome
         nums = tuple(int(x) for x in ticket["combo"].split("-"))
@@ -16928,7 +16610,6 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             return nums == (a, b)
         return tuple(sorted(nums)) == tuple(sorted((a, b)))
 
-    candidates = []
     pool_summary = {}
     for label, spec in type_specs.items():
         counter = bets.get(spec["counter"], {}) or {}
@@ -18623,23 +18304,6 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
 
     result["provisional_7type_candidates"] = optional
     result["provisional_7type_added"] = added
-    # 監査専用。ここは独立関数内なので、外側の candidates / notes を参照しない。
-    # 候補一覧は result に保持されている場合だけ利用し、無ければ空配列にする。
-    _audit_candidates = (
-        result.get("selection_candidates")
-        or result.get("candidates")
-        or result.get("tickets")
-        or []
-    )
-    result["selection_audit"] = _v319_build_selection_audit(
-        plan, _audit_candidates,
-        protected_reasons=[],
-        v299_hole_notes=[],
-        protected_add_notes=[],
-        replacement_notes=[],
-        pair_mix_notes=[],
-        low_odds_floor_notes=[],
-    )
     if not added:
         return result
 
@@ -18659,15 +18323,6 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
         if rows:
             role_lines.append(f"{v205_ticket_display_name(typ)}{len(rows)}点：{rows[0].get('role','')}")
     result["role_lines"] = role_lines
-    result["selection_audit"] = _v319_build_selection_audit(
-        plan, candidates,
-        protected_reasons=sum((list(v) for v in protected_reasons.values()), []) if isinstance(protected_reasons, dict) else protected_reasons,
-        v299_hole_notes=v299_hole_notes,
-        protected_add_notes=protected_add_notes,
-        replacement_notes=replacement_notes,
-        pair_mix_notes=pair_mix_notes,
-        low_odds_floor_notes=low_odds_floor_notes,
-    )
     return result
 
 def _v305_supersede_plan_after_odds_refresh(
@@ -25199,11 +24854,6 @@ if selected_main_page == "✅ 結果登録・解析":
                         key, comparison, analysis, adjustment, registration = engine.v41_register_result(
                             meta_for_engine, rows_for_engine, laps_r, payouts_r, engine.DB_PATH
                         )
-                    # Ver319: 結果登録時に、R番号と競走Tが揃った実結果を選手履歴へ補完する。
-                    # 発走後事故・学習対象外レースは従来どおり履歴学習を止める。
-                    result_history_sync = _v319_sync_registered_result_to_player_history(
-                        engine.DB_PATH, str(key), meta=meta_r, rows=rows_r
-                    )
                     # Ver287: 1Rの結果だけで補正せず、結果登録のたびに登録済み全体を再集計。
                     # 学習対象外レースでは予測補正の再計算を行わない。
                     if not (registration.get("learning_excluded") or meta_r.get("学習対象外")):
@@ -25375,12 +25025,7 @@ if selected_main_page == "✅ 結果登録・解析":
                     h1.metric("新規履歴", analysis.get("履歴追加", 0))
                     h2.metric("重複スキップ", analysis.get("履歴重複スキップ", 0))
                     h3.metric("周回順位", analysis.get("周回履歴保存", 0))
-                    _rhs = locals().get("result_history_sync") or {}
-                    st.caption(
-                        "結果登録したレースについて、R番号と競走Tが揃った行を選手履歴へ補完します。"
-                        f" 今回の補完対象{int(_rhs.get('eligible') or 0)}行 / 新規・更新{int(_rhs.get('added') or 0)}件"
-                        f" / R不足{int(_rhs.get('skipped_missing_race') or 0)}行 / 競走T不足{int(_rhs.get('skipped_missing_race_time') or 0)}行。"
-                    )
+                    st.caption("結果登録した競走T・試走T・ST・着順・ハンデ・走路条件は、次回以降の予測用選手履歴へ反映されます。")
                     if registration.get("race_context_updated"):
                         ctx_stats = registration.get("race_context_refresh", {})
                         ov_stats = registration.get("overtake_matchups_refresh", {})
