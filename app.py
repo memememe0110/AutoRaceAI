@@ -10426,6 +10426,11 @@ def _v319_fill_player_histories(
 ) -> dict:
     """選手履歴を公式PC版 PlayerDetail から取得して保存。
 
+    Ver319改:
+      - 新規（DB min_rows未満）: 従来どおり min_rows 件を取得
+      - 既存（min_rows以上）: DB最新日〜対象日の「穴」を全部埋める
+        （公式最新≦DB最新でもキー包含チェックを行い、missing があれば取り込む）
+
     Ver319改善#2: 1レース分は接続を1本だけ開いて使い回す（毎回connectしない）。
     con を渡された場合はその接続を共有し、閉じない（呼び出し側が管理する）。
     _exclusive=True かつ con=None のときは BEGIN IMMEDIATE でまとめて書く。
@@ -10463,57 +10468,27 @@ def _v319_fill_player_histories(
                     continue
                 before_d = _v319_ymd_digits(before_ymd)
 
-                # ========== 1) DBだけ（COUNT + 最新日） ==========
+                # ========== 1) DB状態 ==========
                 have, latest_d = _v319_player_history_latest_fast(db_path, name)
                 latest_d = _v319_ymd_digits(latest_d)
-                if already_skipped:
-                    skipped += 1
-                    details.append(f"{name}:キャッシュスキップ")
-                    continue
-                # 対象レース日までDBに入っている → HTTP不要
-                if before_d and latest_d and latest_d >= before_d and have >= min_rows:
-                    skipped += 1
-                    details.append(
-                        f"{name}:最新一致スキップ(DB{latest_d}>=対象{before_d}/{have}件)"
-                    )
-                    _V319_HIST_SKIPPED.add(cache_key)
-                    continue
-
-                # ========== 2) 軽いHTTPで公式最新（対象日以前）を確認 ==========
-                # 前日がDB最新でも、公式に同日先のレース等がある可能性があるため必ず確認
-                official_latest = ""
-                try:
-                    official_latest = _v319_probe_official_latest_ymd(pcd, max_ymd=before_d)
-                except Exception:
-                    official_latest = ""
-                official_latest = _v319_ymd_digits(official_latest)
-                if before_d and official_latest and official_latest > before_d:
-                    official_latest = before_d
-
-                # 公式最新 <= DB最新 → 公式にある分は取り済み → スキップ
-                if official_latest and latest_d and official_latest <= latest_d:
-                    skipped += 1
-                    details.append(
-                        f"{name}:公式最新一致スキップ(公式{official_latest}/DB{latest_d})"
-                    )
-                    _V319_HIST_SKIPPED.add(cache_key)
-                    continue
-                # 公式日が取れず件数十分 → 待ち回避でスキップ（取りこぼし時は手動再取込）
-                if not official_latest and have >= min_rows and latest_d:
-                    skipped += 1
-                    details.append(
-                        f"{name}:公式不明スキップ(DB{latest_d}/{have}件)"
-                    )
-                    _V319_HIST_SKIPPED.add(cache_key)
-                    continue
-
-                # ========== 3) 公式の方が新しい → 全件取得 ==========
-                details.append(
-                    f"{name}:差分取得(DB{latest_d or 'なし'}<公式{official_latest or '?'} / 対象{before_d or '-'} / 既存{have})"
-                )
                 state = _v319_player_history_state(db_path, name)
                 have_keys = set(state.get("keys") or set())
                 dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
+
+                # 既存判定: min_rows 以上かつ最新日が入っている
+                is_existing = (have >= min_rows and bool(latest_d))
+
+                # 前回「穴なし」確認済みの既存選手だけキャッシュスキップ。
+                # 新規/穴残りの疑いがある選手は必ず再チェックする。
+                if already_skipped and is_existing:
+                    skipped += 1
+                    details.append(f"{name}:キャッシュスキップ(既存{have}件/最新{latest_d})")
+                    continue
+
+                # ========== 2) 公式履歴を取得 ==========
+                details.append(
+                    f"{name}:取得開始(DB{have}件/最新{latest_d or 'なし'}/対象{before_d or '-'})"
+                )
                 df = _v319_fetch_player_history_df(pcd, name)
                 if df is None or df.empty:
                     if have <= 0:
@@ -10523,9 +10498,10 @@ def _v319_fill_player_histories(
                         skipped += 1
                         details.append(f"{name}:公式0件/既存{have}")
                     continue
+
                 if "車番" not in df.columns:
                     df["車番"] = 0
-                # Rを数値化（drop_duplicates用）
+
                 def _rn(v):
                     try:
                         if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -10536,15 +10512,20 @@ def _v319_fill_player_histories(
                     except Exception:
                         pass
                     return 0
-                df = df.copy()
-                df["レース"] = df["レース"].map(_rn) if "レース" in df.columns else 0
 
+                df = df.copy()
+                if "レース" in df.columns:
+                    df["レース"] = df["レース"].map(_rn)
+                else:
+                    df["レース"] = 0
+
+                # 対象日以前に限定
                 if before_ymd:
-                    before_rows = [
+                    _rows = [
                         r for _, r in df.iterrows()
                         if _v319_hist_row_before(r, before_ymd, before_venue, before_race)
                     ]
-                    df = pd.DataFrame(before_rows)
+                    df = pd.DataFrame(_rows)
                     if df.empty:
                         if have <= 0:
                             errors += 1
@@ -10554,16 +10535,21 @@ def _v319_fill_player_histories(
                             details.append(f"{name}:当該R以前は追加なし")
                         continue
 
+                # result_entries からの補完
                 extra = _v319_history_from_results(
-                    db_path, name, before_ymd or latest, before_venue, before_race
+                    db_path, name, before_ymd or latest_d, before_venue, before_race
                 )
                 if extra is not None and not extra.empty:
                     if "車番" not in extra.columns:
                         extra["車番"] = 0
                     extra = extra.copy()
-                    extra["レース"] = extra["レース"].map(_rn) if "レース" in extra.columns else 0
+                    if "レース" in extra.columns:
+                        extra["レース"] = extra["レース"].map(_rn)
+                    else:
+                        extra["レース"] = 0
                     df = pd.concat([df, extra], ignore_index=True)
 
+                # 公式側の全キー
                 official_keys = set()
                 for _, r in df.iterrows():
                     k = _v319_hist_row_key(r)
@@ -10571,27 +10557,71 @@ def _v319_fill_player_histories(
                         official_keys.add(k)
 
                 missing_official = official_keys - have_keys
-                # 全件再取込は不足時のみ。十分なら差分追加だけ（上書きしない）
-                need_refresh = (not already_refreshed) and have < min_rows and (
-                    bool(dirty_keys) or len(missing_official) >= 1 or have < 15
-                )
 
+                # ========== 3) 取り込む対象を決定 ==========
+                if not is_existing:
+                    # 新規 or min_rows未満: min_rows 件を確保
+                    need_refresh = (not already_refreshed) and (
+                        bool(dirty_keys) or len(missing_official) >= 1 or have < 15
+                    )
+                    target_count = max(min_rows, min(len(df), min_rows))
+                    if dirty_keys:
+                        # R欠落行の再構築を優先（多めに取り直す）
+                        target_count = max(target_count, min(len(df), max(min_rows, 35)))
+                else:
+                    # 既存: 穴を全部埋める。missing_official が空かつ dirty なしなら更新不要。
+                    if not missing_official and not dirty_keys:
+                        skipped += 1
+                        details.append(f"{name}:穴なしスキップ(既存{have}件/最新{latest_d})")
+                        if before_d and latest_d and latest_d >= before_d:
+                            _V319_HIST_SKIPPED.add(cache_key)
+                        continue
+                    # 穴埋め対象: missing_official を全部 + R欠落行の再構築
+                    need_refresh = True
+                    target_count = len(df)
+
+                # ========== 4) 取り込み行を構築 ==========
                 keep = []
                 seen = set()
-                for _, r in df.iterrows():
-                    k = _v319_hist_row_key(r)
-                    if not k[0] or k in seen:
-                        continue
-                    if before_ymd and not _v319_hist_row_before(r, before_ymd, before_venue, before_race):
-                        continue
-                    seen.add(k)
-                    if need_refresh:
+                if is_existing:
+                    # 穴埋めモード: missing_official と dirty_keys に含まれるキーだけを厳密に追加
+                    for _, r in df.iterrows():
+                        k = _v319_hist_row_key(r)
+                        if not k[0] or k in seen:
+                            continue
+                        if before_ymd and not _v319_hist_row_before(
+                            r, before_ymd, before_venue, before_race
+                        ):
+                            continue
+                        # 既存キーでも R欠落で再構築対象のものは通す
+                        if k in have_keys and k not in dirty_keys:
+                            continue
+                        seen.add(k)
                         keep.append(r)
-                    elif k not in have_keys:
+                else:
+                    # 新規/再取込モード: DB最新日以降〜対象日までを広く追加。
+                    # 既存キーはスキップ（重複追加防止）。
+                    for _, r in df.iterrows():
+                        k = _v319_hist_row_key(r)
+                        if not k[0] or k in seen:
+                            continue
+                        if before_ymd and not _v319_hist_row_before(
+                            r, before_ymd, before_venue, before_race
+                        ):
+                            continue
+                        seen.add(k)
+                        if k in have_keys and k not in dirty_keys:
+                            continue
                         keep.append(r)
+                    # min_rows を満たすよう先頭から切る（新規のみ）
+                    if len(keep) > target_count:
+                        keep = keep[:target_count]
+
                 if not keep:
                     skipped += 1
-                    details.append(f"{name}:最新済{latest or have}")
+                    details.append(f"{name}:追加対象なし(既存{have}/公式{len(official_keys)})")
+                    if before_d and latest_d and latest_d >= before_d:
+                        _V319_HIST_SKIPPED.add(cache_key)
                     continue
 
                 work = pd.DataFrame(keep)
@@ -10607,18 +10637,13 @@ def _v319_fill_player_histories(
                 work["_ymd"] = work["開催日"].map(_v319_ymd_digits)
                 work = work.sort_values("_ymd", ascending=False, kind="mergesort").drop(columns=["_ymd"])
 
-                if need_refresh:
-                    df_use = work.head(max(min_rows, min(len(work), 35)))
-                else:
-                    need = max(min_rows - have, 1)
-                    df_use = work.head(max(need, len(work)))
-
-                # 公式貼付フォーマット → 解析。失敗時はDF直接。pendingは手動UIと同じ確定処理。
+                # ========== 5) 解析・保存 ==========
                 try:
-                    df_use = _v319_fill_missing_race_nos(df_use, db_path=db_path, player_name=name)
+                    work = _v319_fill_missing_race_nos(work, db_path=db_path, player_name=name)
                 except Exception:
                     pass
-                lines = _v319_build_player_history_lines(name, df_use, fetch_weather=False)
+
+                lines = _v319_build_player_history_lines(name, work, fetch_weather=False)
                 parsed = None
                 try:
                     parsed = engine.v15_parse_player_history(
@@ -10627,15 +10652,17 @@ def _v319_fill_player_histories(
                 except Exception:
                     parsed = None
                 if not isinstance(parsed, pd.DataFrame) or parsed.empty:
-                    parsed = df_use.copy()
-                elif len(parsed) < max(8, int(len(df_use) * 0.5)) and len(df_use) >= 8:
-                    parsed = df_use.copy()
+                    parsed = work.copy()
+                elif len(parsed) < max(8, int(len(work) * 0.5)) and len(work) >= 8:
+                    parsed = work.copy()
                 else:
-                    # 解析でRが落ちたらPC版から戻す
+                    # 解析でRが落ちたら元dfから戻す
                     try:
-                        src = df_use.copy()
+                        src = work.copy()
                         src["_ds"] = src["開催日"].map(_v319_ymd_digits)
-                        src["_vn"] = src["開催場"].map(lambda x: str(x or "").replace("　", "").strip())
+                        src["_vn"] = src["開催場"].map(
+                            lambda x: str(x or "").replace("　", "").strip()
+                        )
                         rmap = {}
                         for _, sr in src.iterrows():
                             try:
@@ -10648,13 +10675,15 @@ def _v319_fill_player_histories(
                             parsed = parsed.copy()
                             parsed["レース"] = 0
                         for i, pr in parsed.iterrows():
-                            cur = 0
                             try:
                                 cur = int(pd.to_numeric(pr.get("レース"), errors="coerce") or 0)
                             except Exception:
                                 cur = 0
                             if cur <= 0:
-                                k = (_v319_ymd_digits(pr.get("開催日")), str(pr.get("開催場") or "").replace("　", "").strip())
+                                k = (
+                                    _v319_ymd_digits(pr.get("開催日")),
+                                    str(pr.get("開催場") or "").replace("　", "").strip(),
+                                )
                                 if k in rmap:
                                     parsed.at[i, "レース"] = rmap[k]
                     except Exception:
@@ -10665,16 +10694,22 @@ def _v319_fill_player_histories(
                     parsed["選手名"] = name
                 else:
                     parsed["選手名"] = parsed["選手名"].fillna(name)
-                    parsed.loc[parsed["選手名"].astype(str).str.strip().isin(["", "nan", "None"]), "選手名"] = name
+                    parsed.loc[
+                        parsed["選手名"].astype(str).str.strip().isin(["", "nan", "None"]),
+                        "選手名",
+                    ] = name
                 try:
-                    parsed = _v319_fill_missing_race_nos(parsed, db_path=db_path, player_name=name)
+                    parsed = _v319_fill_missing_race_nos(
+                        parsed, db_path=db_path, player_name=name
+                    )
                 except Exception:
                     pass
+
                 # ソース df から R を再注入（パーサが落とした場合）
                 try:
-                    if isinstance(df_use, pd.DataFrame) and not df_use.empty and "レース" in parsed.columns:
+                    if isinstance(work, pd.DataFrame) and not work.empty and "レース" in parsed.columns:
                         src_map = {}
-                        for _, sr in df_use.iterrows():
+                        for _, sr in work.iterrows():
                             try:
                                 rv = int(pd.to_numeric(sr.get("レース"), errors="coerce") or 0)
                             except Exception:
@@ -10707,7 +10742,6 @@ def _v319_fill_player_histories(
                 pending_df = report.get("pending")
                 pending_left = int(report.get("pending_count") or 0)
 
-                # 手動登録と同じ: pending → 「入力したRで新規登録」で確定
                 if isinstance(pending_df, pd.DataFrame) and not pending_df.empty:
                     repaired = pending_df.copy()
                     if "重複処理" not in repaired.columns:
@@ -10719,9 +10753,14 @@ def _v319_fill_player_histories(
                         repaired.loc[need, "重複処理"] = "入力したRで新規登録"
                     repaired["_v58_duplicate_confirmed"] = True
                     try:
-                        report2 = engine.v131_save_pending_player_history(repaired, db_path=db_path) or {}
+                        report2 = engine.v131_save_pending_player_history(
+                            repaired, db_path=db_path
+                        ) or {}
                         changed += int(
-                            report2.get("verified") or report2.get("changed") or report2.get("saved") or 0
+                            report2.get("verified")
+                            or report2.get("changed")
+                            or report2.get("saved")
+                            or 0
                         )
                         pending_left = int(report2.get("pending_count") or 0)
                     except Exception as _pend_exc:
@@ -10732,9 +10771,14 @@ def _v319_fill_player_histories(
                         work2 = parsed.copy()
                         work2["重複処理"] = "入力したRで新規登録"
                         work2["_v58_duplicate_confirmed"] = True
-                        report3 = engine.v131_save_pending_player_history(work2, db_path=db_path) or {}
+                        report3 = engine.v131_save_pending_player_history(
+                            work2, db_path=db_path
+                        ) or {}
                         changed += int(
-                            report3.get("verified") or report3.get("changed") or report3.get("saved") or 0
+                            report3.get("verified")
+                            or report3.get("changed")
+                            or report3.get("saved")
+                            or 0
                         )
                         pending_left = int(report3.get("pending_count") or pending_left or 0)
                     except Exception:
@@ -10745,25 +10789,34 @@ def _v319_fill_player_histories(
                 added += delta
                 if need_refresh:
                     _V319_HIST_REFRESHED.add(cache_key)
-                # 最新が対象日に届いたときだけキャッシュスキップ対象にする
+
+                # 穴なし確認: 対象日までの最新が埋まり、missing_official が解消された時だけ
+                # キャッシュスキップ登録する（次回の無駄な再取得を防ぐ）。
                 try:
                     after_state = _v319_player_history_state(db_path, name)
+                    after_keys = set(after_state.get("keys") or set())
                     after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
-                    if before_d and after_latest and after_latest >= before_d:
+                    _remaining_missing = official_keys - after_keys
+                    if before_d and after_latest and after_latest >= before_d and not _remaining_missing:
                         _V319_HIST_SKIPPED.add(cache_key)
-                    elif not before_d and after >= min_rows:
+                    elif not before_d and after >= min_rows and not _remaining_missing:
                         _V319_HIST_SKIPPED.add(cache_key)
                 except Exception:
-                    if after >= min_rows:
-                        _V319_HIST_SKIPPED.add(cache_key)
-                tag = "再取込" if need_refresh else "追加"
+                    pass
+
+                tag = "穴埋め" if is_existing else ("再取込" if need_refresh else "追加")
                 try:
-                    r_ok = int((pd.to_numeric(parsed["レース"], errors="coerce").fillna(0) > 0).sum()) if "レース" in parsed.columns else 0
+                    r_ok = int(
+                        (
+                            pd.to_numeric(parsed["レース"], errors="coerce").fillna(0) > 0
+                        ).sum()
+                    ) if "レース" in parsed.columns else 0
                 except Exception:
                     r_ok = 0
                 pend_s = f"/未確定{pending_left}" if pending_left else ""
-                details.append(f"{name}:{have}→{after}({tag}{len(parsed)}件/R付{r_ok}/保存{changed}{pend_s})")
-                time_module.sleep(0.15)
+                details.append(
+                    f"{name}:{have}→{after}({tag}{len(parsed)}件/R付{r_ok}/保存{changed}{pend_s})"
+                )
                 time_module.sleep(0.15)
             except Exception as exc:
                 errors += 1
