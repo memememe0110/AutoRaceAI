@@ -9855,6 +9855,165 @@ def _v319_merge_sp_enrich(df: pd.DataFrame, enrich: list[dict]) -> pd.DataFrame:
 
 
 
+
+def _v319_sync_registered_result_to_player_history(
+    db_path: str,
+    race_key: str,
+    meta: dict | None = None,
+    rows: pd.DataFrame | None = None,
+) -> dict:
+    """結果登録済みレースを選手履歴へ反映する（結果登録時の補完）。
+
+    登録条件を厳密化するため、必ず
+      - 開催日・開催場・R番号が確定
+      - 車番・選手名が存在
+      - 競走Tが正の数値
+    を満たす行だけを履歴へ渡す。
+    R番号または競走Tが欠けた結果行は履歴へ登録しない。
+    発走後事故・学習対象外レースは従来どおり選手履歴を更新しない。
+    """
+    result = {
+        "ok": False,
+        "added": 0,
+        "read": 0,
+        "eligible": 0,
+        "skipped_missing_race": 0,
+        "skipped_missing_race_time": 0,
+        "skipped_incident": 0,
+        "message": "",
+    }
+    try:
+        meta = dict(meta or {})
+        if bool(meta.get("学習対象外") or meta.get("learning_excluded") or meta.get("発走後事故")):
+            result["skipped_incident"] = 1
+            result["ok"] = True
+            result["message"] = "学習対象外レースのため選手履歴補完をスキップ"
+            return result
+
+        # race_keyから基本情報を取得し、DB本体を正とする。
+        with sqlite3.connect(str(db_path), timeout=15) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "result_races" not in tables or "result_entries" not in tables:
+                result["message"] = "結果テーブルなし"
+                return result
+            rr_cols = {r[1] for r in con.execute("PRAGMA table_info(result_races)").fetchall()}
+            re_cols = {r[1] for r in con.execute("PRAGMA table_info(result_entries)").fetchall()}
+            if not {"race_date", "venue", "race_no"}.issubset(rr_cols):
+                result["message"] = "結果レースのR情報が不足"
+                return result
+            name_col = "player_name" if "player_name" in re_cols else None
+            if not name_col:
+                result["message"] = "結果選手名列なし"
+                return result
+            car_col = "car_no" if "car_no" in re_cols else None
+            finish_col = "finish" if "finish" in re_cols else ("finish_order" if "finish_order" in re_cols else None)
+            hand_col = "handicap" if "handicap" in re_cols else None
+            race_time_col = "race_time" if "race_time" in re_cols else None
+            trial_col = "trial_time" if "trial_time" in re_cols else ("trial" if "trial" in re_cols else None)
+            st_col = "start_time" if "start_time" in re_cols else ("st" if "st" in re_cols else None)
+            if not race_time_col:
+                result["message"] = "競走T列なし"
+                return result
+
+            select_cols = [
+                "rr.race_date", "rr.venue", "rr.race_no",
+                f"re.{name_col}",
+                f"re.{car_col}" if car_col else "NULL",
+                f"re.{finish_col}" if finish_col else "NULL",
+                f"re.{hand_col}" if hand_col else "NULL",
+                f"re.{trial_col}" if trial_col else "NULL",
+                f"re.{race_time_col}",
+                f"re.{st_col}" if st_col else "NULL",
+            ]
+            rows_db = con.execute(
+                f"SELECT {', '.join(select_cols)} FROM result_entries re "
+                "JOIN result_races rr ON rr.race_key=re.race_key "
+                "WHERE re.race_key=?",
+                (str(race_key),),
+            ).fetchall()
+
+        result["read"] = len(rows_db)
+        if not rows_db:
+            result["message"] = "結果選手行なし"
+            return result
+
+        history_rows = []
+        for race_date, venue, race_no, pname, car_no, finish, hand, trial, race_time, st in rows_db:
+            try:
+                rn = int(race_no)
+            except Exception:
+                rn = 0
+            if rn <= 0 or rn > 12:
+                result["skipped_missing_race"] += 1
+                continue
+            name = str(pname or "").strip()
+            if not name:
+                result["skipped_missing_race"] += 1
+                continue
+            try:
+                rt = float(str(race_time).replace("秒", "").strip())
+            except Exception:
+                rt = 0.0
+            if not np.isfinite(rt) or rt <= 0.0:
+                result["skipped_missing_race_time"] += 1
+                continue
+            try:
+                car = int(float(car_no)) if car_no is not None and str(car_no).strip() else 0
+            except Exception:
+                car = 0
+            history_rows.append({
+                "選手名": name,
+                "開催日": str(race_date or "")[:10],
+                "開催場": str(venue or "").strip(),
+                "レース": rn,
+                "レース名": "",
+                "レース種別": "",
+                "着順": finish,
+                "走路": "",
+                "天候": "",
+                "車番": car,
+                "ハンデ": hand if hand is not None else 0,
+                "競走T": rt,
+                "試走T": trial if trial is not None else "",
+                "ST": st if st is not None else "",
+            })
+
+        result["eligible"] = len(history_rows)
+        if not history_rows:
+            result["ok"] = True
+            result["message"] = (
+                f"結果{len(rows_db)}行確認 / 履歴対象0行 "
+                f"(R不足{result['skipped_missing_race']} / 競走T不足{result['skipped_missing_race_time']})"
+            )
+            return result
+
+        df = pd.DataFrame(history_rows)
+        # 同一レース・選手の重複をこの処理内でも除去。
+        df = df.drop_duplicates(subset=["選手名", "開催日", "開催場", "レース"], keep="last").reset_index(drop=True)
+        report = engine.v47_save_player_history(df, db_path=db_path) or {}
+        changed = int(report.get("changed") or report.get("saved") or report.get("verified") or 0)
+        pending = report.get("pending")
+        if isinstance(pending, pd.DataFrame) and not pending.empty:
+            repaired = pending.copy()
+            repaired["重複処理"] = "入力したRで新規登録"
+            repaired["_v58_duplicate_confirmed"] = True
+            try:
+                report2 = engine.v131_save_pending_player_history(repaired, db_path=db_path) or {}
+                changed += int(report2.get("verified") or report2.get("changed") or report2.get("saved") or 0)
+            except Exception:
+                pass
+        result["added"] = changed
+        result["ok"] = True
+        result["message"] = (
+            f"結果{len(rows_db)}行→履歴対象{len(df)}行 / 新規・更新{changed}件 "
+            f"/ R不足{result['skipped_missing_race']} / 競走T不足{result['skipped_missing_race_time']}"
+        )
+        return result
+    except Exception as exc:
+        result["message"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+
 def _v319_history_from_results(
     db_path: str, player_name: str, before_ymd: str, before_venue: str, before_race: int
 ) -> pd.DataFrame:
@@ -11467,6 +11626,9 @@ def _v319_import_one_race(
             _v319_upsert_payouts_from_text(db_path, key_guess, raw_pay)
         except Exception as exc:
             odds_msg += f" / 払戻補完失敗:{type(exc).__name__}"
+        # Ver319 result-history sync: 登録済みレースでも、R番号＋競走Tが揃った行は履歴へ補完する。
+        hist_sync = _v319_sync_registered_result_to_player_history(db_path, key_guess)
+        hist_msg += f" / 結果履歴補完+{int(hist_sync.get('added') or 0)}"
         return {
             "status": "skip",
             "phase": "completed",
@@ -11587,6 +11749,12 @@ def _v319_import_one_race(
                 "next_action": "retry",
             }
     key = str(saved.get("key") or key_guess)
+    # Ver319 result-history sync: 結果登録を選手履歴の補完元にもする。
+    # R番号と競走Tが両方揃った結果行だけを登録し、欠損行は履歴へ入れない。
+    hist_sync = _v319_sync_registered_result_to_player_history(
+        db_path, key, meta=meta_r, rows=rows_r
+    )
+    hist_msg += f" / 結果履歴補完+{int(hist_sync.get('added') or 0)}"
     if not _v319_result_exists(db_path, ymd, venue, race_no):
         return {
             "status": "error",
@@ -18491,23 +18659,14 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
         if rows:
             role_lines.append(f"{v205_ticket_display_name(typ)}{len(rows)}点：{rows[0].get('role','')}")
     result["role_lines"] = role_lines
-    # 監査専用。v277内にはv184側のローカル候補変数が存在しないため、
-    # resultに保持された情報だけを参照する。監査処理が本体表示を止めないようにする。
-    _audit_candidates = (
-        result.get("selection_candidates")
-        or result.get("candidates")
-        or result.get("tickets")
-        or optional
-        or []
-    )
     result["selection_audit"] = _v319_build_selection_audit(
-        plan, _audit_candidates,
-        protected_reasons=[],
-        v299_hole_notes=[],
-        protected_add_notes=list(result.get("protected_add_notes") or []),
-        replacement_notes=list(result.get("replacement_notes") or []),
-        pair_mix_notes=[],
-        low_odds_floor_notes=list(result.get("low_odds_floor_notes") or []),
+        plan, candidates,
+        protected_reasons=sum((list(v) for v in protected_reasons.values()), []) if isinstance(protected_reasons, dict) else protected_reasons,
+        v299_hole_notes=v299_hole_notes,
+        protected_add_notes=protected_add_notes,
+        replacement_notes=replacement_notes,
+        pair_mix_notes=pair_mix_notes,
+        low_odds_floor_notes=low_odds_floor_notes,
     )
     return result
 
@@ -25040,6 +25199,11 @@ if selected_main_page == "✅ 結果登録・解析":
                         key, comparison, analysis, adjustment, registration = engine.v41_register_result(
                             meta_for_engine, rows_for_engine, laps_r, payouts_r, engine.DB_PATH
                         )
+                    # Ver319: 結果登録時に、R番号と競走Tが揃った実結果を選手履歴へ補完する。
+                    # 発走後事故・学習対象外レースは従来どおり履歴学習を止める。
+                    result_history_sync = _v319_sync_registered_result_to_player_history(
+                        engine.DB_PATH, str(key), meta=meta_r, rows=rows_r
+                    )
                     # Ver287: 1Rの結果だけで補正せず、結果登録のたびに登録済み全体を再集計。
                     # 学習対象外レースでは予測補正の再計算を行わない。
                     if not (registration.get("learning_excluded") or meta_r.get("学習対象外")):
@@ -25211,7 +25375,12 @@ if selected_main_page == "✅ 結果登録・解析":
                     h1.metric("新規履歴", analysis.get("履歴追加", 0))
                     h2.metric("重複スキップ", analysis.get("履歴重複スキップ", 0))
                     h3.metric("周回順位", analysis.get("周回履歴保存", 0))
-                    st.caption("結果登録した競走T・試走T・ST・着順・ハンデ・走路条件は、次回以降の予測用選手履歴へ反映されます。")
+                    _rhs = locals().get("result_history_sync") or {}
+                    st.caption(
+                        "結果登録したレースについて、R番号と競走Tが揃った行を選手履歴へ補完します。"
+                        f" 今回の補完対象{int(_rhs.get('eligible') or 0)}行 / 新規・更新{int(_rhs.get('added') or 0)}件"
+                        f" / R不足{int(_rhs.get('skipped_missing_race') or 0)}行 / 競走T不足{int(_rhs.get('skipped_missing_race_time') or 0)}行。"
+                    )
                     if registration.get("race_context_updated"):
                         ctx_stats = registration.get("race_context_refresh", {})
                         ov_stats = registration.get("overtake_matchups_refresh", {})
