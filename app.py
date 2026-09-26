@@ -6142,19 +6142,126 @@ def _v287_ensure_global_transition_calibration_table(db_path: str) -> None:
         con.commit()
 
 
-def _v287_recalculate_global_transition_calibration(db_path: str) -> dict:
+_V287_IMPORT_STATE_RESET: dict = {}
+_V287_AUTO_IMPORT_STATE: dict = {}
+
+
+def _v287_calibration_state(db_path: str) -> dict:
+    """全体補正の状態（予測の最大 history_id / 補正行数 / 最大pairs / 最終更新）。"""
+    out = {"history_id": 0, "pairs": -1, "scenario_laps": 0, "recalculated_at": ""}
+    try:
+        with sqlite3.connect(str(db_path), timeout=15.0) as con:
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "v287_global_transition_calibration" in tables:
+                try:
+                    row = con.execute(
+                        "SELECT MAX(sample_pairs), COUNT(*) FROM v287_global_transition_calibration"
+                    ).fetchone()
+                    out["pairs"] = int(row[0]) if row and row[0] is not None else -1
+                    out["scenario_laps"] = int((row or [0, 0])[1] or 0)
+                except Exception:
+                    pass
+                _colfn = globals().get("_v319_table_columns_cached")
+                _has_recat = ("recalculated_at" in set(_colfn(con, "v287_global_transition_calibration"))) if _colfn else True
+                if _has_recat:
+                    try:
+                        r2 = con.execute(
+                            "SELECT MAX(recalculated_at) FROM v287_global_transition_calibration"
+                        ).fetchone()
+                        out["recalculated_at"] = str((r2 or [""])[0] or "")
+                    except Exception:
+                        pass
+            if "v231_prediction_history" in tables:
+                if "history_id" in set(_v319_table_columns_cached(con, "v231_prediction_history")):
+                    try:
+                        r3 = con.execute(
+                            "SELECT MAX(history_id) FROM v231_prediction_history").fetchone()
+                        out["history_id"] = int((r3 or [0])[0] or 0)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return out
+
+
+def _v287_calibration_needs_full(db_path: str) -> bool:
+    """取込時に状態が動いていたら全件再集計が必要。動いていなければ増分で足りる。"""
+    st_now = _v287_calibration_state(db_path)
+    st_old = _V287_IMPORT_STATE_RESET if isinstance(_V287_IMPORT_STATE_RESET, dict) else {}
+    if not st_old:
+        return True
+    for k, dflt in (("history_id", 0), ("scenario_laps", 0), ("pairs", -1)):
+        if int(st_now.get(k) if st_now.get(k) is not None else dflt) != int(st_old.get(k) if st_old.get(k) is not None else dflt):
+            return True
+    return False
+
+
+def _v287_save_calibration_state(db_path: str, history_id: int = 0) -> dict:
+    st = _v287_calibration_state(db_path)
+    try:
+        st["history_id"] = int(history_id or st.get("history_id") or 0)
+    except Exception:
+        pass
+    return st
+
+
+def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bool = False) -> dict:
     """結果登録後、登録済み全体から動的微調整値を再計算して保存する。
 
     直前に登録した1Rだけでは更新しない。
     保存済みVer284監査のうち実測周回比較が存在する全レースを毎回再集計する。
     事故等で学習対象外になったレースは、実測周回比較が監査に無ければ自然に除外される。
+
+    Ver319改善#3（増分集計）:
+      force_full=False のときは pairs が変化し得ない入力（予測テーブルで
+      Ver284 より新しい行を持つレース＝取込中に新規保存された予測）を候補から外す。
+      安全側の全件フォールバック:
+        - force_full=True が指定された場合
+        - 対象レースに app_version='Ver284' の予測が1件も無い場合
+      取込の終端では _v287_calibration_needs_full() で状態が動いたかを確認し、
+      動いていれば force_full=True で全件再集計する。
     """
     out={"ok":False,"source_races":0,"calibrations":0,"details":[],"reason":""}
     try:
         _v287_ensure_global_transition_calibration_table(db_path)
         with sqlite3.connect(str(db_path),timeout=60.0) as con:
             con.execute("PRAGMA busy_timeout=60000")
-            rows=con.execute("""
+            _v287_prev_state = _v287_calibration_state(db_path)
+            _v287_need_full = bool(force_full)
+            if not _v287_need_full:
+                try:
+                    with sqlite3.connect(str(db_path), timeout=15.0) as _fcon:
+                        _vtabs = {r[0] for r in _fcon.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                        _v284_hits = 0
+                        if "v231_prediction_history" in _vtabs and "result_races" in _vtabs:
+                            _v284_hits = int(_fcon.execute("""
+                                SELECT COUNT(*)
+                                FROM v231_prediction_history h
+                                JOIN result_races rr ON rr.race_key=h.race_key
+                                WHERE h.app_version='Ver284'
+                                  AND COALESCE(rr.model_eligible,1)=1
+                                  AND COALESCE(rr.learning_eligible,1)=1
+                            """).fetchone()[0] or 0)
+                    if _v284_hits <= 0:
+                        _v287_need_full = True
+                except Exception:
+                    _v287_need_full = True
+            _v287_where = """
+                  AND COALESCE(rr.model_eligible,1)=1
+                  AND COALESCE(rr.learning_eligible,1)=1
+            """
+            if not _v287_need_full:
+                _v287_where += """
+                  AND NOT EXISTS (
+                      SELECT 1 FROM v231_prediction_history p
+                      WHERE p.race_key = h.race_key
+                        AND p.app_version <> 'Ver284'
+                        AND p.history_id > x.mid
+                  )
+                """
+            rows = con.execute("""
                 SELECT h.race_key,h.payload
                 FROM v231_prediction_history h
                 JOIN (
@@ -6164,9 +6271,14 @@ def _v287_recalculate_global_transition_calibration(db_path: str) -> dict:
                     GROUP BY race_key
                 ) x ON h.history_id=x.mid
                 JOIN result_races rr ON rr.race_key=h.race_key
-                WHERE COALESCE(rr.model_eligible,1)=1
-                  AND COALESCE(rr.learning_eligible,1)=1
-            """).fetchall()
+                WHERE 1=1
+            """ + _v287_where).fetchall()
+            try:
+                _v287_max_hist = int(con.execute(
+                    "SELECT COALESCE(MAX(history_id),0) FROM v231_prediction_history"
+                ).fetchone()[0] or 0)
+            except Exception:
+                _v287_max_hist = 0
 
         from collections import defaultdict
         import itertools
@@ -6240,7 +6352,22 @@ def _v287_recalculate_global_transition_calibration(db_path: str) -> dict:
             _V285_SAME_SCENARIO_CACHE.clear()
         except Exception:
             pass
-        out.update({"ok":True,"source_races":len(used_races),"calibrations":len(saved),"details":saved})
+        _st_new = {}
+        try:
+            _st_new = _v287_save_calibration_state(db_path, _v287_max_hist)
+            _V287_AUTO_IMPORT_STATE.update(_st_new)
+        except Exception:
+            _st_new = {}
+        out.update({
+            "ok": True,
+            "source_races": len(used_races),
+            "calibrations": len(saved),
+            "mode": "full" if _v287_need_full else "incremental",
+            "state_full": bool(_v287_need_full),
+            "state_history_id": int(_v287_max_hist or 0),
+            "state_pairs": int((_st_new or {}).get("pairs") if (_st_new or {}).get("pairs") is not None else -1),
+            "details": saved,
+        })
         return out
     except Exception as exc:
         out["reason"]=f"{type(exc).__name__}: {exc}"
@@ -9313,44 +9440,216 @@ def _v319_ymd_digits(value) -> str:
     return re.sub(r"[^0-9]", "", str(value or ""))[:8]
 
 
-def _v319_player_history_state(db_path: str, player_name: str) -> dict:
+_V319_SCHEMA_CACHE: dict = {}
+
+_V319_INDEX_DDL = [
+    ("result_races", "idx_result_races_race_key", ["race_key"]),
+    ("result_races", "idx_result_races_date_venue", ["race_date", "venue"]),
+    ("result_races", "idx_result_races_learning", ["learning_eligible"]),
+    ("result_races", "idx_result_races_model", ["model_eligible"]),
+    ("result_entries", "idx_result_entries_race_key", ["race_key"]),
+    ("result_entries", "idx_result_entries_player", ["player_name"]),
+    ("result_entries", "idx_result_entries_race_player", ["race_key", "player_name"]),
+    ("result_payouts", "idx_result_payouts_race_key", ["race_key"]),
+    ("v15_player_history_imports", "idx_v15_phi_player_name", ["player_name"]),
+    ("v15_player_history_imports", "idx_v15_phi_date", ["race_date"]),
+]
+
+
+def _v319_conn_stat_key(db_path: str) -> tuple:
+    """DBファイルの (path, mtime, size)。内容が変わればキャッシュ鍵も変わる。"""
+    try:
+        stt = os.stat(str(db_path))
+        return (str(db_path), int(stt.st_mtime_ns), int(stt.st_size))
+    except Exception:
+        return (str(db_path), 0, 0)
+
+
+def _v319_invalidate_schema_cache(db_path: str | None = None) -> None:
+    """スキーマキャッシュを明示破棄する（テーブル作成直後などに呼ぶ）。"""
+    if db_path is None:
+        _V319_SCHEMA_CACHE.clear()
+    else:
+        for k in [k for k in list(_V319_SCHEMA_CACHE.keys()) if k and k[0] == str(db_path)]:
+            _V319_SCHEMA_CACHE.pop(k, None)
+
+
+def _v319_schema_tables(con) -> set:
+    """テーブル名集合。接続ごとに1回だけ問い合わせて使い回す。"""
+    cache = getattr(con, "_v319_tables_cache", None)
+    if cache is not None:
+        return cache
+    try:
+        cache = {str(r[0]) for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    except Exception:
+        cache = set()
+    try:
+        con._v319_tables_cache = cache
+    except Exception:
+        pass
+    return cache
+
+
+def _v319_table_columns_cached(con, table: str) -> list:
+    """列名リスト。(DBファイル, mtime, size) と接続内の二段キャッシュ。"""
+    try:
+        path = str(con.execute("PRAGMA database_list").fetchone()[2] or "")
+    except Exception:
+        path = ""
+    memo = _V319_SCHEMA_CACHE.setdefault(_v319_conn_stat_key(path), {})
+    if table in memo:
+        return memo[table]
+    percon = getattr(con, "_v319_cols_cache", None)
+    if percon is None:
+        percon = {}
+        try:
+            con._v319_cols_cache = percon
+        except Exception:
+            pass
+    if table in percon:
+        memo[table] = percon[table]
+        return percon[table]
+    try:
+        cols = [str(r[1]) for r in con.execute(
+            'PRAGMA table_info("%s")' % str(table)).fetchall()]
+    except Exception:
+        cols = []
+    memo[table] = cols
+    percon[table] = cols
+    return cols
+
+
+def _v319_has_column(con, table: str, column: str) -> bool:
+    return str(column) in set(_v319_table_columns_cached(con, table))
+
+
+def _v319_create_index_if_possible(con, table: str, idx_name: str, columns) -> tuple:
+    """列が無い等で作れない場合は静かにスキップする。戻り値 (作成したか, 理由)。"""
+    try:
+        tcols = {str(r[1]) for r in con.execute(
+            'PRAGMA table_info("%s")' % str(table)).fetchall()}
+    except Exception:
+        return False, "no-table"
+    if not tcols:
+        return False, "no-table"
+    miss = [str(c) for c in columns if str(c) not in tcols]
+    if miss:
+        return False, "no-column:" + ",".join(miss)
+    collist = ",".join('"%s"' % str(c) for c in columns)
+    try:
+        con.execute('CREATE INDEX IF NOT EXISTS "%s" ON "%s"(%s)' % (idx_name, table, collist))
+        return True, "ok"
+    except Exception as exc:
+        return False, "%s: %s" % (type(exc).__name__, exc)
+
+
+def _v319_ensure_perf_indexes(db_path: str) -> dict:
+    """Ver319改善#1: 学習・集計のJOINを速くする索引を冪等に整備する。
+
+    取込開始時に呼ぶ。テーブル/列が無い索引は静かにスキップする。
+    """
+    out = {"ok": False, "created": [], "skipped": [], "reason": ""}
+    try:
+        with sqlite3.connect(str(db_path), timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            for tname, iname, cols in _V319_INDEX_DDL:
+                okc, why = _v319_create_index_if_possible(con, tname, iname, cols)
+                (out["created"].append(iname) if okc else out["skipped"].append(iname + "(" + why + ")"))
+            con.commit()
+        out["ok"] = True
+        _v319_invalidate_schema_cache(db_path)
+    except Exception as exc:
+        out["reason"] = "%s: %s" % (type(exc).__name__, exc)
+    return out
+
+
+def _v319_open_conn(db_path: str):
+    """Ver319改善#2: 取込1レース分を使い回す接続。"""
+    cn = sqlite3.connect(str(db_path), timeout=60.0)
+    cn.execute("PRAGMA busy_timeout=60000")
+    try:
+        cn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
+    return cn
+
+
+def _v319_name_where(con, table: str, alias: str = "") -> str:
+    """選手名の照合式。正規化列 player_name_key があれば索引が効く等値比較にする。"""
+    pre = (str(alias) + ".") if alias else ""
+    try:
+        if "player_name_key" in set(_v319_table_columns_cached(con, table)):
+            return "%splayer_name_key=?" % pre
+    except Exception:
+        pass
+    return "replace(replace(COALESCE(%splayer_name,''),' ',''),'\u3000','')=?" % pre
+
+
+def _v319_player_history_state(db_path: str, player_name: str, con=None) -> dict:
     key = _v319_norm_player_name(player_name)
     out = {"count": 0, "latest": "", "keys": set()}
     if not key:
         return out
+    _own = con is None
+    if con is None:
+        con = _v319_open_conn(db_path)
     try:
-        with sqlite3.connect(str(db_path), timeout=15) as con:
-            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if "v15_player_history_imports" not in tables:
+        try:
+            if "v15_player_history_imports" not in _v319_schema_tables(con):
                 return out
-            cols = {r[1] for r in con.execute("PRAGMA table_info(v15_player_history_imports)").fetchall()}
-            date_c = "race_date" if "race_date" in cols else ("開催日" if "開催日" in cols else None)
-            ven_c = "venue" if "venue" in cols else ("開催場" if "開催場" in cols else None)
-            rno_c = "race_no" if "race_no" in cols else ("レース" if "レース" in cols else None)
-            rows = con.execute(
-                "SELECT * FROM v15_player_history_imports WHERE replace(replace(COALESCE(player_name,''),' ',''),'　','')=?",
-                (key,),
-            ).fetchall()
-            names = [d[0] for d in con.execute("PRAGMA table_info(v15_player_history_imports)").fetchall()]
-            out["count"] = len(rows)
-            for row in rows:
-                rec = dict(zip(names, row))
-                ds = _v319_ymd_digits(rec.get(date_c) if date_c else rec.get("race_date"))
-                if ds and ds > out["latest"]:
-                    out["latest"] = ds
-                vn = str(rec.get(ven_c) or rec.get("venue") or "").replace("　", "").strip()
-                try:
-                    rn = int(rec.get(rno_c) or rec.get("race_no") or 0)
-                except Exception:
-                    rn = 0
-                if ds:
-                    out["keys"].add((ds, vn, rn))
-    except Exception:
-        pass
+            names = _v319_table_columns_cached(con, "v15_player_history_imports")
+            colset = set(names)
+            date_c = "race_date" if "race_date" in colset else ("開催日" if "開催日" in colset else None)
+            ven_c = "venue" if "venue" in colset else ("開催場" if "開催場" in colset else None)
+            rno_c = "race_no" if "race_no" in colset else ("レース" if "レース" in colset else None)
+            where_sql = _v319_name_where(con, "v15_player_history_imports")
+            if date_c and ven_c and rno_c:
+                # 必要な3列だけ読む（全列SELECTをやめる）
+                rows = con.execute(
+                    'SELECT "%s","%s","%s" FROM v15_player_history_imports WHERE %s' % (
+                        date_c, ven_c, rno_c, where_sql),
+                    (key,),
+                ).fetchall()
+                out["count"] = len(rows)
+                for ds_raw, vn_raw, rn_raw in rows:
+                    ds = _v319_ymd_digits(ds_raw)
+                    if ds and ds > out["latest"]:
+                        out["latest"] = ds
+                    vn = str(vn_raw or "").replace("\u3000", "").strip()
+                    try:
+                        rn = int(rn_raw or 0)
+                    except Exception:
+                        rn = 0
+                    if ds:
+                        out["keys"].add((ds, vn, rn))
+            else:
+                rows = con.execute(
+                    "SELECT * FROM v15_player_history_imports WHERE " + where_sql,
+                    (key,),
+                ).fetchall()
+                out["count"] = len(rows)
+                for row in rows:
+                    rec = dict(zip(names, row))
+                    ds = _v319_ymd_digits(rec.get(date_c) if date_c else rec.get("race_date"))
+                    if ds and ds > out["latest"]:
+                        out["latest"] = ds
+                    vn = str(rec.get(ven_c) or rec.get("venue") or "").replace("\u3000", "").strip()
+                    try:
+                        rn = int(rec.get(rno_c) or rec.get("race_no") or 0)
+                    except Exception:
+                        rn = 0
+                    if ds:
+                        out["keys"].add((ds, vn, rn))
+        except Exception:
+            pass
+    finally:
+        if _own:
+            try:
+                con.close()
+            except Exception:
+                pass
     return out
-
-
-
 
 
 def _v319_probe_official_latest_ymd(player_cd: str, max_ymd: str = "") -> str:
@@ -9408,58 +9707,66 @@ def _v319_probe_official_latest_ymd(player_cd: str, max_ymd: str = "") -> str:
 
 
 
-def _v319_player_history_latest_fast(db_path: str, player_name: str) -> tuple[int, str]:
+def _v319_player_history_latest_fast(db_path: str, player_name: str, con=None) -> tuple[int, str]:
     """件数と最新開催日だけを取る（全行SELECTしない）。戻り値: (count, yyyymmdd)。"""
     key = _v319_norm_player_name(player_name)
     if not key:
         return 0, ""
+    _own = con is None
+    if con is None:
+        con = _v319_open_conn(db_path)
     try:
-        with sqlite3.connect(str(db_path), timeout=10) as con:
-            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if "v15_player_history_imports" not in tables:
-                return 0, ""
-            cols = {r[1] for r in con.execute("PRAGMA table_info(v15_player_history_imports)").fetchall()}
-            date_c = "race_date" if "race_date" in cols else ("開催日" if "開催日" in cols else None)
-            if not date_c:
-                return 0, ""
-            row = con.execute(
-                f"""
-                SELECT COUNT(*), MAX(replace(replace(replace(COALESCE({date_c},''),'-',''),'/',''),'.',''))
-                FROM v15_player_history_imports
-                WHERE replace(replace(COALESCE(player_name,''),' ',''),'　','')=?
-                """,
-                (key,),
-            ).fetchone()
-            if not row:
-                return 0, ""
-            cnt = int(row[0] or 0)
-            latest = re.sub(r"[^0-9]", "", str(row[1] or ""))
-            if len(latest) >= 8:
-                latest = latest[:8]
-            else:
-                latest = ""
-            return cnt, latest
+        if "v15_player_history_imports" not in _v319_schema_tables(con):
+            return 0, ""
+        cols = set(_v319_table_columns_cached(con, "v15_player_history_imports"))
+        date_c = "race_date" if "race_date" in cols else ("開催日" if "開催日" in cols else None)
+        if not date_c:
+            return 0, ""
+        row = con.execute(
+            "SELECT COUNT(*), MAX(replace(replace(replace(COALESCE(\"%s\",''),'-',''),'/',''),'.',''))"
+            " FROM v15_player_history_imports WHERE %s" % (date_c, _v319_name_where(con, "v15_player_history_imports")),
+            (key,),
+        ).fetchone()
+        if not row:
+            return 0, ""
+        cnt = int(row[0] or 0)
+        latest = re.sub(r"[^0-9]", "", str(row[1] or ""))
+        latest = latest[:8] if len(latest) >= 8 else ""
+        return cnt, latest
     except Exception:
         return 0, ""
+    finally:
+        if _own:
+            try:
+                con.close()
+            except Exception:
+                pass
 
 
-def _v319_player_history_count(db_path: str, player_name: str) -> int:
+def _v319_player_history_count(db_path: str, player_name: str, con=None) -> int:
     key = _v319_norm_player_name(player_name)
     if not key:
         return 0
+    _own = con is None
+    if con is None:
+        con = _v319_open_conn(db_path)
     try:
-        with sqlite3.connect(str(db_path), timeout=15) as con:
-            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            n = 0
-            if "v15_player_history_imports" in tables:
-                row = con.execute(
-                    "SELECT COUNT(*) FROM v15_player_history_imports WHERE replace(replace(COALESCE(player_name,''),' ',''),'　','')=?",
-                    (key,),
-                ).fetchone()
-                n = max(n, int(row[0] or 0))
-            return n
+        if "v15_player_history_imports" not in _v319_schema_tables(con):
+            return 0
+        row = con.execute(
+            "SELECT COUNT(*) FROM v15_player_history_imports WHERE "
+            + _v319_name_where(con, "v15_player_history_imports"),
+            (key,),
+        ).fetchone()
+        return int((row or [0])[0] or 0)
     except Exception:
         return 0
+    finally:
+        if _own:
+            try:
+                con.close()
+            except Exception:
+                pass
 
 
 def _v319_parse_pc_player_history_html(html: str, player_name: str) -> list[dict]:
@@ -9755,17 +10062,25 @@ def _v319_merge_sp_enrich(df: pd.DataFrame, enrich: list[dict]) -> pd.DataFrame:
 
 
 def _v319_history_from_results(
-    db_path: str, player_name: str, before_ymd: str, before_venue: str, before_race: int
+    db_path: str, player_name: str, before_ymd: str, before_venue: str, before_race: int,
+    con=None,
 ) -> pd.DataFrame:
+    """result_races/result_entries から履歴行を作る。
+
+    Ver319: con を渡すとその接続を共有し、閉じない（呼び出し側が管理する）。
+    """
     key = _v319_norm_player_name(player_name)
     if not key:
         return pd.DataFrame()
+    _own = con is None
+    if con is None:
+        con = _v319_open_conn(db_path)
     try:
-        with sqlite3.connect(str(db_path), timeout=15) as con:
-            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        try:
+            tables = _v319_schema_tables(con)
             if "result_races" not in tables or "result_entries" not in tables:
                 return pd.DataFrame()
-            re_cols = {r[1] for r in con.execute("PRAGMA table_info(result_entries)").fetchall()}
+            re_cols = set(_v319_table_columns_cached(con, "result_entries"))
             car_expr = "re.car_no" if "car_no" in re_cols else "NULL"
             trial_expr = "re.trial_time" if "trial_time" in re_cols else ("re.trial" if "trial" in re_cols else "NULL")
             rows = con.execute(
@@ -9775,12 +10090,18 @@ def _v319_history_from_results(
                        re.player_name, {car_expr}, {trial_expr}
                 FROM result_entries re
                 JOIN result_races rr ON rr.race_key=re.race_key
-                WHERE replace(replace(COALESCE(re.player_name,''),' ',''),'　','')=?
+                WHERE {_v319_name_where(con, "result_entries", "re")}
                 """,
                 (key,),
             ).fetchall()
-    except Exception:
-        return pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+    finally:
+        if _own:
+            try:
+                con.close()
+            except Exception:
+                pass
     out = []
     for race_date, venue, race_no, finish, hand, race_t, st, pname, car_no, trial in rows:
         try:
@@ -10100,8 +10421,14 @@ def _v319_fill_player_histories(
     before_ymd: str = "",
     before_venue: str = "",
     before_race: int = 0,
+    con=None,
+    _exclusive: bool = False,
 ) -> dict:
     """選手履歴を公式PC版 PlayerDetail から取得して保存。
+
+    Ver319改善#2: 1レース分は接続を1本だけ開いて使い回す（毎回connectしない）。
+    con を渡された場合はその接続を共有し、閉じない（呼び出し側が管理する）。
+    _exclusive=True かつ con=None のときは BEGIN IMMEDIATE でまとめて書く。
 
     - R番号は公式テーブルの R 列から取得（SP版にはRが無い）
     - 件数不足・R欠落・公式欠けがあれば再取込（選手ごとに1プロセス1回まで）
@@ -10113,325 +10440,345 @@ def _v319_fill_player_histories(
     errors = 0
     details = []
     min_rows = int(min_rows or 30)
-    for p in players:
-        name = p.get("name") or ""
-        pcd = str(p.get("player_cd") or "").strip()
-        cache_key = pcd or _v319_norm_player_name(name)
-        already_refreshed = cache_key in _V319_HIST_REFRESHED
-        already_skipped = cache_key in _V319_HIST_SKIPPED
-        try:
-            if not pcd:
-                errors += 1
-                details.append(f"{name}:playerCdなし")
-                continue
-            before_d = _v319_ymd_digits(before_ymd)
-
-            # ========== 1) DBだけ（COUNT + 最新日） ==========
-            have, latest_d = _v319_player_history_latest_fast(db_path, name)
-            latest_d = _v319_ymd_digits(latest_d)
-            if already_skipped:
-                skipped += 1
-                details.append(f"{name}:キャッシュスキップ")
-                continue
-            # 対象レース日までDBに入っている → HTTP不要
-            if before_d and latest_d and latest_d >= before_d and have >= min_rows:
-                skipped += 1
-                details.append(
-                    f"{name}:最新一致スキップ(DB{latest_d}>=対象{before_d}/{have}件)"
-                )
-                _V319_HIST_SKIPPED.add(cache_key)
-                continue
-
-            # ========== 2) 軽いHTTPで公式最新（対象日以前）を確認 ==========
-            # 前日がDB最新でも、公式に同日先のレース等がある可能性があるため必ず確認
-            official_latest = ""
+    _own_con2 = bool(con is None and _exclusive)
+    if con is None:
+        con = _v319_open_conn(db_path)
+    try:
+        if _own_con2:
             try:
-                official_latest = _v319_probe_official_latest_ymd(pcd, max_ymd=before_d)
+                con.execute("BEGIN IMMEDIATE")
             except Exception:
-                official_latest = ""
-            official_latest = _v319_ymd_digits(official_latest)
-            if before_d and official_latest and official_latest > before_d:
-                official_latest = before_d
+                pass
 
-            # 公式最新 <= DB最新 → 公式にある分は取り済み → スキップ
-            if official_latest and latest_d and official_latest <= latest_d:
-                skipped += 1
-                details.append(
-                    f"{name}:公式最新一致スキップ(公式{official_latest}/DB{latest_d})"
-                )
-                _V319_HIST_SKIPPED.add(cache_key)
-                continue
-            # 公式日が取れず件数十分 → 待ち回避でスキップ（取りこぼし時は手動再取込）
-            if not official_latest and have >= min_rows and latest_d:
-                skipped += 1
-                details.append(
-                    f"{name}:公式不明スキップ(DB{latest_d}/{have}件)"
-                )
-                _V319_HIST_SKIPPED.add(cache_key)
-                continue
-
-            # ========== 3) 公式の方が新しい → 全件取得 ==========
-            details.append(
-                f"{name}:差分取得(DB{latest_d or 'なし'}<公式{official_latest or '?'} / 対象{before_d or '-'} / 既存{have})"
-            )
-            state = _v319_player_history_state(db_path, name)
-            have_keys = set(state.get("keys") or set())
-            dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
-            df = _v319_fetch_player_history_df(pcd, name)
-            if df is None or df.empty:
-                if have <= 0:
+        for p in players:
+            name = p.get("name") or ""
+            pcd = str(p.get("player_cd") or "").strip()
+            cache_key = pcd or _v319_norm_player_name(name)
+            already_refreshed = cache_key in _V319_HIST_REFRESHED
+            already_skipped = cache_key in _V319_HIST_SKIPPED
+            try:
+                if not pcd:
                     errors += 1
-                    details.append(f"{name}:履歴0件(cd={pcd or '-'})")
-                else:
-                    skipped += 1
-                    details.append(f"{name}:公式0件/既存{have}")
-                continue
-            if "車番" not in df.columns:
-                df["車番"] = 0
-            # Rを数値化（drop_duplicates用）
-            def _rn(v):
-                try:
-                    if v is None or (isinstance(v, float) and pd.isna(v)):
-                        return 0
-                    s = str(v).strip()
-                    if re.fullmatch(r"\d+", s):
-                        return int(s)
-                except Exception:
-                    pass
-                return 0
-            df = df.copy()
-            df["レース"] = df["レース"].map(_rn) if "レース" in df.columns else 0
+                    details.append(f"{name}:playerCdなし")
+                    continue
+                before_d = _v319_ymd_digits(before_ymd)
 
-            if before_ymd:
-                before_rows = [
-                    r for _, r in df.iterrows()
-                    if _v319_hist_row_before(r, before_ymd, before_venue, before_race)
-                ]
-                df = pd.DataFrame(before_rows)
-                if df.empty:
+                # ========== 1) DBだけ（COUNT + 最新日） ==========
+                have, latest_d = _v319_player_history_latest_fast(db_path, name)
+                latest_d = _v319_ymd_digits(latest_d)
+                if already_skipped:
+                    skipped += 1
+                    details.append(f"{name}:キャッシュスキップ")
+                    continue
+                # 対象レース日までDBに入っている → HTTP不要
+                if before_d and latest_d and latest_d >= before_d and have >= min_rows:
+                    skipped += 1
+                    details.append(
+                        f"{name}:最新一致スキップ(DB{latest_d}>=対象{before_d}/{have}件)"
+                    )
+                    _V319_HIST_SKIPPED.add(cache_key)
+                    continue
+
+                # ========== 2) 軽いHTTPで公式最新（対象日以前）を確認 ==========
+                # 前日がDB最新でも、公式に同日先のレース等がある可能性があるため必ず確認
+                official_latest = ""
+                try:
+                    official_latest = _v319_probe_official_latest_ymd(pcd, max_ymd=before_d)
+                except Exception:
+                    official_latest = ""
+                official_latest = _v319_ymd_digits(official_latest)
+                if before_d and official_latest and official_latest > before_d:
+                    official_latest = before_d
+
+                # 公式最新 <= DB最新 → 公式にある分は取り済み → スキップ
+                if official_latest and latest_d and official_latest <= latest_d:
+                    skipped += 1
+                    details.append(
+                        f"{name}:公式最新一致スキップ(公式{official_latest}/DB{latest_d})"
+                    )
+                    _V319_HIST_SKIPPED.add(cache_key)
+                    continue
+                # 公式日が取れず件数十分 → 待ち回避でスキップ（取りこぼし時は手動再取込）
+                if not official_latest and have >= min_rows and latest_d:
+                    skipped += 1
+                    details.append(
+                        f"{name}:公式不明スキップ(DB{latest_d}/{have}件)"
+                    )
+                    _V319_HIST_SKIPPED.add(cache_key)
+                    continue
+
+                # ========== 3) 公式の方が新しい → 全件取得 ==========
+                details.append(
+                    f"{name}:差分取得(DB{latest_d or 'なし'}<公式{official_latest or '?'} / 対象{before_d or '-'} / 既存{have})"
+                )
+                state = _v319_player_history_state(db_path, name)
+                have_keys = set(state.get("keys") or set())
+                dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
+                df = _v319_fetch_player_history_df(pcd, name)
+                if df is None or df.empty:
                     if have <= 0:
                         errors += 1
-                        details.append(f"{name}:当該R以前の履歴0件")
+                        details.append(f"{name}:履歴0件(cd={pcd or '-'})")
                     else:
                         skipped += 1
-                        details.append(f"{name}:当該R以前は追加なし")
+                        details.append(f"{name}:公式0件/既存{have}")
                     continue
+                if "車番" not in df.columns:
+                    df["車番"] = 0
+                # Rを数値化（drop_duplicates用）
+                def _rn(v):
+                    try:
+                        if v is None or (isinstance(v, float) and pd.isna(v)):
+                            return 0
+                        s = str(v).strip()
+                        if re.fullmatch(r"\d+", s):
+                            return int(s)
+                    except Exception:
+                        pass
+                    return 0
+                df = df.copy()
+                df["レース"] = df["レース"].map(_rn) if "レース" in df.columns else 0
 
-            extra = _v319_history_from_results(
-                db_path, name, before_ymd or latest, before_venue, before_race
-            )
-            if extra is not None and not extra.empty:
-                if "車番" not in extra.columns:
-                    extra["車番"] = 0
-                extra = extra.copy()
-                extra["レース"] = extra["レース"].map(_rn) if "レース" in extra.columns else 0
-                df = pd.concat([df, extra], ignore_index=True)
+                if before_ymd:
+                    before_rows = [
+                        r for _, r in df.iterrows()
+                        if _v319_hist_row_before(r, before_ymd, before_venue, before_race)
+                    ]
+                    df = pd.DataFrame(before_rows)
+                    if df.empty:
+                        if have <= 0:
+                            errors += 1
+                            details.append(f"{name}:当該R以前の履歴0件")
+                        else:
+                            skipped += 1
+                            details.append(f"{name}:当該R以前は追加なし")
+                        continue
 
-            official_keys = set()
-            for _, r in df.iterrows():
-                k = _v319_hist_row_key(r)
-                if k[0] and k[2] > 0:
-                    official_keys.add(k)
-
-            missing_official = official_keys - have_keys
-            # 全件再取込は不足時のみ。十分なら差分追加だけ（上書きしない）
-            need_refresh = (not already_refreshed) and have < min_rows and (
-                bool(dirty_keys) or len(missing_official) >= 1 or have < 15
-            )
-
-            keep = []
-            seen = set()
-            for _, r in df.iterrows():
-                k = _v319_hist_row_key(r)
-                if not k[0] or k in seen:
-                    continue
-                if before_ymd and not _v319_hist_row_before(r, before_ymd, before_venue, before_race):
-                    continue
-                seen.add(k)
-                if need_refresh:
-                    keep.append(r)
-                elif k not in have_keys:
-                    keep.append(r)
-            if not keep:
-                skipped += 1
-                details.append(f"{name}:最新済{latest or have}")
-                continue
-
-            work = pd.DataFrame(keep)
-            if "車番" in work.columns:
-                work["_car"] = pd.to_numeric(work["車番"], errors="coerce").fillna(0).astype(int)
-            else:
-                work["_car"] = 0
-            work["レース"] = work["レース"].map(_rn)
-            work = work.sort_values(["_car"], ascending=False, kind="mergesort")
-            work["_key"] = work.apply(lambda r: _v319_hist_row_key(r), axis=1)
-            work = work.drop_duplicates(subset=["_key"], keep="first")
-            work = work.drop(columns=["_car", "_key"], errors="ignore")
-            work["_ymd"] = work["開催日"].map(_v319_ymd_digits)
-            work = work.sort_values("_ymd", ascending=False, kind="mergesort").drop(columns=["_ymd"])
-
-            if need_refresh:
-                df_use = work.head(max(min_rows, min(len(work), 35)))
-            else:
-                need = max(min_rows - have, 1)
-                df_use = work.head(max(need, len(work)))
-
-            # 公式貼付フォーマット → 解析。失敗時はDF直接。pendingは手動UIと同じ確定処理。
-            try:
-                df_use = _v319_fill_missing_race_nos(df_use, db_path=db_path, player_name=name)
-            except Exception:
-                pass
-            lines = _v319_build_player_history_lines(name, df_use, fetch_weather=False)
-            parsed = None
-            try:
-                parsed = engine.v15_parse_player_history(
-                    "\n".join(lines), player_name=str(name).strip()
+                extra = _v319_history_from_results(
+                    db_path, name, before_ymd or latest, before_venue, before_race
                 )
-            except Exception:
-                parsed = None
-            if not isinstance(parsed, pd.DataFrame) or parsed.empty:
-                parsed = df_use.copy()
-            elif len(parsed) < max(8, int(len(df_use) * 0.5)) and len(df_use) >= 8:
-                parsed = df_use.copy()
-            else:
-                # 解析でRが落ちたらPC版から戻す
-                try:
-                    src = df_use.copy()
-                    src["_ds"] = src["開催日"].map(_v319_ymd_digits)
-                    src["_vn"] = src["開催場"].map(lambda x: str(x or "").replace("　", "").strip())
-                    rmap = {}
-                    for _, sr in src.iterrows():
-                        try:
-                            rv = int(sr.get("レース") or 0)
-                        except Exception:
-                            rv = 0
-                        if rv > 0:
-                            rmap[(sr["_ds"], sr["_vn"])] = rv
-                    if "レース" not in parsed.columns:
-                        parsed = parsed.copy()
-                        parsed["レース"] = 0
-                    for i, pr in parsed.iterrows():
-                        cur = 0
-                        try:
-                            cur = int(pd.to_numeric(pr.get("レース"), errors="coerce") or 0)
-                        except Exception:
-                            cur = 0
-                        if cur <= 0:
-                            k = (_v319_ymd_digits(pr.get("開催日")), str(pr.get("開催場") or "").replace("　", "").strip())
-                            if k in rmap:
-                                parsed.at[i, "レース"] = rmap[k]
-                except Exception:
-                    pass
+                if extra is not None and not extra.empty:
+                    if "車番" not in extra.columns:
+                        extra["車番"] = 0
+                    extra = extra.copy()
+                    extra["レース"] = extra["レース"].map(_rn) if "レース" in extra.columns else 0
+                    df = pd.concat([df, extra], ignore_index=True)
 
-            parsed = parsed.copy()
-            if "選手名" not in parsed.columns:
-                parsed["選手名"] = name
-            else:
-                parsed["選手名"] = parsed["選手名"].fillna(name)
-                parsed.loc[parsed["選手名"].astype(str).str.strip().isin(["", "nan", "None"]), "選手名"] = name
-            try:
-                parsed = _v319_fill_missing_race_nos(parsed, db_path=db_path, player_name=name)
-            except Exception:
-                pass
-            # ソース df から R を再注入（パーサが落とした場合）
-            try:
-                if isinstance(df_use, pd.DataFrame) and not df_use.empty and "レース" in parsed.columns:
-                    src_map = {}
-                    for _, sr in df_use.iterrows():
-                        try:
-                            rv = int(pd.to_numeric(sr.get("レース"), errors="coerce") or 0)
-                        except Exception:
-                            rv = 0
-                        if rv <= 0:
-                            continue
-                        k = (
-                            _v319_ymd_digits(sr.get("開催日")),
-                            str(sr.get("開催場") or "").replace("　", "").strip(),
-                        )
-                        src_map[k] = rv
-                    for i, pr in parsed.iterrows():
-                        try:
-                            cur = int(pd.to_numeric(pr.get("レース"), errors="coerce") or 0)
-                        except Exception:
-                            cur = 0
-                        if cur > 0:
-                            continue
-                        k = (
-                            _v319_ymd_digits(pr.get("開催日")),
-                            str(pr.get("開催場") or "").replace("　", "").strip(),
-                        )
-                        if k in src_map:
-                            parsed.at[i, "レース"] = int(src_map[k])
-            except Exception:
-                pass
+                official_keys = set()
+                for _, r in df.iterrows():
+                    k = _v319_hist_row_key(r)
+                    if k[0] and k[2] > 0:
+                        official_keys.add(k)
 
-            report = engine.v47_save_player_history(parsed, db_path=db_path) or {}
-            changed = int(report.get("changed") or report.get("saved") or 0)
-            pending_df = report.get("pending")
-            pending_left = int(report.get("pending_count") or 0)
+                missing_official = official_keys - have_keys
+                # 全件再取込は不足時のみ。十分なら差分追加だけ（上書きしない）
+                need_refresh = (not already_refreshed) and have < min_rows and (
+                    bool(dirty_keys) or len(missing_official) >= 1 or have < 15
+                )
 
-            # 手動登録と同じ: pending → 「入力したRで新規登録」で確定
-            if isinstance(pending_df, pd.DataFrame) and not pending_df.empty:
-                repaired = pending_df.copy()
-                if "重複処理" not in repaired.columns:
-                    repaired["重複処理"] = "入力したRで新規登録"
+                keep = []
+                seen = set()
+                for _, r in df.iterrows():
+                    k = _v319_hist_row_key(r)
+                    if not k[0] or k in seen:
+                        continue
+                    if before_ymd and not _v319_hist_row_before(r, before_ymd, before_venue, before_race):
+                        continue
+                    seen.add(k)
+                    if need_refresh:
+                        keep.append(r)
+                    elif k not in have_keys:
+                        keep.append(r)
+                if not keep:
+                    skipped += 1
+                    details.append(f"{name}:最新済{latest or have}")
+                    continue
+
+                work = pd.DataFrame(keep)
+                if "車番" in work.columns:
+                    work["_car"] = pd.to_numeric(work["車番"], errors="coerce").fillna(0).astype(int)
                 else:
-                    need = repaired["重複処理"].fillna("選択してください").astype(str).isin(
-                        ["", "選択してください", "nan", "None"]
-                    )
-                    repaired.loc[need, "重複処理"] = "入力したRで新規登録"
-                repaired["_v58_duplicate_confirmed"] = True
-                try:
-                    report2 = engine.v131_save_pending_player_history(repaired, db_path=db_path) or {}
-                    changed += int(
-                        report2.get("verified") or report2.get("changed") or report2.get("saved") or 0
-                    )
-                    pending_left = int(report2.get("pending_count") or 0)
-                except Exception as _pend_exc:
-                    details.append(f"{name}:pending失敗:{type(_pend_exc).__name__}")
+                    work["_car"] = 0
+                work["レース"] = work["レース"].map(_rn)
+                work = work.sort_values(["_car"], ascending=False, kind="mergesort")
+                work["_key"] = work.apply(lambda r: _v319_hist_row_key(r), axis=1)
+                work = work.drop_duplicates(subset=["_key"], keep="first")
+                work = work.drop(columns=["_car", "_key"], errors="ignore")
+                work["_ymd"] = work["開催日"].map(_v319_ymd_digits)
+                work = work.sort_values("_ymd", ascending=False, kind="mergesort").drop(columns=["_ymd"])
 
-            if changed <= 0 and len(parsed) >= 5:
+                if need_refresh:
+                    df_use = work.head(max(min_rows, min(len(work), 35)))
+                else:
+                    need = max(min_rows - have, 1)
+                    df_use = work.head(max(need, len(work)))
+
+                # 公式貼付フォーマット → 解析。失敗時はDF直接。pendingは手動UIと同じ確定処理。
                 try:
-                    work2 = parsed.copy()
-                    work2["重複処理"] = "入力したRで新規登録"
-                    work2["_v58_duplicate_confirmed"] = True
-                    report3 = engine.v131_save_pending_player_history(work2, db_path=db_path) or {}
-                    changed += int(
-                        report3.get("verified") or report3.get("changed") or report3.get("saved") or 0
+                    df_use = _v319_fill_missing_race_nos(df_use, db_path=db_path, player_name=name)
+                except Exception:
+                    pass
+                lines = _v319_build_player_history_lines(name, df_use, fetch_weather=False)
+                parsed = None
+                try:
+                    parsed = engine.v15_parse_player_history(
+                        "\n".join(lines), player_name=str(name).strip()
                     )
-                    pending_left = int(report3.get("pending_count") or pending_left or 0)
+                except Exception:
+                    parsed = None
+                if not isinstance(parsed, pd.DataFrame) or parsed.empty:
+                    parsed = df_use.copy()
+                elif len(parsed) < max(8, int(len(df_use) * 0.5)) and len(df_use) >= 8:
+                    parsed = df_use.copy()
+                else:
+                    # 解析でRが落ちたらPC版から戻す
+                    try:
+                        src = df_use.copy()
+                        src["_ds"] = src["開催日"].map(_v319_ymd_digits)
+                        src["_vn"] = src["開催場"].map(lambda x: str(x or "").replace("　", "").strip())
+                        rmap = {}
+                        for _, sr in src.iterrows():
+                            try:
+                                rv = int(sr.get("レース") or 0)
+                            except Exception:
+                                rv = 0
+                            if rv > 0:
+                                rmap[(sr["_ds"], sr["_vn"])] = rv
+                        if "レース" not in parsed.columns:
+                            parsed = parsed.copy()
+                            parsed["レース"] = 0
+                        for i, pr in parsed.iterrows():
+                            cur = 0
+                            try:
+                                cur = int(pd.to_numeric(pr.get("レース"), errors="coerce") or 0)
+                            except Exception:
+                                cur = 0
+                            if cur <= 0:
+                                k = (_v319_ymd_digits(pr.get("開催日")), str(pr.get("開催場") or "").replace("　", "").strip())
+                                if k in rmap:
+                                    parsed.at[i, "レース"] = rmap[k]
+                    except Exception:
+                        pass
+
+                parsed = parsed.copy()
+                if "選手名" not in parsed.columns:
+                    parsed["選手名"] = name
+                else:
+                    parsed["選手名"] = parsed["選手名"].fillna(name)
+                    parsed.loc[parsed["選手名"].astype(str).str.strip().isin(["", "nan", "None"]), "選手名"] = name
+                try:
+                    parsed = _v319_fill_missing_race_nos(parsed, db_path=db_path, player_name=name)
+                except Exception:
+                    pass
+                # ソース df から R を再注入（パーサが落とした場合）
+                try:
+                    if isinstance(df_use, pd.DataFrame) and not df_use.empty and "レース" in parsed.columns:
+                        src_map = {}
+                        for _, sr in df_use.iterrows():
+                            try:
+                                rv = int(pd.to_numeric(sr.get("レース"), errors="coerce") or 0)
+                            except Exception:
+                                rv = 0
+                            if rv <= 0:
+                                continue
+                            k = (
+                                _v319_ymd_digits(sr.get("開催日")),
+                                str(sr.get("開催場") or "").replace("　", "").strip(),
+                            )
+                            src_map[k] = rv
+                        for i, pr in parsed.iterrows():
+                            try:
+                                cur = int(pd.to_numeric(pr.get("レース"), errors="coerce") or 0)
+                            except Exception:
+                                cur = 0
+                            if cur > 0:
+                                continue
+                            k = (
+                                _v319_ymd_digits(pr.get("開催日")),
+                                str(pr.get("開催場") or "").replace("　", "").strip(),
+                            )
+                            if k in src_map:
+                                parsed.at[i, "レース"] = int(src_map[k])
                 except Exception:
                     pass
 
-            after = _v319_player_history_count(db_path, name)
-            delta = max(changed, max(0, after - have))
-            added += delta
-            if need_refresh:
-                _V319_HIST_REFRESHED.add(cache_key)
-            # 最新が対象日に届いたときだけキャッシュスキップ対象にする
+                report = engine.v47_save_player_history(parsed, db_path=db_path) or {}
+                changed = int(report.get("changed") or report.get("saved") or 0)
+                pending_df = report.get("pending")
+                pending_left = int(report.get("pending_count") or 0)
+
+                # 手動登録と同じ: pending → 「入力したRで新規登録」で確定
+                if isinstance(pending_df, pd.DataFrame) and not pending_df.empty:
+                    repaired = pending_df.copy()
+                    if "重複処理" not in repaired.columns:
+                        repaired["重複処理"] = "入力したRで新規登録"
+                    else:
+                        need = repaired["重複処理"].fillna("選択してください").astype(str).isin(
+                            ["", "選択してください", "nan", "None"]
+                        )
+                        repaired.loc[need, "重複処理"] = "入力したRで新規登録"
+                    repaired["_v58_duplicate_confirmed"] = True
+                    try:
+                        report2 = engine.v131_save_pending_player_history(repaired, db_path=db_path) or {}
+                        changed += int(
+                            report2.get("verified") or report2.get("changed") or report2.get("saved") or 0
+                        )
+                        pending_left = int(report2.get("pending_count") or 0)
+                    except Exception as _pend_exc:
+                        details.append(f"{name}:pending失敗:{type(_pend_exc).__name__}")
+
+                if changed <= 0 and len(parsed) >= 5:
+                    try:
+                        work2 = parsed.copy()
+                        work2["重複処理"] = "入力したRで新規登録"
+                        work2["_v58_duplicate_confirmed"] = True
+                        report3 = engine.v131_save_pending_player_history(work2, db_path=db_path) or {}
+                        changed += int(
+                            report3.get("verified") or report3.get("changed") or report3.get("saved") or 0
+                        )
+                        pending_left = int(report3.get("pending_count") or pending_left or 0)
+                    except Exception:
+                        pass
+
+                after = _v319_player_history_count(db_path, name)
+                delta = max(changed, max(0, after - have))
+                added += delta
+                if need_refresh:
+                    _V319_HIST_REFRESHED.add(cache_key)
+                # 最新が対象日に届いたときだけキャッシュスキップ対象にする
+                try:
+                    after_state = _v319_player_history_state(db_path, name)
+                    after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
+                    if before_d and after_latest and after_latest >= before_d:
+                        _V319_HIST_SKIPPED.add(cache_key)
+                    elif not before_d and after >= min_rows:
+                        _V319_HIST_SKIPPED.add(cache_key)
+                except Exception:
+                    if after >= min_rows:
+                        _V319_HIST_SKIPPED.add(cache_key)
+                tag = "再取込" if need_refresh else "追加"
+                try:
+                    r_ok = int((pd.to_numeric(parsed["レース"], errors="coerce").fillna(0) > 0).sum()) if "レース" in parsed.columns else 0
+                except Exception:
+                    r_ok = 0
+                pend_s = f"/未確定{pending_left}" if pending_left else ""
+                details.append(f"{name}:{have}→{after}({tag}{len(parsed)}件/R付{r_ok}/保存{changed}{pend_s})")
+                time_module.sleep(0.15)
+                time_module.sleep(0.15)
+            except Exception as exc:
+                errors += 1
+                details.append(f"{name}:{type(exc).__name__}:{exc}")
+        return {"added": added, "skipped": skipped, "errors": errors, "details": details}
+    finally:
+        if _own_con2:
             try:
-                after_state = _v319_player_history_state(db_path, name)
-                after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
-                if before_d and after_latest and after_latest >= before_d:
-                    _V319_HIST_SKIPPED.add(cache_key)
-                elif not before_d and after >= min_rows:
-                    _V319_HIST_SKIPPED.add(cache_key)
+                con.commit()
             except Exception:
-                if after >= min_rows:
-                    _V319_HIST_SKIPPED.add(cache_key)
-            tag = "再取込" if need_refresh else "追加"
+                pass
             try:
-                r_ok = int((pd.to_numeric(parsed["レース"], errors="coerce").fillna(0) > 0).sum()) if "レース" in parsed.columns else 0
+                con.close()
             except Exception:
-                r_ok = 0
-            pend_s = f"/未確定{pending_left}" if pending_left else ""
-            details.append(f"{name}:{have}→{after}({tag}{len(parsed)}件/R付{r_ok}/保存{changed}{pend_s})")
-            time_module.sleep(0.15)
-            time_module.sleep(0.15)
-        except Exception as exc:
-            errors += 1
-            details.append(f"{name}:{type(exc).__name__}:{exc}")
-    return {"added": added, "skipped": skipped, "errors": errors, "details": details}
+                pass
 
 
 
@@ -11015,6 +11362,10 @@ def _v319_import_official_results(
         report["error"] = 1
         report["details"].append({"status": "error", "message": "開催日または開催場が不正です"})
         return report
+    try:
+        _v319_ensure_perf_indexes(db_path)
+    except Exception:
+        pass
     races = _v319_ordered_race_nos(ymd, venue, max_races)
     for n in races:
         item = {"venue": venue, "R": n, "status": "", "message": ""}
@@ -11039,10 +11390,8 @@ def _v319_import_official_results(
             report["error"] += 1
         report["details"].append(item)
         time_module.sleep(0.35)
-    try:
-        _v287_recalculate_global_transition_calibration(db_path)
-    except Exception:
-        pass
+    # Ver319改善#3: 全体補正(Ver287)は開催場ごとに実行しない。
+    #   呼び出し側が全開催場の取込終了後に1回だけ実行する（二重計算の回避）。
     return report
 
 
@@ -11180,6 +11529,10 @@ def _v319_import_player_history_only(
         report["error"] = 1
         report["details"].append({"status": "error", "message": "開催日または開催場が不正です"})
         return report
+    try:
+        _v319_ensure_perf_indexes(db_path)
+    except Exception:
+        pass
     races = _v319_ordered_race_nos(ymd, venue, max_races)
     for n in races:
         item = {"venue": venue, "R": n, "status": "", "message": "", "added": 0}
@@ -11676,6 +12029,14 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             current_label="開催確認",
             message="対象レースを数えています",
         )
+        try:
+            _v319_ensure_perf_indexes(db_path)
+        except Exception:
+            pass
+        _V287_IMPORT_STATE_RESET.clear()
+        _V287_IMPORT_STATE_RESET.update(_v287_calibration_state(db_path))
+        _V287_AUTO_IMPORT_STATE.clear()
+        _V287_AUTO_IMPORT_STATE.update(_V287_IMPORT_STATE_RESET)
         ymd = str(req.get("ymd") or "")
         venues = list(req.get("venues") or [])
         targets = []
@@ -11764,10 +12125,23 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 result_blob=mid_blob,
             )
             time_module.sleep(0.2)
+        _v287_recalc_result = {}
         try:
-            _v287_recalculate_global_transition_calibration(db_path)
+            _v287_recalc_result = _v287_recalculate_global_transition_calibration(
+                db_path, force_full=bool(_v287_calibration_needs_full(db_path))
+            ) or {}
+        except Exception as _v287_exc:
+            _v287_recalc_result = {"ok": False, "mode": "?", "calibrations": 0,
+                                   "reason": "%s: %s" % (type(_v287_exc).__name__, _v287_exc)}
+        _recalc_suffix = ""
+        try:
+            _recalc_suffix = "｜全体補正" + ("更新" if _v287_recalc_result.get("ok") else "失敗") \
+                + "(%s,%s件)" % (str(_v287_recalc_result.get("mode") or "?"),
+                                 int(_v287_recalc_result.get("calibrations") or 0))
+            if not _v287_recalc_result.get("ok") and _v287_recalc_result.get("reason"):
+                _recalc_suffix += "(%s)" % str(_v287_recalc_result.get("reason"))[:60]
         except Exception:
-            pass
+            _recalc_suffix = ""
         failed_keys = [
             f"{d.get('venue','')}{d.get('R','')}R"
             for d in details
@@ -11842,7 +12216,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             finished_at=_v228_now_jst_iso(),
             done_count=total,
             current_label="完了",
-            message=f"自動取得完了｜完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}{gh_msg}",
+            message=f"自動取得完了｜完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}{gh_msg}{_recalc_suffix}",
             result_blob=blob,
         )
     except Exception as exc:
@@ -11919,6 +12293,14 @@ def _v319_bg_history_worker(db_path: str, job_id: int, req: dict) -> None:
             current_label="開催確認",
             message="対象レースを数えています（選手履歴のみ）",
         )
+        try:
+            _v319_ensure_perf_indexes(db_path)
+        except Exception:
+            pass
+        _V287_IMPORT_STATE_RESET.clear()
+        _V287_IMPORT_STATE_RESET.update(_v287_calibration_state(db_path))
+        _V287_AUTO_IMPORT_STATE.clear()
+        _V287_AUTO_IMPORT_STATE.update(_V287_IMPORT_STATE_RESET)
         ymd = str(req.get("ymd") or "")
         venues = list(req.get("venues") or [])
         min_rows = int(req.get("min_rows") or 30)
@@ -24782,6 +25164,9 @@ if selected_main_page == "✅ 結果登録・解析":
             else:
                 all_rep = {"ok": 0, "skip": 0, "error": 0, "details": []}
                 with st.spinner(f"{ymd} {','.join(venues)} を取得しています…"):
+                    _v319_prev_state = _v287_calibration_state(engine.DB_PATH)
+                    _V287_IMPORT_STATE_RESET.clear()
+                    _V287_IMPORT_STATE_RESET.update(_v319_prev_state)
                     for vn in venues:
                         rep = _v319_import_official_results(
                             engine.DB_PATH,
@@ -24797,6 +25182,36 @@ if selected_main_page == "✅ 結果登録・解析":
                         all_rep["skip"] += int(rep.get("skip") or 0)
                         all_rep["error"] += int(rep.get("error") or 0)
                         all_rep["details"].extend(rep.get("details") or [])
+                    # 取込で予測が増えていたら、取込終了後に1回だけ全件で再集計する。
+                    _v287_do_full = False
+                    try:
+                        _v287_now_state = _v287_calibration_state(engine.DB_PATH)
+                        _v287_do_full = (
+                            int(_v287_now_state.get("history_id") or 0)
+                            != int(_v319_prev_state.get("history_id") or 0)
+                        )
+                    except Exception:
+                        _v287_do_full = False
+                    if _v287_do_full:
+                        try:
+                            _v287_inc = _v287_recalculate_global_transition_calibration(
+                                engine.DB_PATH, force_full=True
+                            )
+                            all_rep["v287_recalc"] = {
+                                "mode": str((_v287_inc or {}).get("mode") or "full"),
+                                "ok": bool((_v287_inc or {}).get("ok")),
+                                "calibrations": int((_v287_inc or {}).get("calibrations") or 0),
+                                "reason": str((_v287_inc or {}).get("reason") or ""),
+                            }
+                        except Exception as _v287_full_exc:
+                            all_rep["v287_recalc"] = {
+                                "mode": "full", "ok": False, "calibrations": 0,
+                                "reason": "%s: %s" % (type(_v287_full_exc).__name__, _v287_full_exc),
+                            }
+                    else:
+                        all_rep["v287_recalc"] = {
+                            "mode": "incremental", "ok": True, "calibrations": 0, "reason": "",
+                        }
                 st.session_state["v319_op_last_report"] = all_rep
                 failed_items = [
                     d for d in (all_rep.get("details") or [])
