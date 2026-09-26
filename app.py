@@ -2991,7 +2991,7 @@ def _v279_bg_prediction_any_active(db_path: str) -> bool:
             con.execute("PRAGMA busy_timeout=30000")
             row=con.execute("""
                 SELECT COUNT(*) FROM v278_background_jobs
-                WHERE job_type IN ('normal_prediction','batch_rerun','official_import')
+                WHERE job_type IN ('normal_prediction','batch_rerun','official_import','player_history_import')
                   AND status IN ('queued','running','pause_requested','paused','cancel_requested')
             """).fetchone()
         return bool(int(row[0] or 0))
@@ -11046,6 +11046,185 @@ def _v319_import_official_results(
     return report
 
 
+def _v319_import_player_history_one_race(
+    db_path: str, ymd: str, venue: str, race_no: int,
+    min_rows: int = 30, on_step=None,
+) -> dict:
+    """1レース分の「選手履歴だけ」公式取込。
+
+    出走表(SpRaceInfo)から選手名/選手CDを取得し、選手履歴の保存だけを実行する。
+    予測・オッズ取得・結果登録は一切行わない。
+    """
+    def _step(msg: str) -> None:
+        if on_step:
+            try:
+                on_step(str(msg))
+            except Exception:
+                pass
+
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    venue = str(venue or "").strip()
+    race_no = int(race_no)
+    key_guess = f"{ymd}_{venue}_{race_no}R"
+
+    # --- 1) 出走表から選手を取得（選手履歴には選手名と選手CDが必要） ---
+    players = []
+    _step("出走表")
+    try:
+        sp_html = _v319_fetch_sprace_html(ymd, venue, race_no)
+        if not str(sp_html or "").strip():
+            return {
+                "status": "error",
+                "phase": "fetch_card",
+                "message": f"{venue} {race_no}R：出走表が空です。選手履歴は登録していません。",
+                "key": key_guess,
+                "next_action": "retry",
+            }
+        players = _v319_parse_sprace_car_rows(sp_html) or _v319_parse_sprace_players(sp_html)
+        if not players:
+            return {
+                "status": "error",
+                "phase": "fetch_card",
+                "message": f"{venue} {race_no}R：出走表から選手を取得できませんでした。選手履歴は登録していません。",
+                "key": key_guess,
+                "next_action": "retry",
+            }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "phase": "fetch_card",
+            "message": (
+                f"{venue} {race_no}R：出走表取得に失敗しました。"
+                f" 選手履歴は登録していません。"
+                f" ({type(exc).__name__}: {exc})"
+            ),
+            "key": key_guess,
+            "next_action": "retry",
+        }
+
+    # --- 2) 選手履歴のみ保存（公式PC版/SP版 PlayerDetail → DB） ---
+    _step("選手履歴")
+    try:
+        filled = _v319_fill_player_histories(
+            db_path, players, min_rows=int(min_rows or 30),
+            before_ymd=ymd, before_venue=venue, before_race=race_no,
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "phase": "save_player_history",
+            "message": (
+                f"{venue} {race_no}R：選手履歴登録に失敗しました。"
+                f" ({type(exc).__name__}: {exc})"
+            ),
+            "key": key_guess,
+            "player_history_saved": False,
+            "added": 0,
+            "next_action": "retry",
+        }
+
+    added = int(filled.get("added") or 0)
+    skipped = int(filled.get("skipped") or 0)
+    errors = int(filled.get("errors") or 0)
+    detail = " / ".join(str(x) for x in (filled.get("details") or [])[:8])
+    hist_msg = f"履歴+{added} / 変化なし{skipped} / エラー{errors}"
+
+    # 履歴が0件の選手が残っていれば error、全員そろえば ok
+    missing = []
+    for p in players:
+        nm = str(p.get("name") or "").strip()
+        if not nm:
+            continue
+        if int(_v319_player_history_count(db_path, nm) or 0) <= 0:
+            missing.append(nm)
+    if missing or errors > 0:
+        who = ", ".join(missing[:5]) if missing else "取込エラーあり"
+        return {
+            "status": "error",
+            "phase": "save_player_history",
+            "message": (
+                f"{venue} {race_no}R：選手履歴が不足しています。不足選手：{who}。"
+                f" {hist_msg}" + (f"｜{detail}" if detail else "")
+            ),
+            "key": key_guess,
+            "player_history_saved": bool(added > 0),
+            "added": added,
+            "next_action": "retry",
+            "notify": True,
+            "notify_message": f"【履歴失敗】{venue}{race_no}R：{who}の履歴が不足/失敗。",
+        }
+
+    return {
+        "status": "ok",
+        "phase": "save_player_history",
+        "message": (
+            f"{venue} {race_no}R：選手履歴のみ保存しました（{len(players)}人）。"
+            f" {hist_msg}" + (f"｜{detail}" if detail else "")
+        ),
+        "key": key_guess,
+        "player_history_saved": True,
+        "added": added,
+        "next_action": "done",
+    }
+
+
+def _v319_import_player_history_only(
+    db_path: str, ymd: str, venue: str, max_races: int = 12,
+    min_rows: int = 30, on_step=None,
+) -> dict:
+    """開催場1つ分、全レースの選手履歴だけを順に登録する。"""
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    place = _V319_OP_PLACE.get(str(venue))
+    report = {"ok": 0, "skip": 0, "error": 0, "added": 0, "details": []}
+    if not ymd or not place:
+        report["error"] = 1
+        report["details"].append({"status": "error", "message": "開催日または開催場が不正です"})
+        return report
+    races = _v319_ordered_race_nos(ymd, venue, max_races)
+    for n in races:
+        item = {"venue": venue, "R": n, "status": "", "message": "", "added": 0}
+        try:
+            one = _v319_import_player_history_one_race(
+                db_path, ymd, venue, n, min_rows=int(min_rows or 30), on_step=on_step,
+            )
+            item["status"] = one.get("status") or "ok"
+            item["message"] = one.get("message") or ""
+            item["phase"] = one.get("phase") or ""
+            item["added"] = int(one.get("added") or 0)
+            if one.get("notify_message"):
+                item["notify_message"] = one.get("notify_message")
+            report["added"] += int(one.get("added") or 0)
+            if item["status"] == "skip":
+                report["skip"] += 1
+            elif item["status"] == "error":
+                report["error"] += 1
+            else:
+                report["ok"] += 1
+        except Exception as exc:
+            item["status"] = "error"
+            item["message"] = f"{type(exc).__name__}: {exc}"
+            report["error"] += 1
+        report["details"].append(item)
+        time_module.sleep(0.35)
+    return report
+
+
+def _v319_bg_history_any_active(db_path: str) -> bool:
+    """選手履歴のみ取込が稼働中か。"""
+    try:
+        _v278_bg_ensure_table(db_path)
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            row = con.execute("""
+                SELECT COUNT(*) FROM v278_background_jobs
+                WHERE job_type = 'player_history_import'
+                  AND status IN ('queued','running','pause_requested','paused','cancel_requested')
+            """).fetchone()
+        return bool(int(row[0] or 0))
+    except Exception:
+        return False
+
+
 def _v319_import_one_race(
     db_path: str, ymd: str, venue: str, race_no: int,
     skip_existing: bool, replace: bool, predict_if_missing: bool, trials: int, seed: int,
@@ -11715,6 +11894,221 @@ def _v319_bg_import_start(
     th = threading.Thread(
         target=_v319_bg_import_worker, args=(str(db_path), job_id, req),
         daemon=True, name=f"autorace-bg-import-{job_id}",
+    )
+    with _V278_BG_LOCK:
+        _V278_BG_THREADS[job_id] = th
+    th.start()
+    return {"ok": True, "job_id": job_id}
+
+
+def _v319_bg_history_worker(db_path: str, job_id: int, req: dict) -> None:
+    """選手履歴のみのバックグラウンド取込。予測・オッズ・結果登録は行わない。"""
+    details = []
+    ok = skip = err = added = 0
+    try:
+        try:
+            _v278_bg_update(
+                db_path, job_id,
+                result_blob=zlib.compress(pickle.dumps({"req": req, "details": []}, protocol=4), 6),
+            )
+        except Exception:
+            pass
+        _v278_bg_update(
+            db_path, job_id, status="running",
+            started_at=_v228_now_jst_iso(),
+            current_label="開催確認",
+            message="対象レースを数えています（選手履歴のみ）",
+        )
+        ymd = str(req.get("ymd") or "")
+        venues = list(req.get("venues") or [])
+        min_rows = int(req.get("min_rows") or 30)
+        targets = []
+        seen = set()
+        for vn in venues:
+            for n in _v319_ordered_race_nos(ymd, vn, int(req.get("max_races") or 12)):
+                item = (str(vn), int(n))
+                if item in seen:
+                    continue
+                seen.add(item)
+                targets.append(item)
+        total = len(targets)
+        _v319_wx_reset_budget()
+        _v278_bg_update(db_path, job_id, total_count=total, current_label=f"{total}R 見つかりました")
+        for i, (vn, n) in enumerate(targets, 1):
+            _v278_bg_pause_loop(db_path, job_id)
+            if _v278_bg_cancel_requested(db_path, job_id):
+                blob = zlib.compress(pickle.dumps({
+                    "ok": ok, "skip": skip, "error": err, "added": added, "details": details,
+                    "cancelled": True,
+                    "summary": (
+                        f"中止｜履歴登録{ok}R / 変化なし{skip}R / 失敗{err}R"
+                        f" / 履歴+{added}件（{i-1}/{total}まで）"
+                    ),
+                }, protocol=4), 6)
+                _v278_bg_update(
+                    db_path, job_id, status="cancelled",
+                    finished_at=_v228_now_jst_iso(),
+                    done_count=max(0, i - 1),
+                    current_label="中止",
+                    message=f"今：中止｜{i-1}/{total}まで処理して中止｜登録{ok} スキップ{skip} エラー{err}",
+                    result_blob=blob,
+                )
+                return
+            _v278_bg_update(
+                db_path, job_id,
+                current_label=f"{vn} {n}R",
+                message=f"{i-1}/{total} 完了｜今は選手履歴を取得中",
+                done_count=i - 1,
+            )
+            item = {"venue": vn, "R": n, "status": "", "message": "", "added": 0}
+            try:
+                one = _v319_import_player_history_one_race(
+                    db_path, ymd, vn, n, min_rows=min_rows,
+                    on_step=lambda msg, vn=vn, n=n, i=i, total=total: _v278_bg_update(
+                        db_path, job_id,
+                        current_label=f"{vn} {n}R",
+                        message=f"{i-1}/{total} 完了｜今は{msg}",
+                        done_count=i - 1,
+                    ),
+                )
+                item["status"] = one.get("status") or "ok"
+                item["message"] = one.get("message") or ""
+                item["phase"] = one.get("phase") or ""
+                item["added"] = int(one.get("added") or 0)
+                added += item["added"]
+                if one.get("notify_message"):
+                    item["notify_message"] = one.get("notify_message")
+                st_one = str(item["status"] or "")
+                if st_one == "skip":
+                    skip += 1
+                elif st_one in ("error", "failed"):
+                    err += 1
+                else:
+                    ok += 1
+            except Exception as exc:
+                item["status"] = "error"
+                item["phase"] = "exception"
+                item["message"] = f"{type(exc).__name__}: {exc}"
+                err += 1
+            details.append(item)
+            fail_hint = ""
+            if str(item.get("status") or "") in ("error", "failed"):
+                fail_hint = f"｜失敗:{vn}{n}R"
+            mid_blob = zlib.compress(pickle.dumps({
+                "ok": ok, "skip": skip, "error": err, "added": added, "details": list(details),
+                "partial": True,
+                "summary": (
+                    f"途中経過 {i}/{total}｜履歴登録{ok}R スキップ{skip}R エラー{err}R"
+                    f"（履歴+{added}件）"
+                ),
+            }, protocol=4), 6)
+            _v278_bg_update(
+                db_path, job_id,
+                done_count=i,
+                current_label=f"{vn} {n}R {item['status']}",
+                message=f"{i}/{total}｜履歴登録{ok} スキップ{skip} エラー{err}（履歴+{added}）{fail_hint}",
+                result_blob=mid_blob,
+            )
+            time_module.sleep(0.2)
+        failed_keys = [
+            f"{d.get('venue','')}{d.get('R','')}R"
+            for d in details
+            if str(d.get("status") or "") in ("error", "failed")
+        ]
+        fail_summary = ("｜失敗: " + ", ".join(failed_keys[:8])) if failed_keys else ""
+        blob = zlib.compress(pickle.dumps({
+            "ok": ok, "skip": skip, "error": err, "added": added, "details": details,
+            "failed_keys": failed_keys,
+            "summary": (
+                f"選手履歴の登録が完了しました。履歴登録：{ok}R / 変化なし：{skip}R"
+                f" / 失敗：{err}R / 履歴+{added}件"
+            ),
+        }, protocol=4), 6)
+        # 完了通知（ntfy）。送信失敗は無視する。
+        try:
+            topic = str(__import__("os").environ.get("AUTORACE_NTFY_TOPIC", "notify") or "notify").strip()
+            body = (
+                f"選手履歴のみ取込 完了 {ymd}\n"
+                f"履歴登録{ok}R / 変化なし{skip}R / 失敗{err}R / 履歴+{added}件{fail_summary}"
+            )
+            payload = {
+                "topic": topic,
+                "title": "AutoRaceAI 選手履歴取込完了",
+                "message": body,
+                "priority": 4,
+                "tags": ["bust_in_silhouette"],
+            }
+            req_ntfy = urllib.request.Request(
+                "https://ntfy.sh",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            with urllib.request.urlopen(req_ntfy, timeout=8) as resp:
+                resp.read()
+        except Exception:
+            pass
+        _v278_bg_update(
+            db_path, job_id,
+            status="completed",
+            finished_at=_v228_now_jst_iso(),
+            done_count=total,
+            current_label="完了",
+            message=(
+                f"選手履歴の登録が完了しました｜履歴登録{ok}R / 変化なし{skip}R"
+                f" / 失敗{err}R / 履歴+{added}件{fail_summary}"
+            ),
+            result_blob=blob,
+        )
+    except Exception as exc:
+        _v278_bg_update(
+            db_path, job_id,
+            status="failed",
+            finished_at=_v228_now_jst_iso(),
+            error_text=f"{type(exc).__name__}: {exc}",
+            message=f"失敗: {exc}",
+        )
+    finally:
+        try:
+            with _V278_BG_LOCK:
+                _V278_BG_THREADS.pop(int(job_id), None)
+        except Exception:
+            pass
+
+
+def _v319_bg_history_start(
+    db_path: str, ymd: str, venues: list[str],
+    min_rows: int = 30, max_races: int = 12,
+) -> dict:
+    """選手履歴のみ取込をバックグラウンドで開始する。"""
+    _v278_bg_ensure_table(db_path)
+    if _v279_bg_prediction_any_active(db_path):
+        return {"ok": False, "reason": "別の予測・再シミュレーション・取込が動いています。完了後に開始してください。"}
+    if _v319_bg_history_any_active(db_path):
+        return {"ok": False, "reason": "選手履歴の取込が既に動いています。完了後に開始してください。"}
+    if not venues:
+        return {"ok": False, "reason": "開催場がありません。"}
+    now = _v228_now_jst_iso()
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        cur = con.execute("""
+            INSERT INTO v278_background_jobs(
+                job_type,app_version,status,created_at,updated_at,limit_count,force_current,
+                done_count,total_count,current_label,message
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            "player_history_import", str(_V231_APP_VERSION), "queued", now, now, len(venues), 0,
+            0, 0, "準備中", f"{ymd} {','.join(venues)} の選手履歴のみ取り込みます",
+        ))
+        con.commit()
+        job_id = int(cur.lastrowid or 0)
+    req = {
+        "ymd": ymd, "venues": list(venues),
+        "min_rows": int(min_rows), "max_races": int(max_races),
+    }
+    th = threading.Thread(
+        target=_v319_bg_history_worker, args=(str(db_path), job_id, req),
+        daemon=True, name=f"autorace-bg-history-{job_id}",
     )
     with _V278_BG_LOCK:
         _V278_BG_THREADS[job_id] = th
@@ -22241,6 +22635,8 @@ def _v278_bg_get_latest_active(db_path: str) -> dict:
 
 def _v278_job_kind_label(job: dict) -> str:
     t = str((job or {}).get("job_type") or "")
+    if t == "player_history_import":
+        return "選手履歴取込"
     if t == "official_import":
         return "公式取込"
     if t == "normal_prediction":
@@ -24478,6 +24874,125 @@ if selected_main_page == "✅ 結果登録・解析":
                     )
                 except Exception:
                     pass
+
+    # ===== Ver319: 選手履歴だけを自動登録 =====
+    with st.expander("👤 選手履歴だけを自動登録（予測・オッズ・結果登録なし）", expanded=False):
+        st.caption(
+            "出走表から選手を取得し、選手履歴だけを公式ページから保存します。"
+            "予測・オッズ取得・結果登録は一切行いません。"
+        )
+        hcol1, hcol2 = st.columns(2)
+        hist_date = hcol1.date_input("開催日", value=date.today(), key="v319_hist_date")
+        hist_venue = hcol2.selectbox(
+            "開催場", ["開催を探す"] + RESULT_VENUES, key="v319_hist_venue"
+        )
+        hist_min_rows = st.number_input(
+            "最低履歴件数", min_value=5, max_value=200, value=30, step=5,
+            key="v319_hist_min_rows",
+            help="この件数に満たない選手は、公式ページから履歴を取り直します。",
+        )
+        hist_ymd = hist_date.strftime("%Y%m%d")
+        hist_meets = st.session_state.get("v319_op_meetings") or []
+        hist_venues = (
+            [hist_venue] if hist_venue in RESULT_VENUES
+            else [m["venue"] for m in hist_meets]
+        )
+        hb1, hb2 = st.columns(2)
+        with hb1:
+            hist_start_fg = st.button(
+                "今すぐ選手履歴を登録", use_container_width=True, key="v319_hist_import",
+            )
+        with hb2:
+            hist_start_bg = st.button(
+                "バックグラウンドで登録", type="primary", use_container_width=True,
+                key="v319_hist_import_bg",
+            )
+        if hist_start_fg or hist_start_bg:
+            if not hist_venues:
+                st.warning("開催場を選ぶか、先に「この日の開催を確認」を実行してください。")
+            elif hist_start_bg:
+                started = _v319_bg_history_start(
+                    engine.DB_PATH, hist_ymd, hist_venues, min_rows=int(hist_min_rows),
+                )
+                if started.get("ok"):
+                    st.success(
+                        f"選手履歴のバックグラウンド取込を開始しました（ジョブ {started.get('job_id')}）。"
+                        "画面を離れても進みます。"
+                    )
+                    st.rerun()
+                else:
+                    st.warning(started.get("reason") or "開始できませんでした")
+            else:
+                all_hrep = {"ok": 0, "skip": 0, "error": 0, "added": 0, "details": []}
+                with st.spinner(f"{hist_ymd} {','.join(hist_venues)} の選手履歴を取得しています…"):
+                    for vn in hist_venues:
+                        rep = _v319_import_player_history_only(
+                            engine.DB_PATH, hist_ymd, vn, min_rows=int(hist_min_rows),
+                        )
+                        for hk in ("ok", "skip", "error", "added"):
+                            all_hrep[hk] += int(rep.get(hk) or 0)
+                        all_hrep["details"].extend(rep.get("details") or [])
+                st.session_state["v319_hist_last_report"] = all_hrep
+                st.success(
+                    f"選手履歴の登録が完了しました。履歴登録：{all_hrep['ok']}R / "
+                    f"変化なし：{all_hrep['skip']}R / 失敗：{all_hrep['error']}R / "
+                    f"履歴+{all_hrep['added']}件"
+                )
+
+        job_hist = _v278_bg_get_latest_active(engine.DB_PATH)
+        if str((job_hist or {}).get("job_type") or "") == "player_history_import":
+            st.markdown("#### 選手履歴取込の進捗")
+            done = int(job_hist.get("done_count") or 0)
+            total = int(job_hist.get("total_count") or 0)
+            status = str(job_hist.get("status") or "")
+            if total > 0:
+                st.progress(min(1.0, max(0.0, done / float(total))), text=f"{done}/{total}R")
+            else:
+                st.info("対象レースを数えています…")
+            st.caption(
+                f"今：{job_hist.get('current_label') or '-'} ｜ "
+                f"{job_hist.get('message') or status}"
+            )
+            hc1, hc2 = st.columns(2)
+            if hc1.button("進捗を更新", use_container_width=True, key="v319_hist_refresh_job"):
+                st.rerun()
+            if status in ("queued", "running", "paused", "pause_requested") and hc2.button(
+                "取込を中止", use_container_width=True, key="v319_hist_cancel_job"
+            ):
+                try:
+                    _v278_bg_request_cancel(engine.DB_PATH, int(job_hist.get("job_id") or 0))
+                    st.warning("現在のレースのあとで中止します。")
+                    st.rerun()
+                except Exception as exc:
+                    st.warning(str(exc))
+            hblob = job_hist.get("result_blob")
+            if hblob and status in ("completed", "cancelled", "failed", "running", "paused"):
+                try:
+                    hrep = pickle.loads(zlib.decompress(bytes(hblob)))
+                    if isinstance(hrep, dict) and hrep.get("details") is not None:
+                        st.session_state["v319_hist_last_report"] = hrep
+                except Exception:
+                    pass
+        last_hrep = st.session_state.get("v319_hist_last_report")
+        if last_hrep:
+            st.markdown("#### 選手履歴の取込結果（レースごと）")
+            if last_hrep.get("summary"):
+                st.caption(str(last_hrep.get("summary")))
+            hdet = last_hrep.get("details") or []
+            if hdet:
+                st.dataframe(pd.DataFrame(hdet), use_container_width=True, hide_index=True)
+                try:
+                    hcsv = pd.DataFrame(hdet).to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        "この結果をCSVダウンロード",
+                        data=hcsv,
+                        file_name=f"player_history_{_v228_now_jst_iso()[:10]}.csv",
+                        mime="text/csv",
+                        key="v319_hist_partial_csv",
+                    )
+                except Exception:
+                    pass
+        st.caption("GitHubへは自動保存しません。問題なければサイドバーのDB保存を使ってください。")
 
     saved_results = _v233_list_saved_results(engine.DB_PATH, 250)
     if saved_results:
