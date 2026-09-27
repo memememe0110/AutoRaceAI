@@ -9563,6 +9563,14 @@ def _v319_ensure_perf_indexes(db_path: str) -> dict:
         out["reason"] = "%s: %s" % (type(exc).__name__, exc)
     return out
 
+# Ver319改善#1: 起動時に冪等に索引整備（予測結果は変えない）
+if not st.session_state.get("_v319_startup_index_done"):
+    try:
+        _V319_STARTUP_INDEXES = _v319_ensure_perf_indexes(engine.DB_PATH)
+    except Exception as _v319_idx_exc:
+        _V319_STARTUP_INDEXES = {"ok": False, "reason": f"{type(_v319_idx_exc).__name__}: {_v319_idx_exc}"}
+    st.session_state["_v319_startup_index_done"] = True
+
 
 def _v319_open_conn(db_path: str):
     """Ver319改善#2: 取込1レース分を使い回す接続。"""
@@ -10469,9 +10477,9 @@ def _v319_fill_player_histories(
                 before_d = _v319_ymd_digits(before_ymd)
 
                 # ========== 1) DB状態 ==========
-                have, latest_d = _v319_player_history_latest_fast(db_path, name)
+                have, latest_d = _v319_player_history_latest_fast(db_path, name, con=con)
                 latest_d = _v319_ymd_digits(latest_d)
-                state = _v319_player_history_state(db_path, name)
+                state = _v319_player_history_state(db_path, name, con=con)
                 have_keys = set(state.get("keys") or set())
                 dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
 
@@ -10537,7 +10545,8 @@ def _v319_fill_player_histories(
 
                 # result_entries からの補完
                 extra = _v319_history_from_results(
-                    db_path, name, before_ymd or latest_d, before_venue, before_race
+                    db_path, name, before_ymd or latest_d, before_venue, before_race,
+                    con=con,
                 )
                 if extra is not None and not extra.empty:
                     if "車番" not in extra.columns:
@@ -10784,7 +10793,7 @@ def _v319_fill_player_histories(
                     except Exception:
                         pass
 
-                after = _v319_player_history_count(db_path, name)
+                after = _v319_player_history_count(db_path, name, con=con)
                 delta = max(changed, max(0, after - have))
                 added += delta
                 if need_refresh:
@@ -10793,7 +10802,7 @@ def _v319_fill_player_histories(
                 # 穴なし確認: 対象日までの最新が埋まり、missing_official が解消された時だけ
                 # キャッシュスキップ登録する（次回の無駄な再取得を防ぐ）。
                 try:
-                    after_state = _v319_player_history_state(db_path, name)
+                    after_state = _v319_player_history_state(db_path, name, con=con)
                     after_keys = set(after_state.get("keys") or set())
                     after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
                     _remaining_missing = official_keys - after_keys
