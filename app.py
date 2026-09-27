@@ -11835,8 +11835,72 @@ def _v319_register_void_result(
     return {"key": key, "ok": True, "void": True, "reason": reason}
 
 
-def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, replace: bool = False) -> dict:
+
+def _v320_extract_race_no_from_result_text(text: str):
+    """結果本文からレース番号を抽出する安全網。
+
+    優先順位:
+      1. 先頭付近の 'NR' / '第NR'
+      2. 'レース番号: N' など
+    取れなければ None。
+    """
+    s = str(text or "")
+    if not s.strip():
+        return None
+    head = s[:800]
+    for m in re.finditer(
+        r"(?:^|\n)\s*(?:第\s*)?(\d{1,2})\s*[RrＲ]\s*(?=\n|$|\s|確定|締切)",
+        head,
+    ):
+        try:
+            n = int(m.group(1))
+        except Exception:
+            continue
+        if 1 <= n <= 12:
+            return n
+    m = re.search(r"レース(?:番号)?\s*[:：]?\s*(\d{1,2})", head)
+    if m:
+        try:
+            n = int(m.group(1))
+        except Exception:
+            n = 0
+        if 1 <= n <= 12:
+            return n
+    return None
+
+
+def _v320_fill_race_no_in_meta(meta, raw_text: str = "", race_no_hint=None):
+    """meta['レース'] が空/不正なら hint または本文から補完する。"""
+    meta_out = dict(meta or {})
+    try:
+        rn = int(meta_out.get("レース") or 0)
+    except Exception:
+        rn = 0
+    if 1 <= rn <= 12:
+        return meta_out
+    fill = None
+    try:
+        if race_no_hint is not None and str(race_no_hint).strip():
+            fill = int(re.sub(r"[^0-9]", "", str(race_no_hint)) or 0)
+    except Exception:
+        fill = None
+    if not fill or not (1 <= int(fill) <= 12):
+        fill = _v320_extract_race_no_from_result_text(raw_text)
+    if fill and 1 <= int(fill) <= 12:
+        meta_out["レース"] = int(fill)
+    return meta_out
+
+
+def _v319_register_fetched_result(
+    db_path: str,
+    raw_text: str,
+    venue: str,
+    replace: bool = False,
+    race_no_hint=None,
+) -> dict:
     meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(raw_text, venue, "")
+    # Ver320: parser がレース番号を落としても hint/本文から補完
+    meta_r = _v320_fill_race_no_in_meta(meta_r, raw_text, race_no_hint=race_no_hint)
     meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(raw_text, meta_r, rows_r)
     # 「/停止」は発走前除外。engine が発走後事故にしていたのをここで矯正。
     meta_r, teishi_cars = _v320_reclassify_teishi_as_kessha(meta_r, rows_r, raw_text)
@@ -12628,7 +12692,7 @@ def _v319_import_one_race(
             "key": key_guess,
         }
     try:
-        saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
+        saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace), race_no_hint=int(race_no))
     except Exception as exc:
         emsg = f"{type(exc).__name__}: {exc}"
         # 予測と結果の台数/車番不一致 → 反妨補完 or 再予測 or 予測クリア後の強制登録
@@ -12656,12 +12720,12 @@ def _v319_import_one_race(
                     except Exception:
                         pass
                     pred_msg += f" / {reason}"
-                    return _v319_register_fetched_result(db_path, raw, venue, replace=True)
+                    return _v319_register_fetched_result(db_path, raw, venue, replace=True, race_no_hint=int(race_no))
 
                 if missing_cars and inc_cars and set(missing_cars).issubset(set(inc_cars)):
                     _step("反妨台数→結果補完")
                     pred_msg += " / 反妨車を結果に補完"
-                    saved = _v319_register_fetched_result(db_path, raw, venue, replace=True)
+                    saved = _v319_register_fetched_result(db_path, raw, venue, replace=True, race_no_hint=int(race_no))
                 else:
                     _step("台数不一致→再予測")
                     if not str(card_text or "").strip():
@@ -12679,7 +12743,7 @@ def _v319_import_one_race(
                     if pred.get("ok"):
                         pred_msg += " / 結果前に再予測"
                         try:
-                            saved = _v319_register_fetched_result(db_path, raw, venue, replace=True)
+                            saved = _v319_register_fetched_result(db_path, raw, venue, replace=True, race_no_hint=int(race_no))
                         except Exception as exc_retry:
                             saved = _force_register_without_prediction(
                                 f"再予測後も不一致のため予測削除して結果保存({type(exc_retry).__name__})"
@@ -12691,7 +12755,7 @@ def _v319_import_one_race(
             except Exception as exc2:
                 try:
                     _v319_clear_prediction(db_path, key_guess)
-                    saved = _v319_register_fetched_result(db_path, raw, venue, replace=True)
+                    saved = _v319_register_fetched_result(db_path, raw, venue, replace=True, race_no_hint=int(race_no))
                     pred_msg += f" / 例外後に予測削除して結果保存({type(exc2).__name__})"
                 except Exception as exc3:
                     return {
@@ -26335,6 +26399,14 @@ if selected_main_page == "✅ 結果登録・解析":
                     meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(
                         result_text, venue_override, race_no_override
                     )
+                    # Ver320: 非compactでもレース番号を補完
+                    meta_r = _v320_fill_race_no_in_meta(
+                        meta_r, result_text, race_no_hint=race_no_override
+                    )
+                # compact 経路でもレース番号が空なら本文から補完
+                meta_r = _v320_fill_race_no_in_meta(
+                    meta_r, result_text, race_no_hint=race_no_override
+                )
                 meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(
                     result_text, meta_r, rows_r
                 )
