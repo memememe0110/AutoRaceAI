@@ -27419,24 +27419,32 @@ if selected_main_page == "🗃️ 登録情報確認":
                     st.divider()
                     st.subheader("DBメンテナンス")
                     st.caption("姓名の空白違いと数値完全一致の同一走行を整理します。ただしRが異なる組み合わせは勝手に統合せず、確認対象として残します。")
+                    _show_sticky_notice("v320_dedup_notice")
                     if st.button("完全一致を含む重複データを一括統合", use_container_width=True):
                         # Ver320: DB書き換え直後のフルGitHub pushはOOMしやすいため分離
-                        with st.spinner("重複統合中（GitHub保存はしません）…"):
-                            result = engine.v32_merge_duplicate_players(engine.DB_PATH)
-                            exact_result = engine.v58_cleanup_exact_numeric_duplicates(engine.DB_PATH)
-                            race_result = engine.v33_cleanup_duplicate_histories(engine.DB_PATH)
-                            identity_result = engine.v46_cleanup_player_identity_duplicates(engine.DB_PATH)
-                        summary = (
-                            f"選手 {result['merged_players']}件を統合、履歴 {result['moved_histories']}件を移動、"
-                            f"数値完全一致の正規履歴 {exact_result['merged_histories']}件・詳細履歴 {exact_result['merged_imports']}件、R相違の確認対象 {exact_result.get('r_conflicts', 0)}組、"
-                            f"その他の同一走行履歴 {race_result['deleted_histories']}件・詳細履歴 {race_result['deleted_imports']}件、"
-                            f"レース識別違いの正規履歴 {identity_result['merged_histories']}件・詳細履歴 {identity_result['merged_imports']}件を統合しました。"
-                        )
-                        st.success(summary)
-                        st.warning(
-                            "GitHub保存は自動では行いません。"
-                            "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
-                        )
+                        # st.rerun()後も結果が見えるよう sticky notice を使う
+                        try:
+                            with st.spinner("重複統合中（GitHub保存はしません）…"):
+                                result = engine.v32_merge_duplicate_players(engine.DB_PATH)
+                                exact_result = engine.v58_cleanup_exact_numeric_duplicates(engine.DB_PATH)
+                                race_result = engine.v33_cleanup_duplicate_histories(engine.DB_PATH)
+                                identity_result = engine.v46_cleanup_player_identity_duplicates(engine.DB_PATH)
+                            summary = (
+                                f"選手 {result['merged_players']}件を統合、履歴 {result['moved_histories']}件を移動、"
+                                f"数値完全一致の正規履歴 {exact_result['merged_histories']}件・詳細履歴 {exact_result['merged_imports']}件、"
+                                f"R相違の確認対象 {exact_result.get('r_conflicts', 0)}組、"
+                                f"その他の同一走行履歴 {race_result['deleted_histories']}件・詳細履歴 {race_result['deleted_imports']}件、"
+                                f"レース識別違いの正規履歴 {identity_result['merged_histories']}件・詳細履歴 {identity_result['merged_imports']}件を統合しました。"
+                                "\n\nGitHub保存は自動では行いません。"
+                                "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
+                            )
+                            _set_sticky_notice("v320_dedup_notice", "success", summary)
+                        except Exception as _dedup_exc:
+                            _set_sticky_notice(
+                                "v320_dedup_notice",
+                                "error",
+                                f"重複統合エラー: {type(_dedup_exc).__name__}: {_dedup_exc}",
+                            )
                         st.rerun()
 
                     st.divider()
@@ -27613,21 +27621,27 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 st.dataframe(pd.DataFrame(accident_status["対象レース"]), use_container_width=True, hide_index=True)
                     except Exception as exc:
                         st.caption(f"事故レース状況を取得できませんでした: {exc}")
+                    _show_sticky_notice("v320_accident_notice")
                     if st.button("登録済み結果を再点検して事故レースを学習対象外にする", use_container_width=True):
-                        with st.spinner("登録済み結果を再点検しています（GitHub保存はしません）..."):
-                            accident_result = engine.v76_reclassify_existing_accident_races(engine.DB_PATH)
-                        summary = (
-                            f"{accident_result.get('結果レース確認', 0)}レースを確認し、"
-                            f"事故 {accident_result.get('事故レース', 0)}レースを学習対象外にしました。"
-                            f" 選手履歴 {accident_result.get('選手履歴除外', 0)}行を除外、"
-                            f"周回学習 {accident_result.get('周回学習削除', 0)}行・"
-                            f"事故レースの重み履歴 {accident_result.get('重み履歴削除', 0)}件を削除しました。"
-                        )
-                        st.success(summary)
-                        st.warning(
-                            "GitHub保存は自動では行いません。"
-                            "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
-                        )
+                        try:
+                            with st.spinner("登録済み結果を再点検しています（GitHub保存はしません）..."):
+                                accident_result = engine.v76_reclassify_existing_accident_races(engine.DB_PATH)
+                            summary = (
+                                f"{accident_result.get('結果レース確認', 0)}レースを確認し、"
+                                f"事故 {accident_result.get('事故レース', 0)}レースを学習対象外にしました。"
+                                f" 選手履歴 {accident_result.get('選手履歴除外', 0)}行を除外、"
+                                f"周回学習 {accident_result.get('周回学習削除', 0)}行・"
+                                f"事故レースの重み履歴 {accident_result.get('重み履歴削除', 0)}件を削除しました。"
+                                "\n\nGitHub保存は自動では行いません。"
+                                "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
+                            )
+                            _set_sticky_notice("v320_accident_notice", "success", summary)
+                        except Exception as _exc:
+                            _set_sticky_notice(
+                                "v320_accident_notice",
+                                "error",
+                                f"{type(_exc).__name__}: {_exc}",
+                            )
                         st.rerun()
 
                     st.divider()
@@ -27644,24 +27658,32 @@ if selected_main_page == "🗃️ 登録情報確認":
                     except Exception as exc:
                         st.caption(f"再学習状況を取得できませんでした: {exc}")
 
+                    _show_sticky_notice("v320_gn_notice")
                     if st.button("登録済みグランドノートを全件再学習", use_container_width=True):
-                        with st.spinner("登録済みグランドノートを再同期しています（GitHub保存はしません）..."):
-                            gn_result = engine.v62_rebuild_grand_note_learning(engine.DB_PATH)
-                        summary = (
-                            f"対象 {gn_result.get('対象レース', 0)}レース・{gn_result.get('対象選手', 0)}選手、"
-                            f"周回 {gn_result.get('同期成功', 0)}行を反映 "
-                            f"（新規 {gn_result.get('新規', 0)} / 更新 {gn_result.get('更新', 0)}）。"
-                        )
-                        if gn_result.get('結果選手不明', 0) or gn_result.get('選手不明', 0):
-                            summary += (
-                                f" 選手名不足 {gn_result.get('結果選手不明', 0)}行、"
-                                f"選手未解決 {gn_result.get('選手不明', 0)}行。"
+                        try:
+                            with st.spinner("登録済みグランドノートを再同期しています（GitHub保存はしません）..."):
+                                gn_result = engine.v62_rebuild_grand_note_learning(engine.DB_PATH)
+                            summary = (
+                                f"対象 {gn_result.get('対象レース', 0)}レース・{gn_result.get('対象選手', 0)}選手、"
+                                f"周回 {gn_result.get('同期成功', 0)}行を反映 "
+                                f"（新規 {gn_result.get('新規', 0)} / 更新 {gn_result.get('更新', 0)}）。"
                             )
-                        st.success(summary)
-                        st.warning(
-                            "GitHub保存は自動では行いません。"
-                            "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
-                        )
+                            if gn_result.get('結果選手不明', 0) or gn_result.get('選手不明', 0):
+                                summary += (
+                                    f" 選手名不足 {gn_result.get('結果選手不明', 0)}行、"
+                                    f"選手未解決 {gn_result.get('選手不明', 0)}行。"
+                                )
+                            summary += (
+                                "\n\nGitHub保存は自動では行いません。"
+                                "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
+                            )
+                            _set_sticky_notice("v320_gn_notice", "success", summary)
+                        except Exception as _exc:
+                            _set_sticky_notice(
+                                "v320_gn_notice",
+                                "error",
+                                f"{type(_exc).__name__}: {_exc}",
+                            )
                         st.rerun()
 
                     st.divider()
@@ -28118,19 +28140,26 @@ if selected_main_page == "🗃️ 登録情報確認":
                         unresolved = []
                         st.error(f"未リンク診断に失敗しました: {exc}")
 
+                    # unresolved が空になっても最後の修復結果を表示するため if の外で show
+                    _show_sticky_notice("v320_gnlink_notice")
                     if unresolved:
                         if st.button("一意に決まる未リンクだけ自動修復", use_container_width=True):
-                            with st.spinner("未リンクを自動修復しています（GitHub保存はしません）..."):
-                                repair_result = engine.v63_auto_repair_grand_note_links(engine.DB_PATH)
-                            summary = (
-                                f"{repair_result.get('repaired_groups', 0)}組・{repair_result.get('synced_rows', 0)}行を修復。"
-                                f"手動確認 {repair_result.get('manual_groups', 0)}組。"
-                            )
-                            st.success(summary)
-                            st.warning(
-                                "GitHub保存は自動では行いません。"
-                                "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
-                            )
+                            try:
+                                with st.spinner("未リンクを自動修復しています（GitHub保存はしません）..."):
+                                    repair_result = engine.v63_auto_repair_grand_note_links(engine.DB_PATH)
+                                summary = (
+                                    f"{repair_result.get('repaired_groups', 0)}組・{repair_result.get('synced_rows', 0)}行を修復。"
+                                    f"手動確認 {repair_result.get('manual_groups', 0)}組。"
+                                    "\n\nGitHub保存は自動では行いません。"
+                                    "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
+                                )
+                                _set_sticky_notice("v320_gnlink_notice", "success", summary)
+                            except Exception as _exc:
+                                _set_sticky_notice(
+                                    "v320_gnlink_notice",
+                                    "error",
+                                    f"{type(_exc).__name__}: {_exc}",
+                                )
                             st.rerun()
 
                         player_choices = engine.v63_player_name_choices(engine.DB_PATH)
@@ -28168,17 +28197,21 @@ if selected_main_page == "🗃️ 登録情報確認":
                                         item.get('race_key'), item.get('car_no'), selected_name, engine.DB_PATH
                                     )
                                     if result.get('ok'):
-                                        st.success(
+                                        _set_sticky_notice(
+                                            "v320_gnlink_notice",
+                                            "success",
                                             result.get('message', '修復しました。')
                                             + f" 周回{result.get('synced_rows', 0)}行を再学習しました。"
+                                            + "\n\nGitHub保存は自動では行いません。"
+                                            + "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。",
                                         )
-                                        st.warning(
-                                            "GitHub保存は自動では行いません。"
-                                            "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
-                                        )
-                                        st.rerun()
                                     else:
-                                        st.warning(result.get('message', '修復できませんでした。'))
+                                        _set_sticky_notice(
+                                            "v320_gnlink_notice",
+                                            "warning",
+                                            result.get('message', '修復できませんでした。'),
+                                        )
+                                    st.rerun()
                     else:
                         st.success("未リンクのグランドノートはありません。すべて選手別学習へ反映されています。")
 
