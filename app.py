@@ -9544,6 +9544,56 @@ def _v319_create_index_if_possible(con, table: str, idx_name: str, columns) -> t
         return False, "%s: %s" % (type(exc).__name__, exc)
 
 
+def _v319_ensure_player_name_key_columns(db_path: str) -> dict:
+    """Ver319改善#5: 関数被せWHEREを等値比較へ置き換えるための正規化列。
+
+    replace 内容はフォールバック式と完全一致させ、返る行が同一になることを保証する。
+    結果は予測に影響しない（同じ行・同じ順）。
+    """
+    out = {"ok": False, "backfilled": 0, "tables": [], "reason": ""}
+    targets = [
+        ("v15_player_history_imports", "player_name"),
+        ("result_entries", "player_name"),
+    ]
+    try:
+        with sqlite3.connect(str(db_path), timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            for table, src_col in targets:
+                tabs = {r[0] for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if table not in tabs:
+                    continue
+                cols = {r[1] for r in con.execute(
+                    f'PRAGMA table_info("{table}")'
+                ).fetchall()}
+                if src_col not in cols:
+                    continue
+                if "player_name_key" not in cols:
+                    con.execute(
+                        f'ALTER TABLE "{table}" ADD COLUMN player_name_key TEXT'
+                    )
+                cur = con.execute(
+                    f'UPDATE "{table}" '
+                    f'SET player_name_key = '
+                    f"replace(replace(COALESCE(\"{src_col}\",''),' ',''),'\u3000','') "
+                    f'WHERE COALESCE(player_name_key,"") = ""'
+                )
+                out["backfilled"] += int(cur.rowcount or 0)
+                con.execute(
+                    f'CREATE INDEX IF NOT EXISTS idx_{table}_name_key '
+                    f'ON "{table}"(player_name_key) '
+                    f'WHERE player_name_key IS NOT NULL'
+                )
+                out["tables"].append(table)
+            con.commit()
+        out["ok"] = True
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+
 def _v319_ensure_perf_indexes(db_path: str) -> dict:
     """Ver319改善#1: 学習・集計のJOINを速くする索引を冪等に整備する。
 
@@ -9562,6 +9612,15 @@ def _v319_ensure_perf_indexes(db_path: str) -> dict:
     except Exception as exc:
         out["reason"] = "%s: %s" % (type(exc).__name__, exc)
     return out
+
+# Ver319改善#5: player_name_key 列を冪等に整備（結果は変えない）
+if not st.session_state.get("_v319_startup_name_key_done"):
+    try:
+        _V319_STARTUP_NAME_KEYS = _v319_ensure_player_name_key_columns(engine.DB_PATH)
+    except Exception as _v319_nk_exc:
+        _V319_STARTUP_NAME_KEYS = {"ok": False, "reason": f"{type(_v319_nk_exc).__name__}: {_v319_nk_exc}"}
+    st.session_state["_v319_startup_name_key_done"] = True
+
 
 # Ver319改善#1: 起動時に冪等に索引整備（予測結果は変えない）
 if not st.session_state.get("_v319_startup_index_done"):
