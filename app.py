@@ -6142,6 +6142,99 @@ def _v287_ensure_global_transition_calibration_table(db_path: str) -> None:
         con.commit()
 
 
+def _v287_ensure_race_contributions_table(db_path: str) -> None:
+    """Ver319改善#3 Stage1: レース単位の集計キャッシュテーブル。
+
+    payload の decompress/pickle.loads 結果をレース単位で保存し、
+    次回呼び出し時に payload_hash 一致ならスキップする。
+    sim/actual/pairs は整数なので集計順序に依存せず、
+    従来の全件再集計と同じ dynamic_logit を返す。
+    """
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS v287_race_contributions (
+            race_key TEXT NOT NULL,
+            scenario_type TEXT NOT NULL,
+            lap_no INTEGER NOT NULL,
+            sim_sum INTEGER NOT NULL DEFAULT 0,
+            actual_sum INTEGER NOT NULL DEFAULT 0,
+            pairs INTEGER NOT NULL DEFAULT 0,
+            payload_hash TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (race_key, scenario_type, lap_no)
+        )
+        """)
+        con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v287_race_contrib_key
+        ON v287_race_contributions(race_key)
+        """)
+        con.commit()
+
+
+def _v287_compute_race_contribution(payload: bytes) -> list[tuple]:
+    """1レース payload から (scenario_type, lap_no, sim, actual, pairs) の
+    整数タプルを返す。対象外・解析不能なら空リスト。
+
+    現行 _v287_recalculate_global_transition_calibration の集計ロジックを
+    1レース単位に切り出しただけ。整数演算のみで結果は完全に同一。
+    """
+    try:
+        obj = pickle.loads(zlib.decompress(payload))
+    except Exception:
+        return []
+    meta = (obj or {}).get("meta") or {}
+    audit = meta.get("6周展開シミュレーション") or meta.get("壁補正監査") or {}
+    actual_s = str(audit.get("actual_scenario_v263") or "")
+    if actual_s not in ("早仕掛け型", "中盤入替型", "後半追込型", "波乱型", "前残り型"):
+        return []
+    actual_orders = []
+    for x in (audit.get("actual_lap_comparison") or []):
+        vals = tuple(
+            int(v) for v in str(x.get("actual") or "").split("-")
+            if str(v).strip().isdigit()
+        )
+        if vals:
+            actual_orders.append(vals)
+    same = [
+        r for r in (audit.get("top_routes_v263") or [])
+        if str(r.get("scenario") or "") == actual_s
+    ]
+    if len(actual_orders) < 2 or not same:
+        return []
+    best = max(same, key=lambda r: float(r.get("similarity", 0.0) or 0.0))
+    sim_orders = []
+    for part in str(best.get("route") or "").split(" / "):
+        vals = tuple(int(v) for v in part.split("-") if str(v).strip().isdigit())
+        if vals:
+            sim_orders.append(vals)
+    L = min(6, len(actual_orders), len(sim_orders))
+    if L < 3:
+        return []
+
+    import itertools
+    from collections import defaultdict
+    lap_agg = defaultdict(lambda: {"sim": 0, "actual": 0, "pairs": 0})
+    for lap in range(3, L + 1):
+        sp0 = {c: i for i, c in enumerate(sim_orders[lap - 2])}
+        sp1 = {c: i for i, c in enumerate(sim_orders[lap - 1])}
+        ap0 = {c: i for i, c in enumerate(actual_orders[lap - 2])}
+        ap1 = {c: i for i, c in enumerate(actual_orders[lap - 1])}
+        common = set(sp0) & set(sp1) & set(ap0) & set(ap1)
+        for a, b in itertools.combinations(common, 2):
+            sf = int((sp0[a] - sp0[b]) * (sp1[a] - sp1[b]) < 0)
+            af = int((ap0[a] - ap0[b]) * (ap1[a] - ap1[b]) < 0)
+            rec = lap_agg[lap]
+            rec["sim"] += sf
+            rec["actual"] += af
+            rec["pairs"] += 1
+
+    return [
+        (actual_s, int(lap), int(rec["sim"]), int(rec["actual"]), int(rec["pairs"]))
+        for lap, rec in sorted(lap_agg.items())
+    ]
+
+
 _V287_IMPORT_STATE_RESET: dict = {}
 _V287_AUTO_IMPORT_STATE: dict = {}
 
@@ -6209,25 +6302,20 @@ def _v287_save_calibration_state(db_path: str, history_id: int = 0) -> dict:
 def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bool = False) -> dict:
     """結果登録後、登録済み全体から動的微調整値を再計算して保存する。
 
-    直前に登録した1Rだけでは更新しない。
-    保存済みVer284監査のうち実測周回比較が存在する全レースを毎回再集計する。
-    事故等で学習対象外になったレースは、実測周回比較が監査に無ければ自然に除外される。
-
-    Ver319改善#3（増分集計）:
-      force_full=False のときは pairs が変化し得ない入力（予測テーブルで
-      Ver284 より新しい行を持つレース＝取込中に新規保存された予測）を候補から外す。
-      安全側の全件フォールバック:
-        - force_full=True が指定された場合
-        - 対象レースに app_version='Ver284' の予測が1件も無い場合
-      取込の終端では _v287_calibration_needs_full() で状態が動いたかを確認し、
-      動いていれば force_full=True で全件再集計する。
+    Ver319改善#3 Stage1（レース単位キャッシュ）:
+      v287_race_contributions にレース単位の整数集計を保存する。
+      payload_hash が一致するレースは decompress/pickle.loads をスキップ。
+      最終集計は SQL SUM で従来と同じ整数和を取るため、
+      sim/actual/pairs は完全に同一、dynamic_logit も同一値になる。
     """
-    out={"ok":False,"source_races":0,"calibrations":0,"details":[],"reason":""}
+    out = {"ok": False, "source_races": 0, "calibrations": 0, "details": [], "reason": ""}
     try:
         _v287_ensure_global_transition_calibration_table(db_path)
-        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+        _v287_ensure_race_contributions_table(db_path)
+
+        # ---- 1) 対象 race_key 一覧と payload / 既存 hash を取得 ----
+        with sqlite3.connect(str(db_path), timeout=60.0) as con:
             con.execute("PRAGMA busy_timeout=60000")
-            _v287_prev_state = _v287_calibration_state(db_path)
             _v287_need_full = bool(force_full)
             if not _v287_need_full:
                 try:
@@ -6262,7 +6350,7 @@ def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bo
                   )
                 """
             rows = con.execute("""
-                SELECT h.race_key,h.payload
+                SELECT h.race_key, h.history_id, LENGTH(h.payload) AS payload_len, h.payload
                 FROM v231_prediction_history h
                 JOIN (
                     SELECT race_key,MAX(history_id) AS mid
@@ -6280,74 +6368,112 @@ def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bo
             except Exception:
                 _v287_max_hist = 0
 
-        from collections import defaultdict
-        import itertools
-        agg=defaultdict(lambda:{"sim":0,"actual":0,"pairs":0,"races":set()})
-        used_races=set()
-        for race_key,payload in rows:
+        # ---- 2) 既存 contribution の hash を race_key 単位で取得 ----
+        with sqlite3.connect(str(db_path), timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            existing = {}
             try:
-                obj=pickle.loads(zlib.decompress(payload))
-                meta=(obj or {}).get("meta") or {}
-                audit=meta.get("6周展開シミュレーション") or meta.get("壁補正監査") or {}
-                actual_s=str(audit.get("actual_scenario_v263") or "")
-                if actual_s not in ("早仕掛け型","中盤入替型","後半追込型","波乱型","前残り型"):
-                    continue
-                actual_orders=[]
-                for x in (audit.get("actual_lap_comparison") or []):
-                    vals=tuple(int(v) for v in str(x.get("actual") or "").split("-") if str(v).strip().isdigit())
-                    if vals: actual_orders.append(vals)
-                same=[r for r in (audit.get("top_routes_v263") or []) if str(r.get("scenario") or "")==actual_s]
-                if len(actual_orders)<2 or not same:
-                    continue
-                best=max(same,key=lambda r:float(r.get("similarity",0.0) or 0.0))
-                sim_orders=[]
-                for part in str(best.get("route") or "").split(" / "):
-                    vals=tuple(int(v) for v in part.split("-") if str(v).strip().isdigit())
-                    if vals: sim_orders.append(vals)
-                L=min(6,len(actual_orders),len(sim_orders))
-                if L<3: continue
-                used_races.add(str(race_key))
-                for lap in range(3,L+1):
-                    sp0={c:i for i,c in enumerate(sim_orders[lap-2])}; sp1={c:i for i,c in enumerate(sim_orders[lap-1])}
-                    ap0={c:i for i,c in enumerate(actual_orders[lap-2])}; ap1={c:i for i,c in enumerate(actual_orders[lap-1])}
-                    common=set(sp0)&set(sp1)&set(ap0)&set(ap1)
-                    for a,b in itertools.combinations(common,2):
-                        sf=int((sp0[a]-sp0[b])*(sp1[a]-sp1[b])<0)
-                        af=int((ap0[a]-ap0[b])*(ap1[a]-ap1[b])<0)
-                        rec=agg[(actual_s,lap)]
-                        rec["sim"]+=sf; rec["actual"]+=af; rec["pairs"]+=1; rec["races"].add(str(race_key))
+                for rk, ph in con.execute("""
+                    SELECT race_key, MIN(payload_hash) FROM v287_race_contributions
+                    GROUP BY race_key
+                """).fetchall():
+                    existing[str(rk)] = str(ph or "")
             except Exception:
-                continue
+                existing = {}
 
-        now=_v228_now_jst_iso()
-        saved=[]
-        with sqlite3.connect(str(db_path),timeout=60.0) as con:
+        # ---- 3) 各レースの payload_hash を計算し、必要なものだけ decompress ----
+        import hashlib as _hashlib
+        target_race_keys = set()
+        to_compute = []
+        for race_key, history_id, payload_len, payload in rows:
+            rk = str(race_key)
+            target_race_keys.add(rk)
+            try:
+                head = bytes(payload[:512]) if payload else b""
+                tail = bytes(payload[-512:]) if payload else b""
+                ph = _hashlib.md5(
+                    f"{history_id}:{payload_len}:".encode() + head + b"|" + tail
+                ).hexdigest()
+            except Exception:
+                ph = f"{history_id}:{payload_len}:hash_failed"
+            if (not force_full) and existing.get(rk) == ph:
+                continue
+            to_compute.append((rk, ph, payload))
+
+        # ---- 4) 変更分だけ decompress → v287_race_contributions へ保存 ----
+        now = _v228_now_jst_iso()
+        computed_count = 0
+        with sqlite3.connect(str(db_path), timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                all_existing_keys = {str(r[0]) for r in con.execute(
+                    "SELECT DISTINCT race_key FROM v287_race_contributions"
+                ).fetchall()}
+            except Exception:
+                all_existing_keys = set()
+            stale_keys = all_existing_keys - target_race_keys
+            if stale_keys:
+                con.executemany(
+                    "DELETE FROM v287_race_contributions WHERE race_key=?",
+                    [(k,) for k in stale_keys],
+                )
+            for rk, ph, payload in to_compute:
+                con.execute("DELETE FROM v287_race_contributions WHERE race_key=?", (rk,))
+                contribs = _v287_compute_race_contribution(payload)
+                for (sc, lap, s, a, p) in contribs:
+                    con.execute("""
+                        INSERT INTO v287_race_contributions
+                        (race_key, scenario_type, lap_no, sim_sum, actual_sum,
+                         pairs, payload_hash, updated_at)
+                        VALUES (?,?,?,?,?,?,?,?)
+                    """, (rk, sc, int(lap), int(s), int(a), int(p), ph, now))
+                computed_count += 1
+            skipped_count = len(rows) - len(to_compute)
+            con.commit()
+
+        # ---- 5) SQL SUM で集計（従来と同じ整数和） ----
+        with sqlite3.connect(str(db_path), timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            agg_rows = con.execute("""
+                SELECT scenario_type, lap_no,
+                       SUM(sim_sum)    AS sim_total,
+                       SUM(actual_sum) AS actual_total,
+                       SUM(pairs)      AS pairs_total,
+                       COUNT(DISTINCT race_key) AS race_count
+                FROM v287_race_contributions
+                GROUP BY scenario_type, lap_no
+            """).fetchall()
+
+        # ---- 6) v287_global_transition_calibration を書き換え（従来同一ロジック） ----
+        saved = []
+        with sqlite3.connect(str(db_path), timeout=60.0) as con:
             con.execute("PRAGMA busy_timeout=60000")
             con.execute("BEGIN IMMEDIATE")
             con.execute("DELETE FROM v287_global_transition_calibration")
-            for (scenario,lap),rec in sorted(agg.items()):
-                nr=len(rec["races"]); npairs=int(rec["pairs"] or 0)
-                if nr<4 or npairs<80:
+            for scenario, lap, sim_total, actual_total, pairs_total, race_count in agg_rows:
+                nr = int(race_count or 0)
+                npairs = int(pairs_total or 0)
+                if nr < 4 or npairs < 80:
                     continue
-                sim_rate=float(rec["sim"])/max(1,npairs)
-                act_rate=float(rec["actual"])/max(1,npairs)
-                residual=act_rate-sim_rate
-                # 固定値が主役。全体再集計側は小さな微調整のみ。
-                shrink=float(nr)/(float(nr)+8.0)
-                dyn=float(np.clip(residual*1.2*shrink,-0.10,0.10))
+                sim_rate = float(sim_total or 0) / max(1, npairs)
+                act_rate = float(actual_total or 0) / max(1, npairs)
+                residual = act_rate - sim_rate
+                shrink = float(nr) / (float(nr) + 8.0)
+                dyn = float(np.clip(residual * 1.2 * shrink, -0.10, 0.10))
                 con.execute("""
                     INSERT INTO v287_global_transition_calibration(
-                        scenario_type,lap_no,sample_races,sample_pairs,
-                        sim_flip_rate,actual_flip_rate,residual,dynamic_logit,recalculated_at
+                        scenario_type, lap_no, sample_races, sample_pairs,
+                        sim_flip_rate, actual_flip_rate, residual,
+                        dynamic_logit, recalculated_at
                     ) VALUES (?,?,?,?,?,?,?,?,?)
-                """,(scenario,int(lap),nr,npairs,sim_rate,act_rate,residual,dyn,now))
+                """, (scenario, int(lap), nr, npairs, sim_rate, act_rate, residual, dyn, now))
                 saved.append({
-                    "scenario":scenario,"lap":int(lap),"races":nr,"pairs":npairs,
-                    "dynamic_logit":dyn,
+                    "scenario": scenario, "lap": int(lap),
+                    "races": nr, "pairs": npairs, "dynamic_logit": dyn,
                 })
             con.commit()
 
-        # prediction-side cache must not retain values calculated before result registration.
         try:
             _V285_SAME_SCENARIO_CACHE.clear()
         except Exception:
@@ -6360,17 +6486,19 @@ def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bo
             _st_new = {}
         out.update({
             "ok": True,
-            "source_races": len(used_races),
+            "source_races": len(target_race_keys),
             "calibrations": len(saved),
-            "mode": "full" if _v287_need_full else "incremental",
+            "mode": ("full" if _v287_need_full else "incremental")
+                    + f"(computed={computed_count},cached={skipped_count})",
             "state_full": bool(_v287_need_full),
             "state_history_id": int(_v287_max_hist or 0),
-            "state_pairs": int((_st_new or {}).get("pairs") if (_st_new or {}).get("pairs") is not None else -1),
+            "state_pairs": int((_st_new or {}).get("pairs")
+                               if (_st_new or {}).get("pairs") is not None else -1),
             "details": saved,
         })
         return out
     except Exception as exc:
-        out["reason"]=f"{type(exc).__name__}: {exc}"
+        out["reason"] = f"{type(exc).__name__}: {exc}"
         return out
 
 
