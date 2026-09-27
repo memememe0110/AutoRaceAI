@@ -9869,7 +9869,7 @@ def _v319_player_history_state(db_path: str, player_name: str, con=None) -> dict
                     if ds:
                         out["keys"].add((ds, vn, rn))
         except Exception:
-            pass
+            return None   # 変更前: pass
     finally:
         if _own:
             try:
@@ -9961,7 +9961,7 @@ def _v319_player_history_latest_fast(db_path: str, player_name: str, con=None) -
         latest = latest[:8] if len(latest) >= 8 else ""
         return cnt, latest
     except Exception:
-        return 0, ""
+        return None, ""   # 変更前: return 0, ""
     finally:
         if _own:
             try:
@@ -9987,7 +9987,7 @@ def _v319_player_history_count(db_path: str, player_name: str, con=None) -> int:
         ).fetchone()
         return int((row or [0])[0] or 0)
     except Exception:
-        return 0
+        return None   # 変更前: return 0
     finally:
         if _own:
             try:
@@ -10697,8 +10697,16 @@ def _v319_fill_player_histories(
 
                 # ========== 1) DB状態 ==========
                 have, latest_d = _v319_player_history_latest_fast(db_path, name, con=con)
+                if have is None:
+                    errors += 1
+                    details.append(f"{name}:DB読取エラー(history_latest)")
+                    continue
                 latest_d = _v319_ymd_digits(latest_d)
                 state = _v319_player_history_state(db_path, name, con=con)
+                if state is None:
+                    errors += 1
+                    details.append(f"{name}:DB読取エラー(history_state)")
+                    continue
                 have_keys = set(state.get("keys") or set())
                 dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
 
@@ -11012,7 +11020,8 @@ def _v319_fill_player_histories(
                     except Exception:
                         pass
 
-                after = _v319_player_history_count(db_path, name, con=con)
+                after_raw = _v319_player_history_count(db_path, name, con=con)
+                after = int(after_raw) if after_raw is not None else int(have)
                 delta = max(changed, max(0, after - have))
                 added += delta
                 if need_refresh:
@@ -11022,13 +11031,17 @@ def _v319_fill_player_histories(
                 # キャッシュスキップ登録する（次回の無駄な再取得を防ぐ）。
                 try:
                     after_state = _v319_player_history_state(db_path, name, con=con)
-                    after_keys = set(after_state.get("keys") or set())
-                    after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
-                    _remaining_missing = official_keys - after_keys
-                    if before_d and after_latest and after_latest >= before_d and not _remaining_missing:
-                        _V319_HIST_SKIPPED.add(cache_key)
-                    elif not before_d and after >= min_rows and not _remaining_missing:
-                        _V319_HIST_SKIPPED.add(cache_key)
+                    if after_state is None:
+                        # 読取失敗時はキャッシュスキップ登録だけ諦める（次回再チェック）
+                        pass
+                    else:
+                        after_keys = set(after_state.get("keys") or set())
+                        after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
+                        _remaining_missing = official_keys - after_keys
+                        if before_d and after_latest and after_latest >= before_d and not _remaining_missing:
+                            _V319_HIST_SKIPPED.add(cache_key)
+                        elif not before_d and after >= min_rows and not _remaining_missing:
+                            _V319_HIST_SKIPPED.add(cache_key)
                 except Exception:
                     pass
 
@@ -26097,6 +26110,7 @@ if selected_main_page == "✅ 結果登録・解析":
                         st.caption(
                             f"🔄 Ver287全体補正を再計算：登録済み監査{int(_gr287.get('source_races') or 0)}R全体"
                             f" → 補正{int(_gr287.get('calibrations') or 0)}条件を更新"
+                            f"｜mode={_gr287.get('mode', '?')}"   # ← この行を追加
                         )
                     elif _gr287.get("reason") and _gr287.get("reason")!="学習対象外":
                         st.warning("Ver287全体補正の再計算に失敗しました: "+str(_gr287.get("reason")))
@@ -27638,6 +27652,32 @@ if selected_main_page == "🗃️ 登録情報確認":
             st.error(f"登録情報の確認エラー: {type(exc).__name__}: {exc}")
             st.exception(exc)
 
+    st.divider()
+    with st.expander("🔍 SQLクエリ実行（デバッグ用・SELECTのみ）", expanded=False):
+        _dbg_q = st.text_area(
+            "SELECT文",
+            value="SELECT app_version, COUNT(*) AS n FROM v231_prediction_history GROUP BY app_version ORDER BY n DESC",
+            key="v319_debug_sql",
+            height=100,
+        )
+        if st.button("実行", key="v319_debug_sql_run"):
+            _q = str(_dbg_q or "").strip()
+            if not _q.upper().startswith("SELECT"):
+                st.error("SELECT文のみ許可しています。")
+            else:
+                try:
+                    with sqlite3.connect(str(engine.DB_PATH)) as _c:
+                        _c.row_factory = sqlite3.Row
+                        _rows = _c.execute(_q).fetchall()
+                    st.dataframe(
+                        pd.DataFrame([dict(r) for r in _rows]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.caption(f"{len(_rows)}行")
+                except Exception as _exc:
+                    st.error(f"{type(_exc).__name__}: {_exc}")
+    
     st.caption("再シミュレーション中は約40レースごとにGitHubへ軽量自動途中保存し、終了後にも最終保存します。通常の履歴登録はローカルDBへそのまま登録されます。\n\nGitHub保存にはStreamlit Secretsの設定が必要です。トークンはコードやGitHubへ直接書かないでください。")
 
 
