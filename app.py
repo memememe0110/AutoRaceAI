@@ -76,19 +76,14 @@ def _v320_extract_started_and_incident_cars(text, finished_rows=None):
     started = sorted(finished | set(incidents))
     return started, incidents
 
+_V320_ENGINE_PATCH_ERROR = ""
 try:
     engine._v121_extract_started_and_incident_cars = _v320_extract_started_and_incident_cars
 except Exception as _v320_patch_exc:
     # 失敗すると /停止 が発走後事故のままになるため、黙殺しない
+    _V320_ENGINE_PATCH_ERROR = f"{type(_v320_patch_exc).__name__}: {_v320_patch_exc}"
     try:
-        print(f"[Ver320] engine._v121 patch failed: {type(_v320_patch_exc).__name__}: {_v320_patch_exc}")
-    except Exception:
-        pass
-    try:
-        st.warning(
-            "停止→発走前除外のパッチ適用に失敗しました。"
-            f" ({type(_v320_patch_exc).__name__}: {_v320_patch_exc})"
-        )
+        print(f"[Ver320] engine._v121 patch failed: {_V320_ENGINE_PATCH_ERROR}")
     except Exception:
         pass
 
@@ -779,6 +774,14 @@ def _v266_render_error_analysis(db_path):
         st.caption("この表はVer評価専用です。原因学習の統計には混ぜません。")
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
+if _V320_ENGINE_PATCH_ERROR:
+    try:
+        st.warning(
+            "停止→発走前除外のパッチ適用に失敗しました。"
+            f" ({_V320_ENGINE_PATCH_ERROR})"
+        )
+    except Exception:
+        pass
 
 # Ver290 hotfix2:
 # 起動高速化（manifest-first / DB identity cache）で画面表示が十分軽くなったため、
@@ -3407,24 +3410,99 @@ def _v279_bg_prediction_load_completed(db_path: str, job: dict) -> tuple[dict,st
         return {},"",""
 
 
+_V310_LAST_DIAG_ERROR = ""
+
 def _v310_auto_diagnostic_race_keys(db_path: str, current_ver: str, limit: int) -> list[str]:
-    """直前2版で買い目差分が大きいレースを自動選定する。"""
-    m=re.match(r'^Ver(\d+)$',str(current_ver or ''))
-    if not m: return []
-    n=int(m.group(1)); newer=f'Ver{n-1}'; older=f'Ver{n-2}'
+    """直前2版で買い目差分が大きいレースを自動選定する。
+
+    戻り値 [] は「差分なし」または「対象なし」。
+    SQL等の失敗時は _V310_LAST_DIAG_ERROR に理由を残し、ログにも出す。
+    """
+    global _V310_LAST_DIAG_ERROR
+    _V310_LAST_DIAG_ERROR = ""
+    m = re.match(r'^Ver(\d+)$', str(current_ver or ''))
+    if not m:
+        return []
+    n = int(m.group(1))
+    newer = f'Ver{n-1}'
+    older = f'Ver{n-2}'
     try:
-        with sqlite3.connect(str(db_path)) as con:
-            keys=[r[0] for r in con.execute('SELECT DISTINCT race_key FROM v187_mixed_plan_runs WHERE app_version=?',(newer,))]
-            scored=[]
-            for rk in keys:
-                rows={v:con.execute('SELECT plan_hash FROM v187_mixed_plan_runs WHERE race_key=? AND app_version=? ORDER BY created_at DESC LIMIT 1',(rk,v)).fetchone() for v in (older,newer)}
-                if not all(rows.values()): continue
-                def sig(v):
-                    return [(r[0],r[1],round(float(r[2] or 0),5)) for r in con.execute('SELECT bet_type,combination,probability FROM v187_mixed_plan_tickets WHERE race_key=? AND plan_hash=?',(rk,rows[v][0]))]
-                a,b=sig(older),sig(newer); diff=len(set(a)^set(b))+abs(len(a)-len(b))*2
-                if diff: scored.append((diff,str(rk)))
-            return [rk for _d,rk in sorted(scored,reverse=True)[:max(1,int(limit))]]
-    except Exception:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            keys = [
+                str(r[0])
+                for r in con.execute(
+                    'SELECT DISTINCT race_key FROM v187_mixed_plan_runs WHERE app_version=?',
+                    (newer,),
+                ).fetchall()
+                if r and r[0]
+            ]
+            if not keys:
+                return []
+            # 版ごとの最新 plan_hash を一括取得（N+1回避）
+            hash_by_ver = {older: {}, newer: {}}
+            ph_list = ",".join("?" * len(keys))
+            for ver in (older, newer):
+                best = {}
+                for rk, ph, ca in con.execute(
+                    f"""
+                    SELECT race_key, plan_hash, COALESCE(created_at,'')
+                    FROM v187_mixed_plan_runs
+                    WHERE app_version=? AND race_key IN ({ph_list})
+                    """,
+                    (ver, *keys),
+                ).fetchall():
+                    rk = str(rk)
+                    prev = best.get(rk)
+                    if prev is None or str(ca or "") >= str(prev[1] or ""):
+                        best[rk] = (str(ph or ""), str(ca or ""))
+                hash_by_ver[ver] = {rk: ph for rk, (ph, _) in best.items()}
+            # 両方に hash があるキーだけ対象
+            common = [
+                rk for rk in keys
+                if hash_by_ver[older].get(rk) and hash_by_ver[newer].get(rk)
+            ]
+            if not common:
+                return []
+            needed_hashes = sorted({
+                hash_by_ver[older][rk] for rk in common
+            } | {
+                hash_by_ver[newer][rk] for rk in common
+            })
+            tickets_by_hash: dict[str, list] = {h: [] for h in needed_hashes}
+            if needed_hashes:
+                hh = ",".join("?" * len(needed_hashes))
+                for ph, bt, combo, prob in con.execute(
+                    f"""
+                    SELECT plan_hash, bet_type, combination, probability
+                    FROM v187_mixed_plan_tickets
+                    WHERE plan_hash IN ({hh})
+                    """,
+                    tuple(needed_hashes),
+                ).fetchall():
+                    ph = str(ph or "")
+                    if ph in tickets_by_hash:
+                        try:
+                            tickets_by_hash[ph].append(
+                                (str(bt or ""), str(combo or ""), round(float(prob or 0), 5))
+                            )
+                        except Exception:
+                            tickets_by_hash[ph].append(
+                                (str(bt or ""), str(combo or ""), 0.0)
+                            )
+            scored = []
+            for rk in common:
+                a = tickets_by_hash.get(hash_by_ver[older][rk], [])
+                b = tickets_by_hash.get(hash_by_ver[newer][rk], [])
+                diff = len(set(a) ^ set(b)) + abs(len(a) - len(b)) * 2
+                if diff:
+                    scored.append((diff, str(rk)))
+            return [rk for _d, rk in sorted(scored, reverse=True)[: max(1, int(limit))]]
+    except Exception as exc:
+        _V310_LAST_DIAG_ERROR = f"{type(exc).__name__}: {exc}"
+        try:
+            print(f"[Ver310] auto_diagnostic_race_keys failed: {_V310_LAST_DIAG_ERROR}")
+        except Exception:
+            pass
         return []
 
 
@@ -3489,7 +3567,15 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         _diag_keys310=set(_v310_auto_diagnostic_race_keys(db_path,current_ver,max(1,int(limit))))
         unique=[h for h in unique if str(h.get('race_key') or '').strip() in _diag_keys310]
         if not unique:
-            out['message']='自動診断対象の版間買い目差分が見つかりません。'
+            _diag_err310 = str(globals().get('_V310_LAST_DIAG_ERROR') or '')
+            if _diag_err310:
+                out['message'] = (
+                    '自動診断キー抽出でSQL等のエラーが発生しました: '
+                    + _diag_err310
+                )
+                out['diagnostic_error'] = _diag_err310
+            else:
+                out['message'] = '自動診断対象の版間買い目差分が見つかりません。'
             out['candidate_total']=0
             return out
     # Ver276 speed: race_key から日付・場・Rを直接読める通常ケースでは、
@@ -7620,9 +7706,16 @@ def _v320_reclassify_teishi_as_kessha(meta: dict, rows, result_text: str = "") -
     if not teishi:
         return meta_out, []
 
-    # 欠車側へ
-    kessha = set(int(x) for x in (meta_out.get("欠車車番") or meta_out.get("事前除外車番") or []) if str(x).strip())
-    kessha |= teishi
+    # 欠車側へ（None/"None" 等は捨てる）
+    kessha = set()
+    for x in (meta_out.get("欠車車番") or meta_out.get("事前除外車番") or []):
+        try:
+            s = str(x).strip()
+            if s.isdigit():
+                kessha.add(int(s))
+        except Exception:
+            pass
+    kessha |= set(int(c) for c in teishi)
     reasons = dict(meta_out.get("事前除外理由") or {})
     for c in teishi:
         reasons[str(c)] = "停止"
@@ -8877,7 +8970,7 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
-st.caption("Ver263｜複数展開ルートを確率化し、実測グランドノートから展開タイプと近似ルートを学習。")
+st.caption(f"{APP_VERSION}｜複数展開ルートを確率化し、実測グランドノートから展開タイプと近似ルートを学習。")
 _v290_load_started=time_module.perf_counter()
 _v290_load_stage_started=_v290_load_started
 _v290_load_times={}
@@ -10190,6 +10283,68 @@ def _v319_player_history_count(db_path: str, player_name: str, con=None) -> int:
             except Exception:
                 pass
 
+
+def _v319_player_history_counts_batch(db_path: str, player_names: list, con=None) -> dict:
+    """複数選手の履歴件数を1クエリで取得。戻り値: {表示名: count}。
+
+    照合キーは _v319_norm_player_name と同じ規則。
+    失敗時は全員0（個別countと同じ「失敗=0件」方針）。
+    """
+    names = [str(n or "").strip() for n in (player_names or []) if str(n or "").strip()]
+    out = {n: 0 for n in names}
+    if not names:
+        return out
+    key_to_names: dict = {}
+    for n in names:
+        k = _v319_norm_player_name(n)
+        if not k:
+            continue
+        key_to_names.setdefault(k, []).append(n)
+    keys = list(key_to_names.keys())
+    if not keys:
+        return out
+    _own = con is None
+    if con is None:
+        con = _v319_open_conn(db_path)
+    try:
+        if "v15_player_history_imports" not in _v319_schema_tables(con):
+            return out
+        cols = set(_v319_table_columns_cached(con, "v15_player_history_imports"))
+        ph = ",".join("?" * len(keys))
+        if "player_name_key" in cols:
+            rows = con.execute(
+                f"""
+                SELECT player_name_key, COUNT(*)
+                FROM v15_player_history_imports
+                WHERE player_name_key IN ({ph})
+                GROUP BY player_name_key
+                """,
+                tuple(keys),
+            ).fetchall()
+        else:
+            expr = "replace(replace(COALESCE(player_name,''),' ',''),'　','')"
+            rows = con.execute(
+                f"""
+                SELECT {expr}, COUNT(*)
+                FROM v15_player_history_imports
+                WHERE {expr} IN ({ph})
+                GROUP BY 1
+                """,
+                tuple(keys),
+            ).fetchall()
+        for k, cnt in rows:
+            kk = str(k or "")
+            for nm in key_to_names.get(kk, []):
+                out[nm] = int(cnt or 0)
+        return out
+    except Exception:
+        return out
+    finally:
+        if _own:
+            try:
+                con.close()
+            except Exception:
+                pass
 
 def _v319_parse_pc_player_history_html(html: str, player_name: str) -> list[dict]:
     """PC版 PlayerDetail HTML → 履歴行（R列あり）。"""
@@ -12021,11 +12176,10 @@ def _v319_import_player_history_one_race(
 
     # 履歴が0件の選手が残っていれば error、全員そろえば ok
     missing = []
-    for p in players:
-        nm = str(p.get("name") or "").strip()
-        if not nm:
-            continue
-        if int(_v319_player_history_count(db_path, nm) or 0) <= 0:
+    _names_chk = [str(p.get("name") or "").strip() for p in players if str(p.get("name") or "").strip()]
+    _cnt_map = _v319_player_history_counts_batch(db_path, _names_chk)
+    for nm in _names_chk:
+        if int(_cnt_map.get(nm) or 0) <= 0:
             _ = missing.append(nm)
     if missing or errors > 0:
         who = ", ".join(missing[:5]) if missing else "取込エラーあり"
@@ -12201,11 +12355,10 @@ def _v319_import_one_race(
         err_n = int(filled.get("errors") or 0)
         # 1人でも履歴0 or 取込エラーなら予測しない（通知して終了）
         missing = []
-        for p in players:
-            nm = str(p.get("name") or "").strip()
-            if not nm:
-                continue
-            if int(_v319_player_history_count(db_path, nm) or 0) <= 0:
+        _names_chk = [str(p.get("name") or "").strip() for p in players if str(p.get("name") or "").strip()]
+        _cnt_map = _v319_player_history_counts_batch(db_path, _names_chk)
+        for nm in _names_chk:
+            if int(_cnt_map.get(nm) or 0) <= 0:
                 _ = missing.append(nm)
         if missing or err_n > 0:
             detail = " / ".join(str(x) for x in (filled.get("details") or [])[:8])
