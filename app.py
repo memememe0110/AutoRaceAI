@@ -9547,17 +9547,49 @@ def _v319_create_index_if_possible(con, table: str, idx_name: str, columns) -> t
 def _v319_ensure_player_name_key_columns(db_path: str) -> dict:
     """Ver319改善#5: 関数被せWHEREを等値比較へ置き換えるための正規化列。
 
-    replace 内容はフォールバック式と完全一致させ、返る行が同一になることを保証する。
-    結果は予測に影響しない（同じ行・同じ順）。
+    重要: result_entries は engine.py が「INSERT INTO result_entries VALUES(9個)」
+    の位置指定で書くため、列を追加してはいけない。
+    対象は v15_player_history_imports のみ。
+    誤って result_entries に追加された player_name_key は起動時に除去する。
     """
-    out = {"ok": False, "backfilled": 0, "tables": [], "reason": ""}
+    out = {"ok": False, "backfilled": 0, "tables": [], "reason": "", "repairs": []}
     targets = [
         ("v15_player_history_imports", "player_name"),
-        ("result_entries", "player_name"),
     ]
     try:
         with sqlite3.connect(str(db_path), timeout=60.0) as con:
             con.execute("PRAGMA busy_timeout=60000")
+
+            # --- Ver319改善#5 リカバリ ---
+            # 過去版で誤って result_entries に追加された player_name_key を除去する。
+            tabs = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if "result_entries" in tabs:
+                re_cols = {r[1] for r in con.execute(
+                    'PRAGMA table_info("result_entries")'
+                ).fetchall()}
+                if "player_name_key" in re_cols:
+                    try:
+                        con.execute('DROP INDEX IF EXISTS idx_result_entries_name_key')
+                    except Exception:
+                        pass
+                    try:
+                        con.execute(
+                            'ALTER TABLE "result_entries" DROP COLUMN player_name_key'
+                        )
+                        out["repairs"].append(
+                            "result_entries.player_name_key を削除（位置指定INSERT復旧）"
+                        )
+                    except Exception as _drop_exc:
+                        out["reason"] = (
+                            "result_entries.player_name_key を削除できません。"
+                            f" SQLite 3.35.0 以降が必要です: "
+                            f"{type(_drop_exc).__name__}: {_drop_exc}"
+                        )
+                        return out
+
+            # --- 本体 ---
             for table, src_col in targets:
                 tabs = {r[0] for r in con.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
