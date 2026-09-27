@@ -7666,17 +7666,24 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
     if not raw:
         return dict(meta or {}), []
     normalized = re.sub(r"[\t\u3000]+", " ", raw)
-    words = r"反妨|反則妨害|妨害失格|反則失格|落車|他落|落妨|競走中止|周回誤認|周誤|失格|故障"
+    # 欠車・出走取消は発走前除外。ここでは発走後事故のみ。
+    words = r"反妨|反則妨害|妨害失格|反則失格|落車|他落|落妨|競走中止|周回誤認|周誤|故障"
+    # 「失格」単体は払戻説明や脚注に出やすいので、スラッシュ付きのみ採用する
+    words_slash = words + r"|失格"
     found: list[dict] = []
-    # 公式結果の「- 6 選手名 ... /反妨」形式を優先。
+    # 公式結果の「- 6 選手名 ... /反妨」形式を優先（スラッシュ必須に近い）
     pat = re.compile(
-        rf"(?:^|\n)\s*-?\s*(?:\n|\s)+([1-8])(?:\s|\n)+(.{{0,180}}?)(?:/\s*)?({words})(?=\s|$)",
-        re.MULTILINE | re.DOTALL,
+        rf"(?:^|\n)\s*-\s*([1-8])\b[^\n]{{0,200}}?/\s*({words_slash})(?=\s|$)",
+        re.MULTILINE,
     )
     for m in pat.finditer(normalized):
-        _ = found.append({"車番": int(m.group(1)), "理由": str(m.group(3))})
+        _ = found.append({"車番": int(m.group(1)), "理由": str(m.group(2))})
     if not found:
-        line_pat = re.compile(rf"(?:^|\n)\s*-?\s*([1-8])\b[^\n]{{0,240}}?({words})", re.MULTILINE)
+        # フォールバック: 着順が "-" の行に事故語がある場合のみ
+        line_pat = re.compile(
+            rf"(?:^|\n)\s*-\s*([1-8])\b[^\n]{{0,200}}?({words})(?=\s|$)",
+            re.MULTILINE,
+        )
         for m in line_pat.finditer(normalized):
             _ = found.append({"車番": int(m.group(1)), "理由": str(m.group(2))})
     unique=[]
@@ -11242,7 +11249,12 @@ def _v319_prediction_entry_count(db_path: str, race_key: str) -> int:
 
 
 def _v319_clear_prediction(db_path: str, race_key: str) -> None:
-    """古い誤予測を消して再予測できるようにする。"""
+    """古い誤予測を消して再予測できるようにする。
+
+    engine の prediction_snapshots も消す。
+    v117 の出走数照合は prediction_snapshots を見るため、v231 だけ消すと
+    台数不一致が解消されず再登録に失敗する。
+    """
     try:
         keys = [str(race_key)]
         m = re.match(r"(\d{4})-?(\d{2})-?(\d{2})_(.+)_(\d+)R?", str(race_key))
@@ -11251,28 +11263,40 @@ def _v319_clear_prediction(db_path: str, race_key: str) -> None:
             keys = _v319_race_key_candidates(ymd, m.group(4), m.group(5))
         with sqlite3.connect(str(db_path), timeout=15) as con:
             tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            if "v231_prediction_history" not in tables:
-                return
             ph = ",".join("?" * len(keys))
-            ids = [r[0] for r in con.execute(
-                f"SELECT history_id FROM v231_prediction_history WHERE race_key IN ({ph})",
-                tuple(keys),
-            ).fetchall()]
+            # engine 側（出走数照合の本体）
             for snap in (
-                "v231_prediction_entry_snapshots",
-                "v231_prediction_snapshots",
-                "v231_prediction_entry",
+                "prediction_snapshots",
+                "prediction_feature_snapshots",
+                "v40_prediction_feature_snapshots",
+                "prediction_races",
             ):
-                if snap in tables and ids:
+                if snap in tables:
                     try:
-                        q = ",".join("?" * len(ids))
-                        con.execute(f"DELETE FROM {snap} WHERE history_id IN ({q})", tuple(ids))
+                        con.execute(f"DELETE FROM {snap} WHERE race_key IN ({ph})", tuple(keys))
                     except Exception:
                         pass
-            con.execute(
-                f"DELETE FROM v231_prediction_history WHERE race_key IN ({ph})",
-                tuple(keys),
-            )
+            # app 側履歴
+            if "v231_prediction_history" in tables:
+                ids = [r[0] for r in con.execute(
+                    f"SELECT history_id FROM v231_prediction_history WHERE race_key IN ({ph})",
+                    tuple(keys),
+                ).fetchall()]
+                for snap in (
+                    "v231_prediction_entry_snapshots",
+                    "v231_prediction_snapshots",
+                    "v231_prediction_entry",
+                ):
+                    if snap in tables and ids:
+                        try:
+                            q = ",".join("?" * len(ids))
+                            con.execute(f"DELETE FROM {snap} WHERE history_id IN ({q})", tuple(ids))
+                        except Exception:
+                            pass
+                con.execute(
+                    f"DELETE FROM v231_prediction_history WHERE race_key IN ({ph})",
+                    tuple(keys),
+                )
             con.commit()
     except Exception:
         pass
@@ -11488,6 +11512,35 @@ def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, repla
         meta_r["事前除外車番"] = kessha
         meta_r["比較対象外車番"] = kessha
     meta_r, _inc = _v227_detect_poststart_incidents(raw_text, meta_r)
+    # 具体的な発走後事故車が取れないのに engine 側だけが事故フラグを立てている場合は外す
+    # （通常レースが「発走後事故」扱いになり学習・履歴更新が止まる誤検知対策）
+    if not _inc:
+        _cars = meta_r.get("発走後事故車") or meta_r.get("発走後事故車番") or {}
+        _has_car = bool(_cars) if isinstance(_cars, dict) else bool(_cars)
+        if not _has_car:
+            for k in (
+                "発走後事故", "事故レース", "事故あり", "レース状態",
+                "予測精度評価対象外", "AI学習対象", "学習対象外", "学習除外",
+                "選手履歴学習対象", "展開学習対象", "追い抜き相性学習対象",
+                "開催場補正学習対象", "壁補正学習対象", "重み更新対象",
+                "learning_excluded", "learning_exclusion_reason", "学習除外理由",
+                "発走後事故車", "発走後事故車番", "発走後事故理由",
+            ):
+                if k in meta_r:
+                    if k in ("AI学習対象", "選手履歴学習対象", "展開学習対象",
+                             "追い抜き相性学習対象", "開催場補正学習対象",
+                             "壁補正学習対象", "重み更新対象", "予測精度評価対象"):
+                        meta_r[k] = True
+                    elif k == "予測精度評価対象外":
+                        meta_r[k] = False
+                    elif k in ("発走後事故", "事故レース", "事故あり", "学習対象外",
+                               "学習除外", "learning_excluded"):
+                        meta_r[k] = False
+                    elif k == "レース状態":
+                        if str(meta_r.get(k) or "") == "発走後事故":
+                            meta_r[k] = "通常"
+                    else:
+                        meta_r.pop(k, None)
     # 反妨等: 結果に必ず残し、着順は数値にする（engineが "-" 行を落とすため）
     try:
         inc_cars = []
@@ -12233,22 +12286,33 @@ def _v319_import_one_race(
         saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace))
     except Exception as exc:
         emsg = f"{type(exc).__name__}: {exc}"
-        # 予測8車・結果7車などの不一致 → 出走表で再予測して1回だけリトライ
-        if ("出走数が一致しない" in emsg) or ("結果にない車番" in emsg) or ("予測=" in emsg and "結果=" in emsg):
+        # 予測と結果の台数/車番不一致 → 反妨補完 or 再予測 or 予測クリア後の強制登録
+        if ("出走数が一致しない" in emsg) or ("結果にない車番" in emsg) or ("予測にない車番" in emsg) or ("予測=" in emsg and "結果=" in emsg):
             try:
-                # 反妨など発走後事故が原因の台数差なら、再予測せず結果側を強制補完して再登録
                 _inc_try = _v227_detect_poststart_incidents(str(raw or ""), {})
                 inc_list = _inc_try[1] if isinstance(_inc_try, tuple) and len(_inc_try) > 1 else []
                 missing_m = re.search(r"結果にない車番=([0-9,\s]+)", emsg)
-                missing_cars = []
-                if missing_m:
-                    missing_cars = [int(x) for x in re.findall(r"\d+", missing_m.group(1))]
+                extra_m = re.search(r"予測にない車番=([0-9,\s]+)", emsg)
+                missing_cars = [int(x) for x in re.findall(r"\d+", missing_m.group(1))] if missing_m else []
+                extra_cars = [int(x) for x in re.findall(r"\d+", extra_m.group(1))] if extra_m else []
                 inc_cars = []
                 for it in (inc_list or []):
                     try:
                         _ = inc_cars.append(int(it.get("車番")))
                     except Exception:
                         pass
+
+                def _force_register_without_prediction(reason: str):
+                    """照合不能な古い予測を消して結果だけ保存する。"""
+                    nonlocal pred_msg
+                    _step("台数不一致→予測クリアして結果保存")
+                    try:
+                        _v319_clear_prediction(db_path, key_guess)
+                    except Exception:
+                        pass
+                    pred_msg += f" / {reason}"
+                    return _v319_register_fetched_result(db_path, raw, venue, replace=True)
+
                 if missing_cars and inc_cars and set(missing_cars).issubset(set(inc_cars)):
                     _step("反妨台数→結果補完")
                     pred_msg += " / 反妨車を結果に補完"
@@ -12257,24 +12321,45 @@ def _v319_import_one_race(
                     _step("台数不一致→再予測")
                     if not str(card_text or "").strip():
                         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
-                    _v319_clear_prediction(db_path, key_guess)
-                    pred = _v319_run_prerace_prediction(db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text, manual_excluded=kessha_cars)
-                    if not pred.get("ok"):
-                        raise RuntimeError(pred.get("reason") or "再予測失敗")
-                    pred_msg += " / 結果前に再予測"
-                    saved = _v319_register_fetched_result(db_path, raw, venue, replace=True)
+                    excl = [c for c in (kessha_cars or []) if int(c) not in set(extra_cars or [])]
+                    try:
+                        _v319_clear_prediction(db_path, key_guess)
+                    except Exception:
+                        pass
+                    pred = _v319_run_prerace_prediction(
+                        db_path, key_guess, venue,
+                        trials=int(trials), seed=int(seed),
+                        raw_text=card_text, manual_excluded=excl,
+                    )
+                    if pred.get("ok"):
+                        pred_msg += " / 結果前に再予測"
+                        try:
+                            saved = _v319_register_fetched_result(db_path, raw, venue, replace=True)
+                        except Exception as exc_retry:
+                            saved = _force_register_without_prediction(
+                                f"再予測後も不一致のため予測削除して結果保存({type(exc_retry).__name__})"
+                            )
+                    else:
+                        saved = _force_register_without_prediction(
+                            f"再予測失敗のため予測削除して結果保存({pred.get('reason') or '不明'})"
+                        )
             except Exception as exc2:
-                return {
-                    "status": "error",
-                    "phase": "save_result",
-                    "message": (
-                        f"{venue} {race_no}R：結果登録に失敗しました。"
-                        f" ({emsg}｜再予測後:{type(exc2).__name__}: {exc2})"
-                        f"{hist_msg}{pred_msg}{odds_msg}"
-                    ),
-                    "key": key_guess,
-                    "next_action": "retry",
-                }
+                try:
+                    _v319_clear_prediction(db_path, key_guess)
+                    saved = _v319_register_fetched_result(db_path, raw, venue, replace=True)
+                    pred_msg += f" / 例外後に予測削除して結果保存({type(exc2).__name__})"
+                except Exception as exc3:
+                    return {
+                        "status": "error",
+                        "phase": "save_result",
+                        "message": (
+                            f"{venue} {race_no}R：結果登録に失敗しました。"
+                            f" ({emsg}｜再予測後:{type(exc2).__name__}: {exc2}｜強制:{type(exc3).__name__}: {exc3})"
+                            f"{hist_msg}{pred_msg}{odds_msg}"
+                        ),
+                        "key": key_guess,
+                        "next_action": "retry",
+                    }
         else:
             return {
                 "status": "error",
