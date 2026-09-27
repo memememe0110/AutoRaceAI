@@ -38,7 +38,7 @@ import math
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver319"
+APP_VERSION = "Ver320"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
@@ -9865,7 +9865,8 @@ def _v319_player_history_state(db_path: str, player_name: str, con=None) -> dict
                     if ds:
                         out["keys"].add((ds, vn, rn))
         except Exception:
-            return None   # 変更前: pass
+            # 呼び出し側は dict 前提。失敗時は空状態（握りつぶしではなく既定値）
+            return {"count": 0, "latest": "", "keys": set()}
     finally:
         if _own:
             try:
@@ -9957,7 +9958,8 @@ def _v319_player_history_latest_fast(db_path: str, player_name: str, con=None) -
         latest = latest[:8] if len(latest) >= 8 else ""
         return cnt, latest
     except Exception:
-        return None, ""   # 変更前: return 0, ""
+        # 呼び出し側は (int, str) 前提
+        return 0, ""
     finally:
         if _own:
             try:
@@ -9983,7 +9985,8 @@ def _v319_player_history_count(db_path: str, player_name: str, con=None) -> int:
         ).fetchone()
         return int((row or [0])[0] or 0)
     except Exception:
-        return None   # 変更前: return 0
+        # 呼び出し側は int 前提
+        return 0
     finally:
         if _own:
             try:
