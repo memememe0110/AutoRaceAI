@@ -78,8 +78,19 @@ def _v320_extract_started_and_incident_cars(text, finished_rows=None):
 
 try:
     engine._v121_extract_started_and_incident_cars = _v320_extract_started_and_incident_cars
-except Exception:
-    pass
+except Exception as _v320_patch_exc:
+    # 失敗すると /停止 が発走後事故のままになるため、黙殺しない
+    try:
+        print(f"[Ver320] engine._v121 patch failed: {type(_v320_patch_exc).__name__}: {_v320_patch_exc}")
+    except Exception:
+        pass
+    try:
+        st.warning(
+            "停止→発走前除外のパッチ適用に失敗しました。"
+            f" ({type(_v320_patch_exc).__name__}: {_v320_patch_exc})"
+        )
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # AutoRaceAI runtime configuration / state
@@ -6368,18 +6379,18 @@ def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bo
             _v287_need_full = bool(force_full)
             if not _v287_need_full:
                 try:
-                    with sqlite3.connect(str(db_path), timeout=15.0) as _fcon:
-                        _vtabs = {r[0] for r in _fcon.execute(
-                            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-                        _v284_hits = 0
-                        if "v231_prediction_history" in _vtabs and "result_races" in _vtabs:
-                            _v284_hits = int(_fcon.execute("""
-                                SELECT COUNT(*)
-                                FROM v231_prediction_history h
-                                JOIN result_races rr ON rr.race_key=h.race_key
-                                WHERE COALESCE(rr.model_eligible,1)=1
-                                    AND COALESCE(rr.learning_eligible,1)=1
-                            """).fetchone()[0] or 0)
+                    # 外側の con を再利用（二重接続を避ける）
+                    _vtabs = {r[0] for r in con.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                    _v284_hits = 0
+                    if "v231_prediction_history" in _vtabs and "result_races" in _vtabs:
+                        _v284_hits = int(con.execute("""
+                            SELECT COUNT(*)
+                            FROM v231_prediction_history h
+                            JOIN result_races rr ON rr.race_key=h.race_key
+                            WHERE COALESCE(rr.model_eligible,1)=1
+                                AND COALESCE(rr.learning_eligible,1)=1
+                        """).fetchone()[0] or 0)
                     if _v284_hits <= 0:
                         _v287_need_full = True
                 except Exception:
@@ -10844,7 +10855,8 @@ def _v319_fill_player_histories(
 
     Ver319改善#2: 1レース分は接続を1本だけ開いて使い回す（毎回connectしない）。
     con を渡された場合はその接続を共有し、閉じない（呼び出し側が管理する）。
-    _exclusive=True かつ con=None のときは BEGIN IMMEDIATE でまとめて書く。
+    con=None のときだけ接続を開き、終了時に close する。
+    _exclusive=True かつ自分で開いた接続のときは BEGIN IMMEDIATE でまとめて書く。
 
     - R番号は公式テーブルの R 列から取得（SP版にはRが無い）
     - 件数不足・R欠落・公式欠けがあれば再取込（選手ごとに1プロセス1回まで）
@@ -10856,11 +10868,14 @@ def _v319_fill_player_histories(
     errors = 0
     details = []
     min_rows = int(min_rows or 30)
-    _own_con2 = bool(con is None and _exclusive)
+    # con を自分で開いたときだけ閉じる（_exclusive と独立）。
+    # 以前は _own_con2 = (con is None and _exclusive) のため、
+    # 通常呼び出し（con=None, _exclusive=False）で接続がリークしていた。
+    _own_con = con is None
     if con is None:
         con = _v319_open_conn(db_path)
     try:
-        if _own_con2:
+        if _exclusive and _own_con:
             try:
                 con.execute("BEGIN IMMEDIATE")
             except Exception:
@@ -10880,17 +10895,11 @@ def _v319_fill_player_histories(
                 before_d = _v319_ymd_digits(before_ymd)
 
                 # ========== 1) DB状態 ==========
+                # 履歴ヘルパは失敗時も 0/(0,"")/空dict を返す（Noneは返さない）。
+                # 「失敗=0件扱い」を明示し、到達不能な None 分岐は置かない。
                 have, latest_d = _v319_player_history_latest_fast(db_path, name, con=con)
-                if have is None:
-                    errors += 1
-                    _ = details.append(f"{name}:DB読取エラー(history_latest)")
-                    continue
                 latest_d = _v319_ymd_digits(latest_d)
-                state = _v319_player_history_state(db_path, name, con=con)
-                if state is None:
-                    errors += 1
-                    _ = details.append(f"{name}:DB読取エラー(history_state)")
-                    continue
+                state = _v319_player_history_state(db_path, name, con=con) or {}
                 have_keys = set(state.get("keys") or set())
                 dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
 
@@ -11204,8 +11213,7 @@ def _v319_fill_player_histories(
                     except Exception:
                         pass
 
-                after_raw = _v319_player_history_count(db_path, name, con=con)
-                after = int(after_raw) if after_raw is not None else int(have)
+                after = int(_v319_player_history_count(db_path, name, con=con) or 0)
                 delta = max(changed, max(0, after - have))
                 added += delta
                 if need_refresh:
@@ -11214,18 +11222,14 @@ def _v319_fill_player_histories(
                 # 穴なし確認: 対象日までの最新が埋まり、missing_official が解消された時だけ
                 # キャッシュスキップ登録する（次回の無駄な再取得を防ぐ）。
                 try:
-                    after_state = _v319_player_history_state(db_path, name, con=con)
-                    if after_state is None:
-                        # 読取失敗時はキャッシュスキップ登録だけ諦める（次回再チェック）
-                        pass
-                    else:
-                        after_keys = set(after_state.get("keys") or set())
-                        after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
-                        _remaining_missing = official_keys - after_keys
-                        if before_d and after_latest and after_latest >= before_d and not _remaining_missing:
-                            _V319_HIST_SKIPPED.add(cache_key)
-                        elif not before_d and after >= min_rows and not _remaining_missing:
-                            _V319_HIST_SKIPPED.add(cache_key)
+                    after_state = _v319_player_history_state(db_path, name, con=con) or {}
+                    after_keys = set(after_state.get("keys") or set())
+                    after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
+                    _remaining_missing = official_keys - after_keys
+                    if before_d and after_latest and after_latest >= before_d and not _remaining_missing:
+                        _V319_HIST_SKIPPED.add(cache_key)
+                    elif not before_d and after >= min_rows and not _remaining_missing:
+                        _V319_HIST_SKIPPED.add(cache_key)
                 except Exception:
                     pass
 
@@ -11248,7 +11252,7 @@ def _v319_fill_player_histories(
                 _ = details.append(f"{name}:{type(exc).__name__}:{exc}")
         return {"added": added, "skipped": skipped, "errors": errors, "details": details}
     finally:
-        if _own_con2:
+        if _own_con:
             try:
                 con.commit()
             except Exception:
