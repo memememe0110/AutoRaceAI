@@ -42,7 +42,7 @@ APP_VERSION = "Ver319"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver319"  # Ver319: 壁は予測日前のみ（少件数は過去分で学習）。同ハンデ寄せは外す。時間補正は良/湿分離。
+_V231_APP_VERSION = "Ver320"  # Ver320: Ver284固定を解除し全バージョンを校正対象に。
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -6328,9 +6328,8 @@ def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bo
                                 SELECT COUNT(*)
                                 FROM v231_prediction_history h
                                 JOIN result_races rr ON rr.race_key=h.race_key
-                                WHERE h.app_version='Ver284'
-                                  AND COALESCE(rr.model_eligible,1)=1
-                                  AND COALESCE(rr.learning_eligible,1)=1
+                                WHERE COALESCE(rr.model_eligible,1)=1
+                                    AND COALESCE(rr.learning_eligible,1)=1
                             """).fetchone()[0] or 0)
                     if _v284_hits <= 0:
                         _v287_need_full = True
@@ -6345,7 +6344,6 @@ def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bo
                   AND NOT EXISTS (
                       SELECT 1 FROM v231_prediction_history p
                       WHERE p.race_key = h.race_key
-                        AND p.app_version <> 'Ver284'
                         AND p.history_id > x.mid
                   )
                 """
@@ -6355,7 +6353,6 @@ def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bo
                 JOIN (
                     SELECT race_key,MAX(history_id) AS mid
                     FROM v231_prediction_history
-                    WHERE app_version='Ver284'
                     GROUP BY race_key
                 ) x ON h.history_id=x.mid
                 JOIN result_races rr ON rr.race_key=h.race_key
@@ -6558,7 +6555,6 @@ def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_
                 JOIN (
                     SELECT race_key,MAX(history_id) AS mid
                     FROM v231_prediction_history
-                    WHERE app_version='Ver284'
                     GROUP BY race_key
                 ) x ON h.history_id=x.mid
             """).fetchall()
