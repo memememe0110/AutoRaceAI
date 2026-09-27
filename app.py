@@ -32,6 +32,55 @@ import streamlit.components.v1 as components
 import engine
 import math
 
+# Ver320: 「/停止」を発走後事故(競走中止等)にしない。
+# engine._v121_extract_started_and_incident_cars は着順「-」の車を、
+# 欠車語が無いとデフォルトで 発走後事故車=競走中止等 にしていた。
+# 公式の「0.00 /停止」は欠車・発走前除外と同型なので nonstarters に含める。
+def _v320_extract_started_and_incident_cars(text, finished_rows=None):
+    finished = set()
+    if isinstance(finished_rows, pd.DataFrame) and "車番" in finished_rows.columns:
+        finished = set(
+            pd.to_numeric(finished_rows["車番"], errors="coerce").dropna().astype(int).tolist()
+        )
+    block = str(text or "")
+    if "着順" in block and "車番" in block:
+        block = block[block.find("着順"):]
+    if "グランドノート" in block:
+        block = block.split("グランドノート", 1)[0]
+    lines = [re.sub(r"[\t\u3000]+", " ", x).strip() for x in block.splitlines()]
+    lines = [x for x in lines if x]
+    incident_words = (
+        "競走中止", "落妨", "落車", "反妨", "反則", "周誤", "周回誤認",
+        "他落", "故障", "妨害", "失格", "再試走", "戒告",
+    )
+    # 停止 = 発走前除外（欠車と同型）。予測に含まれないのもこれが理由。
+    nonstarters = (
+        "欠車", "出走取消", "参加解除", "欠場", "停止",
+        "発走除外", "競走除外", "出走取り消し",
+    )
+    incidents = {}
+    for i, line in enumerate(lines):
+        car = None
+        m = re.match(r"^[-－—–]\s*([1-8])(?:\s|$)", line)
+        if m:
+            car = int(m.group(1))
+        elif re.fullmatch(r"[-－—–]", line) and i + 1 < len(lines) and re.fullmatch(r"[1-8]", lines[i + 1]):
+            car = int(lines[i + 1])
+        if car is None:
+            continue
+        nearby = " ".join(lines[i:min(len(lines), i + 8)])
+        if any(w in nearby for w in nonstarters):
+            continue
+        status = next((w for w in incident_words if w in nearby), "競走中止等")
+        incidents[car] = status
+    started = sorted(finished | set(incidents))
+    return started, incidents
+
+try:
+    engine._v121_extract_started_and_incident_cars = _v320_extract_started_and_incident_cars
+except Exception:
+    pass
+
 # ---------------------------------------------------------------------------
 # AutoRaceAI runtime configuration / state
 # Ver265 refactor: version, modes and mutable caches are initialized in one
@@ -7498,6 +7547,132 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     return out,new_bets,audit
 
 
+
+def _v320_teishi_cars_from_text(result_text: str) -> list[int]:
+    """結果本文の「/停止」を発走前除外車番として抽出。
+
+    着順が「-」の行ブロック内に `/停止` がある車だけを対象にする。
+    近傍の完走車（例: 2番）を誤って拾わない。
+    """
+    found: set[int] = set()
+    raw = str(result_text or "")
+    normalized = re.sub(r"[\t\u3000]+", " ", raw)
+    block = normalized
+    if "着順" in block:
+        block = block[block.find("着順"):]
+    if "グランドノート" in block:
+        block = block.split("グランドノート", 1)[0]
+    if "払戻金" in block:
+        block = block.split("払戻金", 1)[0]
+    # 着順「-」始まりのブロック単位で /停止 を探す
+    # 例:
+    # - 3
+    # 亀井　政和
+    # ...
+    # 0.00 /停止
+    for m in re.finditer(
+        r"(?:^|\n)\s*[-－]\s*([1-8])\b([\s\S]*?)(?=(?:\n\s*[-－]\s*[1-8]\b)|\Z)",
+        block,
+        flags=re.MULTILINE,
+    ):
+        car = int(m.group(1))
+        chunk = m.group(2) or ""
+        # 次の着順行の手前まで。完走行(数字始まり)を跨がないよう先頭付近だけ見る
+        head = "\n".join(chunk.splitlines()[:8])
+        if re.search(r"/\s*停止\b", head) or re.search(r"(?:^|\s)停止\s*$", head, re.MULTILINE):
+            found.add(car)
+    # 横一列「- 3 ... /停止」
+    for m in re.finditer(r"(?:^|\n)\s*[-－]\s*([1-8])\b[^\n]{0,120}/\s*停止", block, flags=re.MULTILINE):
+        found.add(int(m.group(1)))
+    return sorted(found)
+
+
+def _v320_reclassify_teishi_as_kessha(meta: dict, rows, result_text: str = "") -> tuple[dict, list[int]]:
+    """停止車を発走後事故から欠車（発走前除外）へ移す。
+
+    予測時点で停止車は出走表に出ない／除外されるのが自然。
+    engine が「- 3 … /停止」を競走中止等扱いにしていたのをここで矯正する。
+    """
+    meta_out = dict(meta or {})
+    teishi = set(_v320_teishi_cars_from_text(result_text))
+    # meta 上の事故理由が停止・競走中止等だけで本文に停止がある車も拾う
+    inc = meta_out.get("発走後事故車") or {}
+    if isinstance(inc, dict):
+        for car, reason in list(inc.items()):
+            try:
+                c = int(car)
+            except Exception:
+                continue
+            rs = str(reason or "")
+            if "停止" in rs or (c in teishi):
+                teishi.add(c)
+    if not teishi:
+        return meta_out, []
+
+    # 欠車側へ
+    kessha = set(int(x) for x in (meta_out.get("欠車車番") or meta_out.get("事前除外車番") or []) if str(x).strip())
+    kessha |= teishi
+    reasons = dict(meta_out.get("事前除外理由") or {})
+    for c in teishi:
+        reasons[str(c)] = "停止"
+    meta_out["欠車車番"] = sorted(kessha)
+    meta_out["事前除外車番"] = sorted(kessha)
+    meta_out["比較対象外車番"] = sorted(kessha)
+    meta_out["事前除外理由"] = reasons
+
+    # 発走後事故から除去
+    if isinstance(inc, dict):
+        inc2 = {int(k): v for k, v in inc.items() if int(k) not in teishi}
+        if inc2:
+            meta_out["発走後事故車"] = dict(sorted(inc2.items()))
+            meta_out["発走後事故車番"] = sorted(inc2)
+            meta_out["発走後事故理由"] = {str(k): v for k, v in sorted(inc2.items())}
+        else:
+            for k in (
+                "発走後事故車", "発走後事故車番", "発走後事故理由",
+                "発走後事故", "事故レース", "事故あり",
+                "予測精度評価対象外", "学習対象外", "学習除外",
+                "learning_excluded", "learning_exclusion_reason", "学習除外理由",
+            ):
+                meta_out.pop(k, None)
+            meta_out["発走後事故"] = False
+            meta_out["事故レース"] = False
+            meta_out["事故あり"] = False
+            meta_out["学習除外"] = False
+            meta_out["learning_excluded"] = False
+            meta_out["AI学習対象"] = True
+            meta_out["予測精度評価対象"] = True
+            meta_out["予測精度評価対象外"] = False
+            meta_out["選手履歴学習対象"] = True
+            meta_out["展開学習対象"] = True
+            meta_out["重み更新対象"] = True
+            if str(meta_out.get("レース状態") or "") == "発走後事故":
+                meta_out["レース状態"] = "通常"
+
+    # 発走車番から停止を外す（欠車は発走していない）
+    started = meta_out.get("発走車番") or []
+    try:
+        started2 = [int(x) for x in started if int(x) not in teishi]
+        meta_out["発走車番"] = started2
+    except Exception:
+        pass
+
+    # rows の事故欄が停止なら欠車表記へ
+    try:
+        if isinstance(rows, pd.DataFrame) and not rows.empty and "車番" in rows.columns:
+            cars = pd.to_numeric(rows["車番"], errors="coerce")
+            for idx, car in cars.items():
+                if pd.isna(car) or int(car) not in teishi:
+                    continue
+                if "事故" in rows.columns:
+                    rows.at[idx, "事故"] = "停止"
+                if "結果区分" in rows.columns:
+                    rows.at[idx, "結果区分"] = "欠車"
+    except Exception:
+        pass
+    return meta_out, sorted(teishi)
+
+
 def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFrame) -> tuple[dict, pd.DataFrame, list[int]]:
     if not isinstance(rows, pd.DataFrame) or rows.empty:
         return meta, rows, []
@@ -7509,7 +7684,7 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
     # 公式結果では「- 4 選手名 ... /欠車」のように掲載される。
     # 改行・タブ・全角空白の揺れを許容して、事故語の直前にある車番を拾う。
     normalized = re.sub(r"[\t\u3000]+", " ", raw)
-    accident_words = r"欠車|発走除外|競走除外|出走取消|出走取り消し"
+    accident_words = r"欠車|発走除外|競走除外|出走取消|出走取り消し|停止"
     detected: list[tuple[int, str]] = []
 
     # まず事故語を含む周辺ブロックから「着順 - の次にある車番」を優先取得。
@@ -7583,7 +7758,7 @@ def _v315_detect_kessha_cars(result_text: str, rows: pd.DataFrame | None = None)
     found: set[int] = set()
     raw = str(result_text or "")
     normalized = re.sub(r"[\t\u3000]+", " ", raw)
-    words = r"欠車|発走除外|競走除外|出走取消|出走取り消し"
+    words = r"欠車|発走除外|競走除外|出走取消|出走取り消し|停止"
     for m in re.finditer(
         rf"(?:^|\n)\s*[-－]\s*([1-8])\b[\s\S]{{0,280}}?(?:/\s*)?({words})",
         normalized,
@@ -11504,14 +11679,27 @@ def _v319_register_void_result(
 def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, replace: bool = False) -> dict:
     meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(raw_text, venue, "")
     meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(raw_text, meta_r, rows_r)
+    # 「/停止」は発走前除外。engine が発走後事故にしていたのをここで矯正。
+    meta_r, teishi_cars = _v320_reclassify_teishi_as_kessha(meta_r, rows_r, raw_text)
     extra = _v315_detect_kessha_cars(raw_text, rows_r)
-    kessha = sorted(set(int(x) for x in (nonstarter_numbers or [])) | set(extra))
+    kessha = sorted(
+        set(int(x) for x in (nonstarter_numbers or []))
+        | set(extra)
+        | set(teishi_cars or [])
+    )
     meta_r = dict(meta_r or {})
     if kessha:
         meta_r["欠車車番"] = kessha
         meta_r["事前除外車番"] = kessha
         meta_r["比較対象外車番"] = kessha
+        reasons = dict(meta_r.get("事前除外理由") or {})
+        for c in (teishi_cars or []):
+            reasons.setdefault(str(int(c)), "停止")
+        meta_r["事前除外理由"] = reasons
     meta_r, _inc = _v227_detect_poststart_incidents(raw_text, meta_r)
+    # 停止だけの「事故」検出は捨てる
+    if _inc:
+        _inc = [x for x in _inc if "停止" not in str(x.get("理由") or "")]
     # 具体的な発走後事故車が取れないのに engine 側だけが事故フラグを立てている場合は外す
     # （通常レースが「発走後事故」扱いになり学習・履歴更新が止まる誤検知対策）
     if not _inc:
@@ -25993,14 +26181,29 @@ if selected_main_page == "✅ 結果登録・解析":
                 meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(
                     result_text, meta_r, rows_r
                 )
+                meta_r, teishi_cars = _v320_reclassify_teishi_as_kessha(meta_r, rows_r, result_text)
                 extra_kessha = _v315_detect_kessha_cars(result_text, rows_r)
-                nonstarter_numbers = sorted(set(int(x) for x in (nonstarter_numbers or [])) | set(extra_kessha))
+                nonstarter_numbers = sorted(
+                    set(int(x) for x in (nonstarter_numbers or []))
+                    | set(extra_kessha)
+                    | set(teishi_cars or [])
+                )
                 if nonstarter_numbers:
                     meta_r = dict(meta_r or {})
                     meta_r["欠車車番"] = nonstarter_numbers
                     meta_r["事前除外車番"] = nonstarter_numbers
                     meta_r["比較対象外車番"] = nonstarter_numbers
+                    reasons = dict(meta_r.get("事前除外理由") or {})
+                    for c in (teishi_cars or []):
+                        reasons.setdefault(str(int(c)), "停止")
+                    meta_r["事前除外理由"] = reasons
                 meta_r, poststart_incidents = _v227_detect_poststart_incidents(result_text, meta_r)
+                if poststart_incidents:
+                    poststart_incidents = [
+                        x for x in poststart_incidents
+                        if "停止" not in str(x.get("理由") or "")
+                        and int(x.get("車番") or -1) not in set(teishi_cars or [])
+                    ]
                 st.session_state["v224_nonstarter_numbers"] = nonstarter_numbers
                 st.session_state["v227_poststart_incidents"] = poststart_incidents
                 st.session_state["v35_result_meta"] = meta_r
@@ -26140,7 +26343,15 @@ if selected_main_page == "✅ 結果登録・解析":
         if st.button(button_label, type="primary", use_container_width=True, disabled=button_disabled):
             try:
                 # 解析後のsession_state復元や再登録でも、発走後事故の学習遮断フラグを再適用する。
-                meta_r, poststart_incidents = _v227_detect_poststart_incidents(result_text, dict(meta_r or {}))
+                # ただし「/停止」は発走前除外として事故から外す。
+                meta_r, teishi_cars = _v320_reclassify_teishi_as_kessha(dict(meta_r or {}), rows_r, result_text)
+                meta_r, poststart_incidents = _v227_detect_poststart_incidents(result_text, meta_r)
+                if poststart_incidents:
+                    poststart_incidents = [
+                        x for x in poststart_incidents
+                        if "停止" not in str(x.get("理由") or "")
+                        and int(x.get("車番") or -1) not in set(teishi_cars or [])
+                    ]
                 st.session_state["v35_result_meta"] = meta_r
                 st.session_state["v227_poststart_incidents"] = poststart_incidents
                 with st.spinner("① SQLiteへ保存 → ② 予測差・展開を解析しています…"):
@@ -26149,7 +26360,11 @@ if selected_main_page == "✅ 結果登録・解析":
                         rows_r,
                     )
                     sess_kessha = st.session_state.get("v224_nonstarter_numbers") or []
-                    kessha_nums = sorted(set(int(x) for x in kessha_nums) | set(int(x) for x in sess_kessha))
+                    kessha_nums = sorted(
+                        set(int(x) for x in kessha_nums)
+                        | set(int(x) for x in sess_kessha)
+                        | set(int(x) for x in (teishi_cars or []))
+                    )
                     rows_for_engine = _v315_drop_kessha_rows(rows_r, kessha_nums)
                     meta_for_engine = dict(meta_r or {})
                     if kessha_nums:
