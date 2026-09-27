@@ -28168,8 +28168,14 @@ if selected_main_page == "🗃️ 登録情報確認":
                                         item.get('race_key'), item.get('car_no'), selected_name, engine.DB_PATH
                                     )
                                     if result.get('ok'):
-                                        ok, msg = push_db_to_github("AutoRaceAI: グランドノート未リンクを手動修復")
-                                        st.success(result.get('message', '修復しました。') + f" 周回{result.get('synced_rows', 0)}行を再学習しました。" + (" " + msg if ok else " GitHub保存は未完了です。" + msg))
+                                        st.success(
+                                            result.get('message', '修復しました。')
+                                            + f" 周回{result.get('synced_rows', 0)}行を再学習しました。"
+                                        )
+                                        st.warning(
+                                            "GitHub保存は自動では行いません。"
+                                            "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
+                                        )
                                         st.rerun()
                                     else:
                                         st.warning(result.get('message', '修復できませんでした。'))
