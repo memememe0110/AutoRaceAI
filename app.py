@@ -247,7 +247,7 @@ def _v266_coalesce_player_name_columns(df):
             if valid(v):
                 chosen = str(v).strip()
                 break
-        vals.append(chosen if chosen else None)
+        _ = vals.append(chosen if chosen else None)
     df["player_name"] = vals
     return df
 
@@ -308,7 +308,7 @@ def _v266_load_error_rows(db_path, limit_rows=20000):
         }
         for c, sql in optional_map.items():
             if c in re_cols:
-                select_parts.append(sql)
+                _ = select_parts.append(sql)
 
         # 開催条件はresult_races側にあれば拾う
         rr_optional = {
@@ -321,7 +321,7 @@ def _v266_load_error_rows(db_path, limit_rows=20000):
         }
         for c, sql in rr_optional.items():
             if c in rr_cols:
-                select_parts.append(sql)
+                _ = select_parts.append(sql)
 
         result_sql = f"""
             SELECT {", ".join(select_parts)}
@@ -391,7 +391,7 @@ def _v266_load_error_rows(db_path, limit_rows=20000):
         cols = []
         for c in (p_date, p_venue, p_race, p_ver, p_payload, p_race_key):
             if c and c not in cols:
-                cols.append(c)
+                _ = cols.append(c)
 
         if not cols:
             return pd.DataFrame(), f"{pred_table} の予測保存カラムを特定できません: {pcols}"
@@ -562,9 +562,9 @@ def _v267_prepare_unique_actual_runs(rows):
     keys = ["race_key", "car_no"] if "race_key" in d.columns else ["date","venue","race_no","car_no"]
     order = []
     if "prediction_time" in d.columns:
-        order.append("prediction_time")
+        _ = order.append("prediction_time")
     if "_rowid" in d.columns:
-        order.append("_rowid")
+        _ = order.append("_rowid")
     if order:
         d = d.sort_values(order)
     return d.drop_duplicates(keys, keep="last").copy()
@@ -816,7 +816,7 @@ def _v229_wall_profile(df: pd.DataFrame, entries: pd.DataFrame) -> dict[int, dic
         vals = []
         for key in ("混戦突破適性", "展開適性点", "実戦能力点", "スタート伸び指数"):
             if key in r.index:
-                vals.append(_v229_num(r.get(key), 0.0))
+                _ = vals.append(_v229_num(r.get(key), 0.0))
         raw_break[car] = sum(vals) / len(vals) if vals else 0.0
     if raw_break:
         lo, hi = min(raw_break.values()), max(raw_break.values())
@@ -1299,7 +1299,7 @@ def _v251_lap_alignment_calibration(db_path: str | None, venue: str, cutoff_date
             lap_no=lap_key[0]
             try: lap_no=int(lap_no)
             except Exception: lap_no=len(laps)+1
-            laps.append((lap_no, order, hmap))
+            _ = laps.append((lap_no, order, hmap))
         laps.sort(key=lambda x:x[0])
         if len(laps)<2: continue
         race_count += 1
@@ -1312,7 +1312,7 @@ def _v251_lap_alignment_calibration(db_path: str | None, venue: str, cutoff_date
                 if front not in cur_pos or chaser not in cur_pos: continue
                 success=1 if cur_pos[chaser] < cur_pos[front] else 0
                 gap=max(0, int(hmap.get(chaser,0))-int(hmap.get(front,0)))
-                events.append((int(lap_no), _v251_gap_bucket(gap), success))
+                _ = events.append((int(lap_no), _v251_gap_bucket(gap), success))
     if len(events)<120:
         result.update({"sample_pairs":len(events),"races":race_count})
         _V251_LAP_ALIGNMENT_CACHE[stamp]=dict(result)
@@ -1358,7 +1358,7 @@ def _v251_actual_lap_orders(db_path: str | None, meta: dict) -> list[tuple[str, 
     if d.empty:return []
     out=[]
     for (label,lap_no),g in d.groupby(['lap_label','lap_no'],dropna=False,sort=False):
-        out.append((str(label),tuple(int(x) for x in g.sort_values('position').car_no.tolist())))
+        _ = out.append((str(label),tuple(int(x) for x in g.sort_values('position').car_no.tolist())))
     return out
 
 def _v251_pairwise_accuracy(pred: tuple[int,...], actual: tuple[int,...]) -> float:
@@ -1843,7 +1843,7 @@ def _v276_virtual_all_odds_candidates(
     for combo,count in tri_counter.items():
         vals=tuple(int(v) for v in (tuple(combo) if isinstance(combo,(tuple,list)) else (combo,)))
         if len(vals)==3:
-            outcomes.append((vals,float(count)/max(int(trials),1)*100.0))
+            _ = outcomes.append((vals,float(count)/max(int(trials),1)*100.0))
     if not outcomes:
         return []
 
@@ -1981,7 +1981,7 @@ def _v276_virtual_extra_all_odds_score(
         next_rate=next_expected/next_cost*100.0 if next_cost>0 else 0.0
         # 追加後の合成モデル期待回収率が上がるものだけ。
         if next_rate>current_rate+1e-9:
-            selected.append(dict(cand))
+            _ = selected.append(dict(cand))
             expected_payout=next_expected
             current_cost=next_cost
             current_rate=next_rate
@@ -3443,7 +3443,7 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         if _m276:
             _d8,_venue,_rno_s=_m276.groups()
             _date=f"{_d8[:4]}-{_d8[4:6]}-{_d8[6:8]}"
-            chronological.append((_date,_venue,int(_rno_s),_hid,h))
+            _ = chronological.append((_date,_venue,int(_rno_s),_hid,h))
             continue
         try:
             _v, _raw, _vo, _hm = _v231_load_prediction_history(db_path, _hid)
@@ -3453,9 +3453,9 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             _rraw = str(_mm.get('R') or _mm.get('レース') or _mm.get('レース番号') or _mm.get('race_no') or _mm.get('race') or '')
             _rm = re.search(r'\d+', _rraw)
             _rno = int(_rm.group()) if _rm else 999
-            chronological.append((_date, _venue, _rno, _hid, h))
+            _ = chronological.append((_date, _venue, _rno, _hid, h))
         except Exception:
-            chronological.append(('9999-99-99','',999,_hid,h))
+            _ = chronological.append(('9999-99-99','',999,_hid,h))
     chronological.sort(key=lambda x:(x[0],x[1],x[2],x[3]))
     unique=[x[4] for x in chronological]
 
@@ -3859,7 +3859,7 @@ def _v252_lap_residual_calibration(db_path: str | None, venue: str, cutoff_date:
             if front not in pp or chaser not in pp or front not in ap or chaser not in ap: continue
             pred_pass=int(pp[chaser]<pp[front]); actual_pass=int(ap[chaser]<ap[front])
             gap=max(0,hp.get(chaser,0)-hp.get(front,0))
-            events.append((key[3],_v251_gap_bucket(gap),actual_pass-pred_pass,0.35 if int(getattr(row,'is_backtest',0) or 0)==2 else 1.0))
+            _ = events.append((key[3],_v251_gap_bucket(gap),actual_pass-pred_pass,0.35 if int(getattr(row,'is_backtest',0) or 0)==2 else 1.0))
     if len(events)<60:
         result.update({'samples':len(events),'races':len(race_keys)})
         _V252_LAP_RESIDUAL_CACHE[stamp]=dict(result)
@@ -3947,7 +3947,7 @@ def _v256_actual_lap_calibration(db_path: str | None, venue: str = "", cutoff_da
                     if front in pos and chaser in pos:
                         pairs+=1; inv += int(pos[chaser] < pos[front])
                 if pairs:
-                    events.append((str(v),int(lap),int(inv),int(pairs)))
+                    _ = events.append((str(v),int(lap),int(inv),int(pairs)))
                     race_keys.add((str(race_date),str(v),str(race_no)))
             prev=cur
     if not events:
@@ -4087,7 +4087,7 @@ def _v254_player_lap_calibration(db_path: str | None, venue: str, cutoff_date: s
                 continue
             pred_pass=int(pp[chaser]<pp[front]); actual_pass=int(ap[chaser]<ap[front])
             weight=0.35 if int(getattr(row,'is_backtest',0) or 0)==2 else 1.0
-            events.append((name,key[3],actual_pass-pred_pass,weight))
+            _ = events.append((name,key[3],actual_pass-pred_pass,weight))
             race_keys.add(key[:3])
     if len(events)<40:
         result.update({'samples':len(events),'races':len(race_keys)})
@@ -4184,7 +4184,7 @@ def _v258_player_actual_lap_calibration(db_path: str | None, venue: str = "", cu
                 if not name or front not in pos or chaser not in pos:
                     continue
                 passed=int(pos[chaser] < pos[front])
-                events.append((str(v),name,int(lap),passed))
+                _ = events.append((str(v),name,int(lap),passed))
                 race_keys.add((str(race_date),str(v),str(race_no)))
             prev=cur
     if len(events)<100:
@@ -4492,7 +4492,7 @@ def _v272_common_race_precision_compare(db_path: str, versions: list[str]) -> tu
                     pair_total += 1
                     pair_ok += int((ap[a] < ap[b]) == (pp[a] < pp[b]))
             mae = float(np.mean([abs(ap[c]-pp[c]) for c in common]))
-            metrics.append((pos_match, pair_ok/pair_total if pair_total else 0.0, mae))
+            _ = metrics.append((pos_match, pair_ok/pair_total if pair_total else 0.0, mae))
             if 1 <= int(row.lap_no) <= 6:
                 lap_mae[int(row.lap_no)].append(mae)
             used_races.add(key[:3])
@@ -4524,7 +4524,7 @@ def _v272_common_race_precision_compare(db_path: str, versions: list[str]) -> tu
                 15.0*_trio_hit +
                 15.0*_trifecta_hit
             )
-            top3_eval.append((_win_hit,_top3_n,_trio_hit,_trifecta_hit,_actual_top3_rank_err,_score))
+            _ = top3_eval.append((_win_hit,_top3_n,_trio_hit,_trifecta_hit,_actual_top3_rank_err,_score))
 
         if metrics:
             arr = np.asarray(metrics, dtype=float)
@@ -4555,7 +4555,7 @@ def _v272_common_race_precision_compare(db_path: str, versions: list[str]) -> tu
                 rec[f"{lap}周目誤差"] = (
                     round(float(np.mean(lap_mae[lap])),2) if lap_mae[lap] else None
                 )
-            rows.append(rec)
+            _ = rows.append(rec)
 
     return pd.DataFrame(rows, columns=cols), common_races
 
@@ -4619,7 +4619,7 @@ def _v254_saved_version_lap_comparison(db_path: str) -> pd.DataFrame:
                     a,b=common[i],common[j]; pair_total+=1
                     pair_ok += int((ap[a]<ap[b])==(pp[a]<pp[b]))
             mae=float(np.mean([abs(ap[c]-pp[c]) for c in common]))
-            metrics.append((pos_match,pair_ok/pair_total if pair_total else 0.0,mae))
+            _ = metrics.append((pos_match,pair_ok/pair_total if pair_total else 0.0,mae))
             races.add(key[:3])
         if metrics:
             arr=np.asarray(metrics,dtype=float)
@@ -4818,7 +4818,7 @@ def _v292_trial_gap_gate_calibration(
                     params.extend([cutoff,cutoff,race_no])
                 else:
                     q += " AND substr(rr.race_date,1,10) < substr(?,1,10)"
-                    params.append(cutoff)
+                    _ = params.append(cutoff)
             rows=con.execute(q,params).fetchall()
     except Exception as exc:
         out["reason"]=f"読込失敗: {type(exc).__name__}: {exc}"
@@ -4952,7 +4952,7 @@ def _v294_front_st_guard_calibration(
                     params.extend([cutoff,cutoff,race_no])
                 else:
                     q += " AND substr(rr.race_date,1,10) < substr(?,1,10)"
-                    params.append(cutoff)
+                    _ = params.append(cutoff)
             rows=con.execute(q,params).fetchall()
     except Exception as exc:
         out["reason"]=f"読込失敗: {type(exc).__name__}: {exc}"
@@ -5162,7 +5162,7 @@ def _v263_route_similarity(pred_laps, actual_laps):
         if not pp or not aa:
             continue
         pos=sum(1 for x,y in zip(pp,aa) if x==y)/max(1,len(aa))
-        vals.append(0.35*pos + 0.65*_v251_pairwise_accuracy(pp,aa))
+        _ = vals.append(0.35*pos + 0.65*_v251_pairwise_accuracy(pp,aa))
     return float(sum(vals)/len(vals)) if vals else 0.0
 
 def _v263_scenario_prior(db_path, venue='', cutoff=''):
@@ -5176,7 +5176,7 @@ def _v263_scenario_prior(db_path, venue='', cutoff=''):
         con=sqlite3.connect(db_path)
         params=[]; wh=['COALESCE(rr.learning_eligible,1)=1']
         if cutoff:
-            wh.append('substr(rr.race_date,1,10)<substr(?,1,10)'); params.append(str(cutoff)[:10])
+            _ = wh.append('substr(rr.race_date,1,10)<substr(?,1,10)'); params.append(str(cutoff)[:10])
         q=f'''SELECT rr.race_key,rr.venue,rl.lap_no,rl.position,rl.car_no
               FROM result_laps rl JOIN result_races rr ON rr.race_key=rl.race_key
               WHERE {' AND '.join(wh)} ORDER BY rr.race_key,rl.lap_no,rl.position'''
@@ -5277,14 +5277,14 @@ def _v318_same_handicap_flow_calibration(db_path: str | None, cutoff_date: str =
             for _, one in lg.groupby("lap_no", sort=True):
                 order = tuple(int(x) for x in one.sort_values("position")["car_no"].tolist())
                 if order:
-                    laps.append(order)
+                    _ = laps.append(order)
         typ = _v263_scenario_type_from_laps(laps)
         if typ == "不明":
             continue
         wet = _v316_surface_is_wet(g["surface"].iloc[0] if "surface" in g.columns else "")
-        all_types.append(typ)
+        _ = all_types.append(typ)
         if spread <= 10:
-            same_rows.append({"typ": typ, "wet": wet})
+            _ = same_rows.append({"typ": typ, "wet": wet})
     n_same = len(same_rows)
     out["samples"] = n_same
     if n_same < 8:
@@ -5374,9 +5374,9 @@ def _v264_feedback_scenario_adjustment(db_path, venue='', cutoff=''):
         con.commit()
         wh=[]; params=[]
         if venue:
-            wh.append('venue=?'); params.append(str(venue))
+            _ = wh.append('venue=?'); params.append(str(venue))
         if cutoff:
-            wh.append('substr(race_date,1,10)<substr(?,1,10)'); params.append(str(cutoff)[:10])
+            _ = wh.append('substr(race_date,1,10)<substr(?,1,10)'); params.append(str(cutoff)[:10])
         q='SELECT actual_scenario,predicted_json,closest_similarity FROM v263_scenario_feedback'
         if wh: q += ' WHERE ' + ' AND '.join(wh)
         rows=con.execute(q,params).fetchall(); con.close()
@@ -5465,7 +5465,7 @@ def _v265_time_residual_calibration(db_path: str | None, venue: str = "", cutoff
             m=re.search(r'-?\d+',str(h or '0'))
             hv=int(m.group()) if m else 0
             bucket=int(round(hv/10.0)*10)
-            vals.append((str(v or ''),_v230_norm_name(nm),bucket,d,str(rd or '')))
+            _ = vals.append((str(v or ''),_v230_norm_name(nm),bucket,d,str(rd or '')))
         except Exception:
             continue
     if len(vals)<20:
@@ -5582,10 +5582,10 @@ def _v268_handicap_bias_model(db_path: str | None, venue: str = "", cutoff_date:
                     params.extend([str(cutoff_date)[:10], str(cutoff_date)[:10], int(cutoff_race_no)])
                 else:
                     q += " AND substr(rr.race_date,1,10) < substr(?,1,10)"
-                    params.append(str(cutoff_date)[:10])
+                    _ = params.append(str(cutoff_date)[:10])
             if venue:
                 q += " AND rr.venue = ?"
-                params.append(str(venue))
+                _ = params.append(str(venue))
             q += """
                     GROUP BY s.race_key, s.car_no
                 )
@@ -5627,9 +5627,9 @@ def _v268_handicap_bias_model(db_path: str | None, venue: str = "", cutoff_date:
             err = a - p
             if not np.isfinite(hv) or not np.isfinite(err) or abs(err) > 0.20:
                 continue
-            xs.append(hv)
-            ys.append(err)
-            group_keys.append(str(race_key or f"{rd}|{vv}"))
+            _ = xs.append(hv)
+            _ = ys.append(err)
+            _ = group_keys.append(str(race_key or f"{rd}|{vv}"))
         except Exception:
             continue
 
@@ -5776,7 +5776,7 @@ def _v270_chase_gate(
     # 60m+は渋滞・捌きの不確実性が大きいので、根拠なしの全開補正を抑える。
     if h >= 60.0 and not any(r in reasons for r in ("strong_chaser_history","chaser_history")):
         gate -= 0.08
-        reasons.append("deep_handicap_uncertainty")
+        _ = reasons.append("deep_handicap_uncertainty")
 
     gate = float(np.clip(gate, 0.45, 1.00))
     return gate, {"gate": gate, "reason": ",".join(reasons) if reasons else "neutral"}
@@ -5834,13 +5834,13 @@ def _v271_mid_lap_pass_factor(
     # Ver271で「追える根拠」が弱い後方車は3～4周目の追い抜きを抑える。
     if gate < 0.60:
         factor *= 0.84
-        reasons.append("weak_chase_gate")
+        _ = reasons.append("weak_chase_gate")
     elif gate < 0.75:
         factor *= 0.92
-        reasons.append("moderate_chase_gate")
+        _ = reasons.append("moderate_chase_gate")
     elif gate >= 0.92:
         factor *= 1.05
-        reasons.append("strong_chase_gate")
+        _ = reasons.append("strong_chase_gate")
 
     # 当日の試走が良い場合だけ、中盤の捌き成功率を小さく上乗せ。
     try:
@@ -5850,17 +5850,17 @@ def _v271_mid_lap_pass_factor(
             adv = med - tt
             if adv >= 0.040:
                 factor *= 1.05
-                reasons.append("strong_trial")
+                _ = reasons.append("strong_trial")
             elif adv <= -0.035:
                 factor *= 0.94
-                reasons.append("weak_trial")
+                _ = reasons.append("weak_trial")
     except Exception:
         pass
 
     # 60m以上は中盤の渋滞・複数捌き不確実性を追加で抑える。
     if h >= 60.0 and gate < 0.90:
         factor *= 0.93
-        reasons.append("deep_handicap")
+        _ = reasons.append("deep_handicap")
 
     # 過学習防止。±18%以内。
     factor = float(np.clip(factor, 0.82, 1.08))
@@ -5913,28 +5913,28 @@ def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_t
     if samples >= 5:
         if tadj <= -0.030:
             score += 2
-            reasons.append("residual_strong")
+            _ = reasons.append("residual_strong")
         elif tadj <= -0.015:
             score += 1
-            reasons.append("residual_mild")
+            _ = reasons.append("residual_mild")
     else:
-        reasons.append("residual_samples_lt5")
+        _ = reasons.append("residual_samples_lt5")
 
     if gate >= 0.90:
         score += 2
-        reasons.append("gate_ge_090")
+        _ = reasons.append("gate_ge_090")
     elif gate >= 0.80:
         score += 1
-        reasons.append("gate_ge_080")
+        _ = reasons.append("gate_ge_080")
     else:
-        reasons.append("gate_lt_080")
+        _ = reasons.append("gate_lt_080")
 
     if trial is not None and tmed is not None:
         if trial <= tmed - 0.035:
             score += 1
-            reasons.append("trial_fast")
+            _ = reasons.append("trial_fast")
     else:
-        reasons.append("trial_missing")
+        _ = reasons.append("trial_missing")
 
     base_threshold = 4 if h >= 60.0 else 3
     required = base_threshold
@@ -6063,7 +6063,7 @@ def _v276_mark_retrial_from_prediction_text(entries, raw_text):
                     continue
                 _following276 = [x for x in _lines276[_i276+1:_i276+10] if x]
                 if any(re.search(r"(川口|伊勢崎|浜松|山陽|飯塚)\s*\d{1,2}期", x) for x in _following276):
-                    _starts276.append((_i276, int(_line276)))
+                    _ = _starts276.append((_i276, int(_line276)))
             for _n276, (_s276, _car276) in enumerate(_starts276):
                 _e276 = _starts276[_n276+1][0] if _n276+1 < len(_starts276) else len(_lines276)
                 _block276 = " ".join(_lines276[_s276:_e276])
@@ -6195,7 +6195,7 @@ def _v287_compute_race_contribution(payload: bytes) -> list[tuple]:
             if str(v).strip().isdigit()
         )
         if vals:
-            actual_orders.append(vals)
+            _ = actual_orders.append(vals)
     same = [
         r for r in (audit.get("top_routes_v263") or [])
         if str(r.get("scenario") or "") == actual_s
@@ -6207,7 +6207,7 @@ def _v287_compute_race_contribution(payload: bytes) -> list[tuple]:
     for part in str(best.get("route") or "").split(" / "):
         vals = tuple(int(v) for v in part.split("-") if str(v).strip().isdigit())
         if vals:
-            sim_orders.append(vals)
+            _ = sim_orders.append(vals)
     L = min(6, len(actual_orders), len(sim_orders))
     if L < 3:
         return []
@@ -6395,7 +6395,7 @@ def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bo
                 ph = f"{history_id}:{payload_len}:hash_failed"
             if (not force_full) and existing.get(rk) == ph:
                 continue
-            to_compute.append((rk, ph, payload))
+            _ = to_compute.append((rk, ph, payload))
 
         # ---- 4) 変更分だけ decompress → v287_race_contributions へ保存 ----
         now = _v228_now_jst_iso()
@@ -6585,7 +6585,7 @@ def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_
             for x in (audit.get("actual_lap_comparison") or []):
                 vals=tuple(int(v) for v in str(x.get("actual") or "").split("-") if str(v).strip().isdigit())
                 if vals:
-                    actual_orders.append(vals)
+                    _ = actual_orders.append(vals)
             if len(actual_orders)<2:
                 continue
             same=[r for r in (audit.get("top_routes_v263") or []) if str(r.get("scenario") or "")==actual_s]
@@ -6597,7 +6597,7 @@ def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_
             for part in str(best.get("route") or "").split(" / "):
                 vals=tuple(int(v) for v in part.split("-") if str(v).strip().isdigit())
                 if vals:
-                    sim_orders.append(vals)
+                    _ = sim_orders.append(vals)
             L=min(6,len(actual_orders),len(sim_orders))
             for lap in range(2,L+1):
                 sp0={c:i for i,c in enumerate(sim_orders[lap-2])}; sp1={c:i for i,c in enumerate(sim_orders[lap-1])}
@@ -6674,7 +6674,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 for k in ("選手名","名前","player_name"):
                     if k in src.index and str(src.get(k,"")).strip(): name=_v230_norm_name(src.get(k)); break
             if name: break
-        names.append(name or str(c))
+        _ = names.append(name or str(c))
         h=0
         if er is not None:
             m=re.search(r"-?\d+",str(er.get("ハンデ",er.get("H",0))))
@@ -6992,7 +6992,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for i in range(1,len(order)):
             prev,cur=order[i-1],order[i]
             dh=max(0,handicap[cur]-handicap[prev])
-            gaps.append(0.11+0.017*dh+rng.uniform(0.00,0.08))
+            _ = gaps.append(0.11+0.017*dh+rng.uniform(0.00,0.08))
         # 6周。後車から前車へ隣接追い抜き判定。
         sim_lap_path=[]
         momentum={c:0.0 for c in cars}
@@ -7253,7 +7253,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             transition_audit[lap]["top3_entries"]+=len(_new_top3_audit-_prev_top3_audit)
             transition_audit[lap]["top3_exits"]+=len(_prev_top3_audit-_new_top3_audit)
             lap_tuple=tuple(order)
-            sim_lap_path.append(lap_tuple)
+            _ = sim_lap_path.append(lap_tuple)
             lap_order_counts[lap][lap_tuple]=lap_order_counts[lap].get(lap_tuple,0)+1
         final_tuple=tuple(order)
         final_order_counts[final_tuple]=final_order_counts.get(final_tuple,0)+1
@@ -7364,13 +7364,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         counter=lap_order_counts.get(lap) or {}
         if counter:
             order_mode,n=max(counter.items(),key=lambda kv:kv[1])
-            modal_laps.append({"lap":lap,"order":"-".join(map(str,order_mode)),"support":n/max(1,sim_trials)*100})
+            _ = modal_laps.append({"lap":lap,"order":"-".join(map(str,order_mode)),"support":n/max(1,sim_trials)*100})
     lap_comparison=[]
     if actual_lap_orders:
         for idx,(label,actual) in enumerate(actual_lap_orders[:6],start=1):
             pred=tuple(int(x) for x in modal_laps[idx-1]["order"].split('-')) if idx<=len(modal_laps) else tuple()
             pos_acc=(sum(1 for a,b in zip(pred,actual) if a==b)/max(1,len(actual))) if pred else 0.0
-            lap_comparison.append({"lap":idx,"label":label,"actual":"-".join(map(str,actual)),"predicted":"-".join(map(str,pred)),"position_accuracy":pos_acc*100,"pairwise_accuracy":_v251_pairwise_accuracy(pred,actual)*100})
+            _ = lap_comparison.append({"lap":idx,"label":label,"actual":"-".join(map(str,actual)),"predicted":"-".join(map(str,pred)),"position_accuracy":pos_acc*100,"pairwise_accuracy":_v251_pairwise_accuracy(pred,actual)*100})
     # Ver263: 複数展開ルートと、実測に最も近かったルートを監査。
     scenario_distribution={k:float(v)/max(1,sim_trials)*100 for k,v in sorted(scenario_counts.items(),key=lambda kv:kv[1],reverse=True)}
     top_routes=[]
@@ -7381,7 +7381,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     for route,n in sorted(route_counts.items(),key=lambda kv:kv[1],reverse=True)[:12]:
         sim=float(_v263_route_similarity(route,actual_orders_only)) if actual_orders_only else 0.0
         route_text=' / '.join('-'.join(map(str,row)) for row in route)
-        top_routes.append({'support':n/max(1,sim_trials)*100,'scenario':_v263_scenario_type_from_laps(route),'similarity':sim*100,'route':route_text})
+        _ = top_routes.append({'support':n/max(1,sim_trials)*100,'scenario':_v263_scenario_type_from_laps(route),'similarity':sim*100,'route':route_text})
         if sim>closest_similarity:
             closest_similarity=sim; closest_route=route_text
     if actual_orders_only:
@@ -7520,13 +7520,13 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
     for m in block_pattern.finditer(normalized):
         car_no = int(m.group(1))
         reason = str(m.group(3))
-        detected.append((car_no, reason))
+        _ = detected.append((car_no, reason))
 
     # 保存テキストの整形によって1行化されている場合の補助。
     if not detected:
         line_pattern = re.compile(rf"-\s*([1-8])\b[^\n]{{0,220}}?({accident_words})")
         for m in line_pattern.finditer(normalized):
-            detected.append((int(m.group(1)), str(m.group(2))))
+            _ = detected.append((int(m.group(1)), str(m.group(2))))
 
     if not detected:
         return meta, rows, []
@@ -7564,7 +7564,7 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
             row["事故"] = "事前除外"
         out = pd.concat([out, pd.DataFrame([row])], ignore_index=True)
         existing.add(car_no)
-        added.append(car_no)
+        _ = added.append(car_no)
 
     meta_out = dict(meta or {})
     detected_numbers = sorted({int(car_no) for car_no, _reason in detected})
@@ -7653,7 +7653,7 @@ def _v319_detect_kessha_from_players(players: list) -> list[int]:
             continue
         if p.get("kessha") or p.get("欠車"):
             try:
-                out.append(int(p.get("car")))
+                _ = out.append(int(p.get("car")))
             except Exception:
                 pass
     return sorted(set(out))
@@ -7674,11 +7674,11 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
         re.MULTILINE | re.DOTALL,
     )
     for m in pat.finditer(normalized):
-        found.append({"車番": int(m.group(1)), "理由": str(m.group(3))})
+        _ = found.append({"車番": int(m.group(1)), "理由": str(m.group(3))})
     if not found:
         line_pat = re.compile(rf"(?:^|\n)\s*-?\s*([1-8])\b[^\n]{{0,240}}?({words})", re.MULTILINE)
         for m in line_pat.finditer(normalized):
-            found.append({"車番": int(m.group(1)), "理由": str(m.group(2))})
+            _ = found.append({"車番": int(m.group(1)), "理由": str(m.group(2))})
     unique=[]
     seen=set()
     for item in found:
@@ -8337,7 +8337,7 @@ def _v280_build_result_view_for_prediction(db_path: str, race_key: str, predicti
                 except Exception:
                     continue
                 if c not in have:
-                    extra.append({"車番": c})
+                    _ = extra.append({"車番": c})
                     have.add(c)
             if extra:
                 p = pd.concat([p, pd.DataFrame(extra)], ignore_index=True)
@@ -8477,9 +8477,9 @@ def _v238_result_safety_check(db_path: str, race_key: str, rows: pd.DataFrame) -
         vals = sorted({int(x) for x in dup[finish_c].dropna().tolist()})
         # Ver276: オートレースでは同着が成立するため、着順重複だけでは登録停止しない。
         # 車番重複は従来どおりエラーにし、同着は監査用の警告だけ残す。
-        warnings.append(f"同着として扱う着順があります：{vals}")
+        _ = warnings.append(f"同着として扱う着順があります：{vals}")
     if ranked[car_c].duplicated().any():
-        errors.append("同じ車番が複数の通常結果として解析されています。")
+        _ = errors.append("同じ車番が複数の通常結果として解析されています。")
     if not race_key:
         return errors, warnings
     try:
@@ -8496,7 +8496,7 @@ def _v238_result_safety_check(db_path: str, race_key: str, rows: pd.DataFrame) -
             removed = sorted(old_cars - new_cars)
             added = sorted(new_cars - old_cars)
             if removed or added:
-                warnings.append(f"車番構成が変わります（削除 {removed or 'なし'}／追加 {added or 'なし'}）。")
+                _ = warnings.append(f"車番構成が変わります（削除 {removed or 'なし'}／追加 {added or 'なし'}）。")
             for _, r in work.iterrows():
                 if pd.isna(r[car_c]):
                     continue
@@ -8505,15 +8505,15 @@ def _v238_result_safety_check(db_path: str, race_key: str, rows: pd.DataFrame) -
                 if not old_r:
                     continue
                 if race_c and old_r.get("race_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[race_c]]), errors="coerce").iloc[0]):
-                    errors.append(f"{car}番の競走タイムが既存データから消えます。")
+                    _ = errors.append(f"{car}番の競走タイムが既存データから消えます。")
                 if st_c and old_r.get("start_time") is not None and pd.isna(pd.to_numeric(pd.Series([r[st_c]]), errors="coerce").iloc[0]):
-                    errors.append(f"{car}番のSTが既存データから消えます。")
+                    _ = errors.append(f"{car}番のSTが既存データから消えます。")
                 old_status = str(old_r.get("result_status") or "通常")
                 new_status = str(r[status_c] if status_c else "通常")
                 if old_status != "通常" and not any(k in new_status for k in ["欠車","取消","除外","反妨","反則","失格","落車","中止","周誤"]):
-                    errors.append(f"{car}番の異常情報「{old_status}」が通常扱いへ変わります。")
+                    _ = errors.append(f"{car}番の異常情報「{old_status}」が通常扱いへ変わります。")
     except Exception as exc:
-        warnings.append(f"既存結果との詳細比較を完了できませんでした：{type(exc).__name__}")
+        _ = warnings.append(f"既存結果との詳細比較を完了できませんでした：{type(exc).__name__}")
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))
 
 
@@ -8574,15 +8574,15 @@ def _v233_build_result_text_from_db(db_path: str, race_key: str) -> str:
         ]
         cond=[]
         if race['surface']:
-            cond.append(str(race['surface']))
+            _ = cond.append(str(race['surface']))
         if race['track_temp'] is not None:
-            cond.append(f"/{_v233_fmt_num(race['track_temp'],0)}℃")
+            _ = cond.append(f"/{_v233_fmt_num(race['track_temp'],0)}℃")
         if cond:
-            lines.append(' '.join(cond))
+            _ = lines.append(' '.join(cond))
         if race['air_temp'] is not None:
-            lines.append(f"気温：{_v233_fmt_num(race['air_temp'],0)}℃")
+            _ = lines.append(f"気温：{_v233_fmt_num(race['air_temp'],0)}℃")
         if race['humidity'] is not None:
-            lines.append(f"湿度：{_v233_fmt_num(race['humidity'],0)}%")
+            _ = lines.append(f"湿度：{_v233_fmt_num(race['humidity'],0)}%")
         lines += ["着順 車番 選手名", "LG/ハンデ/試走T 競走T（人気） ST/事故"]
         for e in entries:
             status=str(e['result_status'] or '通常')
@@ -8599,18 +8599,18 @@ def _v233_build_result_text_from_db(db_path: str, race_key: str) -> str:
                 f"{stt}" + (f" /{status}" if status and status != '通常' else ''),
             ]
         if laps:
-            lines.append('グランドノート')
+            _ = lines.append('グランドノート')
             grouped={}
             for x in laps:
                 grouped.setdefault(str(x['lap_label']), []).append((int(x['position']), int(x['car_no'])))
             for label, vals in grouped.items():
                 vals=sorted(vals)
-                lines.append(label + '\t' + '\t'.join(str(car) for _,car in vals))
+                _ = lines.append(label + '\t' + '\t'.join(str(car) for _,car in vals))
         if payouts:
-            lines.append('払戻金')
+            _ = lines.append('払戻金')
             for x in payouts:
                 pop = f" {int(x['popularity'])}人気" if x['popularity'] is not None else ''
-                lines.append(f"{x['bet_type']}\t{x['combination']}\t{int(x['payout_yen'] or 0)}円{pop}")
+                _ = lines.append(f"{x['bet_type']}\t{x['combination']}\t{int(x['payout_yen'] or 0)}円{pop}")
         return '\n'.join(lines).strip()
     except Exception:
         return ""
@@ -8680,7 +8680,7 @@ def _v163_save_input(widget_key: str, saved_key: str) -> None:
 
 def _v163_clear_saved_inputs(*saved_keys: str) -> None:
     for saved_key in saved_keys:
-        st.session_state.pop(saved_key, None)
+        _ = st.session_state.pop(saved_key, None)
 
 
 st.title("🏁 AutoRaceAI スマホ本予測")
@@ -8891,7 +8891,7 @@ def _v319_list_oddspark_meetings(ymd: str) -> list[dict]:
     for cd in sorted(set(re.findall(r"placeCd=(\d+)", html))):
         venue = _V319_OP_PLACE_REV.get(cd)
         if venue:
-            found.append({"venue": venue, "place_cd": cd, "ymd": ymd})
+            _ = found.append({"venue": venue, "place_cd": cd, "ymd": ymd})
     return found
 
 
@@ -8952,7 +8952,7 @@ def _v319_html_cells(row_html: str) -> list[str]:
         cell = cell.replace("&nbsp;", " ").replace("&amp;", "&").replace("&#12288;", " ")
         cell = re.sub(r"&#(\d+);", lambda mm: chr(int(mm.group(1))), cell)
         cell = re.sub(r"\s+", " ", cell).strip()
-        cells.append(cell)
+        _ = cells.append(cell)
     return cells
 
 
@@ -8991,16 +8991,16 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
         extra = f"{surface}"
         if track_temp:
             extra += f" /{track_temp}℃"
-        lines.append(extra)
+        _ = lines.append(extra)
     if weather:
-        lines.append(weather)
+        _ = lines.append(weather)
     if air:
-        lines.append(f"気温：{air}℃")
+        _ = lines.append(f"気温：{air}℃")
     if hum:
-        lines.append(f"湿度：{hum}%")
-    lines.append("着順	車番	選手名")
-    lines.append("LG/ハンデ/試走T	競走T（人気）")
-    lines.append("ST/事故")
+        _ = lines.append(f"湿度：{hum}%")
+    _ = lines.append("着順	車番	選手名")
+    _ = lines.append("LG/ハンデ/試走T	競走T（人気）")
+    _ = lines.append("ST/事故")
 
     tables = re.findall(r"(?is)<table[^>]*>(.*?)</table>", html)
     finish_rows, lap_rows, pay_rows = [], [], []
@@ -9047,25 +9047,25 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
             or (pos in ("-", "欠", "－") and ("欠車" in str(acc or "") or "欠車" in str(abn or "")))
         )
         if _is_kessha:
-            lines.append(f"-\t{car}\t{name}")
-            lines.append(f"{lg}/{hand}m/{trial}\t0.000(-)")
-            lines.append("0.00 /欠車")
+            _ = lines.append(f"-\t{car}\t{name}")
+            _ = lines.append(f"{lg}/{hand}m/{trial}\t0.000(-)")
+            _ = lines.append("0.00 /欠車")
             continue
         flag = f" /{abn}" if abn else ""
         # 発走後事故（反妨等）は着順 "-" のまま残す（欠車にしない）
         if str(pos) in ("-", "欠", "－") and abn and "欠車" not in str(abn):
-            lines.append(f"-\t{car}\t{name}")
-            lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop})")
+            _ = lines.append(f"-\t{car}\t{name}")
+            _ = lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop})")
             st_s = str(st or "0.00")
-            lines.append(f"{st_s} /{abn}")
+            _ = lines.append(f"{st_s} /{abn}")
         else:
-            lines.append(f"{pos}\t{car}\t{name}")
-            lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop}){flag}")
-            lines.append(str(st))
+            _ = lines.append(f"{pos}\t{car}\t{name}")
+            _ = lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop}){flag}")
+            _ = lines.append(str(st))
 
     if lap_rows:
-        lines.append("グランドノート")
-        lines.append("周回・順位	1	2	3	4	5	6	7	8")
+        _ = lines.append("グランドノート")
+        _ = lines.append("周回・順位	1	2	3	4	5	6	7	8")
         for cells in lap_rows[1:]:
             if not cells:
                 continue
@@ -9074,9 +9074,9 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
                 label = "ゴール線"
             cars = "\t".join(c for c in cells[1:] if re.fullmatch(r"\d+", c or ""))
             if cars:
-                lines.append(f"{label}\t{cars}")
+                _ = lines.append(f"{label}\t{cars}")
 
-    lines.append("払戻金")
+    _ = lines.append("払戻金")
     kind = ""
     for cells in pay_rows:
         vals = [c for c in cells if c]
@@ -9099,7 +9099,7 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
                 before.extend(nums)
         if kind and yen and before:
             sep = "→" if kind in ("2連単", "3連単") else "-"
-            lines.append(f"{kind}\t{sep.join(before)}\t{yen}")
+            _ = lines.append(f"{kind}\t{sep.join(before)}\t{yen}")
     pay_txt = re.sub(r"\s*-\s*", "-", raw.replace("\t", " "))
     pay_txt = re.sub(r"\s+", " ", pay_txt)
     existing = "\n".join(lines)
@@ -9107,23 +9107,23 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
         for mm in re.finditer(rf"{pk}\s+([0-9\-]+)\s+([\d,]+)円", pay_txt):
             row = f"{pk}\t{mm.group(1)}\t{mm.group(2)}円"
             if row not in existing:
-                lines.append(row)
+                _ = lines.append(row)
                 existing += "\n" + row
     
     # 中止・不成立を正規化テキストに残す（オッズ空時の判定用）
     if re.search(r"レース中止|競走中止", raw) or re.search(r"(?:^|\n)\s*中止\s*(?:\n|$)", raw):
         if "レース中止" not in existing:
-            lines.append("レース中止")
+            _ = lines.append("レース中止")
             existing += "\nレース中止"
     if "不成立" in raw and "不成立" not in existing:
-        lines.append("不成立")
+        _ = lines.append("不成立")
         for bt in ("単勝", "複勝", "2連複", "2連単", "ワイド", "3連複", "3連単"):
             row = f"{bt}\t-\t100円\t不成立"
             if row not in existing:
-                lines.append(row)
+                _ = lines.append(row)
                 existing += "\n" + row
     if "全返還" in raw and "全返還" not in existing:
-        lines.append("全返還")
+        _ = lines.append("全返還")
     return "\n".join(lines)
 
 
@@ -9148,7 +9148,7 @@ def _v319_float_odd(val) -> float | None:
         for k in ("min", "max", "odds"):
             if val.get(k) not in (None, "", "-"):
                 try:
-                    nums.append(float(str(val.get(k)).replace(",", "")))
+                    _ = nums.append(float(str(val.get(k)).replace(",", "")))
                 except Exception:
                     pass
         return min(nums) if nums else None
@@ -9405,7 +9405,7 @@ def _v319_parse_sprace_players(html: str) -> list[dict]:
         seen.add(key)
         if "　" not in name and len(name) <= 3:
             continue
-        out.append({"car": car, "player_cd": pcd, "name": name, "name_key": _v319_norm_player_name(name)})
+        _ = out.append({"car": car, "player_cd": pcd, "name": name, "name_key": _v319_norm_player_name(name)})
     return out
 
 
@@ -9524,39 +9524,39 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
         f"{sm.group(1) if sm else '良走路'}" + (f" /{tm.group(1)}℃" if tm else ""),
     ]
     if am:
-        lines.append(f"気温：{am.group(1)}℃")
+        _ = lines.append(f"気温：{am.group(1)}℃")
     if hm:
-        lines.append(f"湿度：{hm.group(1)}%")
-    lines.append("出走表")
+        _ = lines.append(f"湿度：{hm.group(1)}%")
+    _ = lines.append("出走表")
     for p in cars:
         lg = p.get("lg") or venue
         name = p.get("name") or ""
-        lines.append(f"{p.get('car')}\t{name}({lg})")
+        _ = lines.append(f"{p.get('car')}\t{name}({lg})")
         if p.get("kessha"):
-            lines.append("欠車")
+            _ = lines.append("欠車")
         if p.get("age"):
-            lines.append(p["age"])
+            _ = lines.append(p["age"])
         hand = p.get("hand") or "0"
         st = p.get("st") or ""
         trial = p.get("trial") or ""
-        lines.append(f"ハンデ{hand}m/ST{st or '-'}\t{trial}".rstrip())
+        _ = lines.append(f"ハンデ{hand}m/ST{st or '-'}\t{trial}".rstrip())
         if p.get("dev") or p.get("rank"):
-            lines.append(f"{p.get('dev') or ''}\t{p.get('rank') or ''}".strip())
+            _ = lines.append(f"{p.get('dev') or ''}\t{p.get('rank') or ''}".strip())
         if p.get("avg_r") or p.get("best_r"):
             bit = []
             if p.get("avg_r"):
-                bit.append(f"平均競走T {p['avg_r']}")
+                _ = bit.append(f"平均競走T {p['avg_r']}")
             if p.get("best_r"):
-                bit.append(f"最高競走T {p['best_r']}")
-            lines.append(" ".join(bit))
+                _ = bit.append(f"最高競走T {p['best_r']}")
+            _ = lines.append(" ".join(bit))
         if p.get("finish10"):
-            lines.append(f"着順 {p['finish10']}")
+            _ = lines.append(f"着順 {p['finish10']}")
         if p.get("rate2"):
-            lines.append(f"2連 {p['rate2']}%")
+            _ = lines.append(f"2連 {p['rate2']}%")
         if p.get("rate3"):
-            lines.append(f"3連 {p['rate3']}%")
+            _ = lines.append(f"3連 {p['rate3']}%")
         if p.get("car_name"):
-            lines.append(p["car_name"])
+            _ = lines.append(p["car_name"])
     return "\n".join([ln for ln in lines if ln is not None])
 
 
@@ -9761,7 +9761,10 @@ def _v319_ensure_perf_indexes(db_path: str) -> dict:
             con.execute("PRAGMA busy_timeout=60000")
             for tname, iname, cols in _V319_INDEX_DDL:
                 okc, why = _v319_create_index_if_possible(con, tname, iname, cols)
-                (out["created"].append(iname) if okc else out["skipped"].append(iname + "(" + why + ")"))
+                if okc:
+                    out["created"].append(iname)
+                else:
+                    out["skipped"].append(iname + "(" + why + ")")
             con.commit()
         out["ok"] = True
         _v319_invalidate_schema_cache(db_path)
@@ -9913,11 +9916,11 @@ def _v319_probe_official_latest_ymd(player_cd: str, max_ymd: str = "") -> str:
         for m in re.finditer(r"(20\d{2})[年/.\-](\d{1,2})[月/.\-](\d{1,2})", html):
             ds = _norm_ymd(m.group(1), m.group(2), m.group(3))
             if ds:
-                found.append(ds)
+                _ = found.append(ds)
         for m in re.finditer(r"(?<!\d)(\d{2})/(\d{2})/(\d{2})(?!\d)", html):
             ds = _norm_ymd(m.group(1), m.group(2), m.group(3))
             if ds:
-                found.append(ds)
+                _ = found.append(ds)
         if not found:
             continue
         # 対象レース日より先は捨てる
@@ -10353,7 +10356,7 @@ def _v319_history_from_results(
         }
         if before_ymd and not _v319_hist_row_before(rec, before_ymd, before_venue, before_race):
             continue
-        out.append(rec)
+        _ = out.append(rec)
     return pd.DataFrame(out)
 
 
@@ -10445,7 +10448,7 @@ def _v319_fill_missing_race_nos(df: pd.DataFrame, db_path: str = "", player_name
         except Exception:
             cur = 0
         if cur <= 0:
-            need_idx.append(i)
+            _ = need_idx.append(i)
     if not need_idx:
         return df
     try:
@@ -10541,24 +10544,24 @@ def _v319_build_player_history_lines(
     lines = [str(player_name)]
     for n, (_, r) in enumerate(df.iterrows()):
         if n == 0:
-            lines.append("前走")
+            _ = lines.append("前走")
         elif n == 1:
-            lines.append("前々走")
+            _ = lines.append("前々走")
         else:
-            lines.append(f"{n + 1}走前")
+            _ = lines.append(f"{n + 1}走前")
         acc = str(r.get("事故") or "")
         fin = r.get("着順")
         if "欠責" in acc:
-            lines.append("欠責")
+            _ = lines.append("欠責")
         elif "欠車" in acc:
-            lines.append("欠車")
+            _ = lines.append("欠車")
         elif pd.notna(fin) and str(fin).strip() and str(fin).replace(".0", "", 1).isdigit():
-            lines.append(str(int(float(fin))))
+            _ = lines.append(str(int(float(fin))))
         else:
-            lines.append(str(fin or "欠車"))
+            _ = lines.append(str(fin or "欠車"))
         ds = str(r.get("開催日") or "")
         dm = re.match(r"(\d{4})-(\d{2})-(\d{2})", ds)
-        lines.append(f"{dm.group(1)}年{int(dm.group(2))}月{int(dm.group(3))}日" if dm else ds)
+        _ = lines.append(f"{dm.group(1)}年{int(dm.group(2))}月{int(dm.group(3))}日" if dm else ds)
         venue = str(r.get("開催場") or "").strip()
         try:
             rn = int(pd.to_numeric(r.get("レース"), errors="coerce") or 0)
@@ -10573,9 +10576,9 @@ def _v319_build_player_history_lines(
                 rn = int(m_rn.group(1))
         # 公式貼付形式: 開催場と R を別行（結合するとパーサがRを落とす）
         if venue:
-            lines.append(venue)
+            _ = lines.append(venue)
         if 1 <= rn <= 12:
-            lines.append(f"{rn}R")
+            _ = lines.append(f"{rn}R")
         rname = str(r.get("レース名") or "").strip()
         rname = re.sub(r"\s*\d*\s*レース映像", "", rname).strip()
         if not rname and r.get("レース種別"):
@@ -10586,19 +10589,19 @@ def _v319_build_player_history_lines(
             short = short.strip() or rname
             if len(short) > 40:
                 short = short[-40:]
-            lines.append(short)
+            _ = lines.append(short)
         elif r.get("レース種別"):
-            lines.append(str(r.get("レース種別")))
+            _ = lines.append(str(r.get("レース種別")))
         sky = str(r.get("天候") or "").replace("走路", "")
         if sky:
-            lines.append(sky)
+            _ = lines.append(sky)
         surf = str(r.get("走路") or "良").replace("走路", "")
-        lines.append(surf or "良")
+        _ = lines.append(surf or "良")
         # SP補完の走/気/湿があれば使う（HTTPしない）
         for col, prefix in (("走", "走"), ("気", "気"), ("湿", "湿")):
             val = str(r.get(col) or "").strip()
             if val:
-                lines.append(f"{prefix}{val}")
+                _ = lines.append(f"{prefix}{val}")
         if fetch_weather and not any(str(r.get(c) or "").strip() for c in ("走", "気", "湿")):
             ymd_wx = re.sub(r"[^0-9]", "", ds)
             try:
@@ -10606,11 +10609,11 @@ def _v319_build_player_history_lines(
             except Exception:
                 wx = {}
             if wx.get("走"):
-                lines.append(f"走{wx['走']}")
+                _ = lines.append(f"走{wx['走']}")
             if wx.get("気"):
-                lines.append(f"気{wx['気']}")
+                _ = lines.append(f"気{wx['気']}")
             if wx.get("湿"):
-                lines.append(f"湿{wx['湿']}")
+                _ = lines.append(f"湿{wx['湿']}")
         try:
             hnum = int(r.get("ハンデ") or 0)
         except Exception:
@@ -10620,22 +10623,22 @@ def _v319_build_player_history_lines(
         except Exception:
             car = 0
         if car > 0:
-            lines.append(f"{car}番{hnum}m" if hnum else f"{car}番-m")
+            _ = lines.append(f"{car}番{hnum}m" if hnum else f"{car}番-m")
         elif hnum:
-            lines.append(f"ハンデ{hnum}m")
+            _ = lines.append(f"ハンデ{hnum}m")
         else:
-            lines.append("ハンデ-m")
-        lines.append("3100m(6周)")
+            _ = lines.append("ハンデ-m")
+        _ = lines.append("3100m(6周)")
         race_t = str(r.get("競走T") or "0.000").replace("試", "")
         trial = str(r.get("試走T") or "-")
         stv = str(r.get("ST") or "0.00")
-        lines.append(race_t if race_t else "0.000")
-        lines.append(f"試{trial}" if not str(trial).startswith("試") else str(trial))
-        lines.append(f"ST{stv}" if not str(stv).upper().startswith("ST") else str(stv))
+        _ = lines.append(race_t if race_t else "0.000")
+        _ = lines.append(f"試{trial}" if not str(trial).startswith("試") else str(trial))
+        _ = lines.append(f"ST{stv}" if not str(stv).upper().startswith("ST") else str(stv))
         if "F" in acc or acc in {"F", "フライング"}:
-            lines.append("F")
+            _ = lines.append("F")
         elif acc and acc not in {"欠責", "欠車", "-", ""}:
-            lines.append(acc)
+            _ = lines.append(acc)
     return lines
 
 
@@ -10690,7 +10693,7 @@ def _v319_fill_player_histories(
             try:
                 if not pcd:
                     errors += 1
-                    details.append(f"{name}:playerCdなし")
+                    _ = details.append(f"{name}:playerCdなし")
                     continue
                 before_d = _v319_ymd_digits(before_ymd)
 
@@ -10698,13 +10701,13 @@ def _v319_fill_player_histories(
                 have, latest_d = _v319_player_history_latest_fast(db_path, name, con=con)
                 if have is None:
                     errors += 1
-                    details.append(f"{name}:DB読取エラー(history_latest)")
+                    _ = details.append(f"{name}:DB読取エラー(history_latest)")
                     continue
                 latest_d = _v319_ymd_digits(latest_d)
                 state = _v319_player_history_state(db_path, name, con=con)
                 if state is None:
                     errors += 1
-                    details.append(f"{name}:DB読取エラー(history_state)")
+                    _ = details.append(f"{name}:DB読取エラー(history_state)")
                     continue
                 have_keys = set(state.get("keys") or set())
                 dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
@@ -10716,7 +10719,7 @@ def _v319_fill_player_histories(
                 # 新規/穴残りの疑いがある選手は必ず再チェックする。
                 if already_skipped and is_existing:
                     skipped += 1
-                    details.append(f"{name}:キャッシュスキップ(既存{have}件/最新{latest_d})")
+                    _ = details.append(f"{name}:キャッシュスキップ(既存{have}件/最新{latest_d})")
                     continue
 
                 # ========== 2) 公式履歴を取得 ==========
@@ -10727,10 +10730,10 @@ def _v319_fill_player_histories(
                 if df is None or df.empty:
                     if have <= 0:
                         errors += 1
-                        details.append(f"{name}:履歴0件(cd={pcd or '-'})")
+                        _ = details.append(f"{name}:履歴0件(cd={pcd or '-'})")
                     else:
                         skipped += 1
-                        details.append(f"{name}:公式0件/既存{have}")
+                        _ = details.append(f"{name}:公式0件/既存{have}")
                     continue
 
                 if "車番" not in df.columns:
@@ -10763,10 +10766,10 @@ def _v319_fill_player_histories(
                     if df.empty:
                         if have <= 0:
                             errors += 1
-                            details.append(f"{name}:当該R以前の履歴0件")
+                            _ = details.append(f"{name}:当該R以前の履歴0件")
                         else:
                             skipped += 1
-                            details.append(f"{name}:当該R以前は追加なし")
+                            _ = details.append(f"{name}:当該R以前は追加なし")
                         continue
 
                 # result_entries からの補完
@@ -10807,7 +10810,7 @@ def _v319_fill_player_histories(
                     # 既存: 穴を全部埋める。missing_official が空かつ dirty なしなら更新不要。
                     if not missing_official and not dirty_keys:
                         skipped += 1
-                        details.append(f"{name}:穴なしスキップ(既存{have}件/最新{latest_d})")
+                        _ = details.append(f"{name}:穴なしスキップ(既存{have}件/最新{latest_d})")
                         if before_d and latest_d and latest_d >= before_d:
                             _V319_HIST_SKIPPED.add(cache_key)
                         continue
@@ -10832,7 +10835,7 @@ def _v319_fill_player_histories(
                         if k in have_keys and k not in dirty_keys:
                             continue
                         seen.add(k)
-                        keep.append(r)
+                        _ = keep.append(r)
                 else:
                     # 新規/再取込モード: DB最新日以降〜対象日までを広く追加。
                     # 既存キーはスキップ（重複追加防止）。
@@ -10847,14 +10850,14 @@ def _v319_fill_player_histories(
                         seen.add(k)
                         if k in have_keys and k not in dirty_keys:
                             continue
-                        keep.append(r)
+                        _ = keep.append(r)
                     # min_rows を満たすよう先頭から切る（新規のみ）
                     if len(keep) > target_count:
                         keep = keep[:target_count]
 
                 if not keep:
                     skipped += 1
-                    details.append(f"{name}:追加対象なし(既存{have}/公式{len(official_keys)})")
+                    _ = details.append(f"{name}:追加対象なし(既存{have}/公式{len(official_keys)})")
                     if before_d and latest_d and latest_d >= before_d:
                         _V319_HIST_SKIPPED.add(cache_key)
                     continue
@@ -10999,7 +11002,7 @@ def _v319_fill_player_histories(
                         )
                         pending_left = int(report2.get("pending_count") or 0)
                     except Exception as _pend_exc:
-                        details.append(f"{name}:pending失敗:{type(_pend_exc).__name__}")
+                        _ = details.append(f"{name}:pending失敗:{type(_pend_exc).__name__}")
 
                 if changed <= 0 and len(parsed) >= 5:
                     try:
@@ -11060,7 +11063,7 @@ def _v319_fill_player_histories(
                 time_module.sleep(0.15)
             except Exception as exc:
                 errors += 1
-                details.append(f"{name}:{type(exc).__name__}:{exc}")
+                _ = details.append(f"{name}:{type(exc).__name__}:{exc}")
         return {"added": added, "skipped": skipped, "errors": errors, "details": details}
     finally:
         if _own_con2:
@@ -11329,7 +11332,7 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
                         row["車番"] = c
                     if "選手名" in row:
                         row["選手名"] = r.get("選手名")
-                    miss.append(row)
+                    _ = miss.append(row)
                     have.add(c)
             if miss:
                 df = pd.concat([df, pd.DataFrame(miss)], ignore_index=True)
@@ -11490,7 +11493,7 @@ def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, repla
         inc_cars = []
         for item in (_inc or []):
             try:
-                inc_cars.append((int(item.get("車番")), str(item.get("理由") or "反妨")))
+                _ = inc_cars.append((int(item.get("車番")), str(item.get("理由") or "反妨")))
             except Exception:
                 pass
         # raw からも再検出（パース漏れ対策）
@@ -11501,7 +11504,7 @@ def _v319_register_fetched_result(db_path: str, raw_text: str, venue: str, repla
         ):
             c = int(m.group(1))
             if c not in {x[0] for x in inc_cars}:
-                inc_cars.append((c, m.group(2)))
+                _ = inc_cars.append((c, m.group(2)))
         if not isinstance(rows_r, pd.DataFrame):
             rows_r = pd.DataFrame(columns=["着順", "車番", "選手名", "競走T", "ST", "事故"])
         for col in ("着順", "車番", "選手名", "競走T", "ST", "事故"):
@@ -11605,13 +11608,13 @@ def _v319_upsert_payouts_from_text(db_path: str, race_key: str, raw_text: str) -
             kind = m.group(1)
             combo = m.group(2).replace("→", "-").replace(" ", "")
             yen = int(m.group(3).replace(",", ""))
-            rows.append((kind, combo, yen))
+            _ = rows.append((kind, combo, yen))
             continue
         m2 = re.match(r"^(\S+)\s+([\d,]+)円", line)
         if m2 and kind in ("複勝", "ワイド"):
             combo = m2.group(1).replace("→", "-").replace(" ", "")
             yen = int(m2.group(2).replace(",", ""))
-            rows.append((kind, combo, yen))
+            _ = rows.append((kind, combo, yen))
     if not rows:
         return 0
     with sqlite3.connect(str(db_path), timeout=20) as con:
@@ -11778,7 +11781,7 @@ def _v319_import_player_history_one_race(
         if not nm:
             continue
         if int(_v319_player_history_count(db_path, nm) or 0) <= 0:
-            missing.append(nm)
+            _ = missing.append(nm)
     if missing or errors > 0:
         who = ", ".join(missing[:5]) if missing else "取込エラーあり"
         return {
@@ -11958,7 +11961,7 @@ def _v319_import_one_race(
             if not nm:
                 continue
             if int(_v319_player_history_count(db_path, nm) or 0) <= 0:
-                missing.append(nm)
+                _ = missing.append(nm)
         if missing or err_n > 0:
             detail = " / ".join(str(x) for x in (filled.get("details") or [])[:8])
             who = ", ".join(missing[:5]) if missing else "取込エラーあり"
@@ -12243,7 +12246,7 @@ def _v319_import_one_race(
                 inc_cars = []
                 for it in (inc_list or []):
                     try:
-                        inc_cars.append(int(it.get("車番")))
+                        _ = inc_cars.append(int(it.get("車番")))
                     except Exception:
                         pass
                 if missing_cars and inc_cars and set(missing_cars).issubset(set(inc_cars)):
@@ -12340,7 +12343,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 if item in seen:
                     continue
                 seen.add(item)
-                targets.append(item)
+                _ = targets.append(item)
         total = len(targets)
         _v319_wx_reset_budget()
         _v278_bg_update(db_path, job_id, total_count=total, current_label=f"{total}R 見つかりました")
@@ -12400,7 +12403,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 item["phase"] = "exception"
                 item["message"] = f"{type(exc).__name__}: {exc}"
                 err += 1
-            details.append(item)
+            _ = details.append(item)
             fail_hint = ""
             if str(item.get("status") or "") in ("error", "failed"):
                 fail_hint = f"｜失敗:{vn}{n}R"
@@ -12605,7 +12608,7 @@ def _v319_bg_history_worker(db_path: str, job_id: int, req: dict) -> None:
                 if item in seen:
                     continue
                 seen.add(item)
-                targets.append(item)
+                _ = targets.append(item)
         total = len(targets)
         _v319_wx_reset_budget()
         _v278_bg_update(db_path, job_id, total_count=total, current_label=f"{total}R 見つかりました")
@@ -12665,7 +12668,7 @@ def _v319_bg_history_worker(db_path: str, job_id: int, req: dict) -> None:
                 item["phase"] = "exception"
                 item["message"] = f"{type(exc).__name__}: {exc}"
                 err += 1
-            details.append(item)
+            _ = details.append(item)
             fail_hint = ""
             if str(item.get("status") or "") in ("error", "failed"):
                 fail_hint = f"｜失敗:{vn}{n}R"
@@ -13176,7 +13179,7 @@ def v123_render_general_reminder_tab() -> None:
                             notify_at=notify_dt,
                         )
                         receipt = f" / 受付ID: {reply.get('id')}" if reply.get("id") else ""
-                        receipts.append(f"{notify_dt.strftime('%Y/%m/%d %H:%M')}（{minutes}分前）{receipt}")
+                        _ = receipts.append(f"{notify_dt.strftime('%Y/%m/%d %H:%M')}（{minutes}分前）{receipt}")
                 st.session_state["v139_reminder_message"] = (
                     "success",
                     "通知を予約しました：" + " ／ ".join(receipts),
@@ -13440,7 +13443,7 @@ def lookup_player_registration(name: str, db_path: str) -> dict:
         if key in pkey or pkey in key:
             display_names = sorted(set(item["names"]), key=lambda x: (len(x), x))
             if display_names:
-                candidates.append(display_names[0])
+                _ = candidates.append(display_names[0])
     result["candidates"] = sorted(set(candidates))[:8]
     return result
 
@@ -14065,7 +14068,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
             for copy_bet_type in bet_types:
                 copy_row = stats[stats["券種"] == copy_bet_type]
                 if copy_row.empty:
-                    generated_notes.append(f"{copy_bet_type}: 結果照合データなし")
+                    _ = generated_notes.append(f"{copy_bet_type}: 結果照合データなし")
                     continue
                 copy_r = copy_row.iloc[0]
 
@@ -14085,7 +14088,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
                     meta, copy_bet_type, copy_cutoff, engine.DB_PATH
                 )
                 if copy_table.empty:
-                    generated_notes.append(f"{copy_bet_type}: 現在の予測分布なし")
+                    _ = generated_notes.append(f"{copy_bet_type}: 現在の予測分布なし")
                     continue
                 if cap_enabled:
                     copy_table = copy_table.head(int(cap_points)).copy()
@@ -14098,7 +14101,7 @@ def show_v67_self_evaluation(meta: dict) -> None:
                         copy_table["組み合わせ"].tolist(), copy_bet_type
                     )
                 if not copy_formations:
-                    generated_notes.append(f"{copy_bet_type}: フォーメーション作成不可")
+                    _ = generated_notes.append(f"{copy_bet_type}: フォーメーション作成不可")
                     continue
 
                 generated_text[copy_bet_type] = "\n".join(str(line) for line in copy_formations)
@@ -14186,7 +14189,7 @@ def parse_manual_odds(text: str, unordered: bool = False) -> tuple[pd.DataFrame,
         # 最後の数値をオッズ、その前を組み合わせとして扱う。
         match = re.match(r"^(.*?)[\s,，:：]+([0-9]+(?:\.[0-9]+)?)\s*(?:倍)?$", line)
         if not match:
-            errors.append(f"{line_no}行目: {line}")
+            _ = errors.append(f"{line_no}行目: {line}")
             continue
         combo = normalize_ticket_combo(match.group(1), unordered=unordered)
         try:
@@ -14194,9 +14197,9 @@ def parse_manual_odds(text: str, unordered: bool = False) -> tuple[pd.DataFrame,
         except ValueError:
             odds = 0.0
         if not combo or odds <= 0:
-            errors.append(f"{line_no}行目: {line}")
+            _ = errors.append(f"{line_no}行目: {line}")
             continue
-        rows.append({"組み合わせ": combo, "入力オッズ": odds})
+        _ = rows.append({"組み合わせ": combo, "入力オッズ": odds})
     if not rows:
         return pd.DataFrame(columns=["組み合わせ", "入力オッズ"]), errors
     return pd.DataFrame(rows).drop_duplicates("組み合わせ", keep="last"), errors
@@ -14378,7 +14381,7 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
         def handle_starttag(self, tag, attrs):
             attrs_dict = self._attrs(attrs)
             if tag == "div":
-                self.div_target_stack.append(self.current_target)
+                _ = self.div_target_stack.append(self.current_target)
                 element_id = attrs_dict.get("id", "")
                 if element_id in target_ids:
                     self.current_target = element_id
@@ -14409,7 +14412,7 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
                     " ".join(self.current_cell["text"]).split()
                 )
                 if self.current_row is not None:
-                    self.current_row.append(self.current_cell)
+                    _ = self.current_row.append(self.current_cell)
                 self.current_cell = None
             elif tag == "tr" and self.current_row is not None:
                 if self.current_table is not None and self.current_row:
@@ -14579,7 +14582,7 @@ def v218_parse_autorace_odds_html(text: str) -> dict:
             for row in popular_tables[0]["rows"]:
                 cols = [cell["text"] for cell in row]
                 if cols:
-                    lines.append("\t".join(cols))
+                    _ = lines.append("\t".join(cols))
             result = v182_parse_four_block_odds("\n".join(lines))
     return result
 
@@ -14920,7 +14923,7 @@ def v203_standard_trifecta_formations(formations, combos):
                     expanded.add((a, b, third))
                     expanded.add((b, a, third))
                 if expanded and expanded.issubset(target):
-                    valid_thirds.append(third)
+                    _ = valid_thirds.append(third)
             if valid_thirds:
                 add_candidate(
                     "".join(map(str, left)) + "=" +
@@ -14940,7 +14943,7 @@ def v203_standard_trifecta_formations(formations, combos):
                     expanded.add((a, b, third))
                     expanded.add((a, third, b))
                 if expanded and expanded.issubset(target):
-                    valid_thirds.append(third)
+                    _ = valid_thirds.append(third)
             if valid_thirds:
                 add_candidate(
                     "".join(map(str, firsts)) + "-" +
@@ -14966,7 +14969,7 @@ def v203_standard_trifecta_formations(formations, combos):
         if best is None or len(best[1]) < 2:
             break
         _, expanded, line = best
-        output.append(line)
+        _ = output.append(line)
         uncovered.difference_update(expanded)
 
     output.extend("-".join(map(str, combo)) for combo in sorted(uncovered))
@@ -14995,7 +14998,7 @@ def v182_hit_first_odds_adjustment(bets: dict, trials: int, base_info: dict, odd
         key = "-".join(map(str, tuple(combo) if isinstance(combo, (tuple, list)) else (combo,)))
         probability = float(count) / max(int(trials), 1) * 100.0
         odds = float(odds_map.get(key, 0) or 0)
-        rows.append({"rank": rank, "combo": key, "probability": probability, "odds": odds})
+        _ = rows.append({"rank": rank, "combo": key, "probability": probability, "odds": odds})
     if not rows or not any(r["odds"] > 0 for r in rows):
         return {"available": False, "reason": "上位10点に対応する三連単オッズが見つかりません。"}
 
@@ -15422,7 +15425,7 @@ def _v187_sync_mixed_feedback(db_path: str) -> int:
                 hit = int(pay > 0)
                 total_payout += pay
                 if hit:
-                    winning_types.append(t["bet_type"])
+                    _ = winning_types.append(t["bet_type"])
                 con.execute("""
                     INSERT OR REPLACE INTO v187_mixed_ticket_feedback
                     (race_key,plan_hash,bet_type,combination,hit,payout_yen) VALUES (?,?,?,?,?,?)
@@ -15479,7 +15482,7 @@ def _v212_recalculate_plan_feedback(db_path: str, race_key: str, plan_hash: str)
             hit = int(pay > 0)
             total_payout += pay
             if hit:
-                winning_types.append(_v212_norm_bet_type(t["bet_type"]))
+                _ = winning_types.append(_v212_norm_bet_type(t["bet_type"]))
             con.execute("""
                 INSERT OR REPLACE INTO v187_mixed_ticket_feedback
                 (race_key,plan_hash,bet_type,combination,hit,payout_yen) VALUES (?,?,?,?,?,?)
@@ -15762,7 +15765,7 @@ def _v310_save_diagnostic(db_path: str, race_key: str, view: dict, source_versio
                 try:
                     if isinstance(prob, dict):
                         prob = prob.get('probability', prob.get('p', prob.get('successes', 0)))
-                    rows.append((float(prob), str(typ), json.dumps(combo, ensure_ascii=False, default=str)))
+                    _ = rows.append((float(prob), str(typ), json.dumps(combo, ensure_ascii=False, default=str)))
                 except Exception: pass
         return [{'type':t,'combo':c,'probability':round(p,6)} for p,t,c in sorted(rows, reverse=True)[:30]]
     _v187_ensure_mixed_learning_tables(db_path)
@@ -15956,7 +15959,7 @@ def _v304_build_safe_prediction_text_from_result(db_path: str, race_key: str) ->
                 continue
             if e["car_no"] is None or not str(e["player_name"] or "").strip():
                 continue
-            usable.append(e)
+            _ = usable.append(e)
         if len(usable) < 2:
             return "", {"reason":"再構成可能な出走者不足"}
 
@@ -15981,9 +15984,9 @@ def _v304_build_safe_prediction_text_from_result(db_path: str, race_key: str) ->
             f"{surface} /{track_temp:g}℃",
         ]
         if rr["air_temp"] is not None:
-            lines.append(f"気温：{float(rr['air_temp']):g}℃")
+            _ = lines.append(f"気温：{float(rr['air_temp']):g}℃")
         if rr["humidity"] is not None:
-            lines.append(f"湿度：{float(rr['humidity']):g}%")
+            _ = lines.append(f"湿度：{float(rr['humidity']):g}%")
 
         for e in usable:
             h = re.search(r"-?\d+", str(e["handicap"] or "0"))
@@ -16449,7 +16452,7 @@ def _v300_backfill_recommendation_audit(db_path: str, app_version_filter: str = 
                      json.dumps(reasons,ensure_ascii=False),str(app_ver or app_version_filter),_v228_now_jst_iso()))
                 done+=1
             except Exception as exc:
-                errors.append(f"{race_key}: {type(exc).__name__}: {exc}")
+                _ = errors.append(f"{race_key}: {type(exc).__name__}: {exc}")
         con.commit()
     return {"done":done,"skipped":skipped,"errors":errors,"factor":factor}
 
@@ -16526,7 +16529,7 @@ def _v301_auto_backfill_strong_recommendation(db_path: str) -> dict:
                      str(app_ver or "Ver301"),_v228_now_jst_iso()))
                 done+=1
             except Exception as exc:
-                errors.append(f"{race_key}: {type(exc).__name__}: {exc}")
+                _ = errors.append(f"{race_key}: {type(exc).__name__}: {exc}")
         con.commit()
     return {"done":done,"skipped":skipped,"errors":errors}
 
@@ -16644,7 +16647,7 @@ def _v295_ev_calibration_table(db_path: str, cutoff_date: str="") -> dict:
             params=[]
             if cutoff:
                 sql+=" AND substr(rr.race_date,1,10) < substr(?,1,10)"
-                params.append(cutoff)
+                _ = params.append(cutoff)
             rows=con.execute(sql,params).fetchall()
 
             wsql="""
@@ -16656,7 +16659,7 @@ def _v295_ev_calibration_table(db_path: str, cutoff_date: str="") -> dict:
             wparams=[]
             if cutoff:
                 wsql+=" AND substr(rr.race_date,1,10) < substr(?,1,10)"
-                wparams.append(cutoff)
+                _ = wparams.append(cutoff)
             win_rows=con.execute(wsql,wparams).fetchall()
     except Exception:
         _V295_EV_CALIBRATION_CACHE[stamp]=out
@@ -16772,7 +16775,7 @@ def _v300_recommendation_audit(result: dict) -> dict:
     for t in tickets:
         p=float(t.get("ev_probability",t.get("probability",0.0)) or 0.0)
         od=float(t.get("odds",0.0) or 0.0)
-        raw_evs.append((p/100.0)*od)
+        _ = raw_evs.append((p/100.0)*od)
         if bool(t.get("v299_hole_rescue")):
             hole_count+=1
     max_ev=max(raw_evs) if raw_evs else 0.0
@@ -16838,7 +16841,7 @@ def _v301_live_recommendation(result: dict) -> dict:
         # 実運用時はその場で保持している期待値評価用確率を優先。
         p=float(t.get("ev_probability",t.get("probability",0.0)) or 0.0)
         od=float(t.get("odds",0.0) or 0.0)
-        evs.append((p/100.0)*od)
+        _ = evs.append((p/100.0)*od)
     max_ev=max(evs) if evs else 0.0
 
     strong = (
@@ -16919,7 +16922,7 @@ def _v305_live_recommendation(result: dict) -> dict:
     for t in tickets:
         p = float(t.get("ev_probability", t.get("probability", 0.0)) or 0.0)
         od = float(t.get("odds", 0.0) or 0.0)
-        evs.append(_safe_ev_multiple(p, od))
+        _ = evs.append(_safe_ev_multiple(p, od))
     max_ev = max(evs) if evs else 0.0
 
     # Ver301の候補条件（参考・○候補用）
@@ -17661,7 +17664,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     for combo, count in tri_counter.items():
         vals = tuple(int(v) for v in (tuple(combo) if isinstance(combo, (tuple, list)) else (combo,)))
         if len(vals) == 3:
-            outcomes.append((vals, float(count) / max(int(trials), 1) * 100.0))
+            _ = outcomes.append((vals, float(count) / max(int(trials), 1) * 100.0))
     if not outcomes:
         return {"available": False, "reason": "三連単結果空間を作れませんでした。"}
 
@@ -17739,7 +17742,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 continue
             ticket["matched"] = matched
             ticket["matched_probability"] = sum(outcomes[i][1] for i in matched)
-            candidates.append(ticket)
+            _ = candidates.append(ticket)
             added += 1
             if _is_hole299:
                 hole_added += 1
@@ -17834,7 +17837,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 covered.add(i)
                 cover += probability
                 expected_return += probability / 100.0 * payout
-                hit_payout_rows.append((float(payout), float(probability)))
+                _ = hit_payout_rows.append((float(payout), float(probability)))
                 if payout >= cost:
                     black += probability
                 else:
@@ -17936,7 +17939,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             - 0.30 * seed_metrics["low"]
             - 0.16 * k
         )
-        tri_seed_options.append((k, seed_plan, seed_metrics, seed_utility))
+        _ = tri_seed_options.append((k, seed_plan, seed_metrics, seed_utility))
 
     best_seed_utility = max(x[3] for x in tri_seed_options)
     # 最高評価にほぼ並ぶなら少ない点数を優先し、無意味な膨張を避ける。
@@ -17960,7 +17963,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             solo_recovers = float(cand.get("odds", 0.0)) * 100.0 >= new_cost
             key = ((1.35 * mg["black_gain"] + 0.35 * mg["cover_gain"] - 0.75 * max(0.0, mg["low_gain"])) * lw,
                    int(solo_recovers), mg["unique_prob"] * lw, cand["probability"], cand["odds"])
-            choices.append((key, cand, mg))
+            _ = choices.append((key, cand, mg))
         if choices:
             key, cand, mg = max(choices, key=lambda x: x[0])
             # 役割券でも、ほとんど範囲が増えないものは無理に入れない。
@@ -17969,13 +17972,13 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             min_black_gain = 0.18 if required_type == "2連複" else 0.28
             # 低配当保険は、単独回収できるか、同時的中込みで黒字確率を明確に増やす場合だけ採用。
             if mg["black_gain"] >= min_black_gain and (solo_recovers or mg["black_gain"] >= 0.65):
-                plan.append(cand)
+                _ = plan.append(cand)
                 remaining.remove(cand)
 
     snapshots = []
     # Ver305: 6点以上の構成だけを推奨判定の母集団として評価する。
     if len(plan) >= 6:
-        snapshots.append((list(plan), evaluate(plan)))
+        _ = snapshots.append((list(plan), evaluate(plan)))
 
     # 基本上限は12点。13〜14点目は黒字側が明確に伸びる場合だけ例外採用する。
     while len(plan) < 14 and remaining:
@@ -18010,10 +18013,10 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             break
         if len(plan) >= 12 and (mg["black_gain"] < 0.80 or mg["after"]["ev_expected_multiple"] < evaluate(plan)["ev_expected_multiple"]):
             break
-        plan.append(cand)
+        _ = plan.append(cand)
         remaining.remove(cand)
         if len(plan) >= 6:
-            snapshots.append((list(plan), evaluate(plan)))
+            _ = snapshots.append((list(plan), evaluate(plan)))
 
     if not snapshots:
         # 6点合成が作れなくても、三連単土台があればそれを出す（空欄より実買い目を優先）。
@@ -18089,7 +18092,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         if _best299 is None:
             break
         _,_cand299,_after299,_ret_delta299,_black_delta299,_cover_gain299,_ev299=_best299
-        selected.append(_cand299)
+        _ = selected.append(_cand299)
         v299_hole_notes.append(
             f"中穴価値候補を追加：3連単 {_cand299.get('combo')} "
             f"（確率{float(_cand299.get('probability',0)):.2f}%・"
@@ -18103,7 +18106,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     for ticket in protected_tickets:
         key = (str(ticket.get("type")), str(ticket.get("combo")))
         if key not in selected_ids:
-            selected.append(ticket)
+            _ = selected.append(ticket)
             selected_ids.add(key)
             protected_add_notes.append(
                 f"{ticket['type']} {ticket['combo']}（モデル{float(ticket.get('probability',0.0)):.2f}%）を高確率本線として保護"
@@ -18213,9 +18216,9 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                     except Exception:
                         pass
                 if is_related:
-                    related.append(ticket)
+                    _ = related.append(ticket)
                 else:
-                    fixed_plan.append(ticket)
+                    _ = fixed_plan.append(ticket)
 
             option_rows = [("2連複のみ", [quinella_ticket])]
             if forward is not None:
@@ -18259,7 +18262,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 trial_plan = list(fixed_plan)
                 for ticket in option_tickets:
                     if ticket not in trial_plan:
-                        trial_plan.append(ticket)
+                        _ = trial_plan.append(ticket)
                 if len(trial_plan) > 14:
                     continue
 
@@ -18516,7 +18519,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 except Exception:
                     continue
                 if {a, b} == pair_set and c not in pair_set:
-                    pair_rows.append(t)
+                    _ = pair_rows.append(t)
                     third_scores[c] = third_scores.get(c, 0.0) + float(t.get("probability", 0.0))
 
             third_order = [c for c, _ in sorted(third_scores.items(), key=lambda x: x[1], reverse=True)]
@@ -18529,7 +18532,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 for t in rows[:2]:
                     key = (t.get("type"), t.get("combo"))
                     if key not in used:
-                        structured.append(t); used.add(key)
+                        _ = structured.append(t); used.add(key)
 
             # ペア固定だけで不足する場合は、全体上位から補完する。
             for t in top_tri_rows:
@@ -18537,7 +18540,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                     break
                 key = (t.get("type"), t.get("combo"))
                 if key not in used:
-                    structured.append(t); used.add(key)
+                    _ = structured.append(t); used.add(key)
 
             compact_options = []
             min_k = 2 if len(structured) >= 2 else 1
@@ -18554,7 +18557,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                     - 0.35 * k
                     + (12.0 if break_even_ok else -12.0)
                 )
-                compact_options.append((utility, compact, compact_metrics, break_even_ok))
+                _ = compact_options.append((utility, compact, compact_metrics, break_even_ok))
 
             _, compact_plan, compact_metrics, break_even_ok = max(
                 compact_options,
@@ -18599,7 +18602,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 for _t301 in list(compact_plan):
                     _k301=(str(_t301.get("type","")),str(_t301.get("combo","")))
                     if _k301 not in _audit_seen301:
-                        _audit_order301.append(_t301)
+                        _ = _audit_order301.append(_t301)
                         _audit_seen301.add(_k301)
 
                 # 残りは「校正後EV・モデル確率・オッズ」の順で候補を広げる。
@@ -18612,12 +18615,12 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                     _ep301=float(_t301.get("ev_probability",_p301) or _p301)
                     _od301=float(_t301.get("odds",0.0) or 0.0)
                     _ev301=(_ep301/100.0)*_od301
-                    _rest301.append((_ev301,_p301,_od301,_t301))
+                    _ = _rest301.append((_ev301,_p301,_od301,_t301))
 
                 for _,_,_,_t301 in sorted(_rest301,key=lambda x:(x[0],x[1],x[2]),reverse=True):
                     _k301=(str(_t301.get("type","")),str(_t301.get("combo","")))
                     if _k301 not in _audit_seen301:
-                        _audit_order301.append(_t301)
+                        _ = _audit_order301.append(_t301)
                         _audit_seen301.add(_k301)
 
                 _rows301=[]
@@ -18695,13 +18698,13 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             if return_drop > 5.0 or black_drop > 0.55 or low_gain > 1.25:
                 continue
             score = 1.25 * cover_gain + 0.60 * p2 + 8.0 * standalone_ev - 0.55 * return_drop - 0.40 * low_gain
-            pair_candidates.append((score, ticket, reverse_ticket, after, return_drop, black_drop, cover_gain, standalone_ev))
+            _ = pair_candidates.append((score, ticket, reverse_ticket, after, return_drop, black_drop, cover_gain, standalone_ev))
 
         for _, source_ticket, reverse_ticket, after, return_drop, black_drop, cover_gain, standalone_ev in sorted(pair_candidates, key=lambda x: x[0], reverse=True)[:2]:
             key = (str(reverse_ticket.get("type", "")), str(reverse_ticket.get("combo", "")))
             if key in {(str(t.get("type", "")), str(t.get("combo", ""))) for t in selected}:
                 continue
-            selected.append(reverse_ticket)
+            _ = selected.append(reverse_ticket)
             base_pair_metrics = evaluate(selected)
             reverse_ticket["protected"] = True
             v245_pair_protection_notes.append(
@@ -18751,7 +18754,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 current_cost - payout,
                 -ev,
             )
-            solo_gami.append((key, ticket, trial, after, payout, ev))
+            _ = solo_gami.append((key, ticket, trial, after, payout, ev))
         if not solo_gami:
             break
         solo_gami.sort(key=lambda x: x[0], reverse=True)
@@ -18882,13 +18885,13 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         a, b, c = vals
         support = []
         if (a, b) in selected_exacta:
-            support.append(f"2連単 {a}-{b}を3着まで延長")
+            _ = support.append(f"2連単 {a}-{b}を3着まで延長")
         if tuple(sorted(vals)) in selected_trio:
-            support.append(f"3連複 {'-'.join(map(str, sorted(vals)))}の着順候補")
+            _ = support.append(f"3連複 {'-'.join(map(str, sorted(vals)))}の着順候補")
         if any(x[0] == a and x[2] == c and x[1] != b for x in selected_tris):
-            support.append(f"1着{a}・3着{c}の相手替わり")
+            _ = support.append(f"1着{a}・3着{c}の相手替わり")
         if any(x[0] == a and x[1] == b and x[2] != c for x in selected_tris):
-            support.append(f"1・2着{a}-{b}の3着替わり")
+            _ = support.append(f"1・2着{a}-{b}の3着替わり")
         if len(support) < 2:
             continue
 
@@ -19075,7 +19078,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
         (_, cand, after_refill, standalone_ev, unique_prob,
          return_delta, black_delta, gami_delta, cover_delta) = best_refill
-        selected.append(cand)
+        _ = selected.append(cand)
         v260_refill_notes.append(
             f"{cand['type']} {cand['combo']}（{float(cand.get('odds',0)):.1f}倍）を次点から追加。"
             f"参考回収率{before_refill['model_return_rate']:.1f}%→{after_refill['model_return_rate']:.1f}% "
@@ -19140,7 +19143,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
     for ticket_type in ("三連単", "三連複", "2連単", "2連複"):
         rows = grouped.get(ticket_type, [])
         if rows:
-            role_lines.append(f"{v205_ticket_display_name(ticket_type)}{len(rows)}点：{rows[0]['role']}")
+            _ = role_lines.append(f"{v205_ticket_display_name(ticket_type)}{len(rows)}点：{rows[0]['role']}")
     return {
         "available": True, "grade": grade, "icon": icon, "reason": reason,
         "multiple_grade": multiple_grade,
@@ -19198,7 +19201,7 @@ def v207_build_mixed_formation_sections(result: dict):
             and len(formations) == len(combos)
             and ticket_type in ("三連単", "三連複", "2連単")
         ):
-            notes.append(f"{v205_ticket_display_name(ticket_type)}: 流し・折り返しにできない組み合わせは個別表記")
+            _ = notes.append(f"{v205_ticket_display_name(ticket_type)}: 流し・折り返しにできない組み合わせは個別表記")
         sections.append(
             f"{v205_ticket_display_name(ticket_type)} {len(combos)}点\n" + "\n".join(str(x) for x in formations)
         )
@@ -19214,7 +19217,7 @@ def v244_optional_single_wide_candidates(bets: dict, trials: int, odds_maps: dic
     for combo, count in tri_counter.items():
         vals = tuple(int(v) for v in (tuple(combo) if isinstance(combo, (tuple, list)) else (combo,)))
         if len(vals) == 3:
-            outcomes.append((vals, float(count) / max(int(trials), 1) * 100.0))
+            _ = outcomes.append((vals, float(count) / max(int(trials), 1) * 100.0))
     if not outcomes:
         return []
     win_prob = {}
@@ -19288,7 +19291,7 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
         except Exception:
             continue
         if len(vals) == 3:
-            outcomes.append((vals, float(count) / total_trials * 100.0))
+            _ = outcomes.append((vals, float(count) / total_trials * 100.0))
     if not outcomes:
         return result
 
@@ -19327,7 +19330,7 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
             if payout > 0:
                 cover += prob
                 expected += prob / 100.0 * payout
-                hit_rows.append((payout, prob))
+                _ = hit_rows.append((payout, prob))
                 if payout >= cost:
                     black += prob
                 else:
@@ -19366,8 +19369,8 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
         # 追加コスト込みで回収率が改善し、黒字的中率を大きく壊さない候補だけ採用。
         if (after["model_return_rate"] >= before["model_return_rate"] + 0.50
                 and after["black"] >= before["black"] - 0.20):
-            plan.append(ticket)
-            added.append(ticket)
+            _ = plan.append(ticket)
+            _ = added.append(ticket)
             used_types.add(typ)
             before = after
 
@@ -19390,7 +19393,7 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
     for typ in ("三連単", "三連複", "2連単", "2連複", "ワイド", "単勝", "複勝"):
         rows = grouped.get(typ, []) or []
         if rows:
-            role_lines.append(f"{v205_ticket_display_name(typ)}{len(rows)}点：{rows[0].get('role','')}")
+            _ = role_lines.append(f"{v205_ticket_display_name(typ)}{len(rows)}点：{rows[0].get('role','')}")
     result["role_lines"] = role_lines
     return result
 
@@ -19440,7 +19443,7 @@ def _v315_parse_combo_cars(combo: str) -> list[str]:
     for p in parts:
         m = re.sub(r"\D+", "", p)
         if m:
-            cars.append(str(int(m)))
+            _ = cars.append(str(int(m)))
     return cars
 
 
@@ -19465,7 +19468,7 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
     for c in combos:
         cars = _v315_parse_combo_cars(c)
         if cars:
-            parsed.append(tuple(cars))
+            _ = parsed.append(tuple(cars))
     if not parsed:
         return []
 
@@ -19482,12 +19485,12 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
         for trio in combinations(cars_all, 3):
             perms = set(permutations(trio, 3))
             if perms.issubset(unused):
-                box_cands.append((trio, perms))
+                _ = box_cands.append((trio, perms))
         box_cands.sort(key=lambda x: -len(x[1]))
         for trio, perms in box_cands:
             if not perms.issubset(unused):
                 continue
-            lines.append("".join(trio) + "BOX")
+            _ = lines.append("".join(trio) + "BOX")
             unused -= perms
         if not unused:
             return lines
@@ -19503,14 +19506,14 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
                 continue
             common = sorted(thirds_ab[(a, b)] & thirds_ab.get((b, a), set()), key=int)
             if common:
-                fold12.append((len(common), key[0], key[1], common))
+                _ = fold12.append((len(common), key[0], key[1], common))
                 seen_pair.add(key)
         fold12.sort(key=lambda x: (-x[0], int(x[1]), int(x[2])))
         for _, a, b, thirds in fold12:
             keep = [t for t in thirds if (a, b, t) in unused and (b, a, t) in unused]
             if not keep:
                 continue
-            lines.append(f"{a}={b}-{''.join(keep)}")
+            _ = lines.append(f"{a}={b}-{''.join(keep)}")
             for t in keep:
                 unused.discard((a, b, t))
                 unused.discard((b, a, t))
@@ -19525,7 +19528,7 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
             if key in seen23:
                 continue
             seen23.add(key)
-            fold23_units.append((a, lo, hi))
+            _ = fold23_units.append((a, lo, hi))
         by_axis = defaultdict(set)
         for a, lo, hi in fold23_units:
             by_axis[(a, lo)].add(hi)
@@ -19535,10 +19538,10 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
             for o in sorted(others, key=int):
                 t1, t2 = (a, mid, o), (a, o, mid)
                 if t1 in unused and t2 in unused:
-                    keep.append(o)
+                    _ = keep.append(o)
             if not keep:
                 continue
-            lines.append(f"{a}-{mid}={''.join(keep)}")
+            _ = lines.append(f"{a}-{mid}={''.join(keep)}")
             for o in keep:
                 unused.discard((a, mid, o))
                 unused.discard((a, o, mid))
@@ -19549,9 +19552,9 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
         for (a, b), thirds in sorted(by12.items(), key=lambda x: (-len(x[1]), int(x[0][0]), int(x[0][1]))):
             thirds = sorted(set(thirds), key=int)
             if len(thirds) >= 2:
-                lines.append(f"{a}-{b}-{''.join(thirds)}")
+                _ = lines.append(f"{a}-{b}-{''.join(thirds)}")
             else:
-                lines.append(f"{a}-{b}-{thirds[0]}")
+                _ = lines.append(f"{a}-{b}-{thirds[0]}")
         return lines
 
     if n == 3:
@@ -19561,9 +19564,9 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
         for (a, b), thirds in sorted(by12.items(), key=lambda x: (-len(x[1]), int(x[0][0]), int(x[0][1]))):
             thirds = sorted(set(thirds), key=int)
             if len(thirds) >= 2:
-                lines.append(f"{a}-{b}-{''.join(thirds)}")
+                _ = lines.append(f"{a}-{b}-{''.join(thirds)}")
             else:
-                lines.append(f"{a}-{b}-{thirds[0]}")
+                _ = lines.append(f"{a}-{b}-{thirds[0]}")
         return lines
 
     if n == 2:
@@ -19580,13 +19583,13 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
                     key=int,
                 )
                 if len(partners) >= 2:
-                    lines.append(f"{axis}-{''.join(partners)}")
+                    _ = lines.append(f"{axis}-{''.join(partners)}")
                     for p in partners:
                         used.add(tuple(sorted((axis, p), key=int)))
             for a, b in pairs:
                 key = tuple(sorted((a, b), key=int))
                 if key not in used:
-                    lines.append(f"{a}-{b}")
+                    _ = lines.append(f"{a}-{b}")
                     used.add(key)
             return lines
 
@@ -19599,11 +19602,11 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
                 continue
             seen.add(key)
             if (b, a) in unused and (a, b) in unused:
-                fold_pairs.append(key)
+                _ = fold_pairs.append(key)
         fold_pairs.sort(key=lambda x: (int(x[0]), int(x[1])))
         for a, b in fold_pairs:
             if (a, b) in unused and (b, a) in unused:
-                lines.append(f"{a}={b}")
+                _ = lines.append(f"{a}={b}")
                 unused.discard((a, b))
                 unused.discard((b, a))
         by1 = defaultdict(list)
@@ -19612,9 +19615,9 @@ def _v315_summarize_ticket_combos(ticket_type: str, combos: list[str]) -> list[s
         for a, seconds in sorted(by1.items(), key=lambda x: (-len(x[1]), int(x[0]))):
             seconds = sorted(set(seconds), key=int)
             if len(seconds) >= 2:
-                lines.append(f"{a}-{''.join(seconds)}")
+                _ = lines.append(f"{a}-{''.join(seconds)}")
             else:
-                lines.append(f"{a}-{seconds[0]}")
+                _ = lines.append(f"{a}-{seconds[0]}")
         return lines
 
     return ["-".join(x) for x in parsed]
@@ -19660,7 +19663,7 @@ def show_v184_eight_car_mixed_plan(
                     engine.DB_PATH, str(race_key), str(app_version or APP_VERSION), ""
                 )
             finally:
-                st.session_state.pop(_odds_refresh_key305, None)
+                _ = st.session_state.pop(_odds_refresh_key305, None)
         st.caption(result.get("reason", "オッズを読み込むと表示します。"))
         return
     saved_hash = ""
@@ -19702,7 +19705,7 @@ def show_v184_eight_car_mixed_plan(
                     engine.DB_PATH, str(race_key),
                     str(app_version or APP_VERSION), str(saved_hash or "")
                 )
-                st.session_state.pop(_odds_refresh_key305, None)
+                _ = st.session_state.pop(_odds_refresh_key305, None)
     except Exception as exc:
         st.warning(f"合成プランをDBへ保存できませんでした: {exc}")
 
@@ -19866,7 +19869,7 @@ def show_v184_eight_car_mixed_plan(
             after = item.get("after", {})
             mode = item.get("mode", "追加候補")
             combo = str(ticket.get("combo", ""))
-            residual_copy.append(combo)
+            _ = residual_copy.append(combo)
             if old:
                 title = f"{mode}：{v205_ticket_display_name(old.get('type'))} {old.get('combo')} → 3連単 {combo}"
             else:
@@ -19946,7 +19949,7 @@ def show_v184_eight_car_mixed_plan(
         for r in rows:
             combo = str(r.get("combo", "")).strip()
             if combo:
-                combos.append(combo)
+                _ = combos.append(combo)
             solo_gami = float(r["odds"]) * 100.0 < float(result["cost"])
             note = " / 単独的中ではガミ注意" if solo_gami else ""
             protect_note = " / 本線保護" if r.get("protected") else ""
@@ -20317,7 +20320,7 @@ def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataF
                 pick = ["rr.race_key"]
                 for c in ("surface", "track_condition", "weather", "temperature", "track_temp", "humidity"):
                     if c in rr_cols:
-                        pick.append(f"rr.{c}")
+                        _ = pick.append(f"rr.{c}")
                 race_meta = pd.read_sql_query(
                     f"SELECT {', '.join(pick)} FROM result_races rr WHERE rr.race_key IN ({ph})",
                     con, params=keys,
@@ -20350,7 +20353,7 @@ def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataF
                     for _, lg in g.groupby("lap_no", sort=True):
                         order = tuple(int(x) for x in lg.sort_values("position")["car_no"].tolist())
                         if order:
-                            orders.append(order)
+                            _ = orders.append(order)
                     typ = _v263_scenario_type_from_laps(orders) if orders else "不明"
                     rows.append({
                         "race_key": str(rk),
@@ -21405,7 +21408,7 @@ def _v283_db_fingerprint_bytes(data: bytes) -> dict:
                     if c in cols:
                         v=con.execute(f'SELECT MAX(COALESCE("{c}", "")) FROM "{t}"').fetchone()[0]
                         if v:
-                            latest_candidates.append(str(v))
+                            _ = latest_candidates.append(str(v))
             out["latest"]=max(latest_candidates) if latest_candidates else ""
             out["ok"]=True
             return out
@@ -21572,9 +21575,9 @@ def _v284_containment_message(rel: dict, candidate_label: str, baseline_label: s
     bo=rel.get("baseline_only") or {}
     parts=[f"包含判定: {rel.get('relation','unknown')}"]
     if co:
-        parts.append(candidate_label+"のみ: "+", ".join(f"{k}+{v}" for k,v in sorted(co.items())))
+        _ = parts.append(candidate_label+"のみ: "+", ".join(f"{k}+{v}" for k,v in sorted(co.items())))
     if bo:
-        parts.append(baseline_label+"のみ: "+", ".join(f"{k}+{v}" for k,v in sorted(bo.items())))
+        _ = parts.append(baseline_label+"のみ: "+", ".join(f"{k}+{v}" for k,v in sorted(bo.items())))
     return " / ".join(parts)
 
 
@@ -21807,10 +21810,10 @@ def _v282_push_chunked_db(
                         f"GitHub保存を中止しました。既存part {idx+1}/{len(chunks)} "
                         "のSHA確認に失敗しました。"
                     )
-            chunk_paths.append(cp)
-            part_sizes.append(csize)
-            part_sha256.append(csha)
-            part_git_sha1.append(gitsha)
+            _ = chunk_paths.append(cp)
+            _ = part_sizes.append(csize)
+            _ = part_sha256.append(csha)
+            _ = part_git_sha1.append(gitsha)
             reused_count += 1
             continue
 
@@ -21845,10 +21848,10 @@ def _v282_push_chunked_db(
             })
             new_blob_count += 1
 
-        chunk_paths.append(cp)
-        part_sizes.append(csize)
-        part_sha256.append(csha)
-        part_git_sha1.append(gitsha)
+        _ = chunk_paths.append(cp)
+        _ = part_sizes.append(csize)
+        _ = part_sha256.append(csha)
+        _ = part_git_sha1.append(gitsha)
 
     manifest = {
         "format": "AutoRaceAI-sqlite-chunks-v4-atomic",
@@ -22089,7 +22092,7 @@ def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
             if hashlib.sha256(pdata284).hexdigest() != str(shas284[idx284]):
                 return False,None,f"分割DB part {idx284+1}/{len(parts284)} SHA256検証失敗 ({method284})"
 
-        data_parts284.append(pdata284)
+        _ = data_parts284.append(pdata284)
 
     data284=b"".join(data_parts284)
     try:
@@ -22162,7 +22165,7 @@ def pull_db_from_github() -> tuple[bool, str]:
                             + chr(10) + str((_merge_rep284 or {}).get("reason") or "")
                             + chr(10) + str(msg)
                         )
-                    st.session_state.pop("loaded_db_hash", None)
+                    _ = st.session_state.pop("loaded_db_hash", None)
                     return True, (
                         "diverged統合は一部失敗したためGitHub DBを採用しました。"
                         + chr(10) + str((_merge_rep284 or {}).get("reason") or "")
@@ -22172,7 +22175,7 @@ def pull_db_from_github() -> tuple[bool, str]:
                 ok, msg = _v276_atomic_install_db_bytes(data, "GitHub+端末の安全統合DB")
                 if not ok:
                     return False, "統合DBの反映に失敗しました。現在のDBは保護されています。" + chr(10) + str(msg)
-                st.session_state.pop("loaded_db_hash", None)
+                _ = st.session_state.pop("loaded_db_hash", None)
                 _added = ((_merge_rep284 or {}).get("added") or {})
                 _add_txt = (
                     ", ".join(f"{k}+{v}" for k, v in sorted(_added.items())[:12])
@@ -22188,7 +22191,7 @@ def pull_db_from_github() -> tuple[bool, str]:
             ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上の分割DB")
             if not ok:
                 return False, "GitHub上の分割DBは採用しませんでした。現在のDBは保護されています。\n" + msg
-            st.session_state.pop("loaded_db_hash", None)
+            _ = st.session_state.pop("loaded_db_hash", None)
             try:
                 _mfok305,_mf305,_=_v283_get_chunk_manifest(branch=_v282_db_read_branch(),previous=False)
                 if _mfok305:
@@ -22235,20 +22238,20 @@ def pull_db_from_github() -> tuple[bool, str]:
                 ok, msg = _v276_atomic_install_db_bytes(data, "GitHub DB（統合失敗時の優先採用）")
                 if not ok:
                     return False, "diverged統合失敗かつGitHub採用失敗: " + str(msg)
-                st.session_state.pop("loaded_db_hash", None)
+                _ = st.session_state.pop("loaded_db_hash", None)
                 return True, f"diverged統合失敗のためGitHub DBを採用しました（{len(data)/1024/1024:.2f} MB）"
             data = bytes(_merged_bytes284)
             ok, msg = _v276_atomic_install_db_bytes(data, "GitHub+端末の安全統合DB")
             if not ok:
                 return False, "統合DBの反映に失敗: " + msg
-            st.session_state.pop("loaded_db_hash", None)
+            _ = st.session_state.pop("loaded_db_hash", None)
             return True, f"divergedを安全統合して反映しました（{len(data)/1024/1024:.2f} MB）"
         if _relation284=="unknown":
             return False,"GitHub DBの包含関係を安全確認できないため再読込を中止しました。"
         ok, msg = _v276_atomic_install_db_bytes(data, "GitHub上のDB")
         if not ok:
             return False, "GitHub上のDBは採用しませんでした。現在のDBは保護されています。\n" + msg
-        st.session_state.pop("loaded_db_hash", None)
+        _ = st.session_state.pop("loaded_db_hash", None)
         return True, f"GitHubから正常DBを安全に取得しました（{len(data) / 1024 / 1024:.2f} MB / 旧WAL・SHM除去済み）"
     except Exception as exc:
         return False, f"GitHub DB取得エラー: {type(exc).__name__}: {exc}"
@@ -22540,7 +22543,7 @@ def _v284_safe_union_merge_db_bytes(local_bytes: bytes, remote_bytes: bytes) -> 
                             )
                             return False,None,report
                         _vals295[_pi295]=int(_local_pid295)
-                    _insert_rows295.append(tuple(_vals295))
+                    _ = _insert_rows295.append(tuple(_vals295))
 
                 lc.executemany(
                     f'INSERT INTO "{table}" ({qcols}) VALUES ({placeholders})',
@@ -22804,7 +22807,7 @@ def _v305_sanitize_remote_for_safe_sync(
                             and _same_num305(lr["start_time"],rr["start_time"])
                         )
                         if core_same and remote_r is None and local_r is not None:
-                            remove_keys.append(rk)
+                            _ = remove_keys.append(rk)
                             break
 
                         # race_no欄へ「一般戦」など種別が誤混入した旧行。
@@ -22822,7 +22825,7 @@ def _v305_sanitize_remote_for_safe_sync(
                                 or int(lr["use_for_model"] or 0)==0
                             )
                             if newer and corrected:
-                                remove_keys.append(rk)
+                                _ = remove_keys.append(rk)
                                 break
 
                 if remove_keys:
@@ -23156,10 +23159,10 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
                 st.session_state["v284_uploaded_master_identity"]=_adopt_identity298
                 st.session_state["v284_db_identity_baseline"]=_adopt_identity298
                 st.session_state["v284_db_identity_block"]=[]
-            st.session_state.pop("_v296_sidebar_db_summary_cache",None)
-            st.session_state.pop("_v296_sidebar_manifest_cache",None)
-            st.session_state.pop("_v290_identity_cache",None)
-            st.session_state.pop("_v290_download_snapshot",None)
+            _ = st.session_state.pop("_v296_sidebar_db_summary_cache",None)
+            _ = st.session_state.pop("_v296_sidebar_manifest_cache",None)
+            _ = st.session_state.pop("_v290_identity_cache",None)
+            _ = st.session_state.pop("_v290_download_snapshot",None)
 
             _adopt_detail298=_v284_containment_message(_relpush284,"端末","GitHub")
             return True,(
@@ -23438,7 +23441,7 @@ def _v284_db_identity_regressed(now: dict, baseline: dict) -> tuple[bool,list[st
     if not now.get("ok") or not baseline.get("ok"):
         return True,["DB識別情報を取得できません"]
     if str(now.get("path")) != str(baseline.get("path")):
-        reasons.append(f"DBパス変更: {baseline.get('path')} → {now.get('path')}")
+        _ = reasons.append(f"DBパス変更: {baseline.get('path')} → {now.get('path')}")
     cmp=_v283_compare_db_fingerprints(now.get("fingerprint") or {},baseline.get("fingerprint") or {})
     st.session_state["v284_db_identity_warnings"]=list(cmp.get("warnings") or [])
     if not cmp.get("safe"):
@@ -23571,7 +23574,7 @@ def _v301_build_analysis_light_db_zip(snapshot_bytes: bytes) -> dict:
             for table_name,create_sql in table_rows:
                 name=str(table_name)
                 if name in _V301_ANALYSIS_EXPORT_EXCLUDE_TABLES:
-                    excluded.append(name)
+                    _ = excluded.append(name)
                     continue
                 if not create_sql:
                     continue
@@ -23592,9 +23595,9 @@ def _v301_build_analysis_light_db_zip(snapshot_bytes: bytes) -> dict:
                             batch,
                         )
                         count += len(batch)
-                    copied.append((name,count))
+                    _ = copied.append((name,count))
                 except Exception as exc:
-                    errors.append(f"{name}: {type(exc).__name__}: {exc}")
+                    _ = errors.append(f"{name}: {type(exc).__name__}: {exc}")
                     try: dst.execute(f"DROP TABLE IF EXISTS {_v301_sql_ident(name)}")
                     except Exception: pass
 
@@ -23605,8 +23608,8 @@ def _v301_build_analysis_light_db_zip(snapshot_bytes: bytes) -> dict:
                     coldefs=[]; cols=[]
                     for r in info:
                         cname=str(r[1]); ctype=str(r[2] or '')
-                        cols.append(cname)
-                        coldefs.append(f"{_v301_sql_ident(cname)} {ctype}".strip())
+                        _ = cols.append(cname)
+                        _ = coldefs.append(f"{_v301_sql_ident(cname)} {ctype}".strip())
                     dst.execute("CREATE TABLE analysis_prediction_history_summary ("+','.join(coldefs)+")")
                     qcols=','.join(_v301_sql_ident(c) for c in cols)
                     ph=','.join('?' for _ in cols)
@@ -23617,9 +23620,9 @@ def _v301_build_analysis_light_db_zip(snapshot_bytes: bytes) -> dict:
                         if not batch: break
                         dst.executemany("INSERT INTO analysis_prediction_history_summary VALUES ("+ph+")",batch)
                         n+=len(batch)
-                    copied.append(("analysis_prediction_history_summary",n))
+                    _ = copied.append(("analysis_prediction_history_summary",n))
             except Exception as exc:
-                errors.append(f"prediction_history_summary: {type(exc).__name__}: {exc}")
+                _ = errors.append(f"prediction_history_summary: {type(exc).__name__}: {exc}")
 
             dst.execute("CREATE TABLE analysis_export_manifest(key TEXT PRIMARY KEY,value TEXT)")
             manifest={
@@ -23729,9 +23732,9 @@ with st.sidebar:
         ok, msg = pull_db_from_github()
         (st.success if ok else st.error)(msg)
         if ok:
-            st.session_state.pop("_v296_sidebar_db_summary_cache",None)
-            st.session_state.pop("_v296_sidebar_manifest_cache",None)
-            st.session_state.pop("_v290_identity_cache",None)
+            _ = st.session_state.pop("_v296_sidebar_db_summary_cache",None)
+            _ = st.session_state.pop("_v296_sidebar_manifest_cache",None)
+            _ = st.session_state.pop("_v290_identity_cache",None)
             st.rerun()
 
     # Ver305: GitHub DBを現在DBへ反映せず、取得だけして端末保存する。
@@ -23762,7 +23765,7 @@ with st.sidebar:
                 f" {len(_gh_bytes305)/1024/1024:.2f} MB"
             )
         except Exception as _gh_exc305:
-            st.session_state.pop("_v305_github_export_only",None)
+            _ = st.session_state.pop("_v305_github_export_only",None)
             _gh_export_cache305=None
             st.error(
                 "GitHub DB取得のみでエラー: "
@@ -23793,7 +23796,7 @@ with st.sidebar:
         if _ar.get("ok"):
             st.success(f"退避完了: {_ar.get('moved', 0)}件 → バックアップ表（同一DB内）")
             st.caption("容量を減らすには下の「アーカイブを別ファイルへ出して本体から削除」を実行してください。")
-            st.session_state.pop("_v296_sidebar_manifest_cache", None)
+            _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
         else:
             st.error(str(_ar.get("error") or "退避失敗"))
     if st.button("アーカイブを別ファイルへ出して本体から削除", use_container_width=True,
@@ -23807,7 +23810,7 @@ with st.sidebar:
                 f"書き出し完了: {_ex.get('export_path')} ({mb:.1f}MB) ／ 本体DB約{main_mb:.1f}MB"
             )
             st.caption("別ファイルはサーバー上にあります。必要なら端末保存やGitHub前に保管してください。")
-            st.session_state.pop("_v296_sidebar_manifest_cache", None)
+            _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
         else:
             st.error(str(_ex.get("error") or "書き出し失敗"))
     if st.button("現在のDBをGitHubへ保存（軽量）", use_container_width=True, disabled=not ready,
@@ -23816,7 +23819,7 @@ with st.sidebar:
             ok, msg = push_db_to_github("AutoRaceAI: DBを手動保存（軽量）", _lightweight=True)
         (st.success if ok else st.error)(msg)
         if ok:
-            st.session_state.pop("_v296_sidebar_manifest_cache",None)
+            _ = st.session_state.pop("_v296_sidebar_manifest_cache",None)
     with st.expander("フル保存（重い・非推奨）", expanded=False):
         st.caption("GitHub側DBを全取得して統合してから保存します。DBが大きいとメモリ不足で落ちることがあります。")
         if st.button("フル統合でGitHubへ保存", use_container_width=True, disabled=not ready, key="sidebar_full_db_push"):
@@ -23824,7 +23827,7 @@ with st.sidebar:
                 ok, msg = push_db_to_github("AutoRaceAI: DBを手動保存")
             (st.success if ok else st.error)(msg)
             if ok:
-                st.session_state.pop("_v296_sidebar_manifest_cache",None)
+                _ = st.session_state.pop("_v296_sidebar_manifest_cache",None)
 
     try:
         _summary_sig296=_v290_db_stat_signature(engine.DB_PATH)
@@ -23875,7 +23878,7 @@ with st.sidebar:
             _dl_sig290=_v290_db_stat_signature(db_path)
             _dl_cache290=st.session_state.get("_v290_download_snapshot")
             if isinstance(_dl_cache290,dict) and _dl_cache290.get("sig")!=_dl_sig290:
-                st.session_state.pop("_v290_download_snapshot",None)
+                _ = st.session_state.pop("_v290_download_snapshot",None)
                 _dl_cache290=None
             if st.button("💾 端末保存用DBを準備",use_container_width=True,key="v290_prepare_db_download"):
                 try:
@@ -23907,7 +23910,7 @@ with st.sidebar:
             _light_sig301=_v290_db_stat_signature(db_path)
             _light_cache301=st.session_state.get("_v301_analysis_light_export")
             if isinstance(_light_cache301,dict) and _light_cache301.get("sig")!=_light_sig301:
-                st.session_state.pop("_v301_analysis_light_export",None)
+                _ = st.session_state.pop("_v301_analysis_light_export",None)
                 _light_cache301=None
             if st.button("🪶 ChatGPT解析用の軽量DBを準備",use_container_width=True,key="v301_prepare_analysis_light_db"):
                 try:
@@ -24375,7 +24378,7 @@ elif selected_main_page == "🏁 予測":
             while label in restore_by_label:
                 label = f"{base_label} ({suffix})"
                 suffix += 1
-            restore_labels.append(label)
+            _ = restore_labels.append(label)
             restore_by_label[label] = {"kind":"history", **item}
         for item in saved_predictions:
             when = str(item.get("updated_at") or "").replace("T", " ")[:19]
@@ -24385,7 +24388,7 @@ elif selected_main_page == "🏁 予測":
             while label in restore_by_label:
                 label = f"{base_label} ({suffix})"
                 suffix += 1
-            restore_labels.append(label)
+            _ = restore_labels.append(label)
             restore_by_label[label] = {"kind":"legacy", **item}
         st.caption("最近の保存済み予測をボタンで復元します。文字入力欄ではないため、iPhoneのキーボードは開きません。")
         visible_labels = restore_labels[:24]
@@ -24429,7 +24432,7 @@ elif selected_main_page == "🏁 予測":
                             # 復元欄専用。全体の「直前結果」は上書きせず、旧バージョン表示との混線を防ぐ。
                             st.session_state["v232_restored_result_view"] = restored_result_view
                         else:
-                            st.session_state.pop("v232_restored_result_view", None)
+                            _ = st.session_state.pop("v232_restored_result_view", None)
                         st.session_state["v231_restore_notice"] = {
                             "label": target.get("race_label") or "保存済みレース",
                             "version": history_meta.get("app_version") or "Unknown",
@@ -24460,8 +24463,8 @@ elif selected_main_page == "🏁 予測":
     st.session_state.setdefault("prediction_input_version", 0)
     if st.button("🗑️ 予測入力をリセット", use_container_width=True, key="reset_prediction_input"):
         st.session_state["prediction_input_version"] += 1
-        st.session_state.pop("last_prediction_view", None)
-        st.session_state.pop("v232_restored_result_view", None)
+        _ = st.session_state.pop("last_prediction_view", None)
+        _ = st.session_state.pop("v232_restored_result_view", None)
         _v163_clear_saved_inputs("v163_saved_prediction_text", "v163_saved_prediction_venue")
         st.rerun()
     prediction_version = st.session_state["prediction_input_version"]
@@ -24565,7 +24568,7 @@ elif selected_main_page == "🏁 予測":
                             _trial_txt = f"{float(_trial):.2f}"
                         except Exception:
                             _trial_txt = str(_trial or "")
-                        _pre_retrial.append(f"{_car} {_name} {_trial_txt}".strip())
+                        _ = _pre_retrial.append(f"{_car} {_name} {_trial_txt}".strip())
                     st.info("🔁 再試走あり：" + " / ".join(_pre_retrial) + "｜再試走として認識済み（専用補正なし）")
                 else:
                     st.caption("🔁 再試走：なし")
@@ -24637,7 +24640,7 @@ elif selected_main_page == "🏁 予測":
                         if _loaded_race301 and _result_race301 and _loaded_race301==_result_race301:
                             st.session_state["last_prediction_view"]=_bview
                             st.session_state["v279_bg_loaded_job_id"]=_bjobid
-                            st.session_state.pop("v232_restored_result_view",None)
+                            _ = st.session_state.pop("v232_restored_result_view",None)
                             st.rerun()
                         else:
                             st.error("BG予測のレース照合に失敗したため、別レースの結果は表示しませんでした。")
@@ -24931,7 +24934,7 @@ elif selected_main_page == "🏁 予測":
                             _forced_odds305.get(_bk305, {}) or {}
                         )
                     st.session_state[f"v221_restored_snapshot_{odds_namespace}"] = ""
-                    st.session_state.pop(f"v305_force_odds_snapshot_{race_key}", None)
+                    _ = st.session_state.pop(f"v305_force_odds_snapshot_{race_key}", None)
 
             if st.session_state.pop(f"v305_odds_refresh_notice_{race_key}", False):
                 st.success("✅ 訂正版オッズを現在状態へ反映しました。EV・回収率合成を再計算しました。")
@@ -25734,7 +25737,7 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.session_state["v238_result_restore_source"] = "exact_archive"
                 st.session_state["result_input_version"] = int(st.session_state.get("result_input_version", 0)) + 1
                 for key in ["v35_result_meta","v35_result_rows","v35_result_laps","v35_result_payouts"]:
-                    st.session_state.pop(key, None)
+                    _ = st.session_state.pop(key, None)
                 st.session_state["result_reset_notice"] = f"元の結果本文を復元しました：{race_key_restore}。内容を確認して置き換えできます。"
                 st.rerun()
             else:
@@ -25761,12 +25764,12 @@ if selected_main_page == "✅ 結果登録・解析":
             "result_replace_confirmed",
         ]
         for key in result_only_keys:
-            st.session_state.pop(key, None)
+            _ = st.session_state.pop(key, None)
         _v163_clear_saved_inputs(
             "v163_saved_result_text", "v163_saved_result_venue", "v163_saved_result_race_no"
         )
-        st.session_state.pop("v238_result_restore_source", None)
-        st.session_state.pop("v238_structured_preview_race_key", None)
+        _ = st.session_state.pop("v238_result_restore_source", None)
+        _ = st.session_state.pop("v238_structured_preview_race_key", None)
         st.session_state["result_reset_notice"] = "結果入力だけをリセットしました。予測結果・DBキャッシュ・重み設定は維持しています。"
 
     st.button(
@@ -25788,7 +25791,7 @@ if selected_main_page == "✅ 結果登録・解析":
             "v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts",
             "v224_nonstarter_numbers", "v227_poststart_incidents", "v305_result_parse_text_hash",
         ]:
-            st.session_state.pop(_k, None)
+            _ = st.session_state.pop(_k, None)
 
     result_text = st.text_area(
         "公式結果ページを全文貼り付け",
@@ -25861,7 +25864,7 @@ if selected_main_page == "✅ 結果登録・解析":
             "v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts",
             "v224_nonstarter_numbers", "v227_poststart_incidents", "v305_result_parse_text_hash",
         ]:
-            st.session_state.pop(_k, None)
+            _ = st.session_state.pop(_k, None)
 
         if not venue_override:
             st.warning("開催場を選択してください。")
@@ -25932,7 +25935,7 @@ if selected_main_page == "✅ 結果登録・解析":
     _parsed_result_text_hash = str(st.session_state.get("v305_result_parse_text_hash") or "")
     if _parsed_result_text_hash and _parsed_result_text_hash != _current_result_text_hash:
         for _k in ["v35_result_meta", "v35_result_rows", "v35_result_laps", "v35_result_payouts"]:
-            st.session_state.pop(_k, None)
+            _ = st.session_state.pop(_k, None)
 
     meta_r = st.session_state.get("v35_result_meta")
     rows_r = st.session_state.get("v35_result_rows")
@@ -26204,7 +26207,7 @@ if selected_main_page == "✅ 結果登録・解析":
                     lap_items = []
                     for label in ["1周目先頭", "ゴール先頭", "先頭交代回数", "最大順位上昇車", "最大順位上昇"]:
                         if label in analysis:
-                            lap_items.append(f"{label}: {analysis[label]}")
+                            _ = lap_items.append(f"{label}: {analysis[label]}")
                     if lap_items:
                         st.info("展開解析｜" + " / ".join(lap_items))
 
@@ -26334,7 +26337,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                 ok,msg=engine.v74_apply_optimized_weights(opt["optimization_id"],engine.DB_PATH)
                 (st.success if ok else st.warning)(msg)
                 if ok:
-                    st.session_state.pop("v74_optimization",None)
+                    _ = st.session_state.pop("v74_optimization",None)
                     st.rerun()
     # Ver271安定化: 学習テーブルの読込失敗でアプリ全体を落とさない。
     # DB本体の予測・結果テーブルと、重み学習の補助テーブルは切り離して扱う。
@@ -26421,7 +26424,7 @@ if selected_main_page == "🗃️ 登録情報確認":
 def _v146_reset_player_input():
     st.session_state["player_input_version"] = int(st.session_state.get("player_input_version", 0)) + 1
     for key in ["parsed_player_history", "player_register_notice", "player_registration_lookup"]:
-        st.session_state.pop(key, None)
+        _ = st.session_state.pop(key, None)
     _v163_clear_saved_inputs("v163_saved_player_name", "v163_saved_player_history")
     st.session_state["player_register_notice"] = {"level":"success", "message":"選手入力だけをリセットしました。"}
 
@@ -26563,7 +26566,7 @@ if selected_main_page == "👤 選手情報登録":
                     st.session_state["pending_player_history"] = pending_df
                 else:
                     st.session_state["parsed_player_history"] = work
-                    st.session_state.pop("pending_player_history", None)
+                    _ = st.session_state.pop("pending_player_history", None)
 
                 text = (
                     f"読込 {report.get('read', len(work))}件｜追加・更新 {changed}件"
@@ -26665,7 +26668,7 @@ if selected_main_page == "🗃️ 登録情報確認":
         with st.spinner("開催場別重みを読み込んでいます…"):
             try:
                 st.session_state["v132_venue_profiles"] = engine.v92_all_venue_weight_profiles(engine.DB_PATH)
-                st.session_state.pop("v132_venue_profile_error", None)
+                _ = st.session_state.pop("v132_venue_profile_error", None)
             except Exception as exc:
                 st.session_state["v132_venue_profile_error"] = str(exc)
 
@@ -26723,7 +26726,7 @@ if selected_main_page == "🗃️ 登録情報確認":
         st.session_state["v132_registration_info_open"] = True
     if st.session_state.get("v132_registration_info_open", False):
         if st.button("登録情報確認を閉じる", use_container_width=True, key="v132_close_registration_info"):
-            st.session_state.pop("v132_registration_info_open", None)
+            _ = st.session_state.pop("v132_registration_info_open", None)
             st.rerun()
         st.divider()
         st.subheader("登録されている情報")
