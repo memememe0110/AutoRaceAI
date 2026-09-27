@@ -27420,21 +27420,23 @@ if selected_main_page == "🗃️ 登録情報確認":
                     st.subheader("DBメンテナンス")
                     st.caption("姓名の空白違いと数値完全一致の同一走行を整理します。ただしRが異なる組み合わせは勝手に統合せず、確認対象として残します。")
                     if st.button("完全一致を含む重複データを一括統合", use_container_width=True):
-                        result = engine.v32_merge_duplicate_players(engine.DB_PATH)
-                        exact_result = engine.v58_cleanup_exact_numeric_duplicates(engine.DB_PATH)
-                        race_result = engine.v33_cleanup_duplicate_histories(engine.DB_PATH)
-                        identity_result = engine.v46_cleanup_player_identity_duplicates(engine.DB_PATH)
-                        ok, msg = push_db_to_github("AutoRaceAI: 数値完全一致を含む重複履歴を一括統合")
+                        # Ver320: DB書き換え直後のフルGitHub pushはOOMしやすいため分離
+                        with st.spinner("重複統合中（GitHub保存はしません）…"):
+                            result = engine.v32_merge_duplicate_players(engine.DB_PATH)
+                            exact_result = engine.v58_cleanup_exact_numeric_duplicates(engine.DB_PATH)
+                            race_result = engine.v33_cleanup_duplicate_histories(engine.DB_PATH)
+                            identity_result = engine.v46_cleanup_player_identity_duplicates(engine.DB_PATH)
                         summary = (
                             f"選手 {result['merged_players']}件を統合、履歴 {result['moved_histories']}件を移動、"
                             f"数値完全一致の正規履歴 {exact_result['merged_histories']}件・詳細履歴 {exact_result['merged_imports']}件、R相違の確認対象 {exact_result.get('r_conflicts', 0)}組、"
                             f"その他の同一走行履歴 {race_result['deleted_histories']}件・詳細履歴 {race_result['deleted_imports']}件、"
                             f"レース識別違いの正規履歴 {identity_result['merged_histories']}件・詳細履歴 {identity_result['merged_imports']}件を統合しました。"
                         )
-                        if ok:
-                            st.success(summary + " " + msg)
-                        else:
-                            st.warning(summary + " GitHub保存は未完了です。" + msg)
+                        st.success(summary)
+                        st.warning(
+                            "GitHub保存は自動では行いません。"
+                            "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
+                        )
                         st.rerun()
 
                     st.divider()
@@ -27612,9 +27614,8 @@ if selected_main_page == "🗃️ 登録情報確認":
                     except Exception as exc:
                         st.caption(f"事故レース状況を取得できませんでした: {exc}")
                     if st.button("登録済み結果を再点検して事故レースを学習対象外にする", use_container_width=True):
-                        with st.spinner("登録済み結果を再点検しています..."):
+                        with st.spinner("登録済み結果を再点検しています（GitHub保存はしません）..."):
                             accident_result = engine.v76_reclassify_existing_accident_races(engine.DB_PATH)
-                        ok, msg = push_db_to_github("AutoRaceAI: 事故レースを学習対象外へ再分類")
                         summary = (
                             f"{accident_result.get('結果レース確認', 0)}レースを確認し、"
                             f"事故 {accident_result.get('事故レース', 0)}レースを学習対象外にしました。"
@@ -27622,10 +27623,11 @@ if selected_main_page == "🗃️ 登録情報確認":
                             f"周回学習 {accident_result.get('周回学習削除', 0)}行・"
                             f"事故レースの重み履歴 {accident_result.get('重み履歴削除', 0)}件を削除しました。"
                         )
-                        if ok:
-                            st.success(summary + " " + msg)
-                        else:
-                            st.warning(summary + " GitHub保存は未完了です。" + msg)
+                        st.success(summary)
+                        st.warning(
+                            "GitHub保存は自動では行いません。"
+                            "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
+                        )
                         st.rerun()
 
                     st.divider()
@@ -27643,9 +27645,8 @@ if selected_main_page == "🗃️ 登録情報確認":
                         st.caption(f"再学習状況を取得できませんでした: {exc}")
 
                     if st.button("登録済みグランドノートを全件再学習", use_container_width=True):
-                        with st.spinner("登録済みグランドノートを再同期しています..."):
+                        with st.spinner("登録済みグランドノートを再同期しています（GitHub保存はしません）..."):
                             gn_result = engine.v62_rebuild_grand_note_learning(engine.DB_PATH)
-                        ok, msg = push_db_to_github("AutoRaceAI: 登録済みグランドノートを全件再学習")
                         summary = (
                             f"対象 {gn_result.get('対象レース', 0)}レース・{gn_result.get('対象選手', 0)}選手、"
                             f"周回 {gn_result.get('同期成功', 0)}行を反映 "
@@ -27656,10 +27657,11 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 f" 選手名不足 {gn_result.get('結果選手不明', 0)}行、"
                                 f"選手未解決 {gn_result.get('選手不明', 0)}行。"
                             )
-                        if ok:
-                            st.success(summary + " " + msg)
-                        else:
-                            st.warning(summary + " GitHub保存は未完了です。" + msg)
+                        st.success(summary)
+                        st.warning(
+                            "GitHub保存は自動では行いません。"
+                            "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
+                        )
                         st.rerun()
 
                     st.divider()
@@ -28118,13 +28120,17 @@ if selected_main_page == "🗃️ 登録情報確認":
 
                     if unresolved:
                         if st.button("一意に決まる未リンクだけ自動修復", use_container_width=True):
-                            repair_result = engine.v63_auto_repair_grand_note_links(engine.DB_PATH)
-                            ok, msg = push_db_to_github("AutoRaceAI: グランドノート未リンクを自動修復")
+                            with st.spinner("未リンクを自動修復しています（GitHub保存はしません）..."):
+                                repair_result = engine.v63_auto_repair_grand_note_links(engine.DB_PATH)
                             summary = (
                                 f"{repair_result.get('repaired_groups', 0)}組・{repair_result.get('synced_rows', 0)}行を修復。"
                                 f"手動確認 {repair_result.get('manual_groups', 0)}組。"
                             )
-                            st.success(summary + (" " + msg if ok else " GitHub保存は未完了です。" + msg))
+                            st.success(summary)
+                            st.warning(
+                                "GitHub保存は自動では行いません。"
+                                "サイドバーの『現在のDBをGitHubへ保存（軽量）』を実行してください。"
+                            )
                             st.rerun()
 
                         player_choices = engine.v63_player_name_choices(engine.DB_PATH)
