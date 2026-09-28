@@ -9334,20 +9334,25 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
         )
         if _is_kessha:
             _ = lines.append(f"-\t{car}\t{name}")
-            _ = lines.append(f"{lg}/{hand}m/{trial}\t0.000(-)")
+            # engine._v35_parse_entries は プロフィール行と 競走T行を分ける前提
+            _ = lines.append(f"{lg}/{hand}m/{trial}")
+            _ = lines.append("0.000(-)")
             _ = lines.append("0.00 /欠車")
             continue
         flag = f" /{abn}" if abn else ""
         # 発走後事故（反妨等）は着順 "-" のまま残す（欠車にしない）
         if str(pos) in ("-", "欠", "－") and abn and "欠車" not in str(abn):
             _ = lines.append(f"-\t{car}\t{name}")
-            _ = lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop})")
+            _ = lines.append(f"{lg}/{hand}m/{trial}")
+            _ = lines.append(f"{race_t}({pop})")
             st_s = str(st or "0.00")
             _ = lines.append(f"{st_s} /{abn}")
         else:
             _ = lines.append(f"{pos}\t{car}\t{name}")
-            _ = lines.append(f"{lg}/{hand}m/{trial}\t{race_t}({pop}){flag}")
-            _ = lines.append(str(st))
+            # Ver320: プロフィールと競走Tを別行に（同一行だと競走Tが欠落する）
+            _ = lines.append(f"{lg}/{hand}m/{trial}")
+            _ = lines.append(f"{race_t}({pop}){flag}")
+            _ = lines.append(str(st or "0.00"))
 
     if lap_rows:
         _ = lines.append("グランドノート")
@@ -11056,7 +11061,15 @@ def _v319_fill_player_histories(
                 latest_d = _v319_ymd_digits(latest_d)
                 state = _v319_player_history_state(db_path, name, con=con) or {}
                 have_keys = set(state.get("keys") or set())
-                dirty_keys = {k for k in have_keys if not k[0] or int(k[2] or 0) <= 0}
+                # R未設定、または仮R(700-908: 結果由来の暫定キー)は上書き対象
+                dirty_keys = set()
+                for k in have_keys:
+                    try:
+                        rn = int(k[2] or 0)
+                    except Exception:
+                        rn = 0
+                    if (not k[0]) or rn <= 0 or (700 <= rn <= 908):
+                        dirty_keys.add(k)
 
                 # 既存判定: min_rows 以上かつ最新日が入っている
                 is_existing = (have >= min_rows and bool(latest_d))
