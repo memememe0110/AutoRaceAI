@@ -17124,6 +17124,143 @@ def _v321_trace_summary(db_path: str) -> dict:
     return out
 
 
+
+def _v321_miss_analysis(db_path: str, car_filter: int | None = None) -> dict:
+    """精度向上用: 脱落 × プラン的中を結合し、取りこぼし候補を数える。
+
+    Step1: v187_mixed_plan_feedback を race_key で結合（読み取り専用）
+    Step2: 脱落かつプラン外れ = 取りこぼし候補
+           脱落かつプラン的中 = 正しい除外（他券カバー等）の可能性
+
+    本番の買い目ロジックは変更しない。
+    """
+    _v321_ensure_trace_results_table(db_path)
+    out = {
+        "races_with_trace": 0,
+        "races_with_feedback": 0,
+        "dropped_rows": 0,
+        "dropped_plan_hit": 0,
+        "dropped_plan_miss": 0,  # 取りこぼし候補
+        "dropped_no_feedback": 0,
+        "kept_plan_hit": 0,
+        "kept_plan_miss": 0,
+        "by_stage_miss": {},
+        "by_car_miss": {},
+        "sample_miss": [],
+        "errors": [],
+    }
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.row_factory = sqlite3.Row
+            # race単位で最新feedbackを決定論的に1件採用。
+            # - v187_mixed_plan_runs と JOIN して孤児 feedback を除外
+            # - evaluated_at DESC, plan_hash DESC でタイブレーク
+            fb_sql = """
+                SELECT f.race_key, f.hit, f.payout_yen, f.cost_yen, f.return_rate,
+                       f.plan_hash, f.evaluated_at
+                  FROM v187_mixed_plan_feedback f
+                  JOIN v187_mixed_plan_runs r
+                    ON r.race_key = f.race_key AND r.plan_hash = f.plan_hash
+                 ORDER BY f.race_key,
+                          datetime(f.evaluated_at) DESC,
+                          f.plan_hash DESC
+            """
+            try:
+                fb_rows = {}
+                for r in con.execute(fb_sql).fetchall():
+                    rk = str(r["race_key"])
+                    if rk not in fb_rows:  # 先頭 = 最新・決定論的
+                        fb_rows[rk] = dict(r)
+            except Exception as exc:
+                # runs テーブルが無い/空の場合は feedback のみでフォールバック
+                try:
+                    fb_sql2 = """
+                        SELECT f.race_key, f.hit, f.payout_yen, f.cost_yen, f.return_rate,
+                               f.plan_hash, f.evaluated_at
+                          FROM v187_mixed_plan_feedback f
+                         ORDER BY f.race_key,
+                                  datetime(f.evaluated_at) DESC,
+                                  f.plan_hash DESC
+                    """
+                    fb_rows = {}
+                    for r in con.execute(fb_sql2).fetchall():
+                        rk = str(r["race_key"])
+                        if rk not in fb_rows:
+                            fb_rows[rk] = dict(r)
+                    out["errors"].append(
+                        f"feedback_fallback(no_runs_join): {type(exc).__name__}: {exc}"
+                    )
+                except Exception as exc2:
+                    out["errors"].append(f"feedback: {type(exc2).__name__}: {exc2}")
+                    fb_rows = {}
+
+            where = ""
+            params: list = []
+            if car_filter is not None:
+                where = " WHERE t.car_no=?"
+                params.append(int(car_filter))
+
+            rows = con.execute(
+                f"""
+                SELECT t.race_key, t.car_no, t.top3_rank, t.in_final_plan,
+                       t.drop_stage, t.final_plan_points, t.final_plan_cost_yen
+                  FROM v321_trace_results t
+                {where}
+                """,
+                params,
+            ).fetchall()
+
+            races = set()
+            races_fb = set()
+            samples = []
+            for r in rows:
+                rk = str(r["race_key"])
+                races.add(rk)
+                fb = fb_rows.get(rk)
+                hit = None if not fb else int(fb.get("hit") or 0)
+                if fb:
+                    races_fb.add(rk)
+                dropped = int(r["in_final_plan"] or 0) == 0
+                if dropped:
+                    out["dropped_rows"] += 1
+                    if hit is None:
+                        out["dropped_no_feedback"] += 1
+                    elif hit:
+                        out["dropped_plan_hit"] += 1
+                    else:
+                        out["dropped_plan_miss"] += 1
+                        stg = str(r["drop_stage"] or "unknown")
+                        out["by_stage_miss"][stg] = out["by_stage_miss"].get(stg, 0) + 1
+                        cno = int(r["car_no"])
+                        out["by_car_miss"][cno] = out["by_car_miss"].get(cno, 0) + 1
+                        if len(samples) < 30:
+                            samples.append({
+                                "race_key": rk,
+                                "car_no": cno,
+                                "top3_rank": int(r["top3_rank"] or 0),
+                                "drop_stage": stg,
+                                "plan_points": r["final_plan_points"],
+                                "plan_cost": r["final_plan_cost_yen"],
+                                "plan_hit": hit,
+                                "plan_payout": (fb or {}).get("payout_yen"),
+                                "plan_return_rate": (fb or {}).get("return_rate"),
+                            })
+                else:
+                    if hit is None:
+                        pass
+                    elif hit:
+                        out["kept_plan_hit"] += 1
+                    else:
+                        out["kept_plan_miss"] += 1
+
+            out["races_with_trace"] = len(races)
+            out["races_with_feedback"] = len(races_fb)
+            out["sample_miss"] = samples
+    except Exception as exc:
+        out["errors"].append(f"{type(exc).__name__}: {exc}")
+    return out
+
+
 def _v187_save_mixed_plan(
     db_path: str, race_key: str, result: dict, app_version: str | None = None,
     plan_origin: str = "live", source_prediction_version: str | None = None,
@@ -29137,6 +29274,57 @@ if selected_main_page == "🗃️ 登録情報確認":
                                     for k, v in sorted(_sum["dropped_by_car"].items())
                                 ])
                                 st.dataframe(_bc, use_container_width=True, hide_index=True)
+
+                            st.markdown("### 🎯 取りこぼし判定（脱落 × プラン的中）")
+                            st.caption(
+                                "v187_mixed_plan_feedback を結合。脱落かつプラン外れ＝取りこぼし候補。"
+                                "脱落かつプラン的中＝正しい除外の可能性。本番ロジックは変更しません。"
+                            )
+                            _miss_all = _v321_miss_analysis(engine.DB_PATH, None)
+                            _miss_7 = _v321_miss_analysis(engine.DB_PATH, 7)
+                            _m1, _m2, _m3, _m4 = st.columns(4)
+                            _m1.metric("脱落行", f"{_miss_all.get('dropped_rows', 0)}")
+                            _m2.metric("取りこぼし候補", f"{_miss_all.get('dropped_plan_miss', 0)}")
+                            _m3.metric("脱落だが的中", f"{_miss_all.get('dropped_plan_hit', 0)}")
+                            _m4.metric("FBなし脱落", f"{_miss_all.get('dropped_no_feedback', 0)}")
+                            _n1, _n2, _n3 = st.columns(3)
+                            _n1.metric("7番取りこぼし候補", f"{_miss_7.get('dropped_plan_miss', 0)}")
+                            _n2.metric("7番脱落だが的中", f"{_miss_7.get('dropped_plan_hit', 0)}")
+                            _n3.metric("FB結合レース", f"{_miss_all.get('races_with_feedback', 0)}/{_miss_all.get('races_with_trace', 0)}")
+                            if _miss_all.get("by_stage_miss"):
+                                st.dataframe(
+                                    pd.DataFrame([
+                                        {"脱落ステージ": k, "取りこぼし候補": v}
+                                        for k, v in sorted(
+                                            _miss_all["by_stage_miss"].items(),
+                                            key=lambda x: -x[1],
+                                        )
+                                    ]),
+                                    use_container_width=True, hide_index=True,
+                                )
+                            if _miss_7.get("sample_miss"):
+                                st.markdown("#### 7番車 取りこぼし候補サンプル")
+                                st.dataframe(
+                                    pd.DataFrame(_miss_7["sample_miss"]),
+                                    use_container_width=True, hide_index=True,
+                                )
+                            elif _miss_all.get("sample_miss"):
+                                st.markdown("#### 取りこぼし候補サンプル（全車）")
+                                st.dataframe(
+                                    pd.DataFrame(_miss_all["sample_miss"][:15]),
+                                    use_container_width=True, hide_index=True,
+                                )
+                            if _miss_all.get("errors"):
+                                st.warning(" / ".join(_miss_all["errors"][:3]))
+                            if int(_miss_all.get("dropped_plan_miss") or 0) <= 1:
+                                st.info(
+                                    "取りこぼし候補がほぼ無いため、v184段階ログ拡張（Step3）より"
+                                    "他の精度要因（候補生成・オッズ校正など）を優先した方がよい可能性があります。"
+                                )
+                            elif int(_miss_all.get("dropped_plan_miss") or 0) >= 5:
+                                st.warning(
+                                    "取りこぼし候補が複数あります。Step3（pool/tri_seed段階ログ）の検討価値があります。"
+                                )
 
                             st.markdown("### 🥇 実TOP3順位別 脱落率")
                             _tr = _sum.get("by_top3_rank") or {}
