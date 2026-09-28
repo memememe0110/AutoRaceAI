@@ -11054,11 +11054,30 @@ def _v319_fill_player_histories(
                     continue
                 before_d = _v319_ymd_digits(before_ymd)
 
-                # ========== 1) DB状態 ==========
+                # ========== 1) DB状態（軽量） ==========
                 # 履歴ヘルパは失敗時も 0/(0,"")/空dict を返す（Noneは返さない）。
-                # 「失敗=0件扱い」を明示し、到達不能な None 分岐は置かない。
                 have, latest_d = _v319_player_history_latest_fast(db_path, name, con=con)
                 latest_d = _v319_ymd_digits(latest_d)
+                is_existing = (have >= min_rows and bool(latest_d))
+
+                # Ver320: 1度十分に登録済みなら、公式再取得・keys照合をしない。
+                # - 件数 >= min_rows
+                # - 対象日が無い、または DB最新日 >= 対象日（対象日までの穴なし）
+                # プロセス内キャッシュ済みも同様に即スキップ。
+                if is_existing and ((not before_d) or (latest_d >= before_d)):
+                    skipped += 1
+                    _V319_HIST_SKIPPED.add(cache_key)
+                    _ = details.append(
+                        f"{name}:充足スキップ(既存{have}件/最新{latest_d}"
+                        f"{'/対象'+before_d if before_d else ''})"
+                    )
+                    continue
+                if already_skipped and is_existing:
+                    skipped += 1
+                    _ = details.append(f"{name}:キャッシュスキップ(既存{have}件/最新{latest_d})")
+                    continue
+
+                # ここから先だけ keys 照合・公式HTTPが必要（件数不足 or 対象日より古い）
                 state = _v319_player_history_state(db_path, name, con=con) or {}
                 have_keys = set(state.get("keys") or set())
                 # R未設定、または仮R(700-908: 結果由来の暫定キー)は上書き対象
@@ -11070,16 +11089,6 @@ def _v319_fill_player_histories(
                         rn = 0
                     if (not k[0]) or rn <= 0 or (700 <= rn <= 908):
                         dirty_keys.add(k)
-
-                # 既存判定: min_rows 以上かつ最新日が入っている
-                is_existing = (have >= min_rows and bool(latest_d))
-
-                # 前回「穴なし」確認済みの既存選手だけキャッシュスキップ。
-                # 新規/穴残りの疑いがある選手は必ず再チェックする。
-                if already_skipped and is_existing:
-                    skipped += 1
-                    _ = details.append(f"{name}:キャッシュスキップ(既存{have}件/最新{latest_d})")
-                    continue
 
                 # ========== 2) 公式履歴を取得 ==========
                 details.append(
@@ -11217,7 +11226,11 @@ def _v319_fill_player_histories(
                 if not keep:
                     skipped += 1
                     _ = details.append(f"{name}:追加対象なし(既存{have}/公式{len(official_keys)})")
-                    if before_d and latest_d and latest_d >= before_d:
+                    # 一度公式を見て追加不要なら、同一プロセス内は再取得しない
+                    # （latest が対象日未満でも「今日の出走なし」で繰り返しHTTPしない）
+                    if is_existing or have >= min_rows:
+                        _V319_HIST_SKIPPED.add(cache_key)
+                    elif before_d and latest_d and latest_d >= before_d:
                         _V319_HIST_SKIPPED.add(cache_key)
                     continue
 
@@ -11338,6 +11351,16 @@ def _v319_fill_player_histories(
                 changed = int(report.get("changed") or report.get("saved") or 0)
                 pending_df = report.get("pending")
                 pending_left = int(report.get("pending_count") or 0)
+
+                # Ver320 post-fix: パーサが R を拾えなかった行を結果DBから補完
+                try:
+                    _rno_fix = _v320_backfill_race_no_for_player(db_path, name)
+                    if int(_rno_fix.get("race_history") or 0) > 0 or int(_rno_fix.get("v15") or 0) > 0:
+                        _ = details.append(
+                            f"{name}:race_no補完(rh={_rno_fix.get('race_history', 0)}/v15={_rno_fix.get('v15', 0)})"
+                        )
+                except Exception as _rno_exc:
+                    _ = details.append(f"{name}:race_no補完失敗:{type(_rno_exc).__name__}")
 
                 if isinstance(pending_df, pd.DataFrame) and not pending_df.empty:
                     repaired = pending_df.copy()
@@ -11847,6 +11870,205 @@ def _v319_register_void_result(
         pass
     return {"key": key, "ok": True, "void": True, "reason": reason}
 
+
+
+
+def _v320_backfill_race_no_for_player(db_path: str, player_name: str = "") -> dict:
+    """race_history / v15_player_history_imports の空 race_no を result_races から補完。
+
+    Ver320: engine.v15_parse_player_history が "1R" 単独行を拾えないケースがあるため、
+    result_races.race_no を正本として事後 UPDATE する。
+
+    マッチ優先順位（ユニーク時のみ採用、曖昧なら触らない）:
+      1) 日付+場+選手+試走T+競走T
+      2) 日付+場+選手+試走T
+      3) 日付+場+選手（候補が1件だけ）
+    """
+    out = {"race_history": 0, "v15": 0, "skipped_ambiguous": 0, "errors": []}
+
+    def _norm_name(n: str) -> str:
+        return re.sub(r"[\s\u3000]+", "", str(n or ""))
+
+    def _norm_venue(v: str) -> str:
+        return str(v or "").strip().replace(" ", "").replace("\u3000", "")
+
+    def _date_digits(d) -> str:
+        return re.sub(r"[^0-9]", "", str(d or ""))[:8]
+
+    def _num(v):
+        try:
+            f = float(v)
+            if f != f:  # NaN
+                return None
+            return f
+        except Exception:
+            return None
+
+    def _pick_rn(raw) -> str:
+        m = re.search(r"(\d{1,2})", str(raw or ""))
+        if not m:
+            return ""
+        n = int(m.group(1))
+        return str(n) if 1 <= n <= 12 else ""
+
+    def _lookup_rn(con, rd8: str, venue: str, pname: str, trial_time=None, race_time=None):
+        if not rd8 or len(rd8) < 8:
+            return ""
+        vn = _norm_venue(venue)
+        pn = _norm_name(pname)
+        if not vn or not pn:
+            return ""
+        _tt = _num(trial_time)
+        _rt = _num(race_time)
+
+        def _query(extra_sql: str, extra_params: tuple):
+            sql = (
+                "SELECT DISTINCT rr.race_no FROM result_races rr "
+                "JOIN result_entries re ON re.race_key = rr.race_key "
+                "WHERE replace(replace(replace(COALESCE(rr.race_date,''),'-',''),'/',''),'.','') LIKE ? "
+                "  AND replace(replace(COALESCE(rr.venue,''),' ',''),'\u3000','') = ? "
+                "  AND replace(replace(COALESCE(re.player_name,''),' ',''),'\u3000','') = ? "
+                "  AND rr.race_no IS NOT NULL "
+                "  AND TRIM(CAST(rr.race_no AS TEXT)) <> '' "
+                + extra_sql
+            )
+            try:
+                rows = con.execute(sql, (rd8 + "%", vn, pn) + tuple(extra_params)).fetchall()
+            except Exception:
+                return []
+            out_set = set()
+            for r in rows:
+                rn = _pick_rn(r[0] if r else "")
+                if rn:
+                    out_set.add(rn)
+            return sorted(out_set)
+
+        if _tt is not None and _rt is not None:
+            c = _query(
+                " AND re.trial_time IS NOT NULL AND re.race_time IS NOT NULL"
+                " AND ABS(CAST(re.trial_time AS REAL) - ?) < 0.005"
+                " AND ABS(CAST(re.race_time AS REAL) - ?) < 0.005",
+                (_tt, _rt),
+            )
+            if len(c) == 1:
+                return c[0]
+        if _tt is not None:
+            c = _query(
+                " AND re.trial_time IS NOT NULL"
+                " AND ABS(CAST(re.trial_time AS REAL) - ?) < 0.005",
+                (_tt,),
+            )
+            if len(c) == 1:
+                return c[0]
+        c = _query("", ())
+        if len(c) == 1:
+            return c[0]
+        return ""  # 曖昧 or 不一致 → 触らない
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            where = "(h.race_no IS NULL OR TRIM(CAST(h.race_no AS TEXT)) = '')"
+            params: list = []
+            if player_name:
+                where += (
+                    " AND replace(replace(COALESCE(p.player_name,''),' ',''),'\u3000','') = ?"
+                )
+                params.append(_norm_name(player_name))
+            rows = con.execute(
+                f"""
+                SELECT h.history_id, h.race_date, h.venue, p.player_name,
+                       h.trial_time, h.race_time
+                  FROM race_history h
+                  JOIN players p ON p.player_id = h.player_id
+                 WHERE {where}
+                """,
+                params,
+            ).fetchall()
+            for hid, rd, venue, pname, tt, rt in rows:
+                rn = _lookup_rn(con, _date_digits(rd), venue, pname, tt, rt)
+                if rn:
+                    con.execute(
+                        "UPDATE race_history SET race_no=? WHERE history_id=?",
+                        (rn, int(hid)),
+                    )
+                    out["race_history"] += 1
+                else:
+                    out["skipped_ambiguous"] += 1
+
+            try:
+                v15_cols = {
+                    str(c[1])
+                    for c in con.execute(
+                        'PRAGMA table_info("v15_player_history_imports")'
+                    ).fetchall()
+                }
+                if "race_no" in v15_cols:
+                    key_col = (
+                        "history_key"
+                        if "history_key" in v15_cols
+                        else ("id" if "id" in v15_cols else None)
+                    )
+                    date_col = (
+                        "race_date"
+                        if "race_date" in v15_cols
+                        else ("開催日" if "開催日" in v15_cols else None)
+                    )
+                    ven_col = (
+                        "venue"
+                        if "venue" in v15_cols
+                        else ("開催場" if "開催場" in v15_cols else None)
+                    )
+                    name_col = (
+                        "player_name"
+                        if "player_name" in v15_cols
+                        else ("選手名" if "選手名" in v15_cols else None)
+                    )
+                    trial_col = (
+                        "trial_time"
+                        if "trial_time" in v15_cols
+                        else ("試走T" if "試走T" in v15_cols else None)
+                    )
+                    race_col = (
+                        "race_time"
+                        if "race_time" in v15_cols
+                        else ("競走T" if "競走T" in v15_cols else None)
+                    )
+                    if key_col and date_col and ven_col and name_col:
+                        where15 = "COALESCE(CAST(race_no AS TEXT), '') = ''"
+                        params15: list = []
+                        if player_name:
+                            where15 += (
+                                f" AND replace(replace(COALESCE({name_col},''),' ',''),'\u3000','') = ?"
+                            )
+                            params15.append(_norm_name(player_name))
+                        sel_tt = trial_col if trial_col else "NULL"
+                        sel_rt = race_col if race_col else "NULL"
+                        rows15 = con.execute(
+                            f"""
+                            SELECT {key_col}, {date_col}, {ven_col}, {name_col},
+                                   {sel_tt}, {sel_rt}
+                              FROM v15_player_history_imports
+                             WHERE {where15}
+                            """,
+                            params15,
+                        ).fetchall()
+                        for hk, rd, venue, pname, tt, rt in rows15:
+                            rn = _lookup_rn(con, _date_digits(rd), venue, pname, tt, rt)
+                            if rn:
+                                con.execute(
+                                    f"UPDATE v15_player_history_imports SET race_no=? WHERE {key_col}=?",
+                                    (rn, hk),
+                                )
+                                out["v15"] += 1
+                            else:
+                                out["skipped_ambiguous"] += 1
+            except Exception as exc15:
+                out["errors"].append(f"v15: {type(exc15).__name__}: {exc15}")
+            con.commit()
+    except Exception as exc:
+        out["errors"].append(f"race_history: {type(exc).__name__}: {exc}")
+    return out
 
 
 def _v320_extract_race_no_from_result_text(text: str):
@@ -27428,6 +27650,35 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 st.rerun()
                             else:
                                 st.warning(result.get("message", "削除対象がありませんでした。"))
+
+                    st.divider()
+                    st.subheader("🔧 race_no 欠落の一括補完")
+                    st.caption(
+                        "result_races.race_no を正本として、race_history / v15 の空 race_no を埋めます。"
+                        "パーサが R を拾えなかった既存行の復旧用です。"
+                    )
+                    _show_sticky_notice("v320_race_no_fix_notice")
+                    if st.button("race_no 欠落を一括補完", key="v320_fix_race_no_bulk", use_container_width=True):
+                        try:
+                            with st.spinner("result_races から race_no を補完しています…"):
+                                _fix = _v320_backfill_race_no_for_player(engine.DB_PATH, "")
+                            msg = (
+                                f"race_history {_fix.get('race_history', 0)}件 / "
+                                f"v15 {_fix.get('v15', 0)}件 を補完しました。"
+                                f"（曖昧スキップ {_fix.get('skipped_ambiguous', 0)}件）"
+                            )
+                            if _fix.get("errors"):
+                                msg += " / " + " / ".join(str(x) for x in _fix["errors"][:5])
+                                _set_sticky_notice("v320_race_no_fix_notice", "warning", msg)
+                            else:
+                                _set_sticky_notice("v320_race_no_fix_notice", "success", msg)
+                        except Exception as _exc:
+                            _set_sticky_notice(
+                                "v320_race_no_fix_notice",
+                                "error",
+                                f"{type(_exc).__name__}: {_exc}",
+                            )
+                        st.rerun()
 
                     st.divider()
                     st.subheader("DBメンテナンス")
