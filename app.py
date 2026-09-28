@@ -16790,12 +16790,45 @@ def _v321_ensure_trace_results_table(db_path: str) -> None:
 
 
 def _v321_car_in_combo(car_no: int, combo_text: str) -> bool:
+    """買い目コンボ文字列に車番が含まれるか（1-8の並びのみ）。"""
     try:
-        nums = [int(x) for x in re.findall(r"\d+", str(combo_text or ""))]
-        return int(car_no) in nums
+        n = int(car_no)
+        s = str(combo_text or "")
+        for m in re.finditer(r"[1-8](?:\s*[-→・>]\s*[1-8]){1,2}", s):
+            nums = [int(x) for x in re.findall(r"[1-8]", m.group(0))]
+            if n in nums:
+                return True
+        # BOX等: 短い数字列で小数・2桁を含まない場合のみ
+        if re.search(r"\d{2,}|\d\.\d", s):
+            return False
+        nums = [int(x) for x in re.findall(r"[1-8]", s)]
+        return n in nums and 1 <= len(nums) <= 8
     except Exception:
         return False
 
+
+def _v321_note_mentions_car(car_no: int, note: str) -> bool:
+    """診断noteが当該車番を言及しているか。
+
+    オッズ小数（5.7倍 / 151.7倍 / 7.8倍）や 94.7% の数字に
+    誤マッチしないよう、コンボ表記・「N番」に限定する。
+    """
+    try:
+        n = int(car_no)
+        s = str(note or "")
+        if not s:
+            return False
+        if re.search(rf"(?<![\d.]){n}\s*番(?:車)?", s):
+            return True
+        if re.search(rf"車番\s*{n}(?![\d.])", s):
+            return True
+        for m in re.finditer(r"[1-8](?:\s*[-→・>]\s*[1-8]){1,2}", s):
+            nums = [int(x) for x in re.findall(r"[1-8]", m.group(0))]
+            if n in nums:
+                return True
+        return False
+    except Exception:
+        return False
 
 _V321_NOTE_ORDER = [
     "solo_gami",
@@ -16860,12 +16893,11 @@ def _v321_detect_drop_stage(car_no: int, result: dict) -> tuple[str, list[dict]]
         ("protected_add_notes", "protected_add"),
         ("v260_refill_notes", "v260_refill"),
     ]
-    # noteは自由形式なので車番の「単語境界」で照合する。
-    car_re = re.compile(rf"(?<!\d){int(car_no)}(?!\d)")
+    # noteは自由形式。オッズ小数の数字に誤マッチしないようコンボ/N番に限定。
     for key, label in note_map:
         for note in (result.get(key) or []):
             note_s = str(note)
-            if car_re.search(note_s):
+            if _v321_note_mentions_car(car_no, note_s):
                 hits.append({"note_key": label, "text": note_s[:500]})
 
     hard = result.get("hard_race_info") or {}
