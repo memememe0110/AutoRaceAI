@@ -4519,6 +4519,88 @@ def _v253_reconstruction_status(db_path: str) -> dict:
 
 
 
+def _v320_prediction_accuracy_diagnostics(db_path: str) -> dict:
+    """Ver320: 保存済み予測精度を車立て・開催場別に診断する。予測/推薦ロジックは変更しない。"""
+    out = {
+        "by_starter": pd.DataFrame(),
+        "eight_by_venue": pd.DataFrame(),
+        "reason": "",
+    }
+    if not db_path or not Path(db_path).exists():
+        out["reason"] = "DBが見つかりません。"
+        return out
+    try:
+        with sqlite3.connect(str(db_path)) as con:
+            df = pd.read_sql_query("""
+                SELECT pf.race_key,
+                       pf.mean_rank_error,
+                       pf.winner_hit,
+                       pf.top3_hit_count,
+                       rr.venue,
+                       rr.race_date,
+                       COUNT(DISTINCT CASE
+                           WHEN re.car_no IS NOT NULL
+                            AND re.finish IS NOT NULL
+                            AND CAST(re.finish AS INTEGER) BETWEEN 1 AND 8
+                           THEN re.car_no END) AS starter_count
+                FROM prediction_feedback pf
+                JOIN result_races rr ON rr.race_key = pf.race_key
+                LEFT JOIN result_entries re ON re.race_key = pf.race_key
+                WHERE COALESCE(rr.learning_eligible,1)=1
+                  AND pf.mean_rank_error IS NOT NULL
+                  AND pf.winner_hit IS NOT NULL
+                GROUP BY pf.race_key, pf.mean_rank_error, pf.winner_hit,
+                         pf.top3_hit_count, rr.venue, rr.race_date
+            """, con)
+        if df.empty:
+            out["reason"] = "比較可能な予測精度データがありません。"
+            return out
+
+        df["starter_count"] = pd.to_numeric(df["starter_count"], errors="coerce")
+        df["mean_rank_error"] = pd.to_numeric(df["mean_rank_error"], errors="coerce")
+        df["winner_hit"] = pd.to_numeric(df["winner_hit"], errors="coerce")
+        df["top3_hit_count"] = pd.to_numeric(df["top3_hit_count"], errors="coerce")
+        df = df.dropna(subset=["starter_count", "mean_rank_error", "winner_hit"])
+        df["starter_count"] = df["starter_count"].astype(int)
+        df = df[df["starter_count"].between(5, 8)]
+        if df.empty:
+            out["reason"] = "5～8車の比較可能データがありません。"
+            return out
+
+        rows=[]
+        for n,g in df.groupby("starter_count"):
+            rows.append({
+                "車立て": f"{int(n)}車",
+                "件数": int(len(g)),
+                "平均順位誤差": float(g["mean_rank_error"].mean()),
+                "1着的中率": float(g["winner_hit"].mean()*100),
+                "TOP3平均": float(g["top3_hit_count"].mean()),
+            })
+        out["by_starter"] = pd.DataFrame(rows).sort_values("車立て")
+
+        e8=df[df["starter_count"]==8].copy()
+        if not e8.empty:
+            venue_rows=[]
+            for venue,g in e8.groupby("venue", dropna=False):
+                if len(g)<15:
+                    continue
+                venue_rows.append({
+                    "開催場": str(venue or "不明"),
+                    "件数": int(len(g)),
+                    "平均順位誤差": float(g["mean_rank_error"].mean()),
+                    "1着的中率": float(g["winner_hit"].mean()*100),
+                    "TOP3平均": float(g["top3_hit_count"].mean()),
+                })
+            if venue_rows:
+                out["eight_by_venue"] = pd.DataFrame(venue_rows).sort_values(
+                    ["件数","平均順位誤差"], ascending=[False,False]
+                )
+        return out
+    except Exception as exc:
+        out["reason"] = f"診断失敗: {type(exc).__name__}: {exc}"
+        return out
+
+
 def _v272_common_race_precision_compare(db_path: str, versions: list[str]) -> tuple[pd.DataFrame, list[tuple]]:
     """
     選択した全Verに周回スナップショットがある共通レースだけで精度比較する。
@@ -9604,6 +9686,12 @@ def _v319_apply_odds_and_plan(db_path: str, ymd: str, venue: str, race_no: int, 
                     include_in_live_stats=True,
                 ) or "")
                 if plan_hash:
+                    try:
+                        _v321_save_plan_diagnostics(
+                            db_path, str(race_key), plan_hash, result, str(APP_VERSION),
+                        )
+                    except Exception:
+                        pass
                     _v305_supersede_plan_after_odds_refresh(db_path, str(race_key), APP_VERSION, plan_hash)
                     try:
                         _v212_recalculate_plan_feedback(db_path, str(race_key), plan_hash)
@@ -16566,6 +16654,444 @@ def _v310_save_diagnostic(db_path: str, race_key: str, view: dict, source_versio
         con.commit()
 
 
+
+def _v321_ensure_plan_diagnostics_table(db_path: str) -> None:
+    """Ver320の最終プラン生成を変更せず、脱落要因の監査情報だけ保存する。"""
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v321_plan_diagnostics (
+                race_key TEXT NOT NULL,
+                plan_hash TEXT NOT NULL,
+                app_version TEXT,
+                hard_race_info_json TEXT,
+                low_odds_floor_json TEXT,
+                gami_prune_json TEXT,
+                solo_gami_exclusion_json TEXT,
+                v259_overlap_prune_json TEXT,
+                v260_refill_json TEXT,
+                replacement_json TEXT,
+                protected_add_json TEXT,
+                tri_seed_points INTEGER,
+                tri_seed_cover REAL,
+                tri_seed_black REAL,
+                pool_summary_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (race_key, plan_hash)
+            )
+        """)
+        con.commit()
+
+
+def _v321_save_plan_diagnostics(
+    db_path: str,
+    race_key: str,
+    plan_hash: str,
+    result: dict,
+    app_version: str,
+) -> None:
+    """v184のresultから監査noteだけを保存する。予測・プラン生成結果は変更しない。"""
+    if not race_key or not plan_hash or not isinstance(result, dict):
+        return
+    _v321_ensure_plan_diagnostics_table(db_path)
+    now = _v228_now_jst_iso()
+
+    def _j(key):
+        try:
+            return json.dumps(result.get(key) or {}, ensure_ascii=False, default=str)
+        except Exception:
+            return "{}"
+
+    def _jl(key):
+        try:
+            return json.dumps(list(result.get(key) or []), ensure_ascii=False, default=str)
+        except Exception:
+            return "[]"
+
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("""
+            INSERT INTO v321_plan_diagnostics
+            (race_key, plan_hash, app_version, hard_race_info_json,
+             low_odds_floor_json, gami_prune_json, solo_gami_exclusion_json,
+             v259_overlap_prune_json, v260_refill_json, replacement_json,
+             protected_add_json, tri_seed_points, tri_seed_cover, tri_seed_black,
+             pool_summary_json, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(race_key, plan_hash) DO UPDATE SET
+                app_version=excluded.app_version,
+                hard_race_info_json=excluded.hard_race_info_json,
+                low_odds_floor_json=excluded.low_odds_floor_json,
+                gami_prune_json=excluded.gami_prune_json,
+                solo_gami_exclusion_json=excluded.solo_gami_exclusion_json,
+                v259_overlap_prune_json=excluded.v259_overlap_prune_json,
+                v260_refill_json=excluded.v260_refill_json,
+                replacement_json=excluded.replacement_json,
+                protected_add_json=excluded.protected_add_json,
+                tri_seed_points=excluded.tri_seed_points,
+                tri_seed_cover=excluded.tri_seed_cover,
+                tri_seed_black=excluded.tri_seed_black,
+                pool_summary_json=excluded.pool_summary_json,
+                created_at=excluded.created_at
+        """, (
+            str(race_key), str(plan_hash), str(app_version),
+            _j("hard_race_info"),
+            _jl("low_odds_floor_notes"),
+            _jl("gami_prune_notes"),
+            _jl("solo_gami_exclusion_notes"),
+            _jl("v259_overlap_prune_notes"),
+            _jl("v260_refill_notes"),
+            _jl("replacement_notes"),
+            _jl("protected_add_notes"),
+            int(result.get("tri_seed_points", 0) or 0),
+            float(result.get("tri_seed_cover", 0.0) or 0.0),
+            float(result.get("tri_seed_black", 0.0) or 0.0),
+            _j("pool_summary"),
+            now,
+        ))
+        con.commit()
+
+
+# ============================================================
+# Ver320 Phase 2: 最終プラン脱落トレース（replay専用・予測ロジック不変）
+# ============================================================
+def _v321_ensure_trace_results_table(db_path: str) -> None:
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS v321_trace_results (
+                race_key TEXT NOT NULL,
+                car_no INTEGER NOT NULL,
+                top3_rank INTEGER NOT NULL,
+                in_predicted_pool INTEGER NOT NULL DEFAULT 1,
+                in_final_plan INTEGER NOT NULL DEFAULT 0,
+                in_final_ticket_count INTEGER NOT NULL DEFAULT 0,
+                drop_stage TEXT,
+                drop_notes_json TEXT,
+                final_plan_points INTEGER,
+                final_plan_cost_yen INTEGER,
+                tri_seed_points INTEGER,
+                tri_seed_cover REAL,
+                tri_seed_black REAL,
+                plan_available INTEGER NOT NULL DEFAULT 0,
+                plan_reason TEXT,
+                source_prediction_version TEXT,
+                traced_at TEXT NOT NULL,
+                PRIMARY KEY (race_key, car_no)
+            )
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_v321_trace_in_final
+            ON v321_trace_results(in_final_plan, drop_stage)
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_v321_trace_stage
+            ON v321_trace_results(drop_stage)
+        """)
+        con.commit()
+
+
+def _v321_car_in_combo(car_no: int, combo_text: str) -> bool:
+    try:
+        nums = [int(x) for x in re.findall(r"\d+", str(combo_text or ""))]
+        return int(car_no) in nums
+    except Exception:
+        return False
+
+
+_V321_NOTE_ORDER = [
+    "solo_gami",
+    "v259_overlap",
+    "gami_prune",
+    "low_odds_floor",
+    "replacement",
+    "hard_race_compact",
+    "v260_refill",
+    "protected_add",
+]
+
+
+def _v321_actual_top3_cars(db_path: str, race_key: str) -> list[int]:
+    """結果DBから実際のTOP3車番を取得する。事故・欠車等は除外。"""
+    excluded = (
+        '欠車','出走取消','発走除外','競走除外',
+        '落車','競走中止','失格','反則','反妨','周誤','周回誤認',
+    )
+    placeholders = ",".join("?" * len(excluded))
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            rows = con.execute(f"""
+                SELECT car_no, finish
+                FROM result_entries
+                WHERE race_key=?
+                  AND finish IS NOT NULL
+                  AND TRIM(CAST(finish AS TEXT)) <> ''
+                  AND COALESCE(result_status,'通常') NOT IN ({placeholders})
+                ORDER BY CAST(finish AS INTEGER), CAST(car_no AS INTEGER)
+                LIMIT 3
+            """, (str(race_key), *excluded)).fetchall()
+        out=[]
+        for car, _finish in rows:
+            try:
+                out.append(int(car))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return []
+
+
+def _v321_detect_drop_stage(car_no: int, result: dict) -> tuple[str, list[dict]]:
+    """最終プランに車番が残っていない場合、保存されたnoteから脱落要因を推定する。
+    noteが残っていない場合は候補母集団段階/原因不明として分類する。
+    """
+    if not isinstance(result, dict) or not result.get("available"):
+        return "plan_unavailable", []
+    tickets = result.get("tickets") or []
+    n_in_final = sum(1 for t in tickets if _v321_car_in_combo(car_no, t.get("combo", "")))
+    if n_in_final > 0:
+        return "kept", []
+
+    hits: list[dict] = []
+    note_map = [
+        ("solo_gami_exclusion_notes", "solo_gami"),
+        ("v259_overlap_prune_notes", "v259_overlap"),
+        ("gami_prune_notes", "gami_prune"),
+        ("low_odds_floor_notes", "low_odds_floor"),
+        ("replacement_notes", "replacement"),
+        ("protected_add_notes", "protected_add"),
+        ("v260_refill_notes", "v260_refill"),
+    ]
+    # noteは自由形式なので車番の「単語境界」で照合する。
+    car_re = re.compile(rf"(?<!\d){int(car_no)}(?!\d)")
+    for key, label in note_map:
+        for note in (result.get(key) or []):
+            note_s = str(note)
+            if car_re.search(note_s):
+                hits.append({"note_key": label, "text": note_s[:500]})
+
+    hard = result.get("hard_race_info") or {}
+    if isinstance(hard, dict) and hard.get("applied"):
+        # hard_raceのtop_pairに車番が含まれる場合のみ関連候補として記録。
+        pair = hard.get("top_pair") or ()
+        try:
+            pair_nums = {int(x) for x in pair}
+            if int(car_no) in pair_nums:
+                hits.append({
+                    "note_key": "hard_race_compact",
+                    "text": f"compact plan applied, top_pair={tuple(pair)}",
+                })
+        except Exception:
+            pass
+
+    if hits:
+        hits.sort(key=lambda h: _V321_NOTE_ORDER.index(h["note_key"])
+                  if h["note_key"] in _V321_NOTE_ORDER else 99)
+        return hits[0]["note_key"], hits
+
+    # noteに車番が出ていない場合。ここでは「候補母集団で消えた」と断定せず、
+    # replayだけでは特定できないことを明示する。
+    return "unattributed_drop", hits
+
+
+def _v321_trace_top3_loss(
+    db_path: str,
+    car_filter: list[int] | None = None,
+    race_limit: int | None = None,
+    on_progress=None,
+) -> dict:
+    """保存済みprediction_view + 最古オッズからVer320最終プランをreplayする。
+
+    実際の結果TOP3を対象に、最終プラン内にその車番を含む券が残っていたか、
+    また残っていない場合はresult内の監査noteから脱落段階を記録する。
+    予測/推薦ロジック・正本DBの既存データは変更しない。
+    """
+    _v321_ensure_trace_results_table(db_path)
+    out = {
+        "ok": True, "races_total": 0, "races_done": 0, "rows_saved": 0,
+        "skipped_no_view": 0, "skipped_no_odds": 0, "skipped_not_8car": 0,
+        "plan_unavailable": 0, "errors": [], "by_stage": {}, "by_car_stage": {},
+    }
+    try:
+        with sqlite3.connect(str(db_path), timeout=60.0) as con:
+            rows = con.execute("""
+                SELECT DISTINCT h.race_key
+                FROM v231_prediction_history h
+                JOIN result_races rr ON rr.race_key = h.race_key
+                JOIN v221_odds_runs orun ON orun.race_key = h.race_key
+                WHERE h.race_key IS NOT NULL AND TRIM(h.race_key) <> ''
+                  AND COALESCE(h.app_version,'') = 'Ver320'
+                ORDER BY h.race_key
+            """).fetchall()
+    except Exception as exc:
+        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    race_keys = [str(r[0]) for r in rows]
+    if race_limit:
+        race_keys = race_keys[: int(race_limit)]
+    out["races_total"] = len(race_keys)
+    now = _v228_now_jst_iso()
+    car_filter_set = {int(x) for x in car_filter} if car_filter else None
+
+    for idx, rk in enumerate(race_keys, start=1):
+        if callable(on_progress):
+            try:
+                on_progress(idx, len(race_keys), rk)
+            except Exception:
+                pass
+        try:
+            # 7番車firstでも、TOP3判定は必ず実結果から行う。
+            actual_top3 = _v321_actual_top3_cars(db_path, rk)
+            if len(actual_top3) < 3:
+                continue
+            if car_filter_set is not None:
+                actual_top3 = [c for c in actual_top3 if c in car_filter_set]
+                if not actual_top3:
+                    continue
+
+            view = _v319_load_latest_prediction_view(db_path, rk)
+            if not view:
+                out["skipped_no_view"] += 1
+                continue
+            odds_maps, _odds_run = _v273_load_earliest_saved_odds(db_path, rk)
+            if sum(len(v) for v in odds_maps.values()) <= 0:
+                out["skipped_no_odds"] += 1
+                continue
+
+            bets = view.get("bets") or {}
+            meta = view.get("meta") or {}
+            trials = int(view.get("trials") or 20000)
+            try:
+                starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH)
+            except Exception:
+                starter_count = 0
+            if starter_count and int(starter_count) != 8:
+                out["skipped_not_8car"] += 1
+                continue
+
+            try:
+                result = v184_eight_car_mixed_plan(bets, trials, meta, odds_maps)
+                result = v277_provisional_merge_7types(result, bets, trials, odds_maps)
+            except Exception as exc:
+                out["errors"].append(f"{rk}: replay {type(exc).__name__}: {exc}")
+                continue
+
+            plan_available = bool(result.get("available"))
+            if not plan_available:
+                out["plan_unavailable"] += 1
+            tickets = result.get("tickets") or []
+            plan_points = int(result.get("points", 0) or 0) if plan_available else 0
+            plan_cost = int(result.get("cost", result.get("cost_yen", 0)) or 0) if plan_available else 0
+            tri_seed = int(result.get("tri_seed_points", 0) or 0)
+            tri_cov = float(result.get("tri_seed_cover", 0.0) or 0.0)
+            tri_blk = float(result.get("tri_seed_black", 0.0) or 0.0)
+            plan_reason = str(result.get("reason", "") or "")
+            src_ver = str(view.get("app_version") or "Ver320")
+
+            with sqlite3.connect(str(db_path), timeout=30.0) as con:
+                for rank_idx, car in enumerate(actual_top3, start=1):
+                    n_in_final = sum(1 for t in tickets if _v321_car_in_combo(int(car), t.get("combo", "")))
+                    stage, notes = _v321_detect_drop_stage(int(car), result)
+                    # 完全保持/脱落を最終券の存在で決定する。
+                    if n_in_final > 0:
+                        stage = "kept"
+                    con.execute("""
+                        INSERT INTO v321_trace_results
+                        (race_key,car_no,top3_rank,in_predicted_pool,in_final_plan,
+                         in_final_ticket_count,drop_stage,drop_notes_json,
+                         final_plan_points,final_plan_cost_yen,
+                         tri_seed_points,tri_seed_cover,tri_seed_black,
+                         plan_available,plan_reason,source_prediction_version,traced_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(race_key,car_no) DO UPDATE SET
+                            top3_rank=excluded.top3_rank,
+                            in_predicted_pool=excluded.in_predicted_pool,
+                            in_final_plan=excluded.in_final_plan,
+                            in_final_ticket_count=excluded.in_final_ticket_count,
+                            drop_stage=excluded.drop_stage,
+                            drop_notes_json=excluded.drop_notes_json,
+                            final_plan_points=excluded.final_plan_points,
+                            final_plan_cost_yen=excluded.final_plan_cost_yen,
+                            tri_seed_points=excluded.tri_seed_points,
+                            tri_seed_cover=excluded.tri_seed_cover,
+                            tri_seed_black=excluded.tri_seed_black,
+                            plan_available=excluded.plan_available,
+                            plan_reason=excluded.plan_reason,
+                            source_prediction_version=excluded.source_prediction_version,
+                            traced_at=excluded.traced_at
+                    """, (
+                        rk, int(car), int(rank_idx), 1,
+                        1 if n_in_final > 0 else 0, int(n_in_final),
+                        stage, json.dumps(notes, ensure_ascii=False, default=str),
+                        int(plan_points), int(plan_cost), int(tri_seed), float(tri_cov), float(tri_blk),
+                        1 if plan_available else 0, plan_reason, src_ver, now,
+                    ))
+                    out["rows_saved"] += 1
+                    out["by_stage"][stage] = out["by_stage"].get(stage, 0) + 1
+                    kp = f"{int(car)}|{stage}"
+                    out["by_car_stage"][kp] = out["by_car_stage"].get(kp, 0) + 1
+                con.commit()
+            out["races_done"] += 1
+        except Exception as exc:
+            out["errors"].append(f"{rk}: {type(exc).__name__}: {exc}")
+    return out
+
+
+def _v321_trace_summary(db_path: str) -> dict:
+    """v321_trace_resultsから重複なしの保持/脱落集計を返す。"""
+    _v321_ensure_trace_results_table(db_path)
+    out = {
+        "total_rows": 0, "races": 0, "kept_rows": 0, "dropped_rows": 0,
+        "dropped_stage": {}, "dropped_by_car": {}, "by_top3_rank": {},
+        "car7": {"total": 0, "kept": 0, "dropped": 0, "in_final_ticket_sum": 0, "stage": {}},
+    }
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            r = con.execute("""
+                SELECT COUNT(*), COUNT(DISTINCT race_key), SUM(in_final_plan)
+                FROM v321_trace_results
+            """).fetchone()
+            out["total_rows"] = int(r[0] or 0)
+            out["races"] = int(r[1] or 0)
+            out["kept_rows"] = int(r[2] or 0)
+            out["dropped_rows"] = max(0, out["total_rows"] - out["kept_rows"])
+            for row in con.execute("""
+                SELECT drop_stage, COUNT(*) n FROM v321_trace_results
+                WHERE in_final_plan=0 GROUP BY drop_stage ORDER BY n DESC
+            """).fetchall():
+                out["dropped_stage"][str(row[0])] = int(row[1])
+            for row in con.execute("""
+                SELECT car_no, COUNT(*) n FROM v321_trace_results
+                WHERE in_final_plan=0 GROUP BY car_no ORDER BY n DESC
+            """).fetchall():
+                out["dropped_by_car"][int(row[0])] = int(row[1])
+            for row in con.execute("""
+                SELECT top3_rank, COUNT(*) n,
+                       SUM(CASE WHEN in_final_plan=0 THEN 1 ELSE 0 END) dropped
+                FROM v321_trace_results GROUP BY top3_rank ORDER BY top3_rank
+            """).fetchall():
+                out["by_top3_rank"][int(row[0])] = {
+                    "total": int(row[1]), "dropped": int(row[2] or 0)
+                }
+            row = con.execute("""
+                SELECT COUNT(*), SUM(in_final_plan), SUM(in_final_ticket_count)
+                FROM v321_trace_results WHERE car_no=7
+            """).fetchone()
+            out["car7"] = {
+                "total": int(row[0] or 0),
+                "kept": int(row[1] or 0),
+                "dropped": max(0, int(row[0] or 0) - int(row[1] or 0)),
+                "in_final_ticket_sum": int(row[2] or 0), "stage": {},
+            }
+            for row in con.execute("""
+                SELECT drop_stage, COUNT(*) n FROM v321_trace_results
+                WHERE car_no=7 AND in_final_plan=0
+                GROUP BY drop_stage ORDER BY n DESC
+            """).fetchall():
+                out["car7"]["stage"][str(row[0])] = int(row[1])
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 def _v187_save_mixed_plan(
     db_path: str, race_key: str, result: dict, app_version: str | None = None,
     plan_origin: str = "live", source_prediction_version: str | None = None,
@@ -20447,6 +20973,16 @@ def show_v184_eight_car_mixed_plan(
                 source_prediction_version=source_prediction_version,
                 include_in_live_stats=include_in_live_stats,
             )
+            # Ver321診断: 既存の買い目・推奨・保存ロジックは変更せず、
+            # 最終候補からの脱落理由を後から追跡できる監査情報だけ保存する。
+            if saved_hash:
+                try:
+                    _v321_save_plan_diagnostics(
+                        engine.DB_PATH, str(race_key), str(saved_hash), result,
+                        str(app_version or APP_VERSION),
+                    )
+                except Exception as _diag_exc321:
+                    st.caption(f"診断情報の保存をスキップしました: {type(_diag_exc321).__name__}")
             if saved_hash and _rec_audit300:
                 _save_audit301=dict(_rec_audit300)
                 if _live_rec301:
@@ -28429,6 +28965,175 @@ if selected_main_page == "🗃️ 登録情報確認":
                                     st.warning("比較は完了しましたが、レポートのDB保存に失敗しました。")
                         except Exception as exc:
                             st.warning(f"精度比較の表示に失敗しました: {type(exc).__name__}: {exc}")
+
+                    # Ver320: 車立て別・8車開催場別の予測精度診断。予測/推薦ロジックは変更しない。
+                    with st.expander("🔬 車立て別・8車精度診断", expanded=False):
+                        try:
+                            _v320_diag = _v320_prediction_accuracy_diagnostics(engine.DB_PATH)
+                            _starter_diag = _v320_diag.get("by_starter", pd.DataFrame())
+                            if _starter_diag.empty:
+                                st.info(str(_v320_diag.get("reason") or "比較可能なデータがありません。"))
+                            else:
+                                _sd = _starter_diag.copy()
+                                _sd["平均順位誤差"] = _sd["平均順位誤差"].map(lambda x: f"{float(x):.3f}")
+                                _sd["1着的中率"] = _sd["1着的中率"].map(lambda x: f"{float(x):.1f}%")
+                                _sd["TOP3平均"] = _sd["TOP3平均"].map(lambda x: f"{float(x):.3f}")
+                                st.dataframe(_sd, use_container_width=True, hide_index=True)
+                                st.caption(
+                                    "車立て別の差を確認する診断専用表示です。現在の予測補正や推薦条件には自動反映しません。"
+                                )
+                                _e8 = _v320_diag.get("eight_by_venue", pd.DataFrame())
+                                if not _e8.empty:
+                                    st.markdown("##### 8車で件数のある開催場")
+                                    _e8s = _e8.copy()
+                                    _e8s["平均順位誤差"] = _e8s["平均順位誤差"].map(lambda x: f"{float(x):.3f}")
+                                    _e8s["1着的中率"] = _e8s["1着的中率"].map(lambda x: f"{float(x):.1f}%")
+                                    _e8s["TOP3平均"] = _e8s["TOP3平均"].map(lambda x: f"{float(x):.3f}")
+                                    st.dataframe(_e8s, use_container_width=True, hide_index=True)
+                                    st.caption("8車は開催場ごとの件数差が大きいため、15R未満の場は参考表から除外しています。")
+                        except Exception as exc:
+                            st.warning(f"車立て別精度診断に失敗しました: {type(exc).__name__}: {exc}")
+
+
+
+                    # Ver320 Phase 2: 最終プラン脱落トレース。7番車を初期対象にする診断専用UI。
+                    with st.expander("🔎 Ver320 最終プラン脱落トレース（7番車 first）", expanded=False):
+                        st.caption(
+                            "保存済みVer320予測と最古保存オッズから最終プランをreplayし、"
+                            "実際の結果TOP3車が最終プランに残っているかと、保存note上の脱落要因を診断します。"
+                            "予測・推薦ロジックや既存正本データは変更しません。"
+                        )
+                        _v321_ensure_trace_results_table(engine.DB_PATH)
+                        _tc1, _tc2 = st.columns(2)
+                        _v321_only_car7 = _tc1.checkbox(
+                            "7番車が実TOP3に入ったレースだけ", value=True,
+                            key="v321_only_car7_trace",
+                        )
+                        _v321_limit = _tc2.number_input(
+                            "対象レース上限", min_value=10, max_value=2000, value=150, step=10,
+                            key="v321_trace_limit",
+                        )
+                        _rc1, _rc2 = st.columns(2)
+                        if _rc1.button(
+                            "▶ replay実行", type="primary", use_container_width=True,
+                            key="v321_trace_run",
+                        ):
+                            _progress_slot = st.empty()
+                            def _v321_prog(i, n, rk):
+                                try:
+                                    _progress_slot.info(f"replay中 {i}/{n}：{rk}")
+                                except Exception:
+                                    pass
+                            with st.spinner("保存済み予測・最古オッズからVer320プランをreplay中..."):
+                                _trace = _v321_trace_top3_loss(
+                                    engine.DB_PATH,
+                                    car_filter=[7] if _v321_only_car7 else None,
+                                    race_limit=int(_v321_limit),
+                                    on_progress=_v321_prog,
+                                )
+                            _progress_slot.empty()
+                            st.session_state["v321_last_trace"] = _trace
+                        if _rc2.button(
+                            "📊 集計を表示/更新", use_container_width=True,
+                            key="v321_trace_summary",
+                        ):
+                            st.session_state["v321_trace_summary_loaded"] = True
+
+                        _trace = st.session_state.get("v321_last_trace")
+                        if isinstance(_trace, dict):
+                            if _trace.get("ok"):
+                                st.success(
+                                    f"対象 {_trace.get('races_total',0)}R / replay {_trace.get('races_done',0)}R / "
+                                    f"保存 {_trace.get('rows_saved',0)}行 / プラン生成不可 {_trace.get('plan_unavailable',0)}R"
+                                )
+                                st.caption(
+                                    f"8車以外 {_trace.get('skipped_not_8car',0)}R / viewなし {_trace.get('skipped_no_view',0)}R / "
+                                    f"オッズなし {_trace.get('skipped_no_odds',0)}R / エラー {len(_trace.get('errors') or [])}件"
+                                )
+                            else:
+                                st.error(str(_trace.get("reason") or "replayに失敗しました。"))
+                            if _trace.get("errors"):
+                                with st.expander("replayエラー詳細", expanded=False):
+                                    st.code("\n".join(_trace["errors"][:30]))
+
+                        if st.session_state.get("v321_trace_summary_loaded"):
+                            _sum = _v321_trace_summary(engine.DB_PATH)
+                            _s1, _s2, _s3, _s4 = st.columns(4)
+                            _s1.metric("対象レース", f"{_sum.get('races',0)}R")
+                            _s2.metric("TOP3車行数", f"{_sum.get('total_rows',0)}")
+                            _s3.metric("最終プラン保持", f"{_sum.get('kept_rows',0)}")
+                            _s4.metric("脱落", f"{_sum.get('dropped_rows',0)}")
+
+                            _c7 = _sum.get("car7") or {}
+                            st.markdown("### 🚗 7番車 A/B判定")
+                            _a1, _a2, _a3, _a4 = st.columns(4)
+                            _a1.metric("7番車TOP3登場", f"{_c7.get('total',0)}")
+                            _a2.metric("最終プラン保持", f"{_c7.get('kept',0)}")
+                            _a3.metric("完全脱落", f"{_c7.get('dropped',0)}")
+                            _a4.metric("含まれる券数合計", f"{_c7.get('in_final_ticket_sum',0)}枚")
+                            if _c7.get("total"):
+                                if _c7.get("kept", 0) == 0:
+                                    st.error("A: 7番車を含む最終券が1枚もない完全脱落")
+                                elif _c7.get("kept", 0) < _c7.get("total", 0):
+                                    st.warning("A/B混在: 一部は最終プランに残り、一部は完全脱落")
+                                else:
+                                    st.success("B: 7番車を含む券は最終プランに残っている")
+                            if _c7.get("stage"):
+                                st.dataframe(
+                                    pd.DataFrame([
+                                        {"脱落ステージ": k, "件数": v}
+                                        for k, v in _c7["stage"].items()
+                                    ]).sort_values("件数", ascending=False),
+                                    use_container_width=True, hide_index=True,
+                                )
+
+                            st.markdown("### 📉 全体の脱落ステージ集計")
+                            if _sum.get("dropped_stage"):
+                                _ds = pd.DataFrame([
+                                    {"脱落ステージ": k, "件数": v}
+                                    for k, v in _sum["dropped_stage"].items()
+                                ])
+                                _ds["割合%"] = (
+                                    _ds["件数"] / max(1, _ds["件数"].sum()) * 100
+                                ).round(1)
+                                st.dataframe(_ds, use_container_width=True, hide_index=True)
+
+                            st.markdown("### 🚙 車番別 完全脱落回数")
+                            if _sum.get("dropped_by_car"):
+                                _bc = pd.DataFrame([
+                                    {"車番": k, "完全脱落回数": v}
+                                    for k, v in sorted(_sum["dropped_by_car"].items())
+                                ])
+                                st.dataframe(_bc, use_container_width=True, hide_index=True)
+
+                            st.markdown("### 🥇 実TOP3順位別 脱落率")
+                            _tr = _sum.get("by_top3_rank") or {}
+                            if _tr:
+                                _trd = pd.DataFrame([
+                                    {
+                                        "実TOP3順位": k,
+                                        "対象": v["total"],
+                                        "脱落": v["dropped"],
+                                        "脱落率%": round(v["dropped"] / max(1, v["total"]) * 100, 1),
+                                    }
+                                    for k, v in _tr.items()
+                                ])
+                                st.dataframe(_trd, use_container_width=True, hide_index=True)
+
+                            try:
+                                with sqlite3.connect(str(engine.DB_PATH)) as _c:
+                                    _raw = pd.read_sql_query(
+                                        "SELECT * FROM v321_trace_results ORDER BY race_key, car_no", _c,
+                                    )
+                                st.download_button(
+                                    "trace_results 生データCSV",
+                                    _raw.to_csv(index=False).encode("utf-8-sig"),
+                                    file_name="v321_trace_results.csv",
+                                    mime="text/csv", use_container_width=True,
+                                    key="v321_trace_raw_csv",
+                                )
+                            except Exception:
+                                pass
 
                     st.caption("結果の周回順位はあるのに選手名へ結び付いていないデータを、レース・車番単位で診断して修復します。候補が一意のものだけ自動修復し、曖昧なものは手動で選びます。")
                     try:
