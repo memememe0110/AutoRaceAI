@@ -16779,6 +16779,7 @@ def _v321_ensure_trace_results_table(db_path: str) -> None:
                 tri_seed_json TEXT,
                 drop_notes_full_json TEXT,
                 in_pool_by_type_json TEXT,
+                tri_core_top_json TEXT,
                 PRIMARY KEY (race_key, car_no)
             )
         """)
@@ -16791,6 +16792,7 @@ def _v321_ensure_trace_results_table(db_path: str) -> None:
             ("tri_seed_json", "TEXT"),
             ("drop_notes_full_json", "TEXT"),
             ("in_pool_by_type_json", "TEXT"),
+            ("tri_core_top_json", "TEXT"),
         ):
             if col not in cols:
                 try:
@@ -16911,6 +16913,83 @@ def _v321_in_pool_by_type(
                 break
         out[label] = bool(found)
     return out
+
+
+def _v321_tri_core_top(
+    car_no: int,
+    bets: dict,
+    odds_maps: dict,
+    trials: int = 20000,
+    top_n: int = 20,
+    scan_n: int = 80,
+) -> dict:
+    """三連単候補の順位可視化（診断専用・本番不変）。
+
+    - top: オッズ>0 の上位 top_n 点
+    - car_best: 当該車を含む最良順位（scan_n まで探索）
+    - core_limit: 8車相当の core=14 境界を超えているか
+    """
+    n = int(car_no)
+    counter = (bets or {}).get("三連単") or {}
+    odds_map = (odds_maps or {}).get("3tan") or {}
+    ordered = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+    top_rows = []
+    car_best = None
+    rank = 0
+    for combo, count in ordered:
+        try:
+            if isinstance(combo, (tuple, list)):
+                nums = [int(v) for v in combo]
+                key = "-".join(str(x) for x in nums)
+                has_car = n in nums
+            else:
+                key = str(combo)
+                has_car = _v321_car_in_combo(n, key)
+                nums = [int(x) for x in re.findall(r"[1-8]", key)]
+        except Exception:
+            continue
+        try:
+            odds = float(odds_map.get(key, 0) or 0)
+        except Exception:
+            odds = 0.0
+        if odds <= 0:
+            continue
+        rank += 1
+        try:
+            prob = float(count) / max(int(trials or 1), 1) * 100.0
+        except Exception:
+            prob = 0.0
+        try:
+            raw_ev = (prob / 100.0) * odds
+        except Exception:
+            raw_ev = 0.0
+        # hole 条件の可否も記録（v184 現行値）
+        hole_ok = (0.80 <= prob <= 6.00) and (odds >= 30.0) and (0.72 <= raw_ev <= 2.20)
+        entry = {
+            "rank": rank,
+            "combo": key,
+            "prob": round(prob, 4),
+            "odds": round(odds, 2),
+            "raw_ev": round(raw_ev, 4),
+            "has_car": bool(has_car),
+            "hole_ok": bool(hole_ok),
+            "in_core14": rank <= 14,
+        }
+        if rank <= int(top_n):
+            top_rows.append(entry)
+        if has_car and car_best is None:
+            car_best = entry
+        if rank >= int(scan_n) and car_best is not None:
+            break
+        if rank >= int(scan_n):
+            break
+    return {
+        "top": top_rows,
+        "car_best": car_best,
+        "scanned_with_odds": rank,
+        "core_limit": 14,
+        "hole_rule": {"prob": [0.80, 6.00], "odds_min": 30.0, "ev": [0.72, 2.20]},
+    }
 
 
 def _v321_collect_all_drop_notes(car_no: int, result: dict) -> list:
@@ -17087,7 +17166,21 @@ def _v321_trace_top3_loss(
         "ok": True, "races_total": 0, "races_done": 0, "rows_saved": 0,
         "skipped_no_view": 0, "skipped_no_odds": 0, "skipped_not_8car": 0,
         "plan_unavailable": 0, "errors": [], "by_stage": {}, "by_car_stage": {},
+        "cleaned_stale_rows": 0,
     }
+    # 診断列導入前の stale 行を除去（新列 NULL）。次回 replay で再書込される。
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as _c:
+            _c.execute("PRAGMA busy_timeout=30000")
+            _stale = _c.execute("""
+                DELETE FROM v321_trace_results
+                WHERE in_pool_by_type_json IS NULL
+                   OR TRIM(CAST(in_pool_by_type_json AS TEXT)) = ''
+            """).rowcount
+            _c.commit()
+            out["cleaned_stale_rows"] = int(_stale or 0)
+    except Exception as _e:
+        out["errors"].append(f"stale cleanup: {type(_e).__name__}: {_e}")
     try:
         with sqlite3.connect(str(db_path), timeout=60.0) as con:
             rows = con.execute("""
@@ -17141,7 +17234,8 @@ def _v321_trace_top3_loss(
                 starter_count = engine.v102_starter_count_for_meta(meta, engine.DB_PATH)
             except Exception:
                 starter_count = 0
-            if starter_count and int(starter_count) != 8:
+            # 5〜8車を trace 対象（v184 は車立て別 type_specs を持つ）
+            if starter_count and int(starter_count) not in (5, 6, 7, 8):
                 out["skipped_not_8car"] += 1
                 continue
 
@@ -17192,6 +17286,10 @@ def _v321_trace_top3_loss(
                     notes_full = _v321_collect_all_drop_notes(int(car), result)
                     in_pool_js = json.dumps(in_pool, ensure_ascii=False, default=str)
                     notes_full_js = json.dumps(notes_full, ensure_ascii=False, default=str)
+                    tri_core = _v321_tri_core_top(
+                        int(car), bets, odds_maps, trials=trials, top_n=20, scan_n=80,
+                    )
+                    tri_core_js = json.dumps(tri_core, ensure_ascii=False, default=str)
                     con.execute("""
                         INSERT INTO v321_trace_results
                         (race_key,car_no,top3_rank,in_predicted_pool,in_final_plan,
@@ -17199,8 +17297,9 @@ def _v321_trace_top3_loss(
                          final_plan_points,final_plan_cost_yen,
                          tri_seed_points,tri_seed_cover,tri_seed_black,
                          plan_available,plan_reason,source_prediction_version,traced_at,
-                         pool_summary_json,tri_seed_json,drop_notes_full_json,in_pool_by_type_json)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         pool_summary_json,tri_seed_json,drop_notes_full_json,
+                         in_pool_by_type_json,tri_core_top_json)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(race_key,car_no) DO UPDATE SET
                             top3_rank=excluded.top3_rank,
                             in_predicted_pool=excluded.in_predicted_pool,
@@ -17220,14 +17319,15 @@ def _v321_trace_top3_loss(
                             pool_summary_json=excluded.pool_summary_json,
                             tri_seed_json=excluded.tri_seed_json,
                             drop_notes_full_json=excluded.drop_notes_full_json,
-                            in_pool_by_type_json=excluded.in_pool_by_type_json
+                            in_pool_by_type_json=excluded.in_pool_by_type_json,
+                            tri_core_top_json=excluded.tri_core_top_json
                     """, (
                         rk, int(car), int(rank_idx), 1,
                         1 if n_in_final > 0 else 0, int(n_in_final),
                         stage, json.dumps(notes, ensure_ascii=False, default=str),
                         int(plan_points), int(plan_cost), int(tri_seed), float(tri_cov), float(tri_blk),
                         1 if plan_available else 0, plan_reason, src_ver, now,
-                        pool_summary_js, tri_seed_js, notes_full_js, in_pool_js,
+                        pool_summary_js, tri_seed_js, notes_full_js, in_pool_js, tri_core_js,
                     ))
                     out["rows_saved"] += 1
                     out["by_stage"][stage] = out["by_stage"].get(stage, 0) + 1
@@ -17298,6 +17398,45 @@ def _v321_trace_summary(db_path: str) -> dict:
                 GROUP BY drop_stage ORDER BY n DESC
             """).fetchall():
                 out["car7"]["stage"][str(row[0])] = int(row[1])
+            # car_best 集計（tri_core_top_json）
+            try:
+                _core_out = {"in_core14": 0, "out_core14": 0, "hole_ok": 0, "no_car_best": 0, "samples": []}
+                for row in con.execute("""
+                    SELECT race_key, car_no, drop_stage, tri_core_top_json
+                    FROM v321_trace_results
+                    WHERE in_final_plan=0
+                      AND tri_core_top_json IS NOT NULL
+                      AND TRIM(tri_core_top_json) <> ''
+                """).fetchall():
+                    try:
+                        d = json.loads(row[3] or "{}")
+                    except Exception:
+                        d = {}
+                    cb = d.get("car_best")
+                    if not cb:
+                        _core_out["no_car_best"] += 1
+                        continue
+                    if cb.get("in_core14"):
+                        _core_out["in_core14"] += 1
+                    else:
+                        _core_out["out_core14"] += 1
+                    if cb.get("hole_ok"):
+                        _core_out["hole_ok"] += 1
+                    if len(_core_out["samples"]) < 12:
+                        _core_out["samples"].append({
+                            "race_key": row[0],
+                            "car_no": row[1],
+                            "drop_stage": row[2],
+                            "rank": cb.get("rank"),
+                            "combo": cb.get("combo"),
+                            "prob": cb.get("prob"),
+                            "odds": cb.get("odds"),
+                            "hole_ok": cb.get("hole_ok"),
+                            "in_core14": cb.get("in_core14"),
+                        })
+                out["tri_core"] = _core_out
+            except Exception:
+                pass
             # 候補母集団 vs 最終選抜
             try:
                 for row in con.execute("""
@@ -29421,7 +29560,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                     f"保存 {_trace.get('rows_saved',0)}行 / プラン生成不可 {_trace.get('plan_unavailable',0)}R"
                                 )
                                 st.caption(
-                                    f"8車以外 {_trace.get('skipped_not_8car',0)}R / viewなし {_trace.get('skipped_no_view',0)}R / "
+                                    f"5-8車外 {_trace.get('skipped_not_8car',0)}R / stale掃除 {_trace.get('cleaned_stale_rows',0)}行 / viewなし {_trace.get('skipped_no_view',0)}R / "
                                     f"オッズなし {_trace.get('skipped_no_odds',0)}R / エラー {len(_trace.get('errors') or [])}件"
                                 )
                             else:
@@ -29452,6 +29591,23 @@ if selected_main_page == "🗃️ 登録情報確認":
                                     "final_select_drop=母集団にはいたが最終券から落ちた。"
                                     "replay再実行後に反映されます。"
                                 )
+                            _tc = _sum.get("tri_core") or {}
+                            if _tc:
+                                st.markdown("### 📊 三連単 core 順位（脱落車）")
+                                _t1, _t2, _t3, _t4 = st.columns(4)
+                                _t1.metric("core14内", f"{_tc.get('in_core14', 0)}")
+                                _t2.metric("core14外", f"{_tc.get('out_core14', 0)}")
+                                _t3.metric("hole条件OK", f"{_tc.get('hole_ok', 0)}")
+                                _t4.metric("car_bestなし", f"{_tc.get('no_car_best', 0)}")
+                                st.caption(
+                                    "car_best=当該車を含む三連単の最良順位（オッズ>0）。"
+                                    "core14外かつ hole_ok=false なら hole条件緩和の検討材料。"
+                                )
+                                if _tc.get("samples"):
+                                    st.dataframe(
+                                        pd.DataFrame(_tc["samples"]),
+                                        use_container_width=True, hide_index=True,
+                                    )
                             st.markdown("### 🚗 7番車 A/B判定")
 
                             _a1, _a2, _a3, _a4 = st.columns(4)
