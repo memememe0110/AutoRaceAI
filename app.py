@@ -16775,9 +16775,28 @@ def _v321_ensure_trace_results_table(db_path: str) -> None:
                 plan_reason TEXT,
                 source_prediction_version TEXT,
                 traced_at TEXT NOT NULL,
+                pool_summary_json TEXT,
+                tri_seed_json TEXT,
+                drop_notes_full_json TEXT,
+                in_pool_by_type_json TEXT,
                 PRIMARY KEY (race_key, car_no)
             )
         """)
+        cols = {
+            str(r[1])
+            for r in con.execute('PRAGMA table_info("v321_trace_results")').fetchall()
+        }
+        for col, decl in (
+            ("pool_summary_json", "TEXT"),
+            ("tri_seed_json", "TEXT"),
+            ("drop_notes_full_json", "TEXT"),
+            ("in_pool_by_type_json", "TEXT"),
+        ):
+            if col not in cols:
+                try:
+                    con.execute(f"ALTER TABLE v321_trace_results ADD COLUMN {col} {decl}")
+                except Exception:
+                    pass
         con.execute("""
             CREATE INDEX IF NOT EXISTS idx_v321_trace_in_final
             ON v321_trace_results(in_final_plan, drop_stage)
@@ -16787,6 +16806,133 @@ def _v321_ensure_trace_results_table(db_path: str) -> None:
             ON v321_trace_results(drop_stage)
         """)
         con.commit()
+
+
+def _v321_in_pool_by_type(
+    car_no: int,
+    bets: dict,
+    odds_maps: dict,
+    trials: int = 20000,
+    starter_count: int = 8,
+) -> dict:
+    """候補母集団（v184の pool 構築と同じ上限近似）に車番が含まれるか券種別判定。
+
+    本番ロジックは変更しない。診断用の近似再走査。
+    """
+    n = int(car_no)
+    sc = int(starter_count or 8)
+    if sc == 5:
+        type_specs = {
+            "三連単": {"counter": "三連単", "odds": "3tan", "limit": 28, "target_cover": None},
+            "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "target_cover": 84.0},
+            "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 999, "target_cover": 82.0},
+            "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 999, "target_cover": 80.0},
+        }
+    elif sc == 6:
+        type_specs = {
+            "三連単": {"counter": "三連単", "odds": "3tan", "limit": 24, "target_cover": None},
+            "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "target_cover": 86.0},
+            "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 999, "target_cover": 84.0},
+            "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 999, "target_cover": 82.0},
+        }
+    elif sc == 7:
+        type_specs = {
+            "三連単": {"counter": "三連単", "odds": "3tan", "limit": 18, "target_cover": None},
+            "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "target_cover": 88.0},
+            "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 999, "target_cover": 88.0},
+            "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 999, "target_cover": 86.0},
+        }
+    else:
+        type_specs = {
+            "三連単": {"counter": "三連単", "odds": "3tan", "limit": 14, "target_cover": None},
+            "三連複": {"counter": "三連複", "odds": "3fuku", "limit": 999, "target_cover": 90.0},
+            "2連単": {"counter": "2車単", "odds": "2tansho", "limit": 999, "target_cover": 90.0},
+            "2連複": {"counter": "2車複", "odds": "2fuku", "limit": 999, "target_cover": 88.0},
+        }
+
+    def _combo_has_car(combo) -> bool:
+        try:
+            if isinstance(combo, (tuple, list)):
+                return n in {int(x) for x in combo}
+            s = str(combo or "")
+            return _v321_car_in_combo(n, s)
+        except Exception:
+            return False
+
+    out = {}
+    for label, spec in type_specs.items():
+        counter = (bets or {}).get(spec["counter"]) or {}
+        odds_map = (odds_maps or {}).get(spec["odds"]) or {}
+        unordered = label in ("三連複", "2連複")
+        ordered = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+        found = False
+        core_added = 0
+        hole_added = 0
+        cumulative = 0.0
+        target_cover = spec.get("target_cover")
+        for combo, count in ordered:
+            try:
+                probability = float(count) / max(int(trials or 1), 1) * 100.0
+            except Exception:
+                probability = 0.0
+            if isinstance(combo, (tuple, list)):
+                nums = [str(int(v)) for v in combo]
+                if unordered:
+                    nums = sorted(nums, key=int)
+                key = "-".join(nums)
+            else:
+                key = str(combo)
+            try:
+                odds = float(odds_map.get(key, 0) or 0)
+            except Exception:
+                odds = 0.0
+            if odds <= 0:
+                continue
+            is_hole = (
+                label == "三連単"
+                and core_added >= int(spec["limit"])
+                and hole_added < 6
+                and 0.80 <= probability <= 6.00
+                and odds >= 30.0
+            )
+            if label == "三連単" and core_added >= int(spec["limit"]) and not is_hole:
+                continue
+            if _combo_has_car(combo):
+                found = True
+                break
+            if is_hole:
+                hole_added += 1
+            else:
+                core_added += 1
+                cumulative += probability
+            if target_cover is not None and cumulative >= float(target_cover):
+                break
+            if target_cover is None and core_added >= int(spec["limit"]) and hole_added >= 6:
+                break
+        out[label] = bool(found)
+    return out
+
+
+def _v321_collect_all_drop_notes(car_no: int, result: dict) -> list:
+    """脱落関連note全件（車番言及あり）。"""
+    if not isinstance(result, dict):
+        return []
+    note_keys = (
+        "solo_gami_exclusion_notes",
+        "v259_overlap_prune_notes",
+        "gami_prune_notes",
+        "low_odds_floor_notes",
+        "replacement_notes",
+        "protected_add_notes",
+        "v260_refill_notes",
+    )
+    out = []
+    for key in note_keys:
+        for note in (result.get(key) or []):
+            note_s = str(note)
+            if _v321_note_mentions_car(car_no, note_s):
+                out.append({"note_key": key, "text": note_s[:500]})
+    return out
 
 
 def _v321_car_in_combo(car_no: int, combo_text: str) -> bool:
@@ -17018,6 +17164,15 @@ def _v321_trace_top3_loss(
             plan_reason = str(result.get("reason", "") or "")
             src_ver = str(view.get("app_version") or "Ver320")
 
+            pool_summary = result.get("pool_summary") or {}
+            tri_seed_payload = {
+                "tri_seed_points": tri_seed,
+                "tri_seed_cover": tri_cov,
+                "tri_seed_black": tri_blk,
+            }
+            pool_summary_js = json.dumps(pool_summary, ensure_ascii=False, default=str)
+            tri_seed_js = json.dumps(tri_seed_payload, ensure_ascii=False, default=str)
+
             with sqlite3.connect(str(db_path), timeout=30.0) as con:
                 for rank_idx, car in enumerate(actual_top3, start=1):
                     n_in_final = sum(1 for t in tickets if _v321_car_in_combo(int(car), t.get("combo", "")))
@@ -17025,14 +17180,27 @@ def _v321_trace_top3_loss(
                     # 完全保持/脱落を最終券の存在で決定する。
                     if n_in_final > 0:
                         stage = "kept"
+                    in_pool = _v321_in_pool_by_type(
+                        int(car), bets, odds_maps, trials=trials, starter_count=starter_count or 8,
+                    )
+                    # unattributed を候補母集団 vs 最終選抜で切り分け
+                    if stage == "unattributed_drop":
+                        if not in_pool.get("三連単"):
+                            stage = "pool_exclude"
+                        else:
+                            stage = "final_select_drop"
+                    notes_full = _v321_collect_all_drop_notes(int(car), result)
+                    in_pool_js = json.dumps(in_pool, ensure_ascii=False, default=str)
+                    notes_full_js = json.dumps(notes_full, ensure_ascii=False, default=str)
                     con.execute("""
                         INSERT INTO v321_trace_results
                         (race_key,car_no,top3_rank,in_predicted_pool,in_final_plan,
                          in_final_ticket_count,drop_stage,drop_notes_json,
                          final_plan_points,final_plan_cost_yen,
                          tri_seed_points,tri_seed_cover,tri_seed_black,
-                         plan_available,plan_reason,source_prediction_version,traced_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         plan_available,plan_reason,source_prediction_version,traced_at,
+                         pool_summary_json,tri_seed_json,drop_notes_full_json,in_pool_by_type_json)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(race_key,car_no) DO UPDATE SET
                             top3_rank=excluded.top3_rank,
                             in_predicted_pool=excluded.in_predicted_pool,
@@ -17048,13 +17216,18 @@ def _v321_trace_top3_loss(
                             plan_available=excluded.plan_available,
                             plan_reason=excluded.plan_reason,
                             source_prediction_version=excluded.source_prediction_version,
-                            traced_at=excluded.traced_at
+                            traced_at=excluded.traced_at,
+                            pool_summary_json=excluded.pool_summary_json,
+                            tri_seed_json=excluded.tri_seed_json,
+                            drop_notes_full_json=excluded.drop_notes_full_json,
+                            in_pool_by_type_json=excluded.in_pool_by_type_json
                     """, (
                         rk, int(car), int(rank_idx), 1,
                         1 if n_in_final > 0 else 0, int(n_in_final),
                         stage, json.dumps(notes, ensure_ascii=False, default=str),
                         int(plan_points), int(plan_cost), int(tri_seed), float(tri_cov), float(tri_blk),
                         1 if plan_available else 0, plan_reason, src_ver, now,
+                        pool_summary_js, tri_seed_js, notes_full_js, in_pool_js,
                     ))
                     out["rows_saved"] += 1
                     out["by_stage"][stage] = out["by_stage"].get(stage, 0) + 1
@@ -17074,6 +17247,12 @@ def _v321_trace_summary(db_path: str) -> dict:
         "total_rows": 0, "races": 0, "kept_rows": 0, "dropped_rows": 0,
         "dropped_stage": {}, "dropped_by_car": {}, "by_top3_rank": {},
         "car7": {"total": 0, "kept": 0, "dropped": 0, "in_final_ticket_sum": 0, "stage": {}},
+        "pool_vs_final": {
+            "pool_exclude": 0,
+            "final_select_drop": 0,
+            "in_pool_tri_not_final": 0,
+            "not_in_pool_tri": 0,
+        },
     }
     try:
         with sqlite3.connect(str(db_path), timeout=30.0) as con:
@@ -17119,6 +17298,32 @@ def _v321_trace_summary(db_path: str) -> dict:
                 GROUP BY drop_stage ORDER BY n DESC
             """).fetchall():
                 out["car7"]["stage"][str(row[0])] = int(row[1])
+            # 候補母集団 vs 最終選抜
+            try:
+                for row in con.execute("""
+                    SELECT drop_stage, COUNT(*) n FROM v321_trace_results
+                    WHERE in_final_plan=0 AND drop_stage IN ('pool_exclude','final_select_drop')
+                    GROUP BY drop_stage
+                """).fetchall():
+                    out["pool_vs_final"][str(row[0])] = int(row[1])
+                for row in con.execute("""
+                    SELECT in_pool_by_type_json, in_final_plan
+                    FROM v321_trace_results
+                    WHERE in_pool_by_type_json IS NOT NULL
+                      AND TRIM(in_pool_by_type_json) <> ''
+                """).fetchall():
+                    try:
+                        d = json.loads(row[0] or "{}")
+                    except Exception:
+                        d = {}
+                    in_tri = bool(d.get("三連単"))
+                    in_final = int(row[1] or 0) == 1
+                    if in_tri and not in_final:
+                        out["pool_vs_final"]["in_pool_tri_not_final"] += 1
+                    if not in_tri:
+                        out["pool_vs_final"]["not_in_pool_tri"] += 1
+            except Exception:
+                pass
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
     return out
@@ -29234,7 +29439,21 @@ if selected_main_page == "🗃️ 登録情報確認":
                             _s4.metric("脱落", f"{_sum.get('dropped_rows',0)}")
 
                             _c7 = _sum.get("car7") or {}
+                            _pv = _sum.get("pool_vs_final") or {}
+                            if any(int(_pv.get(k) or 0) for k in ("pool_exclude", "final_select_drop", "in_pool_tri_not_final", "not_in_pool_tri")):
+                                st.markdown("### 🧩 候補母集団 vs 最終選抜")
+                                _p1, _p2, _p3, _p4 = st.columns(4)
+                                _p1.metric("母集団で除外", f"{_pv.get('pool_exclude', 0)}")
+                                _p2.metric("最終選抜で脱落", f"{_pv.get('final_select_drop', 0)}")
+                                _p3.metric("三連単母集団あり→最終なし", f"{_pv.get('in_pool_tri_not_final', 0)}")
+                                _p4.metric("三連単母集団なし", f"{_pv.get('not_in_pool_tri', 0)}")
+                                st.caption(
+                                    "pool_exclude=候補母集団段階で消えた / "
+                                    "final_select_drop=母集団にはいたが最終券から落ちた。"
+                                    "replay再実行後に反映されます。"
+                                )
                             st.markdown("### 🚗 7番車 A/B判定")
+
                             _a1, _a2, _a3, _a4 = st.columns(4)
                             _a1.metric("7番車TOP3登場", f"{_c7.get('total',0)}")
                             _a2.metric("最終プラン保持", f"{_c7.get('kept',0)}")
