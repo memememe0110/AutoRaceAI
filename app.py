@@ -17056,12 +17056,12 @@ def _v321_note_mentions_car(car_no: int, note: str) -> bool:
         return False
 
 _V321_NOTE_ORDER = [
+    "hard_race_compact",  # 堅いレース絞込は保護noteより優先（保護解除の本体）
     "solo_gami",
     "v259_overlap",
     "gami_prune",
     "low_odds_floor",
     "replacement",
-    "hard_race_compact",
     "v260_refill",
     "protected_add",
 ]
@@ -17127,7 +17127,6 @@ def _v321_detect_drop_stage(car_no: int, result: dict) -> tuple[str, list[dict]]
 
     hard = result.get("hard_race_info") or {}
     if isinstance(hard, dict) and hard.get("applied"):
-        # hard_raceのtop_pairに車番が含まれる場合のみ関連候補として記録。
         pair = hard.get("top_pair") or ()
         try:
             pair_nums = {int(x) for x in pair}
@@ -17138,6 +17137,25 @@ def _v321_detect_drop_stage(car_no: int, result: dict) -> tuple[str, list[dict]]
                 })
         except Exception:
             pass
+        # 保護解除リストに当該車があれば hard_race を優先要因として記録
+        try:
+            for dp in (hard.get("dropped_protected") or []):
+                if _v321_car_in_combo(car_no, str(dp.get("combo") or "")):
+                    hits.append({
+                        "note_key": "hard_race_compact",
+                        "text": (
+                            f"保護解除: {dp.get('type')} {dp.get('combo')} "
+                            f"(prob={dp.get('probability')})"
+                        ),
+                    })
+                    break
+        except Exception:
+            pass
+        # replacement_notes の「堅いレース絞込により保護解除」も拾う
+        for note in (result.get("replacement_notes") or []):
+            note_s = str(note)
+            if "堅いレース" in note_s and _v321_note_mentions_car(car_no, note_s):
+                hits.append({"note_key": "hard_race_compact", "text": note_s[:500]})
 
     if hits:
         hits.sort(key=lambda h: _V321_NOTE_ORDER.index(h["note_key"])
@@ -20462,6 +20480,48 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                     f"上位2車勝率合計{top2_win_share:.1f}%・中心ペア確率{top_pair_prob:.1f}%・"
                     f"ガミ率{normal_metrics['low']:.2f}%→{compact_metrics['low']:.2f}%"
                 )
+                # Ver320: 保護本線を黙って消さない。compact採用時は保護解除を明示する。
+                # （三連複など非3連単の保護券が selected から落ちる経路が anomaly の主因）
+                try:
+                    _sel_ids_hr = {
+                        (str(t.get("type")), str(t.get("combo"))) for t in selected
+                    }
+                    _dropped_prot = []
+                    _kept_prot_notes = []
+                    for _pt in protected_tickets:
+                        _pk = (str(_pt.get("type")), str(_pt.get("combo")))
+                        if _pk in _sel_ids_hr:
+                            # 既に compact に残っている保護券の note は維持
+                            continue
+                        _dropped_prot.append(_pt)
+                        replacement_notes.append(
+                            f"堅いレース絞込により保護解除: {_pt.get('type')} {_pt.get('combo')}"
+                            f"（モデル{float(_pt.get('probability', 0.0)):.2f}%）"
+                        )
+                    # protected_add_notes は「最終に残った保護」だけに正規化
+                    if protected_add_notes is not None:
+                        _remain = []
+                        for _note in list(protected_add_notes):
+                            _keep = False
+                            for _t in selected:
+                                _combo = str(_t.get("combo") or "")
+                                _typ = str(_t.get("type") or "")
+                                if _combo and _combo in str(_note) and _typ and _typ in str(_note):
+                                    _keep = True
+                                    break
+                            if _keep:
+                                _remain.append(_note)
+                        protected_add_notes[:] = _remain
+                    hard_race_info["dropped_protected"] = [
+                        {
+                            "type": str(t.get("type")),
+                            "combo": str(t.get("combo")),
+                            "probability": float(t.get("probability", 0.0) or 0.0),
+                        }
+                        for t in _dropped_prot
+                    ]
+                except Exception:
+                    pass
     except Exception:
         hard_race_info = {"enabled": False}
 
