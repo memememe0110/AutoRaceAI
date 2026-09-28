@@ -9642,14 +9642,18 @@ _V319_WX_CACHE: dict[str, dict] = {}
 _V319_WX_FETCHES = 0
 _V319_WX_FETCH_LIMIT = 15
 _V319_HIST_REFRESHED: set[str] = set()
-_V319_HIST_SKIPPED: set[str] = set()
+# Ver320: cache_key -> before_d(8桁)。同一開催日取込中は SELECT すら打たない
+_V319_HIST_SKIPPED: dict[str, str] = {}
+# 同一 player_cd の公式履歴DFを取込ジョブ内で再利用
+_V319_HIST_DF_CACHE: dict[str, object] = {}
 
 
 def _v319_wx_reset_budget() -> None:
-    global _V319_WX_FETCHES, _V319_HIST_REFRESHED, _V319_HIST_SKIPPED
+    global _V319_WX_FETCHES, _V319_HIST_REFRESHED, _V319_HIST_SKIPPED, _V319_HIST_DF_CACHE
     _V319_WX_FETCHES = 0
     _V319_HIST_REFRESHED = set()
-    _V319_HIST_SKIPPED = set()
+    _V319_HIST_SKIPPED = {}
+    _V319_HIST_DF_CACHE = {}
 
 
 def _v319_race_weather(ymd: str, venue: str, race_no: int) -> dict:
@@ -10529,48 +10533,78 @@ def _v319_parse_sp_player_history_rows(html: str, player_name: str) -> list[dict
 
 
 def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFrame:
-    """PC版を優先、空ならSP版にフォールバック。RはPC版のみ確実。"""
+    """PC版を優先。有効HTMLが取れたら PC2/SP は打たない（空履歴でも）。
+
+    Ver320:
+      - PC1で有効HTML（>500B）なら空histでもPC2へ行かない
+      - SPはPCが完全失敗したときだけ
+      - timeout 15 / retries 2
+      - 同一 player_cd はジョブ内メモ化
+      - 全リクエスト例外で空になった場合はキャッシュしない（次レースで再試行）
+    """
+    global _V319_HIST_DF_CACHE
     pcd = str(player_cd or "").strip()
     name = str(player_name or "").strip()
+    if pcd and pcd in _V319_HIST_DF_CACHE:
+        cached = _V319_HIST_DF_CACHE[pcd]
+        try:
+            return cached.copy() if hasattr(cached, "copy") else cached
+        except Exception:
+            return cached
+
     hist: list[dict] = []
     pc_err = ""
-    # 1) PC版
+    pc_ok = False
+    # 1) PC版（historyDispType=d を優先、空ページでも有効HTMLなら打ち切り）
     if pcd:
         for url in (
             f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}&historyDispType=d",
             f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}",
         ):
             try:
-                html = _v319_http_get(url, timeout=25, retries=3)
+                html = _v319_http_get(url, timeout=15, retries=2)
+                if html and len(html) > 500:
+                    pc_ok = True
                 hist = _v319_parse_pc_player_history_html(html, name)
                 if hist:
+                    break
+                if pc_ok:
+                    # 有効HTMLだが履歴0 → PC2/SPを打たない
                     break
             except Exception as exc:
                 pc_err = f"{type(exc).__name__}:{exc}"
                 hist = []
-    # 2) SP版フォールバック（またはPCに車番補完用）
+    # 2) SP版: PCが完全失敗したときだけ
     sp_rows: list[dict] = []
-    if pcd:
+    if pcd and not pc_ok:
         try:
             sp_url = (
                 "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
                 f"?playerCd={pcd}&historyDispType=d"
             )
-            sp_html = _v319_http_get(sp_url, timeout=20, retries=2)
+            sp_html = _v319_http_get(sp_url, timeout=15, retries=2)
             sp_rows = _v319_parse_sp_player_history_rows(sp_html, name)
         except Exception:
             sp_rows = []
     if not hist and sp_rows:
         hist = sp_rows
+        out = pd.DataFrame(hist) if hist else pd.DataFrame()
     elif hist and sp_rows:
-        # 車番・天候を突合
         df = pd.DataFrame(hist)
-        df = _v319_merge_sp_enrich(df, sp_rows)
-        return df
-    if not hist:
-        # 空のまま。呼び出し側で詳細を出す
-        return pd.DataFrame()
-    return pd.DataFrame(hist)
+        out = _v319_merge_sp_enrich(df, sp_rows)
+    elif hist:
+        out = pd.DataFrame(hist)
+    else:
+        out = pd.DataFrame()
+    # 全滅（例外）のときはキャッシュしない。次レースで再試行させる。
+    # 本当に履歴0件（pc_ok=True, hist=[]）はキャッシュ対象のまま。
+    _all_failed = bool(pc_err) and (not pc_ok) and (out is None or getattr(out, "empty", True))
+    if pcd and not _all_failed:
+        try:
+            _V319_HIST_DF_CACHE[pcd] = out.copy() if hasattr(out, "copy") else out
+        except Exception:
+            _V319_HIST_DF_CACHE[pcd] = out
+    return out
 
 
 def _v319_fetch_sp_player_history_enrich(player_cd: str) -> list[dict]:
@@ -11041,18 +11075,32 @@ def _v319_fill_player_histories(
             except Exception:
                 pass
 
+        before_d_job = _v319_ymd_digits(before_ymd)  # ループ共通（ジョブ内キャッシュキー）
+
         for p in players:
             name = p.get("name") or ""
             pcd = str(p.get("player_cd") or "").strip()
             cache_key = pcd or _v319_norm_player_name(name)
             already_refreshed = cache_key in _V319_HIST_REFRESHED
-            already_skipped = cache_key in _V319_HIST_SKIPPED
+            # Ver320: dict[cache_key] = before_d。同一開催日なら前レースで充足確認済み
+            already_skipped_d = str(_V319_HIST_SKIPPED.get(cache_key) or "")
             try:
+                # === 最速パス：同一取込ジョブ内・同じ開催日は DB SELECT すら打たない ===
+                if already_skipped_d and before_d_job and already_skipped_d == before_d_job:
+                    skipped += 1
+                    _ = details.append(f"{name}:ジョブ内キャッシュ即スキップ")
+                    continue
+                # before_d 無しでも「充足確認済み」マークがあれば即スキップ
+                if already_skipped_d and not before_d_job:
+                    skipped += 1
+                    _ = details.append(f"{name}:ジョブ内キャッシュ即スキップ")
+                    continue
+
                 if not pcd:
                     errors += 1
                     _ = details.append(f"{name}:playerCdなし")
                     continue
-                before_d = _v319_ymd_digits(before_ymd)
+                before_d = before_d_job
 
                 # ========== 1) DB状態（軽量） ==========
                 # 履歴ヘルパは失敗時も 0/(0,"")/空dict を返す（Noneは返さない）。
@@ -11060,34 +11108,27 @@ def _v319_fill_player_histories(
                 latest_d = _v319_ymd_digits(latest_d)
                 is_existing = (have >= min_rows and bool(latest_d))
 
-                # Ver320: 1度十分に登録済みなら、公式再取得・keys照合をしない。
-                # - 件数 >= min_rows
-                # - 対象日が無い、または DB最新日 >= 対象日（対象日までの穴なし）
-                # プロセス内キャッシュ済みも同様に即スキップ。
+                # Ver320/321: 1度十分に登録済みなら、公式再取得・keys照合をしない。
                 if is_existing and ((not before_d) or (latest_d >= before_d)):
                     skipped += 1
-                    _V319_HIST_SKIPPED.add(cache_key)
+                    _V319_HIST_SKIPPED[cache_key] = before_d or latest_d or "1"
                     _ = details.append(
                         f"{name}:充足スキップ(既存{have}件/最新{latest_d}"
                         f"{'/対象'+before_d if before_d else ''})"
                     )
                     continue
-                if already_skipped and is_existing:
-                    skipped += 1
-                    _ = details.append(f"{name}:キャッシュスキップ(既存{have}件/最新{latest_d})")
-                    continue
 
                 # ここから先だけ keys 照合・公式HTTPが必要（件数不足 or 対象日より古い）
                 state = _v319_player_history_state(db_path, name, con=con) or {}
                 have_keys = set(state.get("keys") or set())
-                # R未設定、または仮R(700-908: 結果由来の暫定キー)は上書き対象
+                # Ver320: R欠落だけでは再取得しない。
+                # 日付・場が揃っていれば予測特徴量は使える。Rは識別補助のみ。
+                # 真の dirty は「日付または場が無い」行だけ。
                 dirty_keys = set()
                 for k in have_keys:
-                    try:
-                        rn = int(k[2] or 0)
-                    except Exception:
-                        rn = 0
-                    if (not k[0]) or rn <= 0 or (700 <= rn <= 908):
+                    ds = str(k[0] or "").strip()
+                    vn = str(k[1] or "").strip()
+                    if not ds or not vn:
                         dirty_keys.add(k)
 
                 # ========== 2) 公式履歴を取得 ==========
@@ -11180,7 +11221,7 @@ def _v319_fill_player_histories(
                         skipped += 1
                         _ = details.append(f"{name}:穴なしスキップ(既存{have}件/最新{latest_d})")
                         if before_d and latest_d and latest_d >= before_d:
-                            _V319_HIST_SKIPPED.add(cache_key)
+                            _V319_HIST_SKIPPED[cache_key] = before_d or "1"
                         continue
                     # 穴埋め対象: missing_official を全部 + R欠落行の再構築
                     need_refresh = True
@@ -11229,9 +11270,9 @@ def _v319_fill_player_histories(
                     # 一度公式を見て追加不要なら、同一プロセス内は再取得しない
                     # （latest が対象日未満でも「今日の出走なし」で繰り返しHTTPしない）
                     if is_existing or have >= min_rows:
-                        _V319_HIST_SKIPPED.add(cache_key)
+                        _V319_HIST_SKIPPED[cache_key] = before_d or "1"
                     elif before_d and latest_d and latest_d >= before_d:
-                        _V319_HIST_SKIPPED.add(cache_key)
+                        _V319_HIST_SKIPPED[cache_key] = before_d or "1"
                     continue
 
                 work = pd.DataFrame(keep)
@@ -11418,9 +11459,9 @@ def _v319_fill_player_histories(
                     after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
                     _remaining_missing = official_keys - after_keys
                     if before_d and after_latest and after_latest >= before_d and not _remaining_missing:
-                        _V319_HIST_SKIPPED.add(cache_key)
+                        _V319_HIST_SKIPPED[cache_key] = before_d or "1"
                     elif not before_d and after >= min_rows and not _remaining_missing:
-                        _V319_HIST_SKIPPED.add(cache_key)
+                        _V319_HIST_SKIPPED[cache_key] = before_d or "1"
                 except Exception:
                     pass
 
