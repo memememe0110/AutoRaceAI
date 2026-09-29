@@ -97,7 +97,7 @@ APP_VERSION = "Ver321"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver321"  # Ver321: 三連単 hole 条件緩和（prob/odds/EV）
+_V231_APP_VERSION = "Ver321"  # Ver321: hole=EV降順6点 + EV下限0.30
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -16872,6 +16872,54 @@ def _v321_in_pool_by_type(
         hole_added = 0
         cumulative = 0.0
         target_cover = spec.get("target_cover")
+        # Ver321 A2/A4: 三連単は core=確率上位 / hole=EV降順6点
+        if label == "三連単":
+            core_keys = set()
+            hole_cands = []
+            for combo, count in ordered:
+                try:
+                    probability = float(count) / max(int(trials or 1), 1) * 100.0
+                except Exception:
+                    probability = 0.0
+                if isinstance(combo, (tuple, list)):
+                    nums = [str(int(v)) for v in combo]
+                    key = "-".join(nums)
+                else:
+                    key = str(combo)
+                try:
+                    odds = float(odds_map.get(key, 0) or 0)
+                except Exception:
+                    odds = 0.0
+                if odds <= 0:
+                    continue
+                try:
+                    _raw_ev_h = (float(probability) / 100.0) * float(odds)
+                except Exception:
+                    _raw_ev_h = 0.0
+                if core_added < int(spec["limit"]):
+                    if _combo_has_car(combo):
+                        found = True
+                        break
+                    core_added += 1
+                    core_keys.add(key)
+                    cumulative += probability
+                else:
+                    if (
+                        0.30 <= probability <= 8.00
+                        and odds >= 15.0
+                        and 0.30 <= _raw_ev_h <= 2.50
+                    ):
+                        hole_cands.append((_raw_ev_h, probability, odds, combo, key))
+            if not found and hole_cands:
+                hole_cands.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+                for item in hole_cands[:6]:
+                    hole_added += 1
+                    if _combo_has_car(item[3]):
+                        found = True
+                        break
+            out[label] = bool(found)
+            continue
+
         for combo, count in ordered:
             try:
                 probability = float(count) / max(int(trials or 1), 1) * 100.0
@@ -16890,32 +16938,14 @@ def _v321_in_pool_by_type(
                 odds = 0.0
             if odds <= 0:
                 continue
-            # v184 と同じ hole 条件（診断近似・raw_ev含む）
-            try:
-                _raw_ev_h = (float(probability) / 100.0) * float(odds)
-            except Exception:
-                _raw_ev_h = 0.0
-            is_hole = (
-                label == "三連単"
-                and core_added >= int(spec["limit"])
-                and hole_added < 6
-                and 0.30 <= probability <= 8.00
-                and odds >= 15.0
-                and 0.60 <= _raw_ev_h <= 2.50
-            )
-            if label == "三連単" and core_added >= int(spec["limit"]) and not is_hole:
-                continue
             if _combo_has_car(combo):
                 found = True
                 break
-            if is_hole:
-                hole_added += 1
-            else:
-                core_added += 1
-                cumulative += probability
+            core_added += 1
+            cumulative += probability
             if target_cover is not None and cumulative >= float(target_cover):
                 break
-            if target_cover is None and core_added >= int(spec["limit"]) and hole_added >= 6:
+            if target_cover is None and core_added >= int(spec["limit"]):
                 break
         out[label] = bool(found)
     return out
@@ -16970,7 +17000,7 @@ def _v321_tri_core_top(
         except Exception:
             raw_ev = 0.0
         # hole 条件の可否も記録（v184 現行値）
-        hole_ok = (0.30 <= prob <= 8.00) and (odds >= 15.0) and (0.60 <= raw_ev <= 2.50)
+        hole_ok = (0.30 <= prob <= 8.00) and (odds >= 15.0) and (0.30 <= raw_ev <= 2.50)
         entry = {
             "rank": rank,
             "combo": key,
@@ -16994,7 +17024,7 @@ def _v321_tri_core_top(
         "car_best": car_best,
         "scanned_with_odds": rank,
         "core_limit": 14,
-        "hole_rule": {"prob": [0.30, 8.00], "odds_min": 15.0, "ev": [0.60, 2.50]},
+        "hole_rule": {"prob": [0.30, 8.00], "odds_min": 15.0, "ev": [0.30, 2.50], "sort": "ev_desc"},
     }
 
 
@@ -19526,6 +19556,10 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         hole_added = 0
         cumulative = 0.0
         target_cover = spec.get("target_cover")
+        # Ver321 A2: 三連単の hole は確率走査のまま枠を埋めると真の中穴に届かない。
+        # core=確率上位limit / hole=条件充足をEV降順で最大6点。
+        # Ver321 A4: hole EV下限 0.60→0.30（川口10R raw_ev≈0.41 救済）
+        _hole_pool321: list = []
         for combo, count in ordered:
             probability = float(count) / max(int(trials), 1) * 100.0
             key = combo_text(combo, unordered=unordered)
@@ -19543,20 +19577,6 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 _ev_prob295*_trust299 if label=="三連単" else _ev_prob295
             )
 
-            # Ver299: 三連単は確率上位limit点を越えても「中穴の価値候補」を最大6点だけ探索。
-            # 極端な宝くじ領域ではなく、シミュレーションにも一定頻度で出る穴だけを対象にする。
-            # Ver320 hole緩和: pool_exclude取りこぼし向け（prob下限・odds下限・EV）
-            _is_hole299=(
-                label=="三連単"
-                and core_added >= int(spec["limit"])
-                and hole_added < 6
-                and 0.30 <= probability <= 8.00
-                and odds >= 15.0
-                and 0.60 <= _raw_ev299 <= 2.50
-            )
-            if label=="三連単" and core_added >= int(spec["limit"]) and not _is_hole299:
-                continue
-
             ticket = {
                 "type": label, "combo": key, "probability": probability,
                 "ev_probability": _effective_ev_prob299,
@@ -19566,9 +19586,9 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 "v299_ev_trust": _trust299,
                 "v299_ev_trust_reason": _trust_reason299,
                 "v299_raw_ev_multiple": _raw_ev299,
-                "v299_hole_rescue": bool(_is_hole299),
+                "v299_hole_rescue": False,
                 "odds": odds, "cap": int(spec["cap"]),
-                "role": (spec["role"] + ("・中穴価値候補" if _is_hole299 else "")),
+                "role": spec["role"],
                 "learned_weight": learned_weight,
             }
             matched = {i for i, (outcome, _) in enumerate(outcomes) if ticket_matches(ticket, outcome)}
@@ -19576,19 +19596,47 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 continue
             ticket["matched"] = matched
             ticket["matched_probability"] = sum(outcomes[i][1] for i in matched)
+
+            if label == "三連単":
+                if core_added < int(spec["limit"]):
+                    _ = candidates.append(ticket)
+                    added += 1
+                    core_added += 1
+                    cumulative += probability
+                else:
+                    # hole候補: 後でEV降順に最大6点採用
+                    if (
+                        0.30 <= probability <= 8.00
+                        and odds >= 15.0
+                        and 0.30 <= _raw_ev299 <= 2.50
+                    ):
+                        _hole_pool321.append((_raw_ev299, probability, odds, ticket))
+                continue
+
+            # 三連単以外: 従来どおり target_cover / limit
             _ = candidates.append(ticket)
             added += 1
-            if _is_hole299:
-                hole_added += 1
-            else:
-                core_added += 1
-                cumulative += probability
-            # 三連単は上位limit点を確保した後も、条件を満たす中穴だけ最大6点探索する。
-            # その他券種は従来通り累積カバー到達で終了。
+            core_added += 1
+            cumulative += probability
             if target_cover is not None and cumulative >= float(target_cover):
                 break
-            if target_cover is None and core_added >= int(spec["limit"]) and hole_added >= 6:
+            if target_cover is None and core_added >= int(spec["limit"]):
                 break
+
+        if label == "三連単" and _hole_pool321:
+            # EV降順（同点は確率・オッズでタイブレーク）
+            _hole_pool321.sort(
+                key=lambda x: (float(x[0]), float(x[1]), float(x[2])),
+                reverse=True,
+            )
+            for _raw_ev_h, _prob_h, _odds_h, _tix in _hole_pool321[:6]:
+                _tix = dict(_tix)
+                _tix["v299_hole_rescue"] = True
+                _tix["role"] = str(_tix.get("role") or "") + "・中穴価値候補"
+                _ = candidates.append(_tix)
+                added += 1
+                hole_added += 1
+
         pool_summary[label] = {
             "points": added,
             "core_points": core_added,
