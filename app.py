@@ -19556,9 +19556,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         hole_added = 0
         cumulative = 0.0
         target_cover = spec.get("target_cover")
-        # Ver321 A2: 三連単の hole は確率走査のまま枠を埋めると真の中穴に届かない。
-        # core=確率上位limit / hole=条件充足をEV降順で最大6点。
-        # Ver321 A4: hole EV下限 0.60→0.30（川口10R raw_ev≈0.41 救済）
+        # Ver321: core=確率上位limit / hole=生EV降順で最大6点（診断と同一定義）。
+        # Step3a: holeは校正後EVではなく生prob×oddsで判定・ソート。
         _hole_pool321: list = []
         for combo, count in ordered:
             probability = float(count) / max(int(trials), 1) * 100.0
@@ -19571,11 +19570,14 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             _ev_prob295,_ev_ratio295,_ev_n295=_v295_ev_probability(
                 probability,label,_ev_calibration295
             )
-            _raw_ev299=(_ev_prob295/100.0)*odds
-            _trust299,_trust_reason299=_v299_ev_trust(_raw_ev299,label,probability,odds)
+            # 校正後EV（Ver299 trust / 表示用）。hole判定には使わない。
+            _cal_ev299=(_ev_prob295/100.0)*odds
+            _trust299,_trust_reason299=_v299_ev_trust(_cal_ev299,label,probability,odds)
             _effective_ev_prob299=(
                 _ev_prob295*_trust299 if label=="三連単" else _ev_prob295
             )
+            # 生EV（prob%×odds）。診断側と同一定義。hole条件・ソート専用。
+            _hole_raw_ev=(float(probability)/100.0)*float(odds)
 
             ticket = {
                 "type": label, "combo": key, "probability": probability,
@@ -19585,7 +19587,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 "ev_calibration_samples": _ev_n295,
                 "v299_ev_trust": _trust299,
                 "v299_ev_trust_reason": _trust_reason299,
-                "v299_raw_ev_multiple": _raw_ev299,
+                "v299_raw_ev_multiple": _cal_ev299,  # 互換: 校正後EVを格納
+                "v299_hole_raw_ev": _hole_raw_ev,
                 "v299_hole_rescue": False,
                 "odds": odds, "cap": int(spec["cap"]),
                 "role": spec["role"],
@@ -19604,13 +19607,15 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                     core_added += 1
                     cumulative += probability
                 else:
-                    # hole候補: 後でEV降順に最大6点採用
+                    # Ver321 Step3a: hole条件・ソートは生確率×オッズ。
+                    # 校正後EVだと ratio>1.1 で真の中穴が上限2.50を超え漏れる
+                    # （伊勢崎9R 1-5-7 raw=2.264）。診断側と定義を揃える。
                     if (
                         0.30 <= probability <= 8.00
                         and odds >= 15.0
-                        and 0.30 <= _raw_ev299 <= 2.50
+                        and 0.30 <= _hole_raw_ev <= 2.50
                     ):
-                        _hole_pool321.append((_raw_ev299, probability, odds, ticket))
+                        _hole_pool321.append((_hole_raw_ev, probability, odds, ticket))
                 continue
 
             # 三連単以外: 従来どおり target_cover / limit
