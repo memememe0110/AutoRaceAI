@@ -19968,8 +19968,11 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             _ret_delta299=float(_after299.get("ev_model_return_rate",0.0)-_base299.get("ev_model_return_rate",0.0))
             _black_delta299=float(_after299.get("black",0.0)-_base299.get("black",0.0))
             _cover_gain299=float(_after299.get("cover",0.0)-_base299.get("cover",0.0))
-            _ev299=(float(_cand299.get("ev_probability",0.0))/100.0)*float(_cand299.get("odds",0.0))
-            # 穴だからという理由だけで追加しない。校正後EVと合成指標の両方を通す。
+            # Step3a': 校正後EVではなく生EV（v299_hole_raw_ev）で判定。
+            # 診断側 / v184 hole 条件と定義を統一。trust減衰で0.78未満に落ちるのを防ぐ。
+            _ev299=float(_cand299.get("v299_hole_raw_ev") or 0.0)
+            if _ev299 <= 0.0:
+                _ev299=(float(_cand299.get("probability",0.0))/100.0)*float(_cand299.get("odds",0.0))
             if _ev299 < 0.78 or _ret_delta299 < -1.5 or _black_delta299 < -0.45:
                 continue
             _score299=2.0*_ret_delta299+1.4*_black_delta299+0.8*_cover_gain299+6.0*_ev299
@@ -19983,7 +19986,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         v299_hole_notes.append(
             f"中穴価値候補を追加：3連単 {_cand299.get('combo')} "
             f"（確率{float(_cand299.get('probability',0)):.2f}%・"
-            f"オッズ{float(_cand299.get('odds',0)):.1f}倍・信頼補正EV{_ev299*100:.1f}%）"
+            f"オッズ{float(_cand299.get('odds',0)):.1f}倍・生EV{_ev299*100:.1f}%）"
         )
 
     # Ver201: 高確率本線を最終候補へ戻す。追加後の購入総額を含めて再評価し、
