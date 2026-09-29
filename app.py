@@ -16912,7 +16912,7 @@ def _v321_in_pool_by_type(
                         hole_cands.append((_raw_ev_h, probability, odds, combo, key))
             if not found and hole_cands:
                 hole_cands.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-                for item in hole_cands[:6]:
+                for item in hole_cands[:10]:
                     hole_added += 1
                     if _combo_has_car(item[3]):
                         found = True
@@ -16957,13 +16957,13 @@ def _v321_tri_core_top(
     odds_maps: dict,
     trials: int = 20000,
     top_n: int = 20,
-    scan_n: int = 80,
+    scan_n: int = 120,
 ) -> dict:
-    """三連単候補の順位可視化（診断専用・本番不変）。
+    """三連単候補の順位可視化（診断専用）。
 
-    - top: オッズ>0 の上位 top_n 点
-    - car_best: 当該車を含む最良順位（scan_n まで探索）
-    - core_limit: 8車相当の core=14 境界を超えているか
+    - top: オッズ>0 の確率上位 top_n 点
+    - car_best: 当該車を含む最良順位（scan_n まで）
+    - hole_candidates_ev_desc: hole条件充足を生EV降順TOP15（本番は上位10点採用）
     """
     n = int(car_no)
     counter = (bets or {}).get("三連単") or {}
@@ -16971,6 +16971,7 @@ def _v321_tri_core_top(
     ordered = sorted(counter.items(), key=lambda x: x[1], reverse=True)
     top_rows = []
     car_best = None
+    hole_cands = []
     rank = 0
     for combo, count in ordered:
         try:
@@ -16999,7 +17000,6 @@ def _v321_tri_core_top(
             raw_ev = (prob / 100.0) * odds
         except Exception:
             raw_ev = 0.0
-        # hole 条件の可否も記録（v184 現行値）
         hole_ok = (0.30 <= prob <= 8.00) and (odds >= 15.0) and (0.30 <= raw_ev <= 2.50)
         entry = {
             "rank": rank,
@@ -17015,16 +17015,45 @@ def _v321_tri_core_top(
             top_rows.append(entry)
         if has_car and car_best is None:
             car_best = entry
-        if rank >= int(scan_n) and car_best is not None:
+        # core外かつ hole条件OK → EV降順プール候補
+        if rank > 14 and hole_ok:
+            hole_cands.append({
+                "combo": key,
+                "ev": round(raw_ev, 4),
+                "rank": rank,
+                "prob": round(prob, 4),
+                "odds": round(odds, 2),
+                "has_car": bool(has_car),
+            })
+        if rank >= int(scan_n) and car_best is not None and len(hole_cands) >= 15:
             break
         if rank >= int(scan_n):
+            break
+    hole_cands.sort(key=lambda x: (float(x["ev"]), float(x["prob"]), float(x["odds"])), reverse=True)
+    hole_ev_top15 = hole_cands[:15]
+    # 当該車が hole10枠に入るか（本番採用枠）
+    car_in_hole10 = any(bool(h.get("has_car")) for h in hole_ev_top15[:10])
+    car_hole_pos = None
+    for i, h in enumerate(hole_ev_top15, start=1):
+        if h.get("has_car"):
+            car_hole_pos = i
             break
     return {
         "top": top_rows,
         "car_best": car_best,
         "scanned_with_odds": rank,
         "core_limit": 14,
-        "hole_rule": {"prob": [0.30, 8.00], "odds_min": 15.0, "ev": [0.30, 2.50], "sort": "ev_desc"},
+        "hole_limit": 10,
+        "hole_rule": {
+            "prob": [0.30, 8.00],
+            "odds_min": 15.0,
+            "ev": [0.30, 2.50],
+            "sort": "ev_desc",
+            "pool_size": 10,
+        },
+        "hole_candidates_ev_desc": hole_ev_top15,
+        "car_in_hole10": bool(car_in_hole10),
+        "car_hole_ev_rank": car_hole_pos,
     }
 
 
@@ -19634,7 +19663,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 key=lambda x: (float(x[0]), float(x[1]), float(x[2])),
                 reverse=True,
             )
-            for _raw_ev_h, _prob_h, _odds_h, _tix in _hole_pool321[:6]:
+            # Ver321 Step3a'': hole枠 6→10（伊勢崎9R系の真の中穴救済）
+            for _raw_ev_h, _prob_h, _odds_h, _tix in _hole_pool321[:10]:
                 _tix = dict(_tix)
                 _tix["v299_hole_rescue"] = True
                 _tix["role"] = str(_tix.get("role") or "") + "・中穴価値候補"
