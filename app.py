@@ -93,11 +93,11 @@ except Exception as _v320_patch_exc:
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver320"
+APP_VERSION = "Ver321"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver320"  # Ver320: Ver284固定を解除し全バージョンを校正対象に。
+_V231_APP_VERSION = "Ver321"  # Ver321: 三連単 hole 条件緩和（prob/odds/EV）
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
@@ -16890,12 +16890,18 @@ def _v321_in_pool_by_type(
                 odds = 0.0
             if odds <= 0:
                 continue
+            # v184 と同じ hole 条件（診断近似・raw_ev含む）
+            try:
+                _raw_ev_h = (float(probability) / 100.0) * float(odds)
+            except Exception:
+                _raw_ev_h = 0.0
             is_hole = (
                 label == "三連単"
                 and core_added >= int(spec["limit"])
                 and hole_added < 6
-                and 0.80 <= probability <= 6.00
-                and odds >= 30.0
+                and 0.30 <= probability <= 8.00
+                and odds >= 15.0
+                and 0.60 <= _raw_ev_h <= 2.50
             )
             if label == "三連単" and core_added >= int(spec["limit"]) and not is_hole:
                 continue
@@ -16964,7 +16970,7 @@ def _v321_tri_core_top(
         except Exception:
             raw_ev = 0.0
         # hole 条件の可否も記録（v184 現行値）
-        hole_ok = (0.80 <= prob <= 6.00) and (odds >= 30.0) and (0.72 <= raw_ev <= 2.20)
+        hole_ok = (0.30 <= prob <= 8.00) and (odds >= 15.0) and (0.60 <= raw_ev <= 2.50)
         entry = {
             "rank": rank,
             "combo": key,
@@ -16988,7 +16994,7 @@ def _v321_tri_core_top(
         "car_best": car_best,
         "scanned_with_odds": rank,
         "core_limit": 14,
-        "hole_rule": {"prob": [0.80, 6.00], "odds_min": 30.0, "ev": [0.72, 2.20]},
+        "hole_rule": {"prob": [0.30, 8.00], "odds_min": 15.0, "ev": [0.60, 2.50]},
     }
 
 
@@ -19539,13 +19545,14 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
             # Ver299: 三連単は確率上位limit点を越えても「中穴の価値候補」を最大6点だけ探索。
             # 極端な宝くじ領域ではなく、シミュレーションにも一定頻度で出る穴だけを対象にする。
+            # Ver320 hole緩和: pool_exclude取りこぼし向け（prob下限・odds下限・EV）
             _is_hole299=(
                 label=="三連単"
                 and core_added >= int(spec["limit"])
                 and hole_added < 6
-                and 0.80 <= probability <= 6.00
-                and odds >= 30.0
-                and 0.72 <= _raw_ev299 <= 2.20
+                and 0.30 <= probability <= 8.00
+                and odds >= 15.0
+                and 0.60 <= _raw_ev299 <= 2.50
             )
             if label=="三連単" and core_added >= int(spec["limit"]) and not _is_hole299:
                 continue
@@ -29570,7 +29577,7 @@ if selected_main_page == "🗃️ 登録情報確認":
 
 
                     # Ver320 Phase 2: 最終プラン脱落トレース。7番車を初期対象にする診断専用UI。
-                    with st.expander("🔎 Ver320 最終プラン脱落トレース（7番車 first）", expanded=False):
+                    with st.expander("🔎 Ver321 最終プラン脱落トレース（7番車 first）", expanded=False):
                         st.caption(
                             "保存済みVer320予測と最古保存オッズから最終プランをreplayし、"
                             "実際の結果TOP3車が最終プランに残っているかと、保存note上の脱落要因を診断します。"
@@ -29661,7 +29668,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 _t4.metric("car_bestなし", f"{_tc.get('no_car_best', 0)}")
                                 st.caption(
                                     "car_best=当該車を含む三連単の最良順位（オッズ>0）。"
-                                    "core14外かつ hole_ok=false なら hole条件緩和の検討材料。"
+                                    "Ver320 hole緩和後: prob0.30-8 / odds≥15 / EV0.60-2.50。replay後に hole_ok 増を確認。"
                                 )
                                 if _tc.get("samples"):
                                     st.dataframe(
