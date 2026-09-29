@@ -93,13 +93,48 @@ except Exception as _v320_patch_exc:
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver321"
+APP_VERSION = "Ver322"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver321"  # Ver321: hole=EV降順6点 + EV下限0.30
+_V231_APP_VERSION = "Ver322"  # Ver322 S1: temp-scale odds>=30; hole sort=raw EV
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
+
+# Ver322 S1: temperature scaling (logit space). T=1 → no-op. odds_gate=9999 → full rollback.
+_V322_TEMP_T = 1.25
+_V322_TEMP_ODDS_GATE = 30.0
+
+
+def _v322_temp_scale_prob(
+    prob_pct: float,
+    odds: float,
+    *,
+    T: float | None = None,
+    odds_gate: float | None = None,
+) -> float:
+    """S1: odds>=gate のみ温度スケーリング。戻りは %。"""
+    if T is None:
+        T = float(_V322_TEMP_T)
+    if odds_gate is None:
+        odds_gate = float(_V322_TEMP_ODDS_GATE)
+    try:
+        p = float(prob_pct) / 100.0
+        o = float(odds)
+    except Exception:
+        try:
+            return float(prob_pct)
+        except Exception:
+            return 0.0
+    if abs(float(T) - 1.0) < 1e-12 or o < float(odds_gate):
+        return float(prob_pct)
+    p = min(max(p, 1e-6), 1.0 - 1e-6)
+    logit = math.log(p / (1.0 - p))
+    z = -float(T) * logit
+    p_cal = 1.0 / (1.0 + math.exp(min(z, 700.0)))
+    return float(p_cal * 100.0)
+
+
 _V284_DB_GUARD_PATCH = "2026-08-09-v5-row-containment-sync"
 _V284_TRANSITION_AUDIT_PATCH = "2026-08-09-v1"
 _V284_DOWNLOAD_SNAPSHOT_PATCH = "2026-08-09-v1"
@@ -16898,6 +16933,12 @@ def _v321_in_pool_by_type(
                     _raw_ev_h = (float(probability) / 100.0) * float(odds)
                 except Exception:
                     _raw_ev_h = 0.0
+                try:
+                    _prob_cal_h = _v322_temp_scale_prob(probability, odds)
+                    _raw_ev_cal_h = (float(_prob_cal_h) / 100.0) * float(odds)
+                except Exception:
+                    _prob_cal_h = probability
+                    _raw_ev_cal_h = _raw_ev_h
                 if core_added < int(spec["limit"]):
                     if _combo_has_car(combo):
                         found = True
@@ -16906,10 +16947,11 @@ def _v321_in_pool_by_type(
                     core_keys.add(key)
                     cumulative += probability
                 else:
+                    # 並びキー=pre EV、レンジ=post EV_cal（S1）
                     if (
                         0.30 <= probability <= 8.00
                         and odds >= 15.0
-                        and 0.30 <= _raw_ev_h <= 2.50
+                        and 0.30 <= _raw_ev_cal_h <= 2.50
                     ):
                         hole_cands.append((_raw_ev_h, probability, odds, combo, key))
             if not found and hole_cands:
@@ -17002,13 +17044,22 @@ def _v321_tri_core_top(
             raw_ev = (prob / 100.0) * odds
         except Exception:
             raw_ev = 0.0
-        hole_ok = (0.30 <= prob <= 8.00) and (odds >= 15.0) and (0.30 <= raw_ev <= 2.50)
+        try:
+            prob_cal = _v322_temp_scale_prob(prob, odds)
+            raw_ev_cal = (float(prob_cal) / 100.0) * float(odds)
+        except Exception:
+            prob_cal = prob
+            raw_ev_cal = raw_ev
+        # hole_ok は post レンジ、並び・rank は pre
+        hole_ok = (0.30 <= prob <= 8.00) and (odds >= 15.0) and (0.30 <= raw_ev_cal <= 2.50)
         entry = {
             "rank": rank,
             "combo": key,
             "prob": round(prob, 4),
+            "prob_cal": round(float(prob_cal), 4),
             "odds": round(odds, 2),
             "raw_ev": round(raw_ev, 4),
+            "raw_ev_cal": round(float(raw_ev_cal), 4),
             "has_car": bool(has_car),
             "hole_ok": bool(hole_ok),
             "in_core14": rank <= 14,
@@ -17017,13 +17068,15 @@ def _v321_tri_core_top(
             top_rows.append(entry)
         if has_car and car_best is None:
             car_best = entry
-        # core外かつ hole条件OK → EV降順プール候補
+        # core外かつ hole条件OK → 生EV降順プール候補（pre）
         if rank > 14 and hole_ok:
             hole_cands.append({
                 "combo": key,
                 "ev": round(raw_ev, 4),
+                "ev_cal": round(float(raw_ev_cal), 4),
                 "rank": rank,
                 "prob": round(prob, 4),
+                "prob_cal": round(float(prob_cal), 4),
                 "odds": round(odds, 2),
                 "has_car": bool(has_car),
             })
@@ -17050,7 +17103,10 @@ def _v321_tri_core_top(
             "prob": [0.30, 8.00],
             "odds_min": 15.0,
             "ev": [0.30, 2.50],
-            "sort": "ev_desc",
+            "ev_basis": "raw_ev_cal",
+            "sort": "raw_ev_pre",
+            "temp_T": float(_V322_TEMP_T),
+            "temp_odds_gate": float(_V322_TEMP_ODDS_GATE),
             "pool_size": 10,
         },
         "hole_candidates_ev_desc": hole_ev_top15,
@@ -19767,11 +19823,15 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             _effective_ev_prob299=(
                 _ev_prob295*_trust299 if label=="三連単" else _ev_prob295
             )
-            # 生EV（prob%×odds）。診断側と同一定義。hole条件・ソート専用。
+            # 生EV（prob%×odds）。並び替えは pre を維持（S1設計①）。
             _hole_raw_ev=(float(probability)/100.0)*float(odds)
+            # Ver322 S1: odds>=30 のみ温度スケーリング。レンジ判定は post。
+            _prob_cal = _v322_temp_scale_prob(probability, odds)
+            _hole_raw_ev_cal = (float(_prob_cal) / 100.0) * float(odds)
 
             ticket = {
                 "type": label, "combo": key, "probability": probability,
+                "probability_cal": _prob_cal,
                 "ev_probability": _effective_ev_prob299,
                 "ev_probability_before_v299": _ev_prob295,
                 "ev_calibration_ratio": _ev_ratio295,
@@ -19779,7 +19839,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 "v299_ev_trust": _trust299,
                 "v299_ev_trust_reason": _trust_reason299,
                 "v299_raw_ev_multiple": _cal_ev299,  # 互換: 校正後EVを格納
-                "v299_hole_raw_ev": _hole_raw_ev,
+                "v299_hole_raw_ev": _hole_raw_ev,  # pre（並び替え用）
+                "v299_hole_raw_ev_cal": _hole_raw_ev_cal,  # post（レンジ判定用）
                 "v299_hole_rescue": False,
                 "odds": odds, "cap": int(spec["cap"]),
                 "role": spec["role"],
@@ -19801,10 +19862,11 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                     # Ver321 Step3a: hole条件・ソートは生確率×オッズ。
                     # 校正後EVだと ratio>1.1 で真の中穴が上限2.50を超え漏れる
                     # （伊勢崎9R 1-5-7 raw=2.264）。診断側と定義を揃える。
+                    # レンジは post(ev_cal)、プール格納キー先頭は pre(raw) でソート維持
                     if (
                         0.30 <= probability <= 8.00
                         and odds >= 15.0
-                        and 0.30 <= _hole_raw_ev <= 2.50
+                        and 0.30 <= _hole_raw_ev_cal <= 2.50
                     ):
                         _hole_pool321.append((_hole_raw_ev, probability, odds, ticket))
                 continue
