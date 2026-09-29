@@ -17069,6 +17069,7 @@ def _v321_collect_all_drop_notes(car_no: int, result: dict) -> list:
         "replacement_notes",
         "protected_add_notes",
         "v260_refill_notes",
+        "v299_hole_reject_notes",
     )
     out = []
     for key in note_keys:
@@ -17129,6 +17130,7 @@ _V321_NOTE_ORDER = [
     "replacement",
     "v260_refill",
     "protected_add",
+    "hole_reject",  # 中穴rescue不採用理由（final_select 空notes対策）
 ]
 
 
@@ -17182,6 +17184,7 @@ def _v321_detect_drop_stage(car_no: int, result: dict) -> tuple[str, list[dict]]
         ("replacement_notes", "replacement"),
         ("protected_add_notes", "protected_add"),
         ("v260_refill_notes", "v260_refill"),
+        ("v299_hole_reject_notes", "hole_reject"),
     ]
     # noteは自由形式。オッズ小数の数字に誤マッチしないようコンボ/N番に限定。
     for key, label in note_map:
@@ -17370,7 +17373,7 @@ def _v321_trace_top3_loss(
                     in_pool_js = json.dumps(in_pool, ensure_ascii=False, default=str)
                     notes_full_js = json.dumps(notes_full, ensure_ascii=False, default=str)
                     tri_core = _v321_tri_core_top(
-                        int(car), bets, odds_maps, trials=trials, top_n=20, scan_n=80,
+                        int(car), bets, odds_maps, trials=trials, top_n=20, scan_n=120,
                     )
                     tri_core_js = json.dumps(tri_core, ensure_ascii=False, default=str)
                     con.execute("""
@@ -19982,7 +19985,11 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
 
     # Ver299: 「上位確率にいないから穴が候補にすら入らない」を防ぐ。
     # 候補母集団へ救済した中穴から、全体のEV指標を壊さず黒字率も大きく落とさないものを最大2点追加。
+    # Ver321 Step3b: 高生EV穴は合成指標悪化を許容（伊勢崎9R 1-5-7 raw_ev=2.264 救済）。
+    # 不採用理由は v299_hole_reject_notes に残し final_select_drop の空notesを解消する。
     v299_hole_notes = []
+    v299_hole_reject_notes = []
+    _hole_reject_seen = set()
     for _ in range(2):
         _base299=evaluate(selected)
         _selected_ids299={(str(t.get("type")),str(t.get("combo"))) for t in selected}
@@ -19998,12 +20005,31 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             _ret_delta299=float(_after299.get("ev_model_return_rate",0.0)-_base299.get("ev_model_return_rate",0.0))
             _black_delta299=float(_after299.get("black",0.0)-_base299.get("black",0.0))
             _cover_gain299=float(_after299.get("cover",0.0)-_base299.get("cover",0.0))
-            # Step3a': 校正後EVではなく生EV（v299_hole_raw_ev）で判定。
-            # 診断側 / v184 hole 条件と定義を統一。trust減衰で0.78未満に落ちるのを防ぐ。
             _ev299=float(_cand299.get("v299_hole_raw_ev") or 0.0)
             if _ev299 <= 0.0:
                 _ev299=(float(_cand299.get("probability",0.0))/100.0)*float(_cand299.get("odds",0.0))
-            if _ev299 < 0.78 or _ret_delta299 < -1.5 or _black_delta299 < -0.45:
+            # 通常ゲート / 高EV穴は緩和
+            _min_ev, _min_ret, _min_black = 0.78, -1.5, -0.45
+            if _ev299 >= 1.50:
+                _min_ret, _min_black = -5.0, -2.0
+            elif _ev299 >= 1.00:
+                _min_ret, _min_black = -3.0, -1.0
+            _reject_reason = None
+            if _ev299 < _min_ev:
+                _reject_reason = f"生EV{_ev299:.3f}<{_min_ev}"
+            elif _ret_delta299 < _min_ret:
+                _reject_reason = f"回収率差{_ret_delta299:+.2f}<{_min_ret}"
+            elif _black_delta299 < _min_black:
+                _reject_reason = f"黒字率差{_black_delta299:+.2f}<{_min_black}"
+            if _reject_reason is not None:
+                if _cid299 not in _hole_reject_seen and len(v299_hole_reject_notes) < 12:
+                    _hole_reject_seen.add(_cid299)
+                    v299_hole_reject_notes.append(
+                        f"中穴不採用：3連単 {_cand299.get('combo')} "
+                        f"（確率{float(_cand299.get('probability',0)):.2f}%・"
+                        f"オッズ{float(_cand299.get('odds',0)):.1f}倍・生EV{_ev299:.3f}）"
+                        f"理由={_reject_reason}"
+                    )
                 continue
             _score299=2.0*_ret_delta299+1.4*_black_delta299+0.8*_cover_gain299+6.0*_ev299
             _key299=(_score299,_ev299,float(_cand299.get("odds",0.0)),float(_cand299.get("probability",0.0)))
@@ -20018,6 +20044,34 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             f"（確率{float(_cand299.get('probability',0)):.2f}%・"
             f"オッズ{float(_cand299.get('odds',0)):.1f}倍・生EV{_ev299*100:.1f}%）"
         )
+
+    # ループ後も未採用の hole 上位を記録（final_select 空notes対策）
+    try:
+        _sel_ids_end = {(str(t.get("type")), str(t.get("combo"))) for t in selected}
+        _hole_left = []
+        for _c in candidates:
+            if not bool(_c.get("v299_hole_rescue")):
+                continue
+            _cid = (str(_c.get("type")), str(_c.get("combo")))
+            if _cid in _sel_ids_end:
+                continue
+            _ev = float(_c.get("v299_hole_raw_ev") or 0.0)
+            if _ev <= 0.0:
+                _ev = (float(_c.get("probability", 0.0)) / 100.0) * float(_c.get("odds", 0.0))
+            _hole_left.append((_ev, _c))
+        _hole_left.sort(key=lambda x: x[0], reverse=True)
+        for _ev, _c in _hole_left[:5]:
+            _cid = (str(_c.get("type")), str(_c.get("combo")))
+            if _cid in _hole_reject_seen:
+                continue
+            _hole_reject_seen.add(_cid)
+            v299_hole_reject_notes.append(
+                f"中穴未採用（rescue枠外または合成未選択）：3連単 {_c.get('combo')} "
+                f"（確率{float(_c.get('probability',0)):.2f}%・"
+                f"オッズ{float(_c.get('odds',0)):.1f}倍・生EV{_ev:.3f}）"
+            )
+    except Exception:
+        pass
 
     # Ver201: 高確率本線を最終候補へ戻す。追加後の購入総額を含めて再評価し、
     # 回収率が悪ければ判定自体を下げるが、本線を黙って削ることはしない。
@@ -21119,6 +21173,7 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         "low_odds_floor_notes": low_odds_floor_notes,
         "solo_gami_exclusion_notes": solo_gami_exclusion_notes,
         "protected_add_notes": protected_add_notes,
+        "v299_hole_reject_notes": v299_hole_reject_notes,
         "protected_count": len([t for t in selected if t.get("protected")]),
         "residual_trifecta_candidates": residual_candidates,
         "hard_race_info": hard_race_info,
