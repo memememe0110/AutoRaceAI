@@ -17314,17 +17314,33 @@ def _v321_final_select_audit(
                 if _v321_car_in_combo(car, str(dp.get("combo") or "")):
                     primary_rule = "hard_race_compact"
                     break
+            # 保護解除リストに無くても compact 適用済みなら hard_race 候補
             if primary_rule:
                 break
+            if hard.get("applied") and not notes_hit:
+                # notes に車番が無い compact 置換は後段フォールバックで扱う
+                pass
             continue
         if notes_hit.get(label):
             primary_rule = label
             break
 
     cb = tri_core.get("car_best") if isinstance(tri_core.get("car_best"), dict) else None
+    in_pool_tri = bool(in_pool.get("三連単"))
+    if primary_rule is None and not final_with_car:
+        if hard.get("applied") and in_pool_tri:
+            primary_rule = "hard_race_compact"
+        elif in_pool_tri:
+            # 母集団にはいたが note 無し = 合成で採用されなかった
+            primary_rule = "synthesis_omit"
+        else:
+            primary_rule = "pool_omit"
+    elif primary_rule is None:
+        primary_rule = "kept_path"
+
     return {
         "car_no": car,
-        "in_pool_tri": bool(in_pool.get("三連単")),
+        "in_pool_tri": in_pool_tri,
         "in_pool_by_type": dict(in_pool),
         "car_best": cb,
         "car_in_hole10": tri_core.get("car_in_hole10"),
@@ -17337,7 +17353,7 @@ def _v321_final_select_audit(
         "hard_race_top_pair": hard.get("top_pair"),
         "point_cap_hint": "14点上限近傍" if int(res.get("points") or 0) >= 12 else "余裕あり",
         "notes_hit_counts": notes_hit,
-        "primary_rule": primary_rule or ("unknown" if not final_with_car else "kept_path"),
+        "primary_rule": primary_rule,
         "notes_samples": notes_samples[:6],
         "residual_with_car": residual[:3],
         "final_tickets_with_car": final_with_car,
@@ -17489,11 +17505,16 @@ def _v321_trace_top3_loss(
                         int(car), result, tri_core=tri_core, in_pool=in_pool,
                     )
                     # primary_rule が分かる場合、空notesの final_select を補完ラベル化
-                    if stage in ("final_select_drop", "unattributed_drop") and audit.get("primary_rule"):
-                        if audit["primary_rule"] == "hole_reject":
+                    if stage in ("final_select_drop", "unattributed_drop", "pool_exclude") and audit.get("primary_rule"):
+                        pr = str(audit.get("primary_rule") or "")
+                        if pr == "hole_reject":
                             stage = "hole_reject"
-                        elif audit["primary_rule"] == "hard_race_compact":
+                        elif pr == "hard_race_compact":
                             stage = "hard_race_compact"
+                        elif pr == "synthesis_omit" and stage != "pool_exclude":
+                            stage = "synthesis_omit"
+                        elif pr == "pool_omit":
+                            stage = "pool_exclude"
                     audit_js = json.dumps(audit, ensure_ascii=False, default=str)
                     con.execute("""
                         INSERT INTO v321_trace_results
