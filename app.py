@@ -16780,6 +16780,7 @@ def _v321_ensure_trace_results_table(db_path: str) -> None:
                 drop_notes_full_json TEXT,
                 in_pool_by_type_json TEXT,
                 tri_core_top_json TEXT,
+                final_select_audit_json TEXT,
                 PRIMARY KEY (race_key, car_no)
             )
         """)
@@ -16793,6 +16794,7 @@ def _v321_ensure_trace_results_table(db_path: str) -> None:
             ("drop_notes_full_json", "TEXT"),
             ("in_pool_by_type_json", "TEXT"),
             ("tri_core_top_json", "TEXT"),
+            ("final_select_audit_json", "TEXT"),
         ):
             if col not in cols:
                 try:
@@ -17235,6 +17237,113 @@ def _v321_detect_drop_stage(car_no: int, result: dict) -> tuple[str, list[dict]]
     return "unattributed_drop", hits
 
 
+def _v321_final_select_audit(
+    car_no: int,
+    result: dict,
+    *,
+    tri_core: dict | None = None,
+    in_pool: dict | None = None,
+) -> dict:
+    """final_select / hole_reject 時の診断専用サマリ（本番買い目不変）。
+
+    result に残る notes・hard_race・residual・plan 点数から、
+    「母集団通過後にどこで落ちたか」を1行で追える形にまとめる。
+    """
+    car = int(car_no)
+    res = result if isinstance(result, dict) else {}
+    tri_core = tri_core or {}
+    in_pool = in_pool or {}
+    hard = res.get("hard_race_info") or {}
+    if not isinstance(hard, dict):
+        hard = {}
+
+    note_fields = (
+        ("solo_gami_exclusion_notes", "solo_gami"),
+        ("v259_overlap_prune_notes", "v259_overlap"),
+        ("gami_prune_notes", "gami_prune"),
+        ("low_odds_floor_notes", "low_odds_floor"),
+        ("replacement_notes", "replacement"),
+        ("protected_add_notes", "protected_add"),
+        ("v260_refill_notes", "v260_refill"),
+        ("v299_hole_reject_notes", "hole_reject"),
+    )
+    notes_hit = {}
+    notes_samples = []
+    for field, label in note_fields:
+        rows = res.get(field) or []
+        if not isinstance(rows, list):
+            continue
+        matched = []
+        for note in rows:
+            s = str(note)
+            if _v321_note_mentions_car(car, s):
+                matched.append(s[:400])
+        if matched:
+            notes_hit[label] = len(matched)
+            for s in matched[:2]:
+                notes_samples.append({"rule": label, "text": s})
+
+    residual = []
+    for row in (res.get("residual_trifecta_candidates") or []):
+        if not isinstance(row, dict):
+            continue
+        combo = str(row.get("combo") or row.get("ticket", {}).get("combo") or "")
+        if _v321_car_in_combo(car, combo):
+            residual.append({
+                "combo": combo,
+                "score": row.get("score"),
+                "probability": row.get("probability"),
+                "odds": row.get("odds"),
+            })
+
+    tickets = res.get("tickets") or []
+    final_with_car = [
+        {"type": t.get("type"), "combo": t.get("combo"), "odds": t.get("odds")}
+        for t in tickets
+        if isinstance(t, dict) and _v321_car_in_combo(car, t.get("combo", ""))
+    ]
+
+    primary_rule = None
+    for label in (
+        "hard_race_compact", "solo_gami", "v259_overlap", "gami_prune",
+        "low_odds_floor", "replacement", "hole_reject", "protected_add", "v260_refill",
+    ):
+        # map hard_race via hard dict
+        if label == "hard_race_compact" and hard.get("applied"):
+            for dp in (hard.get("dropped_protected") or []):
+                if _v321_car_in_combo(car, str(dp.get("combo") or "")):
+                    primary_rule = "hard_race_compact"
+                    break
+            if primary_rule:
+                break
+            continue
+        if notes_hit.get(label):
+            primary_rule = label
+            break
+
+    cb = tri_core.get("car_best") if isinstance(tri_core.get("car_best"), dict) else None
+    return {
+        "car_no": car,
+        "in_pool_tri": bool(in_pool.get("三連単")),
+        "in_pool_by_type": dict(in_pool),
+        "car_best": cb,
+        "car_in_hole10": tri_core.get("car_in_hole10"),
+        "car_hole_ev_rank": tri_core.get("car_hole_ev_rank"),
+        "plan_points": int(res.get("points") or res.get("final_plan_points") or 0),
+        "plan_cost_yen": int(res.get("cost") or res.get("cost_yen") or 0),
+        "hard_race_enabled": bool(hard.get("enabled")),
+        "hard_race_applied": bool(hard.get("applied")),
+        "hard_race_score": hard.get("score"),
+        "hard_race_top_pair": hard.get("top_pair"),
+        "point_cap_hint": "14点上限近傍" if int(res.get("points") or 0) >= 12 else "余裕あり",
+        "notes_hit_counts": notes_hit,
+        "primary_rule": primary_rule or ("unknown" if not final_with_car else "kept_path"),
+        "notes_samples": notes_samples[:6],
+        "residual_with_car": residual[:3],
+        "final_tickets_with_car": final_with_car,
+    }
+
+
 def _v321_trace_top3_loss(
     db_path: str,
     car_filter: list[int] | None = None,
@@ -17376,6 +17485,16 @@ def _v321_trace_top3_loss(
                         int(car), bets, odds_maps, trials=trials, top_n=20, scan_n=120,
                     )
                     tri_core_js = json.dumps(tri_core, ensure_ascii=False, default=str)
+                    audit = _v321_final_select_audit(
+                        int(car), result, tri_core=tri_core, in_pool=in_pool,
+                    )
+                    # primary_rule が分かる場合、空notesの final_select を補完ラベル化
+                    if stage in ("final_select_drop", "unattributed_drop") and audit.get("primary_rule"):
+                        if audit["primary_rule"] == "hole_reject":
+                            stage = "hole_reject"
+                        elif audit["primary_rule"] == "hard_race_compact":
+                            stage = "hard_race_compact"
+                    audit_js = json.dumps(audit, ensure_ascii=False, default=str)
                     con.execute("""
                         INSERT INTO v321_trace_results
                         (race_key,car_no,top3_rank,in_predicted_pool,in_final_plan,
@@ -17384,8 +17503,8 @@ def _v321_trace_top3_loss(
                          tri_seed_points,tri_seed_cover,tri_seed_black,
                          plan_available,plan_reason,source_prediction_version,traced_at,
                          pool_summary_json,tri_seed_json,drop_notes_full_json,
-                         in_pool_by_type_json,tri_core_top_json)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         in_pool_by_type_json,tri_core_top_json,final_select_audit_json)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(race_key,car_no) DO UPDATE SET
                             top3_rank=excluded.top3_rank,
                             in_predicted_pool=excluded.in_predicted_pool,
@@ -17406,14 +17525,15 @@ def _v321_trace_top3_loss(
                             tri_seed_json=excluded.tri_seed_json,
                             drop_notes_full_json=excluded.drop_notes_full_json,
                             in_pool_by_type_json=excluded.in_pool_by_type_json,
-                            tri_core_top_json=excluded.tri_core_top_json
+                            tri_core_top_json=excluded.tri_core_top_json,
+                            final_select_audit_json=excluded.final_select_audit_json
                     """, (
                         rk, int(car), int(rank_idx), 1,
                         1 if n_in_final > 0 else 0, int(n_in_final),
                         stage, json.dumps(notes, ensure_ascii=False, default=str),
                         int(plan_points), int(plan_cost), int(tri_seed), float(tri_cov), float(tri_blk),
                         1 if plan_available else 0, plan_reason, src_ver, now,
-                        pool_summary_js, tri_seed_js, notes_full_js, in_pool_js, tri_core_js,
+                        pool_summary_js, tri_seed_js, notes_full_js, in_pool_js, tri_core_js, audit_js,
                     ))
                     out["rows_saved"] += 1
                     out["by_stage"][stage] = out["by_stage"].get(stage, 0) + 1
@@ -17484,6 +17604,24 @@ def _v321_trace_summary(db_path: str) -> dict:
                 GROUP BY drop_stage ORDER BY n DESC
             """).fetchall():
                 out["car7"]["stage"][str(row[0])] = int(row[1])
+            # final_select audit primary_rule 集計
+            try:
+                _pr = {}
+                for row in con.execute("""
+                    SELECT final_select_audit_json FROM v321_trace_results
+                    WHERE in_final_plan=0
+                      AND final_select_audit_json IS NOT NULL
+                      AND TRIM(final_select_audit_json) <> ''
+                """).fetchall():
+                    try:
+                        d = json.loads(row[0] or "{}")
+                    except Exception:
+                        continue
+                    k = str(d.get("primary_rule") or "unknown")
+                    _pr[k] = _pr.get(k, 0) + 1
+                out["final_select_primary_rules"] = _pr
+            except Exception:
+                pass
             # car_best 集計（tri_core_top_json）
             try:
                 _core_out = {"in_core14": 0, "out_core14": 0, "hole_ok": 0, "no_car_best": 0, "samples": []}
@@ -29799,6 +29937,16 @@ if selected_main_page == "🗃️ 登録情報確認":
                                     "final_select_drop=母集団にはいたが最終券から落ちた。"
                                     "replay再実行後に反映されます。"
                                 )
+                            _prules = _sum.get("final_select_primary_rules") or {}
+                            if _prules:
+                                st.markdown("### 📋 final_select 主因ルール")
+                                st.dataframe(
+                                    pd.DataFrame(
+                                        [{"rule": k, "count": v} for k, v in sorted(_prules.items(), key=lambda x: -x[1])]
+                                    ),
+                                    use_container_width=True, hide_index=True,
+                                )
+                                st.caption("primary_rule=notes/hard_raceから推定した脱落主因（買い目ロジックは不変）")
                             _tc = _sum.get("tri_core") or {}
                             if _tc:
                                 st.markdown("### 📊 三連単 core 順位（脱落車）")
