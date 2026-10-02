@@ -93,17 +93,24 @@ except Exception as _v320_patch_exc:
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver322"
+APP_VERSION = "Ver323"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver322"  # Ver322 S1: temp-scale odds>=30; hole sort=raw EV
+_V231_APP_VERSION = "Ver323"  # Ver323 S2: dual-T temp scale (short=0.90 / hole=1.25)
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 
-# Ver322 S1: temperature scaling (logit space). T=1 → no-op. odds_gate=9999 → full rollback.
-_V322_TEMP_T = 1.25
-_V322_TEMP_ODDS_GATE = 30.0
+# Ver323 S2 Design B: dual temperature scaling (logit space).
+#   odds < gate  → T_short (<1: 低pを底上げ)
+#   odds >= gate → T_hole  (>1: 穴側シャープ化・抑制)
+# ロールバック: T_short=T_hole=1.0 で無補正 / gate=9999 でも短側のみ実質無効に近い
+_V323_TEMP_SHORT = 0.90
+_V323_TEMP_HOLE = 1.25
+_V323_TEMP_ODDS_GATE = 30.0
+# 互換エイリアス（旧 S1 定数名を参照する箇所用）
+_V322_TEMP_T = _V323_TEMP_HOLE
+_V322_TEMP_ODDS_GATE = _V323_TEMP_ODDS_GATE
 
 
 def _v322_temp_scale_prob(
@@ -112,12 +119,20 @@ def _v322_temp_scale_prob(
     *,
     T: float | None = None,
     odds_gate: float | None = None,
+    T_short: float | None = None,
+    T_hole: float | None = None,
 ) -> float:
-    """S1: odds>=gate のみ温度スケーリング。戻りは %。"""
-    if T is None:
-        T = float(_V322_TEMP_T)
+    """S2: 二段温度スケーリング。戻りは %。
+
+    T を明示指定した場合はその T のみ使用（旧S1互換）。
+    未指定時は odds で T_short / T_hole を切替。
+    """
     if odds_gate is None:
-        odds_gate = float(_V322_TEMP_ODDS_GATE)
+        odds_gate = float(_V323_TEMP_ODDS_GATE)
+    if T_short is None:
+        T_short = float(_V323_TEMP_SHORT)
+    if T_hole is None:
+        T_hole = float(_V323_TEMP_HOLE)
     try:
         p = float(prob_pct) / 100.0
         o = float(odds)
@@ -126,11 +141,17 @@ def _v322_temp_scale_prob(
             return float(prob_pct)
         except Exception:
             return 0.0
-    if abs(float(T) - 1.0) < 1e-12 or o < float(odds_gate):
+    if T is not None:
+        use_t = float(T)
+    elif o < float(odds_gate):
+        use_t = float(T_short)
+    else:
+        use_t = float(T_hole)
+    if abs(use_t - 1.0) < 1e-12:
         return float(prob_pct)
     p = min(max(p, 1e-6), 1.0 - 1e-6)
     logit = math.log(p / (1.0 - p))
-    z = -float(T) * logit
+    z = -use_t * logit
     p_cal = 1.0 / (1.0 + math.exp(min(z, 700.0)))
     return float(p_cal * 100.0)
 
@@ -17105,8 +17126,10 @@ def _v321_tri_core_top(
             "ev": [0.30, 2.50],
             "ev_basis": "raw_ev_cal",
             "sort": "raw_ev_pre",
-            "temp_T": float(_V322_TEMP_T),
-            "temp_odds_gate": float(_V322_TEMP_ODDS_GATE),
+            "temp_T_short": float(_V323_TEMP_SHORT),
+            "temp_T_hole": float(_V323_TEMP_HOLE),
+            "temp_T": float(_V323_TEMP_HOLE),  # 互換: 穴側T
+            "temp_odds_gate": float(_V323_TEMP_ODDS_GATE),
             "pool_size": 10,
         },
         "hole_candidates_ev_desc": hole_ev_top15,
