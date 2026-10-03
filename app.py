@@ -97,7 +97,7 @@ APP_VERSION = "Ver324"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver324"  # Ver324: ◎点数下限>=5（プラン生成はVer322 S1のまま）
+_V231_APP_VERSION = "Ver324"  # Ver324: ◎点数下限>=5 / race_no補完はデータ整合のみ（予測不変）
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 
@@ -9771,6 +9771,105 @@ _V319_WX_FETCH_LIMIT = 15
 _V319_HIST_REFRESHED: set[str] = set()
 # Ver320: cache_key -> before_d(8桁)。同一開催日取込中は SELECT すら打たない
 _V319_HIST_SKIPPED: dict[str, str] = {}
+
+
+def _v319_hist_skip_cache_ensure(con) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v319_hist_skip_cache (
+            player_cd TEXT NOT NULL,
+            target_ymd TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            official_latest TEXT,
+            PRIMARY KEY (player_cd, target_ymd)
+        )
+        """
+    )
+
+
+def _v319_persistent_skip_lookup(db_path: str, player_cd: str, target_ymd: str, con=None) -> dict | None:
+    """(player_cd, target_ymd) が既に確認済みならスキップ。
+
+    Ver324: 同日一括取込の2レース目以降・再起動後も HTTP を打たない。
+    TTLなし。同じ対象日を再度公式確認する意味がないため。
+    """
+    pcd = str(player_cd or "").strip()
+    ymd = _v319_ymd_digits(target_ymd or "")
+    if not pcd or not ymd:
+        return None
+    own = con is None
+    try:
+        if own:
+            con = sqlite3.connect(str(db_path), timeout=5.0)
+        _v319_hist_skip_cache_ensure(con)
+        row = con.execute(
+            "SELECT fetched_at, official_latest FROM v319_hist_skip_cache "
+            "WHERE player_cd=? AND target_ymd=?",
+            (pcd, ymd),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "skip": True,
+            "reason": f"永続キャッシュ(対象日{ymd})",
+            "fetched_at": row[0],
+            "official_latest": row[1],
+        }
+    except Exception:
+        return None
+    finally:
+        if own and con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+
+def _v319_persistent_skip_mark(
+    db_path: str,
+    player_cd: str,
+    target_ymd: str,
+    official_latest: str = "",
+    con=None,
+) -> None:
+    """対象日までの履歴確認済みを永続化。"""
+    pcd = str(player_cd or "").strip()
+    ymd = _v319_ymd_digits(target_ymd or "")
+    if not pcd or not ymd:
+        return
+    own = con is None
+    try:
+        if own:
+            con = sqlite3.connect(str(db_path), timeout=5.0)
+        _v319_hist_skip_cache_ensure(con)
+        con.execute(
+            """
+            INSERT INTO v319_hist_skip_cache(player_cd, target_ymd, fetched_at, official_latest)
+            VALUES (?,?,?,?)
+            ON CONFLICT(player_cd, target_ymd) DO UPDATE SET
+                fetched_at=excluded.fetched_at,
+                official_latest=COALESCE(
+                    NULLIF(excluded.official_latest,''),
+                    v319_hist_skip_cache.official_latest
+                )
+            """,
+            (
+                pcd,
+                ymd,
+                _v228_now_jst_iso(),
+                _v319_ymd_digits(official_latest or "") or "",
+            ),
+        )
+        if own:
+            con.commit()
+    except Exception:
+        pass
+    finally:
+        if own and con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
 # 同一 player_cd の公式履歴DFを取込ジョブ内で再利用
 _V319_HIST_DF_CACHE: dict[str, object] = {}
 
@@ -10698,7 +10797,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
             f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}",
         ):
             try:
-                html = _v319_http_get(url, timeout=15, retries=2)
+                html = _v319_http_get(url, timeout=8, retries=1)
                 if html and len(html) > 500:
                     pc_ok = True
                 hist = _v319_parse_pc_player_history_html(html, name)
@@ -10718,7 +10817,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
                 "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
                 f"?playerCd={pcd}&historyDispType=d"
             )
-            sp_html = _v319_http_get(sp_url, timeout=15, retries=2)
+            sp_html = _v319_http_get(sp_url, timeout=8, retries=1)
             sp_rows = _v319_parse_sp_player_history_rows(sp_html, name)
         except Exception:
             sp_rows = []
@@ -11250,6 +11349,17 @@ def _v319_fill_player_histories(
                     _ = details.append(f"{name}:ジョブ内キャッシュ即スキップ")
                     continue
 
+                # Ver324: DB永続スキップ（再起動後も同対象日は HTTP しない）
+                if pcd and before_d_job:
+                    _persist = _v319_persistent_skip_lookup(
+                        db_path, pcd, before_d_job, con=con
+                    )
+                    if _persist and _persist.get("skip"):
+                        skipped += 1
+                        _V319_HIST_SKIPPED[cache_key] = before_d_job
+                        _ = details.append(f"{name}:{_persist.get('reason')}")
+                        continue
+
                 if not pcd:
                     errors += 1
                     _ = details.append(f"{name}:playerCdなし")
@@ -11376,6 +11486,10 @@ def _v319_fill_player_histories(
                         _ = details.append(f"{name}:穴なしスキップ(既存{have}件/最新{latest_d})")
                         if before_d and latest_d and latest_d >= before_d:
                             _V319_HIST_SKIPPED[cache_key] = before_d or "1"
+                            if pcd:
+                                _v319_persistent_skip_mark(
+                                    db_path, pcd, before_d, latest_d, con=con
+                                )
                         continue
                     # 穴埋め対象: missing_official を全部 + R欠落行の再構築
                     need_refresh = True
@@ -11614,6 +11728,10 @@ def _v319_fill_player_histories(
                     _remaining_missing = official_keys - after_keys
                     if before_d and after_latest and after_latest >= before_d and not _remaining_missing:
                         _V319_HIST_SKIPPED[cache_key] = before_d or "1"
+                        if pcd:
+                            _v319_persistent_skip_mark(
+                                db_path, pcd, before_d, after_latest, con=con
+                            )
                     elif not before_d and after >= min_rows and not _remaining_missing:
                         _V319_HIST_SKIPPED[cache_key] = before_d or "1"
                 except Exception:
@@ -12481,6 +12599,24 @@ def _v319_register_fetched_result(
         _v187_sync_mixed_feedback(db_path)
     except Exception:
         pass
+    # Ver324: 結果登録で生成された選手履歴へ race_no を補完
+    # engine 側が race_history.race_no を空で書く経路があるため、
+    # 登録直後に result_races を正本として埋める（対象選手のみ）。
+    try:
+        _names_fix = []
+        if isinstance(rows_r, pd.DataFrame) and "選手名" in rows_r.columns:
+            _names_fix = [
+                str(x).strip()
+                for x in rows_r["選手名"].dropna().tolist()
+                if str(x).strip() and str(x).strip().lower() != "none"
+            ]
+        if _names_fix:
+            for _pn in dict.fromkeys(_names_fix):  # 順序保持のユニーク
+                _v320_backfill_race_no_for_player(db_path, _pn)
+        else:
+            _v320_backfill_race_no_for_player(db_path, "")
+    except Exception:
+        pass
     return {"key": str(key), "cars": int(len(rows_for_engine)), "laps": int(len(laps_r) if laps_r is not None else 0)}
 
 
@@ -13223,6 +13359,17 @@ def _v319_import_one_race(
             "key": key,
             "next_action": "retry",
         }
+    # Ver324: 取込完了時にも対象選手の race_no を補完（register側の保険）
+    try:
+        _names_fix = [
+            str(p.get("name") or "").strip()
+            for p in (players or [])
+            if str(p.get("name") or "").strip()
+        ]
+        for _pn in dict.fromkeys(_names_fix):
+            _v320_backfill_race_no_for_player(db_path, _pn)
+    except Exception:
+        pass
     return {
         "status": "ok",
         "phase": "completed",
