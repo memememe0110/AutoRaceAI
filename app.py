@@ -10767,7 +10767,7 @@ def _v319_parse_sp_player_history_rows(html: str, player_name: str) -> list[dict
     return out
 
 
-def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFrame:
+def _v319_fetch_player_history_df(player_cd: str, player_name: str):
     """PC版を優先。有効HTMLが取れたら PC2/SP は打たない（空履歴でも）。
 
     Ver320:
@@ -10797,7 +10797,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
             f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}",
         ):
             try:
-                html = _v319_http_get(url, timeout=8, retries=1)
+                html = _v319_http_get(url, timeout=15, retries=2)
                 if html and len(html) > 500:
                     pc_ok = True
                 hist = _v319_parse_pc_player_history_html(html, name)
@@ -10817,7 +10817,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
                 "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
                 f"?playerCd={pcd}&historyDispType=d"
             )
-            sp_html = _v319_http_get(sp_url, timeout=8, retries=1)
+            sp_html = _v319_http_get(sp_url, timeout=15, retries=2)
             sp_rows = _v319_parse_sp_player_history_rows(sp_html, name)
         except Exception:
             sp_rows = []
@@ -10831,10 +10831,13 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str) -> pd.DataFr
         out = pd.DataFrame(hist)
     else:
         out = pd.DataFrame()
-    # 全滅（例外）のときはキャッシュしない。次レースで再試行させる。
-    # 本当に履歴0件（pc_ok=True, hist=[]）はキャッシュ対象のまま。
-    _all_failed = bool(pc_err) and (not pc_ok) and (out is None or getattr(out, "empty", True))
-    if pcd and not _all_failed:
+    # Ver324: 有効HTMLを1回も得られていない（全リクエスト失敗）→ None
+    # 呼び出し側は errors 扱いし、スキップキャッシュに書かない。
+    # 本当に履歴0件（pc_ok=True, hist=[]）は空DFのまま返す。
+    _all_failed = (not pc_ok) and (not hist) and (not sp_rows)
+    if _all_failed:
+        return None
+    if pcd:
         try:
             _V319_HIST_DF_CACHE[pcd] = out.copy() if hasattr(out, "copy") else out
         except Exception:
@@ -11400,13 +11403,22 @@ def _v319_fill_player_histories(
                     f"{name}:取得開始(DB{have}件/最新{latest_d or 'なし'}/対象{before_d or '-'})"
                 )
                 df = _v319_fetch_player_history_df(pcd, name)
-                if df is None or df.empty:
+                # 取得失敗（None）は常に errors。スキップ・永続キャッシュに書かない。
+                if df is None:
+                    errors += 1
+                    _ = details.append(f"{name}:取得失敗(再試行対象/cd={pcd or '-'})")
+                    continue
+                if df.empty:
                     if have <= 0:
                         errors += 1
                         _ = details.append(f"{name}:履歴0件(cd={pcd or '-'})")
                     else:
                         skipped += 1
                         _ = details.append(f"{name}:公式0件/既存{have}")
+                    # 公式0件の成功応答は「対象日まで確認済み」としてキャッシュ可
+                    if before_d and pcd and have > 0:
+                        _V319_HIST_SKIPPED[cache_key] = before_d or "1"
+                        _v319_persistent_skip_mark(db_path, pcd, before_d, latest_d, con=con)
                     continue
 
                 if "車番" not in df.columns:
