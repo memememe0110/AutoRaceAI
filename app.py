@@ -10632,6 +10632,15 @@ def _v319_parse_sp_player_history_rows(html: str, player_name: str) -> list[dict
                 rname = rname[:idx].strip()
                 break
         rname = re.sub(r"\d+人気.*$", "", rname).strip()
+        # Ver324: SP本文から R を拾う（従来は常に0でDBに空レースが残った）
+        rn = 0
+        for blob in (body, rname):
+            m_rn = re.search(r"(?<!\d)([1-9]|1[0-2])\s*R\b", str(blob or ""), flags=re.I)
+            if not m_rn:
+                m_rn = re.search(r"第\s*([1-9]|1[0-2])\s*レース", str(blob or ""))
+            if m_rn:
+                rn = int(m_rn.group(1))
+                break
         date_s = f"{m.group('y')}-{int(m.group('m')):02d}-{int(m.group('d')):02d}"
         fin_s = m.group("fin")
         fin = int(fin_s) if re.fullmatch(r"\d+", fin_s) else None
@@ -10640,7 +10649,7 @@ def _v319_parse_sp_player_history_rows(html: str, player_name: str) -> list[dict
             "選手名": player_name,
             "開催日": date_s,
             "開催場": m.group("ven"),
-            "レース": 0,
+            "レース": rn,
             "レース名": rname,
             "レース種別": "",
             "着順": fin,
@@ -10928,12 +10937,30 @@ def _v319_fill_missing_race_nos(df: pd.DataFrame, db_path: str = "", player_name
     優先順:
       1) レース名・種別内の「N R」表記
       2) result_entries（日付+場+選手名）
+
+    Ver324: 「一般戦」「予選」など非数値がレース列に入っている場合はレース名へ退避してから補完。
     """
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return df
     df = df.copy()
     if "レース" not in df.columns:
         df["レース"] = 0
+    # 0) 非数値レース値をレース名へ退避
+    for i, row in df.iterrows():
+        raw = row.get("レース")
+        try:
+            cur = int(pd.to_numeric(raw, errors="coerce") or 0)
+        except Exception:
+            cur = 0
+        if 1 <= cur <= 12:
+            df.at[i, "レース"] = cur
+            continue
+        s = str(raw or "").strip()
+        if s and not re.fullmatch(r"\d+(\.0+)?", s):
+            # 一般戦/予選 等がレース列に混入
+            if "レース名" in df.columns and not str(row.get("レース名") or "").strip():
+                df.at[i, "レース名"] = s
+            df.at[i, "レース"] = 0
     # 1) テキストから
     for i, row in df.iterrows():
         try:
@@ -28950,7 +28977,11 @@ if selected_main_page == "👤 選手情報登録":
         if not player_name.strip() or not history_text.strip():
             st.warning("選手名と履歴を入力してください。")
         else:
-            parsed = engine.v15_parse_player_history(history_text, player_name=player_name.strip())
+            # Ver324: "1R" 単独行をパーサが拾いやすいよう正規化
+            _ht = str(history_text or "")
+            _ht = re.sub(r"(?m)^\s*([1-9]|1[0-2])\s*[RrＲｒ]\s*$", lambda m: f"{int(m.group(1))}R", _ht)
+            _ht = re.sub(r"(?m)^\s*[RrＲｒ]\s*([1-9]|1[0-2])\s*$", lambda m: f"{int(m.group(1))}R", _ht)
+            parsed = engine.v15_parse_player_history(_ht, player_name=player_name.strip())
             try:
                 if isinstance(parsed, pd.DataFrame):
                     parsed = _v319_fill_missing_race_nos(parsed, db_path=engine.DB_PATH, player_name=player_name.strip())
@@ -29090,6 +29121,15 @@ if selected_main_page == "👤 選手情報登録":
                     if level == "success":
                         level = "warning"
 
+                # Ver324: 貼付登録直後に result_races から race_no を補完（空のまま残さない）
+                if changed and player_name.strip():
+                    try:
+                        _bf_rn = _v320_backfill_race_no_for_player(engine.DB_PATH, player_name.strip())
+                        _nfix = int(_bf_rn.get("race_history", 0) or 0) + int(_bf_rn.get("v15", 0) or 0)
+                        if _nfix:
+                            full_text += f"｜race_no補完 {_nfix}件"
+                    except Exception as _bf_exc:
+                        full_text += f"｜race_no補完スキップ: {type(_bf_exc).__name__}"
                 _set_sticky_notice("player_register_notice", level, full_text)
                 getattr(st, level, st.info)(full_text)
                 if pending_left:
