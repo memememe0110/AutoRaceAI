@@ -93,11 +93,15 @@ except Exception as _v320_patch_exc:
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver325"
+APP_VERSION = "Ver324"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver325"  # Ver325: G1 投入時完全包含拒否 / オッズ再計算でプラン更新可
+_V231_APP_VERSION = "Ver324"  # 本線=Ver324。Ver325(G1)は実験経路のみ保存。
+
+# Ver325 G1: 本線では無効。odds_replan など実験経路でのみ一時的に True。
+_V325_ENABLE_G1 = False
+_V325_APP_VERSION = "Ver325"
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 
@@ -9735,12 +9739,21 @@ def _v319_apply_odds_and_plan(
     plan_error = ""
     if isinstance(bets, dict) and bets and n_odds:
         try:
-            result = v184_eight_car_mixed_plan(bets, trials, meta, parsed)
-            result = v277_provisional_merge_7types(result, bets, trials, parsed)
+            # 実験経路(odds_replan): G1有効 + Ver325として保存。本線は Ver324・G1オフ。
+            _exp325 = bool(use_saved_odds)
+            _prev_g1 = bool(globals().get("_V325_ENABLE_G1"))
+            if _exp325:
+                globals()["_V325_ENABLE_G1"] = True
+            try:
+                result = v184_eight_car_mixed_plan(bets, trials, meta, parsed)
+                result = v277_provisional_merge_7types(result, bets, trials, parsed)
+            finally:
+                globals()["_V325_ENABLE_G1"] = _prev_g1
             if isinstance(result, dict) and result.get("available"):
+                _save_ver = str(globals().get("_V325_APP_VERSION") or "Ver325") if _exp325 else str(APP_VERSION)
                 _origin325 = "odds_replan" if use_saved_odds else "official_import"
                 plan_hash = str(_v187_save_mixed_plan(
-                    db_path, str(race_key), result, app_version=APP_VERSION,
+                    db_path, str(race_key), result, app_version=_save_ver,
                     plan_origin=_origin325,
                     source_prediction_version=str((view or {}).get("app_version") or APP_VERSION),
                     include_in_live_stats=True,
@@ -9748,11 +9761,11 @@ def _v319_apply_odds_and_plan(
                 if plan_hash:
                     try:
                         _v321_save_plan_diagnostics(
-                            db_path, str(race_key), plan_hash, result, str(APP_VERSION),
+                            db_path, str(race_key), plan_hash, result, str(_save_ver),
                         )
                     except Exception:
                         pass
-                    _v305_supersede_plan_after_odds_refresh(db_path, str(race_key), APP_VERSION, plan_hash)
+                    _v305_supersede_plan_after_odds_refresh(db_path, str(race_key), _save_ver, plan_hash)
                     try:
                         _v212_recalculate_plan_feedback(db_path, str(race_key), plan_hash)
                     except Exception:
@@ -11522,11 +11535,13 @@ def _v319_fill_player_histories(
                     if not missing_official and not dirty_keys:
                         skipped += 1
                         _ = details.append(f"{name}:穴なしスキップ(既存{have}件/最新{latest_d})")
-                        if before_d and latest_d and latest_d >= before_d:
+                        # 対象日より前に穴なし＝公式確認済み。latest < 対象日でもキャッシュする
+                        # （当日レース前は latest が対象日以上にならないため）
+                        if before_d:
                             _V319_HIST_SKIPPED[cache_key] = before_d or "1"
                             if pcd:
                                 _v319_persistent_skip_mark(
-                                    db_path, pcd, before_d, latest_d, con=con
+                                    db_path, pcd, before_d, latest_d or before_d, con=con
                                 )
                         continue
                     # 穴埋め対象: missing_official を全部 + R欠落行の再構築
@@ -11573,11 +11588,14 @@ def _v319_fill_player_histories(
                 if not keep:
                     skipped += 1
                     _ = details.append(f"{name}:追加対象なし(既存{have}/公式{len(official_keys)})")
-                    # 一度公式を見て追加不要なら、同一プロセス内は再取得しない
-                    # （latest が対象日未満でも「今日の出走なし」で繰り返しHTTPしない）
-                    if is_existing or have >= min_rows:
+                    # 一度公式を見て追加不要 → 同対象日は再HTTPしない（永続も）
+                    if before_d and (is_existing or have >= min_rows):
                         _V319_HIST_SKIPPED[cache_key] = before_d or "1"
-                    elif before_d and latest_d and latest_d >= before_d:
+                        if pcd:
+                            _v319_persistent_skip_mark(
+                                db_path, pcd, before_d, latest_d or before_d, con=con
+                            )
+                    elif is_existing or have >= min_rows:
                         _V319_HIST_SKIPPED[cache_key] = before_d or "1"
                     continue
 
@@ -11780,11 +11798,12 @@ def _v319_fill_player_histories(
                     after_keys = set(after_state.get("keys") or set())
                     after_latest = _v319_ymd_digits(str(after_state.get("latest") or ""))
                     _remaining_missing = official_keys - after_keys
-                    if before_d and after_latest and after_latest >= before_d and not _remaining_missing:
+                    # 公式穴が解消されていれば対象日キャッシュ（当日でも latest < 対象日でOK）
+                    if before_d and not _remaining_missing and after >= min_rows:
                         _V319_HIST_SKIPPED[cache_key] = before_d or "1"
                         if pcd:
                             _v319_persistent_skip_mark(
-                                db_path, pcd, before_d, after_latest, con=con
+                                db_path, pcd, before_d, after_latest or before_d, con=con
                             )
                     elif not before_d and after >= min_rows and not _remaining_missing:
                         _V319_HIST_SKIPPED[cache_key] = before_d or "1"
@@ -20570,7 +20589,10 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         }
 
     # Ver325 G1: 投入時に完全包含なら入れない（後段v259の前倒し）
+    # 本線 Ver324 では _V325_ENABLE_G1=False のため常に False（無効）
     def _g1_fully_contained(plan, cand) -> bool:
+        if not bool(globals().get("_V325_ENABLE_G1")):
+            return False
         try:
             m = set(cand.get("matched") or set())
             if not m:
