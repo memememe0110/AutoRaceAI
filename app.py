@@ -23080,6 +23080,8 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                     END AS app_version,
                     r.logic_version, r.points, r.cost_yen, r.grade,
                     r.model_return_rate, r.created_at,
+                    COALESCE(NULLIF(r.plan_origin,''),'live') AS plan_origin,
+                    COALESCE(NULLIF(r.source_prediction_version,''),'') AS source_prediction_version,
                     a.recommendation_label AS new_recommendation_label,
                     a.recommendation_score AS new_recommendation_score,
                     a.adjusted_return_rate AS new_adjusted_return_rate,
@@ -23095,7 +23097,8 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
                                      AND NULLIF(r.source_prediction_version,'') IS NOT NULL
                                 THEN r.source_prediction_version
                                 ELSE COALESCE(NULLIF(r.app_version,''),'Unknown')
-                            END
+                            END,
+                            COALESCE(NULLIF(r.plan_origin,''),'live')
                         ORDER BY datetime(f.evaluated_at) DESC,
                                  datetime(r.created_at) DESC,
                                  r.plan_hash DESC
@@ -23111,12 +23114,13 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
             )
             SELECT race_key,race_date,venue,race_no,app_version,logic_version,
                    points,cost_yen,grade,model_return_rate,created_at,
+                   plan_origin,source_prediction_version,
                    new_recommendation_label,new_recommendation_score,new_adjusted_return_rate,
                    new_recommendation_cover,new_recommendation_max_ev,new_recommendation_hole_count,
                    hit,black_hit,gami_hit,payout_yen,return_rate,winning_types,evaluated_at
             FROM evaluated
             WHERE rn=1
-            ORDER BY race_date,venue,CAST(race_no AS INTEGER),app_version
+            ORDER BY race_date,venue,CAST(race_no AS INTEGER),app_version,plan_origin
         """
         with sqlite3.connect(str(db_path), timeout=30.0) as con:
             con.execute("PRAGMA busy_timeout=30000")
@@ -23240,6 +23244,8 @@ def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataF
         "payout_yen": "払戻額",
         "return_rate": "回収率",
         "app_version": "バージョン",
+        "plan_origin": "生成経路",
+        "source_prediction_version": "元予測版",
         "grade": "元判定",
         "new_recommendation_label": "新推奨",
         "new_recommendation_score": "推奨スコア",
@@ -23256,6 +23262,7 @@ def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataF
     out = out.rename(columns=rename)
     prefer = [
         "日付", "開催場", "R", "race_key", "バージョン",
+        "生成経路", "元予測版",
         "推奨区分", "新推奨", "推奨フラグ", "推奨スコア",
         "新判定参考回収率", "新判定カバー", "新判定最大EV", "中穴候補数", "点数",
         "購入額", "払戻額", "回収率", "収支", "判定", "的中フラグ", "的中券種", "元判定",
@@ -23444,6 +23451,8 @@ def _v300_bettype_support_audit(db_path: str, df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     w=df.merge(support,on=["race_key","app_version"],how="inner")
+    # Ver325: plan_origin で同一レースが複数行になり得るため、全経路表示時の水増し防止
+    w = w.drop_duplicates(subset=["race_key", "app_version"], keep="first")
     if "new_recommendation_max_ev" not in w.columns:
         return pd.DataFrame()
 
@@ -23518,6 +23527,8 @@ def _v300_support_rescue_summary(db_path: str, df: pd.DataFrame) -> dict:
         return {}
 
     w=df.merge(s,on=["race_key","app_version"],how="inner")
+    # Ver325: plan_origin 複数行の重複カウント防止
+    w = w.drop_duplicates(subset=["race_key", "app_version"], keep="first")
     if "new_recommendation_max_ev" not in w.columns:
         return {}
     w["max_ev"]=pd.to_numeric(w["new_recommendation_max_ev"],errors="coerce")
@@ -23752,15 +23763,34 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         return
 
     venues = sorted([str(v) for v in df["venue"].dropna().unique() if str(v)])
-    c1, c2 = st.columns(2)
-    selected_venue = c1.selectbox("開催場で絞る", ["全開催場"] + venues, key="v215_return_venue")
     versions = sorted([str(v) for v in df["app_version"].dropna().unique() if str(v)])
+    origins = sorted([str(v) for v in df["plan_origin"].dropna().unique() if str(v)]) if "plan_origin" in df.columns else []
+    c1, c2, c3 = st.columns(3)
+    selected_venue = c1.selectbox("開催場で絞る", ["全開催場"] + venues, key="v215_return_venue")
     selected_version = c2.selectbox("バージョンで絞る", ["全バージョン"] + versions, key="v215_return_version")
+    selected_origin = c3.selectbox(
+        "生成経路で絞る",
+        ["全経路"] + origins,
+        key="v215_return_origin",
+        help=(
+            "live=本番予測 / odds_replan=保存オッズ再計算(Ver325 G1) / "
+            "official_import=公式取込 / recommendation_relabel=推奨のみコピー / "
+            "current_version_restore・source_version_restore=復元"
+        ),
+    )
+    if "plan_origin" in df.columns:
+        _org_counts = df["plan_origin"].fillna("live").astype(str).value_counts()
+        st.caption(
+            "生成経路の内訳（絞り込み前）: "
+            + " / ".join(f"{k}:{int(v)}R" for k, v in _org_counts.items())
+        )
     filtered = df.copy()
     if selected_venue != "全開催場":
         filtered = filtered[filtered["venue"].astype(str) == selected_venue]
     if selected_version != "全バージョン":
         filtered = filtered[filtered["app_version"].astype(str) == selected_version]
+    if selected_origin != "全経路" and "plan_origin" in filtered.columns:
+        filtered = filtered[filtered["plan_origin"].astype(str) == selected_origin]
     if filtered.empty:
         st.warning("選択条件に該当する実績がありません。")
         return
@@ -23949,7 +23979,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         detail = filtered.copy()
         detail["日付"] = detail["race_date"].dt.strftime("%Y-%m-%d")
         detail["判定"] = detail.apply(lambda r: "◎黒字" if r.get("black_hit") else ("△ガミ" if r.get("gami_hit") else "×外れ"), axis=1)
-        cols = ["日付","venue","race_no","推奨区分","grade","new_recommendation_label",
+        cols = ["日付","venue","race_no","推奨区分","plan_origin","source_prediction_version","grade","new_recommendation_label",
                 "new_recommendation_score","new_adjusted_return_rate","new_recommendation_cover",
                 "new_recommendation_max_ev","new_recommendation_hole_count",
                 "判定","points","cost_yen","payout_yen","return_rate","収支","app_version"]
@@ -23957,6 +23987,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         detail = detail[cols].rename(columns={
             "venue":"開催場","race_no":"R","points":"点数","cost_yen":"購入額",
             "payout_yen":"払戻額","return_rate":"回収率","app_version":"バージョン","grade":"元判定",
+            "plan_origin":"生成経路","source_prediction_version":"元予測版",
             "new_recommendation_label":"新推奨","new_recommendation_score":"推奨スコア",
             "new_adjusted_return_rate":"新判定参考回収率","new_recommendation_cover":"新判定カバー",
             "new_recommendation_max_ev":"新判定最大EV","new_recommendation_hole_count":"中穴候補数",
