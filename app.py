@@ -12873,8 +12873,9 @@ def _v319_import_player_history_one_race(
     for nm in _names_chk:
         if int(_cnt_map.get(nm) or 0) <= 0:
             _ = missing.append(nm)
-    if missing or errors > 0:
-        who = ", ".join(missing[:5]) if missing else "取込エラーあり"
+    # Ver325: 履歴0件の選手がいるときだけ中止。errors のみは警告付き続行。
+    if missing:
+        who = ", ".join(missing[:5])
         return {
             "status": "error",
             "phase": "save_player_history",
@@ -12887,20 +12888,29 @@ def _v319_import_player_history_one_race(
             "added": added,
             "next_action": "retry",
             "notify": True,
-            "notify_message": f"【履歴失敗】{venue}{race_no}R：{who}の履歴が不足/失敗。",
+            "notify_message": f"【履歴失敗】{venue}{race_no}R：{who}の履歴が不足。",
         }
 
+    warn = ""
+    if errors > 0:
+        warn = f" ⚠取得失敗{errors}件（既存履歴で続行）"
     return {
         "status": "ok",
         "phase": "save_player_history",
         "message": (
             f"{venue} {race_no}R：選手履歴のみ保存しました（{len(players)}人）。"
-            f" {hist_msg}" + (f"｜{detail}" if detail else "")
+            f" {hist_msg}{warn}" + (f"｜{detail}" if detail else "")
         ),
         "key": key_guess,
         "player_history_saved": True,
         "added": added,
+        "errors": errors,
         "next_action": "done",
+        "notify": bool(errors > 0),
+        "notify_message": (
+            f"【履歴警告】{venue}{race_no}R：取得失敗{errors}件。既存履歴で続行。"
+            if errors > 0 else ""
+        ),
     }
 
 
@@ -13048,16 +13058,16 @@ def _v319_import_one_race(
         )
         hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
         err_n = int(filled.get("errors") or 0)
-        # 1人でも履歴0 or 取込エラーなら予測しない（通知して終了）
+        # Ver325: 履歴0件の選手がいるときだけ予測中止。errors のみは警告付きで続行。
         missing = []
         _names_chk = [str(p.get("name") or "").strip() for p in players if str(p.get("name") or "").strip()]
         _cnt_map = _v319_player_history_counts_batch(db_path, _names_chk)
         for nm in _names_chk:
             if int(_cnt_map.get(nm) or 0) <= 0:
                 _ = missing.append(nm)
-        if missing or err_n > 0:
+        if missing:
             detail = " / ".join(str(x) for x in (filled.get("details") or [])[:8])
-            who = ", ".join(missing[:5]) if missing else "取込エラーあり"
+            who = ", ".join(missing[:5])
             return {
                 "status": "error",
                 "phase": "save_player_history",
@@ -13073,10 +13083,13 @@ def _v319_import_one_race(
                 "next_action": "retry",
                 "notify": True,
                 "notify_message": (
-                    f"【履歴失敗】{venue}{race_no}R：{who}の履歴が不足/失敗。"
+                    f"【履歴失敗】{venue}{race_no}R：{who}の履歴が不足。"
                     f" 予測は実行していません。"
                 ),
             }
+        # errors のみ: メッセージに残し、予測は続行
+        if err_n > 0:
+            hist_msg += f" ⚠取得失敗{err_n}件（既存履歴で予測続行）"
     except Exception as exc:
         return {
             "status": "error",
