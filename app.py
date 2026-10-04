@@ -93,11 +93,11 @@ except Exception as _v320_patch_exc:
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver324"
+APP_VERSION = "Ver325"
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver324"  # Ver324: ◎点数下限>=5 / race_no補完はデータ整合のみ（予測不変）
+_V231_APP_VERSION = "Ver325"  # Ver325: G1 投入時完全包含拒否 / オッズ再計算でプラン更新可
 
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 
@@ -9699,14 +9699,34 @@ def _v319_load_latest_prediction_view(db_path: str, race_key: str) -> dict:
         return {}
 
 
-def _v319_apply_odds_and_plan(db_path: str, ymd: str, venue: str, race_no: int, race_key: str, view: dict | None = None) -> dict:
+def _v319_apply_odds_and_plan(
+    db_path: str, ymd: str, venue: str, race_no: int, race_key: str,
+    view: dict | None = None, *, use_saved_odds: bool = False, refetch_odds: bool = True,
+) -> dict:
     """公式オッズを保存し、回収率重視プランを作って結果照合する。
 
     Ver319 fix: プラン生成（v184/v277）の例外はオッズ保存を失敗扱いにしない。
-    以前は NameError 等でプランが落ちると「オッズ取得失敗」になり結果登録まで止まっていた。
+    Ver325: use_saved_odds=True ならHTTPせず保存済みオッズだけでプラン再生成
+            （6周再シミュレーション不要）。
     """
-    parsed = _v319_fetch_official_odds(ymd, venue, race_no)
-    n_odds = _v319_save_official_odds(db_path, race_key, parsed)
+    parsed = {}
+    n_odds = 0
+    if use_saved_odds or not refetch_odds:
+        try:
+            parsed, _meta_od = _v221_load_odds_snapshot(db_path, str(race_key))
+            if not isinstance(parsed, dict):
+                parsed = {}
+            n_odds = int(sum(len(v) for v in parsed.values())) if parsed else 0
+        except Exception:
+            parsed, n_odds = {}, 0
+        if n_odds <= 0 and refetch_odds and not use_saved_odds:
+            parsed = _v319_fetch_official_odds(ymd, venue, race_no)
+            n_odds = _v319_save_official_odds(db_path, race_key, parsed)
+        elif n_odds <= 0 and use_saved_odds:
+            return {"odds": 0, "plan_hash": "", "plan_error": "保存オッズなし"}
+    else:
+        parsed = _v319_fetch_official_odds(ymd, venue, race_no)
+        n_odds = _v319_save_official_odds(db_path, race_key, parsed)
     view = view if isinstance(view, dict) and view else _v319_load_latest_prediction_view(db_path, race_key)
     bets = (view or {}).get("bets")
     meta = (view or {}).get("meta") or {}
@@ -9718,9 +9738,10 @@ def _v319_apply_odds_and_plan(db_path: str, ymd: str, venue: str, race_no: int, 
             result = v184_eight_car_mixed_plan(bets, trials, meta, parsed)
             result = v277_provisional_merge_7types(result, bets, trials, parsed)
             if isinstance(result, dict) and result.get("available"):
+                _origin325 = "odds_replan" if use_saved_odds else "official_import"
                 plan_hash = str(_v187_save_mixed_plan(
                     db_path, str(race_key), result, app_version=APP_VERSION,
-                    plan_origin="official_import",
+                    plan_origin=_origin325,
                     source_prediction_version=str((view or {}).get("app_version") or APP_VERSION),
                     include_in_live_stats=True,
                 ) or "")
@@ -10323,14 +10344,23 @@ def _v319_open_conn(db_path: str):
 
 
 def _v319_name_where(con, table: str, alias: str = "") -> str:
-    """選手名の照合式。正規化列 player_name_key があれば索引が効く等値比較にする。"""
+    """選手名の照合式。
+
+    player_name_key 列がある場合も、NULL/空キーは player_name 正規化で照合する。
+    （engine 保存直後は key が埋まっていないことがある）
+    """
     pre = (str(alias) + ".") if alias else ""
+    expr_name = "replace(replace(COALESCE(%splayer_name,''),' ',''),'　','')" % pre
     try:
         if "player_name_key" in set(_v319_table_columns_cached(con, table)):
-            return "%splayer_name_key=?" % pre
+            # COALESCE(key, 正規化名)=? で NULL key 行も拾う
+            return (
+                "COALESCE(NULLIF(%splayer_name_key,''), %s)=?"
+                % (pre, expr_name)
+            )
     except Exception:
         pass
-    return "replace(replace(COALESCE(%splayer_name,''),' ',''),'\u3000','')=?" % pre
+    return "%s=?" % expr_name
 
 
 def _v319_player_history_state(db_path: str, player_name: str, con=None) -> dict:
@@ -10546,27 +10576,23 @@ def _v319_player_history_counts_batch(db_path: str, player_names: list, con=None
             return out
         cols = set(_v319_table_columns_cached(con, "v15_player_history_imports"))
         ph = ",".join("?" * len(keys))
-        if "player_name_key" in cols:
-            rows = con.execute(
-                f"""
-                SELECT player_name_key, COUNT(*)
-                FROM v15_player_history_imports
-                WHERE player_name_key IN ({ph})
-                GROUP BY player_name_key
-                """,
-                tuple(keys),
-            ).fetchall()
-        else:
-            expr = "replace(replace(COALESCE(player_name,''),' ',''),'　','')"
-            rows = con.execute(
-                f"""
-                SELECT {expr}, COUNT(*)
-                FROM v15_player_history_imports
-                WHERE {expr} IN ({ph})
-                GROUP BY 1
-                """,
-                tuple(keys),
-            ).fetchall()
+        # Ver324: key列があっても NULL/空は player_name 正規化で拾う
+        # （engine 保存直後の行は key 未設定のため）
+        expr = (
+            "COALESCE(NULLIF(player_name_key,''),"
+            "replace(replace(COALESCE(player_name,''),' ',''),'　',''))"
+            if "player_name_key" in cols
+            else "replace(replace(COALESCE(player_name,''),' ',''),'　','')"
+        )
+        rows = con.execute(
+            f"""
+            SELECT {expr}, COUNT(*)
+            FROM v15_player_history_imports
+            WHERE {expr} IN ({ph})
+            GROUP BY 1
+            """,
+            tuple(keys),
+        ).fetchall()
         for k, cnt in rows:
             kk = str(k or "")
             for nm in key_to_names.get(kk, []):
@@ -11725,6 +11751,22 @@ def _v319_fill_player_histories(
                     except Exception:
                         pass
 
+                # Ver324: engine 保存直後は player_name_key が NULL のままなので埋めてから件数確認
+                if changed > 0:
+                    try:
+                        _nk = _v319_norm_player_name(name)
+                        if _nk and "v15_player_history_imports" in _v319_schema_tables(con):
+                            _cols_nk = set(_v319_table_columns_cached(con, "v15_player_history_imports"))
+                            if "player_name_key" in _cols_nk:
+                                con.execute(
+                                    "UPDATE v15_player_history_imports SET player_name_key="
+                                    "replace(replace(COALESCE(player_name,''),' ',''),'　','') "
+                                    "WHERE COALESCE(player_name_key,'')='' "
+                                    "AND replace(replace(COALESCE(player_name,''),' ',''),'　','')=?",
+                                    (_nk,),
+                                )
+                    except Exception:
+                        pass
                 after = int(_v319_player_history_count(db_path, name, con=con) or 0)
                 delta = max(changed, max(0, after - have))
                 added += delta
@@ -12692,6 +12734,9 @@ def _v319_import_official_results(
     predict_if_missing: bool = True,
     trials: int = 20000,
     seed: int = 20260719,
+    race_nos: list | None = None,
+    fetch_odds: bool = True,
+    register_result: bool = True,
 ) -> dict:
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     place = _V319_OP_PLACE.get(str(venue))
@@ -12704,7 +12749,10 @@ def _v319_import_official_results(
         _v319_ensure_perf_indexes(db_path)
     except Exception:
         pass
-    races = _v319_ordered_race_nos(ymd, venue, max_races)
+    if race_nos:
+        races = [int(x) for x in race_nos if 1 <= int(x) <= 12]
+    else:
+        races = _v319_ordered_race_nos(ymd, venue, max_races)
     for n in races:
         item = {"venue": venue, "R": n, "status": "", "message": ""}
         try:
@@ -12713,6 +12761,8 @@ def _v319_import_official_results(
                 skip_existing=skip_existing, replace=replace,
                 predict_if_missing=predict_if_missing,
                 trials=int(trials), seed=int(seed),
+                fetch_odds=bool(fetch_odds),
+                register_result=bool(register_result),
             )
             item["status"] = one.get("status") or "ok"
             item["message"] = one.get("message") or ""
@@ -12919,13 +12969,16 @@ def _v319_import_one_race(
     db_path: str, ymd: str, venue: str, race_no: int,
     skip_existing: bool, replace: bool, predict_if_missing: bool, trials: int, seed: int,
     on_step=None,
+    fetch_odds: bool = True,
+    register_result: bool = True,
 ) -> dict:
     """1レース単位の自動取得。
 
     順序固定:
-      出走表 → 選手履歴 → 予測(+検証) → オッズ → 結果登録
+      出走表 → 選手履歴 → 予測(+検証) → (任意)オッズ → (任意)結果登録
     履歴失敗時は予測・結果を実行せず failed で返す。
-    予測またはオッズ未完了なら結果登録しない。
+    register_result=True のとき、オッズ未完了なら結果登録しない。
+    fetch_odds / register_result で予測のみ・オッズのみも可能。
     """
     def _step(msg: str) -> None:
         if on_step:
@@ -13129,77 +13182,126 @@ def _v319_import_one_race(
             "next_action": "retry",
         }
 
-    # --- 4) オッズ入力・保存確認（結果の前に必須） ---
-    _step("オッズ")
-    void_peek_raw = ""
-    try:
-        applied = _v319_apply_odds_and_plan(db_path, ymd, venue, race_no, key_guess)
-        odds_n = int(applied.get("odds") or 0)
-        odds_msg = f" / オッズ{odds_n}件"
-        if applied.get("plan_hash"):
-            odds_msg += " / 回収率プラン保存"
-        elif applied.get("plan_error"):
-            # オッズは保存済み。プラン生成だけ失敗した旨を残して結果登録へ進む。
-            odds_msg += f" / プラン生成スキップ({applied.get('plan_error')})"
-        void_peek_raw = ""
-        if odds_n <= 0:
+    # --- 予測のみで終了 ---
+    if not fetch_odds and not register_result:
+        return {
+            "status": "ok",
+            "phase": "completed_prediction_only",
+            "message": key_guess + hist_msg + pred_msg + " / 予測のみ（オッズ・結果は未実行）",
+            "key": key_guess,
+            "player_history_saved": True,
+        }
+
+    # --- 4) オッズ（任意。結果登録時は必須） ---
+    if not fetch_odds:
+        odds_msg = " / オッズ取得スキップ"
+        if register_result:
+            # 既存オッズがあれば続行可能か確認
             try:
-                void_peek_raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+                _exist_odds, _ = _v221_load_odds_snapshot(db_path, key_guess)
+                _n_ex = sum(len(v) for v in (_exist_odds or {}).values()) if isinstance(_exist_odds, dict) else 0
             except Exception:
-                void_peek_raw = ""
-            void_info = _v319_is_void_or_cancelled_result(void_peek_raw)
-            if void_info.get("void"):
-                odds_msg += f" / オッズなし({void_info.get('reason') or '中止'})"
-            else:
+                _n_ex = 0
+            if _n_ex <= 0:
                 return {
                     "status": "error",
                     "phase": "save_odds",
                     "message": (
-                        f"{venue} {race_no}R：オッズ未登録のため結果登録を禁止します。"
-                        f"{hist_msg}{pred_msg}{odds_msg}"
+                        f"{venue} {race_no}R：結果登録にはオッズが必要です（取得スキップかつ未保存）。"
+                        f"{hist_msg}{pred_msg}"
                     ),
                     "key": key_guess,
                     "player_history_saved": True,
                     "next_action": "retry",
                 }
-    except Exception as exc:
-        # オッズAPI失敗でも中止レースなら結果登録へ
-        try:
-            void_peek_raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
-        except Exception:
-            void_peek_raw = ""
-        void_info = _v319_is_void_or_cancelled_result(void_peek_raw)
-        # 正規化で落ちた場合、HTML直読みのフォールバック
-        if not void_info.get("void"):
-            try:
-                place = _V319_OP_PLACE.get(str(venue))
-                ymd8 = re.sub(r"[^0-9]", "", str(ymd or ""))
-                url = (
-                    "https://www.oddspark.com/autorace/RaceResult.do"
-                    f"?raceDy={ymd8}&placeCd={place}&raceNo={int(race_no)}"
-                )
-                html_raw = _v319_http_get(url)
-                void_info = _v319_is_void_or_cancelled_result(html_raw)
-                if void_info.get("void") and not void_peek_raw:
-                    void_peek_raw = f"{int(race_no)}R\n{void_info.get('reason') or '不成立'}\n不成立\n払戻金\n"
-            except Exception:
-                pass
-        if void_info.get("void"):
-            odds_msg = f" / オッズ取得失敗→{void_info.get('reason') or '中止'}"
+            odds_msg += f"（既存{_n_ex}件）"
         else:
             return {
-                "status": "error",
-                "phase": "save_odds",
-                "message": (
-                    f"{venue} {race_no}R：オッズ取得に失敗しました。"
-                    f" 結果登録は実行していません。"
-                    f" ({type(exc).__name__}: {exc})"
-                    f"{hist_msg}{pred_msg}"
-                ),
+                "status": "ok",
+                "phase": "completed_no_odds",
+                "message": key_guess + hist_msg + pred_msg + odds_msg,
                 "key": key_guess,
                 "player_history_saved": True,
-                "next_action": "retry",
             }
+    else:
+        _step("オッズ")
+    void_peek_raw = ""
+    if fetch_odds:
+        try:
+            applied = _v319_apply_odds_and_plan(db_path, ymd, venue, race_no, key_guess)
+            odds_n = int(applied.get("odds") or 0)
+            odds_msg = f" / オッズ{odds_n}件"
+            if applied.get("plan_hash"):
+                odds_msg += " / 回収率プラン保存"
+            elif applied.get("plan_error"):
+                odds_msg += f" / プラン生成スキップ({applied.get('plan_error')})"
+            void_peek_raw = ""
+            if odds_n <= 0:
+                try:
+                    void_peek_raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+                except Exception:
+                    void_peek_raw = ""
+                void_info = _v319_is_void_or_cancelled_result(void_peek_raw)
+                if void_info.get("void"):
+                    odds_msg += f" / オッズなし({void_info.get('reason') or '中止'})"
+                else:
+                    return {
+                        "status": "error",
+                        "phase": "save_odds",
+                        "message": (
+                            f"{venue} {race_no}R：オッズ未登録のため結果登録を禁止します。"
+                            f"{hist_msg}{pred_msg}{odds_msg}"
+                        ),
+                        "key": key_guess,
+                        "player_history_saved": True,
+                        "next_action": "retry",
+                    }
+        except Exception as exc:
+            try:
+                void_peek_raw = _v319_fetch_oddspark_result(ymd, venue, race_no)
+            except Exception:
+                void_peek_raw = ""
+            void_info = _v319_is_void_or_cancelled_result(void_peek_raw)
+            if not void_info.get("void"):
+                try:
+                    place = _V319_OP_PLACE.get(str(venue))
+                    ymd8 = re.sub(r"[^0-9]", "", str(ymd or ""))
+                    url = (
+                        "https://www.oddspark.com/autorace/RaceResult.do"
+                        f"?raceDy={ymd8}&placeCd={place}&raceNo={int(race_no)}"
+                    )
+                    html_raw = _v319_http_get(url)
+                    void_info = _v319_is_void_or_cancelled_result(html_raw)
+                    if void_info.get("void") and not void_peek_raw:
+                        void_peek_raw = f"{int(race_no)}R\n{void_info.get('reason') or '不成立'}\n不成立\n払戻金\n"
+                except Exception:
+                    pass
+            if void_info.get("void"):
+                odds_msg = f" / オッズ取得失敗→{void_info.get('reason') or '中止'}"
+            else:
+                return {
+                    "status": "error",
+                    "phase": "save_odds",
+                    "message": (
+                        f"{venue} {race_no}R：オッズ取得に失敗しました。"
+                        f" 結果登録は実行していません。"
+                        f" ({type(exc).__name__}: {exc})"
+                        f"{hist_msg}{pred_msg}"
+                    ),
+                    "key": key_guess,
+                    "player_history_saved": True,
+                    "next_action": "retry",
+                }
+
+    # --- オッズのみで終了 ---
+    if not register_result:
+        return {
+            "status": "ok",
+            "phase": "completed_odds_only" if fetch_odds else "completed_prediction_only",
+            "message": key_guess + hist_msg + pred_msg + odds_msg + " / 結果登録スキップ",
+            "key": key_guess,
+            "player_history_saved": True,
+        }
 
     # --- 5) 結果登録（登録済みスキップは払戻補完のみ） ---
     if exists and skip_existing and not replace:
@@ -13418,10 +13520,12 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
         _V287_AUTO_IMPORT_STATE.update(_V287_IMPORT_STATE_RESET)
         ymd = str(req.get("ymd") or "")
         venues = list(req.get("venues") or [])
+        _only_races = [int(x) for x in (req.get("race_nos") or []) if str(x).isdigit() and 1 <= int(x) <= 12]
         targets = []
         seen = set()
         for vn in venues:
-            for n in _v319_ordered_race_nos(ymd, vn, int(req.get("max_races") or 12)):
+            _rns = _only_races if _only_races else _v319_ordered_race_nos(ymd, vn, int(req.get("max_races") or 12))
+            for n in _rns:
                 item = (str(vn), int(n))
                 if item in seen:
                     continue
@@ -13462,6 +13566,8 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     predict_if_missing=bool(req.get("predict_if_missing")),
                     trials=int(req.get("trials") or 20000),
                     seed=int(req.get("seed") or 20260719),
+                    fetch_odds=bool(req.get("fetch_odds", True)),
+                    register_result=bool(req.get("register_result", True)),
                     on_step=lambda msg, vn=vn, n=n, i=i, total=total: _v278_bg_update(
                         db_path, job_id,
                         current_label=f"{vn} {n}R",
@@ -13565,28 +13671,16 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 db_sz = int(Path(str(db_path)).stat().st_size)
             except Exception:
                 db_sz = 0
-            # 約80MB超は自動保存を見送り（手動の軽量保存を推奨）
-            if db_sz > 80 * 1024 * 1024:
-                gh_msg = f"｜GitHub見送り(DB {db_sz // (1024*1024)}MB>80MB 手動保存へ)"
+            # Ver324: 自動取得完了後のGitHub保存はしない（落ちやすい・手動へ）
+            gh_msg = "｜GitHubは手動保存へ"
+            try:
                 _v278_bg_update(
                     db_path, job_id,
                     current_label="完了",
-                    message=f"自動取得完了｜GitHubはDBが大きいため手動保存してください",
+                    message=f"自動取得完了｜GitHubはサイドバーから手動保存｜完了{ok}/失敗{err}",
                 )
-            else:
-                _v278_bg_update(
-                    db_path, job_id,
-                    current_label="DB保存",
-                    message=f"軽量GitHub保存中…｜完了{ok} / 失敗{err}",
-                )
-                _gh_ok, _gh_detail = push_db_to_github(
-                    f"Ver319 auto-import {ymd} ok={ok} skip={skip} err={err}",
-                    _allow_during_resimulation=True,
-                    _lightweight=True,
-                )
-                gh_msg = f"｜GitHub軽量{'OK' if _gh_ok else '失敗'}"
-                if not _gh_ok and _gh_detail:
-                    gh_msg += f"({str(_gh_detail)[:80]})"
+            except Exception:
+                pass
         except Exception as _gh_exc:
             gh_msg = f"｜GitHub例外:{type(_gh_exc).__name__}（手動保存してください）"
         _v278_bg_update(
@@ -13618,6 +13712,9 @@ def _v319_bg_import_start(
     db_path: str, ymd: str, venues: list[str],
     skip_existing: bool, replace: bool, predict_if_missing: bool,
     trials: int, seed: int,
+    race_nos: list | None = None,
+    fetch_odds: bool = True,
+    register_result: bool = True,
 ) -> dict:
     _v278_bg_ensure_table(db_path)
     if _v279_bg_prediction_any_active(db_path):
@@ -13643,6 +13740,9 @@ def _v319_bg_import_start(
         "skip_existing": bool(skip_existing), "replace": bool(replace),
         "predict_if_missing": bool(predict_if_missing),
         "trials": int(trials), "seed": int(seed), "max_races": 12,
+        "race_nos": [int(x) for x in (race_nos or []) if str(x).isdigit() and 1 <= int(x) <= 12],
+        "fetch_odds": bool(fetch_odds),
+        "register_result": bool(register_result),
     }
     th = threading.Thread(
         target=_v319_bg_import_worker, args=(str(db_path), job_id, req),
@@ -15840,6 +15940,36 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
     st.markdown('<div id="quick-odds-input"></div>', unsafe_allow_html=True)
     st.subheader("オッズ一括入力")
     st.caption("AutoRace.JPの保存HTMLなら7券種を自動入力できます。同じレースへ再入力した場合は、その入力を最新の訂正版としてオッズ・EV・回収率合成を更新します。")
+
+    # Ver324: HTTPで公式オッズを1レース取得
+    with st.expander("公式サイトからHTTP取得（1レース）", expanded=False):
+        _rk = str(race_key or "").strip()
+        _ym, _vn, _rn = "", "", 0
+        _m = re.match(r"^(\d{8})_(.+?)_(\d+)R$", _rk)
+        if _m:
+            _ym, _vn, _rn = _m.group(1), _m.group(2), int(_m.group(3))
+        c1, c2, c3 = st.columns(3)
+        _od = c1.text_input("開催日(YYYYMMDD)", value=_ym, key=f"v324_odds_http_ymd_{namespace}")
+        _ov = c2.selectbox(
+            "開催場",
+            RESULT_VENUES,
+            index=(RESULT_VENUES.index(_vn) if _vn in RESULT_VENUES else 0),
+            key=f"v324_odds_http_venue_{namespace}",
+        )
+        _or = c3.number_input("R", min_value=1, max_value=12, value=max(1, int(_rn or 1)), key=f"v324_odds_http_r_{namespace}")
+        if st.button("HTTPでオッズ取得して反映", use_container_width=True, key=f"v324_odds_http_go_{namespace}"):
+            try:
+                _ymd8 = re.sub(r"[^0-9]", "", str(_od or ""))
+                with st.spinner("autorace.jp からオッズ取得中…"):
+                    _parsed = _v319_fetch_official_odds(_ymd8, str(_ov), int(_or))
+                    _n = int(sum(len(v) for v in (_parsed or {}).values()))
+                    if race_key:
+                        _v319_save_official_odds(engine.DB_PATH, str(race_key), _parsed)
+                    v218_store_parsed_odds(namespace, _parsed)
+                st.success(f"オッズ {_n} 件を取得しました（{ _ov } {_or}R）")
+                st.rerun()
+            except Exception as _ox:
+                st.error(f"オッズHTTP取得失敗: {type(_ox).__name__}: {_ox}")
 
     # セッションにオッズがない場合は、このレースの最新保存分を自動復元する。
     odds_store_keys = [f"saved_odds_{namespace}_{k}" for k in ('3tan','3fuku','2tansho','2fuku','tansho','fukusho','wide')]
@@ -20426,6 +20556,19 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
             "after": after,
         }
 
+    # Ver325 G1: 投入時に完全包含なら入れない（後段v259の前倒し）
+    def _g1_fully_contained(plan, cand) -> bool:
+        try:
+            m = set(cand.get("matched") or set())
+            if not m:
+                return False
+            covered = set()
+            for t in plan:
+                covered |= set(t.get("matched") or set())
+            return m.issubset(covered)
+        except Exception:
+            return False
+
     # Ver189: 三連単も2点固定にせず、上位2〜6点を合成全体の土台として比較する。
     # 的中範囲を優先しつつ、追加による黒字側の改善、ガミ化、点数増を同時に評価する。
     tri_seed_options = []
@@ -20461,6 +20604,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         for cand in remaining:
             if cand["type"] != required_type:
                 continue
+            if _g1_fully_contained(plan, cand):
+                continue
             mg = marginal(plan, cand)
             lw = float(cand.get("learned_weight", 1.0))
             new_cost = (len(plan) + 1) * 100.0
@@ -20490,6 +20635,8 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
         best = None
         for cand in remaining:
             if counts.get(cand["type"], 0) >= cand["cap"]:
+                continue
+            if _g1_fully_contained(plan, cand):
                 continue
             mg = marginal(plan, cand)
             # 既存券と重複するだけの券より、新しい外れ方を拾う券を優先。
@@ -20583,6 +20730,14 @@ def v184_eight_car_mixed_plan(bets: dict, trials: int, meta: dict, odds_maps: di
                 continue
             _cid299=(str(_cand299.get("type")),str(_cand299.get("combo")))
             if _cid299 in _selected_ids299:
+                continue
+            if _g1_fully_contained(selected, _cand299):
+                if _cid299 not in _hole_reject_seen and len(v299_hole_reject_notes) < 12:
+                    _hole_reject_seen.add(_cid299)
+                    v299_hole_reject_notes.append(
+                        f"中穴不採用：3連単 {_cand299.get('combo')} "
+                        f"（G1: 既存券で的中範囲を完全包含）"
+                    )
                 continue
             _trial299=selected+[_cand299]
             _after299=evaluate(_trial299)
@@ -21998,6 +22153,81 @@ def v277_provisional_merge_7types(result: dict, bets: dict, trials: int, odds_ma
     result["role_lines"] = role_lines
     return result
 
+def _v325_rebuild_plans_from_saved_odds(db_path: str, limit: int = 0) -> dict:
+    """保存済み予測 + 保存済みオッズだけで合成プランを再生成（6周再シミュ不要）。
+
+    Ver325 G1 などプランロジック変更を、既存レースへオッズ再計算のみで反映する。
+    """
+    out = {"ok": 0, "skip": 0, "error": 0, "details": []}
+    try:
+        with sqlite3.connect(str(db_path), timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            # 予測がある race_key（最新）
+            rows = con.execute("""
+                SELECT race_key, MAX(history_id) AS hid
+                FROM v231_prediction_history
+                GROUP BY race_key
+                ORDER BY hid DESC
+            """).fetchall()
+    except Exception as exc:
+        out["error"] = 1
+        out["details"].append({"status": "error", "message": f"{type(exc).__name__}: {exc}"})
+        return out
+
+    n = 0
+    for race_key, _hid in rows:
+        if limit and n >= int(limit):
+            break
+        race_key = str(race_key or "")
+        if not race_key:
+            continue
+        # 20260920_伊勢崎_1R
+        m = re.match(r"^(\d{8})_(.+?)_(\d+)R$", race_key)
+        if not m:
+            m = re.match(r"^(\d{4})-(\d{2})-(\d{2})_(.+?)_(\d+)R?$", race_key)
+            if m:
+                ymd = m.group(1) + m.group(2) + m.group(3)
+                venue, rno = m.group(4), int(m.group(5))
+            else:
+                out["skip"] += 1
+                out["details"].append({"status": "skip", "race_key": race_key, "message": "race_key形式"})
+                continue
+        else:
+            ymd, venue, rno = m.group(1), m.group(2), int(m.group(3))
+        n += 1
+        try:
+            applied = _v319_apply_odds_and_plan(
+                db_path, ymd, venue, rno, race_key,
+                use_saved_odds=True, refetch_odds=False,
+            )
+            if applied.get("plan_hash"):
+                out["ok"] += 1
+                out["details"].append({
+                    "status": "ok", "race_key": race_key,
+                    "plan_hash": applied.get("plan_hash"),
+                    "odds": applied.get("odds"),
+                })
+            elif applied.get("plan_error"):
+                out["error"] += 1
+                out["details"].append({
+                    "status": "error", "race_key": race_key,
+                    "message": applied.get("plan_error"),
+                })
+            else:
+                out["skip"] += 1
+                out["details"].append({
+                    "status": "skip", "race_key": race_key,
+                    "message": "オッズまたは予測不足",
+                })
+        except Exception as exc:
+            out["error"] += 1
+            out["details"].append({
+                "status": "error", "race_key": race_key,
+                "message": f"{type(exc).__name__}: {exc}",
+            })
+    return out
+
+
 def _v305_supersede_plan_after_odds_refresh(
     db_path: str, race_key: str, app_version: str, new_plan_hash: str = ""
 ) -> None:
@@ -23365,6 +23595,26 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
 
 def _v215_render_return_dashboard(db_path: str) -> None:
     st.markdown("## 📊 回収率重視プラン実績")
+    with st.expander("Ver325: 保存オッズだけでプラン再計算（再シミュ不要）", expanded=False):
+        st.caption(
+            "予測の6周再シミュレーションはしません。"
+            "保存済みの予測確率 × 保存済みオッズで合成プランだけ作り直します（G1反映用）。"
+        )
+        _lim = st.number_input("最大レース数（0=全件）", min_value=0, max_value=5000, value=0, step=50, key="v325_odds_replan_limit")
+        if st.button("オッズ再計算でプラン更新", type="primary", use_container_width=True, key="v325_odds_replan_go"):
+            with st.spinner("保存オッズからプラン再生成中…"):
+                _rep = _v325_rebuild_plans_from_saved_odds(str(db_path), limit=int(_lim or 0))
+            st.session_state["v325_odds_replan_last"] = _rep
+            st.success(
+                f"完了: ok={_rep.get('ok')} / skip={_rep.get('skip')} / error={_rep.get('error')}"
+            )
+            if _rep.get("error"):
+                st.warning("失敗例: " + " / ".join(
+                    str(d.get("message") or d.get("race_key")) for d in (_rep.get("details") or []) if d.get("status")=="error"
+                )[:500])
+        _last = st.session_state.get("v325_odds_replan_last")
+        if isinstance(_last, dict) and _last.get("ok") is not None:
+            st.caption(f"前回: ok={_last.get('ok')} skip={_last.get('skip')} error={_last.get('error')}")
     try:
         _stamp305fix=(str(db_path),Path(str(db_path)).stat().st_mtime_ns,"Ver305-rec-only-fix1")
         if st.session_state.get("_v305_rec_only_fix_stamp") != _stamp305fix:
@@ -26991,6 +27241,37 @@ elif selected_main_page == "📊 回収率実績":
 
 elif selected_main_page == "🏁 予測":
     st.info("Ver20予測方式：予測競走タイム＋高速6周イベントモデル。欠車・出走取消は存在しない選手として完全除外します。")
+    with st.expander("1レース自動取得で予測（出走表→履歴→予測）", expanded=False):
+        st.caption("自動取込と同じ経路です。オッズ・結果は下のチェックで選べます。GitHubは自動保存しません。")
+        pc1, pc2, pc3 = st.columns(3)
+        _p_date = pc1.date_input("開催日", value=date.today(), key="v324_pred_auto_date")
+        _p_ven = pc2.selectbox("開催場", RESULT_VENUES, key="v324_pred_auto_venue")
+        _p_r = pc3.number_input("R", min_value=1, max_value=12, value=1, key="v324_pred_auto_r")
+        _p_odds = st.checkbox("オッズも取得する", value=False, key="v324_pred_auto_odds")
+        _p_res = st.checkbox("結果も登録する", value=False, key="v324_pred_auto_result")
+        if st.button("この1レースを自動取得→予測", type="primary", use_container_width=True, key="v324_pred_auto_go"):
+            try:
+                _ymd = _p_date.strftime("%Y%m%d")
+                with st.spinner(f"{_p_ven} {_p_r}R を自動取得中…"):
+                    one = _v319_import_one_race(
+                        engine.DB_PATH, _ymd, str(_p_ven), int(_p_r),
+                        skip_existing=True, replace=False,
+                        predict_if_missing=True,
+                        trials=int(st.session_state.get("trials") or 20000),
+                        seed=int(st.session_state.get("seed") or 20260719),
+                        fetch_odds=bool(_p_odds),
+                        register_result=bool(_p_res),
+                    )
+                st.session_state["v324_pred_auto_last"] = one
+                if str(one.get("status") or "") in ("ok", "skip"):
+                    st.success(str(one.get("message") or "完了"))
+                else:
+                    st.warning(str(one.get("message") or one))
+            except Exception as _pe:
+                st.error(f"{type(_pe).__name__}: {_pe}")
+        _last = st.session_state.get("v324_pred_auto_last")
+        if isinstance(_last, dict) and _last.get("message"):
+            st.caption("前回: " + str(_last.get("message")))
     with st.expander("🔧 今回どこを調整したか"):
         if st.button("調整履歴を読み込む", key="v138_load_adjustment_log", use_container_width=True):
             st.session_state["v138_show_adjustment_log"] = True
@@ -28057,14 +28338,39 @@ if selected_main_page == "✅ 結果登録・解析":
     st.info("結果ページを先頭のレース番号から払戻金まで全文コピーして貼り付けます。縦型の着順表、6周のグランドノート、払戻金にも対応します。")
     st.session_state.setdefault("result_input_version", 0)
 
+    with st.expander("結果だけHTTP取得（1レース・貼付不要）", expanded=False):
+        st.caption("オッズパークの結果ページを取得して下の入力欄へ入れます。登録は解析後に通常どおり行ってください。GitHubは自動保存しません。")
+        rc1, rc2, rc3 = st.columns(3)
+        _ry = rc1.date_input("開催日", value=date.today(), key="v324_result_http_date")
+        _rv = rc2.selectbox("開催場", RESULT_VENUES, key="v324_result_http_venue")
+        _rr = rc3.number_input("R", min_value=1, max_value=12, value=1, key="v324_result_http_r")
+        if st.button("結果をHTTP取得して入力欄へ", use_container_width=True, key="v324_result_http_go"):
+            try:
+                _ymd = _ry.strftime("%Y%m%d")
+                with st.spinner("結果ページ取得中…"):
+                    _raw = _v319_fetch_oddspark_result(_ymd, str(_rv), int(_rr))
+                st.session_state["v163_saved_result_text"] = str(_raw or "")
+                st.session_state["v163_saved_result_venue"] = str(_rv)
+                st.session_state["v163_saved_result_race_no"] = str(int(_rr))
+                st.session_state["result_input_version"] = int(st.session_state.get("result_input_version") or 0) + 1
+                for _k in ["v35_result_meta","v35_result_rows","v35_result_laps","v35_result_payouts"]:
+                    _ = st.session_state.pop(_k, None)
+                st.success(f"{_rv} {_rr}R の結果本文を入力欄へ入れました。下で解析→登録してください。")
+                st.rerun()
+            except Exception as _rx:
+                st.error(f"結果HTTP取得失敗: {type(_rx).__name__}: {_rx}")
+
     with st.expander("公式結果を自動取得して登録", expanded=False):
-        st.caption("順番は出走表→選手履歴→予測保存確認→オッズ→結果登録です。履歴失敗時は予測しません。全レース終了時に集計通知します。")
-        dcol, vcol = st.columns(2)
+        st.caption("順番は出走表→選手履歴→予測保存確認→オッズ→結果登録です。履歴失敗時は予測しません。GitHub自動保存はしません。")
+        dcol, vcol, rcol = st.columns(3)
         fetch_date = dcol.date_input("開催日", value=date.today(), key="v319_op_fetch_date")
         fetch_venue = vcol.selectbox("開催場", ["開催を探す"] + RESULT_VENUES, key="v319_op_fetch_venue")
+        fetch_race_no = rcol.number_input("レース番号（1レース指定）", min_value=0, max_value=12, value=0, step=1, key="v319_op_fetch_race_no", help="0=開催全レース / 1〜12=その1レースだけ")
         skip_existing = st.checkbox("登録済みは飛ばす", value=True, key="v319_op_skip_existing")
         replace_existing = st.checkbox("登録済みを置き換える", value=False, key="v319_op_replace_existing")
         predict_missing = st.checkbox("未予測なら予測して補正を更新", value=True, key="v319_op_predict_missing")
+        fetch_odds_opt = st.checkbox("オッズも取得する", value=True, key="v319_op_fetch_odds")
+        register_result_opt = st.checkbox("結果も登録する", value=True, key="v319_op_register_result")
         if st.button("この日の開催を確認", use_container_width=True, key="v319_op_list_meetings"):
             try:
                 ymd = fetch_date.strftime("%Y%m%d")
@@ -28086,12 +28392,16 @@ if selected_main_page == "✅ 結果登録・解析":
             if not venues:
                 st.warning("開催場を選ぶか、先に開催確認してください。")
             elif start_bg:
+                _rnos = [int(fetch_race_no)] if int(fetch_race_no or 0) >= 1 else []
                 started = _v319_bg_import_start(
                     engine.DB_PATH, ymd, venues,
                     skip_existing=bool(skip_existing and not replace_existing),
                     replace=bool(replace_existing),
                     predict_if_missing=bool(predict_missing),
                     trials=int(trials), seed=int(seed),
+                    race_nos=_rnos,
+                    fetch_odds=bool(fetch_odds_opt),
+                    register_result=bool(register_result_opt),
                 )
                 if started.get("ok"):
                     st.success(f"バックグラウンド取込を開始しました（ジョブ {started.get('job_id')}）。画面を離れても進みます。")
@@ -28105,6 +28415,7 @@ if selected_main_page == "✅ 結果登録・解析":
                     _V287_IMPORT_STATE_RESET.clear()
                     _V287_IMPORT_STATE_RESET.update(_v319_prev_state)
                     for vn in venues:
+                        _rnos = [int(fetch_race_no)] if int(fetch_race_no or 0) >= 1 else None
                         rep = _v319_import_official_results(
                             engine.DB_PATH,
                             ymd,
@@ -28114,6 +28425,9 @@ if selected_main_page == "✅ 結果登録・解析":
                             predict_if_missing=bool(predict_missing),
                             trials=int(trials),
                             seed=int(seed),
+                            race_nos=_rnos,
+                            fetch_odds=bool(fetch_odds_opt),
+                            register_result=bool(register_result_opt),
                         )
                         all_rep["ok"] += int(rep.get("ok") or 0)
                         all_rep["skip"] += int(rep.get("skip") or 0)
@@ -28643,11 +28957,8 @@ if selected_main_page == "✅ 結果登録・解析":
                     _set_sticky_notice("result_register_notice", "success", msg)
                     st.success(msg)
                     st.warning("AI学習対象外です。着順・選手履歴・追い抜き相性・レース種別適性・重みは更新していません。")
-                    try:
-                        ok, push_msg = push_db_to_github(f"AutoRaceAI: {key} 不成立・全返還登録")
-                        (st.success if ok else st.warning)(push_msg)
-                    except Exception as push_exc:
-                        st.warning(f"DB保存後のGitHub反映に失敗しました: {push_exc}")
+                    # Ver324: 結果登録直後のGitHub自動保存はしない（落ちやすい）
+                    st.caption("GitHub保存はサイドバーの『現在のDBをGitHubへ保存』で手動実行してください。")
             except Exception as exc:
                 st.error(f"不成立登録エラー: {type(exc).__name__}: {exc}")
 
@@ -28940,11 +29251,11 @@ if selected_main_page == "✅ 結果登録・解析":
                         st.warning("結果は登録しましたが、追加適性の更新でエラー: " + str(registration.get("post_analysis_error")))
                     st.caption("同一判定は開催日・開催場・レース番号で行います。レース名称は判定に使いません。同じレースは通常登録では重複を防止します。再登録を選んだ場合だけ、古い結果を今回の内容へ置き換えます。")
                     st.caption(f"順位分析対象: {analysis.get('分析対象', 0)}名 / 除外: {analysis.get('分析除外', 0)}名。着順なし・欠車・中止・失格などは順位分析から除外します。")
-                    with st.spinner("③ GitHubへDBを保存しています…"):
-                        ok, msg = push_db_to_github(f"AutoRaceAI: {key} 結果・周回・払戻登録")
-                    full_message = result_message + (f"｜{msg}" if msg else "")
-                    _set_sticky_notice("result_register_notice", "success" if ok else "warning", full_message)
-                    (st.success if ok else st.warning)(msg)
+                    # Ver324: 結果登録直後のGitHub自動保存はしない（Streamlit落ち対策）
+                    full_message = result_message + "｜GitHubは手動保存してください"
+                    _set_sticky_notice("result_register_notice", "success", full_message)
+                    st.success(full_message)
+                    st.caption("サイドバーの『現在のDBをGitHubへ保存（軽量）』でバックアップできます。")
             except Exception as exc:
                 error_message = f"結果登録エラー: {type(exc).__name__}: {exc}"
                 _set_sticky_notice("result_register_notice", "error", error_message)
