@@ -21,6 +21,7 @@ import urllib.request
 import zlib
 import time as time_module
 from datetime import date, datetime, time, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -10849,13 +10850,11 @@ def _v319_parse_sp_player_history_rows(html: str, player_name: str) -> list[dict
     return out
 
 
-def _v319_fetch_player_history_df(player_cd: str, player_name: str):
+def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int = 10, retries: int = 1):
     """PC版を優先。有効HTMLが取れたら PC2/SP は打たない（空履歴でも）。
 
-    Ver320:
-      - PC1で有効HTML（>500B）なら空histでもPC2へ行かない
-      - SPはPCが完全失敗したときだけ
-      - timeout 15 / retries 2
+    Ver324速度:
+      - timeout 10 / retries 1（旧15/2）。失敗は errors で再試行可能
       - 同一 player_cd はジョブ内メモ化
       - 全リクエスト例外で空になった場合はキャッシュしない（次レースで再試行）
     """
@@ -10879,7 +10878,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str):
             f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}",
         ):
             try:
-                html = _v319_http_get(url, timeout=15, retries=2)
+                html = _v319_http_get(url, timeout=int(timeout or 10), retries=int(retries if retries is not None else 1))
                 if html and len(html) > 500:
                     pc_ok = True
                 hist = _v319_parse_pc_player_history_html(html, name)
@@ -10899,7 +10898,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str):
                 "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
                 f"?playerCd={pcd}&historyDispType=d"
             )
-            sp_html = _v319_http_get(sp_url, timeout=15, retries=2)
+            sp_html = _v319_http_get(sp_url, timeout=int(timeout or 10), retries=int(retries if retries is not None else 1))
             sp_rows = _v319_parse_sp_player_history_rows(sp_html, name)
         except Exception:
             sp_rows = []
@@ -11416,6 +11415,56 @@ def _v319_fill_player_histories(
 
         before_d_job = _v319_ymd_digits(before_ymd)  # ループ共通（ジョブ内キャッシュキー）
 
+        # Ver324速度: 公式HTTPが必要な選手だけ先に並列取得（結果は _V319_HIST_DF_CACHE へ）
+        try:
+            _prefetch = []
+            for _pp in players:
+                _nm = str(_pp.get("name") or "").strip()
+                _pcd = str(_pp.get("player_cd") or "").strip()
+                if not _pcd:
+                    continue
+                _ck = _pcd or _v319_norm_player_name(_nm)
+                _ask = str(_V319_HIST_SKIPPED.get(_ck) or "")
+                if _ask and before_d_job and _ask == before_d_job:
+                    continue
+                if _pcd in _V319_HIST_DF_CACHE:
+                    continue
+                if before_d_job:
+                    try:
+                        _ps = _v319_persistent_skip_lookup(db_path, _pcd, before_d_job, con=con)
+                        if _ps and _ps.get("skip"):
+                            continue
+                    except Exception:
+                        pass
+                try:
+                    _hv, _lt = _v319_player_history_latest_fast(db_path, _nm, con=con)
+                    _lt = _v319_ymd_digits(_lt)
+                    if int(_hv or 0) >= min_rows and _lt and before_d_job and _lt >= before_d_job:
+                        continue
+                except Exception:
+                    pass
+                _prefetch.append((_pcd, _nm))
+            if len(_prefetch) >= 2:
+                _n_workers = min(4, len(_prefetch))
+                with ThreadPoolExecutor(max_workers=_n_workers) as _ex:
+                    _futs = [
+                        _ex.submit(_v319_fetch_player_history_df, _pcd, _nm)
+                        for _pcd, _nm in _prefetch
+                    ]
+                    for _fu in as_completed(_futs):
+                        if callable(cancel_cb):
+                            try:
+                                if bool(cancel_cb()):
+                                    break
+                            except Exception:
+                                pass
+                        try:
+                            _ = _fu.result()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
         for p in players:
             # 中止要求: 選手単位で即抜ける（長いHTTP中も次選手前に止まる）
             if callable(cancel_cb):
@@ -11883,7 +11932,7 @@ def _v319_fill_player_histories(
                 details.append(
                     f"{name}:{have}→{after}({tag}{len(parsed)}件/R付{r_ok}/保存{changed}{pend_s})"
                 )
-                time_module.sleep(0.15)
+                time_module.sleep(0.03)
             except Exception as exc:
                 errors += 1
                 _ = details.append(f"{name}:{type(exc).__name__}:{exc}")
