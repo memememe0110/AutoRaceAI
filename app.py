@@ -2345,8 +2345,126 @@ def _v278_bg_get_job(db_path: str, job_id: int | None = None) -> dict:
     except Exception:
         return {}
 
+def _v278_bg_reap_stale_jobs(db_path: str, stale_minutes: float = 20.0) -> int:
+    """放置・完了漏れジョブを解放する。
+
+    - done_count >= total_count > 0 なのに active → completed
+    - cancel_requested のまま90秒以上 → cancelled
+    - updated_at/started_at が stale_minutes 超過 → failed
+    """
+    reaped = 0
+    try:
+        _v278_bg_ensure_table(db_path)
+        now = datetime.now(timezone(timedelta(hours=9)))
+        with sqlite3.connect(str(db_path), timeout=5.0) as con:
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA busy_timeout=5000")
+            rows = con.execute("""
+                SELECT job_id, status, done_count, total_count,
+                       COALESCE(updated_at,''), COALESCE(started_at,''), COALESCE(finished_at,'')
+                FROM v278_background_jobs
+                WHERE status IN ('queued','running','pause_requested','paused','cancel_requested')
+            """).fetchall()
+            for row in rows:
+                jid = int(row[0] or 0)
+                status = str(row[1] or "")
+                done = int(row[2] or 0)
+                total = int(row[3] or 0)
+                updated = str(row[4] or "")
+                started = str(row[5] or "")
+                if total > 0 and done >= total and status != "cancel_requested":
+                    con.execute(
+                        """
+                        UPDATE v278_background_jobs
+                           SET status='completed',
+                               finished_at=COALESCE(NULLIF(finished_at,''), ?),
+                               message=CASE WHEN COALESCE(message,'')='' THEN '完了（自動解放）' ELSE message END,
+                               updated_at=?
+                         WHERE job_id=?
+                        """,
+                        (_v228_now_jst_iso(), _v228_now_jst_iso(), jid),
+                    )
+                    reaped += 1
+                    try:
+                        _v278_cancel_flag_clear(jid)
+                    except Exception:
+                        pass
+                    continue
+                if status == "cancel_requested":
+                    ts = updated or started
+                    age_ok = True
+                    try:
+                        if ts:
+                            t0 = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            if t0.tzinfo is None:
+                                t0 = t0.replace(tzinfo=timezone(timedelta(hours=9)))
+                            age_ok = (now - t0).total_seconds() >= 90.0
+                    except Exception:
+                        age_ok = True
+                    if age_ok:
+                        con.execute(
+                            """
+                            UPDATE v278_background_jobs
+                               SET status='cancelled',
+                                   finished_at=?,
+                                   message=CASE WHEN COALESCE(message,'')='' THEN '中止（自動確定）' ELSE message END,
+                                   updated_at=?
+                             WHERE job_id=?
+                            """,
+                            (_v228_now_jst_iso(), _v228_now_jst_iso(), jid),
+                        )
+                        reaped += 1
+                        try:
+                            _v278_cancel_flag_clear(jid)
+                        except Exception:
+                            pass
+                    continue
+                ts = updated or started
+                if not ts:
+                    continue
+                try:
+                    t0 = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if t0.tzinfo is None:
+                        t0 = t0.replace(tzinfo=timezone(timedelta(hours=9)))
+                    age_min = (now - t0).total_seconds() / 60.0
+                except Exception:
+                    continue
+                if age_min >= float(stale_minutes):
+                    con.execute(
+                        """
+                        UPDATE v278_background_jobs
+                           SET status='failed',
+                               finished_at=?,
+                               error_text=COALESCE(NULLIF(error_text,''), 'stale job auto-reaped'),
+                               message=?,
+                               updated_at=?
+                         WHERE job_id=?
+                        """,
+                        (
+                            _v228_now_jst_iso(),
+                            f"一定時間応答がなかったため自動終了しました（{int(age_min)}分）。",
+                            _v228_now_jst_iso(),
+                            jid,
+                        ),
+                    )
+                    reaped += 1
+                    try:
+                        _v278_cancel_flag_clear(jid)
+                    except Exception:
+                        pass
+            if reaped:
+                con.commit()
+    except Exception:
+        return reaped
+    return reaped
+
+
 def _v278_bg_has_running_job(db_path: str) -> bool:
     try:
+        try:
+            _v278_bg_reap_stale_jobs(db_path)
+        except Exception:
+            pass
         _v278_bg_ensure_table(db_path)
         with sqlite3.connect(str(db_path), timeout=30.0) as con:
             con.execute("PRAGMA busy_timeout=30000")
@@ -3136,6 +3254,10 @@ def _v301_bg_completed_view_matches(job: dict, view: dict, raw_text: str, venue_
 
 def _v279_bg_prediction_any_active(db_path: str) -> bool:
     try:
+        try:
+            _v278_bg_reap_stale_jobs(db_path)
+        except Exception:
+            pass
         _v278_bg_ensure_table(db_path)
         with sqlite3.connect(str(db_path), timeout=30.0) as con:
             con.execute("PRAGMA busy_timeout=30000")
@@ -13090,6 +13212,10 @@ def _v319_import_player_history_only(
 def _v319_bg_history_any_active(db_path: str) -> bool:
     """選手履歴のみ取込が稼働中か。"""
     try:
+        try:
+            _v278_bg_reap_stale_jobs(db_path)
+        except Exception:
+            pass
         _v278_bg_ensure_table(db_path)
         with sqlite3.connect(str(db_path), timeout=30.0) as con:
             con.execute("PRAGMA busy_timeout=30000")
@@ -14085,6 +14211,18 @@ def _v319_bg_history_worker(db_path: str, job_id: int, req: dict) -> None:
                 f" / 失敗：{err}R / 履歴+{added}件"
             ),
         }, protocol=4), 6)
+        _v278_bg_update(
+            db_path, job_id,
+            status="completed",
+            finished_at=_v228_now_jst_iso(),
+            done_count=total,
+            current_label="完了",
+            message=(
+                f"選手履歴の登録が完了しました｜履歴登録{ok}R / 変化なし{skip}R"
+                f" / 失敗{err}R / 履歴+{added}件{fail_summary}"
+            ),
+            result_blob=blob,
+        )
         # 完了通知（ntfy）。送信失敗は無視する。
         try:
             topic = str(__import__("os").environ.get("AUTORACE_NTFY_TOPIC", "notify") or "notify").strip()
@@ -14109,18 +14247,6 @@ def _v319_bg_history_worker(db_path: str, job_id: int, req: dict) -> None:
                 resp.read()
         except Exception:
             pass
-        _v278_bg_update(
-            db_path, job_id,
-            status="completed",
-            finished_at=_v228_now_jst_iso(),
-            done_count=total,
-            current_label="完了",
-            message=(
-                f"選手履歴の登録が完了しました｜履歴登録{ok}R / 変化なし{skip}R"
-                f" / 失敗{err}R / 履歴+{added}件{fail_summary}"
-            ),
-            result_blob=blob,
-        )
     except Exception as exc:
         _v278_bg_update(
             db_path, job_id,
