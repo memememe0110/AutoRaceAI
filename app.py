@@ -23395,6 +23395,96 @@ def _v302_normalize_restore_plan_versions(db_path: str) -> int:
         return 0
 
 
+
+def _v324_chatgpt_compact_export(df: pd.DataFrame, analysis_df: pd.DataFrame | None = None) -> str:
+    """ChatGPT向けの小さいテキスト。集計＋代表レースのみ。"""
+    lines: list[str] = []
+    if df is None or getattr(df, "empty", True):
+        return "データなし"
+    d = df.copy()
+    # normalize cols (dashboard uses english sometimes)
+    colmap = {
+        "venue": "開催場", "race_no": "R", "app_version": "バージョン",
+        "plan_origin": "生成経路", "source_prediction_version": "元予測版",
+        "new_recommendation_label": "新推奨", "points": "点数",
+        "cost_yen": "購入額", "payout_yen": "払戻額", "return_rate": "回収率",
+        "new_recommendation_max_ev": "新判定最大EV", "race_key": "race_key",
+        "date": "日付", "hit_flag": "的中フラグ",
+    }
+    for a, b in colmap.items():
+        if a in d.columns and b not in d.columns:
+            d[b] = d[a]
+    if "的中フラグ" not in d.columns:
+        if "hit" in d.columns:
+            d["的中フラグ"] = pd.to_numeric(d["hit"], errors="coerce").fillna(0).astype(int)
+        elif "判定" in d.columns:
+            d["的中フラグ"] = d["判定"].astype(str).str.contains("黒字|的中", na=False).astype(int)
+        else:
+            d["的中フラグ"] = 0
+    for c, default in (("購入額", 0), ("払戻額", 0), ("点数", 0)):
+        if c not in d.columns:
+            d[c] = default
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0)
+    if "新推奨" not in d.columns:
+        d["新推奨"] = ""
+    if "生成経路" not in d.columns:
+        d["生成経路"] = d.get("plan_origin", "unknown")
+    if "バージョン" not in d.columns:
+        d["バージョン"] = d.get("app_version", "")
+
+    def _roi(g):
+        cost = float(g["購入額"].sum())
+        pay = float(g["払戻額"].sum())
+        n = len(g)
+        hits = int(pd.to_numeric(g["的中フラグ"], errors="coerce").fillna(0).sum())
+        roi = (pay / cost * 100.0) if cost > 0 else 0.0
+        return n, hits, cost, pay, roi
+
+    lines.append("# AutoRaceAI 回収率コンパクト分析")
+    lines.append(f"対象行数: {len(d)}")
+    if "日付" in d.columns:
+        lines.append(f"期間: {d['日付'].min()} 〜 {d['日付'].max()}")
+    lines.append("")
+    lines.append("## 全体")
+    n, hits, cost, pay, roi = _roi(d)
+    lines.append(f"n={n} hits={hits} cost={int(cost)} pay={int(pay)} ROI={roi:.1f}%")
+    maru = d[d["新推奨"].astype(str).str.contains("◎", na=False)]
+    n, hits, cost, pay, roi = _roi(maru)
+    lines.append(f"◎のみ n={n} hits={hits} cost={int(cost)} pay={int(pay)} ROI={roi:.1f}%")
+    lines.append("")
+    lines.append("## 生成経路別（全件 / ◎）")
+    if "生成経路" in d.columns:
+        for origin, g in d.groupby(d["生成経路"].fillna("?").astype(str)):
+            n, hits, cost, pay, roi = _roi(g)
+            gm = g[g["新推奨"].astype(str).str.contains("◎", na=False)]
+            n2, h2, c2, p2, r2 = _roi(gm)
+            lines.append(
+                f"- {origin}: all n={n} ROI={roi:.1f}% | ◎ n={n2} ROI={r2:.1f}% hits={h2}"
+            )
+    lines.append("")
+    lines.append("## 月別（画面フィルタ後・全件）")
+    if "日付" in d.columns:
+        d2 = d.copy()
+        d2["_ym"] = d2["日付"].astype(str).str[:7]
+        for ym, g in d2.groupby("_ym"):
+            n, hits, cost, pay, roi = _roi(g)
+            lines.append(f"- {ym}: n={n} hits={hits} ROI={roi:.1f}% cost={int(cost)}")
+    lines.append("")
+    lines.append("## ◎レース一覧（最大40）")
+    if not maru.empty:
+        cols = [c for c in ["日付", "開催場", "R", "race_key", "バージョン", "生成経路", "点数", "購入額", "払戻額", "回収率", "新判定最大EV", "的中フラグ"] if c in maru.columns]
+        show = maru[cols].head(40)
+        lines.append(show.to_csv(index=False))
+    else:
+        lines.append("(◎なし)")
+    lines.append("")
+    lines.append("## 注意")
+    lines.append("- recommendation_relabel は Ver322 買い目を Ver324 推奨ゲートで再ラベルしただけ")
+    lines.append("- 本線評価は official_import / live を使う")
+    lines.append("- ◎は _V324_MIN_TICKETS=5 前提。Ver322 の1点〜と比較しない")
+    return "\n".join(lines)
+
+
 def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
     """各レース・各バージョンの最新「照合済み」プランを集計用DataFrameで返す。
 
@@ -24115,16 +24205,34 @@ def _v215_render_return_dashboard(db_path: str) -> None:
     c1, c2, c3 = st.columns(3)
     selected_venue = c1.selectbox("開催場で絞る", ["全開催場"] + venues, key="v215_return_venue")
     selected_version = c2.selectbox("バージョンで絞る", ["全バージョン"] + versions, key="v215_return_version")
-    selected_origin = c3.selectbox(
-        "生成経路で絞る",
-        ["全経路"] + origins,
-        key="v215_return_origin",
+    # 本線評価の既定: official_import + live（混在を防ぐ）
+    _default_origins = [o for o in ("official_import", "live") if o in origins]
+    selected_origins = c3.multiselect(
+        "生成経路で絞る（複数可）",
+        options=origins if origins else ["live"],
+        default=_default_origins if _default_origins else (origins[:1] if origins else []),
+        key="v215_return_origins",
         help=(
-            "live=本番予測 / odds_replan=保存オッズ再計算(Ver325 G1) / "
-            "official_import=公式取込 / recommendation_relabel=推奨のみコピー / "
-            "current_version_restore・source_version_restore=復元"
+            "本線評価: official_import / live のみ。"
+            " recommendation_relabel=Ver322コピー。"
+            " odds_replan=Ver325 G1実験。"
+            " 空にすると全経路。"
         ),
     )
+    c4, c5, c6 = st.columns(3)
+    selected_rec = c4.selectbox(
+        "推奨で絞る",
+        ["全件", "◎のみ", "◎+○", "見送りのみ"],
+        key="v215_return_rec_filter",
+    )
+    _dates = []
+    if "date" in df.columns:
+        try:
+            _dates = sorted({str(x)[:10] for x in df["date"].dropna().astype(str) if str(x).strip()})
+        except Exception:
+            _dates = []
+    date_from = c5.selectbox("開始日", ["（指定なし）"] + _dates, key="v215_return_date_from")
+    date_to = c6.selectbox("終了日", ["（指定なし）"] + list(reversed(_dates)), key="v215_return_date_to")
     if "plan_origin" in df.columns:
         _org_counts = df["plan_origin"].fillna("live").astype(str).value_counts()
         st.caption(
@@ -24136,8 +24244,21 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         filtered = filtered[filtered["venue"].astype(str) == selected_venue]
     if selected_version != "全バージョン":
         filtered = filtered[filtered["app_version"].astype(str) == selected_version]
-    if selected_origin != "全経路" and "plan_origin" in filtered.columns:
-        filtered = filtered[filtered["plan_origin"].astype(str) == selected_origin]
+    if selected_origins and "plan_origin" in filtered.columns:
+        filtered = filtered[filtered["plan_origin"].astype(str).isin([str(x) for x in selected_origins])]
+    if "date" in filtered.columns and date_from != "（指定なし）":
+        filtered = filtered[filtered["date"].astype(str).str[:10] >= date_from]
+    if "date" in filtered.columns and date_to != "（指定なし）":
+        filtered = filtered[filtered["date"].astype(str).str[:10] <= date_to]
+    _lab = filtered["new_recommendation_label"] if "new_recommendation_label" in filtered.columns else None
+    if _lab is not None and selected_rec != "全件":
+        _ls = _lab.fillna("").astype(str)
+        if selected_rec == "◎のみ":
+            filtered = filtered[_ls.str.contains("◎", na=False)]
+        elif selected_rec == "◎+○":
+            filtered = filtered[_ls.str.contains("◎|○", na=False, regex=True)]
+        elif selected_rec == "見送りのみ":
+            filtered = filtered[~_ls.str.contains("◎|○", na=False, regex=True)]
     if filtered.empty:
         st.warning("選択条件に該当する実績がありません。")
         return
@@ -24352,20 +24473,36 @@ def _v215_render_return_dashboard(db_path: str) -> None:
 
     analysis_df = _v319_analysis_export_rows(str(db_path), filtered)
     st.markdown("### 分析用CSV")
-    st.caption("ハンデ差・走路・展開型・着順を付けたレース単位です。Excelやこちらでの分析用。")
+    st.caption("ハンデ差・走路・展開型・着順を付けたレース単位です。Excelやこちらでの分析用。上のフィルタが効きます。")
     if analysis_df.empty:
         st.info("分析用に結合できる結果がありません。")
     else:
         st.dataframe(analysis_df.head(30), use_container_width=True, hide_index=True)
-        st.caption(f"{len(analysis_df)}R / {len(analysis_df.columns)}列")
+        st.caption(f"{len(analysis_df)}R / {len(analysis_df.columns)}列（画面の絞り込み後）")
         st.download_button(
-            "分析用CSVを保存",
+            "分析用CSVを保存（絞り込み後）",
             analysis_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="return_analysis.csv",
+            file_name="return_analysis_filtered.csv",
             mime="text/csv",
             use_container_width=True,
             key="v319_return_analysis_csv",
         )
+    st.markdown("### ChatGPT用コンパクト")
+    st.caption("集計＋◎一覧のみの小さいテキスト。全経路混在の巨大CSVは使わず、上で経路・推奨・期間を絞ってから保存してください。")
+    try:
+        _compact324 = _v324_chatgpt_compact_export(filtered, analysis_df if not analysis_df.empty else None)
+    except Exception as _cx:
+        _compact324 = f"生成失敗: {_cx}"
+    with st.expander("コンパクト本文プレビュー", expanded=False):
+        st.code(_compact324[:8000])
+    st.download_button(
+        "ChatGPT用テキストを保存",
+        str(_compact324).encode("utf-8"),
+        file_name="return_chatgpt_compact.txt",
+        mime="text/plain",
+        use_container_width=True,
+        key="v324_return_chatgpt_compact",
+    )
 
 
 def _v226_prediction_condition_rows(db_path: str) -> pd.DataFrame:
@@ -26810,37 +26947,123 @@ def _v301_sql_ident(name: str) -> str:
     return '"' + str(name).replace('"','""') + '"'
 
 
-def _v301_build_analysis_light_db_zip(snapshot_bytes: bytes) -> dict:
+def _v301_build_analysis_light_db_zip(
+    snapshot_bytes: bytes,
+    app_versions: list | None = None,
+    plan_origins: list | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict:
     """ChatGPT等へ渡す解析用軽量DB ZIPを作成する。
 
     正本DBの置換/復元には使わない。大容量payload・UI復元・一時キャッシュだけ外し、
     選手履歴、結果、払戻、オッズ、予測券種確率、回収率実績、展開監査、学習値などは保持する。
+
+    任意フィルタ (app_versions / plan_origins / date_from / date_to):
+      プラン系テーブルの行を絞り、ChatGPTへ渡す混在とサイズを抑える。
+      選手履歴・学習値など横断テーブルは常に全件。
     """
-    if not isinstance(snapshot_bytes,(bytes,bytearray)) or not snapshot_bytes:
+    if not isinstance(snapshot_bytes, (bytes, bytearray)) or not snapshot_bytes:
         raise RuntimeError("DBスナップショットが空です。")
+    versions = [str(x).strip() for x in (app_versions or []) if str(x).strip()]
+    origins = [str(x).strip() for x in (plan_origins or []) if str(x).strip()]
+
+    def _ymd(s):
+        t = re.sub(r"\D", "", str(s or ""))
+        return t[:8] if len(t) >= 8 else ""
+
+    d_from = _ymd(date_from)
+    d_to = _ymd(date_to)
+    filter_active = bool(versions or origins or d_from or d_to)
+
+    _PLAN_FILTER_TABLES = {
+        "v187_mixed_plan_runs",
+        "v187_mixed_plan_feedback",
+        "v187_mixed_plan_tickets",
+        "v300_recommendation_audit",
+        "v321_trace_results",
+        "v321_plan_diagnostics",
+    }
+    _RACE_KEY_FILTER_TABLES = {
+        "result_races",
+        "result_entries",
+        "result_payouts",
+        "odds_snapshots",
+    }
+
     with tempfile.TemporaryDirectory(prefix="autorace_analysis_") as td:
-        tdp=Path(td)
-        src_path=tdp/"source.sqlite3"
-        dst_path=tdp/"autorace_analysis_light.sqlite3"
-        zip_path=tdp/"autorace_analysis_light.zip"
+        tdp = Path(td)
+        src_path = tdp / "source.sqlite3"
+        dst_path = tdp / "autorace_analysis_light.sqlite3"
+        zip_path = tdp / "autorace_analysis_light.zip"
         src_path.write_bytes(bytes(snapshot_bytes))
 
-        src=sqlite3.connect(str(src_path),timeout=30.0)
-        dst=sqlite3.connect(str(dst_path),timeout=30.0)
-        copied=[]; excluded=[]; errors=[]
+        src = sqlite3.connect(str(src_path), timeout=30.0)
+        dst = sqlite3.connect(str(dst_path), timeout=30.0)
+        copied = []
+        excluded = []
+        errors = []
+        filter_plan_rows = 0
+        filter_race_rows = 0
+        runs_where = ""
+        runs_params: list = []
         try:
-            ok=src.execute("PRAGMA integrity_check").fetchone()
-            if not ok or str(ok[0]).lower()!="ok":
+            ok = src.execute("PRAGMA integrity_check").fetchone()
+            if not ok or str(ok[0]).lower() != "ok":
                 raise RuntimeError("元DBのintegrity_checkに失敗しました。")
             dst.execute("PRAGMA journal_mode=DELETE")
             dst.execute("PRAGMA synchronous=OFF")
-            table_rows=src.execute("""
+
+            if filter_active:
+                try:
+                    run_cols = {str(r[1]) for r in src.execute("PRAGMA table_info(v187_mixed_plan_runs)").fetchall()}
+                except Exception:
+                    run_cols = set()
+                clauses = []
+                if versions and "app_version" in run_cols:
+                    clauses.append("app_version IN (" + ",".join("?" * len(versions)) + ")")
+                    runs_params.extend(versions)
+                if origins and "plan_origin" in run_cols:
+                    clauses.append(
+                        "COALESCE(plan_origin,'live') IN (" + ",".join("?" * len(origins)) + ")"
+                    )
+                    runs_params.extend(origins)
+                if d_from and "race_key" in run_cols:
+                    clauses.append("REPLACE(SUBSTR(CAST(race_key AS TEXT),1,10),'-','') >= ?")
+                    runs_params.append(d_from)
+                if d_to and "race_key" in run_cols:
+                    clauses.append("REPLACE(SUBSTR(CAST(race_key AS TEXT),1,10),'-','') <= ?")
+                    runs_params.append(d_to)
+                if clauses:
+                    runs_where = " WHERE " + " AND ".join(clauses)
+                    try:
+                        filter_plan_rows = int(
+                            src.execute(
+                                f"SELECT COUNT(*) FROM v187_mixed_plan_runs{runs_where}",
+                                runs_params,
+                            ).fetchone()[0]
+                            or 0
+                        )
+                        filter_race_rows = int(
+                            src.execute(
+                                f"SELECT COUNT(DISTINCT race_key) FROM v187_mixed_plan_runs{runs_where}",
+                                runs_params,
+                            ).fetchone()[0]
+                            or 0
+                        )
+                    except Exception:
+                        filter_plan_rows = 0
+                        filter_race_rows = 0
+
+            table_rows = src.execute(
+                """
                 SELECT name,sql FROM sqlite_master
                 WHERE type='table' AND name NOT LIKE 'sqlite_%'
                 ORDER BY name
-            """).fetchall()
-            for table_name,create_sql in table_rows:
-                name=str(table_name)
+                """
+            ).fetchall()
+            for table_name, create_sql in table_rows:
+                name = str(table_name)
                 if name in _V301_ANALYSIS_EXPORT_EXCLUDE_TABLES:
                     _ = excluded.append(name)
                     continue
@@ -26848,90 +27071,167 @@ def _v301_build_analysis_light_db_zip(snapshot_bytes: bytes) -> dict:
                     continue
                 try:
                     dst.execute(str(create_sql))
-                    cols=[str(r[1]) for r in src.execute(f"PRAGMA table_info({_v301_sql_ident(name)})").fetchall()]
+                    cols = [
+                        str(r[1])
+                        for r in src.execute(f"PRAGMA table_info({_v301_sql_ident(name)})").fetchall()
+                    ]
                     if not cols:
-                        copied.append((name,0)); continue
-                    qcols=','.join(_v301_sql_ident(c) for c in cols)
-                    placeholders=','.join('?' for _ in cols)
-                    cur=src.execute(f"SELECT {qcols} FROM {_v301_sql_ident(name)}")
-                    count=0
+                        copied.append((name, 0))
+                        continue
+                    qcols = ",".join(_v301_sql_ident(c) for c in cols)
+                    placeholders = ",".join("?" for _ in cols)
+                    sql = f"SELECT {qcols} FROM {_v301_sql_ident(name)}"
+                    params_sel: list = []
+                    if filter_active and runs_where and name in _PLAN_FILTER_TABLES:
+                        if name == "v187_mixed_plan_runs":
+                            sql += runs_where
+                            params_sel = list(runs_params)
+                        elif "plan_hash" in cols:
+                            sql += (
+                                " WHERE plan_hash IN (SELECT plan_hash FROM v187_mixed_plan_runs"
+                                + runs_where
+                                + ")"
+                            )
+                            params_sel = list(runs_params)
+                        elif "race_key" in cols:
+                            sql += (
+                                " WHERE race_key IN (SELECT DISTINCT race_key FROM v187_mixed_plan_runs"
+                                + runs_where
+                                + ")"
+                            )
+                            params_sel = list(runs_params)
+                        else:
+                            sql += " WHERE 0"
+                    elif filter_active and runs_where and name in _RACE_KEY_FILTER_TABLES and "race_key" in cols:
+                        sql += (
+                            " WHERE race_key IN (SELECT DISTINCT race_key FROM v187_mixed_plan_runs"
+                            + runs_where
+                            + ")"
+                        )
+                        params_sel = list(runs_params)
+                    cur = src.execute(sql, params_sel)
+                    count = 0
                     while True:
-                        batch=cur.fetchmany(1000)
-                        if not batch: break
+                        batch = cur.fetchmany(1000)
+                        if not batch:
+                            break
                         dst.executemany(
                             f"INSERT INTO {_v301_sql_ident(name)} ({qcols}) VALUES ({placeholders})",
                             batch,
                         )
                         count += len(batch)
-                    _ = copied.append((name,count))
+                    _ = copied.append((name, count))
                 except Exception as exc:
                     _ = errors.append(f"{name}: {type(exc).__name__}: {exc}")
-                    try: dst.execute(f"DROP TABLE IF EXISTS {_v301_sql_ident(name)}")
-                    except Exception: pass
+                    try:
+                        dst.execute(f"DROP TABLE IF EXISTS {_v301_sql_ident(name)}")
+                    except Exception:
+                        pass
 
-            # v231の巨大payloadは除外するが、どのレース/Verを予測したかのメタ情報は残す。
             try:
-                info=[r for r in src.execute("PRAGMA table_info(v231_prediction_history)").fetchall() if str(r[1])!='payload']
+                info = [
+                    r
+                    for r in src.execute("PRAGMA table_info(v231_prediction_history)").fetchall()
+                    if str(r[1]) != "payload"
+                ]
                 if info:
-                    coldefs=[]; cols=[]
+                    coldefs = []
+                    cols = []
                     for r in info:
-                        cname=str(r[1]); ctype=str(r[2] or '')
+                        cname = str(r[1])
+                        ctype = str(r[2] or "")
                         _ = cols.append(cname)
                         _ = coldefs.append(f"{_v301_sql_ident(cname)} {ctype}".strip())
-                    dst.execute("CREATE TABLE analysis_prediction_history_summary ("+','.join(coldefs)+")")
-                    qcols=','.join(_v301_sql_ident(c) for c in cols)
-                    ph=','.join('?' for _ in cols)
-                    cur=src.execute(f"SELECT {qcols} FROM v231_prediction_history")
-                    n=0
+                    dst.execute(
+                        "CREATE TABLE analysis_prediction_history_summary ("
+                        + ",".join(coldefs)
+                        + ")"
+                    )
+                    qcols = ",".join(_v301_sql_ident(c) for c in cols)
+                    ph = ",".join("?" for _ in cols)
+                    sql = f"SELECT {qcols} FROM v231_prediction_history"
+                    params_sel = []
+                    if filter_active and runs_where and "race_key" in cols:
+                        sql += (
+                            " WHERE race_key IN (SELECT DISTINCT race_key FROM v187_mixed_plan_runs"
+                            + runs_where
+                            + ")"
+                        )
+                        params_sel = list(runs_params)
+                    cur = src.execute(sql, params_sel)
+                    n = 0
                     while True:
-                        batch=cur.fetchmany(1000)
-                        if not batch: break
-                        dst.executemany("INSERT INTO analysis_prediction_history_summary VALUES ("+ph+")",batch)
-                        n+=len(batch)
-                    _ = copied.append(("analysis_prediction_history_summary",n))
+                        batch = cur.fetchmany(1000)
+                        if not batch:
+                            break
+                        dst.executemany(
+                            "INSERT INTO analysis_prediction_history_summary VALUES (" + ph + ")",
+                            batch,
+                        )
+                        n += len(batch)
+                    _ = copied.append(("analysis_prediction_history_summary", n))
             except Exception as exc:
                 _ = errors.append(f"prediction_history_summary: {type(exc).__name__}: {exc}")
 
             dst.execute("CREATE TABLE analysis_export_manifest(key TEXT PRIMARY KEY,value TEXT)")
-            manifest={
-                "purpose":"ChatGPT/解析用軽量DB。正本復元には使用しない",
-                "app_version":str(APP_VERSION),
-                "created_at":_v228_now_jst_iso(),
-                "source_bytes":len(snapshot_bytes),
-                "excluded_tables":sorted(_V301_ANALYSIS_EXPORT_EXCLUDE_TABLES),
-                "copied_tables":len(copied),
-                "copy_errors":errors,
+            manifest = {
+                "purpose": "ChatGPT/解析用軽量DB。正本復元には使用しない",
+                "app_version": str(APP_VERSION),
+                "created_at": _v228_now_jst_iso(),
+                "source_bytes": len(snapshot_bytes),
+                "filter_app_versions": versions,
+                "filter_plan_origins": origins,
+                "filter_date_from": d_from or "",
+                "filter_date_to": d_to or "",
+                "filter_plan_rows": filter_plan_rows,
+                "filter_race_keys": filter_race_rows,
+                "excluded_tables": sorted(_V301_ANALYSIS_EXPORT_EXCLUDE_TABLES),
+                "copied_tables": len(copied),
+                "copy_errors": errors,
             }
-            for k,v in manifest.items():
-                dst.execute("INSERT INTO analysis_export_manifest(key,value) VALUES (?,?)",(str(k),json.dumps(v,ensure_ascii=False)))
+            for k, v in manifest.items():
+                dst.execute(
+                    "INSERT INTO analysis_export_manifest(key,value) VALUES (?,?)",
+                    (str(k), json.dumps(v, ensure_ascii=False)),
+                )
             dst.commit()
             dst.execute("VACUUM")
             dst.commit()
-            chk=dst.execute("PRAGMA integrity_check").fetchone()
-            if not chk or str(chk[0]).lower()!="ok":
+            chk = dst.execute("PRAGMA integrity_check").fetchone()
+            if not chk or str(chk[0]).lower() != "ok":
                 raise RuntimeError("軽量DBのintegrity_checkに失敗しました。")
         finally:
-            src.close(); dst.close()
+            src.close()
+            dst.close()
 
-        readme=(
+        filt_note = ""
+        if filter_active:
+            filt_note = (
+                f"\nフィルタ: versions={versions or '全て'} origins={origins or '全て'} "
+                f"date={d_from or '-'}〜{d_to or '-'} / plan行={filter_plan_rows} race={filter_race_rows}\n"
+            )
+        readme = (
             "AutoRaceAI ChatGPT解析用軽量DB\n"
-            "正本DBの復元・GitHub保存には使用しないでください。\n\n"
-            "保持: 選手/履歴/ラップ/結果/払戻/オッズ/券種確率/回収率実績/推奨監査/展開監査/学習値など。\n"
+            "正本DBの復元・GitHub保存には使用しないでください。\n"
+            + filt_note
+            + "\n保持: 選手/履歴/ラップ/結果/払戻/オッズ/券種確率/回収率実績/推奨監査/展開監査/学習値など。\n"
             "除外: 大容量予測payload、入力復元payload、結果UI復元、結果生本文、BGジョブ、一時キャッシュ、孤立退避。\n"
+            "プラン系はフィルタ指定時のみ行を絞る。選手履歴・学習値は全件。\n"
             "v231_prediction_historyはpayloadだけ落とし、analysis_prediction_history_summaryへメタ情報を残しています。\n"
         )
-        with zipfile.ZipFile(str(zip_path),'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
-            z.write(str(dst_path),arcname="autorace_analysis_light.sqlite3")
-            z.writestr("README_解析用.txt",readme)
-        zip_bytes=zip_path.read_bytes()
+        with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+            z.write(str(dst_path), arcname="autorace_analysis_light.sqlite3")
+            z.writestr("README_解析用.txt", readme)
+        zip_bytes = zip_path.read_bytes()
         return {
-            "bytes":zip_bytes,
-            "zip_size":len(zip_bytes),
-            "db_size":dst_path.stat().st_size,
-            "source_size":len(snapshot_bytes),
-            "copied_tables":len(copied),
-            "excluded_tables":excluded,
-            "errors":errors,
+            "bytes": zip_bytes,
+            "zip_size": len(zip_bytes),
+            "db_size": dst_path.stat().st_size,
+            "source_size": len(snapshot_bytes),
+            "copied_tables": len(copied),
+            "excluded_tables": excluded,
+            "filter_plan_rows": filter_plan_rows,
+            "errors": errors,
         }
 
 with st.sidebar:
@@ -27174,18 +27474,65 @@ with st.sidebar:
                 st.caption(f"端末保存用スナップショット: {len(_dl_bytes290)/1024/1024:.2f} MB（WAL内の最新コミットを含む）")
 
             st.markdown("##### 📦 ChatGPT解析用・軽量DB")
-            st.caption("大容量の予測payload・画面復元データ・一時キャッシュだけを外し、分析に必要な履歴/結果/オッズ/回収率/推奨/展開監査は残します。正本復元には使いません。")
+            st.caption("大容量の予測payload・画面復元データ・一時キャッシュだけを外し、分析に必要な履歴/結果/オッズ/回収率/推奨/展開監査は残します。正本復元には使いません。バージョン・経路を絞るとプラン行だけ小さくできます。")
+            _light_vers301, _light_oris301 = [], []
+            try:
+                with sqlite3.connect(str(db_path), timeout=2.0) as _c301:
+                    _c301.execute("PRAGMA busy_timeout=2000")
+                    try:
+                        _light_vers301 = [str(r[0]) for r in _c301.execute(
+                            "SELECT DISTINCT app_version FROM v187_mixed_plan_runs WHERE COALESCE(app_version,'')<>'' ORDER BY 1"
+                        ).fetchall() if r and r[0]]
+                    except Exception:
+                        _light_vers301 = []
+                    try:
+                        _light_oris301 = [str(r[0]) for r in _c301.execute(
+                            "SELECT DISTINCT COALESCE(plan_origin,'live') FROM v187_mixed_plan_runs ORDER BY 1"
+                        ).fetchall() if r and r[0]]
+                    except Exception:
+                        _light_oris301 = []
+            except Exception:
+                pass
+            _def_v301 = [v for v in _light_vers301 if str(v) == str(APP_VERSION)] or (_light_vers301[-1:] if _light_vers301 else [])
+            _def_o301 = [o for o in ("official_import", "live") if o in _light_oris301]
+            _sel_v301 = st.multiselect(
+                "解析用DB: バージョン",
+                options=_light_vers301 or [str(APP_VERSION)],
+                default=_def_v301,
+                key="v301_light_versions",
+                help="空にすると全バージョンのプランを含めます。",
+            )
+            _sel_o301 = st.multiselect(
+                "解析用DB: 生成経路",
+                options=_light_oris301 or ["live", "official_import", "recommendation_relabel"],
+                default=_def_o301 or [],
+                key="v301_light_origins",
+                help="本線評価は official_import / live。recommendation_relabel は Ver322 コピー。",
+            )
+            _dc1, _dc2 = st.columns(2)
+            _sel_df301 = _dc1.text_input("開始日(YYYYMMDD)", value="", key="v301_light_date_from", placeholder="例 20260901")
+            _sel_dt301 = _dc2.text_input("終了日(YYYYMMDD)", value="", key="v301_light_date_to", placeholder="例 20261005")
             _light_sig301=_v290_db_stat_signature(db_path)
             _light_cache301=st.session_state.get("_v301_analysis_light_export")
-            if isinstance(_light_cache301,dict) and _light_cache301.get("sig")!=_light_sig301:
+            _filt_sig301 = (
+                f"{_light_sig301}|{','.join(_sel_v301)}|{','.join(_sel_o301)}|{_sel_df301}|{_sel_dt301}"
+            )
+            if isinstance(_light_cache301,dict) and _light_cache301.get("filt_sig")!=_filt_sig301:
                 _ = st.session_state.pop("_v301_analysis_light_export",None)
                 _light_cache301=None
             if st.button("🪶 ChatGPT解析用の軽量DBを準備",use_container_width=True,key="v301_prepare_analysis_light_db"):
                 try:
                     with st.spinner("最新DBを安全にスナップショット化し、解析用に軽量化しています…"):
                         _source301=_v278_consistent_db_snapshot_bytes(str(db_path))
-                        _pack301=_v301_build_analysis_light_db_zip(_source301)
+                        _pack301=_v301_build_analysis_light_db_zip(
+                            _source301,
+                            app_versions=list(_sel_v301) if _sel_v301 else None,
+                            plan_origins=list(_sel_o301) if _sel_o301 else None,
+                            date_from=_sel_df301 or None,
+                            date_to=_sel_dt301 or None,
+                        )
                     _pack301["sig"]=_v290_db_stat_signature(db_path)
+                    _pack301["filt_sig"]=_filt_sig301
                     st.session_state["_v301_analysis_light_export"]=_pack301
                     _light_cache301=_pack301
                 except Exception as _light_exc301:
@@ -27204,7 +27551,11 @@ with st.sidebar:
                 _db_mb301=float(_light_cache301.get("db_size",0))/1024/1024
                 _zip_mb301=float(_light_cache301.get("zip_size",0))/1024/1024
                 st.success(f"軽量化完了: 元DB {_src_mb301:.1f} MB → 軽量DB {_db_mb301:.1f} MB → ZIP {_zip_mb301:.1f} MB")
-                st.caption(f"保持テーブル {_light_cache301.get('copied_tables',0)}個 / 除外 {len(_light_cache301.get('excluded_tables') or [])}個。ZIPのままこのチャットへ添付できます。")
+                st.caption(
+                    f"保持テーブル {_light_cache301.get('copied_tables',0)}個 / 除外 {len(_light_cache301.get('excluded_tables') or [])}個"
+                    + (f" / プラン行 {_light_cache301.get('filter_plan_rows',0)}" if _light_cache301.get('filter_plan_rows') is not None else "")
+                    + "。ZIPのままこのチャットへ添付できます。"
+                )
                 if _light_cache301.get("errors"):
                     with st.expander("軽量化時のスキップ詳細",expanded=False):
                         st.code("\n".join(map(str,_light_cache301.get("errors") or [])))
