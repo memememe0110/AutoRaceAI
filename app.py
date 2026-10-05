@@ -2357,11 +2357,37 @@ def _v278_bg_has_running_job(db_path: str) -> bool:
     except Exception:
         return False
 
+def _v278_cancel_flag_path(job_id: int) -> Path:
+    """DBロック中でも中止要求を即時受け付けるためのフラグファイル。"""
+    return Path(tempfile.gettempdir()) / f"autoraceai_bg_cancel_{int(job_id)}.flag"
+
+
+def _v278_cancel_flag_set(job_id: int) -> None:
+    try:
+        _v278_cancel_flag_path(job_id).write_text("1", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _v278_cancel_flag_clear(job_id: int) -> None:
+    try:
+        p = _v278_cancel_flag_path(job_id)
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
 def _v278_bg_cancel_requested(db_path: str, job_id: int) -> bool:
     try:
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
-            row=con.execute(
+        if _v278_cancel_flag_path(int(job_id)).exists():
+            return True
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(str(db_path), timeout=1.5) as con:
+            con.execute("PRAGMA busy_timeout=1500")
+            row = con.execute(
                 "SELECT cancel_requested FROM v278_background_jobs WHERE job_id=?",
                 (int(job_id),)
             ).fetchone()
@@ -2369,13 +2395,30 @@ def _v278_bg_cancel_requested(db_path: str, job_id: int) -> bool:
     except Exception:
         return False
 
+
 def _v278_bg_request_cancel(db_path: str, job_id: int) -> None:
-    _v278_bg_update(
-        db_path, job_id,
-        status="cancel_requested",
-        cancel_requested=1,
-        message="現在のレース処理が終わり次第停止します。"
-    )
+    _v278_cancel_flag_set(job_id)
+    try:
+        with sqlite3.connect(str(db_path), timeout=2.0) as con:
+            con.execute("PRAGMA busy_timeout=2000")
+            con.execute(
+                """
+                UPDATE v278_background_jobs
+                   SET status='cancel_requested',
+                       cancel_requested=1,
+                       message=?,
+                       updated_at=?
+                 WHERE job_id=?
+                """,
+                (
+                    "中止要求を受け付けました。処理の区切りで停止します。",
+                    _v228_now_jst_iso(),
+                    int(job_id),
+                ),
+            )
+            con.commit()
+    except Exception:
+        pass
 
 def _v278_bg_pause_requested(db_path: str, job_id: int) -> bool:
     try:
@@ -11334,6 +11377,7 @@ def _v319_fill_player_histories(
     before_race: int = 0,
     con=None,
     _exclusive: bool = False,
+    cancel_cb=None,
 ) -> dict:
     """選手履歴を公式PC版 PlayerDetail から取得して保存。
 
@@ -11373,6 +11417,17 @@ def _v319_fill_player_histories(
         before_d_job = _v319_ymd_digits(before_ymd)  # ループ共通（ジョブ内キャッシュキー）
 
         for p in players:
+            # 中止要求: 選手単位で即抜ける（長いHTTP中も次選手前に止まる）
+            if callable(cancel_cb):
+                try:
+                    if bool(cancel_cb()):
+                        details.append("中止要求により選手履歴取込を中断")
+                        return {
+                            "added": added, "skipped": skipped, "errors": errors,
+                            "details": details, "cancelled": True,
+                        }
+                except Exception:
+                    pass
             name = p.get("name") or ""
             pcd = str(p.get("player_cd") or "").strip()
             cache_key = pcd or _v319_norm_player_name(name)
@@ -11790,6 +11845,11 @@ def _v319_fill_player_histories(
                 added += delta
                 if need_refresh:
                     _V319_HIST_REFRESHED.add(cache_key)
+                # 選手ごとに commit → 取込中でも他画面の読み取りが通りやすい
+                try:
+                    con.commit()
+                except Exception:
+                    pass
 
                 # 穴なし確認: 対象日までの最新が埋まり、missing_official が解消された時だけ
                 # キャッシュスキップ登録する（次回の無駄な再取得を防ぐ）。
@@ -13000,6 +13060,7 @@ def _v319_import_one_race(
     on_step=None,
     fetch_odds: bool = True,
     register_result: bool = True,
+    cancel_cb=None,
 ) -> dict:
     """1レース単位の自動取得。
 
@@ -13015,6 +13076,14 @@ def _v319_import_one_race(
                 on_step(str(msg))
             except Exception:
                 pass
+
+    def _cancelled() -> bool:
+        if not callable(cancel_cb):
+            return False
+        try:
+            return bool(cancel_cb())
+        except Exception:
+            return False
 
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     venue = str(venue or "").strip()
@@ -13071,10 +13140,27 @@ def _v319_import_one_race(
     # --- 2) 選手履歴（失敗時は予測しない） ---
     try:
         _step("選手履歴")
+        if _cancelled():
+            return {
+                "status": "cancelled",
+                "phase": "save_player_history",
+                "message": f"{venue} {race_no}R：中止要求により中断しました。",
+                "key": key_guess,
+                "next_action": "cancelled",
+            }
         filled = _v319_fill_player_histories(
             db_path, players, min_rows=30,
             before_ymd=ymd, before_venue=venue, before_race=race_no,
+            cancel_cb=cancel_cb,
         )
+        if filled.get("cancelled"):
+            return {
+                "status": "cancelled",
+                "phase": "save_player_history",
+                "message": f"{venue} {race_no}R：中止要求により選手履歴取込を中断しました。",
+                "key": key_guess,
+                "next_action": "cancelled",
+            }
         hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
         err_n = int(filled.get("errors") or 0)
         # Ver325: 履歴0件の選手がいるときだけ予測中止。errors のみは警告付きで続行。
@@ -13574,6 +13660,10 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     "cancelled": True,
                     "summary": f"中止｜完了{ok} / スキップ{skip} / 失敗{err}（{i-1}/{total}まで）",
                 }, protocol=4), 6)
+                try:
+                    _v278_cancel_flag_clear(job_id)
+                except Exception:
+                    pass
                 _v278_bg_update(
                     db_path, job_id, status="cancelled",
                     finished_at=_v228_now_jst_iso(),
@@ -13600,6 +13690,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     seed=int(req.get("seed") or 20260719),
                     fetch_odds=bool(req.get("fetch_odds", True)),
                     register_result=bool(req.get("register_result", True)),
+                    cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
                     on_step=lambda msg, vn=vn, n=n, i=i, total=total: _v278_bg_update(
                         db_path, job_id,
                         current_label=f"{vn} {n}R",
@@ -13607,6 +13698,30 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         done_count=i - 1,
                     ),
                 )
+                if str(one.get("status") or "") == "cancelled":
+                    details.append({
+                        "venue": vn, "R": n, "status": "cancelled",
+                        "message": one.get("message") or "中止",
+                        "phase": one.get("phase") or "",
+                    })
+                    blob = zlib.compress(pickle.dumps({
+                        "ok": ok, "skip": skip, "error": err, "details": details,
+                        "cancelled": True,
+                        "summary": f"中止｜完了{ok} / スキップ{skip} / 失敗{err}（{i-1}/{total}まで）",
+                    }, protocol=4), 6)
+                    try:
+                        _v278_cancel_flag_clear(job_id)
+                    except Exception:
+                        pass
+                    _v278_bg_update(
+                        db_path, job_id, status="cancelled",
+                        finished_at=_v228_now_jst_iso(),
+                        done_count=max(0, i - 1),
+                        current_label="中止",
+                        message=f"今：中止｜{i-1}/{total}まで処理して中止｜登録{ok} スキップ{skip} エラー{err}",
+                        result_blob=blob,
+                    )
+                    return
                 item["status"] = one.get("status") or "ok"
                 item["message"] = one.get("message") or ""
                 item["phase"] = one.get("phase") or ""
@@ -13838,6 +13953,10 @@ def _v319_bg_history_worker(db_path: str, job_id: int, req: dict) -> None:
                         f" / 履歴+{added}件（{i-1}/{total}まで）"
                     ),
                 }, protocol=4), 6)
+                try:
+                    _v278_cancel_flag_clear(job_id)
+                except Exception:
+                    pass
                 _v278_bg_update(
                     db_path, job_id, status="cancelled",
                     finished_at=_v228_now_jst_iso(),
@@ -28564,15 +28683,18 @@ if selected_main_page == "✅ 結果登録・解析":
             cprog1, cprog2 = st.columns(2)
             if cprog1.button("進捗を更新", use_container_width=True, key="v319_op_refresh_job"):
                 st.rerun()
-            if status in ("queued", "running", "paused", "pause_requested") and cprog2.button(
-                "取込を中止", use_container_width=True, key="v319_op_cancel_job"
+            if status in ("queued", "running", "paused", "pause_requested", "cancel_requested") and cprog2.button(
+                "取込を中止", use_container_width=True, key="v319_op_cancel_job",
+                disabled=(status == "cancel_requested"),
             ):
                 try:
                     _v278_bg_request_cancel(engine.DB_PATH, int(job_imp.get("job_id") or 0))
-                    st.warning("現在のレースのあとで中止します。")
+                    st.warning("中止を受け付けました。選手履歴の区切りなど、数秒〜数十秒で止まります。")
                     st.rerun()
                 except Exception as exc:
-                    st.warning(str(exc))
+                    # フラグは request_cancel 内で先に立つので、DB locked でも中止は有効
+                    st.warning(f"中止フラグは立てました（{exc}）。処理の区切りで停止します。")
+                    st.rerun()
             blob = job_imp.get("result_blob")
             # 完了・中止・失敗・実行中いずれも、途中結果があれば表示用に取り込む
             if blob and status in ("completed", "cancelled", "failed", "running", "paused"):
@@ -28688,15 +28810,17 @@ if selected_main_page == "✅ 結果登録・解析":
             hc1, hc2 = st.columns(2)
             if hc1.button("進捗を更新", use_container_width=True, key="v319_hist_refresh_job"):
                 st.rerun()
-            if status in ("queued", "running", "paused", "pause_requested") and hc2.button(
-                "取込を中止", use_container_width=True, key="v319_hist_cancel_job"
+            if status in ("queued", "running", "paused", "pause_requested", "cancel_requested") and hc2.button(
+                "取込を中止", use_container_width=True, key="v319_hist_cancel_job",
+                disabled=(status == "cancel_requested"),
             ):
                 try:
                     _v278_bg_request_cancel(engine.DB_PATH, int(job_hist.get("job_id") or 0))
-                    st.warning("現在のレースのあとで中止します。")
+                    st.warning("中止を受け付けました。処理の区切りで停止します。")
                     st.rerun()
                 except Exception as exc:
-                    st.warning(str(exc))
+                    st.warning(f"中止フラグは立てました（{exc}）。処理の区切りで停止します。")
+                    st.rerun()
             hblob = job_hist.get("result_blob")
             if hblob and status in ("completed", "cancelled", "failed", "running", "paused"):
                 try:
@@ -29399,14 +29523,12 @@ if selected_main_page == "🗃️ 登録情報確認":
         if not hist74.empty:
             with st.expander("過去の最適化履歴", expanded=False):
                 st.dataframe(hist74,use_container_width=True,hide_index=True)
-    except sqlite3.DatabaseError as exc:
-        st.warning(
-            "最適化履歴テーブルを読み込めませんでした。"
-            "予測DB全体が壊れているとは限りません。"
-            f"（{type(exc).__name__}: {exc}）"
-        )
     except Exception as exc:
-        st.warning(f"最適化履歴の読込をスキップしました: {type(exc).__name__}: {exc}")
+        # 取込中の locked は異常ではない。読み込み専用表示に中止は不要。
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            st.caption("最適化履歴：取込処理中のため一時スキップ")
+        else:
+            st.caption(f"最適化履歴の読込をスキップ: {type(exc).__name__}")
 
     st.divider()
     st.subheader("学習重み・変更履歴")
@@ -29414,13 +29536,11 @@ if selected_main_page == "🗃️ 登録情報確認":
         _v270_weights_df=engine.v40_current_weights(engine.DB_PATH)
         st.dataframe(_v270_weights_df, use_container_width=True, hide_index=True,
             column_config={"現在の重み":st.column_config.NumberColumn(format="%.4f"),"初期値":st.column_config.NumberColumn(format="%.4f"),"初期値からの差":st.column_config.NumberColumn(format="%+.4f")})
-    except sqlite3.DatabaseError as exc:
-        st.warning(
-            "学習重みテーブルを読み込めないため、この表示だけスキップしました。"
-            f"（{type(exc).__name__}: {exc}）"
-        )
     except Exception as exc:
-        st.warning(f"学習重み表示をスキップしました: {type(exc).__name__}: {exc}")
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            st.caption("学習重み：取込処理中のため一時スキップ")
+        else:
+            st.caption(f"学習重み表示をスキップ: {type(exc).__name__}")
 
     try:
         history_df=engine.v39_weight_history(engine.DB_PATH,100)
@@ -29428,13 +29548,11 @@ if selected_main_page == "🗃️ 登録情報確認":
             st.caption("重み変更履歴はまだありません。")
         else:
             st.dataframe(history_df,use_container_width=True,hide_index=True)
-    except sqlite3.DatabaseError as exc:
-        st.warning(
-            "重み変更履歴テーブルを読み込めないため、この表示だけスキップしました。"
-            f"（{type(exc).__name__}: {exc}）"
-        )
     except Exception as exc:
-        st.warning(f"重み変更履歴の表示をスキップしました: {type(exc).__name__}: {exc}")
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            st.caption("重み変更履歴：取込処理中のため一時スキップ")
+        else:
+            st.caption(f"重み変更履歴の表示をスキップ: {type(exc).__name__}")
     st.subheader("結果登録履歴・取り消し")
     reg_history = engine.v41_registration_history(engine.DB_PATH, 50)
     if reg_history.empty:
