@@ -2249,42 +2249,54 @@ def _v273_virtual_roi_score(
 _V278_BG_THREADS = globals().get("_V278_BG_THREADS", {})
 _V278_BG_LOCK = globals().get("_V278_BG_LOCK", threading.Lock())
 
+_V278_TABLE_READY: set[str] = set()
+
+
 def _v278_bg_ensure_table(db_path: str) -> None:
-    with sqlite3.connect(str(db_path), timeout=30.0) as con:
-        con.execute("PRAGMA busy_timeout=30000")
-        try:
-            con.execute("PRAGMA journal_mode=WAL")
-        except Exception:
-            pass
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS v278_background_jobs(
-                job_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_type TEXT NOT NULL,
-                app_version TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                updated_at TEXT,
-                finished_at TEXT,
-                limit_count INTEGER NOT NULL DEFAULT 0,
-                force_current INTEGER NOT NULL DEFAULT 0,
-                done_count INTEGER NOT NULL DEFAULT 0,
-                total_count INTEGER NOT NULL DEFAULT 0,
-                current_label TEXT DEFAULT '',
-                message TEXT DEFAULT '',
-                result_blob BLOB,
-                cancel_requested INTEGER NOT NULL DEFAULT 0,
-                pause_requested INTEGER NOT NULL DEFAULT 0,
-                error_text TEXT DEFAULT ''
-            )
-        """)
-        try:
-            cols={str(r[1]) for r in con.execute("PRAGMA table_info(v278_background_jobs)").fetchall()}
-            if "pause_requested" not in cols:
-                con.execute("ALTER TABLE v278_background_jobs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
-        con.commit()
+    key = str(db_path or "")
+    if key in _V278_TABLE_READY:
+        return
+    # 起動を止めない：ロック時はスキップ（次回再試行）
+    try:
+        with sqlite3.connect(str(db_path), timeout=1.5) as con:
+            con.execute("PRAGMA busy_timeout=1500")
+            try:
+                con.execute("PRAGMA journal_mode=WAL")
+            except Exception:
+                pass
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS v278_background_jobs(
+                    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_type TEXT NOT NULL,
+                    app_version TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    updated_at TEXT,
+                    finished_at TEXT,
+                    limit_count INTEGER NOT NULL DEFAULT 0,
+                    force_current INTEGER NOT NULL DEFAULT 0,
+                    done_count INTEGER NOT NULL DEFAULT 0,
+                    total_count INTEGER NOT NULL DEFAULT 0,
+                    current_label TEXT DEFAULT '',
+                    message TEXT DEFAULT '',
+                    result_blob BLOB,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    pause_requested INTEGER NOT NULL DEFAULT 0,
+                    error_text TEXT DEFAULT ''
+                )
+            """)
+            try:
+                cols={str(r[1]) for r in con.execute("PRAGMA table_info(v278_background_jobs)").fetchall()}
+                if "pause_requested" not in cols:
+                    con.execute("ALTER TABLE v278_background_jobs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass
+            con.commit()
+        _V278_TABLE_READY.add(key)
+    except Exception:
+        # locked 等は握り、画面起動を止めない
+        pass
 
 def _v278_bg_update(db_path: str, job_id: int, **fields) -> None:
     if not fields:
@@ -2301,17 +2313,16 @@ def _v278_bg_update(db_path: str, job_id: int, **fields) -> None:
     keys=list(fields.keys())
     sql="UPDATE v278_background_jobs SET "+",".join(f"{k}=?" for k in keys)+" WHERE job_id=?"
     vals=[fields[k] for k in keys]+[int(job_id)]
-    with sqlite3.connect(str(db_path), timeout=30.0) as con:
-        con.execute("PRAGMA busy_timeout=30000")
+    with sqlite3.connect(str(db_path), timeout=3.0) as con:
+        con.execute("PRAGMA busy_timeout=3000")
         con.execute(sql, vals)
         con.commit()
 
 def _v278_bg_get_job(db_path: str, job_id: int | None = None) -> dict:
     try:
-        _v278_bg_ensure_table(db_path)
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        with sqlite3.connect(str(db_path), timeout=2.0) as con:
             con.row_factory=sqlite3.Row
-            con.execute("PRAGMA busy_timeout=30000")
+            con.execute("PRAGMA busy_timeout=2000")
             if job_id:
                 row=con.execute(
                     "SELECT * FROM v278_background_jobs WHERE job_id=?",
@@ -2345,20 +2356,29 @@ def _v278_bg_get_job(db_path: str, job_id: int | None = None) -> dict:
     except Exception:
         return {}
 
-def _v278_bg_reap_stale_jobs(db_path: str, stale_minutes: float = 20.0) -> int:
+_V278_REAP_LAST_TS: float = 0.0
+
+
+def _v278_bg_reap_stale_jobs(db_path: str, stale_minutes: float = 20.0, force: bool = False) -> int:
     """放置・完了漏れジョブを解放する。
 
     - done_count >= total_count > 0 なのに active → completed
     - cancel_requested のまま90秒以上 → cancelled
     - updated_at/started_at が stale_minutes 超過 → failed
+    画面描画を止めないよう、短タイムアウト＋30秒に1回まで。
     """
+    global _V278_REAP_LAST_TS
     reaped = 0
     try:
+        now_mono = time_module.monotonic()
+        if not force and (now_mono - float(_V278_REAP_LAST_TS or 0.0)) < 30.0:
+            return 0
+        _V278_REAP_LAST_TS = now_mono
         _v278_bg_ensure_table(db_path)
         now = datetime.now(timezone(timedelta(hours=9)))
-        with sqlite3.connect(str(db_path), timeout=5.0) as con:
+        with sqlite3.connect(str(db_path), timeout=1.0) as con:
             con.row_factory = sqlite3.Row
-            con.execute("PRAGMA busy_timeout=5000")
+            con.execute("PRAGMA busy_timeout=1000")
             rows = con.execute("""
                 SELECT job_id, status, done_count, total_count,
                        COALESCE(updated_at,''), COALESCE(started_at,''), COALESCE(finished_at,'')
@@ -2465,9 +2485,8 @@ def _v278_bg_has_running_job(db_path: str) -> bool:
             _v278_bg_reap_stale_jobs(db_path)
         except Exception:
             pass
-        _v278_bg_ensure_table(db_path)
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
+        with sqlite3.connect(str(db_path), timeout=1.5) as con:
+            con.execute("PRAGMA busy_timeout=1500")
             row=con.execute("""
                 SELECT COUNT(*) FROM v278_background_jobs
                 WHERE job_type IN ('batch_rerun','official_import') AND status IN ('queued','running','pause_requested','paused','cancel_requested')
@@ -3258,9 +3277,8 @@ def _v279_bg_prediction_any_active(db_path: str) -> bool:
             _v278_bg_reap_stale_jobs(db_path)
         except Exception:
             pass
-        _v278_bg_ensure_table(db_path)
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
+        with sqlite3.connect(str(db_path), timeout=1.5) as con:
+            con.execute("PRAGMA busy_timeout=1500")
             row=con.execute("""
                 SELECT COUNT(*) FROM v278_background_jobs
                 WHERE job_type IN ('normal_prediction','batch_rerun','official_import','player_history_import')
@@ -10972,11 +10990,12 @@ def _v319_parse_sp_player_history_rows(html: str, player_name: str) -> list[dict
     return out
 
 
-def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int = 10, retries: int = 1):
+def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int = 15, retries: int = 2):
     """PC版を優先。有効HTMLが取れたら PC2/SP は打たない（空履歴でも）。
 
-    Ver324速度:
-      - timeout 10 / retries 1（旧15/2）。失敗は errors で再試行可能
+    Ver324:
+      - timeout 15 / retries 2（Ver322相当。通信耐性を戻す）
+      - 速度は並列取得（ThreadPool）とスキップキャッシュで確保
       - 同一 player_cd はジョブ内メモ化
       - 全リクエスト例外で空になった場合はキャッシュしない（次レースで再試行）
     """
@@ -11000,7 +11019,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int
             f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}",
         ):
             try:
-                html = _v319_http_get(url, timeout=int(timeout or 10), retries=int(retries if retries is not None else 1))
+                html = _v319_http_get(url, timeout=int(timeout or 15), retries=int(retries if retries is not None else 2))
                 if html and len(html) > 500:
                     pc_ok = True
                 hist = _v319_parse_pc_player_history_html(html, name)
@@ -11020,7 +11039,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int
                 "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
                 f"?playerCd={pcd}&historyDispType=d"
             )
-            sp_html = _v319_http_get(sp_url, timeout=int(timeout or 10), retries=int(retries if retries is not None else 1))
+            sp_html = _v319_http_get(sp_url, timeout=int(timeout or 15), retries=int(retries if retries is not None else 2))
             sp_rows = _v319_parse_sp_player_history_rows(sp_html, name)
         except Exception:
             sp_rows = []
@@ -13216,9 +13235,8 @@ def _v319_bg_history_any_active(db_path: str) -> bool:
             _v278_bg_reap_stale_jobs(db_path)
         except Exception:
             pass
-        _v278_bg_ensure_table(db_path)
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
+        with sqlite3.connect(str(db_path), timeout=1.5) as con:
+            con.execute("PRAGMA busy_timeout=1500")
             row = con.execute("""
                 SELECT COUNT(*) FROM v278_background_jobs
                 WHERE job_type = 'player_history_import'
@@ -26543,10 +26561,9 @@ if "github_pull_done" not in st.session_state:
 
 def _v278_bg_get_latest_active(db_path: str) -> dict:
     try:
-        _v278_bg_ensure_table(db_path)
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        with sqlite3.connect(str(db_path), timeout=1.5) as con:
             con.row_factory = sqlite3.Row
-            con.execute("PRAGMA busy_timeout=30000")
+            con.execute("PRAGMA busy_timeout=1500")
             row = con.execute("""
                 SELECT * FROM v278_background_jobs
                 WHERE status IN ('queued','running','pause_requested','paused','cancel_requested')
