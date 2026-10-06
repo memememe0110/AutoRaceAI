@@ -113,6 +113,11 @@ _V322_TEMP_ODDS_GATE = 30.0
 # Ver324: ◎強推奨の最低点数ゲート（推奨ラベルのみ・プラン生成は不変）
 # 1 に戻すと Ver322 と同一挙動。
 _V324_MIN_TICKETS = 5
+# Ver324: 学習暴走防止（予測ロジック不変。結果登録時の adaptive_weights 更新だけ制御）
+_V324_LEARNING_FREEZE = False  # True で結果登録しても重み更新しない（DB永続化優先）
+_V324_LEARNING_MIN_RACES_BETWEEN = 30  # 前回学習からこの件数の結果登録が来るまで重み更新スキップ
+_V324_MONITOR_APP_VERSION = "Ver324"  # 時間窓モニタの対象予測版
+_V324_MONITOR_ORIGINS = ("live", "official_import")  # 本線のみ（relabel除外）
 
 
 def _v322_temp_scale_prob(
@@ -23485,6 +23490,564 @@ def _v324_chatgpt_compact_export(df: pd.DataFrame, analysis_df: pd.DataFrame | N
     return "\n".join(lines)
 
 
+
+def _v324_ensure_learning_control_table(db_path: str) -> None:
+    try:
+        with sqlite3.connect(str(db_path), timeout=5.0) as con:
+            con.execute("PRAGMA busy_timeout=5000")
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS v324_learning_control (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    freeze_enabled INTEGER NOT NULL DEFAULT 0,
+                    min_races_between INTEGER NOT NULL DEFAULT 30,
+                    last_weight_adjust_at TEXT,
+                    last_weight_adjust_race_key TEXT,
+                    updated_at TEXT,
+                    reason TEXT
+                )
+                """
+            )
+            row = con.execute("SELECT id FROM v324_learning_control WHERE id=1").fetchone()
+            if not row:
+                con.execute(
+                    """
+                    INSERT INTO v324_learning_control
+                    (id, freeze_enabled, min_races_between, updated_at, reason)
+                    VALUES (1, 0, ?, ?, 'init')
+                    """,
+                    (
+                        int(globals().get("_V324_LEARNING_MIN_RACES_BETWEEN") or 30),
+                        _v228_now_jst_iso(),
+                    ),
+                )
+            con.commit()
+    except Exception:
+        pass
+
+
+def _v324_learning_freeze_enabled(db_path: str | None = None) -> bool:
+    """DB永続 → session → グローバルの順で凍結状態を読む。"""
+    try:
+        dbp = db_path or getattr(engine, "DB_PATH", None)
+        if dbp:
+            _v324_ensure_learning_control_table(dbp)
+            with sqlite3.connect(str(dbp), timeout=2.0) as con:
+                con.execute("PRAGMA busy_timeout=2000")
+                row = con.execute(
+                    "SELECT freeze_enabled FROM v324_learning_control WHERE id=1"
+                ).fetchone()
+                if row is not None:
+                    return bool(int(row[0] or 0))
+    except Exception:
+        pass
+    try:
+        if "st" in globals() and hasattr(st, "session_state"):
+            if "v324_learning_freeze" in st.session_state:
+                return bool(st.session_state.get("v324_learning_freeze"))
+    except Exception:
+        pass
+    return bool(globals().get("_V324_LEARNING_FREEZE") or False)
+
+
+def _v324_set_learning_freeze(db_path: str | None, enabled: bool, reason: str = "") -> None:
+    enabled = bool(enabled)
+    globals()["_V324_LEARNING_FREEZE"] = enabled
+    try:
+        if "st" in globals() and hasattr(st, "session_state"):
+            st.session_state["v324_learning_freeze"] = enabled
+    except Exception:
+        pass
+    dbp = db_path or getattr(engine, "DB_PATH", None)
+    if not dbp:
+        return
+    try:
+        _v324_ensure_learning_control_table(dbp)
+        with sqlite3.connect(str(dbp), timeout=5.0) as con:
+            con.execute("PRAGMA busy_timeout=5000")
+            con.execute(
+                """
+                INSERT INTO v324_learning_control
+                (id, freeze_enabled, min_races_between, updated_at, reason)
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    freeze_enabled=excluded.freeze_enabled,
+                    updated_at=excluded.updated_at,
+                    reason=excluded.reason
+                """,
+                (
+                    1 if enabled else 0,
+                    int(globals().get("_V324_LEARNING_MIN_RACES_BETWEEN") or 30),
+                    _v228_now_jst_iso(),
+                    str(reason or "")[:300],
+                ),
+            )
+            con.commit()
+    except Exception:
+        pass
+
+
+def _v324_get_min_races_between(db_path: str | None = None) -> int:
+    try:
+        dbp = db_path or getattr(engine, "DB_PATH", None)
+        if dbp:
+            _v324_ensure_learning_control_table(dbp)
+            with sqlite3.connect(str(dbp), timeout=2.0) as con:
+                con.execute("PRAGMA busy_timeout=2000")
+                row = con.execute(
+                    "SELECT min_races_between FROM v324_learning_control WHERE id=1"
+                ).fetchone()
+                if row is not None and row[0] is not None:
+                    return max(0, int(row[0]))
+    except Exception:
+        pass
+    return max(0, int(globals().get("_V324_LEARNING_MIN_RACES_BETWEEN") or 0))
+
+
+def _v324_set_min_races_between(db_path: str | None, n: int) -> None:
+    n = max(0, min(200, int(n or 0)))
+    globals()["_V324_LEARNING_MIN_RACES_BETWEEN"] = n
+    dbp = db_path or getattr(engine, "DB_PATH", None)
+    if not dbp:
+        return
+    try:
+        _v324_ensure_learning_control_table(dbp)
+        with sqlite3.connect(str(dbp), timeout=5.0) as con:
+            con.execute("PRAGMA busy_timeout=5000")
+            con.execute(
+                """
+                INSERT INTO v324_learning_control (id, freeze_enabled, min_races_between, updated_at, reason)
+                VALUES (1, 0, ?, ?, 'min_gap')
+                ON CONFLICT(id) DO UPDATE SET
+                    min_races_between=excluded.min_races_between,
+                    updated_at=excluded.updated_at
+                """,
+                (n, _v228_now_jst_iso()),
+            )
+            con.commit()
+    except Exception:
+        pass
+
+
+def _v324_mark_weight_adjusted(db_path: str, race_key: str = "") -> None:
+    try:
+        _v324_ensure_learning_control_table(db_path)
+        with sqlite3.connect(str(db_path), timeout=5.0) as con:
+            con.execute("PRAGMA busy_timeout=5000")
+            con.execute(
+                """
+                UPDATE v324_learning_control
+                   SET last_weight_adjust_at=?,
+                       last_weight_adjust_race_key=?,
+                       updated_at=?
+                 WHERE id=1
+                """,
+                (_v228_now_jst_iso(), str(race_key or "")[:80], _v228_now_jst_iso()),
+            )
+            con.commit()
+    except Exception:
+        pass
+
+
+def _v324_races_since_last_weight_adjust(db_path: str) -> int:
+    """前回の重み更新以降に登録された学習対象レース数。"""
+    try:
+        _v324_ensure_learning_control_table(db_path)
+        with sqlite3.connect(str(db_path), timeout=3.0) as con:
+            con.execute("PRAGMA busy_timeout=3000")
+            row = con.execute(
+                "SELECT last_weight_adjust_at FROM v324_learning_control WHERE id=1"
+            ).fetchone()
+            last_at = (row[0] if row else None) or ""
+            if not last_at:
+                # 履歴テーブルの最新調整時刻
+                try:
+                    row2 = con.execute(
+                        "SELECT MAX(adjusted_at) FROM weight_adjustment_history"
+                    ).fetchone()
+                    last_at = (row2[0] if row2 else None) or ""
+                except Exception:
+                    last_at = ""
+            if not last_at:
+                return 9999  # 未学習扱い → 間隔ゲートは通す
+            n = con.execute(
+                """
+                SELECT COUNT(*) FROM result_races
+                 WHERE COALESCE(model_eligible,1)=1
+                   AND COALESCE(registered_at,'') > ?
+                """,
+                (str(last_at),),
+            ).fetchone()
+            return int((n[0] if n else 0) or 0)
+    except Exception:
+        return 9999
+
+
+def _v324_restore_weights_from_json(db_path: str, weights: dict, note: str = "") -> tuple[bool, str]:
+    """adaptive_weights を指定辞書へ戻す（予測ロジック不変）。"""
+    if not isinstance(weights, dict) or not weights:
+        return False, "復元する重みが空です。"
+    try:
+        now = _v228_now_jst_iso()
+        with sqlite3.connect(str(db_path), timeout=15.0) as con:
+            con.execute("PRAGMA busy_timeout=15000")
+            # テーブルが無ければ engine 側初期化を試す
+            try:
+                if hasattr(engine, "v40_init_learning_tables"):
+                    engine.v40_init_learning_tables(db_path)
+                elif hasattr(engine, "v39_init_learning_tables"):
+                    engine.v39_init_learning_tables(db_path)
+            except Exception:
+                pass
+            n = 0
+            for name, w in weights.items():
+                try:
+                    fw = float(w)
+                except Exception:
+                    continue
+                con.execute(
+                    "UPDATE adaptive_weights SET current_weight=?, updated_at=? WHERE feature_name=?",
+                    (fw, now, str(name)),
+                )
+                if con.total_changes:
+                    n += 1
+                else:
+                    con.execute(
+                        """INSERT OR IGNORE INTO adaptive_weights
+                           (feature_name, current_weight, updated_at, update_count)
+                           VALUES (?,?,?,0)""",
+                        (str(name), fw, now),
+                    )
+                    con.execute(
+                        "UPDATE adaptive_weights SET current_weight=?, updated_at=? WHERE feature_name=?",
+                        (fw, now, str(name)),
+                    )
+                    n += 1
+            # 監査ログ
+            try:
+                con.execute(
+                    """CREATE TABLE IF NOT EXISTS v324_weight_restore_log(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        restored_at TEXT,
+                        note TEXT,
+                        weights_json TEXT
+                    )"""
+                )
+                con.execute(
+                    "INSERT INTO v324_weight_restore_log(restored_at, note, weights_json) VALUES (?,?,?)",
+                    (now, str(note or "")[:500], json.dumps(weights, ensure_ascii=False)),
+                )
+            except Exception:
+                pass
+            con.commit()
+        return True, f"学習重みを復元しました（{n}項目）。{note}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _v324_list_weight_restore_points(db_path: str, limit: int = 40) -> pd.DataFrame:
+    """結果登録バッチの before_weights を復元ポイントとして列挙。"""
+    try:
+        with sqlite3.connect(str(db_path), timeout=8.0) as con:
+            con.execute("PRAGMA busy_timeout=8000")
+            df = pd.read_sql_query(
+                """
+                SELECT batch_id,
+                       race_key,
+                       registered_at,
+                       status,
+                       before_weights_json
+                  FROM v41_registration_batches
+                 WHERE COALESCE(before_weights_json,'') <> ''
+                   AND COALESCE(status,'active') = 'active'
+                 ORDER BY batch_id DESC
+                 LIMIT ?
+                """,
+                con,
+                params=(int(limit),),
+            )
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _v324_rollback_last_weight_adjustments(db_path: str, n: int = 1) -> tuple[bool, str]:
+    """直近の重み調整を n 回巻き戻す。"""
+    n = max(1, min(50, int(n or 1)))
+    msgs = []
+    ok_any = False
+    fn = getattr(engine, "v39_rollback_last_adjustment", None)
+    if not callable(fn):
+        return False, "engine.v39_rollback_last_adjustment がありません。"
+    for i in range(n):
+        try:
+            ok, msg = fn(db_path)
+        except TypeError:
+            try:
+                ok, msg = fn(db_path=db_path)
+            except Exception as exc:
+                return ok_any, f"{i}回目で失敗: {exc}" + ((" / " + " | ".join(msgs)) if msgs else "")
+        except Exception as exc:
+            return ok_any, f"{i}回目で失敗: {exc}" + ((" / " + " | ".join(msgs)) if msgs else "")
+        msgs.append(str(msg))
+        if not ok:
+            break
+        ok_any = True
+    return ok_any, " / ".join(msgs)
+
+
+def _v324_prediction_window_monitor(
+    db_path: str,
+    windows: tuple[int, ...] = (10, 30, 50, 100),
+    app_version: str | None = None,
+    plan_origins: tuple[str, ...] | None = None,
+) -> pd.DataFrame:
+    """予測順位 vs 実着順の時間窓評価（読み取り専用）。
+
+    既定は Ver324 本線（live / official_import）の race_key のみ。
+    同一 race_key は1件。結果登録済み・model_eligible のみ。
+    """
+    ver = str(app_version or globals().get("_V324_MONITOR_APP_VERSION") or "Ver324").strip()
+    origins = plan_origins
+    if origins is None:
+        origins = tuple(globals().get("_V324_MONITOR_ORIGINS") or ("live", "official_import"))
+    origins = tuple(str(o).strip() for o in origins if str(o).strip())
+    rows_out = []
+    try:
+        with sqlite3.connect(str(db_path), timeout=12.0) as con:
+            con.execute("PRAGMA busy_timeout=12000")
+            cols = {
+                str(r[1])
+                for r in con.execute("PRAGMA table_info(v40_prediction_feature_snapshots)").fetchall()
+            }
+            if "before_rank" not in cols:
+                return pd.DataFrame()
+
+            # Ver324 本線の race_key 集合
+            run_cols = set()
+            try:
+                run_cols = {
+                    str(r[1]) for r in con.execute("PRAGMA table_info(v187_mixed_plan_runs)").fetchall()
+                }
+            except Exception:
+                run_cols = set()
+            ver_keys: set[str] = set()
+            if "app_version" in run_cols and "race_key" in run_cols:
+                clauses = ["app_version = ?"]
+                params: list = [ver]
+                if origins and "plan_origin" in run_cols:
+                    ph = ",".join("?" * len(origins))
+                    clauses.append(f"COALESCE(plan_origin,'live') IN ({ph})")
+                    params.extend(list(origins))
+                sql_keys = (
+                    "SELECT DISTINCT race_key FROM v187_mixed_plan_runs WHERE "
+                    + " AND ".join(clauses)
+                )
+                ver_keys = {
+                    str(r[0])
+                    for r in con.execute(sql_keys, params).fetchall()
+                    if r and r[0]
+                }
+            # フォールバック: 版指定できない場合は全結果（caption で警告）
+            if ver_keys:
+                ph = ",".join("?" * len(ver_keys))
+                races = pd.read_sql_query(
+                    f"""
+                    SELECT rr.race_key,
+                           COALESCE(rr.race_date,'') AS race_date,
+                           COALESCE(rr.venue,'') AS venue,
+                           COALESCE(rr.race_no,0) AS race_no
+                      FROM result_races rr
+                      JOIN v40_prediction_feature_snapshots s ON s.race_key=rr.race_key
+                     WHERE COALESCE(rr.model_eligible,1)=1
+                       AND rr.race_key IN ({ph})
+                     GROUP BY rr.race_key
+                     ORDER BY rr.race_date DESC, rr.race_no DESC, rr.race_key DESC
+                    """,
+                    con,
+                    params=list(ver_keys),
+                )
+                scope_note = f"{ver}/{'+'.join(origins) if origins else 'all'}"
+            else:
+                races = pd.read_sql_query(
+                    """
+                    SELECT rr.race_key,
+                           COALESCE(rr.race_date,'') AS race_date,
+                           COALESCE(rr.venue,'') AS venue,
+                           COALESCE(rr.race_no,0) AS race_no
+                      FROM result_races rr
+                      JOIN v40_prediction_feature_snapshots s ON s.race_key=rr.race_key
+                     WHERE COALESCE(rr.model_eligible,1)=1
+                     GROUP BY rr.race_key
+                     ORDER BY rr.race_date DESC, rr.race_no DESC, rr.race_key DESC
+                    """,
+                    con,
+                )
+                scope_note = "全版(フォールバック)"
+
+            if races.empty:
+                return pd.DataFrame()
+
+            # race_key は SQL GROUP BY で一意だが、念のため drop_duplicates
+            races = races.drop_duplicates(subset=["race_key"], keep="first")
+            per = []
+            for rk in races["race_key"].astype(str).tolist():
+                try:
+                    m = pd.read_sql_query(
+                        """
+                        SELECT s.car_no, s.before_rank, e.finish
+                          FROM v40_prediction_feature_snapshots s
+                          JOIN result_entries e
+                            ON e.race_key=s.race_key AND e.car_no=s.car_no
+                         WHERE s.race_key=?
+                        """,
+                        con,
+                        params=(rk,),
+                    )
+                except Exception:
+                    continue
+                if m is None or m.empty or len(m) < 3:
+                    continue
+                m = m.copy()
+                m["finish"] = pd.to_numeric(m["finish"], errors="coerce")
+                m["before_rank"] = pd.to_numeric(m["before_rank"], errors="coerce")
+                m = m.dropna(subset=["finish", "before_rank"])
+                m = m[(m["finish"] >= 1) & (m["finish"] <= 8)]
+                if len(m) < 3:
+                    continue
+                # 同一 car が複数行ある場合は finish 優先で1行
+                m = m.sort_values(["car_no", "finish"]).drop_duplicates(subset=["car_no"], keep="first")
+                if len(m) < 3:
+                    continue
+                actual_top3 = set(m.nsmallest(3, "finish")["car_no"].astype(int).tolist())
+                pred_top3 = set(m.nsmallest(3, "before_rank")["car_no"].astype(int).tolist())
+                inter = len(actual_top3 & pred_top3)
+                top1 = 0
+                a1_pred_rank = None
+                try:
+                    a1 = int(m.nsmallest(1, "finish")["car_no"].iloc[0])
+                    p1 = int(m.nsmallest(1, "before_rank")["car_no"].iloc[0])
+                    top1 = 1 if a1 == p1 else 0
+                    a1_pred_rank = float(m.loc[m["car_no"] == a1, "before_rank"].iloc[0])
+                except Exception:
+                    pass
+                per.append(
+                    {
+                        "race_key": rk,
+                        "top1": top1,
+                        "overlap": inter,
+                        "exact3": 1 if inter == 3 else 0,
+                        "a1_pred_rank": a1_pred_rank,
+                    }
+                )
+            if not per:
+                return pd.DataFrame()
+            pdf = pd.DataFrame(per)
+            n_all = len(pdf)
+            win_list = list(windows) + [n_all]
+            seen: set[int] = set()
+            for w in win_list:
+                wi = int(w)
+                if wi in seen or wi <= 0:
+                    continue
+                seen.add(wi)
+                g = pdf.head(wi)
+                if g.empty:
+                    continue
+                label = f"直近{wi}R" if wi < n_all else f"全期間({n_all}R)"
+                rows_out.append(
+                    {
+                        "対象": scope_note,
+                        "窓": label,
+                        "R数": int(len(g)),
+                        "TOP1一致率": float(g["top1"].mean() * 100.0),
+                        "TOP3平均一致数": float(g["overlap"].mean()),
+                        "TOP3完全一致率": float(g["exact3"].mean() * 100.0),
+                        "TOP3に1車以上": float((g["overlap"] >= 1).mean() * 100.0),
+                        "実1着の予測順位中央値": float(
+                            pd.to_numeric(g["a1_pred_rank"], errors="coerce").median()
+                        )
+                        if g["a1_pred_rank"].notna().any()
+                        else None,
+                    }
+                )
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame(rows_out)
+
+
+def _v324_install_learning_gate(force: bool = True) -> None:
+    """engine.v41_adjust_weights_after_result をゲート付きに差し替え。"""
+    if getattr(engine, "_v324_learning_gate_installed", False) and not force:
+        return
+    orig = getattr(engine, "_v324_learning_gate_orig", None)
+    if not callable(orig):
+        orig = getattr(engine, "v41_adjust_weights_after_result", None)
+    if not callable(orig):
+        return
+    # 二重ラップ防止
+    if getattr(orig, "_v324_is_gate", False):
+        orig = getattr(engine, "_v324_learning_gate_orig", orig)
+
+    def _gated(meta, results, db_path=None, *args, **kwargs):
+        dbp = db_path if db_path is not None else getattr(engine, "DB_PATH", None)
+        race_key = ""
+        try:
+            if isinstance(meta, dict):
+                race_key = str(meta.get("race_key") or meta.get("レースキー") or "")
+            if not race_key and hasattr(engine, "v34_race_key"):
+                race_key = str(engine.v34_race_key(meta) or "")
+        except Exception:
+            race_key = ""
+        if _v324_learning_freeze_enabled(dbp):
+            return {
+                "message": "Ver324: 学習重み更新は一時停止中です（結果・履歴は保存済み）。",
+                "frozen": True,
+                "skipped": True,
+            }
+        min_gap = _v324_get_min_races_between(dbp)
+        if min_gap > 0 and dbp:
+            since = _v324_races_since_last_weight_adjust(dbp)
+            if since < min_gap:
+                return {
+                    "message": (
+                        f"Ver324: 学習間隔ゲート（前回更新から{since}R < 必要{min_gap}R）。"
+                        " 重みは変更していません。"
+                    ),
+                    "skipped": True,
+                    "min_gap": min_gap,
+                    "races_since": since,
+                }
+        if dbp is not None:
+            out = orig(meta, results, db_path=dbp, *args, **kwargs)
+        else:
+            out = orig(meta, results, *args, **kwargs)
+        # 実際に更新した場合だけマーク
+        try:
+            skipped = isinstance(out, dict) and (
+                out.get("skipped") or out.get("duplicate") or out.get("frozen")
+            )
+            if not skipped and dbp:
+                _v324_mark_weight_adjusted(dbp, race_key)
+        except Exception:
+            pass
+        return out
+
+    _gated._v324_is_gate = True  # type: ignore[attr-defined]
+    try:
+        engine._v324_learning_gate_orig = orig
+        engine.v41_adjust_weights_after_result = _gated
+        engine._v324_learning_gate_installed = True
+    except Exception:
+        pass
+
+
+try:
+    _v324_install_learning_gate(force=True)
+except Exception:
+    pass
+
+
 def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
     """各レース・各バージョンの最新「照合済み」プランを集計用DataFrameで返す。
 
@@ -30075,6 +30638,142 @@ if selected_main_page == "🗃️ 登録情報確認":
 
     st.divider()
     st.subheader("学習重み・変更履歴")
+    st.markdown("#### 📐 予測精度モニタ（時間窓）")
+    st.caption(
+        "対象は Ver324 本線（live / official_import）の race_key のみ。"
+        "直近10/30/50/100Rと全期間で、候補生成（TOP3に1車以上）と順位付け（完全一致・TOP1）を分けて表示します。"
+        "予測ロジックは変更しません。"
+    )
+    _fz1, _fz2 = st.columns(2)
+    _freeze_now = _v324_learning_freeze_enabled(engine.DB_PATH)
+    _freeze_ui = _fz1.checkbox(
+        "学習重み更新を一時停止",
+        value=_freeze_now,
+        key="v324_learning_freeze_ui",
+        help="ONにすると結果登録しても adaptive_weights を更新しません。状態はDBに保存され再起動後も維持されます。",
+    )
+    if bool(_freeze_ui) != bool(_freeze_now):
+        _v324_set_learning_freeze(
+            engine.DB_PATH,
+            bool(_freeze_ui),
+            reason="ui_toggle",
+        )
+    if _freeze_ui:
+        _fz2.warning("学習更新: 停止中（DB永続）")
+    else:
+        _fz2.caption("学習更新: 有効（間隔ゲートあり）")
+    _gap_now = _v324_get_min_races_between(engine.DB_PATH)
+    _gap_ui = st.number_input(
+        "学習更新の最低間隔（R）",
+        min_value=0,
+        max_value=200,
+        value=int(_gap_now),
+        key="v324_min_gap_ui",
+        help="0=毎回更新可。30なら前回の重み更新から30R結果が貯まるまでスキップ。",
+    )
+    if int(_gap_ui) != int(_gap_now):
+        _v324_set_min_races_between(engine.DB_PATH, int(_gap_ui))
+    try:
+        _since = _v324_races_since_last_weight_adjust(engine.DB_PATH)
+        st.caption(f"前回重み更新からの結果登録: {_since}R / 必要 {_v324_get_min_races_between(engine.DB_PATH)}R")
+    except Exception:
+        pass
+
+    st.markdown("##### ⏪ 学習重みを戻してから止める")
+    st.caption(
+        "いまの精度が悪い状態のまま凍結すると、悪い重みが固定されます。"
+        "先に重みを戻し、その後で「学習重み更新を一時停止」をONにしてください。"
+    )
+    _rb1, _rb2 = st.columns(2)
+    _rb_n = int(_rb1.number_input("直近の調整を何回戻すか", min_value=1, max_value=30, value=5, key="v324_rb_n"))
+    if _rb2.button("直近の重み調整を戻す", key="v324_rb_last_n", use_container_width=True):
+        _ok_rb, _msg_rb = _v324_rollback_last_weight_adjustments(engine.DB_PATH, _rb_n)
+        (st.success if _ok_rb else st.warning)(_msg_rb)
+        st.session_state.pop("v324_pred_monitor_df", None)
+    _pts324 = _v324_list_weight_restore_points(engine.DB_PATH, limit=30)
+    if isinstance(_pts324, pd.DataFrame) and not _pts324.empty:
+        _labels324 = [
+            f"{r.registered_at}｜{r.race_key}（batch {r.batch_id}）"
+            for r in _pts324.itertuples()
+        ]
+        _pick324 = st.selectbox(
+            "登録直前の重みに戻す（そのレース学習前の状態）",
+            options=["（選ばない）"] + _labels324,
+            key="v324_restore_point",
+            help="精度が落ち始める前の日付のバッチを選ぶのが安全です（例: 9月中旬〜下旬）。",
+        )
+        if _pick324 != "（選ばない）" and st.button(
+            "この時点の重みへ復元", key="v324_restore_point_go", use_container_width=True
+        ):
+            try:
+                _i324 = _labels324.index(_pick324)
+                _js324 = _pts324.iloc[_i324]["before_weights_json"]
+                _w324 = json.loads(_js324) if isinstance(_js324, str) else {}
+                _ok2, _msg2 = _v324_restore_weights_from_json(
+                    engine.DB_PATH,
+                    _w324,
+                    note=f"restore from {_pts324.iloc[_i324]['race_key']}",
+                )
+                (st.success if _ok2 else st.warning)(_msg2)
+                if _ok2:
+                    _v324_set_learning_freeze(engine.DB_PATH, True, reason="weight_restore")
+                    st.info("復元後、学習更新を停止状態にしました（DB永続）。様子を見てから再開してください。")
+                    st.session_state.pop("v324_pred_monitor_df", None)
+            except Exception as _rx:
+                st.error(f"{type(_rx).__name__}: {_rx}")
+    else:
+        st.caption("復元ポイント（v41_registration_batches.before_weights）がまだありません。")
+
+    st.markdown("##### 更新を再開してよいかの判断目安")
+    st.caption(
+        "① 直近30RのTOP3完全一致が全期間より大きく悪くない（目安: 差が -5pt 以内）／"
+        "② TOP3に1車以上は高いまま、完全一致・TOP1だけ落ちる → 順位付け問題で凍結向き／"
+        "③ 直近30Rが全期間並みに戻ったら学習停止をOFF（少数R様子見）／"
+        "④ 再開後また直近だけ悪化したらすぐ停止して重みを再復元"
+    )
+
+    if st.button("時間窓精度を再計算", key="v324_recalc_pred_monitor", use_container_width=True):
+        st.session_state.pop("v324_pred_monitor_df", None)
+    if "v324_pred_monitor_df" not in st.session_state:
+        with st.spinner("予測順位と実着順を突合しています…"):
+            st.session_state["v324_pred_monitor_df"] = _v324_prediction_window_monitor(engine.DB_PATH)
+    _mon324 = st.session_state.get("v324_pred_monitor_df")
+    if isinstance(_mon324, pd.DataFrame) and not _mon324.empty:
+        st.dataframe(
+            _mon324,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "TOP1一致率": st.column_config.NumberColumn(format="%.1f%%"),
+                "TOP3平均一致数": st.column_config.NumberColumn(format="%.2f"),
+                "TOP3完全一致率": st.column_config.NumberColumn(format="%.1f%%"),
+                "TOP3に1車以上": st.column_config.NumberColumn(format="%.1f%%"),
+                "実1着の予測順位中央値": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
+        try:
+            _all = _mon324[_mon324["窓"].astype(str).str.startswith("全期間")]
+            _r30 = _mon324[_mon324["窓"].astype(str).str.contains("直近30")]
+            if not _all.empty and not _r30.empty:
+                _d_exact = float(_r30.iloc[0]["TOP3完全一致率"]) - float(_all.iloc[0]["TOP3完全一致率"])
+                if _d_exact <= -5.0:
+                    st.warning(
+                        f"直近30RのTOP3完全一致が全期間より {_d_exact:+.1f}pt。"
+                        " 学習更新の一時停止を検討してください（候補は残っているのに順位付けが崩れている可能性）。"
+                    )
+        except Exception:
+            pass
+        st.download_button(
+            "時間窓モニタCSV",
+            _mon324.to_csv(index=False).encode("utf-8-sig"),
+            file_name="prediction_window_monitor.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="v324_pred_monitor_csv",
+        )
+    else:
+        st.info("スナップショット（before_rank）と結果の突合データがまだありません。")
+
     try:
         _v270_weights_df=engine.v40_current_weights(engine.DB_PATH)
         st.dataframe(_v270_weights_df, use_container_width=True, hide_index=True,
