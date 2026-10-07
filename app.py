@@ -24017,28 +24017,9 @@ def _v324_prediction_window_monitor(
 
 
 
-def _v324_feature_weight_item_audit(
-    db_path: str,
-    app_version: str | None = None,
-    plan_origins: tuple[str, ...] | None = None,
-    limit_races: int = 200,
-) -> pd.DataFrame:
-    """重み項目ごとの調査。
 
-    各特徴量について:
-    - 実着順との Spearman 相関（高いほど「強いほど着順が良い」方向で正）
-    - その特徴だけで順位付けしたときの TOP1 / TOP3完全一致 / 平均一致
-    - 初期重み・現在学習重み
-    - 「学習重みからその項目だけ0」にしたときの TOP1 差分（寄与の目安）
-
-    相関が弱い／負なのに重みが大きい項目は疑わしい。
-    """
-    ver = str(app_version or globals().get("_V324_MONITOR_APP_VERSION") or "Ver324").strip()
-    origins = plan_origins
-    if origins is None:
-        origins = tuple(globals().get("_V324_MONITOR_ORIGINS") or ("live", "official_import"))
-    origins = tuple(str(o).strip() for o in origins if str(o).strip())
-    colmap = {
+def _v324_audit_colmap() -> dict:
+    return {
         "試走": "trial_feature",
         "ST": "st_feature",
         "ハンデ": "handicap_feature",
@@ -24050,57 +24031,81 @@ def _v324_feature_weight_item_audit(
         "コース適性": "course_feature",
         "相手耐性": "opponent_feature",
     }
-    default_w = dict(getattr(engine, "V40_DEFAULT_WEIGHTS", {}) or {}) or {
+
+
+def _v324_audit_default_weights() -> dict:
+    w = dict(getattr(engine, "V40_DEFAULT_WEIGHTS", {}) or {})
+    if w:
+        return w
+    return {
         "試走": 0.18, "ST": 0.10, "ハンデ": 0.10, "近況": 0.14, "走路適性": 0.10,
         "前残り": 0.10, "追い込み": 0.08, "周回安定": 0.07, "コース適性": 0.07, "相手耐性": 0.06,
     }
 
-    def _norm(w: dict) -> dict:
-        out = {k: float(w.get(k, default_w.get(k, 0.0)) or 0.0) for k in colmap}
-        s = sum(max(0.0, v) for v in out.values())
-        if s <= 0:
-            return {k: float(default_w.get(k, 0.1)) for k in colmap}
-        return {k: max(0.0, out[k]) / s for k in out}
 
-    learned_raw = {}
+def _v324_norm_weights(w: dict, keys: list[str] | None = None) -> dict:
+    keys = list(keys or _v324_audit_colmap().keys())
+    base = _v324_audit_default_weights()
+    out = {k: float((w or {}).get(k, base.get(k, 0.0)) or 0.0) for k in keys}
+    s = sum(max(0.0, v) for v in out.values())
+    if s <= 0:
+        return {k: float(base.get(k, 0.1)) for k in keys}
+    return {k: max(0.0, out[k]) / s for k in out}
+
+
+def _v324_load_learned_weights_raw(db_path: str) -> dict:
     try:
         with sqlite3.connect(str(db_path), timeout=5.0) as con:
             rows = con.execute(
                 "SELECT feature_name, current_weight FROM adaptive_weights"
             ).fetchall()
-            learned_raw = {str(a): float(b) for a, b in rows}
+            return {str(a): float(b) for a, b in rows}
     except Exception:
-        pass
-    learned_w = _norm(learned_raw)
+        return {}
 
-    def _spearman(a, b) -> float:
-        try:
-            s1 = pd.Series(a).rank(method="average")
-            s2 = pd.Series(b).rank(method="average")
-            if s1.nunique() < 2 or s2.nunique() < 2:
-                return 0.0
-            return float(s1.corr(s2))
-        except Exception:
-            return 0.0
 
-    def _metrics_from_scores(m: pd.DataFrame, score: pd.Series) -> dict:
-        mm = m.assign(_score=score).sort_values("_score", ascending=False)
-        actual_top3 = set(m.nsmallest(3, "finish")["car_no"].astype(int).tolist())
-        pred_top3 = set(mm.head(3)["car_no"].astype(int).tolist())
-        inter = len(actual_top3 & pred_top3)
-        a1 = int(m.nsmallest(1, "finish")["car_no"].iloc[0])
-        p1 = int(mm.iloc[0]["car_no"])
-        order = {int(c): i + 1 for i, c in enumerate(mm["car_no"].astype(int).tolist())}
-        return {
-            "top1": 1 if p1 == a1 else 0,
-            "overlap": inter,
-            "exact3": 1 if inter == 3 else 0,
-            "a1_rank": float(order.get(a1, 99)),
-        }
-
+def _v324_load_restore_weights_near_date(db_path: str, ymd: str = "20260920") -> dict | None:
+    """指定日前後の registration batch before_weights を1つ取る。"""
+    t = re.sub(r"\D", "", str(ymd or ""))[:8]
+    if len(t) < 8:
+        return None
     try:
-        with sqlite3.connect(str(db_path), timeout=15.0) as con:
-            con.execute("PRAGMA busy_timeout=15000")
+        with sqlite3.connect(str(db_path), timeout=8.0) as con:
+            con.execute("PRAGMA busy_timeout=8000")
+            row = con.execute(
+                """
+                SELECT before_weights_json, race_key FROM v41_registration_batches
+                 WHERE COALESCE(before_weights_json,'') <> ''
+                   AND COALESCE(status,'active')='active'
+                   AND REPLACE(SUBSTR(REPLACE(CAST(race_key AS TEXT),'-',''),1,8),'/','') <= ?
+                 ORDER BY REPLACE(SUBSTR(REPLACE(CAST(race_key AS TEXT),'-',''),1,8),'/','') DESC,
+                          batch_id DESC
+                 LIMIT 1
+                """,
+                (t,),
+            ).fetchone()
+            if not row:
+                return None
+            return json.loads(row[0]) if isinstance(row[0], str) else None
+    except Exception:
+        return None
+
+
+def _v324_audit_race_frame(
+    db_path: str,
+    app_version: str | None = None,
+    plan_origins: tuple[str, ...] | None = None,
+    limit_races: int = 400,
+) -> pd.DataFrame:
+    """race_key, race_date 付きの対象レース一覧（新しい順）。"""
+    ver = str(app_version or globals().get("_V324_MONITOR_APP_VERSION") or "Ver324").strip()
+    origins = plan_origins
+    if origins is None:
+        origins = tuple(globals().get("_V324_MONITOR_ORIGINS") or ("live", "official_import"))
+    origins = tuple(str(o).strip() for o in origins if str(o).strip())
+    try:
+        with sqlite3.connect(str(db_path), timeout=12.0) as con:
+            con.execute("PRAGMA busy_timeout=12000")
             ver_keys: set[str] = set()
             try:
                 run_cols = {
@@ -24126,326 +24131,293 @@ def _v324_feature_weight_item_audit(
                 ver_keys = set()
             races = pd.read_sql_query(
                 """
-                SELECT rr.race_key FROM result_races rr
-                 WHERE COALESCE(rr.model_eligible,1)=1
-                 ORDER BY rr.race_date DESC, rr.race_no DESC, rr.race_key DESC
-                """,
-                con,
-            )
-            if not races.empty and ver_keys:
-                races = races[races["race_key"].astype(str).isin(ver_keys)]
-            races = races.drop_duplicates(subset=["race_key"]).head(int(limit_races))
-            if races.empty:
-                return pd.DataFrame()
-
-            feats = list(colmap.values())
-            # 項目ごと集計バッファ
-            corr_vals = {k: [] for k in colmap}
-            solo = {k: [] for k in colmap}
-            full_ms = []
-            drop_ms = {k: [] for k in colmap}
-
-            for rk in races["race_key"].astype(str).tolist():
-                try:
-                    m = pd.read_sql_query(
-                        f"""
-                        SELECT s.car_no, e.finish,
-                               {", ".join("s." + c for c in feats)}
-                          FROM v40_prediction_feature_snapshots s
-                          JOIN result_entries e
-                            ON e.race_key=s.race_key AND e.car_no=s.car_no
-                         WHERE s.race_key=?
-                        """,
-                        con,
-                        params=(rk,),
-                    )
-                except Exception:
-                    continue
-                if m is None or len(m) < 3:
-                    continue
-                m = m.copy()
-                m["finish"] = pd.to_numeric(m["finish"], errors="coerce")
-                for c in feats:
-                    m[c] = pd.to_numeric(m[c], errors="coerce")
-                m = m.dropna(subset=["finish"])
-                m = m[(m["finish"] >= 1) & (m["finish"] <= 8)]
-                m = m.sort_values(["car_no", "finish"]).drop_duplicates(subset=["car_no"], keep="first")
-                if len(m) < 3:
-                    continue
-                # 着順が良いほど大きい性能スコア
-                perf = (len(m) + 1) - m["finish"].astype(float)
-                for name, col in colmap.items():
-                    if m[col].notna().sum() < 3:
-                        continue
-                    # 特徴が高いほど良い前提で相関（feature と perf）
-                    corr_vals[name].append(_spearman(m[col].fillna(m[col].median()), perf))
-                    solo[name].append(_metrics_from_scores(m, m[col].fillna(0.5)))
-
-                # フル学習スコア
-                full_score = sum(float(learned_w[k]) * m[colmap[k]].fillna(0.5) for k in colmap)
-                full_ms.append(_metrics_from_scores(m, full_score))
-                for name in colmap:
-                    w2 = dict(learned_w)
-                    w2[name] = 0.0
-                    s2 = sum(max(0.0, v) for v in w2.values()) or 1.0
-                    w2 = {k: max(0.0, w2[k]) / s2 for k in w2}
-                    sc = sum(float(w2[k]) * m[colmap[k]].fillna(0.5) for k in colmap)
-                    drop_ms[name].append(_metrics_from_scores(m, sc))
-
-            rows = []
-            full_top1 = float(pd.DataFrame(full_ms)["top1"].mean() * 100.0) if full_ms else None
-            for name in colmap:
-                if not solo[name]:
-                    continue
-                sg = pd.DataFrame(solo[name])
-                dg = pd.DataFrame(drop_ms[name]) if drop_ms[name] else pd.DataFrame()
-                drop_top1 = float(dg["top1"].mean() * 100.0) if not dg.empty else None
-                rows.append(
-                    {
-                        "項目": name,
-                        "初期重み": float(default_w.get(name, 0.0)),
-                        "学習重み": float(learned_w.get(name, 0.0)),
-                        "重み差(学習-初期)": float(learned_w.get(name, 0.0)) - float(default_w.get(name, 0.0)),
-                        "着順相関(平均)": float(np.mean(corr_vals[name])) if corr_vals[name] else None,
-                        "単独TOP1%": float(sg["top1"].mean() * 100.0),
-                        "単独TOP3完全一致%": float(sg["exact3"].mean() * 100.0),
-                        "単独TOP3平均一致": float(sg["overlap"].mean()),
-                        "単独実1着順位中央値": float(pd.to_numeric(sg["a1_rank"], errors="coerce").median()),
-                        "除外時TOP1%": drop_top1,
-                        "除外でTOP1変化pt": (
-                            (drop_top1 - full_top1) if (drop_top1 is not None and full_top1 is not None) else None
-                        ),
-                        "調査R数": int(len(sg)),
-                    }
-                )
-            df = pd.DataFrame(rows)
-            if not df.empty and "着順相関(平均)" in df.columns:
-                df = df.sort_values("着順相関(平均)", ascending=False, na_position="last")
-            return df
-    except Exception:
-        return pd.DataFrame()
-
-
-def _v324_weight_method_audit(
-    db_path: str,
-    app_version: str | None = None,
-    plan_origins: tuple[str, ...] | None = None,
-    limit_races: int = 200,
-) -> pd.DataFrame:
-    """重み調整方法の是非を、同一スナップショットで複数重み案の順位精度比較する。
-
-    予測の再シミュレーションはしない。保存済み feature × 重みで順位を再計算するだけ。
-    - 初期重み（DEFAULT）
-    - 現在の学習重み（DBの adaptive_weights を正規化。ブレンドなし）
-    - エンジン適用重み（v40_get_weights: 登録数に応じた初期への縮約込み）
-    - スナップショット保存時の before_rank（当時の順位）
-
-    DEFAULT ≧ 学習 なら「調整方法が悪化させている」可能性が高い。
-    """
-    ver = str(app_version or globals().get("_V324_MONITOR_APP_VERSION") or "Ver324").strip()
-    origins = plan_origins
-    if origins is None:
-        origins = tuple(globals().get("_V324_MONITOR_ORIGINS") or ("live", "official_import"))
-    origins = tuple(str(o).strip() for o in origins if str(o).strip())
-    colmap = {
-        "試走": "trial_feature",
-        "ST": "st_feature",
-        "ハンデ": "handicap_feature",
-        "近況": "form_feature",
-        "走路適性": "surface_feature",
-        "前残り": "front_feature",
-        "追い込み": "chase_feature",
-        "周回安定": "stability_feature",
-        "コース適性": "course_feature",
-        "相手耐性": "opponent_feature",
-    }
-    default_w = None
-    try:
-        default_w = dict(getattr(engine, "V40_DEFAULT_WEIGHTS", {}) or {})
-    except Exception:
-        default_w = {}
-    if not default_w:
-        default_w = {
-            "試走": 0.18, "ST": 0.10, "ハンデ": 0.10, "近況": 0.14, "走路適性": 0.10,
-            "前残り": 0.10, "追い込み": 0.08, "周回安定": 0.07, "コース適性": 0.07, "相手耐性": 0.06,
-        }
-
-    def _norm(w: dict) -> dict:
-        out = {k: float(w.get(k, default_w.get(k, 0.0)) or 0.0) for k in default_w}
-        s = sum(max(0.0, v) for v in out.values())
-        if s <= 0:
-            return dict(default_w)
-        return {k: max(0.0, out[k]) / s for k in out}
-
-    learned_raw = {}
-    try:
-        with sqlite3.connect(str(db_path), timeout=5.0) as con:
-            rows = con.execute(
-                "SELECT feature_name, current_weight FROM adaptive_weights"
-            ).fetchall()
-            learned_raw = {str(a): float(b) for a, b in rows}
-    except Exception:
-        learned_raw = {}
-    learned_w = _norm(learned_raw)
-    engine_w = dict(default_w)
-    try:
-        if hasattr(engine, "v40_get_weights"):
-            engine_w = _norm(engine.v40_get_weights(db_path))
-    except Exception:
-        engine_w = dict(learned_w)
-
-    schemes = {
-        "初期重み": default_w,
-        "学習重み(純)": learned_w,
-        "エンジン適用重み": engine_w,
-        "保存時before_rank": None,  # 特殊
-    }
-
-    try:
-        with sqlite3.connect(str(db_path), timeout=15.0) as con:
-            con.execute("PRAGMA busy_timeout=15000")
-            run_cols = {
-                str(r[1]) for r in con.execute("PRAGMA table_info(v187_mixed_plan_runs)").fetchall()
-            }
-            ver_keys: list[str] = []
-            if "app_version" in run_cols:
-                clauses = ["app_version = ?"]
-                params: list = [ver]
-                if origins and "plan_origin" in run_cols:
-                    ph = ",".join("?" * len(origins))
-                    clauses.append(f"COALESCE(plan_origin,'live') IN ({ph})")
-                    params.extend(list(origins))
-                ver_keys = [
-                    str(r[0])
-                    for r in con.execute(
-                        "SELECT DISTINCT race_key FROM v187_mixed_plan_runs WHERE "
-                        + " AND ".join(clauses),
-                        params,
-                    ).fetchall()
-                    if r and r[0]
-                ]
-            if not ver_keys:
-                ver_keys = [
-                    str(r[0])
-                    for r in con.execute(
-                        """
-                        SELECT rr.race_key FROM result_races rr
-                         WHERE COALESCE(rr.model_eligible,1)=1
-                         ORDER BY rr.race_date DESC LIMIT ?
-                        """,
-                        (int(limit_races),),
-                    ).fetchall()
-                    if r and r[0]
-                ]
-            # 新しい順
-            races = pd.read_sql_query(
-                """
-                SELECT rr.race_key, COALESCE(rr.race_date,'') AS race_date
+                SELECT rr.race_key,
+                       COALESCE(rr.race_date,'') AS race_date,
+                       COALESCE(rr.race_no,0) AS race_no
                   FROM result_races rr
                  WHERE COALESCE(rr.model_eligible,1)=1
                  ORDER BY rr.race_date DESC, rr.race_no DESC, rr.race_key DESC
                 """,
                 con,
             )
-            if not races.empty and ver_keys:
-                keyset = set(ver_keys)
-                races = races[races["race_key"].astype(str).isin(keyset)]
-            races = races.drop_duplicates(subset=["race_key"]).head(int(limit_races))
             if races.empty:
                 return pd.DataFrame()
-
-            feats = list(colmap.values())
-            per_scheme = {name: [] for name in schemes}
-
-            for rk in races["race_key"].astype(str).tolist():
-                try:
-                    m = pd.read_sql_query(
-                        f"""
-                        SELECT s.car_no, s.before_rank, e.finish,
-                               {", ".join("s." + c for c in feats)}
-                          FROM v40_prediction_feature_snapshots s
-                          JOIN result_entries e
-                            ON e.race_key=s.race_key AND e.car_no=s.car_no
-                         WHERE s.race_key=?
-                        """,
-                        con,
-                        params=(rk,),
-                    )
-                except Exception:
-                    continue
-                if m is None or m.empty or len(m) < 3:
-                    continue
-                m = m.copy()
-                m["finish"] = pd.to_numeric(m["finish"], errors="coerce")
-                m["before_rank"] = pd.to_numeric(m["before_rank"], errors="coerce")
-                for c in feats:
-                    m[c] = pd.to_numeric(m[c], errors="coerce").fillna(0.5)
-                m = m.dropna(subset=["finish"])
-                m = m[(m["finish"] >= 1) & (m["finish"] <= 8)]
-                m = m.sort_values(["car_no", "finish"]).drop_duplicates(subset=["car_no"], keep="first")
-                if len(m) < 3:
-                    continue
-                actual_top3 = set(m.nsmallest(3, "finish")["car_no"].astype(int).tolist())
-                try:
-                    a1 = int(m.nsmallest(1, "finish")["car_no"].iloc[0])
-                except Exception:
-                    continue
-
-                for name, w in schemes.items():
-                    if name == "保存時before_rank":
-                        if m["before_rank"].notna().sum() < 3:
-                            continue
-                        mm = m.dropna(subset=["before_rank"])
-                        pred_top3 = set(mm.nsmallest(3, "before_rank")["car_no"].astype(int).tolist())
-                        try:
-                            p1 = int(mm.nsmallest(1, "before_rank")["car_no"].iloc[0])
-                            a1_rank = float(mm.loc[mm["car_no"] == a1, "before_rank"].iloc[0])
-                        except Exception:
-                            p1, a1_rank = -1, None
-                    else:
-                        score = sum(float(w[k]) * m[colmap[k]] for k in colmap)
-                        mm = m.assign(_score=score)
-                        # 高スコアほど上位（rank 1）
-                        mm = mm.sort_values("_score", ascending=False)
-                        pred_top3 = set(mm.head(3)["car_no"].astype(int).tolist())
-                        p1 = int(mm.iloc[0]["car_no"])
-                        try:
-                            a1_rank = float(mm.reset_index(drop=True).index[mm["car_no"].astype(int) == a1][0]) + 1.0
-                        except Exception:
-                            # fallback
-                            order = {int(c): i + 1 for i, c in enumerate(mm["car_no"].astype(int).tolist())}
-                            a1_rank = float(order.get(a1, 99))
-                    inter = len(actual_top3 & pred_top3)
-                    per_scheme[name].append(
-                        {
-                            "top1": 1 if p1 == a1 else 0,
-                            "overlap": inter,
-                            "exact3": 1 if inter == 3 else 0,
-                            "a1_rank": a1_rank,
-                        }
-                    )
-
-            rows = []
-            for name, items in per_scheme.items():
-                if not items:
-                    continue
-                g = pd.DataFrame(items)
-                rows.append(
-                    {
-                        "重み案": name,
-                        "R数": int(len(g)),
-                        "TOP1一致率": float(g["top1"].mean() * 100.0),
-                        "TOP3平均一致数": float(g["overlap"].mean()),
-                        "TOP3完全一致率": float(g["exact3"].mean() * 100.0),
-                        "TOP3に1車以上": float((g["overlap"] >= 1).mean() * 100.0),
-                        "実1着の予測順位中央値": float(
-                            pd.to_numeric(g["a1_rank"], errors="coerce").median()
-                        ),
-                    }
-                )
-            return pd.DataFrame(rows)
+            if ver_keys:
+                races = races[races["race_key"].astype(str).isin(ver_keys)]
+            races = races.drop_duplicates(subset=["race_key"]).head(int(limit_races))
+            return races.reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
+
+
+def _v324_load_race_feature_finish(db_path: str, race_key: str) -> pd.DataFrame | None:
+    colmap = _v324_audit_colmap()
+    feats = list(colmap.values())
+    try:
+        with sqlite3.connect(str(db_path), timeout=8.0) as con:
+            m = pd.read_sql_query(
+                f"""
+                SELECT s.car_no, e.finish,
+                       {", ".join("s." + c for c in feats)}
+                  FROM v40_prediction_feature_snapshots s
+                  JOIN result_entries e
+                    ON e.race_key=s.race_key AND e.car_no=s.car_no
+                 WHERE s.race_key=?
+                """,
+                con,
+                params=(str(race_key),),
+            )
+    except Exception:
+        return None
+    if m is None or len(m) < 3:
+        return None
+    m = m.copy()
+    m["finish"] = pd.to_numeric(m["finish"], errors="coerce")
+    for c in feats:
+        m[c] = pd.to_numeric(m[c], errors="coerce")
+    m = m.dropna(subset=["finish"])
+    m = m[(m["finish"] >= 1) & (m["finish"] <= 8)]
+    m = m.sort_values(["car_no", "finish"]).drop_duplicates(subset=["car_no"], keep="first")
+    if len(m) < 3:
+        return None
+    return m
+
+
+def _v324_metrics_from_score(m: pd.DataFrame, score: pd.Series) -> dict:
+    mm = m.assign(_score=score).sort_values("_score", ascending=False)
+    actual_top3 = set(m.nsmallest(3, "finish")["car_no"].astype(int).tolist())
+    pred_top3 = set(mm.head(3)["car_no"].astype(int).tolist())
+    inter = len(actual_top3 & pred_top3)
+    a1 = int(m.nsmallest(1, "finish")["car_no"].iloc[0])
+    p1 = int(mm.iloc[0]["car_no"])
+    order = {int(c): i + 1 for i, c in enumerate(mm["car_no"].astype(int).tolist())}
+    return {
+        "top1": 1 if p1 == a1 else 0,
+        "overlap": inter,
+        "exact3": 1 if inter == 3 else 0,
+        "a1_rank": float(order.get(a1, 99)),
+    }
+
+
+def _v324_summarize_metric_rows(rows: list[dict]) -> dict:
+    if not rows:
+        return {}
+    g = pd.DataFrame(rows)
+    return {
+        "R数": int(len(g)),
+        "TOP1一致率": float(g["top1"].mean() * 100.0),
+        "TOP3平均一致数": float(g["overlap"].mean()),
+        "TOP3完全一致率": float(g["exact3"].mean() * 100.0),
+        "TOP3に1車以上": float((g["overlap"] >= 1).mean() * 100.0),
+        "実1着の予測順位中央値": float(pd.to_numeric(g["a1_rank"], errors="coerce").median()),
+    }
+
+
+def _v324_feature_weight_item_audit(
+    db_path: str,
+    app_version: str | None = None,
+    plan_origins: tuple[str, ...] | None = None,
+    limit_races: int = 300,
+    holdout_from: str = "20260921",
+) -> pd.DataFrame:
+    """項目別調査（方向自動判定＋ホールドアウト）。
+
+    - 各特徴について「高いほど良い」「低いほど良い」の両方で単独順位付け
+    - 良い方を採用方向とし、相関もその向きで報告
+    - 評価レースは holdout_from 以降（学習に使った過去日を避ける）
+    """
+    colmap = _v324_audit_colmap()
+    default_w = _v324_audit_default_weights()
+    learned_w = _v324_norm_weights(_v324_load_learned_weights_raw(db_path))
+    hold_ymd = re.sub(r"\D", "", str(holdout_from or "20260921"))[:8]
+    races = _v324_audit_race_frame(db_path, app_version, plan_origins, limit_races)
+    if races.empty:
+        return pd.DataFrame()
+
+    def _rk_ymd(rk: str, rd: str) -> str:
+        t = re.sub(r"\D", "", str(rd or ""))[:8]
+        if len(t) >= 8:
+            return t
+        t2 = re.sub(r"\D", "", str(rk or ""))[:8]
+        return t2 if len(t2) >= 8 else ""
+
+    hold_rows = []
+    for _, rr in races.iterrows():
+        y = _rk_ymd(str(rr["race_key"]), str(rr.get("race_date", "")))
+        if y and y >= hold_ymd:
+            hold_rows.append(str(rr["race_key"]))
+    if len(hold_rows) < 8:
+        # フォールバック: 新しい半分
+        all_keys = races["race_key"].astype(str).tolist()
+        hold_rows = all_keys[: max(8, len(all_keys) // 2)]
+
+    # 項目ごと
+    solo_hi = {k: [] for k in colmap}
+    solo_lo = {k: [] for k in colmap}
+    corr_raw = {k: [] for k in colmap}
+
+    for rk in hold_rows:
+        m = _v324_load_race_feature_finish(db_path, rk)
+        if m is None:
+            continue
+        perf = (len(m) + 1) - m["finish"].astype(float)
+        for name, col in colmap.items():
+            if m[col].notna().sum() < 3:
+                continue
+            x = m[col].fillna(m[col].median())
+            try:
+                s1 = x.rank(method="average")
+                s2 = perf.rank(method="average")
+                c = float(s1.corr(s2)) if s1.nunique() > 1 and s2.nunique() > 1 else 0.0
+            except Exception:
+                c = 0.0
+            corr_raw[name].append(c)
+            solo_hi[name].append(_v324_metrics_from_score(m, x))
+            solo_lo[name].append(_v324_metrics_from_score(m, -x))
+
+    rows = []
+    for name in colmap:
+        if not solo_hi[name] and not solo_lo[name]:
+            continue
+        hi = _v324_summarize_metric_rows(solo_hi[name])
+        lo = _v324_summarize_metric_rows(solo_lo[name])
+        hi_t1 = float(hi.get("TOP1一致率") or 0)
+        lo_t1 = float(lo.get("TOP1一致率") or 0)
+        if lo_t1 > hi_t1 + 0.5:
+            direction = "低いほど良い"
+            best = lo
+            aligned_corr = -float(np.mean(corr_raw[name])) if corr_raw[name] else None
+        else:
+            direction = "高いほど良い"
+            best = hi
+            aligned_corr = float(np.mean(corr_raw[name])) if corr_raw[name] else None
+        rows.append(
+            {
+                "項目": name,
+                "評価": f"holdout>={hold_ymd}",
+                "採用方向": direction,
+                "初期重み": float(default_w.get(name, 0.0)),
+                "学習重み": float(learned_w.get(name, 0.0)),
+                "重み差(学習-初期)": float(learned_w.get(name, 0.0)) - float(default_w.get(name, 0.0)),
+                "向き補正後相関": aligned_corr,
+                "生相関(高=良仮定)": float(np.mean(corr_raw[name])) if corr_raw[name] else None,
+                "単独TOP1%(採用方向)": best.get("TOP1一致率"),
+                "単独TOP3完全一致%": best.get("TOP3完全一致率"),
+                "単独TOP3平均一致": best.get("TOP3平均一致数"),
+                "単独実1着順位中央値": best.get("実1着の予測順位中央値"),
+                "逆方向TOP1%": lo_t1 if direction.startswith("高い") else hi_t1,
+                "調査R数": int(best.get("R数") or 0),
+            }
+        )
+    df = pd.DataFrame(rows)
+    if not df.empty and "向き補正後相関" in df.columns:
+        df = df.sort_values("向き補正後相関", ascending=False, na_position="last")
+    return df
+
+
+def _v324_weight_method_audit(
+    db_path: str,
+    app_version: str | None = None,
+    plan_origins: tuple[str, ...] | None = None,
+    limit_races: int = 300,
+    holdout_from: str = "20260921",
+    direction_from_holdout: bool = True,
+) -> pd.DataFrame:
+    """重み案比較（ホールドアウト＋特徴方向補正）。
+
+    評価は holdout_from 以降のRのみ。各特徴の向きはホールドアウト上で
+    単独TOP1が良い方を採用してから合成スコアを作る。
+    """
+    colmap = _v324_audit_colmap()
+    default_w = _v324_norm_weights(_v324_audit_default_weights())
+    learned_w = _v324_norm_weights(_v324_load_learned_weights_raw(db_path))
+    restored_raw = _v324_load_restore_weights_near_date(db_path, "20260920")
+    restored_w = _v324_norm_weights(restored_raw) if restored_raw else None
+    hold_ymd = re.sub(r"\D", "", str(holdout_from or "20260921"))[:8]
+
+    races = _v324_audit_race_frame(db_path, app_version, plan_origins, limit_races)
+    if races.empty:
+        return pd.DataFrame()
+
+    def _rk_ymd(rk: str, rd: str) -> str:
+        t = re.sub(r"\D", "", str(rd or ""))[:8]
+        if len(t) >= 8:
+            return t
+        t2 = re.sub(r"\D", "", str(rk or ""))[:8]
+        return t2 if len(t2) >= 8 else ""
+
+    hold_keys = []
+    for _, rr in races.iterrows():
+        y = _rk_ymd(str(rr["race_key"]), str(rr.get("race_date", "")))
+        if y and y >= hold_ymd:
+            hold_keys.append(str(rr["race_key"]))
+    if len(hold_keys) < 8:
+        hold_keys = races["race_key"].astype(str).tolist()[: max(8, len(races) // 2)]
+
+    # 方向: 各特徴 high vs low の単独TOP1
+    signs = {k: 1.0 for k in colmap}
+    if direction_from_holdout:
+        hi_n = {k: 0 for k in colmap}
+        lo_n = {k: 0 for k in colmap}
+        hi_t = {k: 0 for k in colmap}
+        lo_t = {k: 0 for k in colmap}
+        for rk in hold_keys:
+            m = _v324_load_race_feature_finish(db_path, rk)
+            if m is None:
+                continue
+            for name, col in colmap.items():
+                if m[col].notna().sum() < 3:
+                    continue
+                x = m[col].fillna(m[col].median())
+                mh = _v324_metrics_from_score(m, x)
+                ml = _v324_metrics_from_score(m, -x)
+                hi_n[name] += 1
+                lo_n[name] += 1
+                hi_t[name] += int(mh["top1"])
+                lo_t[name] += int(ml["top1"])
+        for name in colmap:
+            if lo_n[name] > 0 and hi_n[name] > 0:
+                if (lo_t[name] / lo_n[name]) > (hi_t[name] / hi_n[name]) + 0.005:
+                    signs[name] = -1.0
+
+    schemes = {
+        "初期重み": default_w,
+        "学習重み(純)": learned_w,
+    }
+    if restored_w:
+        schemes["9/20復元重み"] = restored_w
+    try:
+        if hasattr(engine, "v40_get_weights"):
+            schemes["エンジン適用重み"] = _v324_norm_weights(engine.v40_get_weights(db_path))
+    except Exception:
+        pass
+
+    per = {name: [] for name in schemes}
+    for rk in hold_keys:
+        m = _v324_load_race_feature_finish(db_path, rk)
+        if m is None:
+            continue
+        for sname, w in schemes.items():
+            score = sum(
+                float(w[k]) * float(signs[k]) * m[colmap[k]].fillna(0.5)
+                for k in colmap
+            )
+            per[sname].append(_v324_metrics_from_score(m, score))
+
+    rows = []
+    for sname, items in per.items():
+        sm = _v324_summarize_metric_rows(items)
+        if not sm:
+            continue
+        rows.append(
+            {
+                "重み案": sname,
+                "評価": f"holdout>={hold_ymd}・方向補正",
+                "反転項目": "、".join([k for k, s in signs.items() if s < 0]) or "なし",
+                **sm,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _v324_install_learning_gate(force: bool = True) -> None:
@@ -31258,14 +31230,14 @@ if selected_main_page == "🗃️ 登録情報確認":
     else:
         st.info("スナップショット（before_rank）と結果の突合データがまだありません。")
 
-    st.markdown("##### 🧪 重み調整方法の検証（同一特徴で再順位付け）")
+    st.markdown("##### 🧪 重み調整方法の検証（ホールドアウト＋方向補正）")
     st.caption(
-        "予測を回し直さず、保存済み特徴量に「初期重み／学習重み／エンジン適用重み」を掛けて順位精度を比較します。"
-        "初期 ≧ 学習 なら、今の自動調整ルールが順位付けを悪化させている可能性が高いです。"
+        "評価はホールドアウト開始日以降のRのみ。特徴の向きを補正したうえで、"
+        "初期／学習／9/20復元／エンジン適用を比較します。学習データへの当てはめ評価はしません。"
     )
     if st.button("重み案を比較する", key="v324_weight_method_audit_btn", use_container_width=True):
         with st.spinner("同一スナップショットで重み案を比較中…"):
-            st.session_state["v324_weight_audit_df"] = _v324_weight_method_audit(engine.DB_PATH)
+            st.session_state["v324_weight_audit_df"] = _v324_weight_method_audit(engine.DB_PATH, holdout_from=str(st.session_state.get("v324_holdout_from") or st.session_state.get("v324_holdout_from_w") or "20260921"))
     _wa = st.session_state.get("v324_weight_audit_df")
     if isinstance(_wa, pd.DataFrame) and not _wa.empty:
         st.dataframe(
@@ -31309,15 +31281,16 @@ if selected_main_page == "🗃️ 登録情報確認":
             key="v324_weight_audit_csv",
         )
 
-    st.markdown("##### 🔎 項目別重み調査（10特徴）")
+    st.markdown("##### 🔎 項目別重み調査（10特徴・方向補正＋ホールドアウト）")
     st.caption(
-        "各項目について、実着順との相関・その項目だけで順位付けした精度・"
-        "学習重みから外したときのTOP1変化を出します。"
-        "相関が弱い／負なのに学習重みが大きい項目は、調整方法・項目自体を疑う候補です。"
+        "評価は 2026-09-21 以降のRのみ（学習に使った過去日を避ける）。"
+        "各項目は「高いほど良い／低いほど良い」の両方を試し、単独TOP1が良い方を採用方向にします。"
+        "向き補正後相関が弱く学習重みが大きい項目が疑わしい候補です。"
     )
+    _hold_ui = st.text_input("ホールドアウト開始日", value="20260921", key="v324_holdout_from")
     if st.button("項目ごとに調査する", key="v324_feature_item_audit_btn", use_container_width=True):
         with st.spinner("特徴量スナップショットを項目別に集計中…"):
-            st.session_state["v324_feature_item_df"] = _v324_feature_weight_item_audit(engine.DB_PATH)
+            st.session_state["v324_feature_item_df"] = _v324_feature_weight_item_audit(engine.DB_PATH, holdout_from=str(st.session_state.get("v324_holdout_from") or "20260921"))
     _fi = st.session_state.get("v324_feature_item_df")
     if isinstance(_fi, pd.DataFrame) and not _fi.empty:
         st.dataframe(
@@ -31328,7 +31301,8 @@ if selected_main_page == "🗃️ 登録情報確認":
                 "初期重み": st.column_config.NumberColumn(format="%.3f"),
                 "学習重み": st.column_config.NumberColumn(format="%.3f"),
                 "重み差(学習-初期)": st.column_config.NumberColumn(format="%+.3f"),
-                "着順相関(平均)": st.column_config.NumberColumn(format="%+.3f"),
+                "向き補正後相関": st.column_config.NumberColumn(format="%+.3f"),
+                "生相関(高=良仮定)": st.column_config.NumberColumn(format="%+.3f"),
                 "単独TOP1%": st.column_config.NumberColumn(format="%.1f"),
                 "単独TOP3完全一致%": st.column_config.NumberColumn(format="%.1f"),
                 "単独TOP3平均一致": st.column_config.NumberColumn(format="%.2f"),
@@ -31338,20 +31312,23 @@ if selected_main_page == "🗃️ 登録情報確認":
             },
         )
         try:
+            _corr_col = "向き補正後相関" if "向き補正後相関" in _fi.columns else "着順相関(平均)"
             _bad = _fi[
-                (pd.to_numeric(_fi["着順相関(平均)"], errors="coerce") < 0.05)
+                (pd.to_numeric(_fi[_corr_col], errors="coerce") < 0.05)
                 & (pd.to_numeric(_fi["学習重み"], errors="coerce") > pd.to_numeric(_fi["初期重み"], errors="coerce") + 0.01)
             ]
             if isinstance(_bad, pd.DataFrame) and not _bad.empty:
                 st.warning(
-                    "相関が弱いのに学習重みが初期より大きい項目: "
+                    "向き補正後も相関が弱いのに学習重みが初期より大きい項目: "
                     + "、".join(_bad["項目"].astype(str).tolist())
                 )
-            _neg = _fi[pd.to_numeric(_fi["着順相関(平均)"], errors="coerce") < 0]
-            if isinstance(_neg, pd.DataFrame) and not _neg.empty:
-                st.error(
-                    "着順と負の相関の項目（高いほど着順が悪い方向）: "
-                    + "、".join(_neg["項目"].astype(str).tolist())
+            if "採用方向" in _fi.columns:
+                st.caption(
+                    "方向が反転した項目: "
+                    + "、".join(
+                        _fi.loc[_fi["採用方向"].astype(str).str.contains("低い"), "項目"].astype(str).tolist()
+                    )
+                    or "なし"
                 )
         except Exception:
             pass
