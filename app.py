@@ -23745,26 +23745,64 @@ def _v324_restore_weights_from_json(db_path: str, weights: dict, note: str = "")
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def _v324_list_weight_restore_points(db_path: str, limit: int = 40) -> pd.DataFrame:
-    """結果登録バッチの before_weights を復元ポイントとして列挙。"""
+def _v324_list_weight_restore_points(
+    db_path: str,
+    limit: int = 200,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    race_key_contains: str | None = None,
+) -> pd.DataFrame:
+    """結果登録バッチの before_weights を復元ポイントとして列挙。
+
+    date_from/date_to は YYYYMMDD または YYYY-MM-DD。race_key 先頭日付と registered_at の両方で絞る。
+    """
+    def _ymd(s: str) -> str:
+        t = re.sub(r"\D", "", str(s or ""))
+        return t[:8] if len(t) >= 8 else ""
+
+    d0 = _ymd(date_from or "")
+    d1 = _ymd(date_to or "")
+    key_q = str(race_key_contains or "").strip()
+    limit = max(10, min(2000, int(limit or 200)))
     try:
-        with sqlite3.connect(str(db_path), timeout=8.0) as con:
-            con.execute("PRAGMA busy_timeout=8000")
+        with sqlite3.connect(str(db_path), timeout=12.0) as con:
+            con.execute("PRAGMA busy_timeout=12000")
+            clauses = [
+                "COALESCE(before_weights_json,'') <> ''",
+                "COALESCE(status,'active') = 'active'",
+            ]
+            params: list = []
+            # race_key の日付部分（先頭8桁の数字）で絞る
+            if d0:
+                clauses.append(
+                    "REPLACE(SUBSTR(REPLACE(CAST(race_key AS TEXT),'-',''),1,8),'/','') >= ?"
+                )
+                params.append(d0)
+            if d1:
+                clauses.append(
+                    "REPLACE(SUBSTR(REPLACE(CAST(race_key AS TEXT),'-',''),1,8),'/','') <= ?"
+                )
+                params.append(d1)
+            if key_q:
+                clauses.append("CAST(race_key AS TEXT) LIKE ?")
+                params.append(f"%{key_q}%")
+            params.append(limit)
             df = pd.read_sql_query(
-                """
+                f"""
                 SELECT batch_id,
                        race_key,
                        registered_at,
                        status,
                        before_weights_json
                   FROM v41_registration_batches
-                 WHERE COALESCE(before_weights_json,'') <> ''
-                   AND COALESCE(status,'active') = 'active'
-                 ORDER BY batch_id DESC
+                 WHERE {" AND ".join(clauses)}
+                 ORDER BY
+                       REPLACE(SUBSTR(REPLACE(CAST(race_key AS TEXT),'-',''),1,8),'/','') DESC,
+                       batch_id DESC
                  LIMIT ?
                 """,
                 con,
-                params=(int(limit),),
+                params=params,
             )
         return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
     except Exception:
@@ -30690,17 +30728,29 @@ if selected_main_page == "🗃️ 登録情報確認":
         _ok_rb, _msg_rb = _v324_rollback_last_weight_adjustments(engine.DB_PATH, _rb_n)
         (st.success if _ok_rb else st.warning)(_msg_rb)
         st.session_state.pop("v324_pred_monitor_df", None)
-    _pts324 = _v324_list_weight_restore_points(engine.DB_PATH, limit=30)
+    st.caption("9/20付近など古い時点は、日付範囲を指定して探してください（直近30件だけだと出ません）。")
+    _pf1, _pf2, _pf3 = st.columns(3)
+    _df_from = _pf1.text_input("復元ポイント開始日", value="20260915", key="v324_rp_from", placeholder="20260915")
+    _df_to = _pf2.text_input("復元ポイント終了日", value="20260925", key="v324_rp_to", placeholder="20260925")
+    _df_lim = int(_pf3.number_input("表示件数", min_value=20, max_value=500, value=100, key="v324_rp_limit"))
+    _df_key = st.text_input("race_key 部分一致（任意）", value="", key="v324_rp_key", placeholder="例 浜松 または 20260920")
+    _pts324 = _v324_list_weight_restore_points(
+        engine.DB_PATH,
+        limit=_df_lim,
+        date_from=_df_from or None,
+        date_to=_df_to or None,
+        race_key_contains=_df_key or None,
+    )
     if isinstance(_pts324, pd.DataFrame) and not _pts324.empty:
         _labels324 = [
-            f"{r.registered_at}｜{r.race_key}（batch {r.batch_id}）"
+            f"{r.race_key}｜登録 {r.registered_at}（batch {r.batch_id}）"
             for r in _pts324.itertuples()
         ]
         _pick324 = st.selectbox(
             "登録直前の重みに戻す（そのレース学習前の状態）",
             options=["（選ばない）"] + _labels324,
             key="v324_restore_point",
-            help="精度が落ち始める前の日付のバッチを選ぶのが安全です（例: 9月中旬〜下旬）。",
+            help="9/20前後なら開始日20260915・終了日20260925で絞り、該当レースの batch を選んでください。",
         )
         if _pick324 != "（選ばない）" and st.button(
             "この時点の重みへ復元", key="v324_restore_point_go", use_container_width=True
