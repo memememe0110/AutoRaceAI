@@ -5341,6 +5341,282 @@ def _v324_adjacent_swaps(prev_order, cur_order) -> set:
     return swaps
 
 
+
+def _v324_parse_route_orders(route_text: str) -> dict[int, tuple]:
+    """'1-2-3-4 / 2-1-3-4 / ...' → {1: (...), 2: (...), ...}"""
+    out: dict[int, tuple] = {}
+    raw = str(route_text or "").strip()
+    if not raw:
+        return out
+    parts = [p.strip() for p in raw.replace("|", "/").split("/") if p.strip()]
+    for i, part in enumerate(parts, start=1):
+        vals = tuple(int(v) for v in part.replace("→", "-").split("-") if str(v).strip().isdigit())
+        if vals:
+            out[i] = vals
+    return out
+
+
+def _v324_overtake_pair_continuous_diagnostic(
+    db_path: str,
+    app_version: str | None = None,
+    limit_races: int = 200,
+) -> dict:
+    """連続6周ルート（closest / top_routes）と実測の追抜ペア比較。
+
+    最頻隊列のつなぎ合わせではなく、1本の連続軌跡とのスワップ一致を見る。
+    データ優先順位:
+      1) v231_prediction_history の meta 内 top_routes_v263 / closest_route_v263
+      2) v263_scenario_feedback.closest_route
+    実測は result_laps。
+    """
+    ver = str(app_version or globals().get("_V231_APP_VERSION") or "Ver324").strip()
+    out = {
+        "ok": False,
+        "version": ver,
+        "races_used": 0,
+        "source_hist": 0,
+        "source_feedback": 0,
+        "by_lap": pd.DataFrame(),
+        "samples": pd.DataFrame(),
+        "summary": {},
+        "reason": "",
+        "note": "連続ルート（closest/top_routes）基準。最頻隊列診断より意味のあるF1。",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+
+    # 実測ラップ
+    try:
+        with sqlite3.connect(str(db_path), timeout=25.0) as con:
+            con.execute("PRAGMA busy_timeout=25000")
+            actual = pd.read_sql_query(
+                """
+                SELECT substr(rr.race_date,1,10) AS race_date,
+                       rr.venue,
+                       REPLACE(CAST(COALESCE(rr.race_no,'') AS TEXT),'R','') AS race_no,
+                       rl.lap_no, rl.position, rl.car_no
+                  FROM result_laps rl
+                  JOIN result_races rr ON rr.race_key=rl.race_key
+                 WHERE COALESCE(rr.learning_eligible,1)=1
+                """,
+                con,
+            )
+            amap: dict = {}
+            if actual is not None and not actual.empty:
+                for key, g in actual.groupby(["race_date", "venue", "race_no", "lap_no"], dropna=False):
+                    try:
+                        amap[(str(key[0])[:10], str(key[1]), str(key[2]), int(key[3]))] = tuple(
+                            int(x) for x in g.sort_values("position")["car_no"].tolist()
+                        )
+                    except Exception:
+                        continue
+
+            # (date, venue, race_no) -> route_text
+            routes: dict = {}
+            source_hist = 0
+            source_fb = 0
+
+            # 1) prediction history
+            try:
+                cols = {str(r[1]) for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+                if "payload" in cols or "result_blob" in cols:
+                    blob_col = "payload" if "payload" in cols else "result_blob"
+                    ver_clause = ""
+                    params: list = []
+                    if "app_version" in cols:
+                        ver_clause = "WHERE app_version=?"
+                        params.append(ver)
+                    q = f"""
+                        SELECT history_id, race_key, {blob_col}
+                          FROM v231_prediction_history
+                          {ver_clause}
+                         ORDER BY history_id DESC
+                         LIMIT ?
+                    """
+                    params.append(int(limit_races) * 3)
+                    rows = con.execute(q, params).fetchall()
+                    for hid, rk, blob in rows:
+                        try:
+                            obj = pickle.loads(zlib.decompress(bytes(blob)))
+                        except Exception:
+                            continue
+                        if not isinstance(obj, dict):
+                            continue
+                        meta = obj.get("meta") or {}
+                        # sometimes nested
+                        if not meta and isinstance(obj.get("result"), dict):
+                            meta = (obj.get("result") or {}).get("meta") or {}
+                        wall = (
+                            meta.get("6周展開シミュレーション")
+                            or meta.get("壁補正監査")
+                            or obj.get("wall_audit")
+                            or {}
+                        )
+                        if not isinstance(wall, dict):
+                            wall = {}
+                        route_text = str(
+                            wall.get("closest_route_v263")
+                            or ""
+                        ).strip()
+                        if not route_text:
+                            tops = wall.get("top_routes_v263") or []
+                            if tops and isinstance(tops[0], dict):
+                                route_text = str(tops[0].get("route") or "").strip()
+                        if not route_text:
+                            continue
+                        rd = str(meta.get("開催日") or meta.get("race_date") or "")[:10]
+                        vv = str(meta.get("開催場") or meta.get("venue") or "").strip()
+                        rr = re.sub(
+                            r"[^0-9]",
+                            "",
+                            str(meta.get("R") or meta.get("レース") or meta.get("race_no") or ""),
+                        )
+                        if not (rd and vv and rr):
+                            # try race_key
+                            parts = str(rk or "").replace("R", "_").split("_")
+                            if len(parts) >= 3:
+                                rd = rd or re.sub(r"\D", "", parts[0])[:10]
+                                if len(rd) == 8:
+                                    rd = f"{rd[:4]}-{rd[4:6]}-{rd[6:8]}"
+                                vv = vv or parts[1]
+                                rr = rr or re.sub(r"\D", "", parts[-1])
+                        if not (rd and vv and rr):
+                            continue
+                        key = (rd[:10], vv, str(rr))
+                        if key not in routes:
+                            routes[key] = route_text
+                            source_hist += 1
+            except Exception:
+                pass
+
+            # 2) scenario feedback fallback
+            try:
+                fb = con.execute(
+                    """
+                    SELECT race_date, venue, race_no, closest_route
+                      FROM v263_scenario_feedback
+                     WHERE app_version=?
+                       AND COALESCE(closest_route,'')<>''
+                     ORDER BY created_at DESC
+                    """,
+                    (ver,),
+                ).fetchall()
+                for rd, vv, rr, route_text in fb:
+                    key = (
+                        str(rd)[:10],
+                        str(vv).strip(),
+                        re.sub(r"[^0-9]", "", str(rr or "")),
+                    )
+                    if key[0] and key[1] and key[2] and key not in routes:
+                        routes[key] = str(route_text)
+                        source_fb += 1
+            except Exception:
+                pass
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    if not routes:
+        out["reason"] = "連続ルート（closest/top_routes）がDBに見つかりません。予測保存後に再実行してください。"
+        return out
+    if not amap:
+        out["reason"] = "result_laps がありません"
+        return out
+
+    by_lap: dict = {}
+    samples = []
+    used = 0
+
+    def _bucket_add(bucket, key, a_set, s_set):
+        d = bucket.setdefault(key, {"races": 0, "actual": 0, "sim": 0, "matched": 0})
+        d["races"] += 1
+        d["actual"] += len(a_set)
+        d["sim"] += len(s_set)
+        d["matched"] += len(a_set & s_set)
+
+    keys_sorted = sorted(routes.keys(), reverse=True)[: int(limit_races)]
+    for key in keys_sorted:
+        sim_orders = _v324_parse_route_orders(routes[key])
+        if len(sim_orders) < 2:
+            continue
+        act_orders = {}
+        for lap in range(1, 7):
+            a = amap.get((key[0], key[1], key[2], lap))
+            if a:
+                act_orders[lap] = a
+        if len(act_orders) < 2:
+            continue
+        used += 1
+        for lap_to in range(2, 7):
+            if lap_to not in sim_orders or (lap_to - 1) not in sim_orders:
+                continue
+            if lap_to not in act_orders or (lap_to - 1) not in act_orders:
+                continue
+            a_set = _v324_adjacent_swaps(act_orders[lap_to - 1], act_orders[lap_to])
+            s_set = _v324_adjacent_swaps(sim_orders[lap_to - 1], sim_orders[lap_to])
+            _bucket_add(by_lap, lap_to, a_set, s_set)
+            if len(samples) < 50 and (a_set or s_set):
+                samples.append(
+                    {
+                        "開催日": key[0],
+                        "場": key[1],
+                        "R": key[2],
+                        "周回": lap_to,
+                        "実測スワップ": " / ".join(f"{a}→{b}" for a, b in sorted(a_set)) or "—",
+                        "Sim連続ルート": " / ".join(f"{a}→{b}" for a, b in sorted(s_set)) or "—",
+                        "一致": " / ".join(f"{a}→{b}" for a, b in sorted(a_set & s_set)) or "—",
+                        "実測数": len(a_set),
+                        "Sim数": len(s_set),
+                        "一致数": len(a_set & s_set),
+                    }
+                )
+
+    rows = []
+    for lap, d in sorted(by_lap.items()):
+        prec = (d["matched"] / d["sim"] * 100.0) if d["sim"] else None
+        rec = (d["matched"] / d["actual"] * 100.0) if d["actual"] else None
+        f1 = (
+            2 * prec * rec / (prec + rec)
+            if prec is not None and rec is not None and (prec + rec) > 0
+            else None
+        )
+        rows.append(
+            {
+                "周回": int(lap),
+                "遷移数": int(d["races"]),
+                "実測スワップ計": int(d["actual"]),
+                "Simスワップ計": int(d["sim"]),
+                "一致": int(d["matched"]),
+                "Precision%": prec,
+                "Recall%": rec,
+                "F1%": f1,
+            }
+        )
+    by_lap_df = pd.DataFrame(rows)
+    lap3 = by_lap_df[by_lap_df["周回"] == 3] if not by_lap_df.empty else pd.DataFrame()
+    out.update(
+        {
+            "ok": True,
+            "races_used": used,
+            "source_hist": source_hist,
+            "source_feedback": source_fb,
+            "by_lap": by_lap_df,
+            "samples": pd.DataFrame(samples),
+            "summary": {
+                "対象レース": used,
+                "履歴由来": source_hist,
+                "feedback由来": source_fb,
+                "3周目F1": float(lap3.iloc[0]["F1%"]) if len(lap3) else None,
+                "3周目Precision": float(lap3.iloc[0]["Precision%"]) if len(lap3) else None,
+                "3周目Recall": float(lap3.iloc[0]["Recall%"]) if len(lap3) else None,
+            },
+            "reason": "OK",
+        }
+    )
+    return out
+
+
 def _v324_overtake_pair_diagnostic(
     db_path: str,
     app_version: str | None = None,
@@ -31924,6 +32200,59 @@ if selected_main_page == "🗃️ 登録情報確認":
                 st.dataframe(_opv, use_container_width=True, hide_index=True)
     elif isinstance(_op, dict) and _op.get("reason") and _op.get("reason") != "OK":
         st.warning(str(_op.get("reason")))
+
+    st.markdown("##### 🧭 追抜ペア（連続ルート版）")
+    st.caption(
+        "closest_route / top_routes の1本の連続6周軌跡と実測を比較します。"
+        "最頻隊列のつなぎ合わせ診断より信頼できます。"
+        "ここでもF1が低ければ中盤モデル本体の問題とみなせます。"
+    )
+    if st.button("連続ルート追抜診断を実行", key="v324_overtake_cont_btn", use_container_width=True):
+        with st.spinner("連続ルートと実測スワップを突合中…"):
+            st.session_state["v324_overtake_cont"] = _v324_overtake_pair_continuous_diagnostic(engine.DB_PATH)
+    _oc = st.session_state.get("v324_overtake_cont")
+    if isinstance(_oc, dict) and _oc.get("ok"):
+        _osm = _oc.get("summary") or {}
+        st.write(
+            f"対象 {_osm.get('対象レース', 0)}R"
+            f"（履歴{_osm.get('履歴由来', 0)} / feedback{_osm.get('feedback由来', 0)}）｜"
+            f"3周目 F1 {_osm.get('3周目F1')}% / "
+            f"P {_osm.get('3周目Precision')}% / R {_osm.get('3周目Recall')}%"
+        )
+        _ocl = _oc.get("by_lap")
+        if isinstance(_ocl, pd.DataFrame) and not _ocl.empty:
+            st.dataframe(
+                _ocl,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Precision%": st.column_config.NumberColumn(format="%.1f"),
+                    "Recall%": st.column_config.NumberColumn(format="%.1f"),
+                    "F1%": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+            st.download_button(
+                "連続ルート追抜・周回別CSV",
+                _ocl.to_csv(index=False).encode("utf-8-sig"),
+                file_name="overtake_pair_continuous_by_lap.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v324_overtake_cont_bylap_csv",
+            )
+        _ocs = _oc.get("samples")
+        if isinstance(_ocs, pd.DataFrame) and not _ocs.empty:
+            with st.expander("連続ルート・サンプル", expanded=False):
+                st.dataframe(_ocs, use_container_width=True, hide_index=True)
+            st.download_button(
+                "連続ルート追抜・サンプルCSV",
+                _ocs.to_csv(index=False).encode("utf-8-sig"),
+                file_name="overtake_pair_continuous_samples.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v324_overtake_cont_samples_csv",
+            )
+    elif isinstance(_oc, dict) and _oc.get("reason") and _oc.get("reason") != "OK":
+        st.warning(str(_oc.get("reason")))
 
     try:
         _v270_weights_df=engine.v40_current_weights(engine.DB_PATH)
