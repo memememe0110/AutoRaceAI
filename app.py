@@ -5093,6 +5093,233 @@ def _v254_saved_version_lap_comparison(db_path: str) -> pd.DataFrame:
         ['前後関係一致率','位置一致率','平均順位誤差'],ascending=[False,False,True],ignore_index=True)
 
 
+
+def _v324_six_lap_diagnostic(
+    db_path: str,
+    app_version: str | None = None,
+    limit_races: int = 120,
+) -> dict:
+    """6周シミュレーション診断（保存済み代表隊列 vs 実測グランドノート）。
+
+    再シミュレーション不要。v252_lap_prediction_snapshots と result_laps を突合する。
+    - 周回別: TOP1/TOP3/位置一致
+    - レース型: 序盤OK終盤崩れ / 序盤からズレ / 終盤まで安定 など
+    """
+    ver = str(app_version or globals().get("_V231_APP_VERSION") or "Ver324").strip()
+    out = {
+        "ok": False,
+        "version": ver,
+        "by_lap": pd.DataFrame(),
+        "patterns": pd.DataFrame(),
+        "detail": pd.DataFrame(),
+        "summary": {},
+        "reason": "",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+    try:
+        with sqlite3.connect(str(db_path), timeout=20.0) as con:
+            con.execute("PRAGMA busy_timeout=20000")
+            try:
+                _v252_ensure_lap_tables(con)
+            except Exception:
+                pass
+            pred = pd.read_sql_query(
+                """
+                SELECT race_date, venue, race_no, lap_no, predicted_order, created_at
+                  FROM v252_lap_prediction_snapshots
+                 WHERE app_version=?
+                 ORDER BY created_at
+                """,
+                con,
+                params=(ver,),
+            )
+            actual = pd.read_sql_query(
+                """
+                SELECT substr(rr.race_date,1,10) AS race_date,
+                       rr.venue,
+                       REPLACE(CAST(COALESCE(rr.race_no,'') AS TEXT),'R','') AS race_no,
+                       rl.lap_no, rl.position, rl.car_no
+                  FROM result_laps rl
+                  JOIN result_races rr ON rr.race_key=rl.race_key
+                 WHERE COALESCE(rr.learning_eligible,1)=1
+                """,
+                con,
+            )
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+    if pred is None or pred.empty:
+        out["reason"] = f"{ver} の周回予測スナップショットがありません（予測時に保存が必要）"
+        return out
+    if actual is None or actual.empty:
+        out["reason"] = "result_laps（実測グランドノート）がありません"
+        return out
+
+    pred = pred.copy()
+    pred["race_date"] = pred["race_date"].astype(str).str[:10]
+    pred["race_no"] = pred["race_no"].astype(str).str.replace("R", "", regex=False)
+    pred["venue"] = pred["venue"].astype(str)
+    pred["lap_no"] = pd.to_numeric(pred["lap_no"], errors="coerce")
+    pred = pred.dropna(subset=["lap_no"])
+    pred["lap_no"] = pred["lap_no"].astype(int)
+    pred = pred.sort_values("created_at").drop_duplicates(
+        ["race_date", "venue", "race_no", "lap_no"], keep="last"
+    )
+
+    amap: dict = {}
+    for key, g in actual.groupby(["race_date", "venue", "race_no", "lap_no"], dropna=False):
+        try:
+            amap[(str(key[0])[:10], str(key[1]), str(key[2]), int(key[3]))] = tuple(
+                int(x) for x in g.sort_values("position")["car_no"].tolist()
+            )
+        except Exception:
+            continue
+
+    # race -> {lap: (pred, act)}
+    race_laps: dict = {}
+    for row in pred.itertuples():
+        try:
+            prd = tuple(int(x) for x in str(row.predicted_order).split("-") if str(x).strip())
+        except Exception:
+            continue
+        key = (str(row.race_date)[:10], str(row.venue), str(row.race_no), int(row.lap_no))
+        act = amap.get(key)
+        if not act or not prd:
+            continue
+        rk = key[:3]
+        race_laps.setdefault(rk, {})[int(row.lap_no)] = (prd, act)
+
+    if not race_laps:
+        out["reason"] = "予測周回と実測周回の突合が0件"
+        return out
+
+    # limit newest races by date
+    race_keys = sorted(race_laps.keys(), key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    race_keys = race_keys[: int(limit_races)]
+
+    detail_rows = []
+    lap_bucket: dict = {i: [] for i in range(1, 7)}
+    pattern_count = {
+        "終盤まで安定": 0,
+        "序盤OK終盤崩れ": 0,
+        "序盤からズレ": 0,
+        "中盤入れ替わり": 0,
+        "データ不足": 0,
+    }
+
+    def _top1(prd, act):
+        return 1 if prd and act and prd[0] == act[0] else 0
+
+    def _top3(prd, act):
+        if not prd or not act:
+            return 0
+        return 1 if set(prd[:3]) == set(act[:3]) else 0
+
+    def _top3_overlap(prd, act):
+        if not prd or not act:
+            return 0
+        return len(set(prd[:3]) & set(act[:3]))
+
+    def _pos_acc(prd, act):
+        n = max(len(prd), len(act), 1)
+        return sum(1 for i, c in enumerate(act) if i < len(prd) and prd[i] == c) / n
+
+    for rk in race_keys:
+        laps = race_laps[rk]
+        if not laps:
+            continue
+        early = [laps[i] for i in (1, 2, 3) if i in laps]
+        late = [laps[i] for i in (5, 6) if i in laps]
+        early_t3 = np.mean([_top3_overlap(p, a) for p, a in early]) if early else None
+        late_t3 = np.mean([_top3_overlap(p, a) for p, a in late]) if late else None
+        final_t1 = _top1(*laps[6]) if 6 in laps else None
+        final_t3 = _top3(*laps[6]) if 6 in laps else None
+
+        if early_t3 is None or late_t3 is None:
+            pat = "データ不足"
+        elif early_t3 >= 2.0 and late_t3 >= 2.0 and (final_t3 == 1 or (final_t1 == 1)):
+            pat = "終盤まで安定"
+        elif early_t3 >= 2.0 and late_t3 < 1.5:
+            pat = "序盤OK終盤崩れ"
+        elif early_t3 < 1.5:
+            pat = "序盤からズレ"
+        else:
+            pat = "中盤入れ替わり"
+        pattern_count[pat] = pattern_count.get(pat, 0) + 1
+
+        for lap_no, (prd, act) in sorted(laps.items()):
+            if lap_no in lap_bucket:
+                lap_bucket[lap_no].append(
+                    {
+                        "top1": _top1(prd, act),
+                        "top3_exact": _top3(prd, act),
+                        "top3_overlap": _top3_overlap(prd, act),
+                        "pos_acc": _pos_acc(prd, act),
+                    }
+                )
+            detail_rows.append(
+                {
+                    "開催日": rk[0],
+                    "場": rk[1],
+                    "R": rk[2],
+                    "周回": int(lap_no),
+                    "実測": "-".join(map(str, act)),
+                    "Sim代表": "-".join(map(str, prd)),
+                    "TOP1一致": _top1(prd, act),
+                    "TOP3完全": _top3(prd, act),
+                    "TOP3一致数": _top3_overlap(prd, act),
+                    "位置一致率": round(_pos_acc(prd, act) * 100.0, 1),
+                    "展開型": pat,
+                }
+            )
+
+    by_lap_rows = []
+    for lap_no in range(1, 7):
+        items = lap_bucket.get(lap_no) or []
+        if not items:
+            continue
+        g = pd.DataFrame(items)
+        by_lap_rows.append(
+            {
+                "周回": lap_no,
+                "照合R数": int(len(g)),
+                "TOP1一致率": float(g["top1"].mean() * 100.0),
+                "TOP3完全一致率": float(g["top3_exact"].mean() * 100.0),
+                "TOP3平均一致数": float(g["top3_overlap"].mean()),
+                "位置一致率": float(g["pos_acc"].mean() * 100.0),
+            }
+        )
+
+    pat_rows = [{"展開パターン": k, "レース数": int(v)} for k, v in pattern_count.items() if v]
+    detail = pd.DataFrame(detail_rows)
+    # 新しい順
+    if not detail.empty:
+        detail = detail.sort_values(["開催日", "場", "R", "周回"], ascending=[False, True, True, True])
+
+    n_race = len(race_keys)
+    final_rows = [r for r in detail_rows if int(r.get("周回") or 0) == 6] if detail_rows else []
+    out.update(
+        {
+            "ok": True,
+            "by_lap": pd.DataFrame(by_lap_rows),
+            "patterns": pd.DataFrame(pat_rows),
+            "detail": detail,
+            "summary": {
+                "対象レース": n_race,
+                "6周目TOP1%": float(np.mean([r["TOP1一致"] for r in final_rows]) * 100.0) if final_rows else None,
+                "6周目TOP3完全%": float(np.mean([r["TOP3完全"] for r in final_rows]) * 100.0) if final_rows else None,
+                "序盤OK終盤崩れ": int(pattern_count.get("序盤OK終盤崩れ", 0)),
+                "序盤からズレ": int(pattern_count.get("序盤からズレ", 0)),
+                "終盤まで安定": int(pattern_count.get("終盤まで安定", 0)),
+            },
+            "reason": "OK",
+        }
+    )
+    return out
+
+
 def _v260_snapshot_storage_status(db_path: str, app_version: str = "") -> dict:
     """Show prediction-history count separately from lap-snapshot count."""
     out={"history_races":0,"snapshot_races":0,"snapshot_laps":0,"waiting_or_missing":0,"reason":""}
@@ -31340,6 +31567,67 @@ if selected_main_page == "🗃️ 登録情報確認":
             use_container_width=True,
             key="v324_feature_item_csv",
         )
+
+    st.markdown("##### 🏁 6周シミュレーション診断（実測グランドノート比較）")
+    st.caption(
+        "再シミュレーション不要。予測時に保存した代表周回隊列（v252）と実測 result_laps を突合します。"
+        "序盤OK終盤崩れ／序盤からズレを分けて、重みではなく展開モデル側の問題かを見ます。"
+    )
+    if st.button("6周診断を実行", key="v324_six_lap_diag_btn", use_container_width=True):
+        with st.spinner("周回スナップショットと実測を突合中…"):
+            st.session_state["v324_six_lap_diag"] = _v324_six_lap_diagnostic(engine.DB_PATH)
+    _s6 = st.session_state.get("v324_six_lap_diag")
+    if isinstance(_s6, dict) and _s6.get("ok"):
+        _sm = _s6.get("summary") or {}
+        st.write(
+            f"対象 {_sm.get('対象レース', 0)}R｜"
+            f"6周目TOP1 {_sm.get('6周目TOP1%')}%｜"
+            f"6周目TOP3完全 {_sm.get('6周目TOP3完全%')}%｜"
+            f"序盤OK終盤崩れ {_sm.get('序盤OK終盤崩れ')}｜"
+            f"序盤からズレ {_sm.get('序盤からズレ')}｜"
+            f"安定 {_sm.get('終盤まで安定')}"
+        )
+        _bl = _s6.get("by_lap")
+        if isinstance(_bl, pd.DataFrame) and not _bl.empty:
+            st.markdown("**周回別一致率**")
+            st.dataframe(
+                _bl,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "TOP1一致率": st.column_config.NumberColumn(format="%.1f%%"),
+                    "TOP3完全一致率": st.column_config.NumberColumn(format="%.1f%%"),
+                    "TOP3平均一致数": st.column_config.NumberColumn(format="%.2f"),
+                    "位置一致率": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+        _pt = _s6.get("patterns")
+        if isinstance(_pt, pd.DataFrame) and not _pt.empty:
+            st.markdown("**展開パターン内訳**")
+            st.dataframe(_pt, use_container_width=True, hide_index=True)
+        _dt = _s6.get("detail")
+        if isinstance(_dt, pd.DataFrame) and not _dt.empty:
+            st.markdown("**レース×周回明細（新しい順）**")
+            st.dataframe(_dt.head(120), use_container_width=True, hide_index=True)
+            st.download_button(
+                "6周診断明細CSV",
+                _dt.to_csv(index=False).encode("utf-8-sig"),
+                file_name="six_lap_diagnostic_detail.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v324_six_lap_detail_csv",
+            )
+            if isinstance(_bl, pd.DataFrame) and not _bl.empty:
+                st.download_button(
+                    "6周診断・周回別CSV",
+                    _bl.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="six_lap_diagnostic_by_lap.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="v324_six_lap_bylap_csv",
+                )
+    elif isinstance(_s6, dict) and _s6.get("reason") and _s6.get("reason") != "OK":
+        st.warning(str(_s6.get("reason")))
 
     try:
         _v270_weights_df=engine.v40_current_weights(engine.DB_PATH)
