@@ -5320,6 +5320,233 @@ def _v324_six_lap_diagnostic(
     return out
 
 
+
+def _v324_adjacent_swaps(prev_order, cur_order) -> set:
+    """前周で隣接していたペアのうち、今周で順位が逆転したものを (front, chaser) で返す。
+
+    front=前周で前にいた車、chaser=前周で後ろにいた車。
+    今周で chaser が front より前にいれば追抜とみなす。
+    """
+    swaps = set()
+    try:
+        prev = [int(c) for c in (prev_order or [])]
+        cur = [int(c) for c in (cur_order or [])]
+        cur_pos = {c: i for i, c in enumerate(cur)}
+        for i in range(len(prev) - 1):
+            a, b = prev[i], prev[i + 1]
+            if a in cur_pos and b in cur_pos and cur_pos[a] > cur_pos[b]:
+                swaps.add((a, b))
+    except Exception:
+        pass
+    return swaps
+
+
+def _v324_overtake_pair_diagnostic(
+    db_path: str,
+    app_version: str | None = None,
+    limit_races: int = 200,
+) -> dict:
+    """周回別・追抜ペア（隣接スワップ）の precision / recall / F1。
+
+    データ源は v252_lap_prediction_snapshots（代表Sim）と result_laps（実測）。
+    予測ロジックは変更しない。Simは周ごと最頻隊列のため連続ルートではない点に注意。
+    """
+    ver = str(app_version or globals().get("_V231_APP_VERSION") or "Ver324").strip()
+    out = {
+        "ok": False,
+        "version": ver,
+        "races_used": 0,
+        "by_lap": pd.DataFrame(),
+        "by_venue": pd.DataFrame(),
+        "samples": pd.DataFrame(),
+        "summary": {},
+        "reason": "",
+        "note": "Simは各周の最頻隊列。1試行の連続6周ルートではない。",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=20.0) as con:
+            con.execute("PRAGMA busy_timeout=20000")
+            try:
+                _v252_ensure_lap_tables(con)
+            except Exception:
+                pass
+            pred = pd.read_sql_query(
+                """
+                SELECT race_date, venue, race_no, lap_no, predicted_order, created_at
+                  FROM v252_lap_prediction_snapshots
+                 WHERE app_version=?
+                 ORDER BY created_at
+                """,
+                con,
+                params=(ver,),
+            )
+            actual = pd.read_sql_query(
+                """
+                SELECT substr(rr.race_date,1,10) AS race_date,
+                       rr.venue,
+                       REPLACE(CAST(COALESCE(rr.race_no,'') AS TEXT),'R','') AS race_no,
+                       rl.lap_no, rl.position, rl.car_no
+                  FROM result_laps rl
+                  JOIN result_races rr ON rr.race_key=rl.race_key
+                 WHERE COALESCE(rr.learning_eligible,1)=1
+                """,
+                con,
+            )
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    if pred is None or pred.empty:
+        out["reason"] = f"{ver} の周回スナップショットがありません"
+        return out
+    if actual is None or actual.empty:
+        out["reason"] = "result_laps がありません"
+        return out
+
+    pred = pred.copy()
+    pred["race_date"] = pred["race_date"].astype(str).str[:10]
+    pred["race_no"] = pred["race_no"].astype(str).str.replace("R", "", regex=False)
+    pred["venue"] = pred["venue"].astype(str)
+    pred["lap_no"] = pd.to_numeric(pred["lap_no"], errors="coerce")
+    pred = pred.dropna(subset=["lap_no"])
+    pred["lap_no"] = pred["lap_no"].astype(int)
+    pred = pred.sort_values("created_at").drop_duplicates(
+        ["race_date", "venue", "race_no", "lap_no"], keep="last"
+    )
+
+    amap: dict = {}
+    for key, g in actual.groupby(["race_date", "venue", "race_no", "lap_no"], dropna=False):
+        try:
+            amap[(str(key[0])[:10], str(key[1]), str(key[2]), int(key[3]))] = tuple(
+                int(x) for x in g.sort_values("position")["car_no"].tolist()
+            )
+        except Exception:
+            continue
+
+    race_sim: dict = {}
+    race_act: dict = {}
+    for row in pred.itertuples():
+        try:
+            prd = tuple(int(x) for x in str(row.predicted_order).split("-") if str(x).strip())
+        except Exception:
+            continue
+        key4 = (str(row.race_date)[:10], str(row.venue), str(row.race_no), int(row.lap_no))
+        act = amap.get(key4)
+        if not act or not prd:
+            continue
+        rk = key4[:3]
+        race_sim.setdefault(rk, {})[int(row.lap_no)] = prd
+        race_act.setdefault(rk, {})[int(row.lap_no)] = act
+
+    race_keys = sorted(race_sim.keys(), key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    race_keys = race_keys[: int(limit_races)]
+
+    def _bucket_add(bucket: dict, key, a_set, s_set):
+        d = bucket.setdefault(
+            key,
+            {"races": 0, "actual": 0, "sim": 0, "matched": 0},
+        )
+        d["races"] += 1
+        d["actual"] += len(a_set)
+        d["sim"] += len(s_set)
+        d["matched"] += len(a_set & s_set)
+
+    by_lap: dict = {}
+    by_venue: dict = {}
+    samples = []
+    used = 0
+
+    for rk in race_keys:
+        sim_laps = race_sim.get(rk) or {}
+        act_laps = race_act.get(rk) or {}
+        laps = sorted(set(sim_laps.keys()) & set(act_laps.keys()))
+        if len(laps) < 2:
+            continue
+        used += 1
+        venue = rk[1]
+        for lap_to in laps:
+            prev = lap_to - 1
+            if prev not in sim_laps or prev not in act_laps:
+                continue
+            a_set = _v324_adjacent_swaps(act_laps[prev], act_laps[lap_to])
+            s_set = _v324_adjacent_swaps(sim_laps[prev], sim_laps[lap_to])
+            _bucket_add(by_lap, lap_to, a_set, s_set)
+            _bucket_add(by_venue, (venue, lap_to), a_set, s_set)
+            if len(samples) < 50 and (a_set or s_set):
+                samples.append(
+                    {
+                        "開催日": rk[0],
+                        "場": rk[1],
+                        "R": rk[2],
+                        "周回": int(lap_to),
+                        "実測スワップ": " / ".join(f"{a}→{b}" for a, b in sorted(a_set)) or "—",
+                        "Simスワップ": " / ".join(f"{a}→{b}" for a, b in sorted(s_set)) or "—",
+                        "一致": " / ".join(f"{a}→{b}" for a, b in sorted(a_set & s_set)) or "—",
+                        "実測数": len(a_set),
+                        "Sim数": len(s_set),
+                        "一致数": len(a_set & s_set),
+                    }
+                )
+
+    def _rows_from_bucket(bucket: dict, key_name: str) -> list:
+        rows = []
+        for k, d in bucket.items():
+            prec = (d["matched"] / d["sim"] * 100.0) if d["sim"] else None
+            rec = (d["matched"] / d["actual"] * 100.0) if d["actual"] else None
+            if prec is not None and rec is not None and (prec + rec) > 0:
+                f1 = 2 * prec * rec / (prec + rec)
+            else:
+                f1 = None
+            if key_name == "周回":
+                row = {"周回": int(k)}
+            else:
+                row = {"場": k[0], "周回": int(k[1])}
+            row.update(
+                {
+                    "遷移数": int(d["races"]),
+                    "実測スワップ計": int(d["actual"]),
+                    "Simスワップ計": int(d["sim"]),
+                    "一致": int(d["matched"]),
+                    "Precision%": prec,
+                    "Recall%": rec,
+                    "F1%": f1,
+                }
+            )
+            rows.append(row)
+        return rows
+
+    by_lap_df = pd.DataFrame(_rows_from_bucket(by_lap, "周回"))
+    if not by_lap_df.empty:
+        by_lap_df = by_lap_df.sort_values("周回")
+    by_venue_df = pd.DataFrame(_rows_from_bucket(by_venue, "場"))
+    if not by_venue_df.empty:
+        by_venue_df = by_venue_df.sort_values(["場", "周回"])
+
+    # 3周目サマリ
+    lap3 = by_lap_df[by_lap_df["周回"] == 3] if not by_lap_df.empty else pd.DataFrame()
+    out.update(
+        {
+            "ok": True,
+            "races_used": used,
+            "by_lap": by_lap_df,
+            "by_venue": by_venue_df,
+            "samples": pd.DataFrame(samples),
+            "summary": {
+                "対象レース": used,
+                "3周目F1": float(lap3.iloc[0]["F1%"]) if len(lap3) else None,
+                "3周目Precision": float(lap3.iloc[0]["Precision%"]) if len(lap3) else None,
+                "3周目Recall": float(lap3.iloc[0]["Recall%"]) if len(lap3) else None,
+            },
+            "reason": "OK",
+        }
+    )
+    return out
+
+
 def _v260_snapshot_storage_status(db_path: str, app_version: str = "") -> dict:
     """Show prediction-history count separately from lap-snapshot count."""
     out={"history_races":0,"snapshot_races":0,"snapshot_laps":0,"waiting_or_missing":0,"reason":""}
@@ -31628,6 +31855,75 @@ if selected_main_page == "🗃️ 登録情報確認":
                 )
     elif isinstance(_s6, dict) and _s6.get("reason") and _s6.get("reason") != "OK":
         st.warning(str(_s6.get("reason")))
+
+    st.markdown("##### 🎯 追抜ペア一致率（周回別）")
+    st.caption(
+        "実測と代表Simの隣接スワップ（前車→後車）を比較。"
+        "Precision=Simが予測した抜きのうち当たり / Recall=実測の抜きのうち拾えた。"
+        "3周目F1が低いほど中盤の追抜モデルがボトルネック。"
+        "※Simは周ごと最頻隊列（1試行の連続ルートではない）。"
+    )
+    if st.button("追抜ペア診断を実行", key="v324_overtake_pair_btn", use_container_width=True):
+        with st.spinner("隣接スワップを周回別に集計中…"):
+            st.session_state["v324_overtake_pair"] = _v324_overtake_pair_diagnostic(engine.DB_PATH)
+    _op = st.session_state.get("v324_overtake_pair")
+    if isinstance(_op, dict) and _op.get("ok"):
+        _osm = _op.get("summary") or {}
+        st.write(
+            f"対象 {_osm.get('対象レース', 0)}R｜"
+            f"3周目 F1 {_osm.get('3周目F1')}% / "
+            f"Precision {_osm.get('3周目Precision')}% / "
+            f"Recall {_osm.get('3周目Recall')}%"
+        )
+        _opl = _op.get("by_lap")
+        if isinstance(_opl, pd.DataFrame) and not _opl.empty:
+            st.dataframe(
+                _opl,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Precision%": st.column_config.NumberColumn(format="%.1f"),
+                    "Recall%": st.column_config.NumberColumn(format="%.1f"),
+                    "F1%": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+            st.download_button(
+                "追抜ペア・周回別CSV",
+                _opl.to_csv(index=False).encode("utf-8-sig"),
+                file_name="overtake_pair_by_lap.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v324_overtake_bylap_csv",
+            )
+            try:
+                # 読み取りヒント
+                _p = pd.to_numeric(_opl["Precision%"], errors="coerce")
+                _r = pd.to_numeric(_opl["Recall%"], errors="coerce")
+                if _p.notna().any() and _r.notna().any():
+                    if float(_r.mean()) + 5 < float(_p.mean()):
+                        st.info("全体傾向: Recall < Precision → 実測の抜きを取りこぼし気味（網が狭い）")
+                    elif float(_p.mean()) + 5 < float(_r.mean()):
+                        st.info("全体傾向: Precision < Recall → Simが抜きすぎ（中盤が過剰）")
+            except Exception:
+                pass
+        _ops = _op.get("samples")
+        if isinstance(_ops, pd.DataFrame) and not _ops.empty:
+            with st.expander("サンプル（レース別スワップ）", expanded=False):
+                st.dataframe(_ops, use_container_width=True, hide_index=True)
+            st.download_button(
+                "追抜ペア・サンプルCSV",
+                _ops.to_csv(index=False).encode("utf-8-sig"),
+                file_name="overtake_pair_samples.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v324_overtake_samples_csv",
+            )
+        _opv = _op.get("by_venue")
+        if isinstance(_opv, pd.DataFrame) and not _opv.empty:
+            with st.expander("開催場別", expanded=False):
+                st.dataframe(_opv, use_container_width=True, hide_index=True)
+    elif isinstance(_op, dict) and _op.get("reason") and _op.get("reason") != "OK":
+        st.warning(str(_op.get("reason")))
 
     try:
         _v270_weights_df=engine.v40_current_weights(engine.DB_PATH)
