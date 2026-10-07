@@ -5356,6 +5356,706 @@ def _v324_parse_route_orders(route_text: str) -> dict[int, tuple]:
     return out
 
 
+
+
+
+def _v324_overtake_pair_stats_diagnostic(
+    db_path: str,
+    app_version: str | None = None,
+    limit_races: int = 150,
+    min_attempts: int = 20,
+) -> dict:
+    """調査B補助: transition_audit.pair_stats を周回×ペアで集計（読み取り専用）。
+
+    pair_stats キーは通常 "lap|chaser|front" または "chaser|front"。
+    成功率・試行数の多いペアを出し、相手選びの偏りを見る。
+    """
+    ver = str(app_version or globals().get("_V231_APP_VERSION") or "Ver324").strip()
+    out = {
+        "ok": False,
+        "version": ver,
+        "races_used": 0,
+        "by_lap": pd.DataFrame(),
+        "top_pairs": pd.DataFrame(),
+        "summary": {},
+        "reason": "",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=25.0) as con:
+            con.execute("PRAGMA busy_timeout=25000")
+            cols = {str(r[1]) for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+            blob_col = "payload" if "payload" in cols else ("result_blob" if "result_blob" in cols else None)
+            if not blob_col:
+                out["reason"] = "payloadなし"
+                return out
+            ver_clause = "WHERE app_version=?" if "app_version" in cols else ""
+            params: list = [ver] if ver_clause else []
+            params.append(int(limit_races) * 4)
+            rows = con.execute(
+                f"""
+                SELECT history_id, race_key, {blob_col}
+                  FROM v231_prediction_history
+                  {ver_clause}
+                 ORDER BY history_id DESC
+                 LIMIT ?
+                """,
+                params,
+            ).fetchall()
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    # pair key -> stats
+    pair_agg: dict = {}
+    lap_agg = {
+        lap: {"attempts": 0, "successes": 0, "p_sum": 0.0, "pairs": 0}
+        for lap in range(1, 7)
+    }
+    used = set()
+
+    def _parse_pair_key(k: str):
+        parts = [p for p in str(k).replace(",", "|").split("|") if p != ""]
+        nums = []
+        for p in parts:
+            try:
+                nums.append(int(float(p)))
+            except Exception:
+                continue
+        if len(nums) >= 3:
+            return int(nums[0]), int(nums[1]), int(nums[2])  # lap, chaser, front
+        if len(nums) == 2:
+            return None, int(nums[0]), int(nums[1])
+        return None, None, None
+
+    for hid, rk, blob in rows:
+        try:
+            obj = pickle.loads(zlib.decompress(bytes(blob)))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        meta = obj.get("meta") or {}
+        if not meta and isinstance(obj.get("result"), dict):
+            meta = (obj.get("result") or {}).get("meta") or {}
+        wall = (
+            meta.get("6周展開シミュレーション")
+            or meta.get("壁補正監査")
+            or obj.get("wall_audit")
+            or {}
+        )
+        if not isinstance(wall, dict):
+            continue
+        detail = wall.get("v284_transition_audit") or {}
+        if not isinstance(detail, dict):
+            continue
+        pair_stats = detail.get("pair_stats") or {}
+        if not pair_stats:
+            continue
+        rd = str(meta.get("開催日") or meta.get("race_date") or "")[:10]
+        vv = str(meta.get("開催場") or meta.get("venue") or "").strip()
+        rr = re.sub(r"[^0-9]", "", str(meta.get("R") or meta.get("レース") or meta.get("race_no") or ""))
+        key = (rd, vv, rr)
+        if key in used:
+            continue
+        has = False
+        for pk, st in pair_stats.items():
+            if not isinstance(st, dict):
+                continue
+            lap, chaser, front = _parse_pair_key(pk)
+            att = int(st.get("attempts") or 0)
+            suc = int(st.get("successes") or 0)
+            psm = float(st.get("p_sum") or 0.0)
+            if att <= 0:
+                continue
+            has = True
+            if lap is not None and 1 <= lap <= 6:
+                lap_agg[lap]["attempts"] += att
+                lap_agg[lap]["successes"] += suc
+                lap_agg[lap]["p_sum"] += psm
+                lap_agg[lap]["pairs"] += 1
+            pk2 = (lap, chaser, front)
+            d = pair_agg.setdefault(
+                pk2,
+                {"attempts": 0, "successes": 0, "p_sum": 0.0, "wall_a": 0, "mom_a": 0, "races": 0},
+            )
+            d["attempts"] += att
+            d["successes"] += suc
+            d["p_sum"] += psm
+            d["wall_a"] += int(st.get("wall_attempts") or 0)
+            d["mom_a"] += int(st.get("momentum_attempts") or 0)
+            d["races"] += 1
+        if has:
+            used.add(key)
+
+    if not used:
+        out["reason"] = "pair_stats 付きの履歴がありません"
+        return out
+
+    lap_rows = []
+    for lap in range(1, 7):
+        d = lap_agg[lap]
+        if d["attempts"] <= 0:
+            continue
+        lap_rows.append(
+            {
+                "周回": lap,
+                "ペア件数": int(d["pairs"]),
+                "試行計": int(d["attempts"]),
+                "成功計": int(d["successes"]),
+                "成功率%": d["successes"] / d["attempts"] * 100.0,
+                "予測p%": d["p_sum"] / d["attempts"] * 100.0,
+            }
+        )
+
+    pair_rows = []
+    for (lap, chaser, front), d in pair_agg.items():
+        if d["attempts"] < int(min_attempts):
+            continue
+        pair_rows.append(
+            {
+                "周回": lap if lap is not None else "",
+                "追抜車": chaser,
+                "前車": front,
+                "試行": int(d["attempts"]),
+                "成功": int(d["successes"]),
+                "成功率%": d["successes"] / d["attempts"] * 100.0,
+                "予測p%": d["p_sum"] / d["attempts"] * 100.0,
+                "出現R数": int(d["races"]),
+                "壁試行": int(d["wall_a"]),
+                "momentum試行": int(d["mom_a"]),
+            }
+        )
+    top_pairs = pd.DataFrame(pair_rows)
+    if not top_pairs.empty:
+        top_pairs = top_pairs.sort_values(["試行", "成功率%"], ascending=[False, False]).head(80)
+
+    out.update(
+        {
+            "ok": True,
+            "races_used": len(used),
+            "by_lap": pd.DataFrame(lap_rows),
+            "top_pairs": top_pairs,
+            "summary": {
+                "対象レース": len(used),
+                "集計ペア数": len(pair_agg),
+                "表示ペア数(試行≥%d)" % int(min_attempts): len(pair_rows),
+            },
+            "reason": "OK",
+        }
+    )
+    return out
+
+
+def _v324_overtake_p_calibration_diagnostic(
+    db_path: str,
+    app_version: str | None = None,
+    limit_races: int = 200,
+) -> dict:
+    """調査1: 追抜確率pの内部校正（予測p vs 実成功）。
+
+    transition_audit の p_sum/attempts と successes/attempts を周回別に比較。
+    - ギャップ小 → RNG・sigmoid経路は概ね健全。式の当てはめ（相手・周回）が本命
+    - ギャップ大 → 確率の出し方自体にバイアス
+
+    併せて実測隣接スワップ/R と Sim成功/R の量比も出す（調査の量的側面）。
+    予測ロジックは変更しない。
+    """
+    ver = str(app_version or globals().get("_V231_APP_VERSION") or "Ver324").strip()
+    out = {
+        "ok": False,
+        "version": ver,
+        "races_used": 0,
+        "by_lap": pd.DataFrame(),
+        "summary": {},
+        "reason": "",
+        "note": "予測p= p_sum/attempts、実成功= successes/attempts（いずれもSim内）。実測スワップは別定義。",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+
+    actual_swaps: dict = {}
+    try:
+        with sqlite3.connect(str(db_path), timeout=25.0) as con:
+            con.execute("PRAGMA busy_timeout=25000")
+            actual = pd.read_sql_query(
+                """
+                SELECT substr(rr.race_date,1,10) AS race_date,
+                       rr.venue,
+                       REPLACE(CAST(COALESCE(rr.race_no,'') AS TEXT),'R','') AS race_no,
+                       rl.lap_no, rl.position, rl.car_no
+                  FROM result_laps rl
+                  JOIN result_races rr ON rr.race_key=rl.race_key
+                 WHERE COALESCE(rr.learning_eligible,1)=1
+                """,
+                con,
+            )
+            race_orders: dict = {}
+            if actual is not None and not actual.empty:
+                for key, g in actual.groupby(["race_date", "venue", "race_no", "lap_no"], dropna=False):
+                    try:
+                        order = tuple(int(x) for x in g.sort_values("position")["car_no"].tolist())
+                        rk = (str(key[0])[:10], str(key[1]), str(key[2]))
+                        race_orders.setdefault(rk, {})[int(key[3])] = order
+                    except Exception:
+                        continue
+                for rk, laps in race_orders.items():
+                    for lap in range(2, 7):
+                        if lap in laps and (lap - 1) in laps:
+                            actual_swaps[(rk[0], rk[1], rk[2], lap)] = len(
+                                _v324_adjacent_swaps(laps[lap - 1], laps[lap])
+                            )
+
+            cols = {str(r[1]) for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+            blob_col = "payload" if "payload" in cols else ("result_blob" if "result_blob" in cols else None)
+            if not blob_col:
+                out["reason"] = "prediction_history に payload なし"
+                return out
+            ver_clause = "WHERE app_version=?" if "app_version" in cols else ""
+            params: list = [ver] if ver_clause else []
+            params.append(int(limit_races) * 4)
+            rows = con.execute(
+                f"""
+                SELECT history_id, race_key, {blob_col}
+                  FROM v231_prediction_history
+                  {ver_clause}
+                 ORDER BY history_id DESC
+                 LIMIT ?
+                """,
+                params,
+            ).fetchall()
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    agg = {
+        lap: {
+            "races": 0,
+            "attempts": 0,
+            "successes": 0,
+            "p_sum": 0.0,
+            "wall_a": 0,
+            "wall_s": 0,
+            "mom_a": 0,
+            "mom_s": 0,
+            "actual_swaps": 0,
+            "trials_sum": 0,
+        }
+        for lap in range(1, 7)
+    }
+    used = set()
+
+    for hid, rk, blob in rows:
+        try:
+            obj = pickle.loads(zlib.decompress(bytes(blob)))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        meta = obj.get("meta") or {}
+        if not meta and isinstance(obj.get("result"), dict):
+            meta = (obj.get("result") or {}).get("meta") or {}
+        wall = (
+            meta.get("6周展開シミュレーション")
+            or meta.get("壁補正監査")
+            or obj.get("wall_audit")
+            or {}
+        )
+        if not isinstance(wall, dict):
+            continue
+        detail = wall.get("v284_transition_audit") or {}
+        if not isinstance(detail, dict):
+            continue
+        lap_stats = detail.get("lap_stats") or {}
+        if not lap_stats:
+            continue
+        trials = int(detail.get("trials") or wall.get("sim_trials") or 0)
+        rd = str(meta.get("開催日") or meta.get("race_date") or "")[:10]
+        vv = str(meta.get("開催場") or meta.get("venue") or "").strip()
+        rr = re.sub(
+            r"[^0-9]",
+            "",
+            str(meta.get("R") or meta.get("レース") or meta.get("race_no") or ""),
+        )
+        if not (rd and vv and rr):
+            parts = str(rk or "").replace("R", "_").split("_")
+            if len(parts) >= 3:
+                rd = rd or re.sub(r"\D", "", parts[0])
+                if len(rd) == 8:
+                    rd = f"{rd[:4]}-{rd[4:6]}-{rd[6:8]}"
+                vv = vv or parts[1]
+                rr = rr or re.sub(r"\D", "", parts[-1])
+        key = (rd[:10], vv, str(rr))
+        if key in used or not all(key):
+            continue
+
+        has_any = False
+        for lap in range(1, 7):
+            st = lap_stats.get(lap) or lap_stats.get(str(lap)) or {}
+            if not isinstance(st, dict):
+                continue
+            att = int(st.get("attempts") or 0)
+            suc = int(st.get("successes") or 0)
+            psm = float(st.get("p_sum") or 0.0)
+            if att <= 0 and suc <= 0:
+                continue
+            has_any = True
+            d = agg[lap]
+            d["races"] += 1
+            d["attempts"] += att
+            d["successes"] += suc
+            d["p_sum"] += psm
+            d["wall_a"] += int(st.get("wall_attempts") or 0)
+            d["wall_s"] += int(st.get("wall_successes") or 0)
+            d["mom_a"] += int(st.get("momentum_attempts") or 0)
+            d["mom_s"] += int(st.get("momentum_successes") or 0)
+            d["trials_sum"] += max(1, trials)
+            if lap >= 2:
+                d["actual_swaps"] += int(actual_swaps.get((key[0], key[1], key[2], lap), 0) or 0)
+        if has_any:
+            used.add(key)
+
+    if not used:
+        out["reason"] = "v284_transition_audit 付き履歴がありません"
+        return out
+
+    rows = []
+    for lap in range(1, 7):
+        d = agg[lap]
+        if d["races"] <= 0 or d["attempts"] <= 0:
+            continue
+        pred_p = d["p_sum"] / d["attempts"] * 100.0
+        emp_p = d["successes"] / d["attempts"] * 100.0
+        gap = emp_p - pred_p
+        suc_per_r = d["successes"] / max(1, d["races"])
+        act_per_r = (d["actual_swaps"] / max(1, d["races"])) if lap >= 2 else None
+        rows.append(
+            {
+                "周回": lap,
+                "レース数": int(d["races"]),
+                "試行計": int(d["attempts"]),
+                "予測p%": pred_p,
+                "実成功%": emp_p,
+                "校正ギャップpt": gap,
+                "成功/R": suc_per_r,
+                "実測スワップ/R": act_per_r,
+                "成功量/実測比": (suc_per_r / act_per_r) if (act_per_r and act_per_r > 0) else None,
+                "壁成功率%": (d["wall_s"] / d["wall_a"] * 100.0) if d["wall_a"] else None,
+                "momentum成功率%": (d["mom_s"] / d["mom_a"] * 100.0) if d["mom_a"] else None,
+                "壁試行計": int(d["wall_a"]),
+                "momentum試行計": int(d["mom_a"]),
+            }
+        )
+
+    by_lap_df = pd.DataFrame(rows)
+    mid = by_lap_df[by_lap_df["周回"].isin([2, 3, 4])] if not by_lap_df.empty else pd.DataFrame()
+    late = by_lap_df[by_lap_df["周回"].isin([5, 6])] if not by_lap_df.empty else pd.DataFrame()
+
+    def _mean(df, col):
+        if df is None or df.empty or col not in df.columns:
+            return None
+        s = pd.to_numeric(df[col], errors="coerce")
+        return float(s.mean()) if s.notna().any() else None
+
+    gap_mid = _mean(mid, "校正ギャップpt")
+    gap_all = _mean(by_lap_df, "校正ギャップpt")
+    # 解釈ヒント
+    if gap_all is not None and abs(gap_all) < 2.0:
+        hint = "予測pと実成功が近い → RNG経路は概ね健全。相手選び・周回依存の式が本命"
+    elif gap_all is not None and gap_all < -3.0:
+        hint = "実成功が予測pより低い → 確率を高めに出しすぎ（過大評価）"
+    elif gap_all is not None and gap_all > 3.0:
+        hint = "実成功が予測pより高い → 確率を低めに出しすぎ（過小評価）"
+    else:
+        hint = "周回別にギャップを確認"
+
+    out.update(
+        {
+            "ok": True,
+            "races_used": len(used),
+            "by_lap": by_lap_df,
+            "summary": {
+                "対象レース": len(used),
+                "全体校正ギャップpt": gap_all,
+                "中盤(2-4)ギャップpt": gap_mid,
+                "終盤(5-6)ギャップpt": _mean(late, "校正ギャップpt"),
+                "中盤成功/実測比": _mean(mid, "成功量/実測比"),
+                "終盤成功/実測比": _mean(late, "成功量/実測比"),
+                "解釈": hint,
+            },
+            "reason": "OK",
+        }
+    )
+    return out
+
+
+def _v324_overtake_attempt_success_diagnostic(
+    db_path: str,
+    app_version: str | None = None,
+    limit_races: int = 200,
+) -> dict:
+    """追抜の試行数・成功数を周回別に集計し、実測隣接スワップ量と比較する。
+
+    データ源:
+      - v231_prediction_history の meta['6周展開シミュレーション']['v284_transition_audit']
+      - result_laps から実測隣接スワップ数
+
+    見るもの:
+      - 試行あたり成功率（success/attempts）
+      - 壁 / momentum / slowdown 別の試行・成功
+      - 実測スワップ数との比（Sim成功が多すぎ/少なすぎ）
+    予測ロジックは変更しない。
+    """
+    ver = str(app_version or globals().get("_V231_APP_VERSION") or "Ver324").strip()
+    out = {
+        "ok": False,
+        "version": ver,
+        "races_used": 0,
+        "by_lap": pd.DataFrame(),
+        "samples": pd.DataFrame(),
+        "summary": {},
+        "reason": "",
+        "note": "Sim側は試行中の隣接追抜判定カウント。実測は隣接順位逆転数。定義は完全一致しないが量の過不足は読める。",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+
+    # 実測スワップ（レース×周回）
+    actual_swaps: dict = {}  # (date,venue,rno,lap) -> count
+    race_act_orders: dict = {}
+    try:
+        with sqlite3.connect(str(db_path), timeout=25.0) as con:
+            con.execute("PRAGMA busy_timeout=25000")
+            actual = pd.read_sql_query(
+                """
+                SELECT substr(rr.race_date,1,10) AS race_date,
+                       rr.venue,
+                       REPLACE(CAST(COALESCE(rr.race_no,'') AS TEXT),'R','') AS race_no,
+                       rl.lap_no, rl.position, rl.car_no
+                  FROM result_laps rl
+                  JOIN result_races rr ON rr.race_key=rl.race_key
+                 WHERE COALESCE(rr.learning_eligible,1)=1
+                """,
+                con,
+            )
+            if actual is not None and not actual.empty:
+                for key, g in actual.groupby(["race_date", "venue", "race_no", "lap_no"], dropna=False):
+                    try:
+                        order = tuple(int(x) for x in g.sort_values("position")["car_no"].tolist())
+                        rk = (str(key[0])[:10], str(key[1]), str(key[2]))
+                        race_act_orders.setdefault(rk, {})[int(key[3])] = order
+                    except Exception:
+                        continue
+                for rk, laps in race_act_orders.items():
+                    for lap in range(2, 7):
+                        if lap in laps and (lap - 1) in laps:
+                            n = len(_v324_adjacent_swaps(laps[lap - 1], laps[lap]))
+                            actual_swaps[(rk[0], rk[1], rk[2], lap)] = n
+
+            # 予測履歴から transition audit
+            cols = {str(r[1]) for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+            blob_col = "payload" if "payload" in cols else ("result_blob" if "result_blob" in cols else None)
+            if not blob_col:
+                out["reason"] = "v231_prediction_history に payload がありません"
+                return out
+            ver_clause = "WHERE app_version=?" if "app_version" in cols else ""
+            params: list = [ver] if ver_clause else []
+            params.append(int(limit_races) * 4)
+            rows = con.execute(
+                f"""
+                SELECT history_id, race_key, {blob_col}
+                  FROM v231_prediction_history
+                  {ver_clause}
+                 ORDER BY history_id DESC
+                 LIMIT ?
+                """,
+                params,
+            ).fetchall()
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    # 周回別集計
+    agg = {
+        lap: {
+            "races": 0,
+            "attempts": 0,
+            "successes": 0,
+            "wall_a": 0,
+            "wall_s": 0,
+            "mom_a": 0,
+            "mom_s": 0,
+            "slow_a": 0,
+            "slow_s": 0,
+            "p_sum": 0.0,
+            "actual_swaps": 0,
+            "trials_sum": 0,
+            "top3_in": 0,
+            "top3_out": 0,
+        }
+        for lap in range(1, 7)
+    }
+    samples = []
+    used_keys = set()
+
+    for hid, rk, blob in rows:
+        try:
+            obj = pickle.loads(zlib.decompress(bytes(blob)))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        meta = obj.get("meta") or {}
+        if not meta and isinstance(obj.get("result"), dict):
+            meta = (obj.get("result") or {}).get("meta") or {}
+        wall = (
+            meta.get("6周展開シミュレーション")
+            or meta.get("壁補正監査")
+            or obj.get("wall_audit")
+            or {}
+        )
+        if not isinstance(wall, dict):
+            continue
+        detail = wall.get("v284_transition_audit") or {}
+        if not isinstance(detail, dict):
+            continue
+        lap_stats = detail.get("lap_stats") or {}
+        if not lap_stats:
+            continue
+        trials = int(detail.get("trials") or wall.get("sim_trials") or 0)
+        rd = str(meta.get("開催日") or meta.get("race_date") or "")[:10]
+        vv = str(meta.get("開催場") or meta.get("venue") or "").strip()
+        rr = re.sub(
+            r"[^0-9]",
+            "",
+            str(meta.get("R") or meta.get("レース") or meta.get("race_no") or ""),
+        )
+        if not (rd and vv and rr):
+            parts = str(rk or "").replace("R", "_").split("_")
+            if len(parts) >= 3:
+                rd = rd or re.sub(r"\D", "", parts[0])
+                if len(rd) == 8:
+                    rd = f"{rd[:4]}-{rd[4:6]}-{rd[6:8]}"
+                vv = vv or parts[1]
+                rr = rr or re.sub(r"\D", "", parts[-1])
+        key = (rd[:10], vv, str(rr))
+        if key in used_keys:
+            continue
+        if not all(key):
+            continue
+
+        # lap_stats keys may be int or str
+        has_any = False
+        for lap in range(1, 7):
+            st = lap_stats.get(lap) or lap_stats.get(str(lap)) or {}
+            if not isinstance(st, dict):
+                continue
+            att = int(st.get("attempts") or 0)
+            suc = int(st.get("successes") or 0)
+            if att <= 0 and suc <= 0:
+                continue
+            has_any = True
+            d = agg[lap]
+            d["races"] += 1
+            d["attempts"] += att
+            d["successes"] += suc
+            d["wall_a"] += int(st.get("wall_attempts") or 0)
+            d["wall_s"] += int(st.get("wall_successes") or 0)
+            d["mom_a"] += int(st.get("momentum_attempts") or 0)
+            d["mom_s"] += int(st.get("momentum_successes") or 0)
+            d["slow_a"] += int(st.get("slowdown_attempts") or 0)
+            d["slow_s"] += int(st.get("slowdown_successes") or 0)
+            d["p_sum"] += float(st.get("p_sum") or 0.0)
+            d["trials_sum"] += max(1, trials)
+            d["top3_in"] += int(st.get("top3_entries") or 0)
+            d["top3_out"] += int(st.get("top3_exits") or 0)
+            if lap >= 2:
+                d["actual_swaps"] += int(actual_swaps.get((key[0], key[1], key[2], lap), 0) or 0)
+
+            if len(samples) < 40 and lap >= 2:
+                act_n = int(actual_swaps.get((key[0], key[1], key[2], lap), 0) or 0)
+                # 1試行あたり成功数（粗い）
+                per_trial_suc = (suc / max(1, trials)) if trials else None
+                samples.append(
+                    {
+                        "開催日": key[0],
+                        "場": key[1],
+                        "R": key[2],
+                        "周回": lap,
+                        "試行": att,
+                        "成功": suc,
+                        "成功率%": (suc / att * 100.0) if att else None,
+                        "壁試行": int(st.get("wall_attempts") or 0),
+                        "壁成功": int(st.get("wall_successes") or 0),
+                        "実測スワップ": act_n,
+                        "成功/試行数": per_trial_suc,
+                    }
+                )
+        if has_any:
+            used_keys.add(key)
+
+    if not used_keys:
+        out["reason"] = "v284_transition_audit 付きの予測履歴がありません（再予測で監査が保存される必要あり）"
+        return out
+
+    rows = []
+    for lap in range(1, 7):
+        d = agg[lap]
+        if d["races"] <= 0:
+            continue
+        att = d["attempts"]
+        suc = d["successes"]
+        # レースあたり平均（試行回数で割った期待スワップ）
+        mean_suc_per_race = suc / max(1, d["races"])
+        # 1試行あたり成功（全体）
+        mean_suc_per_trial = suc / max(1, d["trials_sum"])
+        mean_act = d["actual_swaps"] / max(1, d["races"]) if lap >= 2 else None
+        rows.append(
+            {
+                "周回": lap,
+                "レース数": int(d["races"]),
+                "試行計": int(att),
+                "成功計": int(suc),
+                "成功率%": (suc / att * 100.0) if att else None,
+                "平均成功/R": mean_suc_per_race,
+                "平均成功/試行": mean_suc_per_trial,
+                "実測スワップ/R": mean_act,
+                "成功量/実測比": (mean_suc_per_race / mean_act) if (mean_act and mean_act > 0) else None,
+                "壁成功率%": (d["wall_s"] / d["wall_a"] * 100.0) if d["wall_a"] else None,
+                "momentum成功率%": (d["mom_s"] / d["mom_a"] * 100.0) if d["mom_a"] else None,
+                "slowdown成功率%": (d["slow_s"] / d["slow_a"] * 100.0) if d["slow_a"] else None,
+                "壁試行計": int(d["wall_a"]),
+                "momentum試行計": int(d["mom_a"]),
+                "TOP3流入計": int(d["top3_in"]),
+                "TOP3流出計": int(d["top3_out"]),
+            }
+        )
+
+    by_lap_df = pd.DataFrame(rows)
+    # 中盤サマリ
+    mid = by_lap_df[by_lap_df["周回"].isin([2, 3, 4])] if not by_lap_df.empty else pd.DataFrame()
+    out.update(
+        {
+            "ok": True,
+            "races_used": len(used_keys),
+            "by_lap": by_lap_df,
+            "samples": pd.DataFrame(samples),
+            "summary": {
+                "対象レース": len(used_keys),
+                "2-4周平均成功率%": float(mid["成功率%"].mean()) if len(mid) and mid["成功率%"].notna().any() else None,
+                "2-4周成功/実測比": float(mid["成功量/実測比"].mean()) if len(mid) and mid["成功量/実測比"].notna().any() else None,
+            },
+            "reason": "OK",
+        }
+    )
+    return out
+
+
 def _v324_overtake_pair_continuous_diagnostic(
     db_path: str,
     app_version: str | None = None,
@@ -32253,6 +32953,159 @@ if selected_main_page == "🗃️ 登録情報確認":
             )
     elif isinstance(_oc, dict) and _oc.get("reason") and _oc.get("reason") != "OK":
         st.warning(str(_oc.get("reason")))
+
+    st.markdown("##### 🔬 追抜試行・成功率（Sim監査 vs 実測量）")
+    st.caption(
+        "予測履歴の v284_transition_audit から周回別の試行/成功/壁/momentum を集計し、"
+        "実測の隣接スワップ数と比較します。"
+        "※成功の定義はSim内判定、実測は順位逆転数なので完全同一ではありませんが、"
+        "中盤で成功が多すぎ/少なすぎ、壁成功率の偏りは読めます。"
+    )
+    if st.button("試行・成功率を集計", key="v324_attempt_success_btn", use_container_width=True):
+        with st.spinner("予測履歴の追抜監査を集計中…"):
+            st.session_state["v324_attempt_success"] = _v324_overtake_attempt_success_diagnostic(engine.DB_PATH)
+    _as = st.session_state.get("v324_attempt_success")
+    if isinstance(_as, dict) and _as.get("ok"):
+        _asm = _as.get("summary") or {}
+        st.write(
+            f"対象 {_asm.get('対象レース', 0)}R｜"
+            f"2〜4周 平均成功率 {_asm.get('2-4周平均成功率%')}%｜"
+            f"成功量/実測比 {_asm.get('2-4周成功/実測比')}"
+        )
+        _asl = _as.get("by_lap")
+        if isinstance(_asl, pd.DataFrame) and not _asl.empty:
+            st.dataframe(
+                _asl,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "成功率%": st.column_config.NumberColumn(format="%.1f"),
+                    "平均成功/R": st.column_config.NumberColumn(format="%.2f"),
+                    "平均成功/試行": st.column_config.NumberColumn(format="%.4f"),
+                    "実測スワップ/R": st.column_config.NumberColumn(format="%.2f"),
+                    "成功量/実測比": st.column_config.NumberColumn(format="%.2f"),
+                    "壁成功率%": st.column_config.NumberColumn(format="%.1f"),
+                    "momentum成功率%": st.column_config.NumberColumn(format="%.1f"),
+                    "slowdown成功率%": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+            st.download_button(
+                "試行成功率・周回別CSV",
+                _asl.to_csv(index=False).encode("utf-8-sig"),
+                file_name="overtake_attempt_success_by_lap.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v324_attempt_success_csv",
+            )
+            try:
+                mid = _asl[_asl["周回"].isin([2, 3, 4])]
+                if not mid.empty and mid["成功量/実測比"].notna().any():
+                    ratio = float(mid["成功量/実測比"].mean())
+                    if ratio > 1.3:
+                        st.warning(f"中盤のSim成功量が実測スワップより多い傾向（比{ratio:.2f}）→ 抜きすぎ寄り")
+                    elif ratio < 0.7:
+                        st.info(f"中盤のSim成功量が実測より少ない傾向（比{ratio:.2f}）→ 取りこぼし寄り")
+            except Exception:
+                pass
+        _ass = _as.get("samples")
+        if isinstance(_ass, pd.DataFrame) and not _ass.empty:
+            with st.expander("サンプル（レース×周回）", expanded=False):
+                st.dataframe(_ass, use_container_width=True, hide_index=True)
+    elif isinstance(_as, dict) and _as.get("reason") and _as.get("reason") != "OK":
+        st.warning(str(_as.get("reason")))
+
+    st.markdown("##### 📐 追抜p校正（予測p vs 実成功）")
+    st.caption(
+        "調査1: transition_audit の p_sum/attempts（予測p）と successes/attempts（Sim内実成功）の差。"
+        "ギャップが小さければRNGは健全で、相手選び・周回依存が本命。"
+        "係数・買い目・◎は変更しません。"
+    )
+    if st.button("p校正を集計", key="v324_p_cal_btn", use_container_width=True):
+        with st.spinner("予測pと成功の校正を集計中…"):
+            st.session_state["v324_p_cal"] = _v324_overtake_p_calibration_diagnostic(engine.DB_PATH)
+    _pc = st.session_state.get("v324_p_cal")
+    if isinstance(_pc, dict) and _pc.get("ok"):
+        _pcm = _pc.get("summary") or {}
+        st.write(
+            f"対象 {_pcm.get('対象レース', 0)}R｜"
+            f"全体ギャップ {_pcm.get('全体校正ギャップpt')}pt｜"
+            f"中盤 {_pcm.get('中盤(2-4)ギャップpt')}pt｜"
+            f"終盤 {_pcm.get('終盤(5-6)ギャップpt')}pt｜"
+            f"中盤成功/実測比 {_pcm.get('中盤成功/実測比')}｜"
+            f"終盤成功/実測比 {_pcm.get('終盤成功/実測比')}"
+        )
+        if _pcm.get("解釈"):
+            st.info(str(_pcm.get("解釈")))
+        _pcl = _pc.get("by_lap")
+        if isinstance(_pcl, pd.DataFrame) and not _pcl.empty:
+            st.dataframe(
+                _pcl,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "予測p%": st.column_config.NumberColumn(format="%.2f"),
+                    "実成功%": st.column_config.NumberColumn(format="%.2f"),
+                    "校正ギャップpt": st.column_config.NumberColumn(format="%.2f"),
+                    "成功/R": st.column_config.NumberColumn(format="%.2f"),
+                    "実測スワップ/R": st.column_config.NumberColumn(format="%.2f"),
+                    "成功量/実測比": st.column_config.NumberColumn(format="%.2f"),
+                    "壁成功率%": st.column_config.NumberColumn(format="%.1f"),
+                    "momentum成功率%": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+            st.download_button(
+                "p校正・周回別CSV",
+                _pcl.to_csv(index=False).encode("utf-8-sig"),
+                file_name="overtake_p_calibration_by_lap.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v324_p_cal_csv",
+            )
+    elif isinstance(_pc, dict) and _pc.get("reason") and _pc.get("reason") != "OK":
+        st.warning(str(_pc.get("reason")))
+
+    st.markdown("##### 📊 追抜 pair_stats（相手別・読み取り専用）")
+    st.caption(
+        "pair_stats を周回×追抜車×前車で集計。試行が多いペアの成功率と予測pを比較します。"
+        "既にある「試行・成功率」「p校正」と併用。ロジック変更なし。"
+    )
+    if st.button("pair_statsを集計", key="v324_pair_stats_btn", use_container_width=True):
+        with st.spinner("pair_stats を集計中…"):
+            st.session_state["v324_pair_stats"] = _v324_overtake_pair_stats_diagnostic(engine.DB_PATH)
+    _ps = st.session_state.get("v324_pair_stats")
+    if isinstance(_ps, dict) and _ps.get("ok"):
+        _psm = _ps.get("summary") or {}
+        st.write(
+            f"対象 {_psm.get('対象レース', 0)}R｜"
+            f"集計ペア {_psm.get('集計ペア数', 0)}｜"
+            f"表示 {_psm.get('表示ペア数(試行≥20)', _psm.get('表示ペア数(試行≥%d)' % 20, 0))}"
+        )
+        _psl = _ps.get("by_lap")
+        if isinstance(_psl, pd.DataFrame) and not _psl.empty:
+            st.markdown("**周回別（pair集計）**")
+            st.dataframe(_psl, use_container_width=True, hide_index=True)
+        _pst = _ps.get("top_pairs")
+        if isinstance(_pst, pd.DataFrame) and not _pst.empty:
+            st.markdown("**試行の多いペア（上位）**")
+            st.dataframe(
+                _pst,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "成功率%": st.column_config.NumberColumn(format="%.1f"),
+                    "予測p%": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+            st.download_button(
+                "pair_stats上位CSV",
+                _pst.to_csv(index=False).encode("utf-8-sig"),
+                file_name="overtake_pair_stats_top.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v324_pair_stats_csv",
+            )
+    elif isinstance(_ps, dict) and _ps.get("reason") and _ps.get("reason") != "OK":
+        st.warning(str(_ps.get("reason")))
 
     try:
         _v270_weights_df=engine.v40_current_weights(engine.DB_PATH)
