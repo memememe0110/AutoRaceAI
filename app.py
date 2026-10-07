@@ -5359,6 +5359,331 @@ def _v324_parse_route_orders(route_text: str) -> dict[int, tuple]:
 
 
 
+
+
+def _v324_late_release_audit_diagnostic(
+    db_path: str,
+    app_version: str | None = None,
+    limit_races: int = 200,
+) -> dict:
+    """周5/6の late_release_audit_v273 を予測履歴から集計（読み取り専用）。
+
+    列: function_called / eligible / triggered / score_below_required /
+        v282_borderline_guard / residual_samples_lt5 / gate_lt_080 / trial_missing
+    周5痩せが「境界ガード」由来か「スコア不足」由来かを切り分ける。
+    """
+    ver = str(app_version or globals().get("_V231_APP_VERSION") or "Ver324").strip()
+    out = {
+        "ok": False,
+        "version": ver,
+        "by_lap": pd.DataFrame(),
+        "per_race": pd.DataFrame(),
+        "summary": {},
+        "reason": "",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+
+    keys = [
+        "function_called",
+        "eligible",
+        "triggered",
+        "score_below_required",
+        "v282_borderline_guard",
+        "residual_samples_lt5",
+        "gate_lt_080",
+        "trial_missing",
+        "pair_checks",
+        "chaser_seen",
+        "rear30_seen",
+        "lap_seen",
+        "errors",
+        "factor_sum",
+    ]
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=25.0) as con:
+            con.execute("PRAGMA busy_timeout=25000")
+            cols = {str(r[1]) for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+            blob_col = "payload" if "payload" in cols else ("result_blob" if "result_blob" in cols else None)
+            if not blob_col:
+                out["reason"] = "payloadなし"
+                return out
+            ver_clause = "WHERE app_version=?" if "app_version" in cols else ""
+            params: list = [ver] if ver_clause else []
+            params.append(int(limit_races) * 4)
+            rows = con.execute(
+                f"""
+                SELECT history_id, race_key, {blob_col}
+                  FROM v231_prediction_history
+                  {ver_clause}
+                 ORDER BY history_id DESC
+                 LIMIT ?
+                """,
+                params,
+            ).fetchall()
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    agg = {5: {k: 0 for k in keys}, 6: {k: 0 for k in keys}}
+    used = set()
+    samples = []
+
+    for hid, rk, blob in rows:
+        try:
+            obj = pickle.loads(zlib.decompress(bytes(blob)))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        meta = obj.get("meta") or {}
+        if not meta and isinstance(obj.get("result"), dict):
+            meta = (obj.get("result") or {}).get("meta") or {}
+        wall = (
+            meta.get("6周展開シミュレーション")
+            or meta.get("壁補正監査")
+            or obj.get("wall_audit")
+            or {}
+        )
+        if not isinstance(wall, dict):
+            continue
+        # prefer nested audit dict
+        audit = wall.get("late_release_audit_v273") or {}
+        # also accept flat Ver273_* keys on wall/out
+        flat = wall if isinstance(wall, dict) else {}
+
+        def _get_lap(lap: int) -> dict:
+            d = {}
+            if isinstance(audit, dict):
+                st = audit.get(lap) or audit.get(str(lap)) or {}
+                if isinstance(st, dict):
+                    for k in keys:
+                        d[k] = int(st.get(k) or 0) if k != "factor_sum" else float(st.get(k) or 0)
+                    if any(d.get(k) for k in keys if k != "factor_sum"):
+                        return d
+            # flat keys
+            mapping = {
+                5: {
+                    "function_called": "Ver273_5周目関数呼出",
+                    "eligible": "Ver273_5周目再加速対象数",
+                    "triggered": "Ver273_5周目再加速発動数",
+                    "score_below_required": "Ver273_5周目スコア不足",
+                    "v282_borderline_guard": "Ver282_5周目境界抑制",
+                    "residual_samples_lt5": "Ver273_5周目残差不足",
+                    "gate_lt_080": "Ver273_5周目ゲート不足",
+                    "trial_missing": "Ver273_5周目試走不足",
+                    "pair_checks": "Ver273_5周目ペア判定",
+                    "chaser_seen": "Ver273_5周目追走車判定",
+                    "rear30_seen": "Ver273_5周目30m以上判定",
+                    "lap_seen": "Ver273_5周目ループ到達",
+                },
+                6: {
+                    "function_called": "Ver273_6周目関数呼出",
+                    "eligible": "Ver273_6周目再加速対象数",
+                    "triggered": "Ver273_6周目再加速発動数",
+                    "score_below_required": "Ver273_6周目スコア不足",
+                    "v282_borderline_guard": None,
+                    "residual_samples_lt5": "Ver273_6周目残差不足",
+                    "gate_lt_080": "Ver273_6周目ゲート不足",
+                    "trial_missing": "Ver273_6周目試走不足",
+                    "pair_checks": "Ver273_6周目ペア判定",
+                    "chaser_seen": "Ver273_6周目追走車判定",
+                    "rear30_seen": "Ver273_6周目30m以上判定",
+                    "lap_seen": "Ver273_6周目ループ到達",
+                },
+            }
+            d = {k: 0 for k in keys}
+            for k, fk in mapping.get(lap, {}).items():
+                if not fk:
+                    continue
+                try:
+                    d[k] = int(flat.get(fk) or 0)
+                except Exception:
+                    d[k] = 0
+            return d
+
+        d5 = _get_lap(5)
+        d6 = _get_lap(6)
+        if not any(d5.get(k) for k in ("function_called", "eligible", "triggered", "pair_checks")) and not any(
+            d6.get(k) for k in ("function_called", "eligible", "triggered", "pair_checks")
+        ):
+            continue
+
+        rd = str(meta.get("開催日") or meta.get("race_date") or "")[:10]
+        vv = str(meta.get("開催場") or meta.get("venue") or "").strip()
+        rr = re.sub(r"[^0-9]", "", str(meta.get("R") or meta.get("レース") or meta.get("race_no") or ""))
+        key = (rd, vv, rr)
+        if key in used:
+            continue
+        used.add(key)
+
+        for lap, d in ((5, d5), (6, d6)):
+            for k in keys:
+                agg[lap][k] = agg[lap].get(k, 0) + (d.get(k) or 0)
+            if len(samples) < 60:
+                samples.append(
+                    {
+                        "開催日": rd,
+                        "場": vv,
+                        "R": rr,
+                        "周回": lap,
+                        "呼出": d.get("function_called", 0),
+                        "対象": d.get("eligible", 0),
+                        "発動": d.get("triggered", 0),
+                        "スコア不足": d.get("score_below_required", 0),
+                        "境界ガード": d.get("v282_borderline_guard", 0),
+                        "残差不足": d.get("residual_samples_lt5", 0),
+                        "ゲート不足": d.get("gate_lt_080", 0),
+                        "試走不足": d.get("trial_missing", 0),
+                    }
+                )
+
+    if not used:
+        out["reason"] = "late_release_audit 付き履歴がありません（再予測後に付きます）"
+        return out
+
+    rows = []
+    for lap in (5, 6):
+        d = agg[lap]
+        called = int(d.get("function_called") or 0)
+        eligible = int(d.get("eligible") or 0)
+        triggered = int(d.get("triggered") or 0)
+        guard = int(d.get("v282_borderline_guard") or 0)
+        score_miss = int(d.get("score_below_required") or 0)
+        rows.append(
+            {
+                "周回": lap,
+                "レース数": len(used),
+                "関数呼出": called,
+                "対象eligible": eligible,
+                "発動triggered": triggered,
+                "発動率_対呼出%": (triggered / called * 100.0) if called else None,
+                "発動率_対対象%": (triggered / eligible * 100.0) if eligible else None,
+                "スコア不足": score_miss,
+                "v282境界ガード": guard,
+                "境界ガード率_対呼出%": (guard / called * 100.0) if called else None,
+                "残差不足": int(d.get("residual_samples_lt5") or 0),
+                "ゲート不足": int(d.get("gate_lt_080") or 0),
+                "試走不足": int(d.get("trial_missing") or 0),
+                "ペア判定": int(d.get("pair_checks") or 0),
+                "30m以上": int(d.get("rear30_seen") or 0),
+            }
+        )
+
+    by_lap = pd.DataFrame(rows)
+    # interpretation
+    hint = ""
+    try:
+        r5 = by_lap[by_lap["周回"] == 5].iloc[0]
+        g = float(r5.get("境界ガード率_対呼出%") or 0)
+        s = float(r5.get("スコア不足") or 0)
+        c = float(r5.get("関数呼出") or 1)
+        if g >= 15:
+            hint = "周5の境界ガード(v282)が呼出の15%以上 → 周5痩せの主因候補"
+        elif s / c >= 0.4:
+            hint = "周5はスコア不足が多い → 根拠不足で再加速が通っていない"
+        else:
+            hint = "境界ガードもスコア不足も突出せず。他要因（p自体の低下・試行構造）も併せて見る"
+    except Exception:
+        hint = ""
+
+    out.update(
+        {
+            "ok": True,
+            "by_lap": by_lap,
+            "per_race": pd.DataFrame(samples),
+            "summary": {
+                "対象レース": len(used),
+                "解釈": hint,
+            },
+            "reason": "OK",
+        }
+    )
+    return out
+
+
+def _v324_adjacent_swap_volume_diagnostic(
+    db_path: str,
+    app_version: str | None = None,
+    limit_races: int = 200,
+) -> dict:
+    """隣接スワップ量のみで Sim連続ルート vs 実測を比較（成功量/実測比の桁ズレ回避）。
+
+    全ペアの試行合計ではなく、隣接逆転数だけを数える。
+    周回別: 実測数 / Sim連続ルート数 / 比(Sim÷実測)
+    """
+    ver = str(app_version or globals().get("_V231_APP_VERSION") or "Ver324").strip()
+    out = {
+        "ok": False,
+        "version": ver,
+        "by_lap": pd.DataFrame(),
+        "summary": {},
+        "reason": "",
+        "note": "連続ルートの隣接スワップ数 ÷ 実測隣接スワップ数。0.7未満で終盤痩せ疑い。",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+
+    # reuse continuous route loader logic lightly
+    cont = _v324_overtake_pair_continuous_diagnostic(db_path, ver, limit_races)
+    if not cont.get("ok"):
+        out["reason"] = cont.get("reason") or "連続ルート取得失敗"
+        return out
+    by = cont.get("by_lap")
+    if not isinstance(by, pd.DataFrame) or by.empty:
+        out["reason"] = "周回別データなし"
+        return out
+
+    rows = []
+    for _, r in by.iterrows():
+        act = float(r.get("実測スワップ計") or 0)
+        sim = float(r.get("Simスワップ計") or 0)
+        ratio = (sim / act) if act > 0 else None
+        rows.append(
+            {
+                "周回": int(r.get("周回")),
+                "遷移数": int(r.get("遷移数") or 0),
+                "実測隣接スワップ": act,
+                "Sim連続ルート隣接": sim,
+                "比_Sim÷実測": ratio,
+                "差_Sim-実測": sim - act,
+                "Precision%": r.get("Precision%"),
+                "Recall%": r.get("Recall%"),
+                "F1%": r.get("F1%"),
+            }
+        )
+    df = pd.DataFrame(rows)
+    late = df[df["周回"].isin([4, 5, 6])] if not df.empty else df
+    mid = df[df["周回"].isin([2, 3])] if not df.empty else df
+
+    def _m(frame, col):
+        if frame is None or frame.empty:
+            return None
+        s = pd.to_numeric(frame[col], errors="coerce")
+        return float(s.mean()) if s.notna().any() else None
+
+    out.update(
+        {
+            "ok": True,
+            "by_lap": df,
+            "summary": {
+                "対象遷移_2周目": int(df.loc[df["周回"] == 2, "遷移数"].sum()) if not df.empty else 0,
+                "中盤比平均": _m(mid, "比_Sim÷実測"),
+                "終盤比平均": _m(late, "比_Sim÷実測"),
+                "周5比": float(df.loc[df["周回"] == 5, "比_Sim÷実測"].iloc[0])
+                if (not df.empty and (df["周回"] == 5).any())
+                else None,
+            },
+            "reason": "OK",
+            "races_used": cont.get("races_used"),
+        }
+    )
+    return out
+
+
 def _v324_overtake_pair_stats_diagnostic(
     db_path: str,
     app_version: str | None = None,
@@ -32951,8 +33276,70 @@ if selected_main_page == "🗃️ 登録情報確認":
                 use_container_width=True,
                 key="v324_overtake_cont_samples_csv",
             )
+            if st.button("隣接量比だけ再表示", key="v324_adj_vol_btn", use_container_width=True):
+                with st.spinner("隣接スワップ量比を集計…"):
+                    st.session_state["v324_adj_vol"] = _v324_adjacent_swap_volume_diagnostic(engine.DB_PATH)
+            _av = st.session_state.get("v324_adj_vol")
+            if isinstance(_av, dict) and _av.get("ok"):
+                _avs = _av.get("summary") or {}
+                st.caption(
+                    f"中盤比 {_avs.get('中盤比平均')}｜終盤比 {_avs.get('終盤比平均')}｜周5比 {_avs.get('周5比')} "
+                    f"（1.0=量一致、<0.7=Sim不足）"
+                )
+                _avl = _av.get("by_lap")
+                if isinstance(_avl, pd.DataFrame) and not _avl.empty:
+                    st.dataframe(_avl, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "隣接量比CSV",
+                        _avl.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="adjacent_swap_volume_by_lap.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="v324_adj_vol_csv",
+                    )
     elif isinstance(_oc, dict) and _oc.get("reason") and _oc.get("reason") != "OK":
         st.warning(str(_oc.get("reason")))
+
+    st.markdown("##### 🕔 周5/6 再加速監査（late_release）")
+    st.caption(
+        "late_release_audit_v273 の集計。周5の v282境界ガード / スコア不足 / 発動率を見ます。"
+        "予測ロジックは変更しません。"
+    )
+    if st.button("周5/6再加速監査を集計", key="v324_late_rel_btn", use_container_width=True):
+        with st.spinner("late_release_audit を集計中…"):
+            st.session_state["v324_late_rel"] = _v324_late_release_audit_diagnostic(engine.DB_PATH)
+    _lr = st.session_state.get("v324_late_rel")
+    if isinstance(_lr, dict) and _lr.get("ok"):
+        _lrm = _lr.get("summary") or {}
+        st.write(f"対象 {_lrm.get('対象レース', 0)}R")
+        if _lrm.get("解釈"):
+            st.info(str(_lrm.get("解釈")))
+        _lrl = _lr.get("by_lap")
+        if isinstance(_lrl, pd.DataFrame) and not _lrl.empty:
+            st.dataframe(
+                _lrl,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "発動率_対呼出%": st.column_config.NumberColumn(format="%.1f"),
+                    "発動率_対対象%": st.column_config.NumberColumn(format="%.1f"),
+                    "境界ガード率_対呼出%": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+            st.download_button(
+                "再加速監査CSV",
+                _lrl.to_csv(index=False).encode("utf-8-sig"),
+                file_name="late_release_audit_by_lap.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v324_late_rel_csv",
+            )
+        _lrs = _lr.get("per_race")
+        if isinstance(_lrs, pd.DataFrame) and not _lrs.empty:
+            with st.expander("レース別サンプル", expanded=False):
+                st.dataframe(_lrs, use_container_width=True, hide_index=True)
+    elif isinstance(_lr, dict) and _lr.get("reason") and _lr.get("reason") != "OK":
+        st.warning(str(_lr.get("reason")))
 
     st.markdown("##### 🔬 追抜試行・成功率（Sim監査 vs 実測量）")
     st.caption(
