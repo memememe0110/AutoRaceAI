@@ -2519,6 +2519,42 @@ def _v278_cancel_flag_clear(job_id: int) -> None:
             p.unlink()
     except Exception:
         pass
+    try:
+        _v326_abort_clear(job_id)
+    except Exception:
+        pass
+
+
+# Ver324: 取込中止をHTTP層まで伝播（長timeout/リトライを即打ち切り）
+_V326_ABORT_EVENTS: dict[int, threading.Event] = {}
+_V326_ABORT_LOCK = threading.Lock()
+
+
+def _v326_abort_set(job_id: int) -> None:
+    try:
+        jid = int(job_id)
+    except Exception:
+        return
+    with _V326_ABORT_LOCK:
+        ev = _V326_ABORT_EVENTS.get(jid)
+        if ev is None:
+            ev = threading.Event()
+            _V326_ABORT_EVENTS[jid] = ev
+        ev.set()
+
+
+def _v326_abort_clear(job_id: int) -> None:
+    try:
+        jid = int(job_id)
+    except Exception:
+        return
+    with _V326_ABORT_LOCK:
+        _V326_ABORT_EVENTS.pop(jid, None)
+
+
+def _v326_abort_any() -> bool:
+    with _V326_ABORT_LOCK:
+        return any(ev.is_set() for ev in _V326_ABORT_EVENTS.values())
 
 
 def _v278_bg_cancel_requested(db_path: str, job_id: int) -> bool:
@@ -2541,6 +2577,10 @@ def _v278_bg_cancel_requested(db_path: str, job_id: int) -> bool:
 
 def _v278_bg_request_cancel(db_path: str, job_id: int) -> None:
     _v278_cancel_flag_set(job_id)
+    try:
+        _v326_abort_set(job_id)
+    except Exception:
+        pass
     try:
         with sqlite3.connect(str(db_path), timeout=2.0) as con:
             con.execute("PRAGMA busy_timeout=2000")
@@ -11190,7 +11230,10 @@ _V319_OP_PLACE_REV = {v: k for k, v in _V319_OP_PLACE.items()}
 
 
 def _v319_http_get(url: str, timeout: int = 20, retries: int = 4) -> str:
-    """HTTP GET with transient retries. Does not hold a DB transaction."""
+    """HTTP GET with transient retries. Does not hold a DB transaction.
+
+    中止フラグ(_v326_abort_any)が立っていればリトライせず即中断する。
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
         "Accept-Language": "ja,en;q=0.8",
@@ -11199,9 +11242,13 @@ def _v319_http_get(url: str, timeout: int = 20, retries: int = 4) -> str:
     last_exc: BaseException | None = None
     attempts = max(1, int(retries or 1))
     for attempt in range(attempts):
+        if _v326_abort_any():
+            raise RuntimeError("import cancel requested")
+        # 中止要求中は in-flight 待ちを短くする
+        _t = 3 if _v326_abort_any() else int(timeout or 20)
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=int(timeout or 20)) as resp:
+            with urllib.request.urlopen(req, timeout=max(1, int(_t))) as resp:
                 status = int(getattr(resp, "status", 200) or 200)
                 raw = resp.read()
             if status in (408, 425, 429, 500, 502, 503, 504):
@@ -11216,8 +11263,14 @@ def _v319_http_get(url: str, timeout: int = 20, retries: int = 4) -> str:
                 raise
         except (TimeoutError, urllib.error.URLError, ConnectionResetError, ValueError, OSError) as exc:
             last_exc = exc
+        if _v326_abort_any():
+            break
         if attempt + 1 < attempts:
             time_module.sleep(delays[min(attempt, len(delays) - 1)])
+            if _v326_abort_any():
+                break
+    if _v326_abort_any():
+        raise RuntimeError("import cancel requested")
     if last_exc is not None:
         raise last_exc
     raise RuntimeError(f"HTTP GET failed: {url}")
@@ -13347,20 +13400,41 @@ def _v319_fill_player_histories(
                 _prefetch.append((_pcd, _nm))
             if len(_prefetch) >= 2:
                 _n_workers = min(4, len(_prefetch))
-                with ThreadPoolExecutor(max_workers=_n_workers) as _ex:
+                _ex = ThreadPoolExecutor(max_workers=_n_workers)
+                try:
                     _futs = [
                         _ex.submit(_v319_fetch_player_history_df, _pcd, _nm)
                         for _pcd, _nm in _prefetch
                     ]
                     for _fu in as_completed(_futs):
+                        _cancel_now = False
                         if callable(cancel_cb):
                             try:
-                                if bool(cancel_cb()):
-                                    break
+                                _cancel_now = bool(cancel_cb())
                             except Exception:
-                                pass
+                                _cancel_now = False
+                        if (not _cancel_now) and _v326_abort_any():
+                            _cancel_now = True
+                        if _cancel_now:
+                            try:
+                                _ex.shutdown(wait=False, cancel_futures=True)
+                            except TypeError:
+                                _ex.shutdown(wait=False)
+                            return {
+                                "added": added, "skipped": skipped, "errors": errors,
+                                "details": details + ["中止要求により履歴プリフェッチを中断"],
+                                "cancelled": True,
+                            }
                         try:
                             _ = _fu.result()
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        _ex.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        try:
+                            _ex.shutdown(wait=False)
                         except Exception:
                             pass
         except Exception:
@@ -14704,26 +14778,39 @@ def _v319_register_fetched_result(
 
 
 def _v319_upsert_payouts_from_text(db_path: str, race_key: str, raw_text: str) -> int:
+    """生テキストから払戻を抽出して result_payouts に書く。
+
+    手動登録・自動取込の両方から呼ぶ。全角スペース・矢印表記・カンマ区切り金額に対応。
+    """
     if not race_key:
         return 0
     body = str(raw_text or "")
     idx = body.find("払戻金")
     if idx >= 0:
         body = body[idx:]
+    body = body.replace("\u3000", " ").replace("\xa0", " ")
+    body = body.replace("　", " ").replace(" ", " ")
     rows = []
     kind = ""
+    kind_re = re.compile(
+        r"^(単勝|複勝|2連複|2連単|ワイド|3連複|3連単)\s+(\S+)\s+([\d,]+)\s*円"
+    )
+    cont_re = re.compile(r"^(\S+)\s+([\d,]+)\s*円")
     for raw in body.splitlines():
-        line = raw.strip()
+        line = str(raw or "").strip()
         if not line:
             continue
-        m = re.match(r"^(単勝|複勝|2連複|2連単|ワイド|3連複|3連単)\s+(\S+)\s+([\d,]+)円", line)
-        if m:
-            kind = m.group(1)
-            combo = m.group(2).replace("→", "-").replace(" ", "")
-            yen = int(m.group(3).replace(",", ""))
+        line = line.replace("\u3000", " ").replace("\xa0", " ")
+        line = line.replace("\u3000", " ").replace("\xa0", " ")
+        line = line.replace("　", " ").replace(" ", " ")
+        m0 = kind_re.match(line)
+        if m0:
+            kind = m0.group(1)
+            combo = m0.group(2).replace("→", "-").replace(" ", "")
+            yen = int(m0.group(3).replace(",", ""))
             _ = rows.append((kind, combo, yen))
             continue
-        m2 = re.match(r"^(\S+)\s+([\d,]+)円", line)
+        m2 = cont_re.match(line)
         if m2 and kind in ("複勝", "ワイド"):
             combo = m2.group(1).replace("→", "-").replace(" ", "")
             yen = int(m2.group(2).replace(",", ""))
@@ -26974,8 +27061,8 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         default=[],
         key="v215_return_origins_v324b",
         help=(
-            "未選択＝各レースの最新予測（照合時刻→保存時刻）を1本表示。"
-            " 経路を明示選択したときはその経路のみ。"
+            "未選択＝各レース×各バージョンの最新予測（照合時刻→保存時刻）を1本。"
+            " 同じレースでもVerが違えば並ぶ。経路を明示選択したときはその経路のみ。"
         ),
     )
     c4, c5, c6 = st.columns(3)
@@ -26997,7 +27084,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         st.caption(
             "生成経路の内訳（絞り込み前）: "
             + " / ".join(f"{k}:{int(v)}R" for k, v in _org_counts.items())
-            + "　※未選択時は各レースの最新予測のみ（経路を問わない）"
+            + "　※未選択時は各レース×各バージョンの最新予測（経路を問わない）"
         )
     filtered = df.copy()
     if selected_venue != "全開催場":
@@ -27014,7 +27101,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             else:
                 filtered = filtered.iloc[0:0]
         else:
-            # 未選択: 経路に関係なく「最後に出した/照合した予測」を race 単位で1本
+            # 未選択: 経路に関係なく「最後に出した/照合した予測」を race×version 単位で1本
             if not filtered.empty and "race_key" in filtered.columns:
                 filtered = filtered.copy()
                 for _ts_col in ("evaluated_at", "created_at"):
@@ -32613,6 +32700,15 @@ if selected_main_page == "✅ 結果登録・解析":
                     else:
                         global_transition_recalc_v287={"ok":False,"source_races":0,"calibrations":0,"reason":"学習対象外"}
                     ticket_analysis = engine.v67_analyze_ticket_result(meta_r, rows_r, engine.DB_PATH)
+                    # 手動登録でも自動取込と同じく生テキストから払戻を救済抽出する
+                    try:
+                        _pay_n319 = _v319_upsert_payouts_from_text(
+                            engine.DB_PATH, str(key or ""), str(result_text or "")
+                        )
+                        if int(_pay_n319 or 0) > 0:
+                            st.caption(f"払戻金を本文から{int(_pay_n319)}件登録しました。")
+                    except Exception as _pay_exc319:
+                        st.caption(f"払戻金の本文抽出をスキップ: {type(_pay_exc319).__name__}")
                     # Ver255管理修正: 予測時に保存済みのプランだけを、結果登録後に払戻と照合する。
                     # 復元表示だけでは新規保存せず、結果登録時点で元バージョンのまま回収率へ反映する。
                     _v187_sync_mixed_feedback(engine.DB_PATH)
