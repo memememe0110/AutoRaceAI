@@ -21,7 +21,7 @@ import urllib.request
 import zlib
 import time as time_module
 from datetime import date, datetime, time, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -2555,6 +2555,193 @@ def _v326_abort_clear(job_id: int) -> None:
 def _v326_abort_any() -> bool:
     with _V326_ABORT_LOCK:
         return any(ev.is_set() for ev in _V326_ABORT_EVENTS.values())
+
+
+_V326_QUEUE_LOCK = threading.Lock()
+
+
+def _v326_ensure_import_queue(db_path: str) -> None:
+    """v326_import_queue を冪等作成。"""
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS v326_import_queue (
+                task_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type    TEXT    NOT NULL,
+                ymd         TEXT    NOT NULL,
+                venue       TEXT    NOT NULL,
+                race_no     INTEGER NOT NULL,
+                status      TEXT    NOT NULL DEFAULT 'pending',
+                sort_order  INTEGER NOT NULL DEFAULT 0,
+                message     TEXT    DEFAULT '',
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL,
+                UNIQUE (job_type, ymd, venue, race_no)
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_v326_queue_pickup
+            ON v326_import_queue (job_type, status, sort_order, task_id)
+            """
+        )
+        con.commit()
+
+
+def _v326_enqueue_tasks(
+    db_path: str,
+    job_type: str,
+    ymd: str,
+    tasks: list,
+    sort_order: int = 0,
+) -> int:
+    """未登録分のみ pending 投入。既存行は触らない。戻り値=新規件数。"""
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    now = _v228_now_jst_iso()
+    inserted = 0
+    with _V326_QUEUE_LOCK:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            _v326_ensure_import_queue(db_path)
+            for venue, race_no in list(tasks or []):
+                try:
+                    rn = int(race_no)
+                except Exception:
+                    continue
+                if not (1 <= rn <= 12):
+                    continue
+                cur = con.execute(
+                    """
+                    INSERT OR IGNORE INTO v326_import_queue
+                        (job_type, ymd, venue, race_no, status, sort_order,
+                         message, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'pending', ?, '', ?, ?)
+                    """,
+                    (
+                        str(job_type),
+                        ymd,
+                        str(venue),
+                        rn,
+                        int(sort_order or 0),
+                        now,
+                        now,
+                    ),
+                )
+                inserted += int(cur.rowcount or 0)
+            con.commit()
+    return inserted
+
+
+def _v326_update_task_status(
+    db_path: str, task_id: int, status: str, message: str = ""
+) -> None:
+    now = _v228_now_jst_iso()
+    with _V326_QUEUE_LOCK:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            con.execute(
+                """
+                UPDATE v326_import_queue
+                   SET status = ?, message = ?, updated_at = ?
+                 WHERE task_id = ?
+                """,
+                (str(status), str(message or "")[:500], now, int(task_id)),
+            )
+            con.commit()
+
+
+def _v326_reset_running_to_pending(
+    db_path: str,
+    job_type: str | None = None,
+    reason: str = "中止要求により pending に戻しました",
+) -> int:
+    now = _v228_now_jst_iso()
+    with _V326_QUEUE_LOCK:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            if job_type:
+                cur = con.execute(
+                    """
+                    UPDATE v326_import_queue
+                       SET status = 'pending', message = ?, updated_at = ?
+                     WHERE status = 'running' AND job_type = ?
+                    """,
+                    (str(reason)[:500], now, str(job_type)),
+                )
+            else:
+                cur = con.execute(
+                    """
+                    UPDATE v326_import_queue
+                       SET status = 'pending', message = ?, updated_at = ?
+                     WHERE status = 'running'
+                    """,
+                    (str(reason)[:500], now),
+                )
+            con.commit()
+            return int(cur.rowcount or 0)
+
+
+def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
+    """pending を sort_order→task_id 順で1件取り、running にする。"""
+    now = _v228_now_jst_iso()
+    with _V326_QUEUE_LOCK:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            row = con.execute(
+                """
+                SELECT task_id, ymd, venue, race_no
+                  FROM v326_import_queue
+                 WHERE job_type = ? AND status = 'pending'
+                 ORDER BY sort_order ASC, task_id ASC
+                 LIMIT 1
+                """,
+                (str(job_type),),
+            ).fetchone()
+            if not row:
+                return None
+            task_id = int(row[0])
+            cur = con.execute(
+                """
+                UPDATE v326_import_queue
+                   SET status = 'running', updated_at = ?
+                 WHERE task_id = ? AND status = 'pending'
+                """,
+                (now, task_id),
+            )
+            con.commit()
+            if int(cur.rowcount or 0) <= 0:
+                return None
+            return {
+                "task_id": task_id,
+                "ymd": str(row[1] or ""),
+                "venue": str(row[2] or ""),
+                "race_no": int(row[3] or 0),
+            }
+
+
+def _v326_queue_summary(db_path: str, job_type: str) -> dict:
+    counts = {k: 0 for k in ("pending", "running", "done", "skipped", "error")}
+    try:
+        with sqlite3.connect(str(db_path), timeout=10.0) as con:
+            con.execute("PRAGMA busy_timeout=10000")
+            rows = con.execute(
+                """
+                SELECT status, COUNT(*) FROM v326_import_queue
+                 WHERE job_type = ?
+                 GROUP BY status
+                """,
+                (str(job_type),),
+            ).fetchall()
+        for status, c in rows:
+            key = str(status or "")
+            if key in counts:
+                counts[key] = int(c or 0)
+    except Exception:
+        pass
+    total = int(sum(counts.values()))
+    return {"total": total, **counts}
 
 
 def _v278_bg_cancel_requested(db_path: str, job_id: int) -> bool:
@@ -12811,6 +12998,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int
       - 速度は並列取得（ThreadPool）とスキップキャッシュで確保
       - 同一 player_cd はジョブ内メモ化
       - 全リクエスト例外で空になった場合はキャッシュしない（次レースで再試行）
+      - 中止要求時はフォールバック連鎖を止め、例外を握りつぶさない
     """
     global _V319_HIST_DF_CACHE
     pcd = str(player_cd or "").strip()
@@ -12822,6 +13010,13 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int
         except Exception:
             return cached
 
+    def _is_cancel_exc(exc: BaseException) -> bool:
+        msg = str(exc or "")
+        return ("import cancel requested" in msg) or ("abort requested" in msg)
+
+    if _v326_abort_any():
+        raise RuntimeError("import cancel requested")
+
     hist: list[dict] = []
     pc_err = ""
     pc_ok = False
@@ -12831,6 +13026,8 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int
             f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}&historyDispType=d",
             f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}",
         ):
+            if _v326_abort_any():
+                raise RuntimeError("import cancel requested")
             try:
                 html = _v319_http_get(url, timeout=int(timeout or 15), retries=int(retries if retries is not None else 2))
                 if html and len(html) > 500:
@@ -12842,11 +13039,15 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int
                     # 有効HTMLだが履歴0 → PC2/SPを打たない
                     break
             except Exception as exc:
+                if _is_cancel_exc(exc) or _v326_abort_any():
+                    raise RuntimeError("import cancel requested") from exc
                 pc_err = f"{type(exc).__name__}:{exc}"
                 hist = []
     # 2) SP版: PCが完全失敗したときだけ
     sp_rows: list[dict] = []
     if pcd and not pc_ok:
+        if _v326_abort_any():
+            raise RuntimeError("import cancel requested")
         try:
             sp_url = (
                 "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
@@ -12854,7 +13055,9 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int
             )
             sp_html = _v319_http_get(sp_url, timeout=int(timeout or 15), retries=int(retries if retries is not None else 2))
             sp_rows = _v319_parse_sp_player_history_rows(sp_html, name)
-        except Exception:
+        except Exception as exc:
+            if _is_cancel_exc(exc) or _v326_abort_any():
+                raise RuntimeError("import cancel requested") from exc
             sp_rows = []
     if not hist and sp_rows:
         hist = sp_rows
@@ -13406,7 +13609,8 @@ def _v319_fill_player_histories(
                         _ex.submit(_v319_fetch_player_history_df, _pcd, _nm)
                         for _pcd, _nm in _prefetch
                     ]
-                    for _fu in as_completed(_futs):
+                    _pending = set(_futs)
+                    while _pending:
                         _cancel_now = False
                         if callable(cancel_cb):
                             try:
@@ -13425,10 +13629,14 @@ def _v319_fill_player_histories(
                                 "details": details + ["中止要求により履歴プリフェッチを中断"],
                                 "cancelled": True,
                             }
-                        try:
-                            _ = _fu.result()
-                        except Exception:
-                            pass
+                        _done, _pending = wait(
+                            _pending, timeout=0.4, return_when=FIRST_COMPLETED
+                        )
+                        for _fu in _done:
+                            try:
+                                _ = _fu.result(timeout=0.01)
+                            except Exception:
+                                pass
                 finally:
                     try:
                         _ex.shutdown(wait=False, cancel_futures=True)
@@ -13520,7 +13728,23 @@ def _v319_fill_player_histories(
                 details.append(
                     f"{name}:取得開始(DB{have}件/最新{latest_d or 'なし'}/対象{before_d or '-'})"
                 )
-                df = _v319_fetch_player_history_df(pcd, name)
+                if _v326_abort_any() or (callable(cancel_cb) and bool(cancel_cb())):
+                    details.append("中止要求により選手履歴取込を中断")
+                    return {
+                        "added": added, "skipped": skipped, "errors": errors,
+                        "details": details, "cancelled": True,
+                    }
+                try:
+                    df = _v319_fetch_player_history_df(pcd, name)
+                except Exception as _fetch_exc:
+                    _msg = str(_fetch_exc or "")
+                    if ("import cancel requested" in _msg) or _v326_abort_any():
+                        details.append("中止要求により選手履歴取込を中断")
+                        return {
+                            "added": added, "skipped": skipped, "errors": errors,
+                            "details": details, "cancelled": True,
+                        }
+                    df = None
                 # 取得失敗（None）は常に errors。スキップ・永続キャッシュに書かない。
                 if df is None:
                     errors += 1
@@ -15679,6 +15903,15 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
         ymd = str(req.get("ymd") or "")
         venues = list(req.get("venues") or [])
         _only_races = [int(x) for x in (req.get("race_nos") or []) if str(x).isdigit() and 1 <= int(x) <= 12]
+        job_type = "official_import"
+        try:
+            _v326_ensure_import_queue(db_path)
+            # 前回中止の孤児 running → pending（再開可能に）
+            _v326_reset_running_to_pending(
+                db_path, job_type=job_type, reason="起動時に running を pending へ復帰"
+            )
+        except Exception:
+            pass
         targets = []
         seen = set()
         for vn in venues:
@@ -15689,16 +15922,40 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     continue
                 seen.add(item)
                 _ = targets.append(item)
-        total = len(targets)
+        try:
+            _new_n = _v326_enqueue_tasks(db_path, job_type, ymd, targets, sort_order=0)
+        except Exception:
+            _new_n = 0
+        _qs0 = _v326_queue_summary(db_path, job_type)
+        total = int(_qs0.get("pending") or 0) + int(_qs0.get("running") or 0)
+        if total <= 0:
+            total = len(targets)
         _v319_wx_reset_budget()
-        _v278_bg_update(db_path, job_id, total_count=total, current_label=f"{total}R 見つかりました")
-        for i, (vn, n) in enumerate(targets, 1):
+        _v278_bg_update(
+            db_path, job_id, total_count=total,
+            current_label=f"キュー{total}件",
+            message=f"新規{_new_n}件追加｜pending={_qs0.get('pending',0)} done={_qs0.get('done',0)}",
+        )
+        i = 0
+        while True:
             _v278_bg_pause_loop(db_path, job_id)
             if _v278_bg_cancel_requested(db_path, job_id):
+                try:
+                    _v326_reset_running_to_pending(
+                        db_path, job_type=job_type,
+                        reason="中止要求により pending に戻しました",
+                    )
+                except Exception:
+                    pass
+                _qs = _v326_queue_summary(db_path, job_type)
                 blob = zlib.compress(pickle.dumps({
                     "ok": ok, "skip": skip, "error": err, "details": details,
                     "cancelled": True,
-                    "summary": f"中止｜完了{ok} / スキップ{skip} / 失敗{err}（{i-1}/{total}まで）",
+                    "queue": _qs,
+                    "summary": (
+                        f"中止｜完了{ok} / スキップ{skip} / 失敗{err}"
+                        f"（pending残{_qs.get('pending',0)}）"
+                    ),
                 }, protocol=4), 6)
                 try:
                     _v278_cancel_flag_clear(job_id)
@@ -15707,22 +15964,43 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 _v278_bg_update(
                     db_path, job_id, status="cancelled",
                     finished_at=_v228_now_jst_iso(),
-                    done_count=max(0, i - 1),
+                    done_count=i,
                     current_label="中止",
-                    message=f"今：中止｜{i-1}/{total}まで処理して中止｜登録{ok} スキップ{skip} エラー{err}",
+                    message=(
+                        f"今：中止｜登録{ok} スキップ{skip} エラー{err}"
+                        f"｜pending残{_qs.get('pending',0)}（次回再開可）"
+                    ),
                     result_blob=blob,
                 )
                 return
+            task = None
+            try:
+                task = _v326_pickup_next(db_path, job_type)
+            except Exception:
+                task = None
+            if task is None:
+                break
+            i += 1
+            vn = str(task.get("venue") or "")
+            n = int(task.get("race_no") or 0)
+            ymd_t = str(task.get("ymd") or ymd)
+            task_id = int(task.get("task_id") or 0)
+            _qs = _v326_queue_summary(db_path, job_type)
+            _left = int(_qs.get("pending") or 0) + int(_qs.get("running") or 0)
             _v278_bg_update(
                 db_path, job_id,
                 current_label=f"{vn} {n}R",
-                message=f"{i-1}/{total} 完了｜今は取得と登録",
-                done_count=i - 1,
+                message=(
+                    f"登録{ok}/skip{skip}/err{err}｜残{_left}"
+                    f"（pending{_qs.get('pending',0)}）｜今は取得と登録"
+                ),
+                done_count=max(0, int(_qs.get("done") or 0) + int(_qs.get("skipped") or 0)),
+                total_count=max(total, int(_qs.get("total") or total)),
             )
-            item = {"venue": vn, "R": n, "status": "", "message": ""}
+            item = {"venue": vn, "R": n, "status": "", "message": "", "task_id": task_id}
             try:
                 one = _v319_import_one_race(
-                    db_path, ymd, vn, n,
+                    db_path, ymd_t, vn, n,
                     skip_existing=bool(req.get("skip_existing")),
                     replace=bool(req.get("replace")),
                     predict_if_missing=bool(req.get("predict_if_missing")),
@@ -15731,10 +16009,10 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     fetch_odds=bool(req.get("fetch_odds", True)),
                     register_result=bool(req.get("register_result", True)),
                     cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
-                    on_step=lambda msg, vn=vn, n=n, i=i, total=total: _v278_bg_update(
+                    on_step=lambda msg, vn=vn, n=n, i=i: _v278_bg_update(
                         db_path, job_id,
                         current_label=f"{vn} {n}R",
-                        message=f"{i-1}/{total} 完了｜今は{msg}",
+                        message=f"登録{ok}/skip{skip}/err{err}｜今は{msg}",
                         done_count=i - 1,
                     ),
                 )
@@ -15743,11 +16021,29 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         "venue": vn, "R": n, "status": "cancelled",
                         "message": one.get("message") or "中止",
                         "phase": one.get("phase") or "",
+                        "task_id": task_id,
                     })
+                    try:
+                        if task_id:
+                            _v326_update_task_status(
+                                db_path, task_id, "pending",
+                                "中止要求により pending に戻しました",
+                            )
+                        _v326_reset_running_to_pending(
+                            db_path, job_type=job_type,
+                            reason="中止要求により pending に戻しました",
+                        )
+                    except Exception:
+                        pass
+                    _qs = _v326_queue_summary(db_path, job_type)
                     blob = zlib.compress(pickle.dumps({
                         "ok": ok, "skip": skip, "error": err, "details": details,
                         "cancelled": True,
-                        "summary": f"中止｜完了{ok} / スキップ{skip} / 失敗{err}（{i-1}/{total}まで）",
+                        "queue": _qs,
+                        "summary": (
+                            f"中止｜完了{ok} / スキップ{skip} / 失敗{err}"
+                            f"（pending残{_qs.get('pending',0)}）"
+                        ),
                     }, protocol=4), 6)
                     try:
                         _v278_cancel_flag_clear(job_id)
@@ -15756,9 +16052,12 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     _v278_bg_update(
                         db_path, job_id, status="cancelled",
                         finished_at=_v228_now_jst_iso(),
-                        done_count=max(0, i - 1),
+                        done_count=i - 1,
                         current_label="中止",
-                        message=f"今：中止｜{i-1}/{total}まで処理して中止｜登録{ok} スキップ{skip} エラー{err}",
+                        message=(
+                            f"今：中止｜登録{ok} スキップ{skip} エラー{err}"
+                            f"｜pending残{_qs.get('pending',0)}（次回再開可）"
+                        ),
                         result_blob=blob,
                     )
                     return
@@ -15770,15 +16069,32 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 st_one = str(item["status"] or "")
                 if st_one == "skip":
                     skip += 1
+                    if task_id:
+                        _v326_update_task_status(
+                            db_path, task_id, "skipped", item.get("message") or "登録済み"
+                        )
                 elif st_one in ("error", "failed"):
                     err += 1
+                    if task_id:
+                        _v326_update_task_status(
+                            db_path, task_id, "error", item.get("message") or "error"
+                        )
                 else:
                     ok += 1
+                    if task_id:
+                        _v326_update_task_status(db_path, task_id, "done", "")
             except Exception as exc:
                 item["status"] = "error"
                 item["phase"] = "exception"
                 item["message"] = f"{type(exc).__name__}: {exc}"
                 err += 1
+                try:
+                    if task_id:
+                        _v326_update_task_status(
+                            db_path, task_id, "error", item["message"]
+                        )
+                except Exception:
+                    pass
             _ = details.append(item)
             fail_hint = ""
             if str(item.get("status") or "") in ("error", "failed"):
