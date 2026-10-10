@@ -26974,10 +26974,9 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         default=[],
         key="v215_return_origins_v324",
         help=(
-            "未選択＝本線経路のみ（live / official_import / odds_replan）。"
-            " 他の版の買い目をコピーした再ラベル行"
-            "（recommendation_relabel / v305_rec_only_from_ver304 /"
-            " current_version_restore / source_version_restore）は被るため、"
+            "未選択＝本線優先（live / official_import / odds_replan）＋"
+            " 本線が無いレースのみ source_version_restore で補完。"
+            " recommendation_relabel / current_version_restore 等は"
             " 明示的に選んだ時だけ表示します。"
         ),
     )
@@ -27000,28 +26999,51 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         st.caption(
             "生成経路の内訳（絞り込み前）: "
             + " / ".join(f"{k}:{int(v)}R" for k, v in _org_counts.items())
-            + "　※未選択時は live / official_import / odds_replan のみ表示（被り防止）"
+            + "　※未選択時は本線優先、欠落レースのみ source_version_restore で補完"
         )
     filtered = df.copy()
     if selected_venue != "全開催場":
         filtered = filtered[filtered["venue"].astype(str) == selected_venue]
     if selected_version != "全バージョン":
         filtered = filtered[filtered["app_version"].astype(str) == selected_version]
-    _V215_CANONICAL_ORIGINS = ("live", "official_import", "odds_replan")
+    # 未選択時の本線＋欠落補完。優先度が低いほど優先（liveが最優先）。
+    _V215_CANONICAL_ORIGINS = ("live", "official_import", "odds_replan", "source_version_restore")
+    _V215_ORIGIN_PRIORITY = {o: i for i, o in enumerate(_V215_CANONICAL_ORIGINS)}
     if "plan_origin" in filtered.columns:
         if selected_origins:
             _origins_effective = [str(x) for x in selected_origins]
+            if _origins_effective:
+                filtered = filtered[
+                    filtered["plan_origin"].astype(str).isin(_origins_effective)
+                ]
+            else:
+                filtered = filtered.iloc[0:0]
         else:
-            # 未選択時は本線経路だけ（recommendation_relabel / restore 系の被り防止）
+            # 未選択: 本線3経路 + 本線が無いレースだけ source_version_restore で補完
             _present = set(filtered["plan_origin"].astype(str))
             _origins_effective = [o for o in _V215_CANONICAL_ORIGINS if o in _present]
-        if _origins_effective:
-            filtered = filtered[
-                filtered["plan_origin"].astype(str).isin(_origins_effective)
-            ]
-        else:
-            # 本線経路が1件もないときは全表示にせず空にする（誤解防止）
-            filtered = filtered.iloc[0:0]
+            if not _origins_effective:
+                filtered = filtered.iloc[0:0]
+            else:
+                filtered = filtered[
+                    filtered["plan_origin"].astype(str).isin(_origins_effective)
+                ].copy()
+                if not filtered.empty and "race_key" in filtered.columns:
+                    filtered["_origin_pri"] = filtered["plan_origin"].astype(str).map(
+                        lambda x: _V215_ORIGIN_PRIORITY.get(x, 99)
+                    )
+                    # race_key×app_version 単位で経路を1本化（全バージョン比較は残す）
+                    _dedup_cols = ["race_key"]
+                    if "app_version" in filtered.columns:
+                        _dedup_cols.append("app_version")
+                    filtered = (
+                        filtered.sort_values(
+                            _dedup_cols + ["_origin_pri"],
+                            kind="mergesort",
+                        )
+                        .drop_duplicates(subset=_dedup_cols, keep="first")
+                        .drop(columns=["_origin_pri"])
+                    )
     if "date" in filtered.columns and date_from != "（指定なし）":
         filtered = filtered[filtered["date"].astype(str).str[:10] >= date_from]
     if "date" in filtered.columns and date_to != "（指定なし）":
