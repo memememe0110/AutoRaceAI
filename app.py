@@ -26967,17 +26967,15 @@ def _v215_render_return_dashboard(db_path: str) -> None:
     c1, c2, c3 = st.columns(3)
     selected_venue = c1.selectbox("開催場で絞る", ["全開催場"] + venues, key="v215_return_venue")
     selected_version = c2.selectbox("バージョンで絞る", ["全バージョン"] + versions, key="v215_return_version")
-    # Ver324: 既定は未選択。未選択時は本線経路のみを内部適用（コピー/復元行の被り防止）
+    # Ver324: 既定は未選択。未選択時は「各レースの最新予測」を1本表示
     selected_origins = c3.multiselect(
         "生成経路で絞る（複数可）",
         options=origins if origins else ["live"],
         default=[],
-        key="v215_return_origins_v324",
+        key="v215_return_origins_v324b",
         help=(
-            "未選択＝本線優先（live / official_import / odds_replan）＋"
-            " 本線が無いレースのみ source_version_restore で補完。"
-            " recommendation_relabel / current_version_restore 等は"
-            " 明示的に選んだ時だけ表示します。"
+            "未選択＝各レースの最新予測（照合時刻→保存時刻）を1本表示。"
+            " 経路を明示選択したときはその経路のみ。"
         ),
     )
     c4, c5, c6 = st.columns(3)
@@ -26999,16 +26997,13 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         st.caption(
             "生成経路の内訳（絞り込み前）: "
             + " / ".join(f"{k}:{int(v)}R" for k, v in _org_counts.items())
-            + "　※未選択時は本線優先、欠落レースのみ source_version_restore で補完"
+            + "　※未選択時は各レースの最新予測のみ（経路を問わない）"
         )
     filtered = df.copy()
     if selected_venue != "全開催場":
         filtered = filtered[filtered["venue"].astype(str) == selected_venue]
     if selected_version != "全バージョン":
         filtered = filtered[filtered["app_version"].astype(str) == selected_version]
-    # 未選択時の本線＋欠落補完。優先度が低いほど優先（liveが最優先）。
-    _V215_CANONICAL_ORIGINS = ("live", "official_import", "odds_replan", "source_version_restore")
-    _V215_ORIGIN_PRIORITY = {o: i for i, o in enumerate(_V215_CANONICAL_ORIGINS)}
     if "plan_origin" in filtered.columns:
         if selected_origins:
             _origins_effective = [str(x) for x in selected_origins]
@@ -27019,31 +27014,29 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             else:
                 filtered = filtered.iloc[0:0]
         else:
-            # 未選択: 本線3経路 + 本線が無いレースだけ source_version_restore で補完
-            _present = set(filtered["plan_origin"].astype(str))
-            _origins_effective = [o for o in _V215_CANONICAL_ORIGINS if o in _present]
-            if not _origins_effective:
-                filtered = filtered.iloc[0:0]
-            else:
-                filtered = filtered[
-                    filtered["plan_origin"].astype(str).isin(_origins_effective)
-                ].copy()
-                if not filtered.empty and "race_key" in filtered.columns:
-                    filtered["_origin_pri"] = filtered["plan_origin"].astype(str).map(
-                        lambda x: _V215_ORIGIN_PRIORITY.get(x, 99)
-                    )
-                    # race_key×app_version 単位で経路を1本化（全バージョン比較は残す）
-                    _dedup_cols = ["race_key"]
-                    if "app_version" in filtered.columns:
-                        _dedup_cols.append("app_version")
-                    filtered = (
-                        filtered.sort_values(
-                            _dedup_cols + ["_origin_pri"],
-                            kind="mergesort",
+            # 未選択: 経路に関係なく「最後に出した/照合した予測」を race 単位で1本
+            if not filtered.empty and "race_key" in filtered.columns:
+                filtered = filtered.copy()
+                for _ts_col in ("evaluated_at", "created_at"):
+                    if _ts_col in filtered.columns:
+                        filtered[_ts_col] = pd.to_datetime(
+                            filtered[_ts_col], errors="coerce"
                         )
-                        .drop_duplicates(subset=_dedup_cols, keep="first")
-                        .drop(columns=["_origin_pri"])
+                _dedup_cols = ["race_key"]
+                if "app_version" in filtered.columns:
+                    _dedup_cols.append("app_version")
+                _sort_cols = list(_dedup_cols)
+                for _ts_col in ("evaluated_at", "created_at"):
+                    if _ts_col in filtered.columns:
+                        _sort_cols.append(_ts_col)
+                filtered = (
+                    filtered.sort_values(
+                        _sort_cols,
+                        ascending=[True] * len(_dedup_cols) + [False] * (len(_sort_cols) - len(_dedup_cols)),
+                        kind="mergesort",
                     )
+                    .drop_duplicates(subset=_dedup_cols, keep="first")
+                )
     if "date" in filtered.columns and date_from != "（指定なし）":
         filtered = filtered[filtered["date"].astype(str).str[:10] >= date_from]
     if "date" in filtered.columns and date_to != "（指定なし）":
