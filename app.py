@@ -26967,18 +26967,18 @@ def _v215_render_return_dashboard(db_path: str) -> None:
     c1, c2, c3 = st.columns(3)
     selected_venue = c1.selectbox("開催場で絞る", ["全開催場"] + venues, key="v215_return_venue")
     selected_version = c2.selectbox("バージョンで絞る", ["全バージョン"] + versions, key="v215_return_version")
-    # 本線評価の既定: official_import + live（混在を防ぐ）
-    _default_origins = [o for o in ("official_import", "live") if o in origins]
+    # Ver324: 既定は未選択。未選択時は本線経路のみを内部適用（コピー/復元行の被り防止）
     selected_origins = c3.multiselect(
         "生成経路で絞る（複数可）",
         options=origins if origins else ["live"],
-        default=_default_origins if _default_origins else (origins[:1] if origins else []),
-        key="v215_return_origins",
+        default=[],
+        key="v215_return_origins_v324",
         help=(
-            "本線評価: official_import / live のみ。"
-            " recommendation_relabel=Ver322コピー。"
-            " odds_replan=Ver325 G1実験。"
-            " 空にすると全経路。"
+            "未選択＝本線経路のみ（live / official_import / odds_replan）。"
+            " 他の版の買い目をコピーした再ラベル行"
+            "（recommendation_relabel / v305_rec_only_from_ver304 /"
+            " current_version_restore / source_version_restore）は被るため、"
+            " 明示的に選んだ時だけ表示します。"
         ),
     )
     c4, c5, c6 = st.columns(3)
@@ -27000,14 +27000,28 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         st.caption(
             "生成経路の内訳（絞り込み前）: "
             + " / ".join(f"{k}:{int(v)}R" for k, v in _org_counts.items())
+            + "　※未選択時は live / official_import / odds_replan のみ表示（被り防止）"
         )
     filtered = df.copy()
     if selected_venue != "全開催場":
         filtered = filtered[filtered["venue"].astype(str) == selected_venue]
     if selected_version != "全バージョン":
         filtered = filtered[filtered["app_version"].astype(str) == selected_version]
-    if selected_origins and "plan_origin" in filtered.columns:
-        filtered = filtered[filtered["plan_origin"].astype(str).isin([str(x) for x in selected_origins])]
+    _V215_CANONICAL_ORIGINS = ("live", "official_import", "odds_replan")
+    if "plan_origin" in filtered.columns:
+        if selected_origins:
+            _origins_effective = [str(x) for x in selected_origins]
+        else:
+            # 未選択時は本線経路だけ（recommendation_relabel / restore 系の被り防止）
+            _present = set(filtered["plan_origin"].astype(str))
+            _origins_effective = [o for o in _V215_CANONICAL_ORIGINS if o in _present]
+        if _origins_effective:
+            filtered = filtered[
+                filtered["plan_origin"].astype(str).isin(_origins_effective)
+            ]
+        else:
+            # 本線経路が1件もないときは全表示にせず空にする（誤解防止）
+            filtered = filtered.iloc[0:0]
     if "date" in filtered.columns and date_from != "（指定なし）":
         filtered = filtered[filtered["date"].astype(str).str[:10] >= date_from]
     if "date" in filtered.columns and date_to != "（指定なし）":
