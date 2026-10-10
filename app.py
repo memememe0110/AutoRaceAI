@@ -2560,34 +2560,73 @@ def _v326_abort_any() -> bool:
 _V326_QUEUE_LOCK = threading.Lock()
 
 
+def _v326_queue_connect(db_path: str, timeout: float = 30.0):
+    """キュー操作用接続。WAL + busy_timeout。"""
+    con = sqlite3.connect(str(db_path), timeout=float(timeout))
+    try:
+        con.execute("PRAGMA busy_timeout=%d" % int(max(1000, float(timeout) * 1000)))
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            pass
+        try:
+            con.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return con
+
+
+def _v326_queue_write_retry(fn, *, retries: int = 5, delay: float = 0.08):
+    """database is locked を短時間リトライ。"""
+    last = None
+    for i in range(max(1, int(retries))):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            last = exc
+            msg = str(exc or "").lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            time_module.sleep(float(delay) * (1.0 + 0.5 * i))
+        except Exception:
+            raise
+    if last is not None:
+        raise last
+    raise RuntimeError("queue write failed")
+
+
 def _v326_ensure_import_queue(db_path: str) -> None:
     """v326_import_queue を冪等作成。"""
-    with sqlite3.connect(str(db_path), timeout=30.0) as con:
-        con.execute("PRAGMA busy_timeout=30000")
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS v326_import_queue (
-                task_id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_type    TEXT    NOT NULL,
-                ymd         TEXT    NOT NULL,
-                venue       TEXT    NOT NULL,
-                race_no     INTEGER NOT NULL,
-                status      TEXT    NOT NULL DEFAULT 'pending',
-                sort_order  INTEGER NOT NULL DEFAULT 0,
-                message     TEXT    DEFAULT '',
-                created_at  TEXT    NOT NULL,
-                updated_at  TEXT    NOT NULL,
-                UNIQUE (job_type, ymd, venue, race_no)
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS v326_import_queue (
+                    task_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_type    TEXT    NOT NULL,
+                    ymd         TEXT    NOT NULL,
+                    venue       TEXT    NOT NULL,
+                    race_no     INTEGER NOT NULL,
+                    status      TEXT    NOT NULL DEFAULT 'pending',
+                    sort_order  INTEGER NOT NULL DEFAULT 0,
+                    message     TEXT    DEFAULT '',
+                    created_at  TEXT    NOT NULL,
+                    updated_at  TEXT    NOT NULL,
+                    UNIQUE (job_type, ymd, venue, race_no)
+                )
+                """
             )
-            """
-        )
-        con.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_v326_queue_pickup
-            ON v326_import_queue (job_type, status, sort_order, task_id)
-            """
-        )
-        con.commit()
+            con.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_v326_queue_pickup
+                ON v326_import_queue (job_type, status, sort_order, task_id)
+                """
+            )
+            con.commit()
+    with _V326_QUEUE_LOCK:
+        _v326_queue_write_retry(_run)
 
 
 def _v326_enqueue_tasks(
@@ -2600,18 +2639,25 @@ def _v326_enqueue_tasks(
     """未登録分のみ pending 投入。既存行は触らない。戻り値=新規件数。"""
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     now = _v228_now_jst_iso()
-    inserted = 0
-    with _V326_QUEUE_LOCK:
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
-            _v326_ensure_import_queue(db_path)
-            for venue, race_no in list(tasks or []):
-                try:
-                    rn = int(race_no)
-                except Exception:
-                    continue
-                if not (1 <= rn <= 12):
-                    continue
+    task_list = []
+    for venue, race_no in list(tasks or []):
+        try:
+            rn = int(race_no)
+        except Exception:
+            continue
+        if 1 <= rn <= 12:
+            task_list.append((str(venue), rn))
+    if not task_list:
+        return 0
+    try:
+        _v326_ensure_import_queue(db_path)
+    except Exception:
+        pass
+
+    def _run():
+        inserted = 0
+        with _v326_queue_connect(db_path, 30.0) as con:
+            for venue, rn in task_list:
                 cur = con.execute(
                     """
                     INSERT OR IGNORE INTO v326_import_queue
@@ -2619,28 +2665,23 @@ def _v326_enqueue_tasks(
                          message, created_at, updated_at)
                     VALUES (?, ?, ?, ?, 'pending', ?, '', ?, ?)
                     """,
-                    (
-                        str(job_type),
-                        ymd,
-                        str(venue),
-                        rn,
-                        int(sort_order or 0),
-                        now,
-                        now,
-                    ),
+                    (str(job_type), ymd, venue, rn, int(sort_order or 0), now, now),
                 )
                 inserted += int(cur.rowcount or 0)
             con.commit()
-    return inserted
+        return inserted
+
+    with _V326_QUEUE_LOCK:
+        return int(_v326_queue_write_retry(_run) or 0)
 
 
 def _v326_update_task_status(
     db_path: str, task_id: int, status: str, message: str = ""
 ) -> None:
     now = _v228_now_jst_iso()
-    with _V326_QUEUE_LOCK:
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
+
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
             con.execute(
                 """
                 UPDATE v326_import_queue
@@ -2651,6 +2692,9 @@ def _v326_update_task_status(
             )
             con.commit()
 
+    with _V326_QUEUE_LOCK:
+        _v326_queue_write_retry(_run)
+
 
 def _v326_reset_running_to_pending(
     db_path: str,
@@ -2658,9 +2702,9 @@ def _v326_reset_running_to_pending(
     reason: str = "中止要求により pending に戻しました",
 ) -> int:
     now = _v228_now_jst_iso()
-    with _V326_QUEUE_LOCK:
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
+
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
             if job_type:
                 cur = con.execute(
                     """
@@ -2682,13 +2726,16 @@ def _v326_reset_running_to_pending(
             con.commit()
             return int(cur.rowcount or 0)
 
+    with _V326_QUEUE_LOCK:
+        return int(_v326_queue_write_retry(_run) or 0)
+
 
 def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
     """pending を sort_order→task_id 順で1件取り、running にする。"""
     now = _v228_now_jst_iso()
-    with _V326_QUEUE_LOCK:
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
+
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
             row = con.execute(
                 """
                 SELECT task_id, ymd, venue, race_no
@@ -2720,12 +2767,14 @@ def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
                 "race_no": int(row[3] or 0),
             }
 
+    with _V326_QUEUE_LOCK:
+        return _v326_queue_write_retry(_run)
+
 
 def _v326_queue_summary(db_path: str, job_type: str) -> dict:
     counts = {k: 0 for k in ("pending", "running", "done", "skipped", "error")}
     try:
-        with sqlite3.connect(str(db_path), timeout=10.0) as con:
-            con.execute("PRAGMA busy_timeout=10000")
+        with _v326_queue_connect(db_path, 10.0) as con:
             rows = con.execute(
                 """
                 SELECT status, COUNT(*) FROM v326_import_queue
@@ -2749,8 +2798,7 @@ def _v326_list_queue_tasks(
 ) -> pd.DataFrame:
     try:
         _v326_ensure_import_queue(db_path)
-        with sqlite3.connect(str(db_path), timeout=15.0) as con:
-            con.execute("PRAGMA busy_timeout=15000")
+        with _v326_queue_connect(db_path, 15.0) as con:
             df = pd.read_sql_query(
                 """
                 SELECT task_id, job_type, ymd, venue, race_no, status,
@@ -2786,11 +2834,10 @@ def _v326_delete_queue_tasks(db_path: str, task_ids: list) -> int:
             pass
     if not ids:
         return 0
-    with _V326_QUEUE_LOCK:
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
-            q = ",".join("?" * len(ids))
-            # running は消さない（実行中の破壊防止）
+    q = ",".join("?" * len(ids))
+
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
             cur = con.execute(
                 f"""
                 DELETE FROM v326_import_queue
@@ -2802,13 +2849,16 @@ def _v326_delete_queue_tasks(db_path: str, task_ids: list) -> int:
             con.commit()
             return int(cur.rowcount or 0)
 
+    with _V326_QUEUE_LOCK:
+        return int(_v326_queue_write_retry(_run) or 0)
+
 
 def _v326_requeue_errors(db_path: str, job_type: str = "official_import") -> int:
     """error → pending（案A: 明示操作のみ）。"""
     now = _v228_now_jst_iso()
-    with _V326_QUEUE_LOCK:
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
+
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
             cur = con.execute(
                 """
                 UPDATE v326_import_queue
@@ -2820,15 +2870,18 @@ def _v326_requeue_errors(db_path: str, job_type: str = "official_import") -> int
             con.commit()
             return int(cur.rowcount or 0)
 
+    with _V326_QUEUE_LOCK:
+        return int(_v326_queue_write_retry(_run) or 0)
+
 
 def _v326_clear_queue_finished(
     db_path: str, job_type: str = "official_import", include_error: bool = False
 ) -> int:
     statuses = ["done", "skipped"] + (["error"] if include_error else [])
     q = ",".join("?" * len(statuses))
-    with _V326_QUEUE_LOCK:
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
+
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
             cur = con.execute(
                 f"""
                 DELETE FROM v326_import_queue
@@ -2838,6 +2891,9 @@ def _v326_clear_queue_finished(
             )
             con.commit()
             return int(cur.rowcount or 0)
+
+    with _V326_QUEUE_LOCK:
+        return int(_v326_queue_write_retry(_run) or 0)
 
 
 def _v326_clear_queue_pending(
@@ -2846,9 +2902,9 @@ def _v326_clear_queue_pending(
     """pending（と任意で running）を消す。誤って膨らんだプレイリストの救済用。"""
     statuses = ["pending"] + (["running"] if include_running else [])
     q = ",".join("?" * len(statuses))
-    with _V326_QUEUE_LOCK:
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
+
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
             cur = con.execute(
                 f"""
                 DELETE FROM v326_import_queue
@@ -2859,17 +2915,22 @@ def _v326_clear_queue_pending(
             con.commit()
             return int(cur.rowcount or 0)
 
+    with _V326_QUEUE_LOCK:
+        return int(_v326_queue_write_retry(_run) or 0)
+
 
 def _v326_clear_queue_all(db_path: str, job_type: str = "official_import") -> int:
-    with _V326_QUEUE_LOCK:
-        with sqlite3.connect(str(db_path), timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
             cur = con.execute(
                 "DELETE FROM v326_import_queue WHERE job_type=?",
                 (str(job_type),),
             )
             con.commit()
             return int(cur.rowcount or 0)
+
+    with _V326_QUEUE_LOCK:
+        return int(_v326_queue_write_retry(_run) or 0)
 
 
 def _v278_bg_cancel_requested(db_path: str, job_id: int) -> bool:
@@ -16041,6 +16102,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             pass
         # Phase3: worker は enqueue しない（プレイリストは UI が定義）
         _qs0 = _v326_queue_summary(db_path, job_type)
+        # 進捗分母は「この実行で処理する pending」のみ（過去 done を混ぜない）
         total = int(_qs0.get("pending") or 0) + int(_qs0.get("running") or 0)
         _v319_wx_reset_budget()
         if total <= 0:
@@ -16059,9 +16121,9 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             )
             return
         _v278_bg_update(
-            db_path, job_id, total_count=total,
+            db_path, job_id, total_count=total, done_count=0,
             current_label=f"キュー{total}件",
-            message=f"pending={_qs0.get('pending',0)} done={_qs0.get('done',0)} skipped={_qs0.get('skipped',0)} error={_qs0.get('error',0)}",
+            message=f"今回{total}件｜pending={_qs0.get('pending',0)}（過去done={_qs0.get('done',0)}は分母に含めない）",
         )
         i = 0
         while True:
@@ -16121,8 +16183,8 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     f"登録{ok}/skip{skip}/err{err}｜残{_left}"
                     f"（pending{_qs.get('pending',0)}）｜今は取得と登録"
                 ),
-                done_count=max(0, int(_qs.get("done") or 0) + int(_qs.get("skipped") or 0)),
-                total_count=max(total, int(_qs.get("total") or total)),
+                done_count=max(0, i - 1),
+                total_count=total,
             )
             item = {"venue": vn, "R": n, "status": "", "message": "", "task_id": task_id}
             try:
@@ -32520,14 +32582,17 @@ if selected_main_page == "✅ 結果登録・解析":
             f"done {_qs.get('done',0)} / skipped {_qs.get('skipped',0)} / error {_qs.get('error',0)}"
             "　※キューの定義は UI、実行は worker（自動で1〜12を足しません）"
         )
-        _pend_n = int(_qs.get("pending") or 0) + int(_qs.get("running") or 0)
+        _pend_n = int(_qs.get("pending") or 0)
+        _run_n = int(_qs.get("running") or 0)
         if _pend_n > 0:
             st.warning(
-                f"キューに未処理が {_pend_n} 件残っています。"
-                "「バックグラウンドで取得」や「▶実行」は **今の入力だけでなく、この残件も全部処理**します。"
-                "2Rだけやりたい場合は先に「🗑 pending全消去」で空にしてから、"
+                f"キューに pending が {_pend_n} 件残っています。"
+                "「▶実行」や「バックグラウンドで取得」は **今の入力だけでなく、この pending も全部処理**します。"
+                "特定Rだけやりたい場合は先に「🗑 pending全消去」で空にしてから、"
                 "「＋条件をキューに追加」→「▶実行」の順にしてください。"
             )
+        elif _run_n > 0:
+            st.info(f"実行中が {_run_n} 件あります（追加は可能・完了を待つか中止してください）。")
         q1, q2, q3, q4 = st.columns(4)
         add_q = q1.button("＋条件をキューに追加", use_container_width=True, key="v326_q_add")
         run_q = q2.button("▶ キューを実行/再開", type="primary", use_container_width=True, key="v326_q_run")
@@ -32606,11 +32671,11 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.warning("開催場を選ぶか、先に開催確認してください。")
             elif start_bg:
                 # 一発: 条件をキュー追加 + 実行（既存 pending もまとめて処理される）
-                _left = int(_qs.get("pending") or 0) + int(_qs.get("running") or 0)
+                _left = int(_qs.get("pending") or 0)
                 if _left > 0:
                     st.warning(
-                        f"既存キューに未処理 {_left} 件があります。"
-                        "このまま開始すると **今の条件に加えて残件も実行**されます。"
+                        f"既存キューに pending {_left} 件があります。"
+                        "このまま開始すると **今の条件に加えて pending も実行**されます。"
                         "不要なら先に「🗑 pending全消去」を押してください。"
                     )
                 started = _v319_bg_import_start(
