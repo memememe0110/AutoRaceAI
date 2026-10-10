@@ -27452,6 +27452,9 @@ def github_request(url: str, method: str = "GET", payload: dict | None = None) -
         except Exception:
             parsed = {"message": body}
         return int(exc.code), parsed
+    except Exception as exc:
+        # URLError / TimeoutError / ConnectionReset 等を呼び出し側の status 分岐で扱えるようにする
+        return 0, {"message": f"{type(exc).__name__}: {exc}"}
 
 
 
@@ -28200,41 +28203,53 @@ def _v282_pull_chunked_db() -> tuple[bool, bytes | None, str]:
     read_branch = _v282_db_read_branch()
 
     def _fetch284(path284: str) -> tuple[bool, bytes | None, str]:
-        enc284=urllib.parse.quote(path284,safe="/")
-        url284=repo_api+enc284+"?ref="+urllib.parse.quote(read_branch)
-        status284,obj284=github_request(url284)
-        if status284 != 200 or not isinstance(obj284,dict):
-            msg284=obj284.get("message",status284) if isinstance(obj284,dict) else status284
-            return False,None,f"Contents API: {msg284}"
+        enc284 = urllib.parse.quote(path284, safe="/")
+        url284 = repo_api + enc284 + "?ref=" + urllib.parse.quote(read_branch)
+        content_err284 = ""
+        dl_url284 = ""
 
-        content284=obj284.get("content")
-        if content284:
-            try:
-                return True,base64.b64decode(str(content284).replace("\n","")),"contents-base64"
-            except Exception:
-                pass
-
-        dl284=obj284.get("download_url")
-        if dl284:
-            try:
-                headers284={"Accept":"application/octet-stream","User-Agent":"AutoRaceAI"}
-                if cfg.get("token"):
-                    headers284["Authorization"]=f"Bearer {cfg.get('token')}"
-                req284=urllib.request.Request(str(dl284),headers=headers284)
-                with urllib.request.urlopen(req284,timeout=45) as resp284:
-                    return True,resp284.read(),"download_url"
-            except Exception:
-                pass
-
+        # 1) Contents API（メタ取得。失敗しても download_url / raw へ続行）
         try:
-            headers284={"Accept":"application/vnd.github.raw+json","User-Agent":"AutoRaceAI"}
+            status284, obj284 = github_request(url284)
+            if status284 == 200 and isinstance(obj284, dict):
+                content284 = obj284.get("content")
+                if content284:
+                    try:
+                        return True, base64.b64decode(str(content284).replace("\n", "")), "contents-base64"
+                    except Exception as _b64e284:
+                        content_err284 = f"base64 {type(_b64e284).__name__}"
+                dl_url284 = str(obj284.get("download_url") or "")
+                if not dl_url284 and not content_err284:
+                    content_err284 = "contents-no-content"
+            else:
+                msg284 = obj284.get("message", status284) if isinstance(obj284, dict) else status284
+                content_err284 = f"Contents API: {msg284}"
+                # タイムアウト等でも download_url は取れないので raw へ
+        except Exception as _e284:
+            content_err284 = f"Contents API {type(_e284).__name__}: {_e284}"
+
+        # 2) download_url（1MB超のファイルはここが本線）
+        if dl_url284:
+            try:
+                headers284 = {"Accept": "application/octet-stream", "User-Agent": "AutoRaceAI"}
+                if cfg.get("token"):
+                    headers284["Authorization"] = f"Bearer {cfg.get('token')}"
+                req284 = urllib.request.Request(dl_url284, headers=headers284)
+                with urllib.request.urlopen(req284, timeout=60) as resp284:
+                    return True, resp284.read(), "download_url"
+            except Exception as _dl_exc284:
+                content_err284 = (content_err284 + f" / dl {type(_dl_exc284).__name__}").strip(" /")
+
+        # 3) raw+json
+        try:
+            headers284 = {"Accept": "application/vnd.github.raw+json", "User-Agent": "AutoRaceAI"}
             if cfg.get("token"):
-                headers284["Authorization"]=f"Bearer {cfg.get('token')}"
-            req284=urllib.request.Request(url284,headers=headers284)
-            with urllib.request.urlopen(req284,timeout=45) as resp284:
-                return True,resp284.read(),"github-raw"
+                headers284["Authorization"] = f"Bearer {cfg.get('token')}"
+            req284 = urllib.request.Request(url284, headers=headers284)
+            with urllib.request.urlopen(req284, timeout=60) as resp284:
+                return True, resp284.read(), "github-raw"
         except Exception as exc284:
-            return False,None,f"raw {type(exc284).__name__}: {exc284}"
+            return False, None, f"raw {type(exc284).__name__}: {exc284} / prior={content_err284}"
 
     okm284,mbytes284,mmethod284=_fetch284(mp)
     if not okm284 or mbytes284 is None:
