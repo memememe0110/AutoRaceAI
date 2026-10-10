@@ -2744,6 +2744,134 @@ def _v326_queue_summary(db_path: str, job_type: str) -> dict:
     return {"total": total, **counts}
 
 
+def _v326_list_queue_tasks(
+    db_path: str, job_type: str = "official_import", limit: int = 200
+) -> pd.DataFrame:
+    try:
+        _v326_ensure_import_queue(db_path)
+        with sqlite3.connect(str(db_path), timeout=15.0) as con:
+            con.execute("PRAGMA busy_timeout=15000")
+            df = pd.read_sql_query(
+                """
+                SELECT task_id, job_type, ymd, venue, race_no, status,
+                       sort_order, message, created_at, updated_at
+                  FROM v326_import_queue
+                 WHERE job_type = ?
+                 ORDER BY
+                    CASE status
+                        WHEN 'running' THEN 0
+                        WHEN 'pending' THEN 1
+                        WHEN 'error' THEN 2
+                        WHEN 'skipped' THEN 3
+                        WHEN 'done' THEN 4
+                        ELSE 5
+                    END,
+                    sort_order ASC, task_id ASC
+                 LIMIT ?
+                """,
+                con,
+                params=(str(job_type), int(limit)),
+            )
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _v326_delete_queue_tasks(db_path: str, task_ids: list) -> int:
+    ids = []
+    for x in list(task_ids or []):
+        try:
+            ids.append(int(x))
+        except Exception:
+            pass
+    if not ids:
+        return 0
+    with _V326_QUEUE_LOCK:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            q = ",".join("?" * len(ids))
+            # running は消さない（実行中の破壊防止）
+            cur = con.execute(
+                f"""
+                DELETE FROM v326_import_queue
+                 WHERE task_id IN ({q})
+                   AND status IN ('pending','error','skipped','done')
+                """,
+                ids,
+            )
+            con.commit()
+            return int(cur.rowcount or 0)
+
+
+def _v326_requeue_errors(db_path: str, job_type: str = "official_import") -> int:
+    """error → pending（案A: 明示操作のみ）。"""
+    now = _v228_now_jst_iso()
+    with _V326_QUEUE_LOCK:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            cur = con.execute(
+                """
+                UPDATE v326_import_queue
+                   SET status='pending', message='失敗から再投入', updated_at=?
+                 WHERE job_type=? AND status='error'
+                """,
+                (now, str(job_type)),
+            )
+            con.commit()
+            return int(cur.rowcount or 0)
+
+
+def _v326_clear_queue_finished(
+    db_path: str, job_type: str = "official_import", include_error: bool = False
+) -> int:
+    statuses = ["done", "skipped"] + (["error"] if include_error else [])
+    q = ",".join("?" * len(statuses))
+    with _V326_QUEUE_LOCK:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            cur = con.execute(
+                f"""
+                DELETE FROM v326_import_queue
+                 WHERE job_type=? AND status IN ({q})
+                """,
+                [str(job_type)] + statuses,
+            )
+            con.commit()
+            return int(cur.rowcount or 0)
+
+
+def _v326_clear_queue_pending(
+    db_path: str, job_type: str = "official_import", include_running: bool = True
+) -> int:
+    """pending（と任意で running）を消す。誤って膨らんだプレイリストの救済用。"""
+    statuses = ["pending"] + (["running"] if include_running else [])
+    q = ",".join("?" * len(statuses))
+    with _V326_QUEUE_LOCK:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            cur = con.execute(
+                f"""
+                DELETE FROM v326_import_queue
+                 WHERE job_type=? AND status IN ({q})
+                """,
+                [str(job_type)] + statuses,
+            )
+            con.commit()
+            return int(cur.rowcount or 0)
+
+
+def _v326_clear_queue_all(db_path: str, job_type: str = "official_import") -> int:
+    with _V326_QUEUE_LOCK:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            cur = con.execute(
+                "DELETE FROM v326_import_queue WHERE job_type=?",
+                (str(job_type),),
+            )
+            con.commit()
+            return int(cur.rowcount or 0)
+
+
 def _v278_bg_cancel_requested(db_path: str, job_id: int) -> bool:
     try:
         if _v278_cancel_flag_path(int(job_id)).exists():
@@ -15902,7 +16030,6 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
         _V287_AUTO_IMPORT_STATE.update(_V287_IMPORT_STATE_RESET)
         ymd = str(req.get("ymd") or "")
         venues = list(req.get("venues") or [])
-        _only_races = [int(x) for x in (req.get("race_nos") or []) if str(x).isdigit() and 1 <= int(x) <= 12]
         job_type = "official_import"
         try:
             _v326_ensure_import_queue(db_path)
@@ -15912,29 +16039,29 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             )
         except Exception:
             pass
-        targets = []
-        seen = set()
-        for vn in venues:
-            _rns = _only_races if _only_races else _v319_ordered_race_nos(ymd, vn, int(req.get("max_races") or 12))
-            for n in _rns:
-                item = (str(vn), int(n))
-                if item in seen:
-                    continue
-                seen.add(item)
-                _ = targets.append(item)
-        try:
-            _new_n = _v326_enqueue_tasks(db_path, job_type, ymd, targets, sort_order=0)
-        except Exception:
-            _new_n = 0
+        # Phase3: worker は enqueue しない（プレイリストは UI が定義）
         _qs0 = _v326_queue_summary(db_path, job_type)
         total = int(_qs0.get("pending") or 0) + int(_qs0.get("running") or 0)
-        if total <= 0:
-            total = len(targets)
         _v319_wx_reset_budget()
+        if total <= 0:
+            blob = zlib.compress(pickle.dumps({
+                "ok": 0, "skip": 0, "error": 0, "details": [],
+                "queue": _qs0,
+                "summary": "キューに pending がありません",
+            }, protocol=4), 6)
+            _v278_bg_update(
+                db_path, job_id, status="completed",
+                finished_at=_v228_now_jst_iso(),
+                done_count=0, total_count=0,
+                current_label="キュー空",
+                message="pending がありません。先にキューへ追加してください。",
+                result_blob=blob,
+            )
+            return
         _v278_bg_update(
             db_path, job_id, total_count=total,
             current_label=f"キュー{total}件",
-            message=f"新規{_new_n}件追加｜pending={_qs0.get('pending',0)} done={_qs0.get('done',0)}",
+            message=f"pending={_qs0.get('pending',0)} done={_qs0.get('done',0)} skipped={_qs0.get('skipped',0)} error={_qs0.get('error',0)}",
         )
         i = 0
         while True:
@@ -16218,12 +16345,60 @@ def _v319_bg_import_start(
     race_nos: list | None = None,
     fetch_odds: bool = True,
     register_result: bool = True,
+    *,
+    enqueue: bool = True,
+    run_worker: bool = True,
 ) -> dict:
+    """enqueue=True で条件をキュー追加。run_worker=True で実行開始。
+
+    - 一発実行: enqueue=True, run_worker=True（従来互換）
+    - キュー追加のみ: enqueue=True, run_worker=False
+    - 再開/実行のみ: enqueue=False, run_worker=True
+    """
     _v278_bg_ensure_table(db_path)
+    try:
+        _v326_ensure_import_queue(db_path)
+    except Exception:
+        pass
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    _rnos = [int(x) for x in (race_nos or []) if str(x).isdigit() and 1 <= int(x) <= 12]
+    enqueued = 0
+    if enqueue:
+        if not venues:
+            return {"ok": False, "reason": "開催場がありません。"}
+        tasks = []
+        seen = set()
+        for vn in list(venues or []):
+            rns = _rnos if _rnos else _v319_ordered_race_nos(ymd, vn, 12)
+            for n in rns:
+                item = (str(vn), int(n))
+                if item in seen:
+                    continue
+                seen.add(item)
+                tasks.append(item)
+        try:
+            enqueued = int(_v326_enqueue_tasks(db_path, "official_import", ymd, tasks, sort_order=0) or 0)
+        except Exception as exc:
+            return {"ok": False, "reason": f"キュー追加失敗: {type(exc).__name__}: {exc}"}
+    if not run_worker:
+        qs = _v326_queue_summary(db_path, "official_import")
+        return {
+            "ok": True,
+            "enqueued": enqueued,
+            "job_id": 0,
+            "queue": qs,
+            "reason": f"キューに{enqueued}件追加（実行はしていません）",
+        }
     if _v279_bg_prediction_any_active(db_path):
-        return {"ok": False, "reason": "別の予測・再シミュレーション・取込が動いています。完了後に開始してください。"}
-    if not venues:
-        return {"ok": False, "reason": "開催場がありません。"}
+        return {
+            "ok": False,
+            "enqueued": enqueued,
+            "reason": "別の予測・再シミュレーション・取込が動いています。完了後に開始してください。",
+        }
+    qs0 = _v326_queue_summary(db_path, "official_import")
+    pending_n = int(qs0.get("pending") or 0) + int(qs0.get("running") or 0)
+    if pending_n <= 0 and not enqueue:
+        return {"ok": False, "reason": "実行する pending がありません。先にキューへ追加してください。"}
     now = _v228_now_jst_iso()
     with sqlite3.connect(str(db_path), timeout=30.0) as con:
         con.execute("PRAGMA busy_timeout=30000")
@@ -16233,17 +16408,18 @@ def _v319_bg_import_start(
                 done_count,total_count,current_label,message
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            "official_import", str(_V231_APP_VERSION), "queued", now, now, len(venues), 0,
-            0, 0, "準備中", f"{ymd} {','.join(venues)} をバックグラウンド取込します",
+            "official_import", str(_V231_APP_VERSION), "queued", now, now, max(1, len(venues or [])), 0,
+            0, pending_n, "準備中",
+            f"キュー実行 pending={qs0.get('pending',0)} (追加{enqueued})",
         ))
         con.commit()
         job_id = int(cur.lastrowid or 0)
     req = {
-        "ymd": ymd, "venues": list(venues),
+        "ymd": ymd, "venues": list(venues or []),
         "skip_existing": bool(skip_existing), "replace": bool(replace),
         "predict_if_missing": bool(predict_if_missing),
         "trials": int(trials), "seed": int(seed), "max_races": 12,
-        "race_nos": [int(x) for x in (race_nos or []) if str(x).isdigit() and 1 <= int(x) <= 12],
+        "race_nos": _rnos,
         "fetch_odds": bool(fetch_odds),
         "register_result": bool(register_result),
     }
@@ -16254,7 +16430,7 @@ def _v319_bg_import_start(
     with _V278_BG_LOCK:
         _V278_BG_THREADS[job_id] = th
     th.start()
-    return {"ok": True, "job_id": job_id}
+    return {"ok": True, "job_id": job_id, "enqueued": enqueued, "queue": qs0}
 
 
 def _v319_bg_history_worker(db_path: str, job_id: int, req: dict) -> None:
@@ -32318,9 +32494,109 @@ if selected_main_page == "✅ 結果登録・解析":
         meets = st.session_state.get("v319_op_meetings") or []
         if meets:
             st.write("取得できた開催: " + "、".join(f"{m['venue']}" for m in meets))
-        b1, b2 = st.columns(2)
         ymd = fetch_date.strftime("%Y%m%d")
         venues = [fetch_venue] if fetch_venue in RESULT_VENUES else [m["venue"] for m in meets]
+        _rnos = [int(fetch_race_no)] if int(fetch_race_no or 0) >= 1 else []
+        _imp_kw = dict(
+            skip_existing=bool(skip_existing and not replace_existing),
+            replace=bool(replace_existing),
+            predict_if_missing=bool(predict_missing),
+            trials=int(trials),
+            seed=int(seed),
+            race_nos=_rnos,
+            fetch_odds=bool(fetch_odds_opt),
+            register_result=bool(register_result_opt),
+        )
+
+        # --- 取込キュー（プレイリスト） ---
+        try:
+            _v326_ensure_import_queue(engine.DB_PATH)
+            _qs = _v326_queue_summary(engine.DB_PATH, "official_import")
+        except Exception:
+            _qs = {"total": 0, "pending": 0, "running": 0, "done": 0, "skipped": 0, "error": 0}
+        st.markdown("#### 📋 取込キュー（プレイリスト）")
+        st.caption(
+            f"pending {_qs.get('pending',0)} / running {_qs.get('running',0)} / "
+            f"done {_qs.get('done',0)} / skipped {_qs.get('skipped',0)} / error {_qs.get('error',0)}"
+            "　※キューの定義は UI、実行は worker（自動で1〜12を足しません）"
+        )
+        _pend_n = int(_qs.get("pending") or 0) + int(_qs.get("running") or 0)
+        if _pend_n > 0:
+            st.warning(
+                f"キューに未処理が {_pend_n} 件残っています。"
+                "「バックグラウンドで取得」や「▶実行」は **今の入力だけでなく、この残件も全部処理**します。"
+                "2Rだけやりたい場合は先に「🗑 pending全消去」で空にしてから、"
+                "「＋条件をキューに追加」→「▶実行」の順にしてください。"
+            )
+        q1, q2, q3, q4 = st.columns(4)
+        add_q = q1.button("＋条件をキューに追加", use_container_width=True, key="v326_q_add")
+        run_q = q2.button("▶ キューを実行/再開", type="primary", use_container_width=True, key="v326_q_run")
+        re_err = q3.button("失敗を再投入", use_container_width=True, key="v326_q_reerr")
+        clr_fin = q4.button("done/skip掃除", use_container_width=True, key="v326_q_clr")
+        q5, q6 = st.columns(2)
+        clr_pend = q5.button("🗑 pending全消去", use_container_width=True, key="v326_q_clr_pend")
+        clr_all = q6.button("🗑 キュー全消去", use_container_width=True, key="v326_q_clr_all")
+        if add_q:
+            if not venues:
+                st.warning("開催場を選ぶか、先に開催確認してください。")
+            else:
+                r = _v319_bg_import_start(
+                    engine.DB_PATH, ymd, venues, **_imp_kw, enqueue=True, run_worker=False
+                )
+                if r.get("ok"):
+                    st.success(r.get("reason") or f"キューに{r.get('enqueued',0)}件追加")
+                    st.rerun()
+                else:
+                    st.warning(r.get("reason") or "追加できませんでした")
+        if run_q:
+            r = _v319_bg_import_start(
+                engine.DB_PATH, ymd, venues or [""], **_imp_kw, enqueue=False, run_worker=True
+            )
+            if r.get("ok"):
+                st.success(f"キュー実行を開始（ジョブ {r.get('job_id')}）")
+                st.rerun()
+            else:
+                st.warning(r.get("reason") or "開始できませんでした")
+        if re_err:
+            n = _v326_requeue_errors(engine.DB_PATH, "official_import")
+            st.info(f"error → pending に {n} 件戻しました" if n else "再投入する error はありません")
+            if n:
+                st.rerun()
+        if clr_fin:
+            n = _v326_clear_queue_finished(engine.DB_PATH, "official_import", include_error=False)
+            st.info(f"done/skipped を {n} 件削除しました")
+            if n:
+                st.rerun()
+        if clr_pend:
+            n = _v326_clear_queue_pending(engine.DB_PATH, "official_import", include_running=True)
+            st.success(f"pending/running を {n} 件削除しました")
+            if n:
+                st.rerun()
+        if clr_all:
+            n = _v326_clear_queue_all(engine.DB_PATH, "official_import")
+            st.success(f"キューを全消去しました（{n} 件）")
+            if n:
+                st.rerun()
+        try:
+            _qdf = _v326_list_queue_tasks(engine.DB_PATH, "official_import", limit=120)
+        except Exception:
+            _qdf = pd.DataFrame()
+        if _qdf is not None and not _qdf.empty:
+            st.dataframe(_qdf, use_container_width=True, hide_index=True)
+            _del_ids = st.multiselect(
+                "削除する task_id（running以外）",
+                options=[int(x) for x in _qdf["task_id"].tolist()],
+                key="v326_q_del_ids",
+            )
+            if st.button("🗑 選択行を削除", use_container_width=True, key="v326_q_del_go"):
+                n = _v326_delete_queue_tasks(engine.DB_PATH, _del_ids)
+                st.info(f"{n} 件削除しました")
+                if n:
+                    st.rerun()
+        else:
+            st.caption("キューは空です。「＋条件をキューに追加」か「バックグラウンドで取得」を使ってください。")
+
+        b1, b2 = st.columns(2)
         with b1:
             start_fg = st.button("今すぐ取得して登録", use_container_width=True, key="v319_op_import")
         with b2:
@@ -32329,19 +32605,22 @@ if selected_main_page == "✅ 結果登録・解析":
             if not venues:
                 st.warning("開催場を選ぶか、先に開催確認してください。")
             elif start_bg:
-                _rnos = [int(fetch_race_no)] if int(fetch_race_no or 0) >= 1 else []
+                # 一発: 条件をキュー追加 + 実行（既存 pending もまとめて処理される）
+                _left = int(_qs.get("pending") or 0) + int(_qs.get("running") or 0)
+                if _left > 0:
+                    st.warning(
+                        f"既存キューに未処理 {_left} 件があります。"
+                        "このまま開始すると **今の条件に加えて残件も実行**されます。"
+                        "不要なら先に「🗑 pending全消去」を押してください。"
+                    )
                 started = _v319_bg_import_start(
-                    engine.DB_PATH, ymd, venues,
-                    skip_existing=bool(skip_existing and not replace_existing),
-                    replace=bool(replace_existing),
-                    predict_if_missing=bool(predict_missing),
-                    trials=int(trials), seed=int(seed),
-                    race_nos=_rnos,
-                    fetch_odds=bool(fetch_odds_opt),
-                    register_result=bool(register_result_opt),
+                    engine.DB_PATH, ymd, venues, **_imp_kw, enqueue=True, run_worker=True
                 )
                 if started.get("ok"):
-                    st.success(f"バックグラウンド取込を開始しました（ジョブ {started.get('job_id')}）。画面を離れても進みます。")
+                    st.success(
+                        f"バックグラウンド取込を開始（ジョブ {started.get('job_id')} / 追加{started.get('enqueued',0)}件）。"
+                        "画面を離れても進みます。"
+                    )
                     st.rerun()
                 else:
                     st.warning(started.get("reason") or "開始できませんでした")
