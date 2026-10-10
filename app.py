@@ -16175,6 +16175,12 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             ymd_t = str(task.get("ymd") or ymd)
             task_id = int(task.get("task_id") or 0)
             _qs = _v326_queue_summary(db_path, job_type)
+            # 途中追加された pending も分母に含める
+            total = (
+                int(ok) + int(skip) + int(err)
+                + int(_qs.get("pending") or 0)
+                + int(_qs.get("running") or 0)
+            )
             _left = int(_qs.get("pending") or 0) + int(_qs.get("running") or 0)
             _v278_bg_update(
                 db_path, job_id,
@@ -16183,8 +16189,8 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     f"登録{ok}/skip{skip}/err{err}｜残{_left}"
                     f"（pending{_qs.get('pending',0)}）｜今は取得と登録"
                 ),
-                done_count=max(0, i - 1),
-                total_count=total,
+                done_count=max(0, int(ok) + int(skip) + int(err)),
+                total_count=max(1, total),
             )
             item = {"venue": vn, "R": n, "status": "", "message": "", "task_id": task_id}
             try:
@@ -16289,16 +16295,28 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             if str(item.get("status") or "") in ("error", "failed"):
                 fail_hint = f"｜失敗:{vn}{n}R"
             # 1レース完了ごとに途中結果を保存（中止・途中でもUIから見られる）
+            try:
+                _qs_mid = _v326_queue_summary(db_path, job_type)
+            except Exception:
+                _qs_mid = {}
+            total = (
+                int(ok) + int(skip) + int(err)
+                + int(_qs_mid.get("pending") or 0)
+                + int(_qs_mid.get("running") or 0)
+            )
+            _done_now = int(ok) + int(skip) + int(err)
             mid_blob = zlib.compress(pickle.dumps({
                 "ok": ok, "skip": skip, "error": err, "details": list(details),
                 "partial": True,
-                "summary": f"途中経過 {i}/{total}｜登録{ok} スキップ{skip} エラー{err}",
+                "queue": _qs_mid,
+                "summary": f"途中経過 {_done_now}/{total}｜登録{ok} スキップ{skip} エラー{err}",
             }, protocol=4), 6)
             _v278_bg_update(
                 db_path, job_id,
-                done_count=i,
+                done_count=_done_now,
+                total_count=max(1, total),
                 current_label=f"{vn} {n}R {item['status']}",
-                message=f"{i}/{total}｜登録{ok} スキップ{skip} エラー{err}{fail_hint}",
+                message=f"{_done_now}/{total}｜登録{ok} スキップ{skip} エラー{err}{fail_hint}",
                 result_blob=mid_blob,
             )
             time_module.sleep(0.2)
