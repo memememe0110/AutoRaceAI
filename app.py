@@ -16234,14 +16234,23 @@ def _v319_register_fetched_result(
             meta_r["学習対象外"] = True
             meta_r["learning_excluded"] = True
             meta_r["learning_exclusion_reason"] = " / ".join(f"{c}番{r}" for c, r in inc_cars)
-            meta_r["予測照合用出走数"] = int(len(have_cars))
-            meta_r["実出走数"] = int(len(have_cars))
+            # Ver324e-B3:
+            # 欠車(kessha)は発走前除外なので、実際に発走した車数から差し引く。
+            # have_cars は rows_r 全件（kessha を落とす前）なので 8 になっている。
+            _kessha_set = set(int(x) for x in (kessha or []))
+            _starters_after_kessha = have_cars - _kessha_set
+            meta_r["予測照合用出走数"] = int(len(_starters_after_kessha))
+            meta_r["実出走数"] = int(len(_starters_after_kessha))
     except Exception:
         pass
     # 反妨車は欠車扱いで落とさない
     rows_for_engine = _v315_drop_kessha_rows(rows_r, kessha)
     if kessha:
+        # Ver324e-B3: 実出走数と予測照合用出走数を必ず同期させる。
+        # 上流の inc_cars ブロックや _v224 側で片方だけ書き換わっていても、
+        # ここで最終確定値として揃える。
         meta_r["実出走数"] = int(len(rows_for_engine))
+        meta_r["予測照合用出走数"] = int(len(rows_for_engine))
     if replace:
         key, *_rest = engine.v70_replace_registered_result(
             meta_r, rows_for_engine, laps_r, payouts_r, db_path
