@@ -2958,6 +2958,149 @@ def _v326_set_sort_orders(
         return int(_v326_queue_write_retry(_run) or 0)
 
 
+_V326_ORDER_KEY = "v326_queue_pending_order"
+
+
+def _v326_sync_order_state(pending_df) -> list:
+    """DB上の pending と session_state の並びを同期。
+
+    - 削除された行は除外
+    - 新規追加された行は末尾へ
+    - 相対順序は維持（意図しない並び替えを起こさない）
+    """
+    db_ids = [int(x) for x in pending_df["task_id"].tolist()]
+    cur = st.session_state.get(_V326_ORDER_KEY)
+    if not isinstance(cur, list):
+        cur = list(db_ids)
+    else:
+        cur = [int(x) for x in cur]
+        present = set(db_ids)
+        cur = [x for x in cur if x in present]
+        have = set(cur)
+        for x in db_ids:
+            if x not in have:
+                cur.append(x)
+    st.session_state[_V326_ORDER_KEY] = cur
+    return cur
+
+
+def _v326_render_queue_reorder(db_path: str, pending_df) -> None:
+    """直感的な並べ替えUI。番号を直接いじらなくてよい。"""
+    import pandas as _pd
+    ids = _v326_sync_order_state(pending_df)
+    lookup = {int(r["task_id"]): dict(r) for _, r in pending_df.iterrows()}
+
+    def _label(tid: int) -> str:
+        r = lookup.get(int(tid)) or {}
+        return f"{r.get('venue','?')} {r.get('race_no','?')}R (task {tid})"
+
+    if not ids:
+        st.caption("pending はありません。")
+        return
+
+    rows = []
+    for i, tid in enumerate(ids, start=1):
+        r = lookup.get(int(tid)) or {}
+        rows.append({
+            "順": i,
+            "task_id": tid,
+            "開催場": r.get("venue", ""),
+            "R": r.get("race_no", ""),
+            "オッズ": "○" if int(r.get("fetch_odds", 1) or 0) else "-",
+            "結果": "○" if int(r.get("register_result", 1) or 0) else "-",
+            "メモ": r.get("message", ""),
+        })
+    st.dataframe(
+        _pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True,
+        height=min(400, 40 + 30 * len(rows)),
+    )
+
+    if len(ids) <= 1:
+        return
+
+    st.markdown("**移動する行を選ぶ**")
+    sel = int(st.selectbox(
+        "行",
+        ids,
+        format_func=_label,
+        key="v326_move_sel",
+        label_visibility="collapsed",
+    ))
+    pos = ids.index(sel)
+
+    c1, c2, c3, c4 = st.columns(4)
+    if c1.button("⤒ 先頭", use_container_width=True, key="v326_mv_top"):
+        ids.pop(pos); ids.insert(0, sel)
+        st.session_state[_V326_ORDER_KEY] = ids; st.rerun()
+    if c2.button("↑ 上へ", use_container_width=True, key="v326_mv_up", disabled=(pos == 0)):
+        ids[pos - 1], ids[pos] = ids[pos], ids[pos - 1]
+        st.session_state[_V326_ORDER_KEY] = ids; st.rerun()
+    if c3.button("↓ 下へ", use_container_width=True, key="v326_mv_dn", disabled=(pos == len(ids) - 1)):
+        ids[pos + 1], ids[pos] = ids[pos], ids[pos + 1]
+        st.session_state[_V326_ORDER_KEY] = ids; st.rerun()
+    if c4.button("⤓ 末尾", use_container_width=True, key="v326_mv_bot"):
+        ids.pop(pos); ids.append(sel)
+        st.session_state[_V326_ORDER_KEY] = ids; st.rerun()
+
+    st.markdown("**または、指定した行の前／後へ移動**")
+    others = [x for x in ids if x != sel]
+    if others:
+        d1, d2, d3 = st.columns([3, 2, 1])
+        target_id = int(d1.selectbox(
+            "基準にする行",
+            others,
+            format_func=_label,
+            key="v326_mv_target",
+        ))
+        target = d2.selectbox("この行の", ["直前", "直後"], key="v326_mv_rel")
+        if d3.button("移動", use_container_width=True, key="v326_mv_go"):
+            ids.pop(pos)
+            tpos = ids.index(target_id)
+            if target == "直後":
+                tpos += 1
+            ids.insert(tpos, sel)
+            st.session_state[_V326_ORDER_KEY] = ids
+            st.rerun()
+
+    st.caption("ボタン操作は画面内の並びだけを変えます。下の保存でDBへ反映されます。")
+    if st.button("📑 この並び順で保存", type="primary", use_container_width=True, key="v326_order_save_simple"):
+        pairs = [(int(tid), i) for i, tid in enumerate(ids)]
+        n = _v326_set_sort_orders(db_path, "official_import", pairs)
+        st.success(f"並び順を保存しました（{n}件）。次回の実行はこの順で処理されます。")
+        st.rerun()
+
+    with st.expander("上級者向け：sort_order を直接編集", expanded=False):
+        st.caption("通常は上のボタンで十分です。数値を直接いじりたい場合のみ使ってください。")
+        _edit_df = pending_df[[
+            c for c in ["task_id", "venue", "race_no", "sort_order", "message"]
+            if c in pending_df.columns
+        ]].copy()
+        _edited = st.data_editor(
+            _edit_df,
+            hide_index=True, use_container_width=True,
+            disabled=[c for c in ["task_id", "venue", "race_no", "message"] if c in _edit_df.columns],
+            key="v326_queue_order_editor_v2",
+            column_config={
+                "sort_order": st.column_config.NumberColumn(
+                    "sort_order", step=1, format="%d",
+                    help="小さいほど先。同値なら task_id 昇順。",
+                ),
+            },
+        )
+        if st.button("📑 番号を保存（上級）", key="v326_order_save_raw", use_container_width=True):
+            _pairs = [
+                (int(r["task_id"]), int(r["sort_order"]))
+                for _, r in _edited.iterrows()
+                if _pd.notna(r.get("sort_order"))
+            ]
+            _n = _v326_set_sort_orders(db_path, "official_import", _pairs)
+            st.success(f"sort_order を保存しました（{_n}件）")
+            st.session_state.pop(_V326_ORDER_KEY, None)
+            st.rerun()
+
+
 def _v326_requeue_errors(db_path: str, job_type: str = "official_import") -> int:
     """error → pending（案A: 明示操作のみ）。"""
     now = _v228_now_jst_iso()
@@ -10957,6 +11100,13 @@ def _v320_reclassify_teishi_as_kessha(meta: dict, rows, result_text: str = "") -
 
 
 def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFrame) -> tuple[dict, pd.DataFrame, list[int]]:
+    """Ver324e: 「- N」行を起点に車番ブロックを厳密分割し、
+    /欠車 等の明示語 + 競走T=0.000（発走後事故語なし）の2条件で事前除外を検出する。
+
+    これにより飯塚 20261002 3R のような
+    「- 5 ...（事故語なし）」+「- 6 ... /欠車」パターンで
+    5番を誤検出・6番を漏らす問題を解消する。
+    """
     if not isinstance(rows, pd.DataFrame) or rows.empty:
         return meta, rows, []
 
@@ -10964,27 +11114,48 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
     if not raw:
         return meta, rows, []
 
-    # 公式結果では「- 4 選手名 ... /欠車」のように掲載される。
-    # 改行・タブ・全角空白の揺れを許容して、事故語の直前にある車番を拾う。
+    # Ver324e: タブ・全角空白→半角空白で正規化
     normalized = re.sub(r"[\t\u3000]+", " ", raw)
     accident_words = r"欠車|発走除外|競走除外|出走取消|出走取り消し|停止"
+    accident_re = re.compile(accident_words)
     detected: list[tuple[int, str]] = []
+    seen_cars: set[int] = set()
 
-    # まず事故語を含む周辺ブロックから「着順 - の次にある車番」を優先取得。
-    block_pattern = re.compile(
-        rf"(?:^|\n)\s*-\s*(?:\n|\s)+([1-8])(?:\s|\n)+(.{{0,160}}?)(?:/\s*)?({accident_words})(?=\s|$)",
-        re.MULTILINE | re.DOTALL,
-    )
-    for m in block_pattern.finditer(normalized):
-        car_no = int(m.group(1))
-        reason = str(m.group(3))
-        _ = detected.append((car_no, reason))
+    # Ver324e: 「- N 選手名」行を起点に車番ブロックを厳密分割。
+    # 各ブロックは次の「- M」行の手前までに限定し、事故語の車番混線を防ぐ。
+    starts = [
+        (m.start(), int(m.group(1)))
+        for m in re.finditer(r"(?m)^\s*[-－]\s*([1-8])\b", normalized)
+    ]
+    for i, (start, car_no) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(normalized)
+        block = normalized[start:end]
 
-    # 保存テキストの整形によって1行化されている場合の補助。
+        # 1) 明示的な事故語（/欠車・/発走除外・/停止 等）→ 事前除外
+        am = accident_re.search(block)
+        if am:
+            if car_no not in seen_cars:
+                seen_cars.add(car_no)
+                detected.append((car_no, str(am.group(0))))
+            continue
+
+        # 2) Ver324e: 競走T=0.000 かつ 発走後事故語なし
+        #    → 発走していない（直前取消・発走前除外）として事前除外扱い
+        #    ※ 反妨・落車・失格・競走中止 等は _v227 側で発走後事故として扱う。
+        if re.search(r"\b0\.000\b", block) and not re.search(
+            r"反妨|反則|失格|落車|他落|周誤|競走中止|故障", block
+        ):
+            if car_no not in seen_cars:
+                seen_cars.add(car_no)
+                detected.append((car_no, "発走前除外"))
+
+    # 補助: 1行化テキストへの後方互換（車番ブロック検出が空のときだけ）
     if not detected:
-        line_pattern = re.compile(rf"-\s*([1-8])\b[^\n]{{0,220}}?({accident_words})")
-        for m in line_pattern.finditer(normalized):
-            _ = detected.append((int(m.group(1)), str(m.group(2))))
+        for m in re.finditer(rf"-\s*([1-8])\b[^\n]{{0,220}}?({accident_words})", normalized):
+            car_no = int(m.group(1))
+            if car_no not in seen_cars:
+                seen_cars.add(car_no)
+                detected.append((car_no, str(m.group(2))))
 
     if not detected:
         return meta, rows, []
@@ -10998,7 +11169,10 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
     for car_no, reason in detected:
         if car_no in existing:
             # 既に行がある場合も事故欄だけ補完する。
-            mask = pd.to_numeric(out["車番"], errors="coerce") == car_no if "車番" in out.columns else None
+            mask = (
+                pd.to_numeric(out["車番"], errors="coerce") == car_no
+                if "車番" in out.columns else None
+            )
             if mask is not None:
                 for col in ("事故", "異常", "異", "備考", "事故内容"):
                     if col in out.columns:
@@ -11022,7 +11196,7 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
             row["事故"] = "事前除外"
         out = pd.concat([out, pd.DataFrame([row])], ignore_index=True)
         existing.add(car_no)
-        _ = added.append(car_no)
+        added.append(car_no)
 
     meta_out = dict(meta or {})
     detected_numbers = sorted({int(car_no) for car_no, _reason in detected})
@@ -11030,8 +11204,11 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
         meta_out["事前除外車番"] = detected_numbers
         meta_out["欠車車番"] = detected_numbers
         meta_out["比較対象外車番"] = detected_numbers
-        meta_out["事前除外理由"] = {str(int(car_no)): str(reason) for car_no, reason in detected}
+        meta_out["事前除外理由"] = {
+            str(int(car_no)): str(reason) for car_no, reason in detected
+        }
         meta_out["実出走数"] = int(len(out) - len(detected_numbers))
+        # Ver324e: 既存 engine の定義を変えず、予測照合用出走数は out の総行数を維持。
         meta_out["予測照合用出走数"] = int(len(out))
     return meta_out, out, sorted(set(added))
 
@@ -17382,10 +17559,29 @@ def _v319_bg_import_start(
                     continue
                 seen.add(item)
                 tasks.append(item)
+        # Ver324c: チェックOFF時は既存 pending の末尾へ。
+        # 以前は sort_order=0 固定で、チェックを付けなくても先頭に入っていた。
+        if insert_first:
+            _so = 0
+        else:
+            try:
+                with _v326_queue_connect(db_path, 15.0) as _qc:
+                    _row = _qc.execute(
+                        """
+                        SELECT COALESCE(MAX(sort_order), -1) + 1
+                          FROM v326_import_queue
+                         WHERE job_type = ? AND status = 'pending'
+                        """,
+                        ("official_import",),
+                    ).fetchone()
+                    _so = int((_row[0] if _row else 0) or 0)
+            except Exception:
+                _so = 0
+
         try:
             enqueued = int(_v326_enqueue_tasks(
                 db_path, "official_import", ymd, tasks,
-                sort_order=0, insert_first=bool(insert_first),
+                sort_order=int(_so), insert_first=bool(insert_first),
                 fetch_odds=bool(fetch_odds),
                 register_result=bool(register_result),
                 skip_existing=bool(skip_existing),
@@ -33285,6 +33481,13 @@ elif selected_main_page == "🏁 予測":
                 )
             st.divider()
             st.markdown("### 詳細予測・診断")
+            # Ver324b: 重い詳細診断は必要時のみ計算（初回表示の高速化）
+            _v324b_heavy = st.checkbox(
+                "🔍 詳細診断を表示（会場重み・レース種別・追抜・逃げ・展開・天候）",
+                value=False,
+                key="v324b_heavy_details_toggle",
+                help="初回表示を速くするため、既定では計算しません。必要な時だけONにしてください。",
+            )
             if day_trend:
                 val = day_trend.get("validation") or {}
                 if float(day_trend.get("blend", 0.0) or 0.0) > 0:
@@ -33412,180 +33615,181 @@ elif selected_main_page == "🏁 予測":
             except Exception as exc:
                 st.caption(f"原因別学習ゲートを表示できませんでした: {exc}")
 
-            with st.expander("🏟️ 今回の開催場重み・適用補正", expanded=True):
-                venue_name = str(meta.get("開催場") or "").strip()
-                try:
-                    profile = engine.v92_venue_weight_profile(venue_name, engine.DB_PATH)
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("開催場", profile.get("開催場") or "未取得")
-                    race_count = int(profile.get("レース数", 0) or 0)
-                    row_count = int(profile.get("開催場全履歴行数", 0) or 0)
-                    row_conf = float(profile.get("レース番号不要反映率", 0.0) or 0.0)
-                    restored_count = int(profile.get("履歴復元レース数", 0) or 0)
-                    m2.metric("全履歴学習", f"{row_count:,}行")
-                    m3.metric("全履歴反映率", f"{row_conf * 100:.1f}%")
-                    m4.metric("展開学習", f"{race_count}R")
-                    if row_count < 50:
-                        st.warning("開催場の全履歴が50行未満のため、第1層補正は安全側で弱く反映されます。")
-                    st.caption(f"第1層はレース番号不要で{row_count:,}行を使用。第2層は同一レースへ復元できた{race_count}R（履歴復元{restored_count}R）で前残り・追込みを学習します。")
-                    st.caption("選手×開催場相性も本人の全場成績との差から縮小推定し、走数が少ない選手は弱く反映します。")
-                    weight_df = pd.DataFrame(profile.get("重み明細", []))
-                    if not weight_df.empty:
-                        # 表示専用に0〜1の信頼度を百分率へ変換する。学習値そのものは変更しない。
-                        weight_view = weight_df.copy()
-                        if "信頼度" in weight_view.columns:
-                            weight_view["信頼度"] = pd.to_numeric(weight_view["信頼度"], errors="coerce") * 100.0
-                        st.dataframe(
-                            weight_view,
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "基礎係数": st.column_config.NumberColumn(format="%.2f"),
-                                "開催場差": st.column_config.NumberColumn(format="%+.3f"),
-                                "信頼度": st.column_config.NumberColumn(format="%.1f%%"),
-                                "実効係数": st.column_config.NumberColumn(format="%.3f"),
-                                "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
-                                "実際寄与目安": st.column_config.NumberColumn(format="%.3f"),
-                            },
-                        )
-                    applied = engine.v92_applied_venue_corrections(df)
-                    if not applied.empty:
-                        st.markdown("#### 各選手へ実際に掛かった補正")
-                        # 表示専用に0〜1の信頼度を百分率へ変換する。予測計算値は維持する。
-                        applied_view = applied.copy()
-                        for pct_col in [
-                            "選手開催場相性信頼度", "開催場全履歴反映率",
-                            "開催場学習反映率", "開催場特徴信頼度",
-                        ]:
-                            if pct_col in applied_view.columns:
-                                applied_view[pct_col] = pd.to_numeric(applied_view[pct_col], errors="coerce") * 100.0
-                        st.dataframe(
-                            applied_view,
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "開催場特徴補正": st.column_config.NumberColumn(format="%+.3f"),
-                                "開催場補正前総合点": st.column_config.NumberColumn(format="%.3f"),
-                                "開催場補正後総合点": st.column_config.NumberColumn(format="%.3f"),
-                                "開催場補正前予測T": st.column_config.NumberColumn(format="%.4f"),
-                                "開催場共通タイム補正秒": st.column_config.NumberColumn(format="%+.4f"),
-                                "選手開催場相性秒": st.column_config.NumberColumn(format="%+.4f"),
-                                "開催場補正秒": st.column_config.NumberColumn(format="%+.4f"),
-                                "開催場補正後予測T": st.column_config.NumberColumn(format="%.4f"),
-                                "選手開催場相性信頼度": st.column_config.NumberColumn(format="%.1f%%"),
-                                "開催場全履歴反映率": st.column_config.NumberColumn(format="%.1f%%"),
-                                "開催場学習反映率": st.column_config.NumberColumn(format="%.1f%%"),
-                                "開催場特徴信頼度": st.column_config.NumberColumn(format="%.1f%%"),
-                                "開催場前残り差": st.column_config.NumberColumn(format="%+.3f"),
-                                "開催場追込み差": st.column_config.NumberColumn(format="%+.3f"),
-                                "開催場試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
-                                "開催場ST影響差": st.column_config.NumberColumn(format="%+.3f"),
-                            },
-                        )
-                    st.caption("Ver96は展開層・全履歴層・選手相性を分けて表示します。補正は縮小・上限制御され、少数データだけで順位が暴れない設計です。")
-                except Exception as exc:
-                    st.warning(f"開催場重みを表示できませんでした: {exc}")
+            if _v324b_heavy:
+                with st.expander("🏟️ 今回の開催場重み・適用補正", expanded=True):
+                    venue_name = str(meta.get("開催場") or "").strip()
+                    try:
+                        profile = engine.v92_venue_weight_profile(venue_name, engine.DB_PATH)
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("開催場", profile.get("開催場") or "未取得")
+                        race_count = int(profile.get("レース数", 0) or 0)
+                        row_count = int(profile.get("開催場全履歴行数", 0) or 0)
+                        row_conf = float(profile.get("レース番号不要反映率", 0.0) or 0.0)
+                        restored_count = int(profile.get("履歴復元レース数", 0) or 0)
+                        m2.metric("全履歴学習", f"{row_count:,}行")
+                        m3.metric("全履歴反映率", f"{row_conf * 100:.1f}%")
+                        m4.metric("展開学習", f"{race_count}R")
+                        if row_count < 50:
+                            st.warning("開催場の全履歴が50行未満のため、第1層補正は安全側で弱く反映されます。")
+                        st.caption(f"第1層はレース番号不要で{row_count:,}行を使用。第2層は同一レースへ復元できた{race_count}R（履歴復元{restored_count}R）で前残り・追込みを学習します。")
+                        st.caption("選手×開催場相性も本人の全場成績との差から縮小推定し、走数が少ない選手は弱く反映します。")
+                        weight_df = pd.DataFrame(profile.get("重み明細", []))
+                        if not weight_df.empty:
+                            # 表示専用に0〜1の信頼度を百分率へ変換する。学習値そのものは変更しない。
+                            weight_view = weight_df.copy()
+                            if "信頼度" in weight_view.columns:
+                                weight_view["信頼度"] = pd.to_numeric(weight_view["信頼度"], errors="coerce") * 100.0
+                            st.dataframe(
+                                weight_view,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "基礎係数": st.column_config.NumberColumn(format="%.2f"),
+                                    "開催場差": st.column_config.NumberColumn(format="%+.3f"),
+                                    "信頼度": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "実効係数": st.column_config.NumberColumn(format="%.3f"),
+                                    "最大寄与目安": st.column_config.NumberColumn(format="%.3f"),
+                                    "実際寄与目安": st.column_config.NumberColumn(format="%.3f"),
+                                },
+                            )
+                        applied = engine.v92_applied_venue_corrections(df)
+                        if not applied.empty:
+                            st.markdown("#### 各選手へ実際に掛かった補正")
+                            # 表示専用に0〜1の信頼度を百分率へ変換する。予測計算値は維持する。
+                            applied_view = applied.copy()
+                            for pct_col in [
+                                "選手開催場相性信頼度", "開催場全履歴反映率",
+                                "開催場学習反映率", "開催場特徴信頼度",
+                            ]:
+                                if pct_col in applied_view.columns:
+                                    applied_view[pct_col] = pd.to_numeric(applied_view[pct_col], errors="coerce") * 100.0
+                            st.dataframe(
+                                applied_view,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "開催場特徴補正": st.column_config.NumberColumn(format="%+.3f"),
+                                    "開催場補正前総合点": st.column_config.NumberColumn(format="%.3f"),
+                                    "開催場補正後総合点": st.column_config.NumberColumn(format="%.3f"),
+                                    "開催場補正前予測T": st.column_config.NumberColumn(format="%.4f"),
+                                    "開催場共通タイム補正秒": st.column_config.NumberColumn(format="%+.4f"),
+                                    "選手開催場相性秒": st.column_config.NumberColumn(format="%+.4f"),
+                                    "開催場補正秒": st.column_config.NumberColumn(format="%+.4f"),
+                                    "開催場補正後予測T": st.column_config.NumberColumn(format="%.4f"),
+                                    "選手開催場相性信頼度": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "開催場全履歴反映率": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "開催場学習反映率": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "開催場特徴信頼度": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "開催場前残り差": st.column_config.NumberColumn(format="%+.3f"),
+                                    "開催場追込み差": st.column_config.NumberColumn(format="%+.3f"),
+                                    "開催場試走信頼差": st.column_config.NumberColumn(format="%+.3f"),
+                                    "開催場ST影響差": st.column_config.NumberColumn(format="%+.3f"),
+                                },
+                            )
+                        st.caption("Ver96は展開層・全履歴層・選手相性を分けて表示します。補正は縮小・上限制御され、少数データだけで順位が暴れない設計です。")
+                    except Exception as exc:
+                        st.warning(f"開催場重みを表示できませんでした: {exc}")
 
-            with st.expander("🎯 レース種別適性・一般戦傾向", expanded=True):
-                type_cols = [c for c in [
-                    "車", "選手名", "今回レース種別", "レース種別履歴件数",
-                    "レース種別適性信頼度", "レース種別適性差", "レース種別適性補正",
-                    "試走実走変換平均", "レース種別適性傾向"
-                ] if c in df.columns]
-                if type_cols:
-                    type_view = df[type_cols].sort_values(["レース種別適性補正", "車"], ascending=[False, True]).reset_index(drop=True)
-                    if "レース種別適性信頼度" in type_view.columns:
-                        type_view["レース種別適性信頼度"] = pd.to_numeric(type_view["レース種別適性信頼度"], errors="coerce") * 100.0
-                    st.dataframe(type_view, use_container_width=True, hide_index=True, column_config={
-                        "レース種別適性信頼度": st.column_config.NumberColumn(format="%.1f%%"),
-                        "レース種別適性差": st.column_config.NumberColumn(format="%+.3f"),
-                        "レース種別適性補正": st.column_config.NumberColumn(format="%+.3f"),
-                        "試走実走変換平均": st.column_config.NumberColumn(format="%.3f"),
+                with st.expander("🎯 レース種別適性・一般戦傾向", expanded=True):
+                    type_cols = [c for c in [
+                        "車", "選手名", "今回レース種別", "レース種別履歴件数",
+                        "レース種別適性信頼度", "レース種別適性差", "レース種別適性補正",
+                        "試走実走変換平均", "レース種別適性傾向"
+                    ] if c in df.columns]
+                    if type_cols:
+                        type_view = df[type_cols].sort_values(["レース種別適性補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                        if "レース種別適性信頼度" in type_view.columns:
+                            type_view["レース種別適性信頼度"] = pd.to_numeric(type_view["レース種別適性信頼度"], errors="coerce") * 100.0
+                        st.dataframe(type_view, use_container_width=True, hide_index=True, column_config={
+                            "レース種別適性信頼度": st.column_config.NumberColumn(format="%.1f%%"),
+                            "レース種別適性差": st.column_config.NumberColumn(format="%+.3f"),
+                            "レース種別適性補正": st.column_config.NumberColumn(format="%+.3f"),
+                            "試走実走変換平均": st.column_config.NumberColumn(format="%.3f"),
+                        })
+                    else:
+                        st.info("レース種別適性データを取得できませんでした。")
+                    st.caption("『やる気』や意図は断定せず、一般戦・予選・準決勝系・優勝戦・選抜戦ごとの実走差を縮小推定します。履歴が少ない選手は本人の通常成績へ強く寄せます。")
+                    st.caption("次走予定や調整目的は、未来の出走データがDBに十分揃うまでは補正に使いません。")
+
+                with st.expander("🔄 グランドノート追い抜き相性", expanded=True):
+                    matchup_cols = [c for c in [
+                        "車", "選手名", "対戦周回比較数", "信頼対戦相手数",
+                        "追い抜き相性指数", "追い抜き相性補正", "追い抜き相性メモ"
+                    ] if c in df.columns]
+                    if matchup_cols:
+                        matchup_view = df[matchup_cols].sort_values(["追い抜き相性補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                        st.dataframe(matchup_view, use_container_width=True, hide_index=True, column_config={
+                            "追い抜き相性指数": st.column_config.NumberColumn(format="%+.3f"),
+                            "追い抜き相性補正": st.column_config.NumberColumn(format="%+.3f"),
+                        })
+                    else:
+                        st.info("今回の出走選手間で比較できるグランドノート履歴がありません。")
+                    st.caption("周回ごとの前後関係が反転した場合だけ追い抜きとして集計します。最終着順だけの先着は含めません。対戦数が少ない組み合わせは縮小し、補正を小さく制限します。")
+
+                with st.expander("🏍️ 逃げ役・逃げ残り診断", expanded=True):
+                    escape_cols = [c for c in [
+                        "車", "選手名", "ハンデ", "逃げ判定", "初周先頭推定", "逃げ残り推定",
+                        "逃切り推定", "逃げ履歴件数", "初周先頭実測件数", "逃げ履歴補正", "逃げ根拠"
+                    ] if c in df.columns]
+                    escape_view = df[escape_cols].sort_values(["ハンデ", "車"]).reset_index(drop=True)
+                    for pct_col in ["初周先頭推定", "逃げ残り推定", "逃切り推定"]:
+                        if pct_col in escape_view.columns:
+                            escape_view[pct_col] = pd.to_numeric(escape_view[pct_col], errors="coerce") * 100.0
+                    st.dataframe(
+                        escape_view, use_container_width=True, hide_index=True,
+                        column_config={
+                            "初周先頭推定": st.column_config.NumberColumn(format="%.1f%%"),
+                            "逃げ残り推定": st.column_config.NumberColumn(format="%.1f%%"),
+                            "逃切り推定": st.column_config.NumberColumn(format="%.1f%%"),
+                            "逃げ履歴補正": st.column_config.NumberColumn(format="%+.3f"),
+                        },
+                    )
+                    st.caption("初周先頭は主導権、逃げ残りは2～3着を含む粘り、逃切りは1着まで残す見込みです。周回実測が少ない間は0m実績・ST・今回の位置関係を中心に推定します。")
+
+                with st.expander("🧭 グランドノート展開学習・熱走路診断", expanded=True):
+                    v60_cols = [c for c in [
+                        "車", "選手名", "展開タイプ_実測", "展開履歴件数", "初周主導指数", "位置維持指数",
+                        "捌き指数", "追込み指数", "終盤指数_実測", "失速リスク", "展開学習補正",
+                        "熱走路帯", "高温履歴件数", "50℃以上3着内率", "熱走路適性", "熱走路学習補正",
+                        "Ver60総合補正", "Ver60根拠"
+                    ] if c in df.columns]
+                    v60_view = df[v60_cols].sort_values(["Ver60総合補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                    for pc in ["初周主導指数", "位置維持指数", "捌き指数", "追込み指数", "終盤指数_実測", "失速リスク", "50℃以上3着内率", "熱走路適性"]:
+                        if pc in v60_view.columns:
+                            v60_view[pc] = pd.to_numeric(v60_view[pc], errors="coerce") * 100.0
+                    st.dataframe(v60_view, use_container_width=True, hide_index=True, column_config={
+                        "初周主導指数": st.column_config.NumberColumn(format="%.1f%%"),
+                        "位置維持指数": st.column_config.NumberColumn(format="%.1f%%"),
+                        "捌き指数": st.column_config.NumberColumn(format="%.1f%%"),
+                        "追込み指数": st.column_config.NumberColumn(format="%.1f%%"),
+                        "終盤指数_実測": st.column_config.NumberColumn(format="%.1f%%"),
+                        "失速リスク": st.column_config.NumberColumn(format="%.1f%%"),
+                        "50℃以上3着内率": st.column_config.NumberColumn(format="%.1f%%"),
+                        "熱走路適性": st.column_config.NumberColumn(format="%.1f%%"),
+                        "展開学習補正": st.column_config.NumberColumn(format="%+.3f"),
+                        "熱走路学習補正": st.column_config.NumberColumn(format="%+.3f"),
+                        "Ver60総合補正": st.column_config.NumberColumn(format="%+.3f"),
                     })
-                else:
-                    st.info("レース種別適性データを取得できませんでした。")
-                st.caption("『やる気』や意図は断定せず、一般戦・予選・準決勝系・優勝戦・選抜戦ごとの実走差を縮小推定します。履歴が少ない選手は本人の通常成績へ強く寄せます。")
-                st.caption("次走予定や調整目的は、未来の出走データがDBに十分揃うまでは補正に使いません。")
+                    temp_now = meta.get("走路温度") or "未取得"
+                    st.caption(f"今回の走路温度：{temp_now}℃。47℃以上を細分化し、50℃以降は前残り・位置維持・選手別高温実績の影響を非線形に強めています。")
+                    st.caption("周回履歴が少ない選手は補正を自動で縮小します。予測対象日以降の結果は学習に使いません。")
 
-            with st.expander("🔄 グランドノート追い抜き相性", expanded=True):
-                matchup_cols = [c for c in [
-                    "車", "選手名", "対戦周回比較数", "信頼対戦相手数",
-                    "追い抜き相性指数", "追い抜き相性補正", "追い抜き相性メモ"
-                ] if c in df.columns]
-                if matchup_cols:
-                    matchup_view = df[matchup_cols].sort_values(["追い抜き相性補正", "車"], ascending=[False, True]).reset_index(drop=True)
-                    st.dataframe(matchup_view, use_container_width=True, hide_index=True, column_config={
-                        "追い抜き相性指数": st.column_config.NumberColumn(format="%+.3f"),
-                        "追い抜き相性補正": st.column_config.NumberColumn(format="%+.3f"),
-                    })
-                else:
-                    st.info("今回の出走選手間で比較できるグランドノート履歴がありません。")
-                st.caption("周回ごとの前後関係が反転した場合だけ追い抜きとして集計します。最終着順だけの先着は含めません。対戦数が少ない組み合わせは縮小し、補正を小さく制限します。")
-
-            with st.expander("🏍️ 逃げ役・逃げ残り診断", expanded=True):
-                escape_cols = [c for c in [
-                    "車", "選手名", "ハンデ", "逃げ判定", "初周先頭推定", "逃げ残り推定",
-                    "逃切り推定", "逃げ履歴件数", "初周先頭実測件数", "逃げ履歴補正", "逃げ根拠"
-                ] if c in df.columns]
-                escape_view = df[escape_cols].sort_values(["ハンデ", "車"]).reset_index(drop=True)
-                for pct_col in ["初周先頭推定", "逃げ残り推定", "逃切り推定"]:
-                    if pct_col in escape_view.columns:
-                        escape_view[pct_col] = pd.to_numeric(escape_view[pct_col], errors="coerce") * 100.0
-                st.dataframe(
-                    escape_view, use_container_width=True, hide_index=True,
-                    column_config={
-                        "初周先頭推定": st.column_config.NumberColumn(format="%.1f%%"),
-                        "逃げ残り推定": st.column_config.NumberColumn(format="%.1f%%"),
-                        "逃切り推定": st.column_config.NumberColumn(format="%.1f%%"),
-                        "逃げ履歴補正": st.column_config.NumberColumn(format="%+.3f"),
-                    },
-                )
-                st.caption("初周先頭は主導権、逃げ残りは2～3着を含む粘り、逃切りは1着まで残す見込みです。周回実測が少ない間は0m実績・ST・今回の位置関係を中心に推定します。")
-
-            with st.expander("🧭 グランドノート展開学習・熱走路診断", expanded=True):
-                v60_cols = [c for c in [
-                    "車", "選手名", "展開タイプ_実測", "展開履歴件数", "初周主導指数", "位置維持指数",
-                    "捌き指数", "追込み指数", "終盤指数_実測", "失速リスク", "展開学習補正",
-                    "熱走路帯", "高温履歴件数", "50℃以上3着内率", "熱走路適性", "熱走路学習補正",
-                    "Ver60総合補正", "Ver60根拠"
-                ] if c in df.columns]
-                v60_view = df[v60_cols].sort_values(["Ver60総合補正", "車"], ascending=[False, True]).reset_index(drop=True)
-                for pc in ["初周主導指数", "位置維持指数", "捌き指数", "追込み指数", "終盤指数_実測", "失速リスク", "50℃以上3着内率", "熱走路適性"]:
-                    if pc in v60_view.columns:
-                        v60_view[pc] = pd.to_numeric(v60_view[pc], errors="coerce") * 100.0
-                st.dataframe(v60_view, use_container_width=True, hide_index=True, column_config={
-                    "初周主導指数": st.column_config.NumberColumn(format="%.1f%%"),
-                    "位置維持指数": st.column_config.NumberColumn(format="%.1f%%"),
-                    "捌き指数": st.column_config.NumberColumn(format="%.1f%%"),
-                    "追込み指数": st.column_config.NumberColumn(format="%.1f%%"),
-                    "終盤指数_実測": st.column_config.NumberColumn(format="%.1f%%"),
-                    "失速リスク": st.column_config.NumberColumn(format="%.1f%%"),
-                    "50℃以上3着内率": st.column_config.NumberColumn(format="%.1f%%"),
-                    "熱走路適性": st.column_config.NumberColumn(format="%.1f%%"),
-                    "展開学習補正": st.column_config.NumberColumn(format="%+.3f"),
-                    "熱走路学習補正": st.column_config.NumberColumn(format="%+.3f"),
-                    "Ver60総合補正": st.column_config.NumberColumn(format="%+.3f"),
-                })
-                temp_now = meta.get("走路温度") or "未取得"
-                st.caption(f"今回の走路温度：{temp_now}℃。47℃以上を細分化し、50℃以降は前残り・位置維持・選手別高温実績の影響を非線形に強めています。")
-                st.caption("周回履歴が少ない選手は補正を自動で縮小します。予測対象日以降の結果は学習に使いません。")
-
-            with st.expander("🌤️ 天候・複合条件適性", expanded=True):
-                weather_cols = [c for c in [
-                    "車", "選手名", "今回天候", "天候条件キー", "天候一致最大件数",
-                    "天候適性信頼度", "天候適性補正", "天候適性根拠"
-                ] if c in df.columns]
-                if weather_cols:
-                    weather_view = df[weather_cols].sort_values(["天候適性補正", "車"], ascending=[False, True]).reset_index(drop=True)
-                    if "天候適性信頼度" in weather_view.columns:
-                        weather_view["天候適性信頼度"] = pd.to_numeric(weather_view["天候適性信頼度"], errors="coerce") * 100.0
-                    st.dataframe(weather_view, use_container_width=True, hide_index=True, column_config={
-                        "天候適性信頼度": st.column_config.NumberColumn(format="%.1f%%"),
-                        "天候適性補正": st.column_config.NumberColumn(format="%+.3f"),
-                    })
-                else:
-                    st.info("天候データを取得できなかったため、今回は天候補正を行っていません。")
-                st.caption("天候単独に加え、天候×走路状態×走路温度帯×時間帯を選手別に学習します。複合条件は十分な履歴件数がある場合だけ反映します。")
+                with st.expander("🌤️ 天候・複合条件適性", expanded=True):
+                    weather_cols = [c for c in [
+                        "車", "選手名", "今回天候", "天候条件キー", "天候一致最大件数",
+                        "天候適性信頼度", "天候適性補正", "天候適性根拠"
+                    ] if c in df.columns]
+                    if weather_cols:
+                        weather_view = df[weather_cols].sort_values(["天候適性補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                        if "天候適性信頼度" in weather_view.columns:
+                            weather_view["天候適性信頼度"] = pd.to_numeric(weather_view["天候適性信頼度"], errors="coerce") * 100.0
+                        st.dataframe(weather_view, use_container_width=True, hide_index=True, column_config={
+                            "天候適性信頼度": st.column_config.NumberColumn(format="%.1f%%"),
+                            "天候適性補正": st.column_config.NumberColumn(format="%+.3f"),
+                        })
+                    else:
+                        st.info("天候データを取得できなかったため、今回は天候補正を行っていません。")
+                    st.caption("天候単独に加え、天候×走路状態×走路温度帯×時間帯を選手別に学習します。複合条件は十分な履歴件数がある場合だけ反映します。")
 
             st.markdown('<div id="prediction-summary"></div>', unsafe_allow_html=True)
             v73_section_nav()
@@ -33906,32 +34110,8 @@ if selected_main_page == "✅ 結果登録・解析":
             _qdf = pd.DataFrame()
         if _qdf is not None and not _qdf.empty:
             _pend_view = _qdf[_qdf["status"] == "pending"].copy().reset_index(drop=True)
-            if not _pend_view.empty and "sort_order" in _pend_view.columns:
-                st.markdown("**並び順（数値が小さいほど先に処理）**")
-                st.caption("sort_order を書き換えて「並び順を保存」を押してください。")
-                _order_cols = [c for c in ["task_id", "venue", "race_no", "sort_order", "message"]
-                               if c in _pend_view.columns]
-                _edited_order = st.data_editor(
-                    _pend_view[_order_cols],
-                    hide_index=True, use_container_width=True,
-                    disabled=[c for c in _order_cols if c != "sort_order"],
-                    key="v326_queue_order_editor",
-                    column_config={
-                        "sort_order": st.column_config.NumberColumn(
-                            "並び順", step=1, format="%d",
-                            help="小さいほど先。同値なら task_id 昇順。",
-                        ),
-                    },
-                )
-                if st.button("📑 並び順を保存", key="v326_queue_order_save", use_container_width=True):
-                    _pairs = [
-                        (int(r["task_id"]), int(r["sort_order"]))
-                        for _, r in _edited_order.iterrows()
-                        if pd.notna(r.get("sort_order"))
-                    ]
-                    _n = _v326_set_sort_orders(engine.DB_PATH, "official_import", _pairs)
-                    st.success(f"並び順を保存しました（{_n}件）")
-                    st.rerun()
+            if not _pend_view.empty:
+                _v326_render_queue_reorder(engine.DB_PATH, _pend_view)
             with st.expander("キュー全件を表示", expanded=False):
                 st.dataframe(_qdf, use_container_width=True, hide_index=True)
             _del_ids = st.multiselect(
