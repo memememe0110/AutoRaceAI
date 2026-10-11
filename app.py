@@ -11143,7 +11143,7 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
         #    → 発走していない（直前取消・発走前除外）として事前除外扱い
         #    ※ 反妨・落車・失格・競走中止 等は _v227 側で発走後事故として扱う。
         if re.search(r"\b0\.000\b", block) and not re.search(
-            r"反妨|反則|失格|落車|他落|周誤|競走中止|故障", block
+            r"反妨|反則|失格|落車|他落|周誤|競走中止|故障|内突|外突", block
         ):
             if car_no not in seen_cars:
                 seen_cars.add(car_no)
@@ -11223,12 +11223,16 @@ def _v315_detect_kessha_cars(result_text: str, rows: pd.DataFrame | None = None)
     raw = str(result_text or "")
     normalized = re.sub(r"[\t\u3000]+", " ", raw)
     words = r"欠車|発走除外|競走除外|出走取消|出走取り消し|停止"
-    for m in re.finditer(
-        rf"(?:^|\n)\s*[-－]\s*([1-8])\b[\s\S]{{0,280}}?(?:/\s*)?({words})",
-        normalized,
-        flags=re.MULTILINE,
-    ):
-        found.add(int(m.group(1)))
+    # Ver324e-B2: 「- N」車番ブロック単位で判定し、次車番の欠車語を跨いで誤検出しない。
+    _starts = [
+        (m.start(), int(m.group(1)))
+        for m in re.finditer(r"(?m)^\s*[-－]\s*([1-8])\b", normalized)
+    ]
+    for i, (start, car_no) in enumerate(_starts):
+        end = _starts[i + 1][0] if i + 1 < len(_starts) else len(normalized)
+        block = normalized[start:end]
+        if re.search(words, block):
+            found.add(car_no)
     for m in re.finditer(rf"\b([1-8])\s*番?[^\n]{{0,80}}(?:/\s*)?({words})", normalized):
         found.add(int(m.group(1)))
     if isinstance(rows, pd.DataFrame) and not rows.empty and "車番" in rows.columns:
@@ -11241,13 +11245,14 @@ def _v315_detect_kessha_cars(result_text: str, rows: pd.DataFrame | None = None)
             if re.search(words, blob):
                 found.add(int(car))
             finish = rows.at[idx, "着順"] if "着順" in rows.columns else None
-            race_t = rows.at[idx, "競走T"] if "競走T" in rows.columns else None
             try:
                 finish_s = str(finish).strip()
             except Exception:
                 finish_s = ""
             if finish_s in {"-", "－", "欠車", "None", "nan"}:
-                if re.search(words, raw) or (pd.to_numeric(pd.Series([race_t]), errors="coerce").fillna(1).iloc[0] == 0):
+                # Ver324e-B2: raw 全体ではなく当該車の status blob のみを見る。
+                # これにより 5番の競走T=0.000 + 6番の /欠車 で 5番を再検出しない。
+                if re.search(words, blob):
                     found.add(int(car))
     return sorted(found)
 
@@ -11306,7 +11311,7 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
         return dict(meta or {}), []
     normalized = re.sub(r"[\t\u3000]+", " ", raw)
     # 欠車・出走取消は発走前除外。ここでは発走後事故のみ。
-    words = r"反妨|反則妨害|妨害失格|反則失格|落車|他落|落妨|競走中止|周回誤認|周誤|故障"
+    words = r"反妨|反則妨害|妨害失格|反則失格|落車|他落|落妨|競走中止|周回誤認|周誤|故障|内突|外突"
     # 「失格」単体は払戻説明や脚注に出やすいので、スラッシュ付きのみ採用する
     words_slash = words + r"|失格"
     found: list[dict] = []
