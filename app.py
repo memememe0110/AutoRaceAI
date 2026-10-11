@@ -2624,6 +2624,19 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                 ON v326_import_queue (job_type, status, sort_order, task_id)
                 """
             )
+            for _col, _typ in (
+                ("fetch_odds", "INTEGER NOT NULL DEFAULT 1"),
+                ("register_result", "INTEGER NOT NULL DEFAULT 1"),
+                ("skip_existing", "INTEGER NOT NULL DEFAULT 1"),
+                ("replace_existing", "INTEGER NOT NULL DEFAULT 0"),
+                ("predict_if_missing", "INTEGER NOT NULL DEFAULT 1"),
+            ):
+                try:
+                    con.execute(
+                        f"ALTER TABLE v326_import_queue ADD COLUMN {_col} {_typ}"
+                    )
+                except Exception:
+                    pass
             con.commit()
     with _V326_QUEUE_LOCK:
         _v326_queue_write_retry(_run)
@@ -2635,8 +2648,20 @@ def _v326_enqueue_tasks(
     ymd: str,
     tasks: list,
     sort_order: int = 0,
+    insert_first: bool = False,
+    *,
+    fetch_odds: bool = True,
+    register_result: bool = True,
+    skip_existing: bool = True,
+    replace: bool = False,
+    predict_if_missing: bool = True,
 ) -> int:
-    """未登録分のみ pending 投入。既存行は触らない。戻り値=新規件数。"""
+    """未登録分のみ pending 投入。既存行は触らない。戻り値=新規件数。
+
+    insert_first=True: 既存 pending の sort_order を +1 シフトし、
+    新規行を sort_order=0 で先頭に挿入する。
+    オプション列は追加時点のチェック状態を保存する。
+    """
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     now = _v228_now_jst_iso()
     task_list = []
@@ -2654,6 +2679,33 @@ def _v326_enqueue_tasks(
     except Exception:
         pass
 
+    if insert_first:
+        with _V326_QUEUE_LOCK:
+            def _shift():
+                with _v326_queue_connect(db_path, 30.0) as con:
+                    con.execute(
+                        """
+                        UPDATE v326_import_queue
+                           SET sort_order = COALESCE(sort_order,0) + 1,
+                               updated_at = ?
+                         WHERE job_type = ? AND status = 'pending'
+                        """,
+                        (now, str(job_type)),
+                    )
+                    con.commit()
+                    return 1
+            try:
+                _v326_queue_write_retry(_shift)
+            except Exception:
+                pass
+
+    effective_so = 0 if insert_first else int(sort_order or 0)
+    _fo = 1 if fetch_odds else 0
+    _rr = 1 if register_result else 0
+    _se = 1 if skip_existing else 0
+    _rp = 1 if replace else 0
+    _pm = 1 if predict_if_missing else 0
+
     def _run():
         inserted = 0
         with _v326_queue_connect(db_path, 30.0) as con:
@@ -2662,10 +2714,16 @@ def _v326_enqueue_tasks(
                     """
                     INSERT OR IGNORE INTO v326_import_queue
                         (job_type, ymd, venue, race_no, status, sort_order,
-                         message, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'pending', ?, '', ?, ?)
+                         message, created_at, updated_at,
+                         fetch_odds, register_result, skip_existing,
+                         replace_existing, predict_if_missing)
+                    VALUES (?, ?, ?, ?, 'pending', ?, '', ?, ?,
+                            ?, ?, ?, ?, ?)
                     """,
-                    (str(job_type), ymd, venue, rn, int(sort_order or 0), now, now),
+                    (
+                        str(job_type), ymd, venue, rn, int(effective_so), now, now,
+                        _fo, _rr, _se, _rp, _pm,
+                    ),
                 )
                 inserted += int(cur.rowcount or 0)
             con.commit()
@@ -2738,7 +2796,12 @@ def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
         with _v326_queue_connect(db_path, 30.0) as con:
             row = con.execute(
                 """
-                SELECT task_id, ymd, venue, race_no
+                SELECT task_id, ymd, venue, race_no,
+                       COALESCE(fetch_odds, 1),
+                       COALESCE(register_result, 1),
+                       COALESCE(skip_existing, 1),
+                       COALESCE(replace_existing, 0),
+                       COALESCE(predict_if_missing, 1)
                   FROM v326_import_queue
                  WHERE job_type = ? AND status = 'pending'
                  ORDER BY sort_order ASC, task_id ASC
@@ -2765,6 +2828,11 @@ def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
                 "ymd": str(row[1] or ""),
                 "venue": str(row[2] or ""),
                 "race_no": int(row[3] or 0),
+                "fetch_odds": bool(int(row[4] or 1)),
+                "register_result": bool(int(row[5] or 1)),
+                "skip_existing": bool(int(row[6] or 1)),
+                "replace": bool(int(row[7] or 0)),
+                "predict_if_missing": bool(int(row[8] or 1)),
             }
 
     with _V326_QUEUE_LOCK:
@@ -2802,7 +2870,12 @@ def _v326_list_queue_tasks(
             df = pd.read_sql_query(
                 """
                 SELECT task_id, job_type, ymd, venue, race_no, status,
-                       sort_order, message, created_at, updated_at
+                       sort_order, message, created_at, updated_at,
+                       COALESCE(fetch_odds,1) AS fetch_odds,
+                       COALESCE(register_result,1) AS register_result,
+                       COALESCE(skip_existing,1) AS skip_existing,
+                       COALESCE(replace_existing,0) AS replace_existing,
+                       COALESCE(predict_if_missing,1) AS predict_if_missing
                   FROM v326_import_queue
                  WHERE job_type = ?
                  ORDER BY
@@ -2848,6 +2921,37 @@ def _v326_delete_queue_tasks(db_path: str, task_ids: list) -> int:
             )
             con.commit()
             return int(cur.rowcount or 0)
+
+    with _V326_QUEUE_LOCK:
+        return int(_v326_queue_write_retry(_run) or 0)
+
+
+def _v326_set_sort_orders(
+    db_path: str, job_type: str, pairs: list,
+) -> int:
+    """(task_id, sort_order) のペアで pending の並び順を一括更新。"""
+    if not pairs:
+        return 0
+    now = _v228_now_jst_iso()
+
+    def _run():
+        n = 0
+        with _v326_queue_connect(db_path, 30.0) as con:
+            for task_id, so in pairs:
+                try:
+                    cur = con.execute(
+                        """
+                        UPDATE v326_import_queue
+                           SET sort_order = ?, updated_at = ?
+                         WHERE task_id = ? AND status = 'pending'
+                        """,
+                        (int(so), now, int(task_id)),
+                    )
+                    n += int(cur.rowcount or 0)
+                except Exception:
+                    continue
+            con.commit()
+        return n
 
     with _V326_QUEUE_LOCK:
         return int(_v326_queue_write_retry(_run) or 0)
@@ -11713,6 +11817,59 @@ def _v319_result_page_alive(ymd: str, venue: str, race_no: int) -> bool:
     return ("払戻" in html or "着" in html) and ("選手" in html or "車" in html)
 
 
+def _v319_registered_race_nos(db_path: str, ymd: str, venue: str) -> list[int]:
+    """result_races に登録済みのレース番号一覧（昇順）。不成立も含む。"""
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    venue = str(venue or "").strip()
+    if not ymd or not venue or len(ymd) < 8:
+        return []
+    date_s = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+    out = []
+    try:
+        with sqlite3.connect(str(db_path), timeout=10.0) as con:
+            con.execute("PRAGMA busy_timeout=10000")
+            # race_key 形式: YYYYMMDD_会場_NR または race_date + venue
+            rows = con.execute(
+                """
+                SELECT DISTINCT race_no FROM result_races
+                 WHERE (
+                        race_key LIKE ?
+                     OR (COALESCE(race_date,'') IN (?, ?) AND COALESCE(venue,'') = ?)
+                       )
+                   AND race_no IS NOT NULL
+                   AND CAST(race_no AS INTEGER) BETWEEN 1 AND 12
+                 ORDER BY CAST(race_no AS INTEGER)
+                """,
+                (f"{ymd}_{venue}_%", date_s, ymd, venue),
+            ).fetchall()
+            for r in rows:
+                try:
+                    n = int(r[0])
+                except Exception:
+                    continue
+                if 1 <= n <= 12 and n not in out:
+                    out.append(n)
+            # race_key から番号を拾う（race_no 空の救済）
+            if not out:
+                rows2 = con.execute(
+                    """
+                    SELECT race_key FROM result_races
+                     WHERE race_key LIKE ?
+                    """,
+                    (f"{ymd}_{venue}_%",),
+                ).fetchall()
+                for r in rows2:
+                    m = re.search(r"_(\d{1,2})R$", str(r[0] or ""))
+                    if m:
+                        n = int(m.group(1))
+                        if 1 <= n <= 12 and n not in out:
+                            out.append(n)
+                out.sort()
+    except Exception:
+        return []
+    return out
+
+
 def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[int]:
     """1Rから当日の最大Rまで連番。抜けた1Rは補う。"""
     place = _V319_OP_PLACE.get(str(venue) or "")
@@ -16194,15 +16351,21 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             )
             item = {"venue": vn, "R": n, "status": "", "message": "", "task_id": task_id}
             try:
+                # task 行のオプション優先（追加時の意図を保持）。無ければ job の req。
+                _t_skip = task.get("skip_existing")
+                _t_repl = task.get("replace")
+                _t_pred = task.get("predict_if_missing")
+                _t_odds = task.get("fetch_odds")
+                _t_reg = task.get("register_result")
                 one = _v319_import_one_race(
                     db_path, ymd_t, vn, n,
-                    skip_existing=bool(req.get("skip_existing")),
-                    replace=bool(req.get("replace")),
-                    predict_if_missing=bool(req.get("predict_if_missing")),
+                    skip_existing=bool(_t_skip if _t_skip is not None else req.get("skip_existing")),
+                    replace=bool(_t_repl if _t_repl is not None else req.get("replace")),
+                    predict_if_missing=bool(_t_pred if _t_pred is not None else req.get("predict_if_missing")),
                     trials=int(req.get("trials") or 20000),
                     seed=int(req.get("seed") or 20260719),
-                    fetch_odds=bool(req.get("fetch_odds", True)),
-                    register_result=bool(req.get("register_result", True)),
+                    fetch_odds=bool(_t_odds if _t_odds is not None else req.get("fetch_odds", True)),
+                    register_result=bool(_t_reg if _t_reg is not None else req.get("register_result", True)),
                     cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
                     on_step=lambda msg, vn=vn, n=n, i=i: _v278_bg_update(
                         db_path, job_id,
@@ -16428,12 +16591,14 @@ def _v319_bg_import_start(
     *,
     enqueue: bool = True,
     run_worker: bool = True,
+    insert_first: bool = False,
 ) -> dict:
     """enqueue=True で条件をキュー追加。run_worker=True で実行開始。
 
     - 一発実行: enqueue=True, run_worker=True（従来互換）
     - キュー追加のみ: enqueue=True, run_worker=False
     - 再開/実行のみ: enqueue=False, run_worker=True
+    - insert_first=True: 新規を sort_order=0 で先頭挿入
     """
     _v278_bg_ensure_table(db_path)
     try:
@@ -16457,7 +16622,15 @@ def _v319_bg_import_start(
                 seen.add(item)
                 tasks.append(item)
         try:
-            enqueued = int(_v326_enqueue_tasks(db_path, "official_import", ymd, tasks, sort_order=0) or 0)
+            enqueued = int(_v326_enqueue_tasks(
+                db_path, "official_import", ymd, tasks,
+                sort_order=0, insert_first=bool(insert_first),
+                fetch_odds=bool(fetch_odds),
+                register_result=bool(register_result),
+                skip_existing=bool(skip_existing),
+                replace=bool(replace),
+                predict_if_missing=bool(predict_if_missing),
+            ) or 0)
         except Exception as exc:
             return {"ok": False, "reason": f"キュー追加失敗: {type(exc).__name__}: {exc}"}
     if not run_worker:
@@ -19311,18 +19484,70 @@ def _v187_norm_combo(bet_type: str, combo: str) -> str:
 
 
 def _v282_is_full_refund_race(con, race_key: str) -> bool:
-    """結果DB上で全券種が『全返還』になっているレースを判定する。"""
+    """全返還・不成立レースを判定する。
+
+    - result_payouts の組み合わせがすべて『全返還』
+    - または raw 本文に不成立/全返還/レース中止があり実払戻が無い
+    - 1台だけの競走中止で実払戻があるケースは False（ROI に含める）
+    """
+    rk = str(race_key or "")
+    if not rk:
+        return False
     try:
         rows = con.execute(
             "SELECT bet_type, combination, payout_yen FROM result_payouts WHERE race_key=?",
-            (str(race_key),),
+            (rk,),
         ).fetchall()
-        if not rows:
-            return False
-        combos = [str(r["combination"] if hasattr(r, "keys") else r[1] or "").strip() for r in rows]
-        return bool(combos) and all("全返還" in x for x in combos if x) and all(bool(x) for x in combos)
     except Exception:
-        return False
+        rows = []
+
+    combos = []
+    real_pay = 0
+    for r in rows or []:
+        try:
+            comb = str(r["combination"] if hasattr(r, "keys") else r[1] or "").strip()
+            yen = int(r["payout_yen"] if hasattr(r, "keys") else (r[2] or 0) or 0)
+        except Exception:
+            comb, yen = "", 0
+        combos.append(comb)
+        if comb and ("全返還" not in comb) and yen > 0:
+            real_pay += yen
+
+    if combos and all(("全返還" in x) for x in combos if x) and any(bool(x) for x in combos):
+        return True
+
+    raw = ""
+    try:
+        row = con.execute(
+            "SELECT raw_result_text FROM v238_result_raw_archive WHERE race_key=? LIMIT 1",
+            (rk,),
+        ).fetchone()
+        if row is not None:
+            raw = str(row["raw_result_text"] if hasattr(row, "keys") else row[0] or "")
+    except Exception:
+        raw = ""
+    void_info = {}
+    try:
+        void_info = _v319_is_void_or_cancelled_result(raw) if raw else {}
+    except Exception:
+        void_info = {}
+
+    if void_info.get("void") and real_pay <= 0:
+        if void_info.get("full_refund") or void_info.get("no_contest") or void_info.get("cancelled"):
+            return True
+
+    try:
+        le = con.execute(
+            "SELECT COALESCE(learning_eligible,1) FROM result_races WHERE race_key=? LIMIT 1",
+            (rk,),
+        ).fetchone()
+        eligible = 1 if le is None else int(le[0] if not hasattr(le, "keys") else le[0])
+    except Exception:
+        eligible = 1
+    if eligible == 0 and real_pay <= 0 and (not combos or all(("全返還" in x or not x) for x in combos)):
+        return True
+
+    return False
 
 
 def _v282_write_full_refund_feedback(con, plan) -> None:
@@ -19349,6 +19574,57 @@ def _v282_write_full_refund_feedback(con, plan) -> None:
         cost, cost, 1.0, 100.0,
         json.dumps(["全返還"], ensure_ascii=False), _v228_now_jst_iso()
     ))
+
+
+
+def _v282_repair_void_feedback(db_path: str) -> int:
+    """不成立なのに『外れ（払戻0）』になっている feedback を全返還へ修正。
+
+    回収率集計は winning_types に 全返還 が含まれると除外されるため、
+    誤って -購入額 されていたレースを分母から外す。
+    """
+    fixed = 0
+    try:
+        _v187_ensure_mixed_learning_tables(db_path)
+    except Exception:
+        pass
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA busy_timeout=30000")
+        rows = con.execute(
+            """
+            SELECT f.race_key, f.plan_hash, f.cost_yen, f.payout_yen, f.winning_types,
+                   r.cost_yen AS run_cost
+              FROM v187_mixed_plan_feedback f
+              JOIN v187_mixed_plan_runs r
+                ON r.race_key=f.race_key AND r.plan_hash=f.plan_hash
+             WHERE COALESCE(f.winning_types,'') NOT LIKE '%全返還%'
+               AND COALESCE(f.payout_yen,0) = 0
+               AND COALESCE(f.cost_yen, r.cost_yen, 0) > 0
+            """
+        ).fetchall()
+        for row in rows:
+            rk = str(row["race_key"] or "")
+            if not rk:
+                continue
+            try:
+                if not _v282_is_full_refund_race(con, rk):
+                    continue
+            except Exception:
+                continue
+            plan = {
+                "race_key": rk,
+                "plan_hash": row["plan_hash"],
+                "cost_yen": int(row["run_cost"] or row["cost_yen"] or 0),
+            }
+            try:
+                _v282_write_full_refund_feedback(con, plan)
+                fixed += 1
+            except Exception:
+                continue
+        if fixed:
+            con.commit()
+    return fixed
 
 
 def _v187_sync_mixed_feedback(db_path: str) -> int:
@@ -19419,6 +19695,10 @@ def _v187_sync_mixed_feedback(db_path: str) -> int:
                     json.dumps(sorted(set(winning_types)), ensure_ascii=False), _v228_now_jst_iso()))
             done += 1
         con.commit()
+    try:
+        done += int(_v282_repair_void_feedback(db_path) or 0)
+    except Exception:
+        pass
     return done
 
 
@@ -26923,6 +27203,10 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
         except Exception:
             # 表示は既存の照合済み実績だけでも継続する。
             pass
+        try:
+            _v282_repair_void_feedback(db_path)
+        except Exception:
+            pass
         query = """
             WITH evaluated AS (
                 SELECT
@@ -27416,6 +27700,77 @@ def _v300_support_rescue_summary(db_path: str, df: pd.DataFrame) -> dict:
     }
 
 
+
+def _v215_result_race_counts_by_day_venue(db_path: str) -> pd.DataFrame:
+    """result_races の日×開催場ごとの登録件数（不成立含む取り込み済み）。"""
+    cols = ["race_date", "venue", "取り込みR数"]
+    try:
+        with sqlite3.connect(str(db_path), timeout=15.0) as con:
+            con.execute("PRAGMA busy_timeout=15000")
+            df = pd.read_sql_query(
+                """
+                SELECT
+                    CASE
+                        WHEN race_date IS NOT NULL AND TRIM(race_date) <> '' THEN
+                            CASE
+                                WHEN length(replace(race_date,'-',''))=8
+                                    THEN substr(replace(race_date,'-',''),1,4)||'-'||
+                                         substr(replace(race_date,'-',''),5,2)||'-'||
+                                         substr(replace(race_date,'-',''),7,2)
+                                ELSE substr(race_date,1,10)
+                            END
+                        WHEN race_key IS NOT NULL AND length(race_key) >= 8
+                            THEN substr(race_key,1,4)||'-'||substr(race_key,5,2)||'-'||substr(race_key,7,2)
+                        ELSE NULL
+                    END AS race_date,
+                    COALESCE(
+                        NULLIF(venue,''),
+                        CASE
+                            WHEN instr(race_key, '_') > 0
+                            THEN replace(substr(race_key, instr(race_key,'_')+1),
+                                        substr(race_key, instr(race_key,'_')+1),
+                                        '')
+                            ELSE ''
+                        END
+                    ) AS venue_raw,
+                    race_key
+                FROM result_races
+                """,
+                con,
+            )
+        if df is None or df.empty:
+            return pd.DataFrame(columns=cols)
+        # venue: prefer column; fallback parse race_key YYYYMMDD_会場_NR
+        def _venue_from_key(rk: str) -> str:
+            s = str(rk or "")
+            parts = s.split("_")
+            if len(parts) >= 3:
+                return str(parts[1] or "")
+            if len(parts) == 2:
+                return str(parts[1] or "").rsplit("R", 1)[0]
+            return ""
+        venues = []
+        for _, r in df.iterrows():
+            v = str(r.get("venue_raw") or "").strip()
+            if not v or v.endswith("R") or v.isdigit():
+                v = _venue_from_key(r.get("race_key"))
+            # race_key format: 20261001_伊勢崎_5R → parts[1]=伊勢崎
+            parts = str(r.get("race_key") or "").split("_")
+            if len(parts) >= 2 and parts[1] and not parts[1].endswith("R"):
+                v = parts[1]
+            venues.append(v)
+        df["venue"] = venues
+        df["race_date"] = df["race_date"].astype(str).str[:10]
+        out = (
+            df.dropna(subset=["race_date"])
+            .groupby(["race_date", "venue"], dropna=False)
+            .size()
+            .reset_index(name="取り込みR数")
+        )
+        return out
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
 def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -27883,9 +28238,33 @@ def _v215_render_return_dashboard(db_path: str) -> None:
     st.dataframe(_v215_aggregate_return(filtered, ["venue"]).sort_values("回収率", ascending=False), use_container_width=True, hide_index=True)
 
     st.markdown("### 日付 × 開催場")
+    st.caption(
+        "「レース数／判定対象レース数」は回収率の評価件数です。"
+        "「取り込みR数」は result_races の登録件数（不成立含む）で、取込の進み具合の確認用です。"
+    )
     day_venue = _v215_aggregate_return(filtered, ["race_date", "venue"])
     if not day_venue.empty:
         day_venue["race_date"] = pd.to_datetime(day_venue["race_date"]).dt.strftime("%Y-%m-%d")
+        try:
+            _reg = _v215_result_race_counts_by_day_venue(db_path)
+            if _reg is not None and not _reg.empty:
+                day_venue = day_venue.merge(
+                    _reg, on=["race_date", "venue"], how="left"
+                )
+                day_venue["取り込みR数"] = pd.to_numeric(
+                    day_venue.get("取り込みR数"), errors="coerce"
+                ).fillna(0).astype(int)
+            else:
+                day_venue["取り込みR数"] = 0
+        except Exception:
+            day_venue["取り込みR数"] = 0
+        # 列順: 日付・場・取り込み・判定系を前に
+        _front = [c for c in [
+            "race_date", "venue", "取り込みR数", "レース数", "判定対象レース数",
+            "的中数", "黒字数", "ガミ数", "購入額", "払戻額", "収支", "的中率", "黒字率", "回収率",
+        ] if c in day_venue.columns]
+        _rest = [c for c in day_venue.columns if c not in _front]
+        day_venue = day_venue[_front + _rest]
         st.dataframe(day_venue.sort_values(["race_date", "venue"], ascending=[False, True]), use_container_width=True, hide_index=True)
 
     st.markdown("### 月別")
@@ -32588,6 +32967,36 @@ if selected_main_page == "✅ 結果登録・解析":
             register_result=bool(register_result_opt),
         )
 
+        # 取り込み済み確認（回収率の「判定対象3R」とは別。result_races の実登録）
+        try:
+            _reg_lines = []
+            for _vn in (venues or []):
+                if _vn not in RESULT_VENUES:
+                    continue
+                _reg_nos = _v319_registered_race_nos(engine.DB_PATH, ymd, _vn)
+                if _reg_nos:
+                    _miss = [n for n in range(1, 13) if n not in _reg_nos]
+                    # 最大Rは登録済み最大か 12
+                    _mx = max(_reg_nos) if _reg_nos else 0
+                    _miss_upto = [n for n in range(1, max(_mx, 8) + 1) if n not in _reg_nos]
+                    _reg_lines.append(
+                        f"**{_vn}**: 登録済み {len(_reg_nos)}R（"
+                        + ",".join(str(n) for n in _reg_nos)
+                        + "）"
+                        + (f" ／ 未登録の候補: {','.join(str(n)+'R' for n in _miss_upto)}" if _miss_upto else " ／ 抜けなし")
+                    )
+                else:
+                    _reg_lines.append(f"**{_vn}**: 登録済み 0R（この日はまだ result_races に無し）")
+            if _reg_lines:
+                st.info(
+                    "📦 結果の取り込み済み（result_races）\n\n"
+                    + "\n\n".join(_reg_lines)
+                    + "\n\n※回収率タブの「レース数」は判定対象（ROI分母）なので、ここと数字が違って正常です。"
+                    + "\n※「登録済みは飛ばす」ONなら上のRは上書きしません。"
+                )
+        except Exception:
+            pass
+
         # --- 取込キュー（プレイリスト） ---
         try:
             _v326_ensure_import_queue(engine.DB_PATH)
@@ -32605,9 +33014,8 @@ if selected_main_page == "✅ 結果登録・解析":
         if _pend_n > 0:
             st.warning(
                 f"キューに pending が {_pend_n} 件残っています。"
-                "「▶実行」や「バックグラウンドで取得」は **今の入力だけでなく、この pending も全部処理**します。"
-                "特定Rだけやりたい場合は先に「🗑 pending全消去」で空にしてから、"
-                "「＋条件をキューに追加」→「▶実行」の順にしてください。"
+                "「▶実行」や「バックグラウンドで取得」は **キューの pending だけ**を処理します（入力条件の再追加はしません）。"
+                "別のレースを入れるときは「＋条件をキューに追加」、不要なら「🗑 pending全消去」。"
             )
         elif _run_n > 0:
             st.info(f"実行中が {_run_n} 件あります（追加は可能・完了を待つか中止してください）。")
@@ -32619,12 +33027,19 @@ if selected_main_page == "✅ 結果登録・解析":
         q5, q6 = st.columns(2)
         clr_pend = q5.button("🗑 pending全消去", use_container_width=True, key="v326_q_clr_pend")
         clr_all = q6.button("🗑 キュー全消去", use_container_width=True, key="v326_q_clr_all")
+        _ins_first = st.checkbox(
+            "＋条件をキューに追加するとき、先頭に割り込み追加",
+            value=False, key="v326_q_add_first",
+            help="既存 pending の前に挿入します。「先に処理したい」ものを優先できます。",
+        )
         if add_q:
             if not venues:
                 st.warning("開催場を選ぶか、先に開催確認してください。")
             else:
                 r = _v319_bg_import_start(
-                    engine.DB_PATH, ymd, venues, **_imp_kw, enqueue=True, run_worker=False
+                    engine.DB_PATH, ymd, venues, **_imp_kw,
+                    enqueue=True, run_worker=False,
+                    insert_first=bool(_ins_first),
                 )
                 if r.get("ok"):
                     st.success(r.get("reason") or f"キューに{r.get('enqueued',0)}件追加")
@@ -32665,7 +33080,35 @@ if selected_main_page == "✅ 結果登録・解析":
         except Exception:
             _qdf = pd.DataFrame()
         if _qdf is not None and not _qdf.empty:
-            st.dataframe(_qdf, use_container_width=True, hide_index=True)
+            _pend_view = _qdf[_qdf["status"] == "pending"].copy().reset_index(drop=True)
+            if not _pend_view.empty and "sort_order" in _pend_view.columns:
+                st.markdown("**並び順（数値が小さいほど先に処理）**")
+                st.caption("sort_order を書き換えて「並び順を保存」を押してください。")
+                _order_cols = [c for c in ["task_id", "venue", "race_no", "sort_order", "message"]
+                               if c in _pend_view.columns]
+                _edited_order = st.data_editor(
+                    _pend_view[_order_cols],
+                    hide_index=True, use_container_width=True,
+                    disabled=[c for c in _order_cols if c != "sort_order"],
+                    key="v326_queue_order_editor",
+                    column_config={
+                        "sort_order": st.column_config.NumberColumn(
+                            "並び順", step=1, format="%d",
+                            help="小さいほど先。同値なら task_id 昇順。",
+                        ),
+                    },
+                )
+                if st.button("📑 並び順を保存", key="v326_queue_order_save", use_container_width=True):
+                    _pairs = [
+                        (int(r["task_id"]), int(r["sort_order"]))
+                        for _, r in _edited_order.iterrows()
+                        if pd.notna(r.get("sort_order"))
+                    ]
+                    _n = _v326_set_sort_orders(engine.DB_PATH, "official_import", _pairs)
+                    st.success(f"並び順を保存しました（{_n}件）")
+                    st.rerun()
+            with st.expander("キュー全件を表示", expanded=False):
+                st.dataframe(_qdf, use_container_width=True, hide_index=True)
             _del_ids = st.multiselect(
                 "削除する task_id（running以外）",
                 options=[int(x) for x in _qdf["task_id"].tolist()],
@@ -32677,36 +33120,37 @@ if selected_main_page == "✅ 結果登録・解析":
                 if n:
                     st.rerun()
         else:
-            st.caption("キューは空です。「＋条件をキューに追加」か「バックグラウンドで取得」を使ってください。")
+            st.caption("キューは空です。「＋条件をキューに追加」→「▶実行」または「バックグラウンドで実行」の順で使ってください。")
 
         b1, b2 = st.columns(2)
         with b1:
             start_fg = st.button("今すぐ取得して登録", use_container_width=True, key="v319_op_import")
         with b2:
-            start_bg = st.button("バックグラウンドで取得", type="primary", use_container_width=True, key="v319_op_import_bg")
+            start_bg = st.button("バックグラウンドで実行（キューのみ）", type="primary", use_container_width=True, key="v319_op_import_bg")
         if start_fg or start_bg:
             if not venues:
                 st.warning("開催場を選ぶか、先に開催確認してください。")
             elif start_bg:
-                # 一発: 条件をキュー追加 + 実行（既存 pending もまとめて処理される）
-                _left = int(_qs.get("pending") or 0)
-                if _left > 0:
+                # 実行のみ: 既存 pending を処理（条件の再 enqueue はしない）
+                # 削除したレースが「レース番号=0」で復活しないよう、enqueue=False
+                _left = int(_qs.get("pending") or 0) + int(_qs.get("running") or 0)
+                if _left <= 0:
                     st.warning(
-                        f"既存キューに pending {_left} 件があります。"
-                        "このまま開始すると **今の条件に加えて pending も実行**されます。"
-                        "不要なら先に「🗑 pending全消去」を押してください。"
+                        "キューが空です。先に「＋条件をキューに追加」でレースを入れてから、"
+                        "「バックグラウンドで取得」または「▶ キューを実行/再開」を押してください。"
                     )
-                started = _v319_bg_import_start(
-                    engine.DB_PATH, ymd, venues, **_imp_kw, enqueue=True, run_worker=True
-                )
-                if started.get("ok"):
-                    st.success(
-                        f"バックグラウンド取込を開始（ジョブ {started.get('job_id')} / 追加{started.get('enqueued',0)}件）。"
-                        "画面を離れても進みます。"
-                    )
-                    st.rerun()
                 else:
-                    st.warning(started.get("reason") or "開始できませんでした")
+                    started = _v319_bg_import_start(
+                        engine.DB_PATH, ymd, venues, **_imp_kw, enqueue=False, run_worker=True
+                    )
+                    if started.get("ok"):
+                        st.success(
+                            f"キュー実行を開始（ジョブ {started.get('job_id')} / pending {_left} 件）。"
+                            "画面を離れても進みます。新規レースは追加しません。"
+                        )
+                        st.rerun()
+                    else:
+                        st.warning(started.get("reason") or "開始できませんでした")
             else:
                 all_rep = {"ok": 0, "skip": 0, "error": 0, "details": []}
                 with st.spinner(f"{ymd} {','.join(venues)} を取得しています…"):
