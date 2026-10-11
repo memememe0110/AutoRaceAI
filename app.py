@@ -11817,6 +11817,64 @@ def _v319_result_page_alive(ymd: str, venue: str, race_no: int) -> bool:
     return ("払戻" in html or "着" in html) and ("選手" in html or "車" in html)
 
 
+
+def _v319_known_race_nos(db_path: str, ymd: str, venue: str) -> list[int]:
+    """再取込なしでDB痕跡があるレース番号（result / raw / plan / odds / queue）。"""
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))[:8]
+    venue = str(venue or "").strip()
+    if len(ymd) < 8 or not venue:
+        return []
+    prefix = f"{ymd}_{venue}_"
+    nos = set(_v319_registered_race_nos(db_path, ymd, venue))
+    try:
+        with sqlite3.connect(str(db_path), timeout=10.0) as con:
+            con.execute("PRAGMA busy_timeout=10000")
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            def _add_from(sql, params=()):
+                try:
+                    for (rk,) in con.execute(sql, params).fetchall():
+                        d, v, n = _v215_parse_race_key_parts(str(rk or ""))
+                        if n and (not d or d.replace("-", "") == ymd) and (not v or v == venue):
+                            nos.add(int(n))
+                        else:
+                            m = re.search(r"_(\d{1,2})R$", str(rk or ""))
+                            if m and str(rk).startswith(prefix):
+                                nos.add(int(m.group(1)))
+                except Exception:
+                    pass
+            if "v238_result_raw_archive" in tables:
+                _add_from("SELECT race_key FROM v238_result_raw_archive WHERE race_key LIKE ?", (prefix + "%",))
+            for tbl in (
+                "v187_mixed_plan_runs",
+                "prediction_snapshots",
+                "prediction_feedback",
+                "v231_prediction_history",
+                "v231_pred_history",
+            ):
+                if tbl in tables:
+                    _add_from(f"SELECT DISTINCT race_key FROM {tbl} WHERE race_key LIKE ?", (prefix + "%",))
+            if "v326_import_queue" in tables:
+                try:
+                    for (rno,) in con.execute(
+                        """
+                        SELECT race_no FROM v326_import_queue
+                         WHERE status IN ('done','skipped')
+                           AND replace(ymd,'-','')=? AND venue=?
+                        """,
+                        (ymd, venue),
+                    ).fetchall():
+                        try:
+                            n = int(rno)
+                            if 1 <= n <= 12:
+                                nos.add(n)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return sorted(n for n in nos if 1 <= int(n) <= 12)
+
 def _v319_registered_race_nos(db_path: str, ymd: str, venue: str) -> list[int]:
     """result_races に登録済みのレース番号一覧（昇順）。不成立も含む。"""
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
@@ -14865,50 +14923,149 @@ def _v319_is_void_or_cancelled_result(text: str) -> dict:
 def _v319_register_void_result(
     db_path: str, raw_text: str, venue: str, ymd: str, race_no: int, reason: str = "レース中止"
 ) -> dict:
-    """中止・不成立・全返還を結果登録（学習対象外）。"""
+    """中止・不成立・全返還を結果登録（学習対象外）。
+
+    優先順:
+      1) engine.v162_register_no_contest（不成立専用・result_races 確実書き込み）
+      2) 直接 result_races / result_payouts INSERT フォールバック
+    空 rows の v41_register_result は払戻列名不一致等で失敗しやすいため使わない。
+    """
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
-    key = f"{ymd}_{venue}_{int(race_no)}R"
+    race_no = int(race_no)
+    key = f"{ymd}_{venue}_{race_no}R"
     date_s = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}" if len(ymd) == 8 else str(ymd)
+    reason_s = str(reason or "レース中止・全返還")
     meta = {
         "開催日": date_s,
         "開催場": venue,
-        "レース": int(race_no),
-        "レース状態": reason or "レース中止",
+        "レース": race_no,
+        "レース状態": reason_s,
         "不成立": True,
         "レース中止": True,
         "全返還": True,
         "学習対象外": True,
         "learning_excluded": True,
-        "learning_exclusion_reason": reason or "レース中止・全返還",
+        "learning_exclusion_reason": reason_s,
         "予測精度評価対象": False,
         "AI学習対象": False,
         "実出走数": 0,
     }
-    rows = pd.DataFrame(columns=["着順", "車番", "選手名", "競走T", "ST"])
-    laps = pd.DataFrame()
-    payout_rows = [
-        {"券種": bt, "組み合わせ": "全返還", "払戻金": 100}
-        for bt in ("単勝", "複勝", "2連複", "2連単", "ワイド", "3連複", "3連単")
-    ]
-    payouts = pd.DataFrame(payout_rows)
+    errors = []
+
+    # 1) 不成立専用 API
     try:
-        key2, *_rest = engine.v41_register_result(meta, rows, laps, payouts, db_path)
-        key = str(key2 or key)
-    except Exception:
-        try:
-            key2, *_rest = engine.v70_replace_registered_result(meta, rows, laps, payouts, db_path)
+        _fn = getattr(engine, "v162_register_no_contest", None)
+        if callable(_fn):
+            key2, info = _fn(meta, payouts=None, db_path=db_path, replace=True)
             key = str(key2 or key)
-        except Exception as exc:
             try:
                 _v238_save_exact_raw_result(db_path, key, raw_text, source="oddspark_void")
             except Exception:
                 pass
-            return {"key": key, "ok": False, "error": f"{type(exc).__name__}: {exc}", "void": True}
+            # 実在確認
+            try:
+                with sqlite3.connect(str(db_path), timeout=10.0) as con:
+                    con.execute("PRAGMA busy_timeout=10000")
+                    row = con.execute(
+                        "SELECT race_key FROM result_races WHERE race_key=?", (key,)
+                    ).fetchone()
+                if row:
+                    return {
+                        "key": key, "ok": True, "void": True, "reason": reason_s,
+                        "via": "v162_register_no_contest",
+                        "info": info if isinstance(info, dict) else {},
+                    }
+                errors.append("v162 wrote no result_races row")
+            except Exception as exc:
+                errors.append(f"v162 verify: {type(exc).__name__}: {exc}")
+        else:
+            errors.append("v162_register_no_contest missing")
+    except Exception as exc:
+        errors.append(f"v162: {type(exc).__name__}: {exc}")
+
+    # 2) 直接 INSERT フォールバック（過去分・不成立も result_races に必ず載せる）
     try:
-        _v238_save_exact_raw_result(db_path, key, raw_text, source="oddspark_void")
-    except Exception:
-        pass
-    return {"key": key, "ok": True, "void": True, "reason": reason}
+        now = datetime.now().isoformat(timespec="seconds")
+        with sqlite3.connect(str(db_path), timeout=15.0) as con:
+            con.execute("PRAGMA busy_timeout=15000")
+            # 足りない列だけ追加
+            try:
+                cols = {r[1] for r in con.execute("PRAGMA table_info(result_races)").fetchall()}
+                for name, definition in (
+                    ("race_status", "TEXT"),
+                    ("refund_status", "TEXT"),
+                    ("learning_eligible", "INTEGER DEFAULT 1"),
+                    ("learning_exclusion_reason", "TEXT"),
+                ):
+                    if name not in cols:
+                        con.execute(f"ALTER TABLE result_races ADD COLUMN {name} {definition}")
+            except Exception:
+                pass
+            con.execute(
+                """
+                INSERT INTO result_races
+                    (race_key, race_date, venue, race_no, surface, track_temp, air_temp, humidity,
+                     registered_at, race_status, refund_status, learning_eligible, learning_exclusion_reason)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(race_key) DO UPDATE SET
+                    race_date=excluded.race_date,
+                    venue=excluded.venue,
+                    race_no=excluded.race_no,
+                    registered_at=excluded.registered_at,
+                    race_status=excluded.race_status,
+                    refund_status=excluded.refund_status,
+                    learning_eligible=excluded.learning_eligible,
+                    learning_exclusion_reason=excluded.learning_exclusion_reason
+                """,
+                (
+                    key, date_s, venue, str(race_no),
+                    None, None, None, None, now,
+                    "不成立", "全返還", 0, reason_s,
+                ),
+            )
+            try:
+                con.execute("DELETE FROM result_entries WHERE race_key=?", (key,))
+                con.execute("DELETE FROM result_laps WHERE race_key=?", (key,))
+            except Exception:
+                pass
+            try:
+                con.execute("DELETE FROM result_payouts WHERE race_key=?", (key,))
+                for bt in ("単勝", "複勝", "2連複", "2連単", "ワイド", "3連複", "3連単"):
+                    con.execute(
+                        """
+                        INSERT OR REPLACE INTO result_payouts
+                            (race_key, bet_type, combination, payout_yen, popularity)
+                        VALUES (?,?,?,?,?)
+                        """,
+                        (key, bt, "全返還", 100, None),
+                    )
+            except Exception as exc:
+                errors.append(f"payouts: {type(exc).__name__}: {exc}")
+            con.commit()
+            row = con.execute(
+                "SELECT race_key FROM result_races WHERE race_key=?", (key,)
+            ).fetchone()
+        if not row:
+            raise RuntimeError("direct INSERT did not create result_races row")
+        try:
+            _v238_save_exact_raw_result(db_path, key, raw_text, source="oddspark_void")
+        except Exception:
+            pass
+        return {
+            "key": key, "ok": True, "void": True, "reason": reason_s,
+            "via": "direct_insert",
+            "errors": errors,
+        }
+    except Exception as exc:
+        errors.append(f"direct: {type(exc).__name__}: {exc}")
+        try:
+            _v238_save_exact_raw_result(db_path, key, raw_text, source="oddspark_void")
+        except Exception:
+            pass
+        return {
+            "key": key, "ok": False, "void": True, "reason": reason_s,
+            "error": " | ".join(errors) if errors else str(exc),
+        }
 
 
 
@@ -16082,11 +16239,25 @@ def _v319_import_one_race(
                 "key": key_guess,
                 "next_action": "retry",
             }
+        if not (saved or {}).get("ok", False):
+            return {
+                "status": "error",
+                "phase": "save_result",
+                "message": (
+                    f"{venue} {race_no}R：中止・不成立の結果登録に失敗しました。"
+                    f" ({(saved or {}).get('error') or 'result_races 未書き込み'})"
+                    f"{hist_msg}{pred_msg}{odds_msg}"
+                ),
+                "key": str((saved or {}).get("key") or key_guess),
+                "next_action": "retry",
+                "void": True,
+            }
         return {
             "status": "ok",
             "phase": "completed_void",
             "message": (
                 f"{key_guess} / {void_info.get('reason') or 'レース中止・全返還'}"
+                f" / void登録OK"
                 f"{hist_msg}{pred_msg}{odds_msg}"
             ),
             "key": str((saved or {}).get("key") or key_guess),
@@ -27701,75 +27872,132 @@ def _v300_support_rescue_summary(db_path: str, df: pd.DataFrame) -> dict:
 
 
 
+def _v215_parse_race_key_parts(race_key: str) -> tuple:
+    """race_key → (YYYY-MM-DD, venue, race_no or None)."""
+    s = str(race_key or "").strip()
+    parts = s.split("_")
+    if len(parts) < 2:
+        return "", "", None
+    ymd = re.sub(r"[^0-9]", "", parts[0])[:8]
+    date_s = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}" if len(ymd) == 8 else ""
+    venue = str(parts[1] or "").strip()
+    rno = None
+    if len(parts) >= 3:
+        m = re.search(r"(\d{1,2})", parts[-1])
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 12:
+                rno = n
+    return date_s, venue, rno
+
+
 def _v215_result_race_counts_by_day_venue(db_path: str) -> pd.DataFrame:
-    """result_races の日×開催場ごとの登録件数（不成立含む取り込み済み）。"""
-    cols = ["race_date", "venue", "取り込みR数"]
+    """日×開催場の R 数。
+
+    - 取り込みR数: result_races の実登録（不成立含む）
+    - 把握R数: 再取込なしでDB内に痕跡があるR
+      （result_races / 生結果アーカイブ / 予測プラン / オッズ等の union）
+
+    不成立が result_races に書けていなくても、予測や raw が残っていれば把握R数に入る。
+    """
+    cols = ["race_date", "venue", "取り込みR数", "把握R数"]
     try:
-        with sqlite3.connect(str(db_path), timeout=15.0) as con:
-            con.execute("PRAGMA busy_timeout=15000")
-            df = pd.read_sql_query(
-                """
-                SELECT
-                    CASE
-                        WHEN race_date IS NOT NULL AND TRIM(race_date) <> '' THEN
-                            CASE
-                                WHEN length(replace(race_date,'-',''))=8
-                                    THEN substr(replace(race_date,'-',''),1,4)||'-'||
-                                         substr(replace(race_date,'-',''),5,2)||'-'||
-                                         substr(replace(race_date,'-',''),7,2)
-                                ELSE substr(race_date,1,10)
-                            END
-                        WHEN race_key IS NOT NULL AND length(race_key) >= 8
-                            THEN substr(race_key,1,4)||'-'||substr(race_key,5,2)||'-'||substr(race_key,7,2)
-                        ELSE NULL
-                    END AS race_date,
-                    COALESCE(
-                        NULLIF(venue,''),
-                        CASE
-                            WHEN instr(race_key, '_') > 0
-                            THEN replace(substr(race_key, instr(race_key,'_')+1),
-                                        substr(race_key, instr(race_key,'_')+1),
-                                        '')
-                            ELSE ''
-                        END
-                    ) AS venue_raw,
-                    race_key
-                FROM result_races
-                """,
-                con,
+        with sqlite3.connect(str(db_path), timeout=20.0) as con:
+            con.execute("PRAGMA busy_timeout=20000")
+            tables = {
+                r[0]
+                for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+
+            def _load_keys(sql: str):
+                try:
+                    return [str(r[0]) for r in con.execute(sql).fetchall() if r and r[0]]
+                except Exception:
+                    return []
+
+            result_keys = set()
+            if "result_races" in tables:
+                result_keys = set(_load_keys("SELECT race_key FROM result_races WHERE race_key IS NOT NULL"))
+
+            known_keys = set(result_keys)
+            # 生結果（void失敗時も oddspark_void で残っていることがある）
+            if "v238_result_raw_archive" in tables:
+                known_keys |= set(_load_keys("SELECT race_key FROM v238_result_raw_archive WHERE race_key IS NOT NULL"))
+            # 予測・プラン
+            for tbl, col in (
+                ("v187_mixed_plan_runs", "race_key"),
+                ("prediction_snapshots", "race_key"),
+                ("v252_lap_prediction_snapshots", "race_key"),
+                ("prediction_feedback", "race_key"),
+                ("v231_prediction_history", "race_key"),
+                ("v231_pred_history", "race_key"),
+            ):
+                if tbl in tables:
+                    known_keys |= set(_load_keys(f"SELECT DISTINCT {col} FROM {tbl} WHERE {col} IS NOT NULL"))
+            # オッズ
+            for tbl in list(tables):
+                if "odds" in tbl.lower() and tbl not in ("sqlite_sequence",):
+                    try:
+                        cols_info = {r[1] for r in con.execute(f"PRAGMA table_info({tbl})").fetchall()}
+                        if "race_key" in cols_info:
+                            known_keys |= set(_load_keys(f"SELECT DISTINCT race_key FROM {tbl} WHERE race_key IS NOT NULL"))
+                    except Exception:
+                        pass
+            # 取込キュー完了分（再HTTPなしで「触ったR」が分かる）
+            if "v326_import_queue" in tables:
+                try:
+                    rows = con.execute(
+                        """
+                        SELECT ymd, venue, race_no FROM v326_import_queue
+                         WHERE status IN ('done','skipped')
+                           AND ymd IS NOT NULL AND venue IS NOT NULL AND race_no IS NOT NULL
+                        """
+                    ).fetchall()
+                    for ymd, venue, rno in rows:
+                        ymd_s = re.sub(r"[^0-9]", "", str(ymd or ""))[:8]
+                        if len(ymd_s) < 8:
+                            continue
+                        try:
+                            n = int(rno)
+                        except Exception:
+                            continue
+                        if not (1 <= n <= 12):
+                            continue
+                        known_keys.add(f"{ymd_s}_{str(venue).strip()}_{n}R")
+                except Exception:
+                    pass
+
+        def _bucket(keys):
+            from collections import defaultdict
+            d = defaultdict(set)  # (date, venue) -> set(rno or key)
+            for rk in keys:
+                date_s, venue, rno = _v215_parse_race_key_parts(rk)
+                if not date_s or not venue:
+                    continue
+                # rno が取れれば番号で、取れなければ key 全体でユニーク
+                d[(date_s, venue)].add(rno if rno is not None else rk)
+            return d
+
+        res_b = _bucket(result_keys)
+        known_b = _bucket(known_keys)
+        rows = []
+        all_pairs = set(res_b.keys()) | set(known_b.keys())
+        for date_s, venue in sorted(all_pairs):
+            rows.append(
+                {
+                    "race_date": date_s,
+                    "venue": venue,
+                    "取り込みR数": len(res_b.get((date_s, venue), set())),
+                    "把握R数": len(known_b.get((date_s, venue), set())),
+                }
             )
-        if df is None or df.empty:
-            return pd.DataFrame(columns=cols)
-        # venue: prefer column; fallback parse race_key YYYYMMDD_会場_NR
-        def _venue_from_key(rk: str) -> str:
-            s = str(rk or "")
-            parts = s.split("_")
-            if len(parts) >= 3:
-                return str(parts[1] or "")
-            if len(parts) == 2:
-                return str(parts[1] or "").rsplit("R", 1)[0]
-            return ""
-        venues = []
-        for _, r in df.iterrows():
-            v = str(r.get("venue_raw") or "").strip()
-            if not v or v.endswith("R") or v.isdigit():
-                v = _venue_from_key(r.get("race_key"))
-            # race_key format: 20261001_伊勢崎_5R → parts[1]=伊勢崎
-            parts = str(r.get("race_key") or "").split("_")
-            if len(parts) >= 2 and parts[1] and not parts[1].endswith("R"):
-                v = parts[1]
-            venues.append(v)
-        df["venue"] = venues
-        df["race_date"] = df["race_date"].astype(str).str[:10]
-        out = (
-            df.dropna(subset=["race_date"])
-            .groupby(["race_date", "venue"], dropna=False)
-            .size()
-            .reset_index(name="取り込みR数")
-        )
-        return out
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
     except Exception:
         return pd.DataFrame(columns=cols)
+
+
 
 def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     if df.empty:
@@ -28239,8 +28467,10 @@ def _v215_render_return_dashboard(db_path: str) -> None:
 
     st.markdown("### 日付 × 開催場")
     st.caption(
-        "「レース数／判定対象レース数」は回収率の評価件数です。"
-        "「取り込みR数」は result_races の登録件数（不成立含む）で、取込の進み具合の確認用です。"
+        "「レース数／判定対象レース数」＝回収率の評価件数。"
+        "「取り込みR数」＝result_races の実登録。"
+        "「把握R数」＝再取込なしでDBに痕跡があるR（v231予測履歴・プラン・生結果・オッズ・取込キュー完了など）。"
+        "不成立が result_races に無くても、予測等が残っていれば把握R数に入ります。"
     )
     day_venue = _v215_aggregate_return(filtered, ["race_date", "venue"])
     if not day_venue.empty:
@@ -28251,16 +28481,18 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 day_venue = day_venue.merge(
                     _reg, on=["race_date", "venue"], how="left"
                 )
-                day_venue["取り込みR数"] = pd.to_numeric(
-                    day_venue.get("取り込みR数"), errors="coerce"
-                ).fillna(0).astype(int)
+                for _c in ("取り込みR数", "把握R数"):
+                    day_venue[_c] = pd.to_numeric(
+                        day_venue.get(_c), errors="coerce"
+                    ).fillna(0).astype(int)
             else:
                 day_venue["取り込みR数"] = 0
+                day_venue["把握R数"] = 0
         except Exception:
             day_venue["取り込みR数"] = 0
-        # 列順: 日付・場・取り込み・判定系を前に
+            day_venue["把握R数"] = 0
         _front = [c for c in [
-            "race_date", "venue", "取り込みR数", "レース数", "判定対象レース数",
+            "race_date", "venue", "把握R数", "取り込みR数", "レース数", "判定対象レース数",
             "的中数", "黒字数", "ガミ数", "購入額", "払戻額", "収支", "的中率", "黒字率", "回収率",
         ] if c in day_venue.columns]
         _rest = [c for c in day_venue.columns if c not in _front]
@@ -32967,32 +33199,35 @@ if selected_main_page == "✅ 結果登録・解析":
             register_result=bool(register_result_opt),
         )
 
-        # 取り込み済み確認（回収率の「判定対象3R」とは別。result_races の実登録）
+        # 取り込み済み／把握済み確認（再HTTPなし。回収率の判定対象とは別）
         try:
             _reg_lines = []
             for _vn in (venues or []):
                 if _vn not in RESULT_VENUES:
                     continue
                 _reg_nos = _v319_registered_race_nos(engine.DB_PATH, ymd, _vn)
-                if _reg_nos:
-                    _miss = [n for n in range(1, 13) if n not in _reg_nos]
-                    # 最大Rは登録済み最大か 12
-                    _mx = max(_reg_nos) if _reg_nos else 0
-                    _miss_upto = [n for n in range(1, max(_mx, 8) + 1) if n not in _reg_nos]
-                    _reg_lines.append(
-                        f"**{_vn}**: 登録済み {len(_reg_nos)}R（"
-                        + ",".join(str(n) for n in _reg_nos)
-                        + "）"
-                        + (f" ／ 未登録の候補: {','.join(str(n)+'R' for n in _miss_upto)}" if _miss_upto else " ／ 抜けなし")
-                    )
-                else:
-                    _reg_lines.append(f"**{_vn}**: 登録済み 0R（この日はまだ result_races に無し）")
+                try:
+                    _known_nos = _v319_known_race_nos(engine.DB_PATH, ymd, _vn)
+                except Exception:
+                    _known_nos = list(_reg_nos)
+                _mx = max([0] + list(_known_nos) + list(_reg_nos) + [8])
+                _miss_reg = [n for n in range(1, _mx + 1) if n not in _reg_nos]
+                _line = (
+                    f"**{_vn}**: 把握 {len(_known_nos)}R"
+                    + (f"（{','.join(str(n) for n in _known_nos)}）" if _known_nos else "（なし）")
+                    + f" ／ result登録 {len(_reg_nos)}R"
+                    + (f"（{','.join(str(n) for n in _reg_nos)}）" if _reg_nos else "")
+                )
+                if _miss_reg:
+                    _line += f" ／ result未登録: {','.join(str(n)+'R' for n in _miss_reg)}"
+                _reg_lines.append(_line)
             if _reg_lines:
                 st.info(
-                    "📦 結果の取り込み済み（result_races）\n\n"
+                    "📦 この日のR把握状況（再取込不要・既存DB）\n\n"
                     + "\n\n".join(_reg_lines)
-                    + "\n\n※回収率タブの「レース数」は判定対象（ROI分母）なので、ここと数字が違って正常です。"
-                    + "\n※「登録済みは飛ばす」ONなら上のRは上書きしません。"
+                    + "\n\n※把握＝予測・生結果・取込キュー完了などDB痕跡。"
+                    + " result未登録の不成立があっても把握には入ります。"
+                    + "\n※回収率の「レース数」は判定対象なので別数字で正常です。"
                 )
         except Exception:
             pass
