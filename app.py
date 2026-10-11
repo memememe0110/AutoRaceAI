@@ -11208,8 +11208,12 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
             str(int(car_no)): str(reason) for car_no, reason in detected
         }
         meta_out["実出走数"] = int(len(out) - len(detected_numbers))
-        # Ver324e: 既存 engine の定義を変えず、予測照合用出走数は out の総行数を維持。
-        meta_out["予測照合用出走数"] = int(len(out))
+        # Ver324e-B: engine の出走数照合は「予測時の実際に走る車数」と比較する。
+        # 事前除外（欠車・停止・発走前除外）は予測対象外なので、
+        # 予測照合用出走数 = out総行数 - 検出車数 とする。
+        _real_starters = int(len(out) - len(detected_numbers))
+        meta_out["実出走数"] = _real_starters
+        meta_out["予測照合用出走数"] = _real_starters
     return meta_out, out, sorted(set(added))
 
 
@@ -16118,6 +16122,17 @@ def _v319_register_fetched_result(
         for c in (teishi_cars or []):
             reasons.setdefault(str(int(c)), "停止")
         meta_r["事前除外理由"] = reasons
+        # Ver324e-B: engine 出走数照合とのインターフェースを統一。
+        # kessha を除いた実出走数を予測照合用出走数にも設定する。
+        try:
+            _starters_after_kessha = int(
+                len(_v315_drop_kessha_rows(rows_r, kessha))
+            )
+            if _starters_after_kessha > 0:
+                meta_r["実出走数"] = _starters_after_kessha
+                meta_r["予測照合用出走数"] = _starters_after_kessha
+        except Exception:
+            pass
     meta_r, _inc = _v227_detect_poststart_incidents(raw_text, meta_r)
     # 停止だけの「事故」検出は捨てる
     if _inc:
