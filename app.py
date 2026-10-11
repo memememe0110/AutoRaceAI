@@ -11265,27 +11265,48 @@ def _v315_drop_kessha_rows(rows: pd.DataFrame, kessha: list[int]) -> pd.DataFram
 
 
 def _v319_detect_kessha_from_card_text(text: str) -> list[int]:
-    """出走表テキストから欠車・出走取消の車番を抽出。"""
+    """出走表テキストから欠車・出走取消の車番を抽出。
+
+    Ver324e-B5:
+    近10走統計行「N\t着順 ...」を車番ヘッダーと誤認し、
+    2〜4行先の別の車の欠車を自車へ紐付けるバグを塞ぐ。
+    車番ヘッダー行は「N\t選手名(LG)」形式に限定し、
+    中間行も最大1行までに制限する。
+    """
     s = str(text or "")
     if not s.strip():
         return []
     found: set[int] = set()
+    _lg = r"(?:川口|伊勢崎|浜松|飯塚|山陽)"
+
+    # 車番ヘッダー「N\t選手名(LG) ...」の直後〜1行以内に欠車語
     for m in re.finditer(
-        r"(?m)^(?:予想印\s*)?([1-8])\s*[\t\s]+[^\n]{0,80}\n[^\n]*欠車",
+        rf"(?m)^([1-8])[\t ]+[^\n]*\({_lg}\)[^\n]*\n(?:[^\n]*\n){{0,1}}[^\n]*?(?:欠車|出走取消|発走除外|競走除外)",
         s,
     ):
         found.add(int(m.group(1)))
-    for m in re.finditer(r"(?m)^(?:予想印\s*)?([1-8])\s*[\t\s]+[^\n]{0,60}欠車", s):
-        found.add(int(m.group(1)))
-    for m in re.finditer(r"([1-8])\s*番[^\n]{0,40}欠車", s):
-        found.add(int(m.group(1)))
+
+    # 予想印付き形式
     for m in re.finditer(
-        r"(?m)^([1-8])\t[^\n]+\n(?:[^\n]*\n){0,3}[^\n]*欠車",
+        rf"(?m)^予想印[\t ]+([1-8])[\t ]+[^\n]*\({_lg}\)[^\n]*\n(?:[^\n]*\n){{0,1}}[^\n]*?(?:欠車|出走取消|発走除外|競走除外)",
         s,
     ):
         found.add(int(m.group(1)))
-    for m in re.finditer(r"(?m)^([1-8])\s+.*欠車", s):
+
+    # 「N番 欠車」一行形式
+    for m in re.finditer(
+        r"([1-8])\s*番[^\n]{0,40}(?:欠車|出走取消|発走除外|競走除外)",
+        s,
+    ):
         found.add(int(m.group(1)))
+
+    # 一行形式「N\t... 欠車」
+    for m in re.finditer(
+        r"(?m)^([1-8])[\t ]+[^\n]{0,60}(?:欠車|出走取消|発走除外|競走除外)",
+        s,
+    ):
+        found.add(int(m.group(1)))
+
     return sorted(found)
 
 
