@@ -2823,16 +2823,17 @@ def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
             con.commit()
             if int(cur.rowcount or 0) <= 0:
                 return None
+            # Ver324: 0 は falsy なので `x or 1` すると意図が反転する。NULL のみ default。
             return {
                 "task_id": task_id,
                 "ymd": str(row[1] or ""),
                 "venue": str(row[2] or ""),
                 "race_no": int(row[3] or 0),
-                "fetch_odds": bool(int(row[4] or 1)),
-                "register_result": bool(int(row[5] or 1)),
-                "skip_existing": bool(int(row[6] or 1)),
-                "replace": bool(int(row[7] or 0)),
-                "predict_if_missing": bool(int(row[8] or 1)),
+                "fetch_odds": bool(int(row[4])) if row[4] is not None else True,
+                "register_result": bool(int(row[5])) if row[5] is not None else True,
+                "skip_existing": bool(int(row[6])) if row[6] is not None else True,
+                "replace": bool(int(row[7])) if row[7] is not None else False,
+                "predict_if_missing": bool(int(row[8])) if row[8] is not None else True,
             }
 
     with _V326_QUEUE_LOCK:
@@ -6123,6 +6124,208 @@ def _v324_late_release_audit_diagnostic(
     )
     return out
 
+
+
+def _v324a_logit_breakdown_diagnostic(
+    db_path: str,
+    app_version: str | None = None,
+    limit_races: int = 200,
+) -> dict:
+    """Ver324a: v284_transition_audit.lap_stats の周回別 logit 内訳を集計。
+
+    新規予測のみ対象。読み取り専用で、予測値・logit・買い目には干渉しない。
+    """
+    ver = str(app_version or globals().get("_V231_APP_VERSION") or "Ver324").strip()
+    out = {
+        "ok": False,
+        "version": ver,
+        "by_lap": pd.DataFrame(),
+        "per_race": pd.DataFrame(),
+        "summary": {},
+        "reason": "",
+        "note": "catch後p_sumは p*=catch_factor の後。catch_drop_pt = p_sum_avg - p_before_catch_sum_avg。",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+
+    KEYS = [
+        "chain_fatigue_sum", "pack_wall_sum", "front_hold_sum",
+        "leader_hold_sum", "handicap_wall_sum", "wall_contrib_sum",
+        "catch_factor_sum", "p_before_catch_sum", "chain_bonus_sum",
+        "weak_front_bonus_sum", "ability_sum", "early_logit290_sum",
+        "slowdown_active_count", "momentum_active_count", "leader_pair_count",
+        "p_sum",
+    ]
+    agg = {
+        lap: {"attempts": 0, "races": 0, **{k: 0.0 for k in KEYS}}
+        for lap in range(1, 7)
+    }
+    used_races = 0
+    samples = []
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=25.0) as con:
+            con.execute("PRAGMA busy_timeout=25000")
+            cols = {str(r[1]) for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+            blob_col = "payload" if "payload" in cols else ("result_blob" if "result_blob" in cols else None)
+            if not blob_col:
+                out["reason"] = "payloadなし"
+                return out
+            ver_clause = "WHERE app_version=?" if "app_version" in cols else ""
+            params = [ver] if ver_clause else []
+            params.append(int(limit_races) * 4)
+            rows = con.execute(
+                f"SELECT history_id, race_key, {blob_col} FROM v231_prediction_history {ver_clause} ORDER BY history_id DESC LIMIT ?",
+                params,
+            ).fetchall()
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    seen_races = set()
+    for hid, rk, blob in rows:
+        try:
+            obj = pickle.loads(zlib.decompress(bytes(blob)))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        meta = obj.get("meta") or {}
+        if not meta and isinstance(obj.get("result"), dict):
+            meta = (obj.get("result") or {}).get("meta") or {}
+        wall = meta.get("6周展開シミュレーション") or meta.get("壁補正監査") or obj.get("wall_audit") or {}
+        if not isinstance(wall, dict):
+            continue
+        detail = wall.get("v284_transition_audit") or {}
+        if not isinstance(detail, dict):
+            continue
+        lap_stats = detail.get("lap_stats") or {}
+        if not lap_stats:
+            continue
+        if not any(
+            isinstance(lap_stats.get(lap) or lap_stats.get(str(lap)) or {}, dict)
+            and "chain_fatigue_sum" in (lap_stats.get(lap) or lap_stats.get(str(lap)) or {})
+            for lap in range(1, 7)
+        ):
+            continue
+
+        rkey = str(rk or "")
+        if rkey and rkey in seen_races:
+            continue
+        if rkey:
+            seen_races.add(rkey)
+        used_races += 1
+
+        for lap in range(1, 7):
+            st_l = lap_stats.get(lap) or lap_stats.get(str(lap)) or {}
+            if not isinstance(st_l, dict):
+                continue
+            att = int(st_l.get("attempts") or 0)
+            if att <= 0:
+                continue
+            agg[lap]["attempts"] += att
+            agg[lap]["races"] += 1
+            for k in KEYS:
+                try:
+                    agg[lap][k] += float(st_l.get(k) or 0.0)
+                except Exception:
+                    pass
+
+        if len(samples) < 40:
+            samples.append({"race_key": rkey, "history_id": int(hid or 0), "trials": int(detail.get("trials") or 0)})
+
+    if used_races == 0:
+        out["reason"] = "Ver324a監査フィールド付きの新規予測がまだありません。数R予測後に再実行してください。"
+        return out
+
+    rows_out = []
+    for lap in range(1, 7):
+        d = agg[lap]
+        att = float(d["attempts"])
+        if att <= 0:
+            continue
+        row = {"周回": lap, "レース数": int(d["races"]), "試行計": int(att), "attempts": att}
+        for k in KEYS:
+            row[k + "_avg"] = float(d.get(k, 0.0)) / att
+        pbc = row.get("p_before_catch_sum_avg", 0.0)
+        cf = row.get("catch_factor_sum_avg", 0.0)
+        ps = row.get("p_sum_avg", 0.0)
+        row["catch_drop_ratio"] = (cf / pbc) if pbc > 0 else None
+        row["catch_drop_pt"] = (ps - pbc) if pbc > 0 else None
+        rows_out.append(row)
+
+    by_lap = pd.DataFrame(rows_out)
+    hint = ""
+    try:
+        r4 = by_lap[by_lap["周回"] == 4]
+        if not r4.empty:
+            r = r4.iloc[0]
+            cands = []
+            cf4 = float(r.get("chain_fatigue_sum_avg", 0.0) or 0.0)
+            pw4 = float(r.get("pack_wall_sum_avg", 0.0) or 0.0)
+            w4 = float(r.get("wall_contrib_sum_avg", 0.0) or 0.0)
+            fh4 = float(r.get("front_hold_sum_avg", 0.0) or 0.0)
+            hw4 = float(r.get("handicap_wall_sum_avg", 0.0) or 0.0)
+            cfr4 = r.get("catch_drop_ratio")
+            if cf4 >= 0.05: cands.append(f"chain_fatigue({cf4:+.3f})")
+            if pw4 >= 0.05: cands.append(f"pack_wall({pw4:+.3f})")
+            if w4 >= 0.30: cands.append(f"wall({w4:+.3f})")
+            if fh4 >= 0.10: cands.append(f"front_hold({fh4:+.3f})")
+            if hw4 >= 0.05: cands.append(f"handicap_wall({hw4:+.3f})")
+            if cfr4 is not None and float(cfr4) < 0.50: cands.append(f"catch_factor({float(cfr4):.3f})")
+            hint = "周4の主因候補: " + " / ".join(cands) if cands else "周4に突出した減点項なし。p_before_catch 自体の低さ or シミュレーション本体側を疑う"
+    except Exception:
+        pass
+
+    out.update({
+        "ok": True,
+        "by_lap": by_lap,
+        "per_race": pd.DataFrame(samples),
+        "summary": {"対象レース": int(used_races), "解釈": hint},
+        "reason": "OK",
+    })
+    return out
+
+
+def _v324a_print_logit_breakdown(res: dict) -> None:
+    """Ver324a logit内訳を読み取り専用で表示。"""
+    if not res or not res.get("ok"):
+        st.warning(str((res or {}).get("reason") or "集計できませんでした。"))
+        return
+    sm = res.get("summary") or {}
+    st.write(f"対象 {int(sm.get('対象レース', 0))}R")
+    if sm.get("解釈"):
+        st.info(str(sm["解釈"]))
+    df = res.get("by_lap")
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        show_cols = [
+            "周回", "レース数", "試行計", "chain_fatigue_sum_avg", "pack_wall_sum_avg",
+            "front_hold_sum_avg", "leader_hold_sum_avg", "handicap_wall_sum_avg",
+            "wall_contrib_sum_avg", "chain_bonus_sum_avg", "weak_front_bonus_sum_avg",
+            "ability_sum_avg", "early_logit290_sum_avg", "p_before_catch_sum_avg", "p_sum_avg",
+            "catch_factor_sum_avg", "catch_drop_ratio", "catch_drop_pt",
+            "slowdown_active_count_avg", "momentum_active_count_avg", "leader_pair_count_avg",
+        ]
+        show_cols = [c for c in show_cols if c in df.columns]
+        st.dataframe(df[show_cols], use_container_width=True, hide_index=True,
+                     column_config={c: st.column_config.NumberColumn(format="%.4f") for c in show_cols if c not in {"周回", "レース数", "試行計"}})
+        r4 = df[df["周回"] == 4]
+        if not r4.empty:
+            r = r4.iloc[0]
+            st.markdown("**周4の主要項（大小比較用）**")
+            st.code(
+                "周4 attempts={att}\n  chain_fatigue   {cf:+.4f}\n  pack_wall       {pw:+.4f}\n  wall            {w:+.4f}\n  front_hold      {fh:+.4f}\n  handicap_wall   {hw:+.4f}\n  p_before_catch  {pbc:.4f}\n  p_after_catch   {ps:.4f}\n  catch_factor    {cfr:.4f}  (drop_ratio={dr:.3f})".format(
+                    att=int(r.get("attempts", 0)), cf=float(r.get("chain_fatigue_sum_avg", 0.0) or 0.0),
+                    pw=float(r.get("pack_wall_sum_avg", 0.0) or 0.0), w=float(r.get("wall_contrib_sum_avg", 0.0) or 0.0),
+                    fh=float(r.get("front_hold_sum_avg", 0.0) or 0.0), hw=float(r.get("handicap_wall_sum_avg", 0.0) or 0.0),
+                    pbc=float(r.get("p_before_catch_sum_avg", 0.0) or 0.0), ps=float(r.get("p_sum_avg", 0.0) or 0.0),
+                    cfr=float(r.get("catch_factor_sum_avg", 0.0) or 0.0), dr=float(r.get("catch_drop_ratio") or 0.0)),
+                language=None)
+    pr = res.get("per_race")
+    if isinstance(pr, pd.DataFrame) and not pr.empty:
+        with st.expander("集計に使ったレース一覧", expanded=False):
+            st.dataframe(pr, use_container_width=True, hide_index=True)
 
 def _v324_adjacent_swap_volume_diagnostic(
     db_path: str,
@@ -10025,11 +10228,28 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     scenario_combo_counts={}
     route_counts={}
     # Ver284 詳細監査。予測判定には一切使わず、再シミュレーション後の原因分析専用。
+    # Ver324a: logit内訳の読み取り専用監査（予測値には非干渉）
     transition_audit={lap:{"attempts":0,"successes":0,"p_sum":0.0,
                            "wall_attempts":0,"wall_successes":0,"wall_sum":0.0,
                            "momentum_attempts":0,"momentum_successes":0,
                            "slowdown_attempts":0,"slowdown_successes":0,
-                           "top3_entries":0,"top3_exits":0} for lap in range(1,7)}
+                           "top3_entries":0,"top3_exits":0,
+                           "chain_fatigue_sum":0.0,
+                           "pack_wall_sum":0.0,
+                           "front_hold_sum":0.0,
+                           "leader_hold_sum":0.0,
+                           "handicap_wall_sum":0.0,
+                           "wall_contrib_sum":0.0,
+                           "catch_factor_sum":0.0,
+                           "p_before_catch_sum":0.0,
+                           "chain_bonus_sum":0.0,
+                           "weak_front_bonus_sum":0.0,
+                           "ability_sum":0.0,
+                           "early_logit290_sum":0.0,
+                           "slowdown_active_count":0,
+                           "momentum_active_count":0,
+                           "leader_pair_count":0,
+                           } for lap in range(1,7)}
     transition_pair_audit={}
     top3_order_audit={}
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
@@ -10271,6 +10491,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 # 大差なら即追越しは難しいが、速度優位車はまず差を詰められる。
                 catch_factor=max(0.10,1.0-min(0.78,gaps[i]*1.12))
                 catch_factor=min(1.15,catch_factor+0.10*max(0.0,speed_edge))
+                _p_before_catch324a = float(p)
                 p*=catch_factor
                 _ta=transition_audit[lap]
                 _ta["attempts"]+=1; _ta["p_sum"]+=float(p)
@@ -10284,6 +10505,23 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 if _wall_audit: _ta["wall_attempts"]+=1
                 if _mom_audit: _ta["momentum_attempts"]+=1
                 if _slow_audit: _ta["slowdown_attempts"]+=1
+                # Ver324a: 読み取り専用積算（logit・p・遷移判定には非干渉）
+                _ta["chain_fatigue_sum"] += float(chain_fatigue)
+                _ta["pack_wall_sum"] += float(pack_wall)
+                _ta["front_hold_sum"] += float(front_hold)
+                _ta["handicap_wall_sum"] += float(handicap_wall)
+                _ta["wall_contrib_sum"] += float(wall)
+                _ta["catch_factor_sum"] += float(catch_factor)
+                _ta["p_before_catch_sum"] += _p_before_catch324a
+                _ta["chain_bonus_sum"] += float(chain_bonus)
+                _ta["weak_front_bonus_sum"] += float(weak_front_bonus)
+                _ta["ability_sum"] += float(ability)
+                _ta["early_logit290_sum"] += float(_early_logit290)
+                if _slow_audit: _ta["slowdown_active_count"] += 1
+                if _mom_audit: _ta["momentum_active_count"] += 1
+                if i == 1:
+                    _ta["leader_hold_sum"] += float(leader_hold_delta) * max(0.25, 1.0 - 0.13*(lap-1))
+                    _ta["leader_pair_count"] += 1
                 _pair_key=(int(lap),int(chaser),int(front))
                 _pa=transition_pair_audit.setdefault(_pair_key,{"attempts":0,"successes":0,"p_sum":0.0,
                                                                  "wall_attempts":0,"wall_sum":0.0,
@@ -35149,6 +35387,19 @@ if selected_main_page == "🗃️ 登録情報確認":
     elif isinstance(_oc, dict) and _oc.get("reason") and _oc.get("reason") != "OK":
         st.warning(str(_oc.get("reason")))
 
+
+    st.markdown("##### 🧪 周回別 logit内訳（Ver324a）")
+    st.caption(
+        "保存済みの新規予測 v284_transition_audit.lap_stats から、"
+        "周回ごとの chain_fatigue / pack_wall / wall / front_hold / catch_factor などの平均寄与を読み取ります。"
+        "予測値・買い目・logit式は一切変更しません。"
+    )
+    if st.button("logit内訳を集計", key="v324a_logit_breakdown_btn", use_container_width=True):
+        with st.spinner("v284_transition_audit を集計中…"):
+            st.session_state["v324a_logit_breakdown"] = _v324a_logit_breakdown_diagnostic(engine.DB_PATH)
+    _bd = st.session_state.get("v324a_logit_breakdown")
+    if isinstance(_bd, dict):
+        _v324a_print_logit_breakdown(_bd)
     st.markdown("##### 🕔 周5/6 再加速監査（late_release）")
     st.caption(
         "late_release_audit_v273 の集計。周5の v282境界ガード / スコア不足 / 発動率を見ます。"
