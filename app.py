@@ -15604,6 +15604,12 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
     try:
         if isinstance(df, pd.DataFrame) and isinstance(entries, pd.DataFrame) and not entries.empty:
             car_col = "車" if isinstance(df, pd.DataFrame) and "車" in df.columns else "車番"
+            # Ver324e-B7:
+            # entries には manual_excluded / auto_kessha で除外したはずの欠車車番も
+            # engine がそのまま返してくる。ここで df へ戻すと、除外した欠車が復活し、
+            # prediction_snapshots が8車のままになり、結果7車との照合が再び不一致になる。
+            # excl に含まれる車番は df へ戻さない。
+            _excl_guard = set(int(x) for x in (excl or []))
             have = set()
             if car_col in df.columns:
                 have = set(pd.to_numeric(df[car_col], errors="coerce").dropna().astype(int).tolist())
@@ -15612,6 +15618,8 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
                 try:
                     c = int(float(r.get("車番")))
                 except Exception:
+                    continue
+                if c in _excl_guard:
                     continue
                 if c not in have:
                     row = {col: None for col in df.columns}
@@ -34866,6 +34874,62 @@ if selected_main_page == "✅ 結果登録・解析":
                         meta_for_engine["事前除外車番"] = kessha_nums
                         meta_for_engine["比較対象外車番"] = kessha_nums
                         meta_for_engine["実出走数"] = int(len(rows_for_engine))
+                    # Ver324e-B8:
+                    # 置き換え登録時、予測スナップショット側に結果へ存在しない車番
+                    # （発走前欠車など）が残っていると engine の出走数照合で不一致になる。
+                    # snapshot の当該車番だけを自動的に除去して照合を通過させる。
+                    # UI操作・SQL操作は不要、置き換えチェックだけで完結する。
+                    if replace_registered and existing_result_key:
+                        try:
+                            _snap_cars = set()
+                            with sqlite3.connect(engine.DB_PATH, timeout=10.0) as _c8:
+                                _c8.execute("PRAGMA busy_timeout=10000")
+                                try:
+                                    for _cr, in _c8.execute(
+                                        "SELECT DISTINCT car_no FROM prediction_snapshots "
+                                        "WHERE race_key=?",
+                                        (str(existing_result_key),),
+                                    ):
+                                        if _cr is not None:
+                                            _snap_cars.add(int(_cr))
+                                except Exception:
+                                    pass
+                            try:
+                                _res_cars = set(
+                                    pd.to_numeric(
+                                        rows_for_engine["車番"], errors="coerce"
+                                    ).dropna().astype(int).tolist()
+                                )
+                            except Exception:
+                                _res_cars = set()
+                            _extra_in_snap = sorted(_snap_cars - _res_cars)
+                            _missing_in_snap = sorted(_res_cars - _snap_cars)
+                            if _extra_in_snap:
+                                with sqlite3.connect(engine.DB_PATH, timeout=10.0) as _c8b:
+                                    _c8b.execute("PRAGMA busy_timeout=10000")
+                                    _q8 = ",".join("?" * len(_extra_in_snap))
+                                    _c8b.execute(
+                                        f"DELETE FROM prediction_snapshots "
+                                        f"WHERE race_key=? AND car_no IN ({_q8})",
+                                        (str(existing_result_key), *_extra_in_snap),
+                                    )
+                                    try:
+                                        _c8b.execute(
+                                            f"DELETE FROM v40_prediction_feature_snapshots "
+                                            f"WHERE race_key=? AND car_no IN ({_q8})",
+                                            (str(existing_result_key), *_extra_in_snap),
+                                        )
+                                    except Exception:
+                                        pass
+                                    _c8b.commit()
+                                st.caption(
+                                    "🧩 予測スナップショットの車番を結果と整合させました"
+                                    f"（除去: {_extra_in_snap}"
+                                    + (f" / 結果のみ: {_missing_in_snap}" if _missing_in_snap else "")
+                                    + "）"
+                                )
+                        except Exception as _b8_exc:
+                            st.caption(f"snapshot車番整合をスキップ: {type(_b8_exc).__name__}")
                     if replace_registered:
                         key, comparison, analysis, adjustment, registration = engine.v70_replace_registered_result(
                             meta_for_engine, rows_for_engine, laps_r, payouts_r, engine.DB_PATH
