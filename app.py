@@ -16795,7 +16795,11 @@ def _v319_import_one_race(
 
     # --- 3) 予測（未保存時）＋出走数不一致なら再予測 ---
     pred_ok = _v319_prediction_exists(db_path, key_guess)
-    card_n = len(players or [])
+    # Ver324e-B6:
+    # players には kessha=True の車も含まれる。len(players) をそのまま使うと
+    # 予測7車 vs card_n=8 の見かけ不一致が毎回出て、旧8車snapshotを「正しい」と
+    # 誤認して再利用してしまう。欠車を差し引いた実出走車数でカウントする。
+    card_n = sum(1 for p in (players or []) if not p.get("kessha"))
     if not card_n and card_text:
         mm = re.search(r"(\d+)\s*車", str(card_text))
         if mm:
