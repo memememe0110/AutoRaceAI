@@ -69,7 +69,14 @@ def _v320_extract_started_and_incident_cars(text, finished_rows=None):
             car = int(lines[i + 1])
         if car is None:
             continue
-        nearby = " ".join(lines[i:min(len(lines), i + 8)])
+        # Ver324e-B9: 8行固定窓だと次の車番のマーカー（例: 6番の /欠車）を
+        # 巻き込んで5番が欠車扱いになる。次の「- N」で打ち切る。
+        _end_idx_b9 = min(len(lines), i + 8)
+        for _j_b9 in range(i + 1, min(len(lines), i + 12)):
+            if re.match(r"^[-－—–]\s*[1-8](?:\s|$)", lines[_j_b9]):
+                _end_idx_b9 = _j_b9
+                break
+        nearby = " ".join(lines[i:_end_idx_b9])
         if any(w in nearby for w in nonstarters):
             continue
         status = next((w for w in incident_words if w in nearby), "競走中止等")
@@ -11142,12 +11149,26 @@ def _v224_restore_nonstarter_rows(result_text: str, meta: dict, rows: pd.DataFra
         # 2) Ver324e: 競走T=0.000 かつ 発走後事故語なし
         #    → 発走していない（直前取消・発走前除外）として事前除外扱い
         #    ※ 反妨・落車・失格・競走中止 等は _v227 側で発走後事故として扱う。
+        #    Ver324e-B9: STに実値(>0)がある車は発走済み。事前除外に含めず、
+        #    発走後事故（_v227側）へ委ねる。
         if re.search(r"\b0\.000\b", block) and not re.search(
             r"反妨|反則|失格|落車|他落|周誤|競走中止|故障|内突|外突", block
         ):
-            if car_no not in seen_cars:
-                seen_cars.add(car_no)
-                detected.append((car_no, "発走前除外"))
+            _st_started_b9 = False
+            for _line_b9 in block.splitlines():
+                _m_b9 = re.match(r"^\s*(\d+\.\d{2,3})\s*(?:/\S+)?\s*$", _line_b9)
+                if not _m_b9:
+                    continue
+                try:
+                    if float(_m_b9.group(1)) > 0.0:
+                        _st_started_b9 = True
+                        break
+                except Exception:
+                    pass
+            if not _st_started_b9:
+                if car_no not in seen_cars:
+                    seen_cars.add(car_no)
+                    detected.append((car_no, "発走前除外"))
 
     # 補助: 1行化テキストへの後方互換（車番ブロック検出が空のときだけ）
     if not detected:
@@ -11351,6 +11372,39 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
         )
         for m in line_pat.finditer(normalized):
             _ = found.append({"車番": int(m.group(1)), "理由": str(m.group(2))})
+    # Ver324e-B9:
+    # 明示マーカーなしの「発走したが着順も競走Tもない」車を発走後事故として扱う。
+    # 例: 飯塚 20261002 3R 5番（着順"-" / 競走T 0.000 / ST 0.14 / 事故語なし）
+    # 事前除外（欠車・発走除外・取消・停止）は対象外。
+    _explicit_b9 = {int(x["車番"]) for x in found}
+    _starts_b9 = [
+        (m.start(), int(m.group(1)))
+        for m in re.finditer(r"(?m)^\s*[-－]\s*([1-8])\b", normalized)
+    ]
+    for _i_b9, (_start_b9, _car_b9) in enumerate(_starts_b9):
+        if _car_b9 in _explicit_b9:
+            continue
+        _end_b9 = _starts_b9[_i_b9 + 1][0] if _i_b9 + 1 < len(_starts_b9) else len(normalized)
+        _block_b9 = normalized[_start_b9:_end_b9]
+        if re.search(r"欠車|発走除外|競走除外|出走取消|出走取り消し|停止", _block_b9):
+            continue
+        if not re.search(r"\b0\.000\b", _block_b9):
+            continue
+        _st_started_b9 = False
+        for _line_b9 in _block_b9.splitlines():
+            _m_b9 = re.match(r"^\s*(\d+\.\d{2,3})\s*(?:/\S+)?\s*$", _line_b9)
+            if not _m_b9:
+                continue
+            try:
+                if float(_m_b9.group(1)) > 0.0:
+                    _st_started_b9 = True
+                    break
+            except Exception:
+                pass
+        if not _st_started_b9:
+            continue
+        _ = found.append({"車番": int(_car_b9), "理由": "競走中止等"})
+
     unique=[]
     seen=set()
     for item in found:
@@ -16225,9 +16279,10 @@ def _v319_register_fetched_result(
         have_cars = set(
             int(x) for x in pd.to_numeric(rows_r["車番"], errors="coerce").dropna().astype(int).tolist()
         )
-        # 既存の正常着順の最大
-        fin_nums = pd.to_numeric(rows_r["着順"], errors="coerce").dropna()
-        next_fin = int(fin_nums.max()) + 1 if len(fin_nums) else 1
+        # Ver324e-B9: 事前除外の999を採番から除外
+        _all_fin_b9 = pd.to_numeric(rows_r["着順"], errors="coerce").dropna()
+        _valid_fin_b9 = _all_fin_b9[_all_fin_b9 <= 8]
+        next_fin = int(_valid_fin_b9.max()) + 1 if len(_valid_fin_b9) else 1
         add_rows = []
         for c, reason in inc_cars:
             if c in have_cars:
@@ -16270,6 +16325,11 @@ def _v319_register_fetched_result(
             _starters_after_kessha = have_cars - _kessha_set
             meta_r["予測照合用出走数"] = int(len(_starters_after_kessha))
             meta_r["実出走数"] = int(len(_starters_after_kessha))
+        # Ver324e-B9: 発走後事故車も 発走車番 に含める（実際に発走している）
+        _started_set_b9 = set(int(x) for x in (meta_r.get("発走車番") or []))
+        for _c_b9, _r_b9 in inc_cars:
+            _started_set_b9.add(int(_c_b9))
+        meta_r["発走車番"] = sorted(_started_set_b9)
     except Exception:
         pass
     # 反妨車は欠車扱いで落とさない
