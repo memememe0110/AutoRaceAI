@@ -12836,6 +12836,39 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
     if hm:
         hum = hm.group(1)
 
+    # Ver324e-B10 Fix G: HTTP経路でもレース種別・開催日程・発走時刻・出走数を保持する。
+    _meta_src_b10 = "\n".join((str(raw or ""), str(html or "")))
+    race_name_b10 = ""
+    race_type_b10 = ""
+    race_start_b10 = ""
+    day_label_b10 = ""
+    n_cars_b10 = 0
+    _m_rt_b10 = re.search(
+        r"(予選|一般戦|選抜(?:戦)?|準決勝?|優勝戦|最終日|初日)\s*"
+        r"(?:\d{3,4}m)?\s*\(?\s*(\d+)\s*周\s*\)?",
+        _meta_src_b10,
+    )
+    if _m_rt_b10:
+        race_type_b10 = _m_rt_b10.group(1)
+        race_name_b10 = race_type_b10
+    else:
+        _m_type_b10 = re.search(r"(?:^|[\s　>])((?:予選|一般戦|選抜(?:戦)?|準決勝?|優勝戦))(?:[\s　<]|$)", _meta_src_b10)
+        if _m_type_b10:
+            race_type_b10 = _m_type_b10.group(1)
+            race_name_b10 = race_type_b10
+    _m_day_b10 = re.search(r"(?:^|[\n\r\s　>])((?:初日|最終日|\d+日目))(?:[\n\r\s　<]|$)", _meta_src_b10)
+    if _m_day_b10:
+        day_label_b10 = _m_day_b10.group(1)
+    _m_start_b10 = re.search(r"(\d{1,2}:\d{2})\s*(?:発走|発走時刻)", _meta_src_b10)
+    if _m_start_b10:
+        race_start_b10 = _m_start_b10.group(1)
+    _m_ncar_b10 = re.search(r"(\d{1,2})\s*車", _meta_src_b10)
+    if _m_ncar_b10:
+        try:
+            n_cars_b10 = int(_m_ncar_b10.group(1))
+        except Exception:
+            n_cars_b10 = 0
+
     lines = [f"{int(race_no)}R", "確定", "締切済", date_s, str(venue or "")]
     if surface:
         extra = f"{surface}"
@@ -12848,6 +12881,14 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
         _ = lines.append(f"気温：{air}℃")
     if hum:
         _ = lines.append(f"湿度：{hum}%")
+    if race_name_b10:
+        _ = lines.append(f"レース名：{race_name_b10}")
+    if race_type_b10:
+        _ = lines.append(f"レース種別：{race_type_b10}")
+    if race_start_b10:
+        _ = lines.append(f"発走時刻：{race_start_b10}")
+    if day_label_b10:
+        _ = lines.append(f"開催日程：{day_label_b10}")
     _ = lines.append("着順	車番	選手名")
     _ = lines.append("LG/ハンデ/試走T	競走T（人気）")
     _ = lines.append("ST/事故")
@@ -12867,6 +12908,12 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
         elif any(k in head for k in ("単勝", "払戻", "2連", "ワイド", "3連")):
             pay_rows.extend(body)
 
+    # 結果テーブル自体が全車番を持つため、ヘッダ側から取れない場合の出走数補完。
+    if not n_cars_b10 and finish_rows:
+        n_cars_b10 = sum(1 for _cells_b10 in finish_rows if len(_cells_b10) >= 3)
+    if n_cars_b10:
+        _ = lines.insert(5, f"出走数：{n_cars_b10}車")
+
     for cells in finish_rows:
         if len(cells) < 6:
             continue
@@ -12879,8 +12926,25 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
             trial = cells[6] if len(cells) > 6 else "0.00"
             race_t = cells[7] if len(cells) > 7 else "0.000"
             st = cells[8] if len(cells) > 8 else "0.00"
+            # Ver324e-B10 Fix F: 事故列の位置を固定せず、全セルから事故語を探索する。
+            _incident_words_b10 = (
+                "内突", "外突", "反妨", "反則", "失格",
+                "落車", "他落", "周誤", "周回誤認", "故障", "競走中止",
+                "欠車", "発走除外", "競走除外", "出走取消", "停止",
+            )
             abn = ""
-            pop = cells[9] if len(cells) > 9 else "-"
+            for _c_b10 in cells:
+                _s_b10 = str(_c_b10 or "").strip()
+                if _s_b10 and any(_w_b10 in _s_b10 for _w_b10 in _incident_words_b10):
+                    abn = _s_b10
+                    break
+            pop = "-"
+            for _c_b10 in reversed(cells):
+                _s_b10 = str(_c_b10 or "").strip()
+                if _s_b10 and not any(_w_b10 in _s_b10 for _w_b10 in _incident_words_b10):
+                    if re.fullmatch(r"\d{1,2}", _s_b10):
+                        pop = _s_b10
+                        break
         else:
             pos, acc, car = cells[0], cells[1], cells[2]
             name = re.sub(r"\s+", "", cells[3] if len(cells) > 3 else "")
@@ -12889,8 +12953,25 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
             trial = cells[7] if len(cells) > 7 else "0.00"
             race_t = cells[8] if len(cells) > 8 else "0.000"
             st = cells[9] if len(cells) > 9 else "0.00"
-            abn = cells[10] if len(cells) > 10 else ""
-            pop = cells[11] if len(cells) > 11 else "-"
+            # Ver324e-B10 Fix F: HTTP取得時の列ずれに依存せず、事故語を全セルから拾う。
+            _incident_words_b10 = (
+                "内突", "外突", "反妨", "反則", "失格",
+                "落車", "他落", "周誤", "周回誤認", "故障", "競走中止",
+                "欠車", "発走除外", "競走除外", "出走取消", "停止",
+            )
+            abn = ""
+            for _c_b10 in cells:
+                _s_b10 = str(_c_b10 or "").strip()
+                if _s_b10 and any(_w_b10 in _s_b10 for _w_b10 in _incident_words_b10):
+                    abn = _s_b10
+                    break
+            pop = "-"
+            for _c_b10 in reversed(cells):
+                _s_b10 = str(_c_b10 or "").strip()
+                if _s_b10 and not any(_w_b10 in _s_b10 for _w_b10 in _incident_words_b10):
+                    if re.fullmatch(r"\d{1,2}", _s_b10):
+                        pop = _s_b10
+                        break
         # 着順 "-" だけでは欠車にしない（反妨・失格なども "-" になる）
         _is_kessha = (
             acc == "欠車" or "欠車" in str(acc or "") or str(abn or "") == "欠車"
@@ -34991,9 +35072,40 @@ if selected_main_page == "✅ 結果登録・解析":
                         except Exception as _b8_exc:
                             st.caption(f"snapshot車番整合をスキップ: {type(_b8_exc).__name__}")
                     if replace_registered:
-                        key, comparison, analysis, adjustment, registration = engine.v70_replace_registered_result(
-                            meta_for_engine, rows_for_engine, laps_r, payouts_r, engine.DB_PATH
-                        )
+                        # Ver324e-B10 Fix E: 置き換え経路の空データ由来 IndexError は、
+                        # 既存結果を削除して通常登録へフォールバックする。
+                        try:
+                            key, comparison, analysis, adjustment, registration = engine.v70_replace_registered_result(
+                                meta_for_engine, rows_for_engine, laps_r, payouts_r, engine.DB_PATH
+                            )
+                        except IndexError as idx_exc:
+                            st.warning(
+                                f"置き換え登録で IndexError: {idx_exc}。既存結果を削除して通常登録パスへフォールバックします。"
+                            )
+                            try:
+                                with sqlite3.connect(engine.DB_PATH, timeout=15.0) as _c10:
+                                    _c10.execute("PRAGMA busy_timeout=15000")
+                                    for _t in ("result_entries", "result_laps", "result_payouts"):
+                                        try:
+                                            _c10.execute(f"DELETE FROM {_t} WHERE race_key=?", (existing_result_key,))
+                                        except Exception:
+                                            pass
+                                    try:
+                                        _c10.execute("DELETE FROM result_races WHERE race_key=?", (existing_result_key,))
+                                    except Exception:
+                                        pass
+                                    _c10.commit()
+                                key, comparison, analysis, adjustment, registration = engine.v41_register_result(
+                                    meta_for_engine, rows_for_engine, laps_r, payouts_r, engine.DB_PATH
+                                )
+                                registration["replaced"] = True
+                                registration["replace_fallback_from_indexerror"] = str(idx_exc)
+                            except Exception as fallback_exc:
+                                raise RuntimeError(
+                                    f"置き換えIndexError→通常登録フォールバックも失敗: "
+                                    f"{type(idx_exc).__name__}: {idx_exc} / "
+                                    f"{type(fallback_exc).__name__}: {fallback_exc}"
+                                ) from fallback_exc
                     else:
                         key, comparison, analysis, adjustment, registration = engine.v41_register_result(
                             meta_for_engine, rows_for_engine, laps_r, payouts_r, engine.DB_PATH
