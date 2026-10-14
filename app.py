@@ -16421,7 +16421,45 @@ def _v319_register_fetched_result(
         # ここで最終確定値として揃える。
         meta_r["実出走数"] = int(len(rows_for_engine))
         meta_r["予測照合用出走数"] = int(len(rows_for_engine))
-    if replace:
+    # Ver324e-B11: 自動取込の置換判定を「result_races があるか」だけで決めない。
+    # 予選系で前回の結果登録が途中終了した場合、result_races だけが残ることがあり、
+    # その不完全レコードを v70 の置換経路へ渡すと内部の空DataFrame参照を誘発する。
+    # 登録済み結果の実体(result_entries)が無い場合は、置換ではなく不完全な殻を先に除去して
+    # 通常登録へ進める。例外を握り潰すフォールバックではなく、原因となる不整合状態を解消する。
+    _replace_effective = bool(replace)
+    if _replace_effective:
+        try:
+            _rk_b11 = str(engine.v34_race_key(meta_r))
+        except Exception:
+            _ymd_b11 = re.sub(r"[^0-9]", "", str(meta_r.get("開催日") or meta_r.get("日付") or ""))[:8]
+            _v_b11 = str(meta_r.get("開催場") or "")
+            _r_b11 = re.sub(r"[^0-9]", "", str(meta_r.get("レース") or meta_r.get("R") or ""))
+            _rk_b11 = f"{_ymd_b11}_{_v_b11}_{int(_r_b11)}R" if len(_ymd_b11) >= 8 and _v_b11 and _r_b11 else ""
+        if _rk_b11:
+            try:
+                with sqlite3.connect(str(db_path), timeout=15.0) as _c_b11:
+                    _c_b11.execute("PRAGMA busy_timeout=15000")
+                    _rr_exists_b11 = bool(_c_b11.execute(
+                        "SELECT 1 FROM result_races WHERE race_key=? LIMIT 1", (_rk_b11,)
+                    ).fetchone())
+                    _entry_count_b11 = int(_c_b11.execute(
+                        "SELECT COUNT(*) FROM result_entries WHERE race_key=?", (_rk_b11,)
+                    ).fetchone()[0])
+                    if _rr_exists_b11 and _entry_count_b11 <= 0:
+                        # result_racesだけ残った中断状態を正規化する。
+                        for _t_b11 in (
+                            "result_laps", "result_payouts", "prediction_feedback",
+                            "result_entries", "v41_registration_batches", "result_races"
+                        ):
+                            try:
+                                _c_b11.execute(f"DELETE FROM {_t_b11} WHERE race_key=?", (_rk_b11,))
+                            except sqlite3.Error:
+                                pass
+                        _c_b11.commit()
+                        _replace_effective = False
+            except Exception:
+                pass
+    if _replace_effective:
         key, *_rest = engine.v70_replace_registered_result(
             meta_r, rows_for_engine, laps_r, payouts_r, db_path
         )
