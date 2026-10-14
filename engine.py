@@ -8030,9 +8030,15 @@ def v39_init_learning_tables(db_path=DB_PATH):
         """)
         now=datetime.now().isoformat(timespec="seconds")
         for name, weight in V39_DEFAULT_WEIGHTS.items():
-            con.execute("""INSERT OR IGNORE INTO adaptive_weights
-                (feature_name,current_weight,initial_weight,updated_at,update_count)
-                VALUES(?,?,?,?,0)""", (name,weight,weight,now))
+            try:
+                con.execute("""INSERT OR IGNORE INTO adaptive_weights
+                    (feature_name,current_weight,initial_weight,updated_at,update_count)
+                    VALUES(?,?,?,?,0)""", (name,weight,weight,now))
+            except sqlite3.OperationalError as e:
+                # Ver324e-B13-C: SQLite OperationalErrorの実体だけをLogsへ出す診断。
+                # 予測ロジック・重み値・DBスキーマ・結果登録処理は変更しない。
+                print(f"[SQLite Diagnostic Error] v39_init_learning_tables: {e!r}")
+                raise
         con.commit()
 
 
@@ -10061,6 +10067,17 @@ def _v56_result_venue_from_header(text):
 _v56_parse_meta_original = _v35_parse_meta
 def _v35_parse_meta(text, venue_override="", race_no_override=""):
     meta = _v56_parse_meta_original(text, venue_override, race_no_override)
+    # Ver324e-B13-B Fix G: HTTP正規化後の「発走時刻：HH:MM」「距離：NNNNm」を確実にメタへ反映。
+    _b13_text = str(text or "")
+    m = re.search(r"発走時刻\s*[:：]\s*(\d{1,2}:\d{2})", _b13_text)
+    if m:
+        meta["発走時刻"] = m.group(1)
+        hour = int(m.group(1).split(":")[0])
+        meta["時間帯"] = "昼" if hour < 16 else ("夕方" if hour < 18 else "夜")
+    m = re.search(r"距離\s*[:：]\s*(\d{4})\s*m", _b13_text)
+    if m:
+        meta["距離"] = int(m.group(1))
+
     # 手動指定が最優先。未指定なら市営見出しから再確定する。
     if str(venue_override or "").strip():
         meta["開催場"] = str(venue_override).strip()
@@ -12177,7 +12194,7 @@ def v74_optimization_history(db_path=DB_PATH, limit=20):
 # Ver76: 事故レースは保存するが、AI学習からレース単位で除外
 # ============================================================
 V76_ACCIDENT_PATTERN = re.compile(
-    r"落車|他落|落妨|反則|反妨|妨害|周誤|周回誤認|競走中止|不成立|失格|欠責|欠車|出走取消|参加解除",
+    r"落車|他落|落妨|反則|反妨|妨害|周誤|周回誤認|競走中止|不成立|失格|欠責|欠車|出走取消|参加解除|内突|外突",
     re.IGNORECASE,
 )
 

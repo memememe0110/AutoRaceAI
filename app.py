@@ -11357,13 +11357,17 @@ def _v227_detect_poststart_incidents(result_text: str, meta: dict) -> tuple[dict
     # 「失格」単体は払戻説明や脚注に出やすいので、スラッシュ付きのみ採用する
     words_slash = words + r"|失格"
     found: list[dict] = []
-    # 公式結果の「- 6 選手名 ... /反妨」形式を優先（スラッシュ必須に近い）
-    pat = re.compile(
-        rf"(?:^|\n)\s*-\s*([1-8])\b[^\n]{{0,200}}?/\s*({words_slash})(?=\s|$)",
-        re.MULTILINE,
-    )
-    for m in pat.finditer(normalized):
-        _ = found.append({"車番": int(m.group(1)), "理由": str(m.group(2))})
+    # Ver324e-B13-B: 「- 5」と「0.14 /内突」が別行でも、車番ブロック内で明示事故を拾う。
+    _starts = [
+        (m.start(), int(m.group(1)))
+        for m in re.finditer(r"(?m)^\s*[-－]\s*([1-8])\b", normalized)
+    ]
+    for _i, (_start, _car) in enumerate(_starts):
+        _end = _starts[_i + 1][0] if _i + 1 < len(_starts) else len(normalized)
+        _block = normalized[_start:_end]
+        _m = re.search(rf"/\s*({words_slash})(?=\s|$)", _block)
+        if _m:
+            _ = found.append({"車番": int(_car), "理由": str(_m.group(1))})
     if not found:
         # フォールバック: 着順が "-" の行に事故語がある場合のみ
         line_pat = re.compile(
@@ -12913,6 +12917,10 @@ def _v319_normalize_oddspark_result_text(html: str, venue: str, race_no: int, ym
         n_cars_b10 = sum(1 for _cells_b10 in finish_rows if len(_cells_b10) >= 3)
     if n_cars_b10:
         _ = lines.insert(5, f"出走数：{n_cars_b10}車")
+    # Ver324e-B13-B Fix G: 「3100m 8車 6周」から距離を保持。
+    _m_dist_b10 = re.search(r"(\d{4})\s*m\s+(\d+)\s*車\s+(\d+)\s*周", _meta_src_b10)
+    if _m_dist_b10:
+        _ = lines.insert(5, f"距離：{_m_dist_b10.group(1)}m")
 
     for cells in finish_rows:
         if len(cells) < 6:
