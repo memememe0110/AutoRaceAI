@@ -7478,6 +7478,12 @@ def v34_save_result_and_analyze(meta, results, db_path=DB_PATH):
     v34_init_feedback_tables(db_path)
     key = v34_race_key(meta)
     now = datetime.now().isoformat(timespec="seconds")
+
+    # Ver324e-B12: 発走後事故レース等で有効着順が0件の場合、
+    # result_races の更新だけを行い、予測比較（.iloc[0]）は実行しない。
+    # これにより空DataFrameへの positional indexer 到達を完全に遮断する。
+    _has_rows = isinstance(results, pd.DataFrame) and len(results) > 0
+
     with sqlite3.connect(db_path) as con:
         # 列名を明示する。Ver76以降で result_races に学習可否列が増えても、
         # 既存の9項目登録が列数不一致で壊れないようにする。
@@ -7491,11 +7497,20 @@ def v34_save_result_and_analyze(meta, results, db_path=DB_PATH):
           (key,meta.get("開催日"),meta.get("開催場"),str(meta.get("レース") or ""),meta.get("走路状態"),
            meta.get("走路温度"),meta.get("気温"),meta.get("湿度"),now))
         con.execute("DELETE FROM result_entries WHERE race_key=?", (key,))
-        for _,r in results.iterrows():
-            con.execute("""INSERT INTO result_entries VALUES(?,?,?,?,?,?,?,?,?)""",
-              (key,int(r["車番"]),str(r["選手名"]),int(r["着順"]),r.get("試走T"),r.get("競走T"),r.get("ST"),str(r.get("ハンデ", "")),str(r.get("結果区分","通常"))))
+        if _has_rows:
+            for _,r in results.iterrows():
+                con.execute("""INSERT INTO result_entries VALUES(?,?,?,?,?,?,?,?,?)""",
+                  (key,int(r["車番"]),str(r["選手名"]),int(r["着順"]),r.get("試走T"),r.get("競走T"),r.get("ST"),str(r.get("ハンデ", "")),str(r.get("結果区分","通常"))))
         pred = pd.read_sql_query("SELECT * FROM prediction_snapshots WHERE race_key=?", con, params=(key,))
         con.commit()
+
+    if not _has_rows:
+        # 事故レース等で有効着順がない場合の早期リターン。
+        # result_races は更新済み、prediction_snapshots は無傷、予測比較は行わない。
+        return key, pd.DataFrame(), {
+            "message": "有効な着順行がないため、予測比較は行いません（事故レース等）。"
+        }
+
     merged = results.merge(pred, left_on="車番", right_on="car_no", how="left") if not pred.empty else results.copy()
     if pred.empty:
         return key, merged, {"message":"同じ日付・開催場・レース番号の保存済み予測がないため、結果登録のみ完了しました。"}

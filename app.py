@@ -17281,6 +17281,7 @@ def _v319_import_one_race(
     try:
         saved = _v319_register_fetched_result(db_path, raw, venue, replace=bool(exists and replace), race_no_hint=int(race_no))
     except Exception as exc:
+        _b13_tb = traceback.format_exc()
         emsg = f"{type(exc).__name__}: {exc}"
         # 予測と結果の台数/車番不一致 → 反妨補完 or 再予測 or 予測クリア後の強制登録
         if ("出走数が一致しない" in emsg) or ("結果にない車番" in emsg) or ("予測にない車番" in emsg) or ("予測=" in emsg and "結果=" in emsg):
@@ -17351,8 +17352,10 @@ def _v319_import_one_race(
                         "message": (
                             f"{venue} {race_no}R：結果登録に失敗しました。"
                             f" ({emsg}｜再予測後:{type(exc2).__name__}: {exc2}｜強制:{type(exc3).__name__}: {exc3})"
+                            f"\n--- B13 traceback ---\n{_b13_tb}"
                             f"{hist_msg}{pred_msg}{odds_msg}"
                         ),
+                        "traceback": _b13_tb,
                         "key": key_guess,
                         "next_action": "retry",
                     }
@@ -17363,8 +17366,10 @@ def _v319_import_one_race(
                 "message": (
                     f"{venue} {race_no}R：結果登録に失敗しました。"
                     f" ({emsg})"
+                    f"\n--- B13 traceback ---\n{_b13_tb}"
                     f"{hist_msg}{pred_msg}{odds_msg}"
                 ),
+                "traceback": _b13_tb,
                 "key": key_guess,
                 "next_action": "retry",
             }
