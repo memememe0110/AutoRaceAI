@@ -3503,6 +3503,11 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
     if _v278_bg_has_running_job(db_path):
         return {"ok":False,"reason":"すでにバックグラウンド再シミュレーションが動いています。"}
     now=_v228_now_jst_iso()
+    # 未処理判定の対象版: C-A実験は Ver326、本線は _V231_APP_VERSION
+    _skip_ver = (
+        str(globals().get("_V326_APP_VERSION") or "Ver326")
+        if enable_ca else str(_V231_APP_VERSION)
+    )
     try:
         _v231_ensure_prediction_history_table(db_path)
         with sqlite3.connect(str(db_path),timeout=30.0) as _con278:
@@ -3516,6 +3521,7 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
                     )
                 """,(max(1,int(limit_count)),)).fetchone()[0] or 0)
             else:
+                # 当該版がまだ無いレースだけ数える → 途中再開でも最初からにならない
                 _approx_total278=int(_con278.execute("""
                     SELECT COUNT(*) FROM (
                         SELECT h.race_key
@@ -3528,7 +3534,7 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
                         GROUP BY h.race_key
                         ORDER BY MAX(h.history_id) DESC LIMIT ?
                     )
-                """,(str(_V231_APP_VERSION),max(1,int(limit_count)))).fetchone()[0] or 0)
+                """,(str(_skip_ver),max(1,int(limit_count)))).fetchone()[0] or 0)
     except Exception:
         _approx_total278=0
     with sqlite3.connect(str(db_path), timeout=30.0) as con:
@@ -3544,7 +3550,9 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
         """,(
             _job_ver,"queued",now,now,
             int(limit_count),1 if force_current else 0,
-            ("Ver326 C-A実験 準備中" if enable_ca else "準備中"),
+            ("Ver326 C-A実験 準備中（未処理のみ）" if enable_ca and not force_current
+             else ("Ver326 C-A実験 準備中（保存済みも再計算）" if enable_ca
+                   else "準備中")),
         ))
         try:
             con.execute(
@@ -3569,6 +3577,9 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
         "ok": True,
         "job_id": job_id,
         "enable_ca": bool(enable_ca),
+        "force_current": bool(force_current),
+        "skip_version": str(_skip_ver),
+        "approx_total": int(_approx_total278),
         "app_version": (
             str(globals().get("_V326_APP_VERSION") or "Ver326") if enable_ca
             else str(_V231_APP_VERSION)
@@ -3741,7 +3752,11 @@ _v290_orphan_recovery={"ok":True,"action":"manual_control"}
 
 
 def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
-    """停止済み/停止要求済みjobを、ユーザー操作時だけ残りから再開する。"""
+    """停止済み/停止要求済みjobを、ユーザー操作時だけ残りから再開する。
+
+    Ver326 C-A: 旧jobの app_version が Ver326 なら C-A を引き継ぐ。
+    force_current=False で「当該版が既にあるレース」をスキップ → 続きから。
+    """
     try:
         if not isinstance(job,dict) or not job:
             return {"ok":False,"reason":"再開対象jobがありません。"}
@@ -3750,6 +3765,15 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
         total0=int(job.get("total_count") or 0)
         limit0=max(1,int(job.get("limit_count") or total0 or 80))
         now=_v228_now_jst_iso()
+        _old_ver = str(job.get("app_version") or "").strip()
+        _ca_resume = _old_ver in (
+            str(globals().get("_V326_APP_VERSION") or "Ver326"),
+            "Ver326",
+        )
+        _resume_ver = (
+            str(globals().get("_V326_APP_VERSION") or "Ver326")
+            if _ca_resume else str(_V231_APP_VERSION)
+        )
 
         with sqlite3.connect(str(db_path),timeout=1.0) as con:
             con.execute("PRAGMA busy_timeout=1000")
@@ -3773,13 +3797,19 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
                     limit_count,force_current,done_count,total_count,current_label,message
                 ) VALUES ('batch_rerun',?,'running',?,?,?,?,0,?,?,?,?)
             """,(
-                str(_V231_APP_VERSION),now,now,now,limit0,
+                _resume_ver,now,now,now,limit0,
                 done0,total0,str(job.get("current_label") or ""),
-                f"{done0}/{total0}から手動再開しました。"
+                (
+                    f"Ver326 C-A {done0}/{total0}から手動再開（未処理のみ）"
+                    if _ca_resume else
+                    f"{done0}/{total0}から手動再開しました。"
+                ),
             ))
             con.commit()
             new_jid=int(cur.lastrowid or 0)
 
+        # C-Aジョブ再開時は worker 先頭で gap=0.60 / 保存版 Ver326 を有効化
+        globals()["_V326_CA_PENDING_FOR_WORKER"] = bool(_ca_resume)
         th=threading.Thread(
             target=_v278_bg_worker,
             args=(str(db_path),new_jid,limit0,False,done0,total0),
@@ -3789,7 +3819,14 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
         with _V278_BG_LOCK:
             _V278_BG_THREADS[new_jid]=th
         th.start()
-        return {"ok":True,"job_id":new_jid,"done":done0,"total":total0}
+        return {
+            "ok": True,
+            "job_id": new_jid,
+            "done": done0,
+            "total": total0,
+            "enable_ca": bool(_ca_resume),
+            "app_version": _resume_ver,
+        }
     except Exception as exc:
         return {"ok":False,"reason":f"{type(exc).__name__}: {exc}"}
 
@@ -28502,6 +28539,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             "大差時の追いつき減衰だけ緩めます（gapペナルティ上限 0.78→0.60）。"
             "本線 APP_VERSION=Ver324 / G1(Ver325) は変更しません。"
             "実験ONの再シミュ・予測は app_version=Ver326 で保存され、回収率で版比較できます。"
+            "既定は「Ver326未保存のみ」→ 途中停止しても続きから再開できます。"
         )
         st.checkbox(
             "通常予測も Ver326 C-A で実行・保存する（セッション）",
@@ -28511,16 +28549,79 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         )
         if st.session_state.get("v326_ca_experiment_mode"):
             st.warning("実験モード中: 予測は Ver326 として保存されます。本線比較用の通常予測はOFFにしてから行ってください。")
+        # Ver326 未処理件数
+        try:
+            _v326_pop = _v304_roi_population_status(str(db_path), str(globals().get("_V326_APP_VERSION") or "Ver326"))
+            if not _v326_pop.get("error"):
+                st.info(
+                    f"Ver326採点済み {_v326_pop.get('current_evaluated', 0)}R ｜ "
+                    f"残り（未処理） {_v326_pop.get('remaining', 0)}R ｜ "
+                    f"完全再シム可能 {_v326_pop.get('replayable_remaining', 0)}R"
+                )
+        except Exception:
+            _v326_pop = {}
         _ca_lim = st.number_input(
-            "C-A再シミュ最大レース数",
+            "C-A再シミュ最大レース数（1回の上限）",
             min_value=1, max_value=500, value=40, step=10,
             key="v326_ca_resim_limit",
         )
-        if st.button("Ver326 C-A でバックグラウンド再シミュ開始", type="primary", use_container_width=True, key="v326_ca_resim_go"):
+        _ca_force = st.checkbox(
+            "Ver326保存済みレースも再計算（最初からやり直し）",
+            value=False,
+            key="v326_ca_force_current",
+            help="OFF=未処理のみ（続きから）。ON=保存済みも含めて最初から。",
+        )
+        # 稼働中ジョブの停止・再開（C-A含む）
+        _ca_job = _v278_bg_get_job(str(db_path))
+        _ca_st = str((_ca_job or {}).get("status") or "")
+        _ca_jid = int((_ca_job or {}).get("job_id") or 0)
+        _ca_done = int((_ca_job or {}).get("done_count") or 0)
+        _ca_total = int((_ca_job or {}).get("total_count") or 0)
+        _ca_job_ver = str((_ca_job or {}).get("app_version") or "")
+        _ca_active_ui = _ca_st in ("queued", "running", "pause_requested", "paused", "cancel_requested")
+        if _ca_active_ui and _ca_jid:
+            st.caption(
+                f"稼働中ジョブ: id={_ca_jid} ver={_ca_job_ver} status={_ca_st} "
+                f"{_ca_done}/{_ca_total or '?'}｜{str((_ca_job or {}).get('current_label') or '')}"
+            )
+            if _ca_total > 0:
+                st.progress(
+                    min(1.0, max(0.0, float(_ca_done) / float(_ca_total))),
+                    text=f"{_ca_done}/{_ca_total}",
+                )
+            _c1, _c2, _c3 = st.columns(3)
+            if _c1.button("🔄 進捗更新", key="v326_ca_refresh", use_container_width=True):
+                st.rerun()
+            if _c2.button("⏹ 現在レース後に停止", key="v326_ca_stop", use_container_width=True):
+                _v278_bg_request_cancel(str(db_path), _ca_jid)
+                st.warning("停止要求を送信しました。現在レース終了後に止まります。")
+                st.rerun()
+            if _c3.button(
+                f"▶ {_ca_done}/{_ca_total or '?'}から再開",
+                key="v326_ca_resume",
+                use_container_width=True,
+                disabled=_ca_st in ("queued", "running", "pause_requested"),
+            ):
+                _res = _v290_manual_resume_batch(str(db_path), _ca_job or {})
+                if _res.get("ok"):
+                    st.success(
+                        f"再開 job={_res.get('job_id')} ver={_res.get('app_version')} "
+                        f"C-A={_res.get('enable_ca')}（未処理のみ）"
+                    )
+                    st.rerun()
+                else:
+                    st.error("再開失敗: " + str(_res.get("reason") or "不明"))
+        if st.button(
+            "Ver326 C-A でバックグラウンド再シミュ開始",
+            type="primary",
+            use_container_width=True,
+            key="v326_ca_resim_go",
+            disabled=_ca_active_ui,
+        ):
             _started = _v278_bg_start(
                 str(db_path),
                 limit_count=int(_ca_lim or 40),
-                force_current=True,
+                force_current=bool(_ca_force),
                 diagnostic_auto=False,
                 enable_ca=True,
             )
@@ -28528,15 +28629,19 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             if _started.get("ok"):
                 st.success(
                     f"開始 job_id={_started.get('job_id')} / 保存版={_started.get('app_version')} "
+                    f"/ 対象約{_started.get('approx_total', '?')}R "
+                    f"/ force={_started.get('force_current')} "
                     f"（gap上限={float(globals().get('_V326_CATCH_GAP_CAP_EXP') or 0.60)}）"
                 )
+                st.rerun()
             else:
                 st.error(str(_started.get("reason") or _started))
         _ca_last = st.session_state.get("v326_ca_resim_last")
         if isinstance(_ca_last, dict):
             st.caption(
                 f"前回開始: ok={_ca_last.get('ok')} job={_ca_last.get('job_id')} "
-                f"ver={_ca_last.get('app_version')} reason={_ca_last.get('reason','')}"
+                f"ver={_ca_last.get('app_version')} force={_ca_last.get('force_current')} "
+                f"approx={_ca_last.get('approx_total')} reason={_ca_last.get('reason','')}"
             )
         st.caption(
             f"現行フラグ: CA_active={_v326_ca_active()} / gap_cap={_v326_catch_gap_cap():.2f} / "
