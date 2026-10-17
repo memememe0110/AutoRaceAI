@@ -2514,21 +2514,85 @@ def _v278_bg_reap_stale_jobs(db_path: str, stale_minutes: float = 20.0, force: b
     return reaped
 
 
-def _v278_bg_has_running_job(db_path: str) -> bool:
+def _v278_bg_has_running_of(db_path: str, job_types: tuple | list | str) -> bool:
+    """指定 job_type だけが稼働中かを見る（種別ごとに同時実行できるようにする）。"""
     try:
         try:
             _v278_bg_reap_stale_jobs(db_path)
         except Exception:
             pass
+        if isinstance(job_types, str):
+            types = (job_types,)
+        else:
+            types = tuple(job_types or ())
+        if not types:
+            return False
+        ph = ",".join("?" * len(types))
         with sqlite3.connect(str(db_path), timeout=1.5) as con:
             con.execute("PRAGMA busy_timeout=1500")
-            row=con.execute("""
+            row = con.execute(
+                f"""
                 SELECT COUNT(*) FROM v278_background_jobs
-                WHERE job_type IN ('batch_rerun','official_import') AND status IN ('queued','running','pause_requested','paused','cancel_requested')
-            """).fetchone()
+                WHERE job_type IN ({ph})
+                  AND status IN ('queued','running','pause_requested','paused','cancel_requested')
+                """,
+                tuple(str(t) for t in types),
+            ).fetchone()
         return bool(int(row[0] or 0))
     except Exception:
         return False
+
+
+def _v278_bg_get_active_of(db_path: str, job_types: tuple | list | str) -> dict:
+    """指定 job_type の最新アクティブジョブ（無ければ最新完了/失敗含む1件）。"""
+    try:
+        if isinstance(job_types, str):
+            types = (job_types,)
+        else:
+            types = tuple(job_types or ())
+        if not types:
+            return {}
+        ph = ",".join("?" * len(types))
+        with sqlite3.connect(str(db_path), timeout=1.5) as con:
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA busy_timeout=1500")
+            row = con.execute(
+                f"""
+                SELECT * FROM v278_background_jobs
+                WHERE job_type IN ({ph})
+                  AND status IN ('queued','running','pause_requested','paused','cancel_requested')
+                ORDER BY job_id DESC LIMIT 1
+                """,
+                tuple(str(t) for t in types),
+            ).fetchone()
+            if not row:
+                row = con.execute(
+                    f"""
+                    SELECT * FROM v278_background_jobs
+                    WHERE job_type IN ({ph})
+                    ORDER BY job_id DESC LIMIT 1
+                    """,
+                    tuple(str(t) for t in types),
+                ).fetchone()
+        if not row:
+            return {}
+        d = dict(row)
+        blob = d.get("result_blob")
+        if blob:
+            try:
+                d["result"] = pickle.loads(zlib.decompress(bytes(blob)))
+            except Exception:
+                d["result"] = {}
+        else:
+            d["result"] = {}
+        return d
+    except Exception:
+        return {}
+
+
+def _v278_bg_has_running_job(db_path: str) -> bool:
+    """再シミュレーション(batch_rerun)だけを見る。取込とは別セッションで同時実行可。"""
+    return _v278_bg_has_running_of(db_path, ("batch_rerun",))
 
 def _v278_cancel_flag_path(job_id: int) -> Path:
     """DBロック中でも中止要求を即時受け付けるためのフラグファイル。"""
@@ -2986,6 +3050,66 @@ def _v326_set_sort_orders(
 
     with _V326_QUEUE_LOCK:
         return int(_v326_queue_write_retry(_run) or 0)
+
+
+def _v326_move_pending(
+    db_path: str,
+    job_type: str,
+    task_id: int,
+    action: str,
+) -> bool:
+    """pending 1件を直感操作で移動する。action: up|down|top|bottom。
+
+    移動後、pending 全体の sort_order を 0..n-1 に振り直す。
+    """
+    action = str(action or "").strip().lower()
+    if action not in ("up", "down", "top", "bottom"):
+        return False
+    try:
+        tid = int(task_id)
+    except Exception:
+        return False
+    now = _v228_now_jst_iso()
+
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
+            rows = con.execute(
+                """
+                SELECT task_id
+                  FROM v326_import_queue
+                 WHERE job_type = ? AND status = 'pending'
+                 ORDER BY sort_order ASC, task_id ASC
+                """,
+                (str(job_type),),
+            ).fetchall()
+            ids = [int(r[0]) for r in rows if r and r[0] is not None]
+            if tid not in ids or len(ids) <= 1:
+                return False
+            i = ids.index(tid)
+            if action == "up" and i > 0:
+                ids[i - 1], ids[i] = ids[i], ids[i - 1]
+            elif action == "down" and i < len(ids) - 1:
+                ids[i + 1], ids[i] = ids[i], ids[i + 1]
+            elif action == "top" and i > 0:
+                ids = [tid] + [x for x in ids if x != tid]
+            elif action == "bottom" and i < len(ids) - 1:
+                ids = [x for x in ids if x != tid] + [tid]
+            else:
+                return False
+            for so, xid in enumerate(ids):
+                con.execute(
+                    """
+                    UPDATE v326_import_queue
+                       SET sort_order = ?, updated_at = ?
+                     WHERE task_id = ? AND status = 'pending'
+                    """,
+                    (int(so), now, int(xid)),
+                )
+            con.commit()
+            return True
+
+    with _V326_QUEUE_LOCK:
+        return bool(_v326_queue_write_retry(_run) or False)
 
 
 def _v326_requeue_errors(db_path: str, job_type: str = "official_import") -> int:
@@ -3501,7 +3625,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
 def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnostic_auto: bool = False, enable_ca: bool = False) -> dict:
     _v278_bg_ensure_table(db_path)
     if _v278_bg_has_running_job(db_path):
-        return {"ok":False,"reason":"すでにバックグラウンド再シミュレーションが動いています。"}
+        return {"ok":False,"reason":"すでにバックグラウンド再シミュレーションが動いています（取込とは同時可・再シムは1本のみ）。"}
     now=_v228_now_jst_iso()
     # 未処理判定の対象版: C-A実験は Ver326、本線は _V231_APP_VERSION
     _skip_ver = (
@@ -13400,6 +13524,41 @@ if not st.session_state.get("_v319_startup_index_done"):
     st.session_state["_v319_startup_index_done"] = True
 
 
+def _v319_is_db_locked_exc(exc: BaseException) -> bool:
+    """SQLite の一時競合かどうかを判定。"""
+    try:
+        msg = str(exc or "").lower()
+        name = type(exc).__name__
+    except Exception:
+        return False
+    if "locked" in msg or "busy" in msg:
+        if "operationalerror" in name.lower() or name == "OperationalError":
+            return True
+        if "database is locked" in msg or "database is busy" in msg:
+            return True
+    return False
+
+
+def _v319_db_call_with_lock_retry(fn, *, retries: int = 4, base_delay: float = 0.35):
+    """database is locked を短時間リトライしてから呼ぶ（履歴取込用）。"""
+    last = None
+    n = max(1, int(retries or 1))
+    for i in range(n):
+        try:
+            return fn()
+        except Exception as exc:
+            last = exc
+            if (not _v319_is_db_locked_exc(exc)) or i >= n - 1:
+                raise
+            try:
+                time_module.sleep(float(base_delay) * (1.0 + 0.6 * i))
+            except Exception:
+                pass
+    if last is not None:
+        raise last
+    return None
+
+
 def _v319_open_conn(db_path: str):
     """Ver319改善#2: 取込1レース分を使い回す接続。"""
     cn = sqlite3.connect(str(db_path), timeout=60.0)
@@ -14426,6 +14585,7 @@ def _v319_fill_player_histories(
     added = 0
     skipped = 0
     errors = 0
+    warnings = 0  # DB locked 等の一時競合（既存履歴で続行）
     details = []
     min_rows = int(min_rows or 30)
     # con を自分で開いたときだけ閉じる（_exclusive と独立）。
@@ -14568,7 +14728,14 @@ def _v319_fill_player_histories(
 
                 # ========== 1) DB状態（軽量） ==========
                 # 履歴ヘルパは失敗時も 0/(0,"")/空dict を返す（Noneは返さない）。
-                have, latest_d = _v319_player_history_latest_fast(db_path, name, con=con)
+                # B13-D: locked 時は短時間リトライ
+                try:
+                    have, latest_d = _v319_db_call_with_lock_retry(
+                        lambda: _v319_player_history_latest_fast(db_path, name, con=con),
+                        retries=4, base_delay=0.3,
+                    )
+                except Exception:
+                    have, latest_d = 0, ""
                 latest_d = _v319_ymd_digits(latest_d)
                 is_existing = (have >= min_rows and bool(latest_d))
 
@@ -15004,9 +15171,50 @@ def _v319_fill_player_histories(
                 )
                 time_module.sleep(0.03)
             except Exception as exc:
-                errors += 1
-                _ = details.append(f"{name}:{type(exc).__name__}:{exc}")
-        return {"added": added, "skipped": skipped, "errors": errors, "details": details}
+                # B13-D: database is locked は既存履歴があるなら警告（致命エラーにしない）
+                _locked = _v319_is_db_locked_exc(exc)
+                _have_safe = 0
+                try:
+                    _have_safe = int(have or 0)
+                except Exception:
+                    try:
+                        _hv_fb, _ = _v319_player_history_latest_fast(db_path, name, con=con)
+                        _have_safe = int(_hv_fb or 0)
+                    except Exception:
+                        _have_safe = 0
+                if _locked and _have_safe > 0:
+                    warnings += 1
+                    _ = details.append(
+                        f"{name}:DB競合スキップ(既存{_have_safe}件で続行/{type(exc).__name__})"
+                    )
+                elif _locked:
+                    _retried_ok = False
+                    for _ri in range(3):
+                        try:
+                            time_module.sleep(0.4 * (1 + _ri))
+                            _hv2, _ = _v319_player_history_latest_fast(db_path, name, con=con)
+                            if int(_hv2 or 0) > 0:
+                                warnings += 1
+                                _ = details.append(
+                                    f"{name}:DB競合後に既存{int(_hv2)}件確認(続行/{type(exc).__name__})"
+                                )
+                                _retried_ok = True
+                                break
+                        except Exception:
+                            continue
+                    if not _retried_ok:
+                        errors += 1
+                        _ = details.append(f"{name}:{type(exc).__name__}:{exc}")
+                else:
+                    errors += 1
+                    _ = details.append(f"{name}:{type(exc).__name__}:{exc}")
+        return {
+            "added": added,
+            "skipped": skipped,
+            "errors": errors,
+            "warnings": warnings,
+            "details": details,
+        }
     finally:
         if _own_con:
             try:
@@ -16173,8 +16381,11 @@ def _v319_import_player_history_one_race(
     added = int(filled.get("added") or 0)
     skipped = int(filled.get("skipped") or 0)
     errors = int(filled.get("errors") or 0)
+    warnings = int(filled.get("warnings") or 0)
     detail = " / ".join(str(x) for x in (filled.get("details") or [])[:8])
     hist_msg = f"履歴+{added} / 変化なし{skipped} / エラー{errors}"
+    if warnings > 0:
+        hist_msg += f" / 警告{warnings}"
 
     # 履歴が0件の選手が残っていれば error、全員そろえば ok
     missing = []
@@ -16204,6 +16415,8 @@ def _v319_import_player_history_one_race(
     warn = ""
     if errors > 0:
         warn = f" ⚠取得失敗{errors}件（既存履歴で続行）"
+    elif warnings > 0:
+        warn = f" ⚠DB競合{warnings}件（既存履歴で続行・致命ではない）"
     return {
         "status": "ok",
         "phase": "save_player_history",
@@ -16215,11 +16428,16 @@ def _v319_import_player_history_one_race(
         "player_history_saved": True,
         "added": added,
         "errors": errors,
+        "warnings": warnings,
         "next_action": "done",
-        "notify": bool(errors > 0),
+        "notify": bool(errors > 0 or warnings > 0),
         "notify_message": (
             f"【履歴警告】{venue}{race_no}R：取得失敗{errors}件。既存履歴で続行。"
-            if errors > 0 else ""
+            if errors > 0
+            else (
+                f"【履歴注意】{venue}{race_no}R：DB競合{warnings}件。既存履歴で続行。"
+                if warnings > 0 else ""
+            )
         ),
     }
 
@@ -17280,11 +17498,12 @@ def _v319_bg_import_start(
             "queue": qs,
             "reason": f"キューに{enqueued}件追加（実行はしていません）",
         }
-    if _v279_bg_prediction_any_active(db_path):
+    # 取込同士だけ排他。再シミュ(batch_rerun)とは別セッションで同時実行可。
+    if _v278_bg_has_running_of(db_path, ("official_import",)):
         return {
             "ok": False,
             "enqueued": enqueued,
-            "reason": "別の予測・再シミュレーション・取込が動いています。完了後に開始してください。",
+            "reason": "別の公式取込が動いています。完了または中止後に開始してください（再シミュとは同時可）。",
         }
     qs0 = _v326_queue_summary(db_path, "official_import")
     pending_n = int(qs0.get("pending") or 0) + int(qs0.get("running") or 0)
@@ -28540,6 +28759,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             "本線 APP_VERSION=Ver324 / G1(Ver325) は変更しません。"
             "実験ONの再シミュ・予測は app_version=Ver326 で保存され、回収率で版比較できます。"
             "既定は「Ver326未保存のみ」→ 途中停止しても続きから再開できます。"
+            "公式取込とは別セッションで同時実行できます（同じ再シミュ同士は1本のみ）。"
         )
         st.checkbox(
             "通常予測も Ver326 C-A で実行・保存する（セッション）",
@@ -28571,8 +28791,8 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             key="v326_ca_force_current",
             help="OFF=未処理のみ（続きから）。ON=保存済みも含めて最初から。",
         )
-        # 稼働中ジョブの停止・再開（C-A含む）
-        _ca_job = _v278_bg_get_job(str(db_path))
+        # 稼働中ジョブの停止・再開（C-A含む）— 再シミュ種別のみ（取込と混同しない）
+        _ca_job = _v278_bg_get_active_of(str(db_path), ("batch_rerun",))
         _ca_st = str((_ca_job or {}).get("status") or "")
         _ca_jid = int((_ca_job or {}).get("job_id") or 0)
         _ca_done = int((_ca_job or {}).get("done_count") or 0)
@@ -32399,7 +32619,8 @@ def _v278_render_background_quick_page(db_path: str) -> None:
         value=False,key="v278_quick_force"
     )
 
-    job=_v278_bg_get_job(db_path)
+    # 再シミュ種別のみ（公式取込ジョブと混同しない）
+    job=_v278_bg_get_active_of(db_path, ("batch_rerun",)) or {}
     status=str(job.get("status") or "") if isinstance(job,dict) else ""
     jid=int(job.get("job_id") or 0) if isinstance(job,dict) else 0
     done=int(job.get("done_count") or 0) if isinstance(job,dict) else 0
@@ -32560,7 +32781,7 @@ def _v278_render_background_quick_page(db_path: str) -> None:
     if rnotice:
         st.success("▶ "+str(rnotice))
 
-    job=_v278_bg_get_job(db_path)
+    job=_v278_bg_get_active_of(db_path, ("batch_rerun",)) or {}
     if job and str(job.get("status") or "") in ("completed","failed","cancelled"):
         status=str(job.get("status") or "")
         if status=="completed":
@@ -33823,6 +34044,7 @@ if selected_main_page == "✅ 結果登録・解析":
             f"pending {_qs.get('pending',0)} / running {_qs.get('running',0)} / "
             f"done {_qs.get('done',0)} / skipped {_qs.get('skipped',0)} / error {_qs.get('error',0)}"
             "　※キューの定義は UI、実行は worker（自動で1〜12を足しません）"
+            "　※再シミュとは別セッションで同時実行できます"
         )
         _pend_n = int(_qs.get("pending") or 0)
         _run_n = int(_qs.get("running") or 0)
@@ -33895,33 +34117,46 @@ if selected_main_page == "✅ 結果登録・解析":
         except Exception:
             _qdf = pd.DataFrame()
         if _qdf is not None and not _qdf.empty:
-            _pend_view = _qdf[_qdf["status"] == "pending"].copy().reset_index(drop=True)
-            if not _pend_view.empty and "sort_order" in _pend_view.columns:
-                st.markdown("**並び順（数値が小さいほど先に処理）**")
-                st.caption("sort_order を書き換えて「並び順を保存」を押してください。")
-                _order_cols = [c for c in ["task_id", "venue", "race_no", "sort_order", "message"]
-                               if c in _pend_view.columns]
-                _edited_order = st.data_editor(
-                    _pend_view[_order_cols],
-                    hide_index=True, use_container_width=True,
-                    disabled=[c for c in _order_cols if c != "sort_order"],
-                    key="v326_queue_order_editor",
-                    column_config={
-                        "sort_order": st.column_config.NumberColumn(
-                            "並び順", step=1, format="%d",
-                            help="小さいほど先。同値なら task_id 昇順。",
-                        ),
-                    },
+            _pend_view = _qdf[_qdf["status"] == "pending"].copy()
+            if not _pend_view.empty:
+                # 表示順を sort_order → task_id に揃える
+                if "sort_order" in _pend_view.columns:
+                    _pend_view = _pend_view.sort_values(
+                        by=["sort_order", "task_id"], ascending=True, kind="mergesort"
+                    ).reset_index(drop=True)
+                else:
+                    _pend_view = _pend_view.reset_index(drop=True)
+                st.markdown("**並び順（上ほど先に処理）**")
+                st.caption(
+                    "⇈先頭 / ↑1つ上 / ↓1つ下 / ⇊末尾 で並べ替え（保存ボタン不要・即反映）。"
+                    "数字入力の「並び順を保存」方式は廃止済みです。"
                 )
-                if st.button("📑 並び順を保存", key="v326_queue_order_save", use_container_width=True):
-                    _pairs = [
-                        (int(r["task_id"]), int(r["sort_order"]))
-                        for _, r in _edited_order.iterrows()
-                        if pd.notna(r.get("sort_order"))
-                    ]
-                    _n = _v326_set_sort_orders(engine.DB_PATH, "official_import", _pairs)
-                    st.success(f"並び順を保存しました（{_n}件）")
-                    st.rerun()
+                for _i, _row in _pend_view.iterrows():
+                    try:
+                        _tid = int(_row.get("task_id"))
+                    except Exception:
+                        continue
+                    _venue = str(_row.get("venue") or "")
+                    try:
+                        _rno = int(_row.get("race_no") or 0)
+                    except Exception:
+                        _rno = 0
+                    _ymd = str(_row.get("ymd") or "")
+                    _label = f"#{_tid} {_ymd} {_venue} {_rno}R".strip()
+                    c_lab, c_top, c_up, c_dn, c_bot = st.columns([4.2, 1, 1, 1, 1])
+                    c_lab.markdown(f"**{_label}**")
+                    if c_top.button("⇈", key=f"v326_q_top_{_tid}", help="先頭へ", use_container_width=True):
+                        if _v326_move_pending(engine.DB_PATH, "official_import", _tid, "top"):
+                            st.rerun()
+                    if c_up.button("↑", key=f"v326_q_up_{_tid}", help="1つ上へ", use_container_width=True):
+                        if _v326_move_pending(engine.DB_PATH, "official_import", _tid, "up"):
+                            st.rerun()
+                    if c_dn.button("↓", key=f"v326_q_dn_{_tid}", help="1つ下へ", use_container_width=True):
+                        if _v326_move_pending(engine.DB_PATH, "official_import", _tid, "down"):
+                            st.rerun()
+                    if c_bot.button("⇊", key=f"v326_q_bot_{_tid}", help="末尾へ", use_container_width=True):
+                        if _v326_move_pending(engine.DB_PATH, "official_import", _tid, "bottom"):
+                            st.rerun()
             with st.expander("キュー全件を表示", expanded=False):
                 st.dataframe(_qdf, use_container_width=True, hide_index=True)
             _del_ids = st.multiselect(
@@ -34039,7 +34274,7 @@ if selected_main_page == "✅ 結果登録・解析":
                     )
                 st.caption("GitHubへは自動保存しません。問題なければサイドバーのDB保存を使ってください。")
 
-        job_imp = _v278_bg_get_latest_active(engine.DB_PATH)
+        job_imp = _v278_bg_get_active_of(engine.DB_PATH, ("official_import",))
         if str((job_imp or {}).get("job_type") or "") == "official_import":
             st.markdown("#### 取込の進捗")
             done = int(job_imp.get("done_count") or 0)
@@ -34166,7 +34401,7 @@ if selected_main_page == "✅ 結果登録・解析":
                     f"履歴+{all_hrep['added']}件"
                 )
 
-        job_hist = _v278_bg_get_latest_active(engine.DB_PATH)
+        job_hist = _v278_bg_get_active_of(engine.DB_PATH, ("player_history_import",))
         if str((job_hist or {}).get("job_type") or "") == "player_history_import":
             st.markdown("#### 選手履歴取込の進捗")
             done = int(job_hist.get("done_count") or 0)
@@ -36849,7 +37084,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 value=False, key="v310_auto_diagnostic",
                                 help="直前2版の保存買い目を比較し、差分が大きいレースだけを指定件数分再シミュレーションします。"
                             )
-                            _bg278=_v278_bg_get_job(engine.DB_PATH)
+                            _bg278=_v278_bg_get_active_of(engine.DB_PATH, ("batch_rerun",)) or {}
                             _bg278_running=bool(_bg278 and str(_bg278.get("status") or "") in ("queued","running","cancel_requested"))
 
                             if _bg278_running:
