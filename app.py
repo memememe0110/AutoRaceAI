@@ -31294,10 +31294,43 @@ def _v319_export_and_drop_archives(db_path: str) -> dict:
     return report
 
 
+def _v319_list_prediction_app_versions(db_path: str) -> list[str]:
+    """本体DBに残っている予測履歴の app_version 一覧（件数降順）。"""
+    out: list[str] = []
+    try:
+        with sqlite3.connect(str(db_path), timeout=15) as con:
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if "v231_prediction_history" not in tables:
+                return out
+            cols = [r[1] for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()]
+            if "app_version" not in cols:
+                return out
+            rows = con.execute(
+                """
+                SELECT COALESCE(app_version, '') AS v, COUNT(*) AS n
+                FROM v231_prediction_history
+                WHERE TRIM(COALESCE(app_version, '')) <> ''
+                GROUP BY 1
+                ORDER BY n DESC, v DESC
+                """
+            ).fetchall()
+            out = [str(r[0]) for r in rows if str(r[0] or "").strip()]
+    except Exception:
+        out = []
+    return out
+
+
 def _v319_archive_old_version_predictions(db_path: str, keep_versions: list[str] | None = None) -> dict:
     """現行以外の予測履歴をバックアップ表へ退避し、本体から外す（起動・表示を軽くする）。"""
-    keep = set(str(v) for v in (keep_versions or [APP_VERSION, _V231_APP_VERSION]) if v)
-    keep.add("Ver319")
+    # B13-I: keep_versions 未指定時は現行＋直近実験系を保護（UIから渡すのが正）
+    _default_keep = [
+        str(APP_VERSION or ""),
+        str(globals().get("_V231_APP_VERSION") or ""),
+        "Ver319", "Ver322", "Ver323", "Ver324", "Ver325", "Ver326",
+    ]
+    keep = set(str(v) for v in (keep_versions if keep_versions is not None else _default_keep) if v)
     report = {"moved": 0, "tables": {}, "ok": False}
     try:
         with sqlite3.connect(str(db_path), timeout=60) as con:
@@ -32365,16 +32398,48 @@ with st.sidebar:
             f"GitHub current取得済み: {len(_gh_dl305)/1024/1024:.2f} MB "
             "｜端末DBへの反映なし"
         )
+    # B13-I: 残すバージョンを画面で選択（誤って Ver322〜326 を消さない）
+    try:
+        _ver_opts = _v319_list_prediction_app_versions(engine.DB_PATH)
+    except Exception:
+        _ver_opts = []
+    _protect_default = []
+    for _pv in [
+        str(APP_VERSION or ""),
+        str(globals().get("_V231_APP_VERSION") or ""),
+        "Ver326", "Ver325", "Ver324", "Ver323", "Ver322", "Ver319",
+    ]:
+        if _pv and _pv not in _protect_default:
+            _protect_default.append(_pv)
+    # 選択肢 = DB実在 + 保護候補
+    _ver_choices = list(dict.fromkeys(list(_ver_opts) + _protect_default))
+    _default_sel = [v for v in _protect_default if v in _ver_choices] or list(_ver_choices[:3])
+    st.caption("DB容量対策：古い予測履歴だけ退避できます（結果・学習・回収率実績は消えません）")
+    _keep_sel = st.multiselect(
+        "DBに残す予測バージョン",
+        options=_ver_choices,
+        default=_default_sel,
+        key="v319_archive_keep_versions",
+        help="ここに無いバージョンだけがバックアップ表へ移動します。比較用の Ver322〜Ver326 は既定で残します。",
+    )
     if st.button("古いVer予測をバックアップへ退避", use_container_width=True,
-                 help="Ver319以外の予測履歴をアーカイブ表へ移します。同じDB内なので容量はほぼ減りません。"):
-        with st.spinner("古いバージョンの予測データを退避中…"):
-            _ar = _v319_archive_old_version_predictions(engine.DB_PATH)
-        if _ar.get("ok"):
-            st.success(f"退避完了: {_ar.get('moved', 0)}件 → バックアップ表（同一DB内）")
-            st.caption("容量を減らすには下の「アーカイブを別ファイルへ出して本体から削除」を実行してください。")
-            _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
+                 help="選択したバージョン以外の予測履歴をアーカイブ表へ移します。同じDB内なので容量はほぼ減りません。"):
+        if not _keep_sel:
+            st.error("残すバージョンを1つ以上選んでください。")
         else:
-            st.error(str(_ar.get("error") or "退避失敗"))
+            with st.spinner("古いバージョンの予測データを退避中…"):
+                _ar = _v319_archive_old_version_predictions(
+                    engine.DB_PATH, keep_versions=list(_keep_sel)
+                )
+            if _ar.get("ok"):
+                st.success(
+                    f"退避完了: {_ar.get('moved', 0)}件 → バックアップ表（同一DB内）"
+                    f" ／ 残した版: {', '.join(_keep_sel)}"
+                )
+                st.caption("容量を減らすには下の「アーカイブを別ファイルへ出して本体から削除」を実行してください。その後「GitHubへ保存（軽量）」を実行してください。")
+                _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
+            else:
+                st.error(str(_ar.get("error") or "退避失敗"))
     if st.button("アーカイブを別ファイルへ出して本体から削除", use_container_width=True,
                  help="v319_*_archive を別sqliteへ保存し、本体DBからDROP+VACUUMします。容量削減用。"):
         with st.spinner("アーカイブ書き出しとVACUUM中…"):
