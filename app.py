@@ -29986,6 +29986,162 @@ def _v284_containment_message(rel: dict, candidate_label: str, baseline_label: s
     return " / ".join(parts)
 
 
+def _v326_local_vs_github_status(
+    local_identity: dict | None = None,
+    force_manifest: bool = False,
+) -> dict:
+    """端末DBとGitHub正本(manifest)の差を軽量に返す。
+
+    本体DBのフルダウンロードはしない。manifestの size/sha256/generation/stats と
+    端末の fingerprint を突き合わせる。登録後に「GitHubへ反映済みか」を見る用途。
+    """
+    out = {
+        "ok": False,
+        "status": "unknown",  # equal | local_ahead | github_ahead | diverged | no_github | error
+        "label": "",
+        "detail": "",
+        "diffs": [],
+        "local": {},
+        "github": {},
+        "reason": "",
+    }
+    try:
+        loc = local_identity if isinstance(local_identity, dict) else _v284_current_db_identity()
+        if not loc.get("ok"):
+            out["reason"] = str(loc.get("reason") or "端末DB指紋を取得できません")
+            out["status"] = "error"
+            out["label"] = "端末DBを確認できません"
+            return out
+        lfp = loc.get("fingerprint") if isinstance(loc.get("fingerprint"), dict) else {}
+        l_counts = dict((lfp or {}).get("counts") or {})
+        l_size = int(loc.get("size") or (lfp or {}).get("size") or 0)
+        l_sha = str(loc.get("sha256") or "")
+        l_latest = str((lfp or {}).get("latest") or "")
+        out["local"] = {
+            "size": l_size,
+            "sha256": l_sha,
+            "latest": l_latest,
+            "counts": l_counts,
+        }
+
+        # manifest（120秒キャッシュを尊重。force時のみ再取得）
+        mf = None
+        mf_ok = False
+        if not force_manifest:
+            _cache = st.session_state.get("_v296_sidebar_manifest_cache")
+            if (
+                isinstance(_cache, dict)
+                and isinstance(_cache.get("manifest"), dict)
+                and (time_module.time() - float(_cache.get("at", 0.0) or 0.0) < 120.0)
+            ):
+                mf_ok = True
+                mf = dict(_cache["manifest"])
+        if not mf_ok:
+            mf_ok, mf, mf_msg = _v283_get_chunk_manifest(previous=False)
+            if mf_ok and isinstance(mf, dict):
+                st.session_state["_v296_sidebar_manifest_cache"] = {
+                    "at": float(time_module.time()),
+                    "manifest": dict(mf),
+                }
+            elif not mf_ok:
+                out["status"] = "no_github"
+                out["label"] = "GitHub manifestなし／取得失敗"
+                out["detail"] = str(mf_msg or "")
+                out["reason"] = str(mf_msg or "manifestなし")
+                out["ok"] = True
+                return out
+
+        g_size = int((mf or {}).get("size") or 0)
+        g_sha = str((mf or {}).get("sha256") or "")
+        g_gen = int((mf or {}).get("generation") or 0)
+        g_saved = str((mf or {}).get("saved_at") or "")
+        g_msg = str((mf or {}).get("commit_message") or "")
+        g_stats = (mf or {}).get("stats") if isinstance((mf or {}).get("stats"), dict) else {}
+        g_counts = dict((g_stats or {}).get("counts") or {})
+        g_latest = str((g_stats or {}).get("latest") or "")
+        out["github"] = {
+            "size": g_size,
+            "sha256": g_sha,
+            "generation": g_gen,
+            "saved_at": g_saved,
+            "commit_message": g_msg,
+            "latest": g_latest,
+            "counts": g_counts,
+        }
+
+        # 主要テーブルの差分
+        _key_tables = [
+            "result_races",
+            "result_payouts",
+            "race_history",
+            "v187_mixed_plan_runs",
+            "v187_mixed_plan_feedback",
+            "v231_prediction_history",
+            "v221_odds_runs",
+            "players",
+        ]
+        diffs = []
+        local_more = 0
+        github_more = 0
+        for t in _key_tables:
+            lv = int(l_counts.get(t, 0) or 0) if t in l_counts else None
+            gv = int(g_counts.get(t, 0) or 0) if t in g_counts else None
+            if lv is None and gv is None:
+                continue
+            if lv is None:
+                lv = 0
+            if gv is None:
+                gv = 0
+            d = lv - gv
+            if d != 0:
+                diffs.append({"table": t, "local": lv, "github": gv, "delta": d})
+                if d > 0:
+                    local_more += 1
+                else:
+                    github_more += 1
+        out["diffs"] = diffs
+
+        same_sha = bool(l_sha and g_sha and l_sha == g_sha)
+        same_size = bool(l_size and g_size and l_size == g_size)
+        if same_sha or (same_size and not diffs):
+            out["status"] = "equal"
+            out["label"] = "端末DB ＝ GitHub（一致）"
+            out["detail"] = (
+                f"世代{g_gen} / {g_size/1024/1024:.1f}MB"
+                + (f" / 保存 {g_saved}" if g_saved else "")
+            )
+        elif local_more and not github_more:
+            out["status"] = "local_ahead"
+            out["label"] = "端末の方が新しい（未保存の登録あり）"
+            out["detail"] = "サイドバー『現在のDBをGitHubへ保存（軽量）』で反映できます"
+        elif github_more and not local_more:
+            out["status"] = "github_ahead"
+            out["label"] = "GitHubの方が多い（再読込で取り込める可能性）"
+            out["detail"] = "『GitHubからDBを再読込』で端末へ反映できます"
+        else:
+            out["status"] = "diverged"
+            out["label"] = "端末とGitHubで内容が分岐"
+            out["detail"] = "両方にしかないデータがある可能性があります。軽量保存前に状況を確認してください"
+            if same_size and not same_sha:
+                out["detail"] += "（容量は近いがSHAが不一致）"
+
+        if diffs:
+            _bits = []
+            for d in diffs[:8]:
+                sign = "+" if d["delta"] > 0 else ""
+                _bits.append(f"{d['table']}: 端末{d['local']:,}/GH{d['github']:,}（{sign}{d['delta']:,}）")
+            out["detail"] = (out.get("detail") or "") + (" ｜ " if out.get("detail") else "") + " / ".join(_bits)
+
+        out["ok"] = True
+        return out
+    except Exception as exc:
+        out["status"] = "error"
+        out["label"] = "比較失敗"
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        out["detail"] = out["reason"]
+        return out
+
+
 def _v283_compare_db_fingerprints(candidate: dict, baseline: dict) -> dict:
     """candidateがbaselineより欠損していないか確認する。欠損が1件でもあれば停止。"""
     result={"safe":True,"regressions":[],"warnings":[]}
@@ -32546,6 +32702,47 @@ with st.sidebar:
                 _s283=str((_gm283 or {}).get("slot") or "?")
                 _cache_note296=" / BG中キャッシュ" if _v296_bg_fast_rerun else ""
                 st.caption(f"GitHub DB世代: {_g283} / 保管slot: {_s283}（行単位包含判定 有効）{_cache_note296}")
+            # Ver324: 端末DBとGitHubの差分を一目で分かるようにする（フルDLなし）
+            _cmp_force = bool(st.session_state.pop("_v326_force_gh_cmp", False))
+            _cmp = _v326_local_vs_github_status(
+                local_identity=_idshow284 if isinstance(_idshow284, dict) else None,
+                force_manifest=_cmp_force,
+            )
+            if _cmp.get("ok"):
+                _st = str(_cmp.get("status") or "unknown")
+                _lbl = str(_cmp.get("label") or "")
+                _det = str(_cmp.get("detail") or "")
+                if _st == "equal":
+                    st.success(f"✅ {_lbl}")
+                    if _det:
+                        st.caption(_det)
+                elif _st == "local_ahead":
+                    st.warning(f"🟡 {_lbl}")
+                    if _det:
+                        st.caption(_det)
+                elif _st == "github_ahead":
+                    st.info(f"🔵 {_lbl}")
+                    if _det:
+                        st.caption(_det)
+                elif _st == "diverged":
+                    st.error(f"🔴 {_lbl}")
+                    if _det:
+                        st.caption(_det)
+                elif _st == "no_github":
+                    st.caption(f"GitHub比較: {_lbl}" + (f"｜{_det}" if _det else ""))
+                else:
+                    st.caption(f"GitHub比較: {_lbl}" + (f"｜{_det}" if _det else ""))
+            if st.button(
+                "GitHubと差分を再確認",
+                use_container_width=True,
+                key="v326_refresh_gh_cmp",
+                help="manifestを再取得して、端末DBとの件数差を更新します（本体DLなし）",
+                disabled=_bg_busy_sidebar,
+            ):
+                _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
+                st.session_state["_v326_force_gh_cmp"] = True
+                st.session_state["_v284_force_identity_refresh"] = True
+                st.rerun()
         except Exception:
             pass
         db_path = Path(engine.DB_PATH)
