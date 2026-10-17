@@ -198,7 +198,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Ver314: 再シミュレーション中のGitHub自動途中保存間隔（レース数）
 # 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
-_V314_AUTOSAVE_EVERY_N = 40
+_V314_AUTOSAVE_EVERY_N = 20  # B13-J: C-A長時間再シムのOOM低減（40→20）
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
 # 古い全バージョンを毎回走査すると起動ループ落ちの原因になる。
@@ -3511,6 +3511,13 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                         "message": f"{type(_as_exc).__name__}: {_as_exc}"[:200],
                     })
                     _msg = _msg + "｜⚠自動保存エラー"
+            # B13-J: 進捗更新のたびに軽くGC（特にautosave直後）
+            try:
+                import gc as _gc_b13j_prog
+                if int(_done_show or 0) % max(1, int(_autosave_every or 20)) == 0:
+                    _gc_b13j_prog.collect()
+            except Exception:
+                pass
             _v278_bg_update(
                 db_path, job_id,
                 done_count=_done_show,
@@ -3543,7 +3550,23 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
         result["v284_audit_backfill"]=_audit_backfill284
         result["v284_transition_audit_saved_races"]=int(_audit_backfill284.get("saved_races") or 0)
         cancelled=bool(result.get("cancelled")) or _v278_bg_cancel_requested(db_path,job_id)
-        blob=zlib.compress(pickle.dumps(result,protocol=pickle.HIGHEST_PROTOCOL),level=6)
+        # B13-J: job結果blobから巨大リストを外してメモリを抑える（集計値は残す）
+        try:
+            _result_slim = dict(result) if isinstance(result, dict) else {"message": str(result)}
+            for _drop_k in (
+                "roi_rows", "labels", "errors", "github_autosave_log",
+                "details", "diagnostic_rows", "trace_rows",
+            ):
+                if _drop_k in _result_slim and isinstance(_result_slim.get(_drop_k), (list, dict)):
+                    _n = len(_result_slim.get(_drop_k) or [])
+                    _result_slim[_drop_k] = f"(omitted {_n})"
+            blob = zlib.compress(
+                pickle.dumps(_result_slim, protocol=pickle.HIGHEST_PROTOCOL),
+                level=6,
+            )
+            del _result_slim
+        except Exception:
+            blob=zlib.compress(pickle.dumps(result,protocol=pickle.HIGHEST_PROTOCOL),level=6)
         _final_done278=int(resume_done_offset or 0)+int(result.get("checked",0) or 0)
         _final_total278=int(resume_done_offset or 0)+int(result.get("candidate_total",result.get("checked",0)) or 0)
         _v278_bg_update(
@@ -3617,6 +3640,12 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             error_text=f"{type(exc).__name__}: {exc}",
         )
     finally:
+        # B13-J: ジョブ終了時に明示GC（完了直後OOM対策）
+        try:
+            import gc as _gc_b13j_end
+            _gc_b13j_end.collect()
+        except Exception:
+            pass
         try:
             with _V278_BG_LOCK:
                 _V278_BG_THREADS.pop(int(job_id),None)
@@ -4917,6 +4946,13 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 pass
             if callable(progress_cb):
                 progress_cb(idx,total,label)
+            # B13-J: レース単位で不要オブジェクトを回収（C-A長時間ジョブのメモリ右肩上がり抑制）
+            if int(idx or 0) % 5 == 0:
+                try:
+                    import gc as _gc_b13j
+                    _gc_b13j.collect()
+                except Exception:
+                    pass
     out['race_processing_seconds_v276']=round(time_module.perf_counter()-_run_t0_v276,3)
     if int(out.get("roi_cost_yen",0) or 0) > 0:
         out["roi_return_rate"]=float(out["roi_payout_yen"])/float(out["roi_cost_yen"])*100.0
