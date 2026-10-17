@@ -12151,11 +12151,14 @@ try:
             globals()["_V231_APP_VERSION"] = str(APP_VERSION or "Ver324")
 except Exception:
     pass
+# B13-E: 起動後の操作（rerun）では重い初期化表示・再計算を抑える
+_v290_startup_ready = bool(st.session_state.get("_v290_startup_ready", False))
 _v290_load_started=time_module.perf_counter()
 _v290_load_stage_started=_v290_load_started
 _v290_load_times={}
 _v290_load_box=st.empty()
-_v290_load_box.info("⏳ 読み込み中：学習設定を確認しています…")
+if not _v290_startup_ready:
+    _v290_load_box.info("⏳ 初回読み込み中：学習設定を確認しています…")
 
 def _v290_load_stage(label: str) -> None:
     global _v290_load_stage_started
@@ -12166,10 +12169,13 @@ def _v290_load_stage(label: str) -> None:
             _v290_load_times[str(prev)]=round(now-float(_v290_load_stage_started),2)
         st.session_state["_v290_load_stage_label"]=str(label)
         _v290_load_stage_started=now
-        _v290_load_box.info("⏳ 読み込み中："+str(label))
+        # 2回目以降の操作ではローディング文言を出さない（体感高速化）
+        if not bool(st.session_state.get("_v290_startup_ready", False)):
+            _v290_load_box.info("⏳ 読み込み中："+str(label))
     except Exception:
         pass
 try:
+    # 学習設定更新は mtime キャッシュあり。初回以外は表示だけ省略。
     _v256_refresh_learning_settings(_v230_db_path())
 except Exception:
     pass
@@ -31696,13 +31702,43 @@ def _v290_db_stat_signature(path_value) -> tuple:
         return (str(path_value),)
 
 def _v284_current_db_identity() -> dict:
-    """DB identity with WAL-aware stat cache to avoid rebuilding a 50MB snapshot multiple times per rerun."""
+    """DB identity with WAL-aware stat cache to avoid rebuilding a 50MB snapshot multiple times per rerun.
+
+    B13-E: 操作中の rerun では、起動済みかつ直近に完全指紋がある場合、
+    サイズが大幅減少していない限りフルスナップショットを省略する（最大45秒に1回）。
+    GitHub再読込・明示リフレッシュ時は st.session_state['_v284_force_identity_refresh']=True で強制。
+    """
     try:
         p=Path(str(engine.DB_PATH)).resolve()
         sig=_v290_db_stat_signature(p)
         cached=st.session_state.get("_v290_identity_cache")
         if isinstance(cached,dict) and cached.get("sig")==sig and isinstance(cached.get("value"),dict):
             return dict(cached["value"])
+        force=bool(st.session_state.pop("_v284_force_identity_refresh", False))
+        ready=bool(st.session_state.get("_v290_startup_ready", False))
+        last_full=float(st.session_state.get("_v290_identity_full_ts") or 0.0)
+        now_ts=time_module.time()
+        # 起動後の操作: 45秒以内の完全指紋があり、サイズがほぼ減っていなければ再利用
+        if (
+            (not force)
+            and ready
+            and isinstance(cached, dict)
+            and isinstance(cached.get("value"), dict)
+            and cached["value"].get("ok")
+            and (now_ts - last_full) < 45.0
+        ):
+            try:
+                cur_size=int(p.stat().st_size)
+                old_size=int(cached["value"].get("size") or 0)
+                # 2%超の縮小のみ「要フル再計算」（通常の追記・更新はスキップ）
+                if old_size > 0 and cur_size >= int(old_size * 0.98):
+                    val=dict(cached["value"])
+                    val["size"]=cur_size
+                    val["light"]=True
+                    st.session_state["_v290_identity_cache"]={"sig":sig,"value":dict(val)}
+                    return val
+            except Exception:
+                pass
         data=_v278_consistent_db_snapshot_bytes(str(p))
         fp=_v283_db_fingerprint_bytes(data)
         value={
@@ -31713,6 +31749,7 @@ def _v284_current_db_identity() -> dict:
             "fingerprint":fp,
         }
         st.session_state["_v290_identity_cache"]={"sig":sig,"value":dict(value)}
+        st.session_state["_v290_identity_full_ts"]=now_ts
         return value
     except Exception as exc:
         return {"ok":False,"path":str(getattr(engine,"DB_PATH","")),"reason":f"{type(exc).__name__}: {exc}"}
@@ -32179,6 +32216,8 @@ with st.sidebar:
             _ = st.session_state.pop("_v296_sidebar_db_summary_cache",None)
             _ = st.session_state.pop("_v296_sidebar_manifest_cache",None)
             _ = st.session_state.pop("_v290_identity_cache",None)
+            st.session_state["_v284_force_identity_refresh"] = True
+            st.session_state["_v290_startup_ready"] = False  # 再読込後は1回だけ初期表示
             st.rerun()
 
     # Ver305: GitHub DBを現在DBへ反映せず、取得だけして端末保存する。
@@ -32530,13 +32569,24 @@ try:
     if _prev290:
         _v290_load_times[str(_prev290)]=round(_now290-float(_v290_load_stage_started),2)
     _total290=round(_now290-float(_v290_load_started),2)
-    _v290_load_box.success(
-        "✅ 画面準備完了 "
-        +f"{_total290:.1f}秒"
-        +("｜"+" / ".join(f"{k}:{v:.1f}s" for k,v in _v290_load_times.items()) if _v290_load_times else "")
-    )
+    if not bool(st.session_state.get("_v290_startup_ready", False)):
+        _v290_load_box.success(
+            "✅ 画面準備完了 "
+            +f"{_total290:.1f}秒"
+            +("｜"+" / ".join(f"{k}:{v:.1f}s" for k,v in _v290_load_times.items()) if _v290_load_times else "")
+        )
+    else:
+        # 操作後の rerun では完了バナーも出さない（チラつき防止）
+        try:
+            _v290_load_box.empty()
+        except Exception:
+            pass
+    st.session_state["_v290_startup_ready"] = True
 except Exception:
-    pass
+    try:
+        st.session_state["_v290_startup_ready"] = True
+    except Exception:
+        pass
 
 # 「↑ 上へ」の着地点。タイトルではなく、操作を再開しやすいメインタブまで戻す。
 st.markdown('<div id="main-tabs" style="scroll-margin-top:72px;"></div>', unsafe_allow_html=True)
