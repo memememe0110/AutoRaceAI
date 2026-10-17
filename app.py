@@ -3562,24 +3562,36 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             ),
             result_blob=sqlite3.Binary(blob),
         )
-        # Ver309: 再シミュレーション中に保留したGitHub保存を、完了後に1回だけ実行。
-        # ここではバックグラウンドjobをcompleted/cancelledへ更新済みなので、
-        # push_db_to_github()の通常の再シミュレーション中ガードには掛からない。
+        # B13-F: 完了時はフルGitHub保存を避ける（C-A長時間ジョブの終盤OOM対策）。
+        # 途中の軽量autosaveと合わせて、最終も _lightweight=True。
+        # フル保存が必要ならサイドバーの手動DB保存を使う。
         try:
             _gh309_ok, _gh309_msg = push_db_to_github(
-                "AutoRaceAI: 再シミュレーション完了後のDB最終保存"
+                "AutoRaceAI: 再シミュレーション完了後のDB軽量保存",
+                _lightweight=True,
             )
             result["github_deferred_save_ok"] = bool(_gh309_ok)
             result["github_deferred_save_message"] = str(_gh309_msg or "")
             if not _gh309_ok:
-                # GitHub保存失敗で再シミュレーション自体をfailed扱いにはしない。
                 _v278_bg_update(
                     db_path, job_id,
                     message=(
-                        "再シミュレーションは完了しました。GitHub一括保存は未完了です。 "
+                        "再シミュレーションは完了しました。GitHub軽量保存は未完了です。"
+                        "必要ならサイドバーから手動保存してください。 "
                         + str(_gh309_msg or "")
                     ),
                 )
+            else:
+                try:
+                    _v278_bg_update(
+                        db_path, job_id,
+                        message=(
+                            str(result.get("message") or "完了しました。")
+                            + " / GitHub軽量保存OK（フル保存はサイドバーから）"
+                        ),
+                    )
+                except Exception:
+                    pass
         except Exception as _gh309_exc:
             result["github_deferred_save_ok"] = False
             result["github_deferred_save_message"] = (
@@ -3588,7 +3600,8 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             _v278_bg_update(
                 db_path, job_id,
                 message=(
-                    "再シミュレーションは完了しました。GitHub一括保存でエラーが発生しました。 "
+                    "再シミュレーションは完了しました。GitHub軽量保存でエラーが発生しました。"
+                    "必要ならサイドバーから手動保存してください。 "
                     + result["github_deferred_save_message"]
                 ),
             )
@@ -11312,6 +11325,76 @@ def _v280_backfill_incident_history(db_path: str) -> dict:
 # Ver148: Streamlit fragment互換デコレーター
 # st.fragment が利用できる環境では部分再実行、未対応環境では通常関数として動作します。
 _v146_fragment = getattr(st, "fragment", lambda func: func)
+
+
+@_v146_fragment
+def _v326_render_queue_reorder_fragment(db_path: str, job_type: str = "official_import") -> None:
+    """取込キュー並び替えを部分再実行（B13-F）。st.rerun() を使わず枠内だけ更新。"""
+    try:
+        _qdf = _v326_list_queue_tasks(db_path, job_type, limit=120)
+    except Exception as _qe:
+        st.caption(f"キュー読込スキップ: {_qe}")
+        return
+    if _qdf is None or getattr(_qdf, "empty", True):
+        st.caption("キューは空です。")
+        return
+    try:
+        _pend = _qdf[_qdf["status"].astype(str) == "pending"].copy()
+    except Exception:
+        _pend = _qdf.iloc[0:0]
+    if (not _pend.empty) and ("sort_order" in _pend.columns):
+        try:
+            _pend = _pend.sort_values(by=["sort_order", "task_id"], ascending=True, kind="mergesort")
+        except Exception:
+            pass
+    try:
+        _np = int((_qdf["status"].astype(str) == "pending").sum())
+        _nr = int((_qdf["status"].astype(str) == "running").sum())
+        _nd = int((_qdf["status"].astype(str) == "done").sum())
+    except Exception:
+        _np = _nr = _nd = 0
+    st.caption(
+        f"pending {_np} / running {_nr} / done {_nd}"
+        "　※並び替えはこの枠内だけ再描画します（全画面再計算なし）"
+    )
+    if _pend.empty:
+        st.caption("pending はありません。")
+    else:
+        st.caption("⇈先頭 / ↑1つ上 / ↓1つ下 / ⇊末尾 で並べ替え（保存不要・即反映）。")
+        for _, _row in _pend.iterrows():
+            try:
+                _tid = int(_row.get("task_id") or 0)
+            except Exception:
+                continue
+            if _tid <= 0:
+                continue
+            _label = f"{_row.get('ymd', '')} {_row.get('venue', '')} {_row.get('race_no', '')}R"
+            c_lab, c_top, c_up, c_dn, c_bot = st.columns([4, 1, 1, 1, 1])
+            c_lab.write(_label)
+            if c_top.button("⇈", key=f"v326_q_top_{_tid}", help="先頭へ", use_container_width=True):
+                try:
+                    _v326_move_pending(db_path, job_type, _tid, "top")
+                except Exception:
+                    pass
+            if c_up.button("↑", key=f"v326_q_up_{_tid}", help="1つ上", use_container_width=True):
+                try:
+                    _v326_move_pending(db_path, job_type, _tid, "up")
+                except Exception:
+                    pass
+            if c_dn.button("↓", key=f"v326_q_dn_{_tid}", help="1つ下", use_container_width=True):
+                try:
+                    _v326_move_pending(db_path, job_type, _tid, "down")
+                except Exception:
+                    pass
+            if c_bot.button("⇊", key=f"v326_q_bot_{_tid}", help="末尾へ", use_container_width=True):
+                try:
+                    _v326_move_pending(db_path, job_type, _tid, "bottom")
+                except Exception:
+                    pass
+    with st.expander("キュー全件を表示", expanded=False):
+        st.dataframe(_qdf, use_container_width=True, hide_index=True)
+
+
 
 
 # Ver217: 予測後の重いDB保存を待たず、オッズ入力を先に表示する。
@@ -19874,17 +19957,27 @@ def v202_quick_bulk_odds_input(namespace: str, race_key: str = '') -> None:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def v202_cached_probability_rank_validation(db_path: str, db_mtime: float):
-    return engine.v196_probability_rank_validation(db_path)
+    # B13-G: engine に関数が無い環境では空結果（表示スキップ）
+    fn = getattr(engine, "v196_probability_rank_validation", None)
+    if not callable(fn):
+        return {"race_count": 0, "enabled": False, "reason": "engine属性なし"}
+    return fn(db_path)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def v202_cached_position_bias_profile(db_path: str, db_mtime: float):
-    return engine.v198_position_bias_profile(db_path)
+    fn = getattr(engine, "v198_position_bias_profile", None)
+    if not callable(fn):
+        return {"race_count": 0, "enabled": False, "train_count": 0, "reason": "engine属性なし"}
+    return fn(db_path)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def v202_cached_weight_validation_profile(db_path: str, db_mtime: float):
-    return engine.v190_weight_validation_profile(db_path)
+    fn = getattr(engine, "v190_weight_validation_profile", None)
+    if not callable(fn):
+        return {"race_count": 0, "enabled": False, "reason": "engine属性なし"}
+    return fn(db_path)
 
 
 def v203_standard_trifecta_formations(formations, combos):
@@ -33524,9 +33617,12 @@ elif selected_main_page == "🏁 予測":
                 "fukusho": st.session_state.get(f"saved_odds_{odds_namespace}_fukusho", {}),
                 "wide": st.session_state.get(f"saved_odds_{odds_namespace}_wide", {}),
             }
+            # B13-H: オッズ入力 → 強調ライン → 推奨買い目
+            show_v67_self_evaluation(meta)
+            st.divider()
             st.markdown('<div id="return-priority-plan"></div>', unsafe_allow_html=True)
             st.markdown("## ⭐ 最優先・回収率重視の推奨買い目")
-            st.caption("オッズ読込後、監査・確率表・展開表などの詳細表示より先に計算して表示します。")
+            st.caption("オッズ読込後、強調ラインの直後に推奨買い目を表示します（詳細診断より先）。")
             _restored_plan_mode = bool(view.get("_v231_restored_only", False))
             _restored_source_ver = str(view.get("app_version") or view.get("_v231_source_app_version") or "Unknown")
             show_v184_eight_car_mixed_plan(
@@ -33673,9 +33769,20 @@ elif selected_main_page == "🏁 予測":
             except Exception as exc:
                 st.caption(f"原因別学習ゲートを表示できませんでした: {exc}")
 
-            with st.expander("🏟️ 今回の開催場重み・適用補正", expanded=True):
+            with st.expander("🏟️ 今回の開催場重み・適用補正", expanded=False):
                 venue_name = str(meta.get("開催場") or "").strip()
+                _vw_key = f"v324_load_venue_weight_{race_key}_{venue_name}"
+                if not st.session_state.get(_vw_key, False):
+                    if st.button("開催場重みを読み込む", key=f"btn_{_vw_key}", use_container_width=True):
+                        st.session_state[_vw_key] = True
+                        st.rerun()
+                    st.caption("未読込の間はDB集計しません。必要なときだけ読み込んでください。")
+                    profile = None
+                else:
+                    profile = "pending"
                 try:
+                    if profile is None:
+                        raise RuntimeError("SKIP_VENUE_WEIGHT")
                     profile = engine.v92_venue_weight_profile(venue_name, engine.DB_PATH)
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("開催場", profile.get("開催場") or "未取得")
@@ -33745,16 +33852,25 @@ elif selected_main_page == "🏁 予測":
                         )
                     st.caption("Ver96は展開層・全履歴層・選手相性を分けて表示します。補正は縮小・上限制御され、少数データだけで順位が暴れない設計です。")
                 except Exception as exc:
-                    st.warning(f"開催場重みを表示できませんでした: {exc}")
+                    if str(exc) != "SKIP_VENUE_WEIGHT":
+                        st.warning(f"開催場重みを表示できませんでした: {exc}")
 
-            with st.expander("🎯 レース種別適性・一般戦傾向", expanded=True):
+            with st.expander("🎯 レース種別適性・一般戦傾向", expanded=False):
                 type_cols = [c for c in [
                     "車", "選手名", "今回レース種別", "レース種別履歴件数",
                     "レース種別適性信頼度", "レース種別適性差", "レース種別適性補正",
                     "試走実走変換平均", "レース種別適性傾向"
                 ] if c in df.columns]
                 if type_cols:
-                    type_view = df[type_cols].sort_values(["レース種別適性補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                    # B13-G: 列が無い保存済み予測でも KeyError にしない
+                    _sort_cols = [c for c in ["レース種別適性補正", "車"] if c in type_cols]
+                    if _sort_cols:
+                        type_view = df[type_cols].sort_values(
+                            _sort_cols,
+                            ascending=[False if c == "レース種別適性補正" else True for c in _sort_cols],
+                        ).reset_index(drop=True)
+                    else:
+                        type_view = df[type_cols].reset_index(drop=True)
                     if "レース種別適性信頼度" in type_view.columns:
                         type_view["レース種別適性信頼度"] = pd.to_numeric(type_view["レース種別適性信頼度"], errors="coerce") * 100.0
                     st.dataframe(type_view, use_container_width=True, hide_index=True, column_config={
@@ -33768,13 +33884,20 @@ elif selected_main_page == "🏁 予測":
                 st.caption("『やる気』や意図は断定せず、一般戦・予選・準決勝系・優勝戦・選抜戦ごとの実走差を縮小推定します。履歴が少ない選手は本人の通常成績へ強く寄せます。")
                 st.caption("次走予定や調整目的は、未来の出走データがDBに十分揃うまでは補正に使いません。")
 
-            with st.expander("🔄 グランドノート追い抜き相性", expanded=True):
+            with st.expander("🔄 グランドノート追い抜き相性", expanded=False):
                 matchup_cols = [c for c in [
                     "車", "選手名", "対戦周回比較数", "信頼対戦相手数",
                     "追い抜き相性指数", "追い抜き相性補正", "追い抜き相性メモ"
                 ] if c in df.columns]
                 if matchup_cols:
-                    matchup_view = df[matchup_cols].sort_values(["追い抜き相性補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                    _mu_sort = [c for c in ["追い抜き相性補正", "車"] if c in matchup_cols]
+                    if _mu_sort:
+                        matchup_view = df[matchup_cols].sort_values(
+                            _mu_sort,
+                            ascending=[False if c == "追い抜き相性補正" else True for c in _mu_sort],
+                        ).reset_index(drop=True)
+                    else:
+                        matchup_view = df[matchup_cols].reset_index(drop=True)
                     st.dataframe(matchup_view, use_container_width=True, hide_index=True, column_config={
                         "追い抜き相性指数": st.column_config.NumberColumn(format="%+.3f"),
                         "追い抜き相性補正": st.column_config.NumberColumn(format="%+.3f"),
@@ -33783,7 +33906,7 @@ elif selected_main_page == "🏁 予測":
                     st.info("今回の出走選手間で比較できるグランドノート履歴がありません。")
                 st.caption("周回ごとの前後関係が反転した場合だけ追い抜きとして集計します。最終着順だけの先着は含めません。対戦数が少ない組み合わせは縮小し、補正を小さく制限します。")
 
-            with st.expander("🏍️ 逃げ役・逃げ残り診断", expanded=True):
+            with st.expander("🏍️ 逃げ役・逃げ残り診断", expanded=False):
                 escape_cols = [c for c in [
                     "車", "選手名", "ハンデ", "逃げ判定", "初周先頭推定", "逃げ残り推定",
                     "逃切り推定", "逃げ履歴件数", "初周先頭実測件数", "逃げ履歴補正", "逃げ根拠"
@@ -33803,14 +33926,21 @@ elif selected_main_page == "🏁 予測":
                 )
                 st.caption("初周先頭は主導権、逃げ残りは2～3着を含む粘り、逃切りは1着まで残す見込みです。周回実測が少ない間は0m実績・ST・今回の位置関係を中心に推定します。")
 
-            with st.expander("🧭 グランドノート展開学習・熱走路診断", expanded=True):
+            with st.expander("🧭 グランドノート展開学習・熱走路診断", expanded=False):
                 v60_cols = [c for c in [
                     "車", "選手名", "展開タイプ_実測", "展開履歴件数", "初周主導指数", "位置維持指数",
                     "捌き指数", "追込み指数", "終盤指数_実測", "失速リスク", "展開学習補正",
                     "熱走路帯", "高温履歴件数", "50℃以上3着内率", "熱走路適性", "熱走路学習補正",
                     "Ver60総合補正", "Ver60根拠"
                 ] if c in df.columns]
-                v60_view = df[v60_cols].sort_values(["Ver60総合補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                _v60_sort = [c for c in ["Ver60総合補正", "車"] if c in v60_cols]
+                if _v60_sort:
+                    v60_view = df[v60_cols].sort_values(
+                        _v60_sort,
+                        ascending=[False if c == "Ver60総合補正" else True for c in _v60_sort],
+                    ).reset_index(drop=True)
+                else:
+                    v60_view = df[v60_cols].reset_index(drop=True)
                 for pc in ["初周主導指数", "位置維持指数", "捌き指数", "追込み指数", "終盤指数_実測", "失速リスク", "50℃以上3着内率", "熱走路適性"]:
                     if pc in v60_view.columns:
                         v60_view[pc] = pd.to_numeric(v60_view[pc], errors="coerce") * 100.0
@@ -33831,13 +33961,20 @@ elif selected_main_page == "🏁 予測":
                 st.caption(f"今回の走路温度：{temp_now}℃。47℃以上を細分化し、50℃以降は前残り・位置維持・選手別高温実績の影響を非線形に強めています。")
                 st.caption("周回履歴が少ない選手は補正を自動で縮小します。予測対象日以降の結果は学習に使いません。")
 
-            with st.expander("🌤️ 天候・複合条件適性", expanded=True):
+            with st.expander("🌤️ 天候・複合条件適性", expanded=False):
                 weather_cols = [c for c in [
                     "車", "選手名", "今回天候", "天候条件キー", "天候一致最大件数",
                     "天候適性信頼度", "天候適性補正", "天候適性根拠"
                 ] if c in df.columns]
                 if weather_cols:
-                    weather_view = df[weather_cols].sort_values(["天候適性補正", "車"], ascending=[False, True]).reset_index(drop=True)
+                    _w_sort = [c for c in ["天候適性補正", "車"] if c in weather_cols]
+                    if _w_sort:
+                        weather_view = df[weather_cols].sort_values(
+                            _w_sort,
+                            ascending=[False if c == "天候適性補正" else True for c in _w_sort],
+                        ).reset_index(drop=True)
+                    else:
+                        weather_view = df[weather_cols].reset_index(drop=True)
                     if "天候適性信頼度" in weather_view.columns:
                         weather_view["天候適性信頼度"] = pd.to_numeric(weather_view["天候適性信頼度"], errors="coerce") * 100.0
                     st.dataframe(weather_view, use_container_width=True, hide_index=True, column_config={
@@ -33970,7 +34107,7 @@ elif selected_main_page == "🏁 予測":
             show_v182_odds_adjusted_tight_recommendation(
                 bets, view_trials, meta, trifecta_odds
             )
-            show_v67_self_evaluation(meta)
+            # B13-H: 強調ラインは推奨買い目の直前へ移動済み
 
             v73_section_nav()
 
@@ -33983,8 +34120,10 @@ elif selected_main_page == "🏁 予測":
                     use_container_width=True,
                 )
         except Exception as exc:
-            st.error(f"保存済み予測の表示エラー: {type(exc).__name__}: {exc}")
-            st.exception(exc)
+            # B13-G: 保存済み表示の欠損列は致命ではない。詳細トレースは展開時のみ。
+            st.warning(f"保存済み予測の一部表示をスキップ: {type(exc).__name__}: {exc}")
+            with st.expander("詳細トレース", expanded=False):
+                st.exception(exc)
 
 if selected_main_page == "✅ 結果登録・解析":
     st.subheader("公式結果を登録して予測と比較")
@@ -34162,56 +34301,24 @@ if selected_main_page == "✅ 結果登録・解析":
             st.success(f"キューを全消去しました（{n} 件）")
             if n:
                 st.rerun()
+        # B13-F: 並び替えは fragment（部分更新）。一覧・削除もここで完結。
+        _v326_render_queue_reorder_fragment(str(engine.DB_PATH), "official_import")
         try:
-            _qdf = _v326_list_queue_tasks(engine.DB_PATH, "official_import", limit=120)
+            _qdf_del = _v326_list_queue_tasks(engine.DB_PATH, "official_import", limit=120)
         except Exception:
-            _qdf = pd.DataFrame()
-        if _qdf is not None and not _qdf.empty:
-            _pend_view = _qdf[_qdf["status"] == "pending"].copy()
-            if not _pend_view.empty:
-                # 表示順を sort_order → task_id に揃える
-                if "sort_order" in _pend_view.columns:
-                    _pend_view = _pend_view.sort_values(
-                        by=["sort_order", "task_id"], ascending=True, kind="mergesort"
-                    ).reset_index(drop=True)
-                else:
-                    _pend_view = _pend_view.reset_index(drop=True)
-                st.markdown("**並び順（上ほど先に処理）**")
-                st.caption(
-                    "⇈先頭 / ↑1つ上 / ↓1つ下 / ⇊末尾 で並べ替え（保存ボタン不要・即反映）。"
-                    "数字入力の「並び順を保存」方式は廃止済みです。"
-                )
-                for _i, _row in _pend_view.iterrows():
-                    try:
-                        _tid = int(_row.get("task_id"))
-                    except Exception:
-                        continue
-                    _venue = str(_row.get("venue") or "")
-                    try:
-                        _rno = int(_row.get("race_no") or 0)
-                    except Exception:
-                        _rno = 0
-                    _ymd = str(_row.get("ymd") or "")
-                    _label = f"#{_tid} {_ymd} {_venue} {_rno}R".strip()
-                    c_lab, c_top, c_up, c_dn, c_bot = st.columns([4.2, 1, 1, 1, 1])
-                    c_lab.markdown(f"**{_label}**")
-                    if c_top.button("⇈", key=f"v326_q_top_{_tid}", help="先頭へ", use_container_width=True):
-                        if _v326_move_pending(engine.DB_PATH, "official_import", _tid, "top"):
-                            st.rerun()
-                    if c_up.button("↑", key=f"v326_q_up_{_tid}", help="1つ上へ", use_container_width=True):
-                        if _v326_move_pending(engine.DB_PATH, "official_import", _tid, "up"):
-                            st.rerun()
-                    if c_dn.button("↓", key=f"v326_q_dn_{_tid}", help="1つ下へ", use_container_width=True):
-                        if _v326_move_pending(engine.DB_PATH, "official_import", _tid, "down"):
-                            st.rerun()
-                    if c_bot.button("⇊", key=f"v326_q_bot_{_tid}", help="末尾へ", use_container_width=True):
-                        if _v326_move_pending(engine.DB_PATH, "official_import", _tid, "bottom"):
-                            st.rerun()
-            with st.expander("キュー全件を表示", expanded=False):
-                st.dataframe(_qdf, use_container_width=True, hide_index=True)
+            _qdf_del = None
+        if _qdf_del is not None and not getattr(_qdf_del, "empty", True):
+            try:
+                _non_run = _qdf_del[_qdf_del["status"].astype(str) != "running"]
+                _del_opts = [int(x) for x in _non_run["task_id"].tolist()]
+            except Exception:
+                try:
+                    _del_opts = [int(x) for x in _qdf_del["task_id"].tolist()]
+                except Exception:
+                    _del_opts = []
             _del_ids = st.multiselect(
                 "削除する task_id（running以外）",
-                options=[int(x) for x in _qdf["task_id"].tolist()],
+                options=_del_opts,
                 key="v326_q_del_ids",
             )
             if st.button("🗑 選択行を削除", use_container_width=True, key="v326_q_del_go"):
