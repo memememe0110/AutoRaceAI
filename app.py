@@ -3465,59 +3465,14 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 _total_show=int(resume_done_offset or 0)+_total_raw
             _total_show=max(_total_show,_done_show)
             _msg = f"{_done_show}/{_total_show}｜{str(label or '')}"
-            # 途中自動保存: N件処理ごと（例: 15, 30, 45...）
+            # B13-L: 進捗表示のみ。GitHub保存はチャンク境界の1回に統一
+            # （progress内保存と境界保存の二重実行を止め、712MB級OOMを低減）
             if (
                 _autosave_every > 0
                 and _done_show > 0
                 and (_done_show - int(_last_gh_save_at[0])) >= _autosave_every
             ):
-                try:
-                    _v278_bg_update(
-                        db_path, job_id,
-                        done_count=_done_show,
-                        total_count=_total_show,
-                        current_label=str(label or ""),
-                        message=_msg + f"｜GitHub自動保存中({_done_show}R)...",
-                    )
-                    _ok_as, _msg_as = push_db_to_github(
-                        f"AutoRaceAI: 再シム途中自動保存 {_done_show}/{_total_show}",
-                        _allow_during_resimulation=True,
-                        _lightweight=True,
-                    )
-                    try:
-                        import gc as _gc_as
-                        _gc_as.collect()
-                    except Exception:
-                        pass
-                    if _ok_as:
-                        _last_gh_save_at[0] = int(_done_show)
-                        _gh_autosave_log.append({
-                            "at": int(_done_show),
-                            "ok": True,
-                            "message": str(_msg_as or "")[:200],
-                        })
-                        _msg = _msg + f"｜✓自動保存済({_done_show}R)"
-                    else:
-                        _gh_autosave_log.append({
-                            "at": int(_done_show),
-                            "ok": False,
-                            "message": str(_msg_as or "")[:200],
-                        })
-                        _msg = _msg + "｜⚠自動保存失敗(後で再試行)"
-                except Exception as _as_exc:
-                    _gh_autosave_log.append({
-                        "at": int(_done_show),
-                        "ok": False,
-                        "message": f"{type(_as_exc).__name__}: {_as_exc}"[:200],
-                    })
-                    _msg = _msg + "｜⚠自動保存エラー"
-            # B13-J: 進捗更新のたびに軽くGC（特にautosave直後）
-            try:
-                import gc as _gc_b13j_prog
-                if int(_done_show or 0) % max(1, int(_autosave_every or 20)) == 0:
-                    _gc_b13j_prog.collect()
-            except Exception:
-                pass
+                _msg = _msg + f"｜境界保存待ち({_done_show}R)"
             _v278_bg_update(
                 db_path, job_id,
                 done_count=_done_show,
@@ -3630,7 +3585,8 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             if part.get("cancelled") or _cancelled:
                 break
 
-            # チャンク境界: 軽量GitHub保存 + 強めのGC（手作業20R終了時相当）
+            # B13-L チャンク境界: 結果破棄 → GC → 軽量GitHub保存1回 → GC
+            # 20RごとのGitHub保存はここだけ（progress側は廃止）
             try:
                 _v278_bg_update(
                     db_path, job_id,
@@ -3641,11 +3597,27 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                     ),
                     message=(
                         f"チャンク{_chunk_i}完了｜累計{_done_in_job}/{_job_limit}"
-                        f"｜境界保存・メモリ解放中…"
+                        f"｜メモリ解放→GitHub境界保存…"
                     ),
                 )
             except Exception:
                 pass
+            # 1) 巨大結果を先に破棄
+            try:
+                if isinstance(part, dict):
+                    part.pop("roi_rows", None)
+                    part.pop("labels", None)
+                    part.pop("errors", None)
+                    part.clear()
+                del part
+            except Exception:
+                pass
+            try:
+                import gc as _gc_pre
+                _gc_pre.collect()
+            except Exception:
+                pass
+            # 2) 軽量GitHub保存（失敗しても再シム継続）
             try:
                 _ok_ch, _msg_ch = push_db_to_github(
                     f"AutoRaceAI: 再シムチャンク{_chunk_i}境界保存 {_done_in_job}/{_job_limit}",
@@ -3666,18 +3638,10 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                     "message": f"{type(_ch_exc).__name__}: {_ch_exc}"[:200],
                     "chunk": int(_chunk_i),
                 })
-            # チャンク結果を明示破棄してから GC
+            # 3) 保存後GC
             try:
-                if isinstance(part, dict):
-                    part.pop("roi_rows", None)
-                    part.pop("labels", None)
-                    part.clear()
-                del part
-            except Exception:
-                pass
-            try:
-                import gc as _gc_chunk
-                _gc_chunk.collect()
+                import gc as _gc_post
+                _gc_post.collect()
             except Exception:
                 pass
 
@@ -29113,7 +29077,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             ),
         )
         st.caption(
-            f"内部区切り: 約{_V314_AUTOSAVE_EVERY_N}Rごと（GitHub軽量保存＋GC）。"
+            f"内部区切り: 約{_V314_AUTOSAVE_EVERY_N}Rごと（B13-L: 境界GitHub1回＋前後GC）。"
             "上限を大きくしても一度に全部をメモリに載せ続けません。"
         )
         _ca_force = st.checkbox(
