@@ -28504,6 +28504,139 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
     return df
 
 
+
+def _v327_trifecta_90pct_points_batch(db_path: str, race_keys) -> pd.DataFrame:
+    """分析CSV専用: 三連単の累積90%到達点数を一括取得（予測・◎・買い目には使わない）。
+
+    優先: v67_prediction_tickets（予測時スナップショットの cumulative_probability）
+    フォールバック: v231_prediction_history の bets['三連単'] 試行回数
+    """
+    cols = ["race_key", "point_90", "cover_90", "source", "reason"]
+    keys = []
+    seen = set()
+    for k in (race_keys or []):
+        rk = str(k or "").strip()
+        if rk and rk not in seen:
+            seen.add(rk)
+            keys.append(rk)
+    if not keys or not db_path or not Path(str(db_path)).exists():
+        return pd.DataFrame(columns=cols)
+
+    out_map = {rk: {"race_key": rk, "point_90": None, "cover_90": None, "source": "", "reason": ""} for rk in keys}
+
+    # 1) v67_prediction_tickets 一括（チャンク）
+    try:
+        with sqlite3.connect(str(db_path), timeout=20.0) as con:
+            con.execute("PRAGMA busy_timeout=20000")
+            tables = {str(r[0]) for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if "v67_prediction_tickets" in tables:
+                for i in range(0, len(keys), 400):
+                    chunk = keys[i:i + 400]
+                    ph = ",".join("?" * len(chunk))
+                    rows = con.execute(
+                        f"""
+                        SELECT race_key,
+                               MIN(predicted_rank) AS point_90,
+                               MIN(cumulative_probability) AS cover_90
+                          FROM v67_prediction_tickets
+                         WHERE bet_type='3連単'
+                           AND cumulative_probability >= 90.0
+                           AND race_key IN ({ph})
+                         GROUP BY race_key
+                        """,
+                        chunk,
+                    ).fetchall()
+                    for rk, p90, c90 in rows:
+                        rk = str(rk or "")
+                        if rk not in out_map:
+                            continue
+                        try:
+                            out_map[rk]["point_90"] = int(p90) if p90 is not None else None
+                        except Exception:
+                            out_map[rk]["point_90"] = None
+                        try:
+                            out_map[rk]["cover_90"] = float(c90) if c90 is not None else None
+                        except Exception:
+                            out_map[rk]["cover_90"] = None
+                        out_map[rk]["source"] = "v67_prediction_tickets"
+                        out_map[rk]["reason"] = ""
+    except Exception as exc:
+        for rk in keys:
+            if not out_map[rk]["source"]:
+                out_map[rk]["reason"] = f"tickets: {type(exc).__name__}"
+
+    # 2) 未取得分だけ history bets から（最大でも不足分のみ）
+    missing = [rk for rk, v in out_map.items() if v.get("point_90") is None]
+    if missing:
+        # history は race 単位でロード（不足分のみ）
+        try:
+            with sqlite3.connect(str(db_path), timeout=20.0) as con:
+                con.execute("PRAGMA busy_timeout=20000")
+                has_hist = con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='v231_prediction_history'"
+                ).fetchone()
+            if has_hist:
+                for rk in missing:
+                    try:
+                        with sqlite3.connect(str(db_path), timeout=10.0) as con:
+                            con.execute("PRAGMA busy_timeout=10000")
+                            row = con.execute(
+                                "SELECT history_id FROM v231_prediction_history "
+                                "WHERE race_key=? ORDER BY history_id DESC LIMIT 1",
+                                (rk,),
+                            ).fetchone()
+                        if not row:
+                            if not out_map[rk]["reason"]:
+                                out_map[rk]["reason"] = "履歴なし"
+                            continue
+                        view, *_ = _v231_load_prediction_history(str(db_path), int(row[0]))
+                        counter = ((view or {}).get("bets") or {}).get("三連単") or {}
+                        if not isinstance(counter, dict) or not counter:
+                            out_map[rk]["reason"] = "bets三連単なし"
+                            continue
+                        # count or probability どちらでも比率で90%
+                        items = []
+                        for combo, val in counter.items():
+                            try:
+                                items.append((combo, float(val)))
+                            except Exception:
+                                continue
+                        total = sum(v for _, v in items)
+                        if total <= 0:
+                            out_map[rk]["reason"] = "三連単合計0"
+                            continue
+                        items.sort(key=lambda x: x[1], reverse=True)
+                        acc = 0.0
+                        hit = None
+                        cover = None
+                        for i, (_, v) in enumerate(items, start=1):
+                            acc += v
+                            if acc / total * 100.0 >= 90.0:
+                                hit = i
+                                cover = acc / total * 100.0
+                                break
+                        if hit is None:
+                            out_map[rk]["reason"] = "90%未到達"
+                        else:
+                            out_map[rk]["point_90"] = int(hit)
+                            out_map[rk]["cover_90"] = float(cover)
+                            out_map[rk]["source"] = "v231_prediction_history.bets"
+                            out_map[rk]["reason"] = ""
+                    except Exception as exc:
+                        out_map[rk]["reason"] = f"history: {type(exc).__name__}"
+        except Exception as exc:
+            for rk in missing:
+                if out_map[rk]["point_90"] is None and not out_map[rk]["reason"]:
+                    out_map[rk]["reason"] = f"history_batch: {type(exc).__name__}"
+
+    for rk, v in out_map.items():
+        if v.get("point_90") is None and not v.get("reason"):
+            v["reason"] = "三連単確率を取得できません"
+    return pd.DataFrame([out_map[rk] for rk in keys], columns=cols)
+
+
 def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataFrame:
     """回収率実績を、ハンデ・走路・展開まで付けて分析用CSVにする。"""
     if filtered is None or filtered.empty:
@@ -28618,11 +28751,35 @@ def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataF
         "winning_types": "的中券種",
     }
     out = out.rename(columns=rename)
+    # 分析専用: 三連単90%到達点数（強調ラインと同じ定義。予測・◎・買い目には未使用）
+    try:
+        _rk_series = out["race_key"].astype(str) if "race_key" in out.columns else pd.Series(dtype=str)
+        _p90_df = _v327_trifecta_90pct_points_batch(str(db_path), _rk_series.tolist())
+        if _p90_df is not None and not _p90_df.empty:
+            _p90_df = _p90_df.copy()
+            _p90_df["race_key"] = _p90_df["race_key"].astype(str)
+            out = out.merge(_p90_df, on="race_key", how="left")
+            out["三連単90%到達点数"] = pd.to_numeric(out.get("point_90"), errors="coerce")
+            out["三連単90%到達カバー"] = pd.to_numeric(out.get("cover_90"), errors="coerce")
+            out["三連単90%算出元"] = out.get("source", pd.Series("", index=out.index)).fillna("").astype(str)
+            out["三連単90%算出不可理由"] = out.get("reason", pd.Series("", index=out.index)).fillna("").astype(str)
+            out = out.drop(columns=[c for c in ("point_90", "cover_90", "source", "reason") if c in out.columns])
+        else:
+            out["三連単90%到達点数"] = pd.NA
+            out["三連単90%到達カバー"] = pd.NA
+            out["三連単90%算出元"] = ""
+            out["三連単90%算出不可理由"] = ""
+    except Exception as _p90_exc:
+        out["三連単90%到達点数"] = pd.NA
+        out["三連単90%到達カバー"] = pd.NA
+        out["三連単90%算出元"] = ""
+        out["三連単90%算出不可理由"] = f"{type(_p90_exc).__name__}"
     prefer = [
         "日付", "開催場", "R", "race_key", "バージョン",
         "生成経路", "元予測版",
         "推奨区分", "新推奨", "推奨フラグ", "推奨スコア",
         "新判定参考回収率", "新判定カバー", "新判定最大EV", "中穴候補数", "点数",
+        "三連単90%到達点数", "三連単90%到達カバー", "三連単90%算出元", "三連単90%算出不可理由",
         "購入額", "払戻額", "回収率", "収支", "判定", "的中フラグ", "的中券種", "元判定",
         "走路", "湿走路", "天候", "気温", "走路温度", "湿度",
         "出走数", "ハンデ最小", "ハンデ最大", "ハンデ差", "ハンデ種類", "同ハンデ",
