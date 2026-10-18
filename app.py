@@ -3526,15 +3526,180 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 message=_msg,
             )
 
-        result=_v262_batch_rerun_saved_histories(
-            db_path,
-            int(limit_count),
-            _progress,
-            force_current=bool(force_current),
-            diagnostic_auto=bool(diagnostic_auto),
-            cancel_cb=lambda: _v278_bg_cancel_requested(db_path,job_id),
-            pause_cb=lambda: _v278_bg_pause_loop(db_path,job_id),
+        # B13-K: 上限が大きくても内部は autosave 間隔（既定20R）ごとに区切る。
+        # 手で「20R×N回」押すのと同じ境界（保存→GC→次チャンク）を1回の開始で自動実行する。
+        # 予測ロジック・C-A係数は変更しない。
+        _chunk_n = max(1, int(_autosave_every or 20))
+        _job_limit = max(1, int(limit_count or 1))
+        result = {
+            "checked": 0, "rerun": 0, "skipped_current": 0, "no_text": 0,
+            "errors": [], "labels": [],
+            "roi_evaluated": 0, "roi_no_odds": 0, "roi_no_payout": 0,
+            "roi_cost_yen": 0, "roi_payout_yen": 0, "roi_hits": 0, "roi_rows": [],
+            "roi_plus_cost_yen": 0, "roi_plus_payout_yen": 0, "roi_plus_extra_points": 0,
+            "chunk_count": 0, "auto_chunk_size": int(_chunk_n),
+        }
+        _done_in_job = 0
+        _processed_keys = set()
+        _cancelled = False
+        _chunk_i = 0
+        while _done_in_job < _job_limit:
+            if _v278_bg_cancel_requested(db_path, job_id):
+                _cancelled = True
+                break
+            _this = min(_chunk_n, _job_limit - _done_in_job)
+            _chunk_i += 1
+            try:
+                _v278_bg_update(
+                    db_path, job_id,
+                    message=(
+                        f"チャンク{_chunk_i}: 最大{_this}R処理"
+                        f"（累計{_done_in_job}/{_job_limit}｜区切り{_chunk_n}R）"
+                    ),
+                )
+            except Exception:
+                pass
+
+            def _progress_chunk(done, total, label, _base=_done_in_job, _jl=_job_limit):
+                # チャンク内進捗をジョブ全体の進捗に載せ替える
+                try:
+                    _d = int(_base) + int(done or 0)
+                    _t = int(_jl)
+                    _progress(_d, _t, label)
+                except Exception:
+                    _progress(done, total, label)
+
+            part = _v262_batch_rerun_saved_histories(
+                db_path,
+                int(_this),
+                _progress_chunk,
+                force_current=bool(force_current),
+                diagnostic_auto=bool(diagnostic_auto),
+                cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
+                pause_cb=lambda: _v278_bg_pause_loop(db_path, job_id),
+                exclude_race_keys=_processed_keys or None,
+            )
+            if not isinstance(part, dict):
+                part = {}
+            if part.get("cancelled"):
+                _cancelled = True
+
+            # 集計マージ（巨大リストは保持上限を抑える）
+            for _k in (
+                "checked", "rerun", "skipped_current", "no_text",
+                "roi_evaluated", "roi_no_odds", "roi_no_payout",
+                "roi_cost_yen", "roi_payout_yen", "roi_hits",
+                "roi_plus_cost_yen", "roi_plus_payout_yen", "roi_plus_extra_points",
+            ):
+                try:
+                    result[_k] = int(result.get(_k, 0) or 0) + int(part.get(_k, 0) or 0)
+                except Exception:
+                    pass
+            try:
+                result["errors"].extend(list(part.get("errors") or [])[:20])
+                result["errors"] = list(result["errors"])[:40]
+            except Exception:
+                pass
+            try:
+                result["labels"].extend(list(part.get("labels") or [])[:30])
+                result["labels"] = list(result["labels"])[:60]
+            except Exception:
+                pass
+            # roi_rows はメモリ肥大の主因 → 件数だけ残し詳細は捨てる
+            try:
+                _nr = len(part.get("roi_rows") or [])
+                result["_roi_rows_merged"] = int(result.get("_roi_rows_merged", 0) or 0) + _nr
+            except Exception:
+                pass
+
+            # このチャンクで触った race_key を記録（force_current の次チャンク用）
+            try:
+                for _rk in (part.get("processed_race_keys") or []):
+                    _rk = str(_rk or "").strip()
+                    if _rk:
+                        _processed_keys.add(_rk)
+            except Exception:
+                pass
+
+            _cand = int(part.get("candidate_total", 0) or 0)
+            # チャンクで実際に見た件数で進捗を進める（候補0なら終了）
+            if _cand <= 0:
+                break
+            _done_in_job += _cand
+            result["chunk_count"] = int(_chunk_i)
+            if part.get("cancelled") or _cancelled:
+                break
+
+            # チャンク境界: 軽量GitHub保存 + 強めのGC（手作業20R終了時相当）
+            try:
+                _v278_bg_update(
+                    db_path, job_id,
+                    done_count=int(resume_done_offset or 0) + int(_done_in_job),
+                    total_count=max(
+                        int(resume_total_target or 0),
+                        int(resume_done_offset or 0) + int(_job_limit),
+                    ),
+                    message=(
+                        f"チャンク{_chunk_i}完了｜累計{_done_in_job}/{_job_limit}"
+                        f"｜境界保存・メモリ解放中…"
+                    ),
+                )
+            except Exception:
+                pass
+            try:
+                _ok_ch, _msg_ch = push_db_to_github(
+                    f"AutoRaceAI: 再シムチャンク{_chunk_i}境界保存 {_done_in_job}/{_job_limit}",
+                    _allow_during_resimulation=True,
+                    _lightweight=True,
+                )
+                _last_gh_save_at[0] = int(resume_done_offset or 0) + int(_done_in_job)
+                _gh_autosave_log.append({
+                    "at": int(_last_gh_save_at[0]),
+                    "ok": bool(_ok_ch),
+                    "message": str(_msg_ch or "")[:200],
+                    "chunk": int(_chunk_i),
+                })
+            except Exception as _ch_exc:
+                _gh_autosave_log.append({
+                    "at": int(resume_done_offset or 0) + int(_done_in_job),
+                    "ok": False,
+                    "message": f"{type(_ch_exc).__name__}: {_ch_exc}"[:200],
+                    "chunk": int(_chunk_i),
+                })
+            # チャンク結果を明示破棄してから GC
+            try:
+                if isinstance(part, dict):
+                    part.pop("roi_rows", None)
+                    part.pop("labels", None)
+                    part.clear()
+                del part
+            except Exception:
+                pass
+            try:
+                import gc as _gc_chunk
+                _gc_chunk.collect()
+            except Exception:
+                pass
+
+        if _cancelled:
+            result["cancelled"] = True
+        try:
+            if int(result.get("roi_cost_yen", 0) or 0) > 0:
+                result["roi_return_rate"] = (
+                    float(result.get("roi_payout_yen", 0) or 0)
+                    / float(result.get("roi_cost_yen", 0) or 1)
+                    * 100.0
+                )
+            else:
+                result["roi_return_rate"] = None
+        except Exception:
+            result["roi_return_rate"] = None
+        result["message"] = (
+            f"確認{result.get('checked',0)} / 再シム{result.get('rerun',0)}"
+            f" / チャンク{result.get('chunk_count',0)}×{_chunk_n}R区切り"
+            + (" / 中止" if _cancelled else "")
         )
+        result["roi_rows"] = []  # 永続化前に空（slim と二重で安全）
         try:
             result["github_autosave_count"] = sum(1 for x in _gh_autosave_log if x.get("ok"))
             result["github_autosave_fail_count"] = sum(1 for x in _gh_autosave_log if not x.get("ok"))
@@ -4526,12 +4691,13 @@ def _v310_auto_diagnostic_race_keys(db_path: str, current_ver: str, limit: int) 
         return []
 
 
-def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None, pause_cb=None, diagnostic_auto: bool = False) -> dict:
+def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None, pause_cb=None, diagnostic_auto: bool = False, exclude_race_keys=None) -> dict:
     out={
         "checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[],
         "roi_evaluated":0,"roi_no_odds":0,"roi_no_payout":0,
         "roi_cost_yen":0,"roi_payout_yen":0,"roi_hits":0,"roi_rows":[],
         "roi_plus_cost_yen":0,"roi_plus_payout_yen":0,"roi_plus_extra_points":0,
+        "processed_race_keys":[],
     }
     current_ver=str(globals().get('_V231_APP_VERSION') or 'Ver304')
     # Ver289 hotfix:
@@ -4712,9 +4878,26 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             unique=[h for h in unique if str(h.get('race_key') or '').strip() not in _already_complete290]
             out['skipped_current'] += int(_before290-len(unique))
 
+    # B13-K: 同一ジョブ内の前チャンクで処理済みキーを除外（force_current 時の重複防止）
+    if exclude_race_keys:
+        try:
+            _exk = {str(x).strip() for x in exclude_race_keys if str(x).strip()}
+        except Exception:
+            _exk = set()
+        if _exk:
+            _before_ex = len(unique)
+            unique = [h for h in unique if str(h.get('race_key') or '').strip() not in _exk]
+            out['skipped_current'] += int(_before_ex - len(unique))
+
     # Ver304 hotfix:
     # 「保存履歴の最新limit件」を先に切るのではなく、現行Ver完了済みを除いた後でlimitを適用。
     # これで古い未処理レースが候補外へ押し出されるのを防ぐ。
+    # 候補0件のときは空のまま返す（max(1,limit)で無理に1件化しない）
+    if not unique:
+        out['candidate_total'] = 0
+        out['message'] = '再シミュレーション対象レースがありません。'
+        out['prepare_seconds_v276'] = round(time_module.perf_counter() - _prep_t0_v276, 3)
+        return out
     unique = unique[:max(1, int(limit))]
     total=len(unique)
     out['candidate_total']=int(total)
@@ -4748,6 +4931,11 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             if callable(progress_cb):
                 progress_cb(idx-1,total,label)
             race_key0=str(h.get('race_key') or '').strip()
+            if race_key0:
+                try:
+                    out.setdefault('processed_race_keys', []).append(race_key0)
+                except Exception:
+                    pass
             if (not force_current) and race_key0 in current_complete_keys and race_key0 in current_audit_complete_keys:
                 out['skipped_current']+=1
                 continue
@@ -28919,6 +29107,14 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             "C-A再シミュ最大レース数（1回の上限）",
             min_value=1, max_value=500, value=40, step=10,
             key="v326_ca_resim_limit",
+            help=(
+                "例: 200 を指定しても内部は20Rごとに区切って保存・メモリ解放します。"
+                "手で20R×N回押すのと同じ境界処理を、1回の開始で自動実行します。"
+            ),
+        )
+        st.caption(
+            f"内部区切り: 約{_V314_AUTOSAVE_EVERY_N}Rごと（GitHub軽量保存＋GC）。"
+            "上限を大きくしても一度に全部をメモリに載せ続けません。"
         )
         _ca_force = st.checkbox(
             "Ver326保存済みレースも再計算（最初からやり直し）",
