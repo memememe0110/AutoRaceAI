@@ -28637,6 +28637,295 @@ def _v327_trifecta_90pct_points_batch(db_path: str, race_keys) -> pd.DataFrame:
     return pd.DataFrame([out_map[rk] for rk in keys], columns=cols)
 
 
+
+# ============================================================
+# B13-N: p90セット × 安い券種カバー診断（読み取り専用・分析CSV専用）
+# 予測・◎・買い目・v184/v277・_V324_MIN_TICKETS は一切変更しない
+# ============================================================
+_V319_P90_DIAG_UNIT_YEN = 100  # 机上コスト単価（1点=100円）
+
+
+def _v319_p90_parse_combo_cars(combo: str, n: int):
+    """'1-2-3' / '1→2→3' / '1 2 3' などを int タプルへ。失敗時 None。"""
+    s = str(combo or "").strip()
+    if not s:
+        return None
+    for sep in ("→", "->", "›", "»", "−", "–", "—"):
+        s = s.replace(sep, "-")
+    s = s.replace("－", "-").replace("—", "-")
+    parts = [p for p in s.replace(" ", "-").replace("　", "-").split("-") if p.strip()]
+    if len(parts) < n:
+        return None
+    try:
+        cars = tuple(int(float(p.strip())) for p in parts[:n])
+    except Exception:
+        return None
+    if any(c <= 0 for c in cars):
+        return None
+    return cars
+
+
+def _v319_p90_diagnostic_from_sets(p90_set, rec_2tan, rec_2fuku, rec_3fuku,
+                                   unit_yen=None):
+    """p90セットと推奨安い券種の交差診断。
+
+    p90_residual_cost は上限近似（机上）:
+      100円 × (寄与した安い券種枚数 + 残差三連単点数)
+    同一comboが複数券種に載っても枚数は加算するため、実購入額より大きめ。
+    実コスト最適化や◎判定には使わない。相対比較用。
+    """
+    if unit_yen is None:
+        unit_yen = int(globals().get("_V319_P90_DIAG_UNIT_YEN") or 100)
+    empty = {
+        "p90_2連単カバー率": None,
+        "p90_2連複カバー率": None,
+        "p90_3連複カバー率": None,
+        "p90_残差点数": None,
+        "p90_残差コスト上限": None,
+    }
+    n = len(p90_set or set())
+    if n <= 0:
+        return empty
+
+    cov_2tan = {c for c in p90_set if (c[0], c[1]) in rec_2tan}
+    cov_2fuku = {c for c in p90_set if tuple(sorted((c[0], c[1]))) in rec_2fuku}
+    cov_3fuku = {c for c in p90_set if tuple(sorted(c)) in rec_3fuku}
+    cov_any = cov_2tan | cov_2fuku | cov_3fuku
+    residual_points = int(n - len(cov_any))
+
+    used_2tan = {(c[0], c[1]) for c in cov_2tan}
+    used_2fuku = {tuple(sorted((c[0], c[1]))) for c in cov_2fuku}
+    used_3fuku = {tuple(sorted(c)) for c in cov_3fuku}
+    # 上限近似: 寄与券種枚数 + 残三連単を単純合算（二重計上があり得る）
+    residual_cost_cap = int(unit_yen) * (
+        len(used_2tan) + len(used_2fuku) + len(used_3fuku) + residual_points
+    )
+
+    return {
+        "p90_2連単カバー率": round(len(cov_2tan) / n, 4),
+        "p90_2連複カバー率": round(len(cov_2fuku) / n, 4),
+        "p90_3連複カバー率": round(len(cov_3fuku) / n, 4),
+        "p90_残差点数": residual_points,
+        "p90_残差コスト上限": residual_cost_cap,
+    }
+
+
+def _v319_p90_cheap_cover_batch(db_path: str, race_keys, p90_points_by_key=None) -> pd.DataFrame:
+    """分析CSV専用: p90セットと現行推奨(2連単/2連複/3連複)の交差を一括計算。
+
+    - p90セット: v67_prediction_tickets の 3連単 を predicted_rank 昇順で上位 point_90 件
+      （三連単90%到達点数の算出と同一順序。再ソートしない）
+    - 推奨券種: include_in_live_stats=1 の最新 plan（race_key単位）の
+      v187_mixed_plan_tickets
+    - 残差コスト上限: 机上の上限近似。実購入額ではない。
+    """
+    cols = [
+        "race_key",
+        "p90_2連単カバー率", "p90_2連複カバー率", "p90_3連複カバー率",
+        "p90_残差点数", "p90_残差コスト上限",
+    ]
+    keys = []
+    seen = set()
+    for k in (race_keys or []):
+        rk = str(k or "").strip()
+        if rk and rk not in seen:
+            seen.add(rk)
+            keys.append(rk)
+    if not keys or not db_path or not Path(str(db_path)).exists():
+        return pd.DataFrame(columns=cols)
+
+    p90_map = {}
+    if isinstance(p90_points_by_key, dict):
+        for rk, v in p90_points_by_key.items():
+            try:
+                iv = int(v) if v is not None and str(v).strip() != "" else None
+            except Exception:
+                iv = None
+            if iv and iv > 0:
+                p90_map[str(rk)] = iv
+
+    out_map = {rk: {"race_key": rk} for rk in keys}
+    for rk in keys:
+        out_map[rk].update({
+            "p90_2連単カバー率": None,
+            "p90_2連複カバー率": None,
+            "p90_3連複カバー率": None,
+            "p90_残差点数": None,
+            "p90_残差コスト上限": None,
+        })
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=20.0) as con:
+            con.execute("PRAGMA busy_timeout=20000")
+            tables = {str(r[0]) for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if "v67_prediction_tickets" not in tables or "v187_mixed_plan_tickets" not in tables:
+                return pd.DataFrame([out_map[rk] for rk in keys], columns=cols)
+
+            # p90点数不足分は v67 から MIN(rank where cum>=90) を補完
+            need_p90 = [rk for rk in keys if rk not in p90_map]
+            if need_p90:
+                for i in range(0, len(need_p90), 400):
+                    chunk = need_p90[i:i + 400]
+                    ph = ",".join("?" * len(chunk))
+                    try:
+                        rows = con.execute(
+                            f"""
+                            SELECT race_key, MIN(predicted_rank) AS point_90
+                              FROM v67_prediction_tickets
+                             WHERE bet_type='3連単'
+                               AND cumulative_probability >= 90.0
+                               AND race_key IN ({ph})
+                             GROUP BY race_key
+                            """,
+                            chunk,
+                        ).fetchall()
+                        for rk, p90 in rows:
+                            try:
+                                p90_map[str(rk)] = int(p90)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+            target_keys = [rk for rk in keys if p90_map.get(rk)]
+            if not target_keys:
+                return pd.DataFrame([out_map[rk] for rk in keys], columns=cols)
+
+            # race_key → 最新 live plan_hash（include_in_live_stats=1）
+            plan_hash_by_rk = {}
+            if "v187_mixed_plan_runs" in tables:
+                for i in range(0, len(target_keys), 400):
+                    chunk = target_keys[i:i + 400]
+                    ph = ",".join("?" * len(chunk))
+                    try:
+                        rows = con.execute(
+                            f"""
+                            SELECT race_key, plan_hash FROM (
+                                SELECT race_key, plan_hash,
+                                       ROW_NUMBER() OVER (
+                                           PARTITION BY race_key
+                                           ORDER BY datetime(COALESCE(created_at,'')) DESC,
+                                                    plan_hash DESC
+                                       ) AS rn
+                                  FROM v187_mixed_plan_runs
+                                 WHERE race_key IN ({ph})
+                                   AND COALESCE(include_in_live_stats,1)=1
+                            ) x WHERE rn=1
+                            """,
+                            chunk,
+                        ).fetchall()
+                        for rk, phash in rows:
+                            if rk and phash:
+                                plan_hash_by_rk[str(rk)] = str(phash)
+                    except Exception:
+                        # ROW_NUMBER 非対応時のフォールバック
+                        try:
+                            rows = con.execute(
+                                f"""
+                                SELECT race_key, plan_hash, COALESCE(created_at,'')
+                                  FROM v187_mixed_plan_runs
+                                 WHERE race_key IN ({ph})
+                                   AND COALESCE(include_in_live_stats,1)=1
+                                 ORDER BY race_key, COALESCE(created_at,'') DESC, plan_hash DESC
+                                """,
+                                chunk,
+                            ).fetchall()
+                            for rk, phash, _ca in rows:
+                                rk = str(rk or "")
+                                if rk and phash and rk not in plan_hash_by_rk:
+                                    plan_hash_by_rk[rk] = str(phash)
+                        except Exception:
+                            pass
+
+            # 推奨安い券種
+            rec_by_rk = {rk: {"2連単": set(), "2連複": set(), "3連複": set()} for rk in target_keys}
+            hashes = sorted(set(plan_hash_by_rk.values()))
+            if hashes:
+                for i in range(0, len(hashes), 400):
+                    chunk = hashes[i:i + 400]
+                    ph = ",".join("?" * len(chunk))
+                    try:
+                        rows = con.execute(
+                            f"""
+                            SELECT race_key, plan_hash, bet_type, combination
+                              FROM v187_mixed_plan_tickets
+                             WHERE plan_hash IN ({ph})
+                               AND bet_type IN ('2連単','2連複','3連複')
+                            """,
+                            chunk,
+                        ).fetchall()
+                    except Exception:
+                        rows = []
+                    for rk, phash, bt, combo in rows:
+                        rk = str(rk or "")
+                        if plan_hash_by_rk.get(rk) != str(phash):
+                            continue
+                        if rk not in rec_by_rk:
+                            continue
+                        if bt == "2連単":
+                            cars = _v319_p90_parse_combo_cars(combo, 2)
+                            if cars:
+                                rec_by_rk[rk]["2連単"].add(cars)
+                        elif bt == "2連複":
+                            cars = _v319_p90_parse_combo_cars(combo, 2)
+                            if cars:
+                                rec_by_rk[rk]["2連複"].add(tuple(sorted(cars)))
+                        elif bt == "3連複":
+                            cars = _v319_p90_parse_combo_cars(combo, 3)
+                            if cars:
+                                rec_by_rk[rk]["3連複"].add(tuple(sorted(cars)))
+
+            # p90セット（predicted_rank 昇順・再ソート禁止）
+            p90_set_by_rk = {rk: set() for rk in target_keys}
+            for i in range(0, len(target_keys), 200):
+                chunk = target_keys[i:i + 200]
+                ph = ",".join("?" * len(chunk))
+                try:
+                    rows = con.execute(
+                        f"""
+                        SELECT race_key, combination, predicted_rank
+                          FROM v67_prediction_tickets
+                         WHERE bet_type='3連単'
+                           AND race_key IN ({ph})
+                         ORDER BY race_key, predicted_rank ASC
+                        """,
+                        chunk,
+                    ).fetchall()
+                except Exception:
+                    rows = []
+                cur_rk = None
+                cur_n = 0
+                limit_n = 0
+                for rk, combo, rank in rows:
+                    rk = str(rk or "")
+                    if rk != cur_rk:
+                        cur_rk = rk
+                        limit_n = int(p90_map.get(rk) or 0)
+                        cur_n = 0
+                    if limit_n <= 0 or cur_n >= limit_n:
+                        continue
+                    cars = _v319_p90_parse_combo_cars(combo, 3)
+                    if not cars:
+                        continue
+                    p90_set_by_rk[rk].add(cars)
+                    cur_n += 1
+
+            for rk in target_keys:
+                diag = _v319_p90_diagnostic_from_sets(
+                    p90_set_by_rk.get(rk) or set(),
+                    rec_by_rk.get(rk, {}).get("2連単") or set(),
+                    rec_by_rk.get(rk, {}).get("2連複") or set(),
+                    rec_by_rk.get(rk, {}).get("3連複") or set(),
+                )
+                out_map[rk].update(diag)
+    except Exception:
+        pass
+
+    return pd.DataFrame([out_map[rk] for rk in keys], columns=cols)
+
+
 def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataFrame:
     """回収率実績を、ハンデ・走路・展開まで付けて分析用CSVにする。"""
     if filtered is None or filtered.empty:
@@ -28774,12 +29063,52 @@ def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataF
         out["三連単90%到達カバー"] = pd.NA
         out["三連単90%算出元"] = ""
         out["三連単90%算出不可理由"] = f"{type(_p90_exc).__name__}"
+
+    # B13-N: p90セット × 安い券種カバー診断（読み取り専用）
+    # p90_残差コスト上限 は机上の上限近似（実購入額ではない）
+    try:
+        _rk_series2 = out.get("race_key", pd.Series(dtype=str)).astype(str)
+        _p90_pts = {}
+        if "三連単90%到達点数" in out.columns:
+            for _rk, _pt, _src in zip(
+                _rk_series2.tolist(),
+                out["三連単90%到達点数"].tolist(),
+                out.get("三連単90%算出元", pd.Series([""] * len(out))).fillna("").astype(str).tolist(),
+            ):
+                if str(_src) != "v67_prediction_tickets":
+                    continue
+                try:
+                    _iv = int(_pt) if _pt is not None and str(_pt).strip() not in ("", "nan", "None", "<NA>") else None
+                except Exception:
+                    _iv = None
+                if _iv and _iv > 0:
+                    _p90_pts[str(_rk)] = _iv
+        _cov_df = _v319_p90_cheap_cover_batch(str(db_path), _rk_series2.tolist(), _p90_pts)
+        if _cov_df is not None and not _cov_df.empty:
+            _cov_df = _cov_df.copy()
+            _cov_df["race_key"] = _cov_df["race_key"].astype(str)
+            # 既存の point_90 等と衝突しない列だけ merge
+            _cov_cols = [
+                "race_key",
+                "p90_2連単カバー率", "p90_2連複カバー率", "p90_3連複カバー率",
+                "p90_残差点数", "p90_残差コスト上限",
+            ]
+            _cov_df = _cov_df[[c for c in _cov_cols if c in _cov_df.columns]]
+            out = out.merge(_cov_df, on="race_key", how="left")
+        else:
+            for _c in ("p90_2連単カバー率", "p90_2連複カバー率", "p90_3連複カバー率", "p90_残差点数", "p90_残差コスト上限"):
+                out[_c] = pd.NA
+    except Exception:
+        for _c in ("p90_2連単カバー率", "p90_2連複カバー率", "p90_3連複カバー率", "p90_残差点数", "p90_残差コスト上限"):
+            if _c not in out.columns:
+                out[_c] = pd.NA
     prefer = [
         "日付", "開催場", "R", "race_key", "バージョン",
         "生成経路", "元予測版",
         "推奨区分", "新推奨", "推奨フラグ", "推奨スコア",
         "新判定参考回収率", "新判定カバー", "新判定最大EV", "中穴候補数", "点数",
         "三連単90%到達点数", "三連単90%到達カバー", "三連単90%算出元", "三連単90%算出不可理由",
+        "p90_2連単カバー率", "p90_2連複カバー率", "p90_3連複カバー率", "p90_残差点数", "p90_残差コスト上限",
         "購入額", "払戻額", "回収率", "収支", "判定", "的中フラグ", "的中券種", "元判定",
         "走路", "湿走路", "天候", "気温", "走路温度", "湿度",
         "出走数", "ハンデ最小", "ハンデ最大", "ハンデ差", "ハンデ種類", "同ハンデ",
