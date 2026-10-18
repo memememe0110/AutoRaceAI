@@ -3210,6 +3210,28 @@ def _v278_bg_cancel_requested(db_path: str, job_id: int) -> bool:
         return False
 
 
+def _v278_bg_release_memory(tag: str = "") -> None:
+    """停止・終了時のメモリ解放（予測ロジック非侵襲）。"""
+    try:
+        import gc as _gc_rel
+        for _ in range(3):
+            _gc_rel.collect()
+    except Exception:
+        pass
+    # 履歴HTTPキャッシュなど、再シム後に残りやすいものを空ける
+    try:
+        global _V319_HIST_DF_CACHE
+        if isinstance(_V319_HIST_DF_CACHE, dict) and _V319_HIST_DF_CACHE:
+            _V319_HIST_DF_CACHE.clear()
+    except Exception:
+        pass
+    try:
+        import gc as _gc_rel2
+        _gc_rel2.collect()
+    except Exception:
+        pass
+
+
 def _v278_bg_request_cancel(db_path: str, job_id: int) -> None:
     _v278_cancel_flag_set(job_id)
     try:
@@ -3229,12 +3251,17 @@ def _v278_bg_request_cancel(db_path: str, job_id: int) -> None:
                  WHERE job_id=?
                 """,
                 (
-                    "中止要求を受け付けました。処理の区切りで停止します。",
+                    "中止要求を受け付けました。現在レース終了後に停止し、メモリを解放します。",
                     _v228_now_jst_iso(),
                     int(job_id),
                 ),
             )
             con.commit()
+    except Exception:
+        pass
+    # 停止ボタン直後にメイン側でも解放を試みる（ワーカー終了待ち中のOOM低減）
+    try:
+        _v278_bg_release_memory("cancel_request")
     except Exception:
         pass
 
@@ -3647,6 +3674,21 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
 
         if _cancelled:
             result["cancelled"] = True
+            # 中止直後に結果バッファを縮め、メモリを返す
+            try:
+                result["errors"] = list(result.get("errors") or [])[:10]
+                result["labels"] = []
+                result["roi_rows"] = []
+            except Exception:
+                pass
+            try:
+                _processed_keys.clear()
+            except Exception:
+                pass
+            try:
+                _v278_bg_release_memory("cancelled_after_loop")
+            except Exception:
+                pass
         try:
             if int(result.get("roi_cost_yen", 0) or 0) > 0:
                 result["roi_return_rate"] = (
@@ -3714,51 +3756,77 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             ),
             result_blob=sqlite3.Binary(blob),
         )
-        # B13-F: 完了時はフルGitHub保存を避ける（C-A長時間ジョブの終盤OOM対策）。
-        # 途中の軽量autosaveと合わせて、最終も _lightweight=True。
-        # フル保存が必要ならサイドバーの手動DB保存を使う。
-        try:
-            _gh309_ok, _gh309_msg = push_db_to_github(
-                "AutoRaceAI: 再シミュレーション完了後のDB軽量保存",
-                _lightweight=True,
-            )
-            result["github_deferred_save_ok"] = bool(_gh309_ok)
-            result["github_deferred_save_message"] = str(_gh309_msg or "")
-            if not _gh309_ok:
+        # B13-M: 中止時は最終GitHub保存をスキップ（712MBスナップショットで取込と競合しやすい）。
+        # 途中の20R境界保存分は既に残っている。不足分はサイドバー手動保存。
+        # 正常完了時のみ軽量GitHub保存。
+        if cancelled:
+            try:
+                _v278_bg_release_memory("cancelled_before_exit")
+            except Exception:
+                pass
+            try:
                 _v278_bg_update(
                     db_path, job_id,
                     message=(
-                        "再シミュレーションは完了しました。GitHub軽量保存は未完了です。"
-                        "必要ならサイドバーから手動保存してください。 "
-                        + str(_gh309_msg or "")
+                        "停止しました。処理済みは保存済みです。"
+                        "最終GitHub保存はスキップ（メモリ優先）。"
+                        "必要ならサイドバー『現在のDBをGitHubへ保存（軽量）』を実行してください。"
                     ),
                 )
-            else:
+            except Exception:
+                pass
+            result["github_deferred_save_ok"] = None
+            result["github_deferred_save_message"] = "skipped_on_cancel"
+        else:
+            # B13-F: 完了時はフルGitHub保存を避ける。軽量のみ。
+            try:
                 try:
+                    _v278_bg_release_memory("before_final_gh")
+                except Exception:
+                    pass
+                _gh309_ok, _gh309_msg = push_db_to_github(
+                    "AutoRaceAI: 再シミュレーション完了後のDB軽量保存",
+                    _lightweight=True,
+                )
+                result["github_deferred_save_ok"] = bool(_gh309_ok)
+                result["github_deferred_save_message"] = str(_gh309_msg or "")
+                if not _gh309_ok:
                     _v278_bg_update(
                         db_path, job_id,
                         message=(
-                            str(result.get("message") or "完了しました。")
-                            + " / GitHub軽量保存OK（フル保存はサイドバーから）"
+                            "再シミュレーションは完了しました。GitHub軽量保存は未完了です。"
+                            "必要ならサイドバーから手動保存してください。 "
+                            + str(_gh309_msg or "")
                         ),
                     )
-                except Exception:
-                    pass
-        except Exception as _gh309_exc:
-            result["github_deferred_save_ok"] = False
-            result["github_deferred_save_message"] = (
-                f"{type(_gh309_exc).__name__}: {_gh309_exc}"
-            )
-            _v278_bg_update(
-                db_path, job_id,
-                message=(
-                    "再シミュレーションは完了しました。GitHub軽量保存でエラーが発生しました。"
-                    "必要ならサイドバーから手動保存してください。 "
-                    + result["github_deferred_save_message"]
-                ),
-            )
-        if not cancelled:
-            _v276_send_rerun_complete_notification(result)
+                else:
+                    try:
+                        _v278_bg_update(
+                            db_path, job_id,
+                            message=(
+                                str(result.get("message") or "完了しました。")
+                                + " / GitHub軽量保存OK（フル保存はサイドバーから）"
+                            ),
+                        )
+                    except Exception:
+                        pass
+            except Exception as _gh309_exc:
+                result["github_deferred_save_ok"] = False
+                result["github_deferred_save_message"] = (
+                    f"{type(_gh309_exc).__name__}: {_gh309_exc}"
+                )
+                _v278_bg_update(
+                    db_path, job_id,
+                    message=(
+                        "再シミュレーションは完了しました。GitHub軽量保存でエラーが発生しました。"
+                        "必要ならサイドバーから手動保存してください。 "
+                        + result["github_deferred_save_message"]
+                    ),
+                )
+            try:
+                _v276_send_rerun_complete_notification(result)
+            except Exception:
+                pass
     except Exception as exc:
         _v278_bg_update(
             db_path, job_id,
@@ -3769,12 +3837,16 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             error_text=f"{type(exc).__name__}: {exc}",
         )
     finally:
-        # B13-J: ジョブ終了時に明示GC（完了直後OOM対策）
+        # B13-M: ジョブ終了・中止後のメモリ解放を強化（直後の公式取込との競合対策）
         try:
-            import gc as _gc_b13j_end
-            _gc_b13j_end.collect()
+            _v278_bg_release_memory("worker_finally")
         except Exception:
-            pass
+            try:
+                import gc as _gc_b13j_end
+                for _ in range(3):
+                    _gc_b13j_end.collect()
+            except Exception:
+                pass
         try:
             with _V278_BG_LOCK:
                 _V278_BG_THREADS.pop(int(job_id),None)
