@@ -8295,6 +8295,251 @@ def _v324_overtake_pair_continuous_diagnostic(
     return out
 
 
+def _v326_paired_lap_swap_comparison(
+    db_path: str,
+    app_a: str = "Ver324",
+    app_b: str = "Ver326",
+    limit_races: int = 400,
+) -> dict:
+    """同一 race_key ペアで隣接スワップ量比と F1 を版間比較（読み取り専用）。
+
+    - closest_route_v263 / top_routes_v263 を両版の v231 payload から取得
+    - result_laps から実測隣接スワップを計算
+    - 両版の Sim スワップと比較（周回別）
+    予測・◎・買い目・C-A係数は変更しない。
+    """
+    out = {
+        "ok": False,
+        "app_a": str(app_a),
+        "app_b": str(app_b),
+        "common_races": 0,
+        "routes_a": 0,
+        "routes_b": 0,
+        "by_lap": pd.DataFrame(),
+        "summary": {},
+        "reason": "",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+
+    def _load_routes(con, version: str) -> dict:
+        routes: dict = {}
+        try:
+            cols = {str(r[1]) for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+            if "payload" not in cols and "result_blob" not in cols:
+                return routes
+            blob_col = "payload" if "payload" in cols else "result_blob"
+            ver_clause = ""
+            params: list = []
+            if "app_version" in cols:
+                ver_clause = "WHERE app_version=?"
+                params.append(str(version))
+            # 最新 history_id のみ
+            q = f"""
+                SELECT h.race_key, h.{blob_col}
+                  FROM v231_prediction_history h
+                  JOIN (
+                    SELECT race_key, MAX(history_id) AS hid
+                      FROM v231_prediction_history
+                     {ver_clause}
+                     GROUP BY race_key
+                  ) m ON m.hid = h.history_id
+                 ORDER BY h.history_id DESC
+                 LIMIT ?
+            """
+            params.append(int(limit_races) * 3)
+            rows = con.execute(q, tuple(params)).fetchall()
+        except Exception:
+            return routes
+        for rk, blob in rows:
+            rk = str(rk or "")
+            if not rk or rk in routes:
+                continue
+            try:
+                obj = pickle.loads(zlib.decompress(bytes(blob)))
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            meta = obj.get("meta") or {}
+            if not meta and isinstance(obj.get("result"), dict):
+                meta = (obj.get("result") or {}).get("meta") or {}
+            wall = (
+                meta.get("6周展開シミュレーション")
+                or meta.get("壁補正監査")
+                or obj.get("wall_audit")
+                or {}
+            )
+            if not isinstance(wall, dict):
+                wall = {}
+            route = str(wall.get("closest_route_v263") or "").strip()
+            if not route:
+                tops = wall.get("top_routes_v263") or []
+                if tops and isinstance(tops[0], dict):
+                    route = str(tops[0].get("route") or "").strip()
+            if route:
+                routes[rk] = route
+        return routes
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            routes_a = _load_routes(con, str(app_a))
+            routes_b = _load_routes(con, str(app_b))
+            out["routes_a"] = len(routes_a)
+            out["routes_b"] = len(routes_b)
+            common = sorted(set(routes_a) & set(routes_b))
+            out["common_races"] = len(common)
+            if not common:
+                out["reason"] = (
+                    f"共通race_keyなし (A:{len(routes_a)} / B:{len(routes_b)})"
+                )
+                return out
+
+            actual_map: dict = {}
+            chunk = 400
+            for i in range(0, len(common), chunk):
+                part = common[i : i + chunk]
+                ph = ",".join("?" * len(part))
+                try:
+                    for rk, lap, pos, car in con.execute(
+                        f"SELECT race_key, lap_no, position, car_no FROM result_laps "
+                        f"WHERE race_key IN ({ph})",
+                        tuple(part),
+                    ).fetchall():
+                        try:
+                            actual_map.setdefault(str(rk), {}).setdefault(
+                                int(lap), []
+                            ).append((int(pos), int(car)))
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    agg = {
+        lap: {
+            "actual": 0,
+            "sim_a": 0,
+            "sim_b": 0,
+            "races": 0,
+            "match_a": 0,
+            "match_b": 0,
+        }
+        for lap in range(2, 7)
+    }
+
+    for rk in common:
+        act = actual_map.get(rk) or {}
+        act_orders = {
+            lap: tuple(c for _, c in sorted(pairs))
+            for lap, pairs in act.items()
+            if pairs
+        }
+        if len(act_orders) < 2:
+            continue
+        ra = _v324_parse_route_orders(routes_a.get(rk, ""))
+        rb = _v324_parse_route_orders(routes_b.get(rk, ""))
+        for lap_to in range(2, 7):
+            if lap_to not in act_orders or (lap_to - 1) not in act_orders:
+                continue
+            asw = _v324_adjacent_swaps(act_orders[lap_to - 1], act_orders[lap_to])
+            a_sw = (
+                _v324_adjacent_swaps(ra[lap_to - 1], ra[lap_to])
+                if (lap_to - 1 in ra and lap_to in ra)
+                else set()
+            )
+            b_sw = (
+                _v324_adjacent_swaps(rb[lap_to - 1], rb[lap_to])
+                if (lap_to - 1 in rb and lap_to in rb)
+                else set()
+            )
+            d = agg[lap_to]
+            d["actual"] += len(asw)
+            d["sim_a"] += len(a_sw)
+            d["sim_b"] += len(b_sw)
+            d["races"] += 1
+            d["match_a"] += len(asw & a_sw)
+            d["match_b"] += len(asw & b_sw)
+
+    rows = []
+    for lap in range(2, 7):
+        d = agg[lap]
+        if d["races"] <= 0:
+            continue
+        a, sa, sb = d["actual"], d["sim_a"], d["sim_b"]
+        ra_ = (sa / a) if a > 0 else None
+        rb_ = (sb / a) if a > 0 else None
+        p_a = (d["match_a"] / sa * 100.0) if sa > 0 else None
+        p_b = (d["match_b"] / sb * 100.0) if sb > 0 else None
+        r_a = (d["match_a"] / a * 100.0) if a > 0 else None
+        r_b = (d["match_b"] / a * 100.0) if a > 0 else None
+        f1_a = (
+            (2 * p_a * r_a / (p_a + r_a))
+            if (p_a is not None and r_a is not None and (p_a + r_a) > 0)
+            else None
+        )
+        f1_b = (
+            (2 * p_b * r_b / (p_b + r_b))
+            if (p_b is not None and r_b is not None and (p_b + r_b) > 0)
+            else None
+        )
+        rows.append(
+            {
+                "周回": lap,
+                "共通遷移": d["races"],
+                "実測計": a,
+                f"Sim計_{app_a}": sa,
+                f"Sim計_{app_b}": sb,
+                f"量比_{app_a}": ra_,
+                f"量比_{app_b}": rb_,
+                "量比差(B-A)": (
+                    (rb_ - ra_) if (ra_ is not None and rb_ is not None) else None
+                ),
+                f"P%_{app_a}": p_a,
+                f"P%_{app_b}": p_b,
+                f"R%_{app_a}": r_a,
+                f"R%_{app_b}": r_b,
+                f"F1%_{app_a}": f1_a,
+                f"F1%_{app_b}": f1_b,
+                "F1差(B-A)": (
+                    (f1_b - f1_a)
+                    if (f1_a is not None and f1_b is not None)
+                    else None
+                ),
+            }
+        )
+
+    out["by_lap"] = pd.DataFrame(rows)
+    # 判定サマリ（周4・5）
+    def _row(lap: int):
+        for r in rows:
+            if int(r.get("周回") or 0) == lap:
+                return r
+        return {}
+
+    r4, r5 = _row(4), _row(5)
+    out["summary"] = {
+        "共通race_key": out["common_races"],
+        "routes_a": out["routes_a"],
+        "routes_b": out["routes_b"],
+        "周4量比差": r4.get("量比差(B-A)"),
+        "周5量比差": r5.get("量比差(B-A)"),
+        "周4F1差": r4.get("F1差(B-A)"),
+        "周5F1差": r5.get("F1差(B-A)"),
+        "量比_Ver324_周4": r4.get(f"量比_{app_a}"),
+        "量比_Ver326_周4": r4.get(f"量比_{app_b}"),
+        "量比_Ver324_周5": r5.get(f"量比_{app_a}"),
+        "量比_Ver326_周5": r5.get(f"量比_{app_b}"),
+    }
+    out["ok"] = True
+    out["reason"] = "OK"
+    return out
+
+
 def _v324_overtake_pair_diagnostic(
     db_path: str,
     app_version: str | None = None,
@@ -13054,7 +13299,11 @@ def _v319_result_page_alive(ymd: str, venue: str, race_no: int) -> bool:
 
 
 def _v319_known_race_nos(db_path: str, ymd: str, venue: str) -> list[int]:
-    """再取込なしでDB痕跡があるレース番号（result / raw / plan / odds / queue）。"""
+    """再取込なしでDB痕跡があるレース番号（result / raw / plan / odds / queue）。
+
+    注意: 予測は全バージョン横断。現行版のみの把握は
+    _v319_prediction_race_nos_for_version を使う。
+    """
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))[:8]
     venue = str(venue or "").strip()
     if len(ymd) < 8 or not venue:
@@ -13110,18 +13359,111 @@ def _v319_known_race_nos(db_path: str, ymd: str, venue: str) -> list[int]:
         pass
     return sorted(n for n in nos if 1 <= int(n) <= 12)
 
+
+def _v319_prediction_race_nos_for_version(
+    db_path: str,
+    ymd: str,
+    venue: str,
+    app_version: str | None = None,
+) -> list[int]:
+    """指定 app_version の予測が保存されているレース番号のみ。
+
+    旧版だけあるレースは含まない → 現行版未予測なら 0R。
+    """
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))[:8]
+    venue = str(venue or "").strip()
+    ver = str(
+        app_version
+        or globals().get("_V231_APP_VERSION")
+        or globals().get("APP_VERSION")
+        or "Ver326"
+    ).strip()
+    if len(ymd) < 8 or not venue or not ver:
+        return []
+    prefix = f"{ymd}_{venue}_"
+    nos: set[int] = set()
+    try:
+        with sqlite3.connect(str(db_path), timeout=10.0) as con:
+            con.execute("PRAGMA busy_timeout=10000")
+            tables = {
+                r[0]
+                for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "v231_prediction_history" not in tables:
+                return []
+            cols = {
+                str(r[1])
+                for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()
+            }
+            if "app_version" not in cols:
+                # 版列が無い古いDBは版判定不可 → 現行扱いせず空（0R）
+                return []
+            rows = con.execute(
+                """
+                SELECT DISTINCT race_key FROM v231_prediction_history
+                 WHERE race_key LIKE ?
+                   AND app_version = ?
+                """,
+                (prefix + "%", ver),
+            ).fetchall()
+            for (rk,) in rows:
+                d, v, n = _v215_parse_race_key_parts(str(rk or ""))
+                if n and 1 <= int(n) <= 12:
+                    if (not d or d.replace("-", "") == ymd) and (not v or v == venue):
+                        nos.add(int(n))
+                        continue
+                m = re.search(r"_(\d{1,2})R$", str(rk or ""))
+                if m and str(rk).startswith(prefix):
+                    nn = int(m.group(1))
+                    if 1 <= nn <= 12:
+                        nos.add(nn)
+            # プランも現行版があれば把握に含める
+            if "v187_mixed_plan_runs" in tables:
+                pcols = {
+                    str(r[1])
+                    for r in con.execute("PRAGMA table_info(v187_mixed_plan_runs)").fetchall()
+                }
+                if "app_version" in pcols:
+                    for (rk,) in con.execute(
+                        """
+                        SELECT DISTINCT race_key FROM v187_mixed_plan_runs
+                         WHERE race_key LIKE ?
+                           AND app_version = ?
+                        """,
+                        (prefix + "%", ver),
+                    ).fetchall():
+                        d, v, n = _v215_parse_race_key_parts(str(rk or ""))
+                        if n and 1 <= int(n) <= 12:
+                            nos.add(int(n))
+                        else:
+                            m = re.search(r"_(\d{1,2})R$", str(rk or ""))
+                            if m:
+                                nn = int(m.group(1))
+                                if 1 <= nn <= 12:
+                                    nos.add(nn)
+    except Exception:
+        return []
+    return sorted(nos)
+
 def _v319_registered_race_nos(db_path: str, ymd: str, venue: str) -> list[int]:
-    """result_races に登録済みのレース番号一覧（昇順）。不成立も含む。"""
+    """result_races に登録済みのレース番号一覧（昇順）。不成立も含む。
+
+    race_no が NULL/0 の行も race_key 末尾の NR から救済する
+    （R把握状況で 0R 扱い・欠落しないようにする）。
+    """
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     venue = str(venue or "").strip()
     if not ymd or not venue or len(ymd) < 8:
         return []
     date_s = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
-    out = []
+    out: list[int] = []
+    seen: set[int] = set()
     try:
         with sqlite3.connect(str(db_path), timeout=10.0) as con:
             con.execute("PRAGMA busy_timeout=10000")
-            # race_key 形式: YYYYMMDD_会場_NR または race_date + venue
+            # race_no が有効な行
             rows = con.execute(
                 """
                 SELECT DISTINCT race_no FROM result_races
@@ -13140,24 +13482,43 @@ def _v319_registered_race_nos(db_path: str, ymd: str, venue: str) -> list[int]:
                     n = int(r[0])
                 except Exception:
                     continue
-                if 1 <= n <= 12 and n not in out:
+                if 1 <= n <= 12 and n not in seen:
+                    seen.add(n)
                     out.append(n)
-            # race_key から番号を拾う（race_no 空の救済）
-            if not out:
-                rows2 = con.execute(
-                    """
-                    SELECT race_key FROM result_races
-                     WHERE race_key LIKE ?
-                    """,
-                    (f"{ymd}_{venue}_%",),
-                ).fetchall()
-                for r in rows2:
-                    m = re.search(r"_(\d{1,2})R$", str(r[0] or ""))
-                    if m:
-                        n = int(m.group(1))
-                        if 1 <= n <= 12 and n not in out:
+            # 常に race_key からも拾う（race_no=0/空の行の救済。out が空のときだけではない）
+            rows2 = con.execute(
+                """
+                SELECT race_key, race_no FROM result_races
+                 WHERE race_key LIKE ?
+                    OR (COALESCE(race_date,'') IN (?, ?) AND COALESCE(venue,'') = ?)
+                """,
+                (f"{ymd}_{venue}_%", date_s, ymd, venue),
+            ).fetchall()
+            for rk, rno in rows2:
+                try:
+                    n_col = int(rno) if rno is not None and str(rno).strip() != "" else 0
+                except Exception:
+                    n_col = 0
+                if 1 <= n_col <= 12:
+                    if n_col not in seen:
+                        seen.add(n_col)
+                        out.append(n_col)
+                    continue
+                # race_no が 0/空/不正 → race_key から
+                m = re.search(r"_(\d{1,2})R$", str(rk or ""))
+                if not m:
+                    d, v, n_key = _v215_parse_race_key_parts(str(rk or ""))
+                    if n_key is not None:
+                        n = int(n_key)
+                        if 1 <= n <= 12 and n not in seen:
+                            seen.add(n)
                             out.append(n)
-                out.sort()
+                    continue
+                n = int(m.group(1))
+                if 1 <= n <= 12 and n not in seen:
+                    seen.add(n)
+                    out.append(n)
+            out.sort()
     except Exception:
         return []
     return out
@@ -15922,6 +16283,51 @@ def _v319_prediction_exists(db_path: str, race_key: str) -> bool:
         return False
 
 
+def _v319_latest_prediction_app_version(db_path: str, race_key: str) -> str:
+    """該当 race_key の最新予測の app_version。無ければ空文字。"""
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as con:
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "v231_prediction_history" not in tables:
+                return ""
+            cols = {str(r[1]) for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+            if "app_version" not in cols:
+                return ""
+            keys = [str(race_key)]
+            m = re.match(r"(\d{4})-?(\d{2})-?(\d{2})_(.+)_(\d+)R?", str(race_key))
+            if m:
+                ymd = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                keys = _v319_race_key_candidates(ymd, m.group(4), m.group(5))
+            ph = ",".join("?" * len(keys))
+            row = con.execute(
+                f"""
+                SELECT app_version FROM v231_prediction_history
+                 WHERE race_key IN ({ph})
+                 ORDER BY history_id DESC LIMIT 1
+                """,
+                tuple(keys),
+            ).fetchone()
+            return str((row or [""])[0] or "").strip()
+    except Exception:
+        return ""
+
+
+def _v319_prediction_matches_current_version(db_path: str, race_key: str) -> bool:
+    """現行予測版（_V231_APP_VERSION / APP_VERSION）の予測があるか。
+
+    他バージョンのみ存在するレースは False（再予測対象）。
+    """
+    cur = str(
+        globals().get("_V231_APP_VERSION")
+        or globals().get("APP_VERSION")
+        or "Ver326"
+    ).strip()
+    latest = _v319_latest_prediction_app_version(db_path, race_key)
+    if not latest:
+        return False
+    return latest == cur
+
+
 def _v319_prediction_entry_count(db_path: str, race_key: str) -> int:
     """保存済み予測の出走台数。不明なら0。"""
     try:
@@ -17305,7 +17711,7 @@ def _v319_import_one_race(
             "next_action": "retry",
         }
 
-    # --- 3) 予測（未保存時）＋出走数不一致なら再予測 ---
+    # --- 3) 予測（未保存時）＋出走数不一致／版違いなら再予測 ---
     pred_ok = _v319_prediction_exists(db_path, key_guess)
     card_n = len(players or [])
     if not card_n and card_text:
@@ -17331,6 +17737,21 @@ def _v319_import_one_race(
                 pass
             pred_ok = False
             pred_msg = f" / 予測台数不明のため再予測({card_n}車)"
+    # 現行版の予測が無い（他版のみ等）→ 未予測扱いで再予測
+    if pred_ok and not _v319_prediction_matches_current_version(db_path, key_guess):
+        _old_ver = _v319_latest_prediction_app_version(db_path, key_guess) or "?"
+        _cur_ver = str(
+            globals().get("_V231_APP_VERSION")
+            or globals().get("APP_VERSION")
+            or "Ver326"
+        ).strip()
+        try:
+            # 他版の履歴は残し、新規 history を現行版で追加する（clear しない）
+            pass
+        except Exception:
+            pass
+        pred_ok = False
+        pred_msg = f" / 予測版違い({_old_ver}→{_cur_ver})で再予測"
     if predict_if_missing and not pred_ok:
         _step("予測中")
         try:
@@ -34984,10 +35405,23 @@ if selected_main_page == "✅ 結果登録・解析":
         dcol, vcol, rcol = st.columns(3)
         fetch_date = dcol.date_input("開催日", value=date.today(), key="v319_op_fetch_date")
         fetch_venue = vcol.selectbox("開催場", ["開催を探す"] + RESULT_VENUES, key="v319_op_fetch_venue")
-        fetch_race_no = rcol.number_input("レース番号（1レース指定）", min_value=0, max_value=12, value=0, step=1, key="v319_op_fetch_race_no", help="0=開催全レース / 1〜12=その1レースだけ")
+        fetch_race_no = rcol.number_input(
+            "レース番号（1レース指定）",
+            min_value=0,
+            max_value=12,
+            value=0,
+            step=1,
+            key="v319_op_fetch_race_no_v326",
+            help="0=開催全レース（結果登録含む） / 1〜12=その1レースだけ",
+        )
         skip_existing = st.checkbox("登録済みは飛ばす", value=True, key="v319_op_skip_existing")
         replace_existing = st.checkbox("登録済みを置き換える", value=False, key="v319_op_replace_existing")
-        predict_missing = st.checkbox("未予測なら予測して補正を更新", value=True, key="v319_op_predict_missing")
+        predict_missing = st.checkbox(
+            "未予測／他バージョン予測なら再予測",
+            value=True,
+            key="v319_op_predict_missing",
+            help="現行版（例: Ver326）の予測が無いレースは、他版の予測があっても再予測します。",
+        )
         fetch_odds_opt = st.checkbox("オッズも取得する", value=True, key="v319_op_fetch_odds")
         register_result_opt = st.checkbox("結果も登録する", value=True, key="v319_op_register_result")
         if st.button("この日の開催を確認", use_container_width=True, key="v319_op_list_meetings"):
@@ -35015,24 +35449,52 @@ if selected_main_page == "✅ 結果登録・解析":
         )
 
         # 取り込み済み／把握済み確認（再HTTPなし。回収率の判定対象とは別）
+        # 現行版の予測のみを「把握」とする（旧版のみあるRは 0R）
         try:
+            _cur_ver = str(
+                globals().get("_V231_APP_VERSION")
+                or globals().get("APP_VERSION")
+                or "Ver326"
+            ).strip()
             _reg_lines = []
             for _vn in (venues or []):
                 if _vn not in RESULT_VENUES:
                     continue
                 _reg_nos = _v319_registered_race_nos(engine.DB_PATH, ymd, _vn)
                 try:
-                    _known_nos = _v319_known_race_nos(engine.DB_PATH, ymd, _vn)
+                    _pred_nos = _v319_prediction_race_nos_for_version(
+                        engine.DB_PATH, ymd, _vn, app_version=_cur_ver
+                    )
                 except Exception:
-                    _known_nos = list(_reg_nos)
-                _mx = max([0] + list(_known_nos) + list(_reg_nos) + [8])
-                _miss_reg = [n for n in range(1, _mx + 1) if n not in _reg_nos]
+                    _pred_nos = []
+                try:
+                    _any_nos = _v319_known_race_nos(engine.DB_PATH, ymd, _vn)
+                except Exception:
+                    _any_nos = list(_reg_nos)
+                # 1〜12 のみ
+                _reg_nos = [n for n in _reg_nos if isinstance(n, int) and 1 <= n <= 12]
+                _pred_nos = [n for n in _pred_nos if isinstance(n, int) and 1 <= n <= 12]
+                _any_nos = [n for n in _any_nos if isinstance(n, int) and 1 <= n <= 12]
+                _old_only = sorted(set(_any_nos) - set(_pred_nos))
+                _mx = max([0] + list(_any_nos) + list(_reg_nos) + list(_pred_nos) + [8])
+                _miss_pred = [n for n in range(1, _mx + 1) if n not in set(_pred_nos)]
+                _miss_reg = [n for n in range(1, _mx + 1) if n not in set(_reg_nos)]
                 _line = (
-                    f"**{_vn}**: 把握 {len(_known_nos)}R"
-                    + (f"（{','.join(str(n) for n in _known_nos)}）" if _known_nos else "（なし）")
+                    f"**{_vn}**（{_cur_ver}）: "
+                    f"現行版予測 {len(_pred_nos)}R"
+                    + (f"（{','.join(str(n) for n in _pred_nos)}）" if _pred_nos else "（0R・なし）")
                     + f" ／ result登録 {len(_reg_nos)}R"
-                    + (f"（{','.join(str(n) for n in _reg_nos)}）" if _reg_nos else "")
+                    + (f"（{','.join(str(n) for n in _reg_nos)}）" if _reg_nos else "（なし）")
                 )
+                if _old_only:
+                    _line += (
+                        f" ／ 旧版のみ予測: {','.join(str(n)+'R' for n in _old_only)}"
+                        f"（現行では未把握＝再予測対象）"
+                    )
+                if _miss_pred and _pred_nos:
+                    _line += f" ／ 現行版未予測: {','.join(str(n)+'R' for n in _miss_pred)}"
+                elif not _pred_nos and _mx > 0:
+                    _line += f" ／ 現行版未予測: 1〜{_mx}R（すべて）"
                 if _miss_reg:
                     _line += f" ／ result未登録: {','.join(str(n)+'R' for n in _miss_reg)}"
                 _reg_lines.append(_line)
@@ -35040,8 +35502,9 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.info(
                     "📦 この日のR把握状況（再取込不要・既存DB）\n\n"
                     + "\n\n".join(_reg_lines)
-                    + "\n\n※把握＝予測・生結果・取込キュー完了などDB痕跡。"
-                    + " result未登録の不成立があっても把握には入ります。"
+                    + f"\n\n※「現行版予測」は {_cur_ver} の予測／プランのみ。"
+                    + " 旧版だけあるRは把握に入れず 0R 扱いです。"
+                    + "\n※result登録は版非依存（着順・払戻）。"
                     + "\n※回収率の「レース数」は判定対象なので別数字で正常です。"
                 )
         except Exception:
@@ -36940,6 +37403,87 @@ if selected_main_page == "🗃️ 登録情報確認":
             )
     elif isinstance(_ps, dict) and _ps.get("reason") and _ps.get("reason") != "OK":
         st.warning(str(_ps.get("reason")))
+
+    # --- Ver326: 同一レース版ペア比較（隣接スワップ量比・F1） ---
+    st.markdown("##### 🔁 C-A検証：同一レースでの版ペア比較（324 vs 326）")
+    st.caption(
+        "同一 race_key に限定して、隣接スワップ量比とF1を版間比較します。"
+        "周4-5の量比が1.0方向へ寄り、F1が悪化していなければ C-A は機能しています。"
+        "1.0を超えてオーバーシュートした場合は C-A が効きすぎのサインです。"
+        "読み取り専用。予測・◎・買い目は変更しません。"
+    )
+    _pc_lim = st.number_input(
+        "最大取得R数（各版）",
+        min_value=50,
+        max_value=2000,
+        value=400,
+        step=50,
+        key="v326_paired_swap_limit",
+    )
+    if st.button("同一レース版ペア比較を実行", key="v326_paired_swap_btn", use_container_width=True):
+        with st.spinner("324/326両版の closest_route と result_laps を突合中…"):
+            st.session_state["v326_paired_swap"] = _v326_paired_lap_swap_comparison(
+                engine.DB_PATH,
+                app_a="Ver324",
+                app_b="Ver326",
+                limit_races=int(_pc_lim),
+            )
+    _pc = st.session_state.get("v326_paired_swap")
+    if isinstance(_pc, dict) and _pc.get("ok"):
+        _psm = _pc.get("summary") or {}
+        st.write(
+            f"共通race_key {_pc.get('common_races', 0)}R"
+            f"（A routes {_pc.get('routes_a', 0)} / B routes {_pc.get('routes_b', 0)}）"
+        )
+        # 簡易判定
+        try:
+            d4 = _psm.get("周4量比差")
+            d5 = _psm.get("周5量比差")
+            f4 = _psm.get("周4F1差")
+            f5 = _psm.get("周5F1差")
+            r4b = _psm.get("量比_Ver326_周4")
+            r5b = _psm.get("量比_Ver326_周5")
+            _msgs = []
+            if d4 is not None and d5 is not None:
+                if float(d4) > 0.05 and float(d5) > 0.05 and (f4 is None or float(f4) >= -1) and (f5 is None or float(f5) >= -1):
+                    _msgs.append("✅ 周4・5の量比が上昇方向（F1悪化なし）→ C-Aは意図どおりの可能性")
+                elif (r4b is not None and float(r4b) > 1.15) or (r5b is not None and float(r5b) > 1.15):
+                    _msgs.append("⚠️ 量比が1.15超 → 効きすぎの可能性")
+                elif abs(float(d4)) <= 0.05 and abs(float(d5)) <= 0.05:
+                    _msgs.append("⚠️ 量比差ほぼゼロ → C-Aが実質効いていない可能性")
+                if (f4 is not None and float(f4) < -2) or (f5 is not None and float(f5) < -2):
+                    _msgs.append("⛔ 周4/5のF1が悪化 → ロールバック検討")
+            if int(_pc.get("common_races") or 0) < 100:
+                _msgs.append("❓ 共通race_key < 100 → 参考値扱い")
+            for _m in _msgs:
+                st.info(_m)
+        except Exception:
+            pass
+        dfp = _pc.get("by_lap")
+        if isinstance(dfp, pd.DataFrame) and not dfp.empty:
+            st.dataframe(
+                dfp,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "量比_Ver324": st.column_config.NumberColumn(format="%.3f"),
+                    "量比_Ver326": st.column_config.NumberColumn(format="%.3f"),
+                    "量比差(B-A)": st.column_config.NumberColumn(format="%+.3f"),
+                    "F1%_Ver324": st.column_config.NumberColumn(format="%.1f"),
+                    "F1%_Ver326": st.column_config.NumberColumn(format="%.1f"),
+                    "F1差(B-A)": st.column_config.NumberColumn(format="%+.1f"),
+                },
+            )
+            st.download_button(
+                "版ペア比較CSV",
+                dfp.to_csv(index=False).encode("utf-8-sig"),
+                file_name="v326_paired_lap_swap.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v326_paired_csv",
+            )
+    elif isinstance(_pc, dict) and _pc.get("reason") not in (None, "", "OK"):
+        st.warning(str(_pc.get("reason")))
 
     # --- Ver326: 版別・当たり三連単上位％比較（読み取り専用） ---
     st.markdown("##### 🎯 版別・当たり三連単上位％比較（読み取り専用）")
