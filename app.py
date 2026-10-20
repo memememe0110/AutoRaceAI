@@ -94,19 +94,20 @@ except Exception as _v320_patch_exc:
 # place so maintenance/reconstruction paths cannot fail from definition order.
 # Prediction formulas are intentionally unchanged by this refactor.
 # ---------------------------------------------------------------------------
-APP_VERSION = "Ver324"
+APP_VERSION = "Ver326"        # Ver326本線採用（C-A有効版）
 SIMULATION_MODE = "6周内蔵型壁展開"
 
 # Backward-compatible aliases used throughout the existing code.
-_V231_APP_VERSION = "Ver324"  # 本線=Ver324。Ver325(G1)は実験経路のみ保存。
+_V231_APP_VERSION = "Ver326"  # 予測本体=Ver326。ゲート/◎条件はVer324据え置き。
 
 # Ver325 G1: 本線では無効。odds_replan など実験経路でのみ一時的に True。
 _V325_ENABLE_G1 = False
 _V325_APP_VERSION = "Ver325"
 
-# Ver326 C-A実験: catch_factor の gap ペナルティ上限のみ変更（本線0.78 → 実験0.60）。
-# 本線 APP_VERSION / _V231 は Ver324 のまま。実験ON時のみシミュレーションと保存版が Ver326。
-_V326_ENABLE_CA = False
+# Ver326本線化: C-A(gap 0.60)を本線で有効。ゲート/◎はVer324据え置き。
+# 旧Ver324本線◎は app_version=Ver324 として履歴保全。新トラックは0件から監視。
+_V326_ENABLE_CA = True             # Ver326本線化: C-A(gap 0.60)を本線有効化
+_V326_ENABLE_CA_MAINLINE = True    # セッション分岐からの誤OFF防止マスタースイッチ
 _V326_APP_VERSION = "Ver326"
 _V326_CATCH_GAP_CAP_MAIN = 0.78
 _V326_CATCH_GAP_CAP_EXP = 0.60
@@ -146,7 +147,7 @@ _V324_MIN_TICKETS = 5
 # Ver324: 学習暴走防止（予測ロジック不変。結果登録時の adaptive_weights 更新だけ制御）
 _V324_LEARNING_FREEZE = False  # True で結果登録しても重み更新しない（DB永続化優先）
 _V324_LEARNING_MIN_RACES_BETWEEN = 30  # 前回学習からこの件数の結果登録が来るまで重み更新スキップ
-_V324_MONITOR_APP_VERSION = "Ver324"  # 時間窓モニタの対象予測版
+_V324_MONITOR_APP_VERSION = "Ver326"  # Ver326本線化に合わせて対象版を更新
 _V324_MONITOR_ORIGINS = ("live", "official_import")  # 本線のみ（relabel除外）
 
 
@@ -3823,9 +3824,11 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 globals()["_V231_APP_VERSION"] = _prev_v231
         except Exception:
             try:
-                globals()["_V326_ENABLE_CA"] = False
+                # 本線化後はフォールバックも C-A ON / Ver326 を維持
+                _ml = bool(globals().get("_V326_ENABLE_CA_MAINLINE", True))
+                globals()["_V326_ENABLE_CA"] = _ml
                 globals()["_V326_CA_WORKER_ACTIVE"] = False
-                globals()["_V231_APP_VERSION"] = "Ver324"
+                globals()["_V231_APP_VERSION"] = str(APP_VERSION or ("Ver326" if _ml else "Ver324"))
             except Exception:
                 pass
 
@@ -12767,16 +12770,23 @@ def _v163_clear_saved_inputs(*saved_keys: str) -> None:
 
 st.title("🏁 AutoRaceAI スマホ本予測")
 st.caption(f"{APP_VERSION}｜複数展開ルートを確率化し、実測グランドノートから展開タイプと近似ルートを学習。")
-# Ver326 C-A: セッション実験モード時のみ保存版を Ver326 に切替（ワーカー中は触らない）
+# Ver326本線化: セッション分岐で C-A を False に戻さない。
+# マスタースイッチが True の間は常に C-A 有効を維持する。
 try:
     if not bool(globals().get("_V326_CA_WORKER_ACTIVE")):
+        globals()["_V326_ENABLE_CA"] = bool(
+            globals().get("_V326_ENABLE_CA_MAINLINE", True)
+        )
+        globals()["_V231_APP_VERSION"] = str(APP_VERSION or "Ver326")
         if bool(st.session_state.get("v326_ca_experiment_mode")):
-            globals()["_V326_ENABLE_CA"] = True
-            globals()["_V231_APP_VERSION"] = str(globals().get("_V326_APP_VERSION") or "Ver326")
-            st.caption("🧪 Ver326 C-A実験モード: catch gap上限=0.60 / 予測保存=Ver326")
+            st.caption(
+                "🧪 Ver326 C-A（セッション表示）: catch gap上限=0.60 / 予測保存=Ver326"
+                "｜本線は既にC-A有効です"
+            )
         else:
-            globals()["_V326_ENABLE_CA"] = False
-            globals()["_V231_APP_VERSION"] = str(APP_VERSION or "Ver324")
+            st.caption(
+                "✅ Ver326 C-A 本線有効: catch gap上限=0.60 / 予測保存=Ver326"
+            )
 except Exception:
     pass
 # B13-E: 起動後の操作（rerun）では重い初期化表示・再計算を抑える
@@ -29397,11 +29407,11 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         _last = st.session_state.get("v325_odds_replan_last")
         if isinstance(_last, dict) and _last.get("ok") is not None:
             st.caption(f"前回: ok={_last.get('ok')} skip={_last.get('skip')} error={_last.get('error')}")
-    with st.expander("Ver326 C-A実験: catch_factor gap上限 0.78→0.60（本線はVer324のまま）", expanded=False):
+    with st.expander("Ver326 C-A本線: catch_factor gap上限 0.78→0.60（ゲートはVer324据え置き）", expanded=False):
         st.caption(
             "大差時の追いつき減衰だけ緩めます（gapペナルティ上限 0.78→0.60）。"
-            "本線 APP_VERSION=Ver324 / G1(Ver325) は変更しません。"
-            "実験ONの再シミュ・予測は app_version=Ver326 で保存され、回収率で版比較できます。"
+            "本線 APP_VERSION=Ver326 / C-A有効。G1(Ver325)・◎ゲート条件は変更しません。"
+            "再シミュ・予測は app_version=Ver326 で保存されます（旧Ver324実績は履歴保全）。"
             "既定は「Ver326未保存のみ」→ 途中停止しても続きから再開できます。"
             "公式取込とは別セッションで同時実行できます（同じ再シミュ同士は1本のみ）。"
         )
