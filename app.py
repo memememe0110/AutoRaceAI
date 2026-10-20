@@ -3210,28 +3210,6 @@ def _v278_bg_cancel_requested(db_path: str, job_id: int) -> bool:
         return False
 
 
-def _v278_bg_release_memory(tag: str = "") -> None:
-    """停止・終了時のメモリ解放（予測ロジック非侵襲）。"""
-    try:
-        import gc as _gc_rel
-        for _ in range(3):
-            _gc_rel.collect()
-    except Exception:
-        pass
-    # 履歴HTTPキャッシュなど、再シム後に残りやすいものを空ける
-    try:
-        global _V319_HIST_DF_CACHE
-        if isinstance(_V319_HIST_DF_CACHE, dict) and _V319_HIST_DF_CACHE:
-            _V319_HIST_DF_CACHE.clear()
-    except Exception:
-        pass
-    try:
-        import gc as _gc_rel2
-        _gc_rel2.collect()
-    except Exception:
-        pass
-
-
 def _v278_bg_request_cancel(db_path: str, job_id: int) -> None:
     _v278_cancel_flag_set(job_id)
     try:
@@ -3251,17 +3229,12 @@ def _v278_bg_request_cancel(db_path: str, job_id: int) -> None:
                  WHERE job_id=?
                 """,
                 (
-                    "中止要求を受け付けました。現在レース終了後に停止し、メモリを解放します。",
+                    "中止要求を受け付けました。処理の区切りで停止します。",
                     _v228_now_jst_iso(),
                     int(job_id),
                 ),
             )
             con.commit()
-    except Exception:
-        pass
-    # 停止ボタン直後にメイン側でも解放を試みる（ワーカー終了待ち中のOOM低減）
-    try:
-        _v278_bg_release_memory("cancel_request")
     except Exception:
         pass
 
@@ -3492,14 +3465,59 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 _total_show=int(resume_done_offset or 0)+_total_raw
             _total_show=max(_total_show,_done_show)
             _msg = f"{_done_show}/{_total_show}｜{str(label or '')}"
-            # B13-L: 進捗表示のみ。GitHub保存はチャンク境界の1回に統一
-            # （progress内保存と境界保存の二重実行を止め、712MB級OOMを低減）
+            # 途中自動保存: N件処理ごと（例: 15, 30, 45...）
             if (
                 _autosave_every > 0
                 and _done_show > 0
                 and (_done_show - int(_last_gh_save_at[0])) >= _autosave_every
             ):
-                _msg = _msg + f"｜境界保存待ち({_done_show}R)"
+                try:
+                    _v278_bg_update(
+                        db_path, job_id,
+                        done_count=_done_show,
+                        total_count=_total_show,
+                        current_label=str(label or ""),
+                        message=_msg + f"｜GitHub自動保存中({_done_show}R)...",
+                    )
+                    _ok_as, _msg_as = push_db_to_github(
+                        f"AutoRaceAI: 再シム途中自動保存 {_done_show}/{_total_show}",
+                        _allow_during_resimulation=True,
+                        _lightweight=True,
+                    )
+                    try:
+                        import gc as _gc_as
+                        _gc_as.collect()
+                    except Exception:
+                        pass
+                    if _ok_as:
+                        _last_gh_save_at[0] = int(_done_show)
+                        _gh_autosave_log.append({
+                            "at": int(_done_show),
+                            "ok": True,
+                            "message": str(_msg_as or "")[:200],
+                        })
+                        _msg = _msg + f"｜✓自動保存済({_done_show}R)"
+                    else:
+                        _gh_autosave_log.append({
+                            "at": int(_done_show),
+                            "ok": False,
+                            "message": str(_msg_as or "")[:200],
+                        })
+                        _msg = _msg + "｜⚠自動保存失敗(後で再試行)"
+                except Exception as _as_exc:
+                    _gh_autosave_log.append({
+                        "at": int(_done_show),
+                        "ok": False,
+                        "message": f"{type(_as_exc).__name__}: {_as_exc}"[:200],
+                    })
+                    _msg = _msg + "｜⚠自動保存エラー"
+            # B13-J: 進捗更新のたびに軽くGC（特にautosave直後）
+            try:
+                import gc as _gc_b13j_prog
+                if int(_done_show or 0) % max(1, int(_autosave_every or 20)) == 0:
+                    _gc_b13j_prog.collect()
+            except Exception:
+                pass
             _v278_bg_update(
                 db_path, job_id,
                 done_count=_done_show,
@@ -3612,8 +3630,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             if part.get("cancelled") or _cancelled:
                 break
 
-            # B13-L チャンク境界: 結果破棄 → GC → 軽量GitHub保存1回 → GC
-            # 20RごとのGitHub保存はここだけ（progress側は廃止）
+            # チャンク境界: 軽量GitHub保存 + 強めのGC（手作業20R終了時相当）
             try:
                 _v278_bg_update(
                     db_path, job_id,
@@ -3624,27 +3641,11 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                     ),
                     message=(
                         f"チャンク{_chunk_i}完了｜累計{_done_in_job}/{_job_limit}"
-                        f"｜メモリ解放→GitHub境界保存…"
+                        f"｜境界保存・メモリ解放中…"
                     ),
                 )
             except Exception:
                 pass
-            # 1) 巨大結果を先に破棄
-            try:
-                if isinstance(part, dict):
-                    part.pop("roi_rows", None)
-                    part.pop("labels", None)
-                    part.pop("errors", None)
-                    part.clear()
-                del part
-            except Exception:
-                pass
-            try:
-                import gc as _gc_pre
-                _gc_pre.collect()
-            except Exception:
-                pass
-            # 2) 軽量GitHub保存（失敗しても再シム継続）
             try:
                 _ok_ch, _msg_ch = push_db_to_github(
                     f"AutoRaceAI: 再シムチャンク{_chunk_i}境界保存 {_done_in_job}/{_job_limit}",
@@ -3665,30 +3666,23 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                     "message": f"{type(_ch_exc).__name__}: {_ch_exc}"[:200],
                     "chunk": int(_chunk_i),
                 })
-            # 3) 保存後GC
+            # チャンク結果を明示破棄してから GC
             try:
-                import gc as _gc_post
-                _gc_post.collect()
+                if isinstance(part, dict):
+                    part.pop("roi_rows", None)
+                    part.pop("labels", None)
+                    part.clear()
+                del part
+            except Exception:
+                pass
+            try:
+                import gc as _gc_chunk
+                _gc_chunk.collect()
             except Exception:
                 pass
 
         if _cancelled:
             result["cancelled"] = True
-            # 中止直後に結果バッファを縮め、メモリを返す
-            try:
-                result["errors"] = list(result.get("errors") or [])[:10]
-                result["labels"] = []
-                result["roi_rows"] = []
-            except Exception:
-                pass
-            try:
-                _processed_keys.clear()
-            except Exception:
-                pass
-            try:
-                _v278_bg_release_memory("cancelled_after_loop")
-            except Exception:
-                pass
         try:
             if int(result.get("roi_cost_yen", 0) or 0) > 0:
                 result["roi_return_rate"] = (
@@ -3756,77 +3750,51 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             ),
             result_blob=sqlite3.Binary(blob),
         )
-        # B13-M: 中止時は最終GitHub保存をスキップ（712MBスナップショットで取込と競合しやすい）。
-        # 途中の20R境界保存分は既に残っている。不足分はサイドバー手動保存。
-        # 正常完了時のみ軽量GitHub保存。
-        if cancelled:
-            try:
-                _v278_bg_release_memory("cancelled_before_exit")
-            except Exception:
-                pass
-            try:
+        # B13-F: 完了時はフルGitHub保存を避ける（C-A長時間ジョブの終盤OOM対策）。
+        # 途中の軽量autosaveと合わせて、最終も _lightweight=True。
+        # フル保存が必要ならサイドバーの手動DB保存を使う。
+        try:
+            _gh309_ok, _gh309_msg = push_db_to_github(
+                "AutoRaceAI: 再シミュレーション完了後のDB軽量保存",
+                _lightweight=True,
+            )
+            result["github_deferred_save_ok"] = bool(_gh309_ok)
+            result["github_deferred_save_message"] = str(_gh309_msg or "")
+            if not _gh309_ok:
                 _v278_bg_update(
                     db_path, job_id,
                     message=(
-                        "停止しました。処理済みは保存済みです。"
-                        "最終GitHub保存はスキップ（メモリ優先）。"
-                        "必要ならサイドバー『現在のDBをGitHubへ保存（軽量）』を実行してください。"
+                        "再シミュレーションは完了しました。GitHub軽量保存は未完了です。"
+                        "必要ならサイドバーから手動保存してください。 "
+                        + str(_gh309_msg or "")
                     ),
                 )
-            except Exception:
-                pass
-            result["github_deferred_save_ok"] = None
-            result["github_deferred_save_message"] = "skipped_on_cancel"
-        else:
-            # B13-F: 完了時はフルGitHub保存を避ける。軽量のみ。
-            try:
+            else:
                 try:
-                    _v278_bg_release_memory("before_final_gh")
-                except Exception:
-                    pass
-                _gh309_ok, _gh309_msg = push_db_to_github(
-                    "AutoRaceAI: 再シミュレーション完了後のDB軽量保存",
-                    _lightweight=True,
-                )
-                result["github_deferred_save_ok"] = bool(_gh309_ok)
-                result["github_deferred_save_message"] = str(_gh309_msg or "")
-                if not _gh309_ok:
                     _v278_bg_update(
                         db_path, job_id,
                         message=(
-                            "再シミュレーションは完了しました。GitHub軽量保存は未完了です。"
-                            "必要ならサイドバーから手動保存してください。 "
-                            + str(_gh309_msg or "")
+                            str(result.get("message") or "完了しました。")
+                            + " / GitHub軽量保存OK（フル保存はサイドバーから）"
                         ),
                     )
-                else:
-                    try:
-                        _v278_bg_update(
-                            db_path, job_id,
-                            message=(
-                                str(result.get("message") or "完了しました。")
-                                + " / GitHub軽量保存OK（フル保存はサイドバーから）"
-                            ),
-                        )
-                    except Exception:
-                        pass
-            except Exception as _gh309_exc:
-                result["github_deferred_save_ok"] = False
-                result["github_deferred_save_message"] = (
-                    f"{type(_gh309_exc).__name__}: {_gh309_exc}"
-                )
-                _v278_bg_update(
-                    db_path, job_id,
-                    message=(
-                        "再シミュレーションは完了しました。GitHub軽量保存でエラーが発生しました。"
-                        "必要ならサイドバーから手動保存してください。 "
-                        + result["github_deferred_save_message"]
-                    ),
-                )
-            try:
-                _v276_send_rerun_complete_notification(result)
-            except Exception:
-                pass
+                except Exception:
+                    pass
+        except Exception as _gh309_exc:
+            result["github_deferred_save_ok"] = False
+            result["github_deferred_save_message"] = (
+                f"{type(_gh309_exc).__name__}: {_gh309_exc}"
+            )
+            _v278_bg_update(
+                db_path, job_id,
+                message=(
+                    "再シミュレーションは完了しました。GitHub軽量保存でエラーが発生しました。"
+                    "必要ならサイドバーから手動保存してください。 "
+                    + result["github_deferred_save_message"]
+                ),
+            )
+        if not cancelled:
+            _v276_send_rerun_complete_notification(result)
     except Exception as exc:
         _v278_bg_update(
             db_path, job_id,
@@ -3837,16 +3805,12 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             error_text=f"{type(exc).__name__}: {exc}",
         )
     finally:
-        # B13-M: ジョブ終了・中止後のメモリ解放を強化（直後の公式取込との競合対策）
+        # B13-J: ジョブ終了時に明示GC（完了直後OOM対策）
         try:
-            _v278_bg_release_memory("worker_finally")
+            import gc as _gc_b13j_end
+            _gc_b13j_end.collect()
         except Exception:
-            try:
-                import gc as _gc_b13j_end
-                for _ in range(3):
-                    _gc_b13j_end.collect()
-            except Exception:
-                pass
+            pass
         try:
             with _V278_BG_LOCK:
                 _V278_BG_THREADS.pop(int(job_id),None)
@@ -7222,6 +7186,327 @@ def _v324_overtake_pair_stats_diagnostic(
         }
     )
     return out
+
+
+def _v326_norm_trifecta_combo(combo) -> str:
+    """三連単組み合わせを 1-2-3 形式に正規化（順序保持）。"""
+    if combo is None:
+        return ""
+    if isinstance(combo, (tuple, list)):
+        try:
+            return "-".join(str(int(x)) for x in combo)
+        except Exception:
+            return "-".join(str(x) for x in combo)
+    s = str(combo or "").strip()
+    if not s:
+        return ""
+    s = s.replace("→", "-").replace(">", "-").replace(" ", "").replace("　", "")
+    s = s.replace("－", "-").replace("ー", "-")
+    parts = [p for p in s.split("-") if p]
+    out = []
+    for p in parts:
+        try:
+            out.append(str(int(p)))
+        except Exception:
+            out.append(p)
+    return "-".join(out)
+
+
+def _v326_trifecta_rank_from_bets(bets: dict) -> list[dict]:
+    """view['bets'] の三連単 counter から rank / cum_prob リストを作る。
+
+    engine.v67_save_ticket_snapshot と同じく count 降順。
+    probability は count/total*100（％）、cum_prob はその累積。
+    """
+    if not isinstance(bets, dict):
+        return []
+    counter = bets.get("三連単")
+    if not isinstance(counter, dict) or not counter:
+        counter = bets.get("3連単")
+    if not isinstance(counter, dict) or not counter:
+        return []
+    total = 0
+    items = []
+    for combo, count in counter.items():
+        try:
+            c = int(count)
+        except Exception:
+            try:
+                c = int(float(count))
+            except Exception:
+                continue
+        if c <= 0:
+            continue
+        text = _v326_norm_trifecta_combo(combo)
+        if not text:
+            continue
+        items.append((text, c))
+        total += c
+    if total <= 0 or not items:
+        return []
+    # count降順、同点は combo 文字列昇順（v67に近い安定ソート）
+    items.sort(key=lambda x: (-x[1], x[0]))
+    rows = []
+    cum = 0.0
+    seen = set()
+    rank = 0
+    for text, c in items:
+        if text in seen:
+            continue
+        seen.add(text)
+        rank += 1
+        prob = float(c) / float(total) * 100.0
+        cum += prob
+        rows.append({
+            "combination": text,
+            "predicted_rank": rank,
+            "count": c,
+            "probability": prob,
+            "cumulative_probability": cum,
+            "n_tickets": 0,  # 後で埋める
+        })
+    n = len(rows)
+    for r in rows:
+        r["n_tickets"] = n
+    return rows
+
+
+def _v326_version_trifecta_rank_compare(
+    db_path: str,
+    versions: list[str] | None = None,
+    race_keys: list[str] | None = None,
+    limit_races: int = 500,
+) -> dict:
+    """Ver版別の「当たり三連単が予測上位何％か」を比較（読み取り専用）。
+
+    - v231_prediction_history の payload を展開（既存 unpickle 経路）
+    - result_payouts の当たり三連単と突合
+    - DB書き込みなし。予測・◎・買い目ロジックは不変。
+    """
+    vers = [str(v).strip() for v in (versions or ["Ver324", "Ver326"]) if str(v).strip()]
+    out = {
+        "ok": False,
+        "versions": vers,
+        "common_keys": 0,
+        "detail": pd.DataFrame(),
+        "summary": pd.DataFrame(),
+        "reason": "",
+        "note": "当たり三連単の predicted_rank / n_tickets *100 と cum_prob。採用判断用・参考記録。",
+    }
+    if not db_path or not Path(str(db_path)).exists():
+        out["reason"] = "DBなし"
+        return out
+    if len(vers) < 1:
+        out["reason"] = "versions 空"
+        return out
+
+    import pickle as _pickle
+    import zlib as _zlib
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            con.row_factory = sqlite3.Row
+            cols = {str(r[1]) for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()}
+            if "payload" not in cols or "app_version" not in cols:
+                out["reason"] = "v231_prediction_history に payload/app_version なし"
+                return out
+
+            # 版ごとに race_key → 最新 history_id
+            latest: dict[str, dict[str, int]] = {v: {} for v in vers}
+            for v in vers:
+                rows = con.execute(
+                    """
+                    SELECT race_key, MAX(history_id) AS hid
+                      FROM v231_prediction_history
+                     WHERE app_version=?
+                     GROUP BY race_key
+                    """,
+                    (v,),
+                ).fetchall()
+                for r in rows:
+                    rk = str(r["race_key"] or "").strip()
+                    if rk:
+                        latest[v][rk] = int(r["hid"])
+
+            key_sets = [set(latest[v].keys()) for v in vers]
+            common = set.intersection(*key_sets) if key_sets else set()
+            if race_keys:
+                want = {str(k).strip() for k in race_keys if str(k).strip()}
+                common = common & want
+            common = sorted(common)
+            out["common_keys"] = len(common)
+            if not common:
+                out["reason"] = "共通 race_key なし"
+                return out
+
+            # limit
+            if int(limit_races or 0) > 0:
+                common = common[: int(limit_races)]
+
+            # 当たり三連単
+            win_map: dict[str, str] = {}
+            try:
+                ph = ",".join("?" * len(common))
+                # チャンク（SQLite変数上限対策）
+                chunk = 400
+                for i in range(0, len(common), chunk):
+                    part = common[i : i + chunk]
+                    ph = ",".join("?" * len(part))
+                    wrows = con.execute(
+                        f"""
+                        SELECT race_key, combination
+                          FROM result_payouts
+                         WHERE bet_type IN ('3連単','三連単')
+                           AND race_key IN ({ph})
+                        """,
+                        tuple(part),
+                    ).fetchall()
+                    for wr in wrows:
+                        rk = str(wr["race_key"] or "").strip()
+                        comb = _v326_norm_trifecta_combo(wr["combination"])
+                        if rk and comb and rk not in win_map:
+                            win_map[rk] = comb
+            except Exception as exc:
+                out["reason"] = f"result_payouts読込失敗: {type(exc).__name__}: {exc}"
+                return out
+
+            # history_id → payload 一括取得
+            hid_list = []
+            hid_meta = {}  # hid -> (race_key, version)
+            for v in vers:
+                for rk in common:
+                    hid = latest[v].get(rk)
+                    if hid:
+                        hid_list.append(hid)
+                        hid_meta[hid] = (rk, v)
+
+            payloads: dict[int, object] = {}
+            chunk = 100
+            for i in range(0, len(hid_list), chunk):
+                part = hid_list[i : i + chunk]
+                ph = ",".join("?" * len(part))
+                prows = con.execute(
+                    f"SELECT history_id, payload FROM v231_prediction_history WHERE history_id IN ({ph})",
+                    tuple(part),
+                ).fetchall()
+                for pr in prows:
+                    payloads[int(pr["history_id"])] = pr["payload"]
+
+        detail_rows = []
+        skip_no_win = 0
+        skip_no_bets = 0
+        skip_no_hit = 0
+        skip_unpickle = 0
+
+        for hid, (rk, ver) in hid_meta.items():
+            win_combo = win_map.get(rk)
+            if not win_combo:
+                skip_no_win += 1
+                continue
+            blob = payloads.get(hid)
+            if blob is None:
+                skip_unpickle += 1
+                continue
+            try:
+                view = _pickle.loads(_zlib.decompress(bytes(blob)))
+            except Exception:
+                skip_unpickle += 1
+                continue
+            if not isinstance(view, dict):
+                skip_unpickle += 1
+                continue
+            bets = view.get("bets")
+            if not isinstance(bets, dict):
+                # 一部payloadは result 配下
+                res = view.get("result") if isinstance(view.get("result"), dict) else {}
+                bets = res.get("bets") if isinstance(res, dict) else None
+            ranked = _v326_trifecta_rank_from_bets(bets if isinstance(bets, dict) else {})
+            if not ranked:
+                skip_no_bets += 1
+                continue
+            by_combo = {r["combination"]: r for r in ranked}
+            hit = by_combo.get(win_combo)
+            if not hit:
+                # 順序違いの可能性は正規化済み。圏外扱い
+                skip_no_hit += 1
+                detail_rows.append({
+                    "race_key": rk,
+                    "app_version": ver,
+                    "predicted_rank": None,
+                    "n_tickets": ranked[0]["n_tickets"],
+                    "win_percentile_pct": None,
+                    "cum_prob": None,
+                    "hit_combo": win_combo,
+                    "in_list": 0,
+                })
+                continue
+            n_t = int(hit["n_tickets"] or 0)
+            rank = int(hit["predicted_rank"])
+            pct = (100.0 * rank / n_t) if n_t > 0 else None
+            detail_rows.append({
+                "race_key": rk,
+                "app_version": ver,
+                "predicted_rank": rank,
+                "n_tickets": n_t,
+                "win_percentile_pct": round(pct, 4) if pct is not None else None,
+                "cum_prob": round(float(hit["cumulative_probability"]), 4),
+                "hit_combo": win_combo,
+                "in_list": 1,
+            })
+
+        detail = pd.DataFrame(detail_rows)
+        if detail.empty:
+            out["reason"] = (
+                f"詳細0件 common={out['common_keys']} "
+                f"no_win={skip_no_win} no_bets={skip_no_bets} "
+                f"no_hit={skip_no_hit} unpickle={skip_unpickle}"
+            )
+            return out
+
+        # サマリ（版別）
+        sum_rows = []
+        for ver, g in detail.groupby("app_version"):
+            g2 = g[g["in_list"] == 1].copy()
+            pcts = pd.to_numeric(g2["win_percentile_pct"], errors="coerce").dropna()
+            ranks = pd.to_numeric(g2["predicted_rank"], errors="coerce").dropna()
+            n = int(len(g2))
+            n_all = int(len(g))
+            sum_rows.append({
+                "app_version": ver,
+                "n_with_rank": n,
+                "n_rows": n_all,
+                "n_out_of_list": int((g["in_list"] == 0).sum()),
+                "mean_pct": round(float(pcts.mean()), 2) if len(pcts) else None,
+                "median_pct": round(float(pcts.median()), 2) if len(pcts) else None,
+                "mean_rank": round(float(ranks.mean()), 1) if len(ranks) else None,
+                "median_rank": float(ranks.median()) if len(ranks) else None,
+                "within_top10pct_rate": round(100.0 * float((pcts <= 10).mean()), 1) if len(pcts) else None,
+                "within_top30pct_rate": round(100.0 * float((pcts <= 30).mean()), 1) if len(pcts) else None,
+                "within_rank10_rate": round(100.0 * float((ranks <= 10).mean()), 1) if len(ranks) else None,
+                "within_rank30_rate": round(100.0 * float((ranks <= 30).mean()), 1) if len(ranks) else None,
+            })
+        summary = pd.DataFrame(sum_rows)
+
+        out.update({
+            "ok": True,
+            "detail": detail,
+            "summary": summary,
+            "reason": "OK",
+            "skips": {
+                "no_win": skip_no_win,
+                "no_bets": skip_no_bets,
+                "no_hit_in_list": skip_no_hit,
+                "unpickle": skip_unpickle,
+                "evaluated_keys": len(common),
+            },
+        })
+        return out
+    except Exception as exc:
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+
 
 
 def _v324_overtake_p_calibration_diagnostic(
@@ -28504,428 +28789,6 @@ def _v215_return_dashboard_rows(db_path: str) -> pd.DataFrame:
     return df
 
 
-
-def _v327_trifecta_90pct_points_batch(db_path: str, race_keys) -> pd.DataFrame:
-    """分析CSV専用: 三連単の累積90%到達点数を一括取得（予測・◎・買い目には使わない）。
-
-    優先: v67_prediction_tickets（予測時スナップショットの cumulative_probability）
-    フォールバック: v231_prediction_history の bets['三連単'] 試行回数
-    """
-    cols = ["race_key", "point_90", "cover_90", "source", "reason"]
-    keys = []
-    seen = set()
-    for k in (race_keys or []):
-        rk = str(k or "").strip()
-        if rk and rk not in seen:
-            seen.add(rk)
-            keys.append(rk)
-    if not keys or not db_path or not Path(str(db_path)).exists():
-        return pd.DataFrame(columns=cols)
-
-    out_map = {rk: {"race_key": rk, "point_90": None, "cover_90": None, "source": "", "reason": ""} for rk in keys}
-
-    # 1) v67_prediction_tickets 一括（チャンク）
-    try:
-        with sqlite3.connect(str(db_path), timeout=20.0) as con:
-            con.execute("PRAGMA busy_timeout=20000")
-            tables = {str(r[0]) for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()}
-            if "v67_prediction_tickets" in tables:
-                for i in range(0, len(keys), 400):
-                    chunk = keys[i:i + 400]
-                    ph = ",".join("?" * len(chunk))
-                    rows = con.execute(
-                        f"""
-                        SELECT race_key,
-                               MIN(predicted_rank) AS point_90,
-                               MIN(cumulative_probability) AS cover_90
-                          FROM v67_prediction_tickets
-                         WHERE bet_type='3連単'
-                           AND cumulative_probability >= 90.0
-                           AND race_key IN ({ph})
-                         GROUP BY race_key
-                        """,
-                        chunk,
-                    ).fetchall()
-                    for rk, p90, c90 in rows:
-                        rk = str(rk or "")
-                        if rk not in out_map:
-                            continue
-                        try:
-                            out_map[rk]["point_90"] = int(p90) if p90 is not None else None
-                        except Exception:
-                            out_map[rk]["point_90"] = None
-                        try:
-                            out_map[rk]["cover_90"] = float(c90) if c90 is not None else None
-                        except Exception:
-                            out_map[rk]["cover_90"] = None
-                        out_map[rk]["source"] = "v67_prediction_tickets"
-                        out_map[rk]["reason"] = ""
-    except Exception as exc:
-        for rk in keys:
-            if not out_map[rk]["source"]:
-                out_map[rk]["reason"] = f"tickets: {type(exc).__name__}"
-
-    # 2) 未取得分だけ history bets から（最大でも不足分のみ）
-    missing = [rk for rk, v in out_map.items() if v.get("point_90") is None]
-    if missing:
-        # history は race 単位でロード（不足分のみ）
-        try:
-            with sqlite3.connect(str(db_path), timeout=20.0) as con:
-                con.execute("PRAGMA busy_timeout=20000")
-                has_hist = con.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='v231_prediction_history'"
-                ).fetchone()
-            if has_hist:
-                for rk in missing:
-                    try:
-                        with sqlite3.connect(str(db_path), timeout=10.0) as con:
-                            con.execute("PRAGMA busy_timeout=10000")
-                            row = con.execute(
-                                "SELECT history_id FROM v231_prediction_history "
-                                "WHERE race_key=? ORDER BY history_id DESC LIMIT 1",
-                                (rk,),
-                            ).fetchone()
-                        if not row:
-                            if not out_map[rk]["reason"]:
-                                out_map[rk]["reason"] = "履歴なし"
-                            continue
-                        view, *_ = _v231_load_prediction_history(str(db_path), int(row[0]))
-                        counter = ((view or {}).get("bets") or {}).get("三連単") or {}
-                        if not isinstance(counter, dict) or not counter:
-                            out_map[rk]["reason"] = "bets三連単なし"
-                            continue
-                        # count or probability どちらでも比率で90%
-                        items = []
-                        for combo, val in counter.items():
-                            try:
-                                items.append((combo, float(val)))
-                            except Exception:
-                                continue
-                        total = sum(v for _, v in items)
-                        if total <= 0:
-                            out_map[rk]["reason"] = "三連単合計0"
-                            continue
-                        items.sort(key=lambda x: x[1], reverse=True)
-                        acc = 0.0
-                        hit = None
-                        cover = None
-                        for i, (_, v) in enumerate(items, start=1):
-                            acc += v
-                            if acc / total * 100.0 >= 90.0:
-                                hit = i
-                                cover = acc / total * 100.0
-                                break
-                        if hit is None:
-                            out_map[rk]["reason"] = "90%未到達"
-                        else:
-                            out_map[rk]["point_90"] = int(hit)
-                            out_map[rk]["cover_90"] = float(cover)
-                            out_map[rk]["source"] = "v231_prediction_history.bets"
-                            out_map[rk]["reason"] = ""
-                    except Exception as exc:
-                        out_map[rk]["reason"] = f"history: {type(exc).__name__}"
-        except Exception as exc:
-            for rk in missing:
-                if out_map[rk]["point_90"] is None and not out_map[rk]["reason"]:
-                    out_map[rk]["reason"] = f"history_batch: {type(exc).__name__}"
-
-    for rk, v in out_map.items():
-        if v.get("point_90") is None and not v.get("reason"):
-            v["reason"] = "三連単確率を取得できません"
-    return pd.DataFrame([out_map[rk] for rk in keys], columns=cols)
-
-
-
-# ============================================================
-# B13-N: p90セット × 安い券種カバー診断（読み取り専用・分析CSV専用）
-# 予測・◎・買い目・v184/v277・_V324_MIN_TICKETS は一切変更しない
-# ============================================================
-_V319_P90_DIAG_UNIT_YEN = 100  # 机上コスト単価（1点=100円）
-
-
-def _v319_p90_parse_combo_cars(combo: str, n: int):
-    """'1-2-3' / '1→2→3' / '1 2 3' などを int タプルへ。失敗時 None。"""
-    s = str(combo or "").strip()
-    if not s:
-        return None
-    for sep in ("→", "->", "›", "»", "−", "–", "—"):
-        s = s.replace(sep, "-")
-    s = s.replace("－", "-").replace("—", "-")
-    parts = [p for p in s.replace(" ", "-").replace("　", "-").split("-") if p.strip()]
-    if len(parts) < n:
-        return None
-    try:
-        cars = tuple(int(float(p.strip())) for p in parts[:n])
-    except Exception:
-        return None
-    if any(c <= 0 for c in cars):
-        return None
-    return cars
-
-
-def _v319_p90_diagnostic_from_sets(p90_set, rec_2tan, rec_2fuku, rec_3fuku,
-                                   unit_yen=None):
-    """p90セットと推奨安い券種の交差診断。
-
-    p90_residual_cost は上限近似（机上）:
-      100円 × (寄与した安い券種枚数 + 残差三連単点数)
-    同一comboが複数券種に載っても枚数は加算するため、実購入額より大きめ。
-    実コスト最適化や◎判定には使わない。相対比較用。
-    """
-    if unit_yen is None:
-        unit_yen = int(globals().get("_V319_P90_DIAG_UNIT_YEN") or 100)
-    empty = {
-        "p90_2連単カバー率": None,
-        "p90_2連複カバー率": None,
-        "p90_3連複カバー率": None,
-        "p90_残差点数": None,
-        "p90_残差コスト上限": None,
-    }
-    n = len(p90_set or set())
-    if n <= 0:
-        return empty
-
-    cov_2tan = {c for c in p90_set if (c[0], c[1]) in rec_2tan}
-    cov_2fuku = {c for c in p90_set if tuple(sorted((c[0], c[1]))) in rec_2fuku}
-    cov_3fuku = {c for c in p90_set if tuple(sorted(c)) in rec_3fuku}
-    cov_any = cov_2tan | cov_2fuku | cov_3fuku
-    residual_points = int(n - len(cov_any))
-
-    used_2tan = {(c[0], c[1]) for c in cov_2tan}
-    used_2fuku = {tuple(sorted((c[0], c[1]))) for c in cov_2fuku}
-    used_3fuku = {tuple(sorted(c)) for c in cov_3fuku}
-    # 上限近似: 寄与券種枚数 + 残三連単を単純合算（二重計上があり得る）
-    residual_cost_cap = int(unit_yen) * (
-        len(used_2tan) + len(used_2fuku) + len(used_3fuku) + residual_points
-    )
-
-    return {
-        "p90_2連単カバー率": round(len(cov_2tan) / n, 4),
-        "p90_2連複カバー率": round(len(cov_2fuku) / n, 4),
-        "p90_3連複カバー率": round(len(cov_3fuku) / n, 4),
-        "p90_残差点数": residual_points,
-        "p90_残差コスト上限": residual_cost_cap,
-    }
-
-
-def _v319_p90_cheap_cover_batch(db_path: str, race_keys, p90_points_by_key=None) -> pd.DataFrame:
-    """分析CSV専用: p90セットと現行推奨(2連単/2連複/3連複)の交差を一括計算。
-
-    - p90セット: v67_prediction_tickets の 3連単 を predicted_rank 昇順で上位 point_90 件
-      （三連単90%到達点数の算出と同一順序。再ソートしない）
-    - 推奨券種: include_in_live_stats=1 の最新 plan（race_key単位）の
-      v187_mixed_plan_tickets
-    - 残差コスト上限: 机上の上限近似。実購入額ではない。
-    """
-    cols = [
-        "race_key",
-        "p90_2連単カバー率", "p90_2連複カバー率", "p90_3連複カバー率",
-        "p90_残差点数", "p90_残差コスト上限",
-    ]
-    keys = []
-    seen = set()
-    for k in (race_keys or []):
-        rk = str(k or "").strip()
-        if rk and rk not in seen:
-            seen.add(rk)
-            keys.append(rk)
-    if not keys or not db_path or not Path(str(db_path)).exists():
-        return pd.DataFrame(columns=cols)
-
-    p90_map = {}
-    if isinstance(p90_points_by_key, dict):
-        for rk, v in p90_points_by_key.items():
-            try:
-                iv = int(v) if v is not None and str(v).strip() != "" else None
-            except Exception:
-                iv = None
-            if iv and iv > 0:
-                p90_map[str(rk)] = iv
-
-    out_map = {rk: {"race_key": rk} for rk in keys}
-    for rk in keys:
-        out_map[rk].update({
-            "p90_2連単カバー率": None,
-            "p90_2連複カバー率": None,
-            "p90_3連複カバー率": None,
-            "p90_残差点数": None,
-            "p90_残差コスト上限": None,
-        })
-
-    try:
-        with sqlite3.connect(str(db_path), timeout=20.0) as con:
-            con.execute("PRAGMA busy_timeout=20000")
-            tables = {str(r[0]) for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()}
-            if "v67_prediction_tickets" not in tables or "v187_mixed_plan_tickets" not in tables:
-                return pd.DataFrame([out_map[rk] for rk in keys], columns=cols)
-
-            # p90点数不足分は v67 から MIN(rank where cum>=90) を補完
-            need_p90 = [rk for rk in keys if rk not in p90_map]
-            if need_p90:
-                for i in range(0, len(need_p90), 400):
-                    chunk = need_p90[i:i + 400]
-                    ph = ",".join("?" * len(chunk))
-                    try:
-                        rows = con.execute(
-                            f"""
-                            SELECT race_key, MIN(predicted_rank) AS point_90
-                              FROM v67_prediction_tickets
-                             WHERE bet_type='3連単'
-                               AND cumulative_probability >= 90.0
-                               AND race_key IN ({ph})
-                             GROUP BY race_key
-                            """,
-                            chunk,
-                        ).fetchall()
-                        for rk, p90 in rows:
-                            try:
-                                p90_map[str(rk)] = int(p90)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-            target_keys = [rk for rk in keys if p90_map.get(rk)]
-            if not target_keys:
-                return pd.DataFrame([out_map[rk] for rk in keys], columns=cols)
-
-            # race_key → 最新 live plan_hash（include_in_live_stats=1）
-            plan_hash_by_rk = {}
-            if "v187_mixed_plan_runs" in tables:
-                for i in range(0, len(target_keys), 400):
-                    chunk = target_keys[i:i + 400]
-                    ph = ",".join("?" * len(chunk))
-                    try:
-                        rows = con.execute(
-                            f"""
-                            SELECT race_key, plan_hash FROM (
-                                SELECT race_key, plan_hash,
-                                       ROW_NUMBER() OVER (
-                                           PARTITION BY race_key
-                                           ORDER BY datetime(COALESCE(created_at,'')) DESC,
-                                                    plan_hash DESC
-                                       ) AS rn
-                                  FROM v187_mixed_plan_runs
-                                 WHERE race_key IN ({ph})
-                                   AND COALESCE(include_in_live_stats,1)=1
-                            ) x WHERE rn=1
-                            """,
-                            chunk,
-                        ).fetchall()
-                        for rk, phash in rows:
-                            if rk and phash:
-                                plan_hash_by_rk[str(rk)] = str(phash)
-                    except Exception:
-                        # ROW_NUMBER 非対応時のフォールバック
-                        try:
-                            rows = con.execute(
-                                f"""
-                                SELECT race_key, plan_hash, COALESCE(created_at,'')
-                                  FROM v187_mixed_plan_runs
-                                 WHERE race_key IN ({ph})
-                                   AND COALESCE(include_in_live_stats,1)=1
-                                 ORDER BY race_key, COALESCE(created_at,'') DESC, plan_hash DESC
-                                """,
-                                chunk,
-                            ).fetchall()
-                            for rk, phash, _ca in rows:
-                                rk = str(rk or "")
-                                if rk and phash and rk not in plan_hash_by_rk:
-                                    plan_hash_by_rk[rk] = str(phash)
-                        except Exception:
-                            pass
-
-            # 推奨安い券種
-            rec_by_rk = {rk: {"2連単": set(), "2連複": set(), "3連複": set()} for rk in target_keys}
-            hashes = sorted(set(plan_hash_by_rk.values()))
-            if hashes:
-                for i in range(0, len(hashes), 400):
-                    chunk = hashes[i:i + 400]
-                    ph = ",".join("?" * len(chunk))
-                    try:
-                        rows = con.execute(
-                            f"""
-                            SELECT race_key, plan_hash, bet_type, combination
-                              FROM v187_mixed_plan_tickets
-                             WHERE plan_hash IN ({ph})
-                               AND bet_type IN ('2連単','2連複','3連複')
-                            """,
-                            chunk,
-                        ).fetchall()
-                    except Exception:
-                        rows = []
-                    for rk, phash, bt, combo in rows:
-                        rk = str(rk or "")
-                        if plan_hash_by_rk.get(rk) != str(phash):
-                            continue
-                        if rk not in rec_by_rk:
-                            continue
-                        if bt == "2連単":
-                            cars = _v319_p90_parse_combo_cars(combo, 2)
-                            if cars:
-                                rec_by_rk[rk]["2連単"].add(cars)
-                        elif bt == "2連複":
-                            cars = _v319_p90_parse_combo_cars(combo, 2)
-                            if cars:
-                                rec_by_rk[rk]["2連複"].add(tuple(sorted(cars)))
-                        elif bt == "3連複":
-                            cars = _v319_p90_parse_combo_cars(combo, 3)
-                            if cars:
-                                rec_by_rk[rk]["3連複"].add(tuple(sorted(cars)))
-
-            # p90セット（predicted_rank 昇順・再ソート禁止）
-            p90_set_by_rk = {rk: set() for rk in target_keys}
-            for i in range(0, len(target_keys), 200):
-                chunk = target_keys[i:i + 200]
-                ph = ",".join("?" * len(chunk))
-                try:
-                    rows = con.execute(
-                        f"""
-                        SELECT race_key, combination, predicted_rank
-                          FROM v67_prediction_tickets
-                         WHERE bet_type='3連単'
-                           AND race_key IN ({ph})
-                         ORDER BY race_key, predicted_rank ASC
-                        """,
-                        chunk,
-                    ).fetchall()
-                except Exception:
-                    rows = []
-                cur_rk = None
-                cur_n = 0
-                limit_n = 0
-                for rk, combo, rank in rows:
-                    rk = str(rk or "")
-                    if rk != cur_rk:
-                        cur_rk = rk
-                        limit_n = int(p90_map.get(rk) or 0)
-                        cur_n = 0
-                    if limit_n <= 0 or cur_n >= limit_n:
-                        continue
-                    cars = _v319_p90_parse_combo_cars(combo, 3)
-                    if not cars:
-                        continue
-                    p90_set_by_rk[rk].add(cars)
-                    cur_n += 1
-
-            for rk in target_keys:
-                diag = _v319_p90_diagnostic_from_sets(
-                    p90_set_by_rk.get(rk) or set(),
-                    rec_by_rk.get(rk, {}).get("2連単") or set(),
-                    rec_by_rk.get(rk, {}).get("2連複") or set(),
-                    rec_by_rk.get(rk, {}).get("3連複") or set(),
-                )
-                out_map[rk].update(diag)
-    except Exception:
-        pass
-
-    return pd.DataFrame([out_map[rk] for rk in keys], columns=cols)
-
-
 def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataFrame:
     """回収率実績を、ハンデ・走路・展開まで付けて分析用CSVにする。"""
     if filtered is None or filtered.empty:
@@ -29040,75 +28903,11 @@ def _v319_analysis_export_rows(db_path: str, filtered: pd.DataFrame) -> pd.DataF
         "winning_types": "的中券種",
     }
     out = out.rename(columns=rename)
-    # 分析専用: 三連単90%到達点数（強調ラインと同じ定義。予測・◎・買い目には未使用）
-    try:
-        _rk_series = out["race_key"].astype(str) if "race_key" in out.columns else pd.Series(dtype=str)
-        _p90_df = _v327_trifecta_90pct_points_batch(str(db_path), _rk_series.tolist())
-        if _p90_df is not None and not _p90_df.empty:
-            _p90_df = _p90_df.copy()
-            _p90_df["race_key"] = _p90_df["race_key"].astype(str)
-            out = out.merge(_p90_df, on="race_key", how="left")
-            out["三連単90%到達点数"] = pd.to_numeric(out.get("point_90"), errors="coerce")
-            out["三連単90%到達カバー"] = pd.to_numeric(out.get("cover_90"), errors="coerce")
-            out["三連単90%算出元"] = out.get("source", pd.Series("", index=out.index)).fillna("").astype(str)
-            out["三連単90%算出不可理由"] = out.get("reason", pd.Series("", index=out.index)).fillna("").astype(str)
-            out = out.drop(columns=[c for c in ("point_90", "cover_90", "source", "reason") if c in out.columns])
-        else:
-            out["三連単90%到達点数"] = pd.NA
-            out["三連単90%到達カバー"] = pd.NA
-            out["三連単90%算出元"] = ""
-            out["三連単90%算出不可理由"] = ""
-    except Exception as _p90_exc:
-        out["三連単90%到達点数"] = pd.NA
-        out["三連単90%到達カバー"] = pd.NA
-        out["三連単90%算出元"] = ""
-        out["三連単90%算出不可理由"] = f"{type(_p90_exc).__name__}"
-
-    # B13-N: p90セット × 安い券種カバー診断（読み取り専用）
-    # p90_残差コスト上限 は机上の上限近似（実購入額ではない）
-    try:
-        _rk_series2 = out.get("race_key", pd.Series(dtype=str)).astype(str)
-        _p90_pts = {}
-        if "三連単90%到達点数" in out.columns:
-            for _rk, _pt, _src in zip(
-                _rk_series2.tolist(),
-                out["三連単90%到達点数"].tolist(),
-                out.get("三連単90%算出元", pd.Series([""] * len(out))).fillna("").astype(str).tolist(),
-            ):
-                if str(_src) != "v67_prediction_tickets":
-                    continue
-                try:
-                    _iv = int(_pt) if _pt is not None and str(_pt).strip() not in ("", "nan", "None", "<NA>") else None
-                except Exception:
-                    _iv = None
-                if _iv and _iv > 0:
-                    _p90_pts[str(_rk)] = _iv
-        _cov_df = _v319_p90_cheap_cover_batch(str(db_path), _rk_series2.tolist(), _p90_pts)
-        if _cov_df is not None and not _cov_df.empty:
-            _cov_df = _cov_df.copy()
-            _cov_df["race_key"] = _cov_df["race_key"].astype(str)
-            # 既存の point_90 等と衝突しない列だけ merge
-            _cov_cols = [
-                "race_key",
-                "p90_2連単カバー率", "p90_2連複カバー率", "p90_3連複カバー率",
-                "p90_残差点数", "p90_残差コスト上限",
-            ]
-            _cov_df = _cov_df[[c for c in _cov_cols if c in _cov_df.columns]]
-            out = out.merge(_cov_df, on="race_key", how="left")
-        else:
-            for _c in ("p90_2連単カバー率", "p90_2連複カバー率", "p90_3連複カバー率", "p90_残差点数", "p90_残差コスト上限"):
-                out[_c] = pd.NA
-    except Exception:
-        for _c in ("p90_2連単カバー率", "p90_2連複カバー率", "p90_3連複カバー率", "p90_残差点数", "p90_残差コスト上限"):
-            if _c not in out.columns:
-                out[_c] = pd.NA
     prefer = [
         "日付", "開催場", "R", "race_key", "バージョン",
         "生成経路", "元予測版",
         "推奨区分", "新推奨", "推奨フラグ", "推奨スコア",
         "新判定参考回収率", "新判定カバー", "新判定最大EV", "中穴候補数", "点数",
-        "三連単90%到達点数", "三連単90%到達カバー", "三連単90%算出元", "三連単90%算出不可理由",
-        "p90_2連単カバー率", "p90_2連複カバー率", "p90_3連複カバー率", "p90_残差点数", "p90_残差コスト上限",
         "購入額", "払戻額", "回収率", "収支", "判定", "的中フラグ", "的中券種", "元判定",
         "走路", "湿走路", "天候", "気温", "走路温度", "湿度",
         "出走数", "ハンデ最小", "ハンデ最大", "ハンデ差", "ハンデ種類", "同ハンデ",
@@ -29635,7 +29434,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             ),
         )
         st.caption(
-            f"内部区切り: 約{_V314_AUTOSAVE_EVERY_N}Rごと（B13-L: 境界GitHub1回＋前後GC）。"
+            f"内部区切り: 約{_V314_AUTOSAVE_EVERY_N}Rごと（GitHub軽量保存＋GC）。"
             "上限を大きくしても一度に全部をメモリに載せ続けません。"
         )
         _ca_force = st.checkbox(
@@ -37131,6 +36930,88 @@ if selected_main_page == "🗃️ 登録情報確認":
             )
     elif isinstance(_ps, dict) and _ps.get("reason") and _ps.get("reason") != "OK":
         st.warning(str(_ps.get("reason")))
+
+    # --- Ver326: 版別・当たり三連単上位％比較（読み取り専用） ---
+    st.markdown("##### 🎯 版別・当たり三連単上位％比較（読み取り専用）")
+    st.caption(
+        "v231 payload から三連単順位を復元し、result_payouts の当たり券が上位何％だったかを版別に比較します。"
+        "DB書き込みなし。予測・◎・買い目ロジックは変更しません。"
+        "326の median_pct が小さい／上位％以内率が高い → 予測本体の採用候補。"
+    )
+    _rc1, _rc2, _rc3 = st.columns([2, 1, 1])
+    with _rc1:
+        _rank_vers = st.multiselect(
+            "比較バージョン",
+            options=["Ver322", "Ver324", "Ver326", "Ver325"],
+            default=["Ver324", "Ver326"],
+            key="v326_rank_compare_versions",
+        )
+    with _rc2:
+        _rank_limit = st.number_input(
+            "最大共通R数",
+            min_value=20,
+            max_value=2000,
+            value=500,
+            step=20,
+            key="v326_rank_compare_limit",
+        )
+    with _rc3:
+        _rank_sample20 = st.checkbox(
+            "20件サンプルのみ",
+            value=False,
+            key="v326_rank_compare_sample20",
+            help="2026-09-29 伊勢崎1-8 + 山陽1-12 に限定（検証用）",
+        )
+    if st.button("版別ランク比較を実行", key="v326_rank_compare_btn", use_container_width=True):
+        _sample_keys = None
+        if _rank_sample20:
+            _sample_keys = (
+                [f"20260929_伊勢崎_{i}R" for i in range(1, 9)]
+                + [f"20260929_山陽_{i}R" for i in range(1, 13)]
+            )
+        with st.spinner("payload展開中（読み取り専用）…"):
+            st.session_state["v326_rank_compare"] = _v326_version_trifecta_rank_compare(
+                engine.DB_PATH,
+                versions=list(_rank_vers) or ["Ver324", "Ver326"],
+                race_keys=_sample_keys,
+                limit_races=int(_rank_limit),
+            )
+    _rc = st.session_state.get("v326_rank_compare")
+    if isinstance(_rc, dict) and _rc.get("ok"):
+        st.write(
+            f"共通 race_key {_rc.get('common_keys', 0)} 件｜"
+            f"skips={_rc.get('skips')}"
+        )
+        _rcs = _rc.get("summary")
+        if isinstance(_rcs, pd.DataFrame) and not _rcs.empty:
+            st.markdown("**版別サマリ（採用判断用）**")
+            st.dataframe(_rcs, use_container_width=True, hide_index=True)
+            st.download_button(
+                "版別サマリCSV",
+                _rcs.to_csv(index=False).encode("utf-8-sig"),
+                file_name="trifecta_rank_compare_summary.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v326_rank_compare_sum_csv",
+            )
+        _rcd = _rc.get("detail")
+        if isinstance(_rcd, pd.DataFrame) and not _rcd.empty:
+            st.markdown("**レース明細**")
+            st.dataframe(_rcd, use_container_width=True, hide_index=True)
+            st.download_button(
+                "レース明細CSV",
+                _rcd.to_csv(index=False).encode("utf-8-sig"),
+                file_name="trifecta_rank_compare_detail.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="v326_rank_compare_detail_csv",
+            )
+        st.info(
+            "判定目安: median_pct / mean_pct が小さい方、within_top10pct_rate / "
+            "within_top30pct_rate が高い方が、当たりを上位に置けている。"
+        )
+    elif isinstance(_rc, dict) and _rc.get("reason") and _rc.get("reason") != "OK":
+        st.warning(str(_rc.get("reason")))
 
     try:
         _v270_weights_df=engine.v40_current_weights(engine.DB_PATH)
