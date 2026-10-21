@@ -17945,6 +17945,30 @@ def _v319_import_one_race(
             _v319_upsert_payouts_from_text(db_path, key_guess, raw_pay)
         except Exception as exc:
             odds_msg += f" / 払戻補完失敗:{type(exc).__name__}"
+        # 結果は登録済みでも、版違い再予測・オッズ更新・払戻補完など
+        # 「仕事をした」場合は skip ではなく ok にする（スキップ表示を避ける）
+        _pm = str(pred_msg or "")
+        _om = str(odds_msg or "")
+        _did_work = (
+            ("予測OK" in _pm)
+            or ("再予測" in _pm)
+            or ("版違い" in _pm)
+            or ("台数不一致" in _pm)
+            or ("台数不明" in _pm)
+            or (("オッズ" in _om) and ("スキップ" not in _om) and ("失敗" not in _om))
+            or ("回収率プラン" in _om)
+            or ("払戻補完" in _om and "失敗" not in _om)
+        )
+        if _did_work:
+            return {
+                "status": "ok",
+                "phase": "completed_result_exists",
+                "message": (
+                    "結果登録済み・更新"
+                    + hist_msg + pred_msg + odds_msg
+                ),
+                "key": key_guess,
+            }
         return {
             "status": "skip",
             "phase": "completed",
