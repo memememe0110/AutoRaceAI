@@ -33072,19 +33072,6 @@ def _v326_sync_db_from_github_and_rerun() -> tuple[bool, str]:
     return ok, msg
 
 
-# Ver326: 起動時（新規セッション時）に、手動ボタンと全く同じ安全同期処理を1回だけ実行。
-if not st.session_state.get("github_startup_sync_done", False):
-    st.session_state["github_startup_sync_done"] = True
-    try:
-        _pok, _pmsg = _v326_sync_db_from_github_and_rerun()
-        if not _pok:
-            st.session_state["github_pull_message"] = (False, str(_pmsg))
-    except Exception as _pexc:
-        st.session_state["github_pull_message"] = (
-            False, 
-            f"起動時GitHub DB同期失敗: {type(_pexc).__name__}: {_pexc}"
-        )
-
 
 def _v278_bg_get_latest_active(db_path: str) -> dict:
     try:
@@ -39623,3 +39610,22 @@ try:
         _v266_render_error_analysis(engine.DB_PATH)
 except Exception as _v266_exc:
     st.warning("Ver266誤差解析の表示に失敗しました: " + _runtime_exception_text(_v266_exc))
+
+# ---------------------------------------------------------
+# Ver326: 画面描画完了後に1回だけGitHub同期を実行（アプローチA）
+# ---------------------------------------------------------
+if not st.session_state.get("github_startup_sync_done", False):
+    st.session_state["github_startup_sync_done"] = True
+    with st.spinner("初回起動時のDB安全同期を実行中…（画面が固まる場合はそのままお待ちください）"):
+        try:
+            _pok, _pmsg = _v326_sync_db_from_github_and_rerun()
+            if not _pok:
+                st.session_state["github_pull_message"] = (False, str(_pmsg))
+                st.toast(f"⚠️ DB自動同期に失敗: {_pmsg}", icon="⚠️")
+        except Exception as _pexc:
+            st.session_state["github_pull_message"] = (
+                False,
+                f"起動時GitHub DB同期失敗: {type(_pexc).__name__}: {_pexc}"
+            )
+            st.toast(f"⚠️ 同期エラー: {_pexc}", icon="⚠️")
+
