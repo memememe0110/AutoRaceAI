@@ -33053,24 +33053,37 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
     return _ok_push284,_msg_push284
 
 
-# Ver326: デプロイ/新規セッション時に「GitHubからDBを再読込」ボタン相当を1回だけ自動実行。
-# pull_db_from_github() 自体の安全ガード（古い/破損DBの保護、diverged安全統合等）はそのまま利用する。
-# 成功時は手動ボタンと同じキャッシュ破棄・初期表示リセットまで行い、1回だけ再描画する。
-if "github_startup_sync_done" not in st.session_state:
+def _v326_sync_db_from_github_and_rerun() -> tuple[bool, str]:
+    """GitHubからDBを再読込し、成功時はキャッシュ破棄とリランを行う（手動ボタン・起動時共通）。"""
+    try:
+        ok, msg = pull_db_from_github()
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+    if ok:
+        _ = st.session_state.pop("_v296_sidebar_db_summary_cache", None)
+        _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
+        _ = st.session_state.pop("_v290_identity_cache", None)
+        st.session_state["_v284_force_identity_refresh"] = True
+        st.session_state["_v290_startup_ready"] = False
+        st.session_state["github_pull_message"] = (True, msg)
+        st.rerun()
+
+    return ok, msg
+
+
+# Ver326: 起動時（新規セッション時）に、手動ボタンと全く同じ安全同期処理を1回だけ実行。
+# 関数側でキャッシュ破棄・リランまで行うため、ロジックの二重化を防ぐ。
+if not st.session_state.get("github_startup_sync_done", False):
     st.session_state["github_startup_sync_done"] = True
     try:
-        _pok, _pmsg = pull_db_from_github()
-        st.session_state["github_pull_message"] = (_pok, str(_pmsg))
-        if _pok:
-            _ = st.session_state.pop("_v296_sidebar_db_summary_cache", None)
-            _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
-            _ = st.session_state.pop("_v290_identity_cache", None)
-            st.session_state["_v284_force_identity_refresh"] = True
-            st.session_state["_v290_startup_ready"] = False
-            st.rerun()
+        _pok, _pmsg = _v326_sync_db_from_github_and_rerun()
+        if not _pok:
+            st.session_state["github_pull_message"] = (False, str(_pmsg))
     except Exception as _pexc:
         st.session_state["github_pull_message"] = (
-            False, f"起動時GitHub DB同期失敗: {type(_pexc).__name__}: {_pexc}"
+            False,
+            f"起動時GitHub DB同期失敗: {type(_pexc).__name__}: {_pexc}"
         )
 
 
@@ -33706,15 +33719,9 @@ with st.sidebar:
         disabled=(not ready) or _bg_busy_sidebar,
         help="バックグラウンド再シミュレーション中はDB上書き防止のため無効です。" if _bg_busy_sidebar else None,
     ):
-        ok, msg = pull_db_from_github()
-        (st.success if ok else st.error)(msg)
-        if ok:
-            _ = st.session_state.pop("_v296_sidebar_db_summary_cache",None)
-            _ = st.session_state.pop("_v296_sidebar_manifest_cache",None)
-            _ = st.session_state.pop("_v290_identity_cache",None)
-            st.session_state["_v284_force_identity_refresh"] = True
-            st.session_state["_v290_startup_ready"] = False  # 再読込後は1回だけ初期表示
-            st.rerun()
+        ok, msg = _v326_sync_db_from_github_and_rerun()
+        if not ok:
+            st.error(msg)
 
     # Ver305: GitHub DBを現在DBへ反映せず、取得だけして端末保存する。
     # diverged解消用の比較・手動統合に使える。現在DBは一切変更しない。
