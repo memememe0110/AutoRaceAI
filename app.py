@@ -4483,7 +4483,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
         _v276_foreground_prediction_event.set()
         with _V276ForegroundPredictionPriority(db_path):
             _t0=time_module.perf_counter()
-            _champion311_applied=bool(engine.v311_set_champion_model_state())
+            _champion311_applied=bool(getattr(engine, "v311_set_champion_model_state", lambda: False)())
             df,bets,output,entries,meta=engine.ver16_run_prediction(
                 prediction_text,trials,seed,manual_excluded=excluded
             )
@@ -16594,7 +16594,7 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
     seed = int(seed if seed is not None else 20260719)
     try:
         if bool(globals().get("use_champion_model", True)):
-            engine.v311_set_champion_model_state()
+            getattr(engine, "v311_set_champion_model_state", lambda: False)()
         else:
             engine.v305_clear_model_state_override()
     except Exception:
@@ -34899,7 +34899,7 @@ elif selected_main_page == "🏁 予測":
             with _V276ForegroundPredictionPriority(engine.DB_PATH):
                 with st.spinner("高速6周イベントシミュレーションを実行中…"):
                     _t0 = time_module.perf_counter()
-                    _champion311_applied = bool(use_champion_model and engine.v311_set_champion_model_state())
+                    _champion311_applied = bool(use_champion_model and getattr(engine, "v311_set_champion_model_state", lambda: False)())
                     if not use_champion_model:
                         engine.v305_clear_model_state_override()
                     df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)

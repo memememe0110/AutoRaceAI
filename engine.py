@@ -7973,6 +7973,64 @@ def v36_get_adjustment_log(db_path=DB_PATH):
             FROM adjustment_log ORDER BY adjustment_id DESC""", con)
 
 
+
+# ============================================================
+# Ver326 compatibility: Ver305/311 model-state API
+# ============================================================
+# app.py still references the historical Ver305/311 model-state API.
+# The current engine does not contain the original Champion snapshot
+# implementation, so these shims must never alter the live learning state.
+# They keep prediction execution safe and report that Champion restoration
+# is unavailable rather than silently applying a guessed model state.
+_V305_MODEL_STATE_OVERRIDE = None
+
+
+def _v305_current_learning_state(db_path=DB_PATH):
+    """Read the current adaptive-weight state for diagnostics/reproducibility."""
+    try:
+        v40_init_learning_tables(db_path)
+        with sqlite3.connect(str(db_path)) as con:
+            rows = con.execute(
+                "SELECT feature_name,current_weight FROM adaptive_weights ORDER BY feature_name"
+            ).fetchall()
+        return {str(k): float(v) for k, v in rows}
+    except Exception:
+        return {}
+
+
+def v305_model_state_fingerprint(db_path=DB_PATH):
+    state = _v305_current_learning_state(db_path)
+    raw = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def v305_capture_model_state_snapshot(meta=None, db_path=DB_PATH):
+    state = _v305_current_learning_state(db_path)
+    return {
+        "schema": "ver305_compat_current_learning_state",
+        "state_hash": v305_model_state_fingerprint(db_path),
+        "weights": state,
+        "champion_restore_available": False,
+    }
+
+
+def v305_set_model_state_override(snapshot):
+    global _V305_MODEL_STATE_OVERRIDE
+    # Do not mutate adaptive_weights or invent a historical Champion state.
+    _V305_MODEL_STATE_OVERRIDE = None
+    return False
+
+
+def v305_clear_model_state_override():
+    global _V305_MODEL_STATE_OVERRIDE
+    _V305_MODEL_STATE_OVERRIDE = None
+    return True
+
+
+def v311_set_champion_model_state():
+    """Compatibility entry point. Returns False when the historical Champion snapshot is unavailable."""
+    return False
+
 # ============================================================
 # v3.9 透明な重み調整・調整前後比較
 # ============================================================
