@@ -33059,7 +33059,6 @@ def _v326_sync_db_from_github_and_rerun() -> tuple[bool, str]:
         ok, msg = pull_db_from_github()
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
-
     if ok:
         _ = st.session_state.pop("_v296_sidebar_db_summary_cache", None)
         _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
@@ -33068,12 +33067,10 @@ def _v326_sync_db_from_github_and_rerun() -> tuple[bool, str]:
         st.session_state["_v290_startup_ready"] = False
         st.session_state["github_pull_message"] = (True, msg)
         st.rerun()
-
     return ok, msg
 
 
 # Ver326: 起動時（新規セッション時）に、手動ボタンと全く同じ安全同期処理を1回だけ実行。
-# 関数側でキャッシュ破棄・リランまで行うため、ロジックの二重化を防ぐ。
 if not st.session_state.get("github_startup_sync_done", False):
     st.session_state["github_startup_sync_done"] = True
     try:
@@ -33082,7 +33079,7 @@ if not st.session_state.get("github_startup_sync_done", False):
             st.session_state["github_pull_message"] = (False, str(_pmsg))
     except Exception as _pexc:
         st.session_state["github_pull_message"] = (
-            False,
+            False, 
             f"起動時GitHub DB同期失敗: {type(_pexc).__name__}: {_pexc}"
         )
 
