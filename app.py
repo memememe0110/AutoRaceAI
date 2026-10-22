@@ -33053,24 +33053,24 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
     return _ok_push284,_msg_push284
 
 
-# Ver276 DB安全化: 起動時にGitHub DBで現在DBを自動上書きしない。
-# GitHub側が古い/破損DBでも、アップロード済みの正常DBを保持する。
-if "github_pull_done" not in st.session_state:
-    st.session_state["github_pull_done"] = True
+# Ver326: デプロイ/新規セッション時に「GitHubからDBを再読込」ボタン相当を1回だけ自動実行。
+# pull_db_from_github() 自体の安全ガード（古い/破損DBの保護、diverged安全統合等）はそのまま利用する。
+# 成功時は手動ボタンと同じキャッシュ破棄・初期表示リセットまで行い、1回だけ再描画する。
+if "github_startup_sync_done" not in st.session_state:
+    st.session_state["github_startup_sync_done"] = True
     try:
-        _boot_sz = Path(str(engine.DB_PATH)).stat().st_size if Path(str(engine.DB_PATH)).exists() else 0
-    except Exception:
-        _boot_sz = 0
-    if _boot_sz < 5 * 1024 * 1024:
-        try:
-            _pok, _pmsg = pull_db_from_github()
-            st.session_state["github_pull_message"] = (_pok, str(_pmsg))
-        except Exception as _pexc:
-            st.session_state["github_pull_message"] = (False, f"起動時読込失敗: {type(_pexc).__name__}: {_pexc}")
-    else:
+        _pok, _pmsg = pull_db_from_github()
+        st.session_state["github_pull_message"] = (_pok, str(_pmsg))
+        if _pok:
+            _ = st.session_state.pop("_v296_sidebar_db_summary_cache", None)
+            _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
+            _ = st.session_state.pop("_v290_identity_cache", None)
+            st.session_state["_v284_force_identity_refresh"] = True
+            st.session_state["_v290_startup_ready"] = False
+            st.rerun()
+    except Exception as _pexc:
         st.session_state["github_pull_message"] = (
-            True,
-            "起動時の強制上書きは停止中です。『GitHubからDBを再読込』でdivergedも安全統合します。",
+            False, f"起動時GitHub DB同期失敗: {type(_pexc).__name__}: {_pexc}"
         )
 
 
