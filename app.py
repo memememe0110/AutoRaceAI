@@ -33059,6 +33059,7 @@ def _v326_sync_db_from_github_and_rerun() -> tuple[bool, str]:
         ok, msg = pull_db_from_github()
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
+
     if ok:
         _ = st.session_state.pop("_v296_sidebar_db_summary_cache", None)
         _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
@@ -33067,6 +33068,7 @@ def _v326_sync_db_from_github_and_rerun() -> tuple[bool, str]:
         st.session_state["_v290_startup_ready"] = False
         st.session_state["github_pull_message"] = (True, msg)
         st.rerun()
+    
     return ok, msg
 
 
