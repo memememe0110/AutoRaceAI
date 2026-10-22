@@ -33320,12 +33320,18 @@ if not st.session_state.get("v284_boot_github_restore_checked",False):
 _v290_load_stage("DB固定監視を確認しています…")
 _v284_identity_key="v284_db_identity_baseline"
 _v284_identity_block_key="v284_db_identity_block"
+
+# Ver326: バックグラウンドの再シミュレーションが動いている間は、
+# 巨大なDBスナップショット作成によるメモリ不足（OOM）を防ぐため、
+# 固定監視（フルスキャン）をスキップして前回のキャッシュを使う。
 if _v296_bg_fast_rerun:
     _v284_identity_now=dict(st.session_state.get(_v284_identity_key) or {})
     if not _v284_identity_now.get("ok"):
-        _v284_identity_now=_v284_current_db_identity()
+        # キャッシュがない場合も、このタイミングでの重い生成は避ける。
+        _v284_identity_now={"ok":False,"reason":"BG実行中のため監視スキップ"}
 else:
     _v284_identity_now=_v284_current_db_identity()
+
 if _v284_identity_now.get("ok"):
     _v284_identity_base=st.session_state.get(_v284_identity_key)
     if not isinstance(_v284_identity_base,dict) or not _v284_identity_base.get("ok"):
