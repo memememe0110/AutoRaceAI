@@ -29946,20 +29946,6 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             "既定は「Ver326未保存のみ」→ 途中停止しても続きから再開できます。"
             "公式取込とは別セッションで同時実行できます（同じ再シミュ同士は1本のみ）。"
         )
-        st.markdown("##### 🧪 Ver327 レイト・リリース閾値緩和実験（本線Ver326は不変）")
-        st.caption(
-            "周5のlate_releaseスコア不足（88.5%）に対する分離実験。"
-            "base_thresholdを3→2 / 4→3に緩和し、score=0は従来どおり不発。"
-            "本線Ver326のC-A gap=0.60・◎ゲート・買い目・重みは変更しません。"
-        )
-        _v327_exp_ui = st.checkbox(
-            "Ver327 閾値緩和を有効化（セッション）",
-            value=bool(st.session_state.get("v327_late_release_experiment")),
-            key="v327_late_release_experiment",
-            help="このセッションの通常予測をVer327として保存し、late_release閾値緩和を適用します。BG再シムは下の専用ボタンから起動します。",
-        )
-        if _v327_exp_ui:
-            st.warning("Ver327実験中: late_release閾値緩和を適用。予測保存版はVer327です。本線Ver326は変更されません。")
         st.checkbox(
             "通常予測も Ver326 C-A で実行・保存する（セッション）",
             value=bool(st.session_state.get("v326_ca_experiment_mode")),
@@ -29968,7 +29954,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         )
         if st.session_state.get("v326_ca_experiment_mode"):
             st.warning("実験モード中: 予測は Ver326 として保存されます。本線比較用の通常予測はOFFにしてから行ってください。")
-        # Ver326 未処理件数
+
         try:
             _v326_pop = _v304_roi_population_status(str(db_path), str(globals().get("_V326_APP_VERSION") or "Ver326"))
             if not _v326_pop.get("error"):
@@ -29979,6 +29965,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 )
         except Exception:
             _v326_pop = {}
+
         _ca_lim = st.number_input(
             "C-A再シミュ最大レース数（1回の上限）",
             min_value=1, max_value=500, value=40, step=10,
@@ -29998,7 +29985,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             key="v326_ca_force_current",
             help="OFF=未処理のみ（続きから）。ON=保存済みも含めて最初から。",
         )
-        # 稼働中ジョブの停止・再開（C-A含む）— 再シミュ種別のみ（取込と混同しない）
+
         _ca_job = _v278_bg_get_active_of(str(db_path), ("batch_rerun",))
         _ca_st = str((_ca_job or {}).get("status") or "")
         _ca_jid = int((_ca_job or {}).get("job_id") or 0)
@@ -30038,6 +30025,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                     st.rerun()
                 else:
                     st.error("再開失敗: " + str(_res.get("reason") or "不明"))
+
         if st.button(
             "Ver326 C-A でバックグラウンド再シミュ開始",
             type="primary",
@@ -30063,17 +30051,112 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 st.rerun()
             else:
                 st.error(str(_started.get("reason") or _started))
+
+        _ca_last = st.session_state.get("v326_ca_resim_last")
+        if isinstance(_ca_last, dict):
+            st.caption(
+                f"前回開始: ok={_ca_last.get('ok')} job={_ca_last.get('job_id')} "
+                f"ver={_ca_last.get('app_version')} force={_ca_last.get('force_current')} "
+                f"approx={_ca_last.get('approx_total')} reason={_ca_last.get('reason','')}"
+            )
+        st.caption(
+            f"現行フラグ: CA_active={_v326_ca_active()} / gap_cap={_v326_catch_gap_cap():.2f} / "
+            f"save_ver={_v326_effective_save_version()}"
+        )
+
+    # ===== Ver327はVer326とは独立したExpander =====
+    with st.expander("🧪 Ver327 レイト・リリース閾値緩和実験（本線Ver326は不変）", expanded=False):
+        st.caption(
+            "周5のlate_releaseスコア不足（88.5%）に対する分離実験。"
+            "base_thresholdを3→2 / 4→3に緩和し、score=0は従来どおり不発。"
+            "本線Ver326のC-A gap=0.60・◎ゲート・買い目・重みは変更しません。"
+        )
+        _v327_exp_ui = st.checkbox(
+            "Ver327 閾値緩和を有効化（セッション）",
+            value=bool(st.session_state.get("v327_late_release_experiment")),
+            key="v327_late_release_experiment",
+            help="このセッションの通常予測をVer327として保存し、late_release閾値緩和を適用します。BG再シムは下の専用ボタンから起動します。",
+        )
+        if _v327_exp_ui:
+            st.warning("Ver327実験中: late_release閾値緩和を適用。予測保存版はVer327です。本線Ver326は変更されません。")
+
+        try:
+            _v327_pop = _v304_roi_population_status(
+                str(db_path), str(globals().get("_V327_APP_VERSION") or "Ver327")
+            )
+            if not _v327_pop.get("error"):
+                st.info(
+                    f"Ver327採点済み {_v327_pop.get('current_evaluated', 0)}R ｜ "
+                    f"残り（未処理） {_v327_pop.get('remaining', 0)}R ｜ "
+                    f"完全再シム可能 {_v327_pop.get('replayable_remaining', 0)}R"
+                )
+        except Exception:
+            _v327_pop = {}
+
+        _v327_lim = st.number_input(
+            "Ver327 再シミュ最大レース数（1回の上限）",
+            min_value=1, max_value=500, value=40, step=10,
+            key="v327_resim_limit",
+            help="例: 200 を指定しても内部は20Rごとに区切って保存・メモリ解放します。"
+        )
+        _v327_force = st.checkbox(
+            "Ver327保存済みレースも再計算（最初からやり直し）",
+            value=False,
+            key="v327_force_current",
+            help="OFF=未処理のみ（続きから）。ON=保存済みも含めて最初から。",
+        )
+
+        _v327_job = _v278_bg_get_active_of(str(db_path), ("batch_rerun",))
+        _v327_st = str((_v327_job or {}).get("status") or "")
+        _v327_jid = int((_v327_job or {}).get("job_id") or 0)
+        _v327_done = int((_v327_job or {}).get("done_count") or 0)
+        _v327_total = int((_v327_job or {}).get("total_count") or 0)
+        _v327_job_ver = str((_v327_job or {}).get("app_version") or "")
+        _v327_active_ui = _v327_st in ("queued", "running", "pause_requested", "paused", "cancel_requested")
+        if _v327_active_ui and _v327_jid:
+            st.caption(
+                f"稼働中ジョブ: id={_v327_jid} ver={_v327_job_ver} status={_v327_st} "
+                f"{_v327_done}/{_v327_total or '?'}｜{str((_v327_job or {}).get('current_label') or '')}"
+            )
+            if _v327_total > 0:
+                st.progress(
+                    min(1.0, max(0.0, float(_v327_done) / float(_v327_total))),
+                    text=f"{_v327_done}/{_v327_total}",
+                )
+            _v327_c1, _v327_c2, _v327_c3 = st.columns(3)
+            if _v327_c1.button("🔄 進捗更新", key="v327_refresh", use_container_width=True):
+                st.rerun()
+            if _v327_c2.button("⏹ 現在レース後に停止", key="v327_stop", use_container_width=True):
+                _v278_bg_request_cancel(str(db_path), _v327_jid)
+                st.warning("停止要求を送信しました。現在レース終了後に止まります。")
+                st.rerun()
+            if _v327_c3.button(
+                f"▶ {_v327_done}/{_v327_total or '?'}から再開",
+                key="v327_resume",
+                use_container_width=True,
+                disabled=_v327_st in ("queued", "running", "pause_requested"),
+            ):
+                _v327_res = _v290_manual_resume_batch(str(db_path), _v327_job or {})
+                if _v327_res.get("ok"):
+                    st.success(
+                        f"再開 job={_v327_res.get('job_id')} ver={_v327_res.get('app_version')} "
+                        f"C-A={_v327_res.get('enable_ca')} / Ver327=True（未処理のみ）"
+                    )
+                    st.rerun()
+                else:
+                    st.error("再開失敗: " + str(_v327_res.get("reason") or "不明"))
+
         if st.button(
             "Ver327 late_release緩和で再シム開始",
             type="primary",
             use_container_width=True,
             key="v327_resim_go",
-            disabled=_ca_active_ui,
+            disabled=(_ca_active_ui or _v327_active_ui),
         ):
             _started327 = _v278_bg_start(
                 str(db_path),
-                limit_count=int(_ca_lim or 40),
-                force_current=bool(_ca_force),
+                limit_count=int(_v327_lim or 40),
+                force_current=bool(_v327_force),
                 diagnostic_auto=False,
                 enable_ca=True,
                 enable_v327=True,
@@ -30088,6 +30171,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 st.rerun()
             else:
                 st.error(str(_started327.get("reason") or _started327))
+
         _v327_last = st.session_state.get("v327_resim_last")
         if isinstance(_v327_last, dict):
             st.caption(
@@ -30096,17 +30180,6 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 f"approx={_v327_last.get('approx_total')} reason={_v327_last.get('reason','')}"
             )
         st.caption("撤回条件: Ver326対比のVer327 周6量比 > 1.15 → Ver327実験停止。")
-        _ca_last = st.session_state.get("v326_ca_resim_last")
-        if isinstance(_ca_last, dict):
-            st.caption(
-                f"前回開始: ok={_ca_last.get('ok')} job={_ca_last.get('job_id')} "
-                f"ver={_ca_last.get('app_version')} force={_ca_last.get('force_current')} "
-                f"approx={_ca_last.get('approx_total')} reason={_ca_last.get('reason','')}"
-            )
-        st.caption(
-            f"現行フラグ: CA_active={_v326_ca_active()} / gap_cap={_v326_catch_gap_cap():.2f} / "
-            f"save_ver={_v326_effective_save_version()}"
-        )
     try:
         _stamp305fix=(str(db_path),Path(str(db_path)).stat().st_mtime_ns,"Ver305-rec-only-fix1")
         if st.session_state.get("_v305_rec_only_fix_stamp") != _stamp305fix:
@@ -37561,53 +37634,90 @@ if selected_main_page == "🗃️ 登録情報確認":
     elif isinstance(_ps, dict) and _ps.get("reason") and _ps.get("reason") != "OK":
         st.warning(str(_ps.get("reason")))
 
-    # --- Ver326: 同一レース版ペア比較（隣接スワップ量比・F1） ---
-    st.markdown("##### 🔁 C-A検証：同一レースでの版ペア比較（324 vs 326）")
+    # --- 同一レース版ペア比較（バージョン選択可能・読み取り専用） ---
+    st.markdown("##### 🔁 C-A検証：同一レースでの版ペア比較")
     st.caption(
         "同一 race_key に限定して、隣接スワップ量比とF1を版間比較します。"
-        "周4-5の量比が1.0方向へ寄り、F1が悪化していなければ C-A は機能しています。"
-        "1.0を超えてオーバーシュートした場合は C-A が効きすぎのサインです。"
+        "周4-5の量比が1.0方向へ寄り、F1が悪化していなければ C-A や late_release が機能しています。"
+        "1.0を超えてオーバーシュートした場合は効きすぎのサインです。"
         "読み取り専用。予測・◎・買い目は変更しません。"
     )
-    _pc_lim = st.number_input(
-        "最大取得R数（各版）",
-        min_value=50,
-        max_value=2000,
-        value=400,
-        step=50,
-        key="v326_paired_swap_limit",
-    )
-    if st.button("同一レース版ペア比較を実行", key="v326_paired_swap_btn", use_container_width=True):
-        with st.spinner("324/326両版の closest_route と result_laps を突合中…"):
-            st.session_state["v326_paired_swap"] = _v326_paired_lap_swap_comparison(
-                engine.DB_PATH,
-                app_a="Ver324",
-                app_b="Ver326",
-                limit_races=int(_pc_lim),
-            )
+
+    try:
+        _avail_vers = _v319_list_prediction_app_versions(engine.DB_PATH)
+        if not _avail_vers:
+            _avail_vers = ["Ver324", "Ver326", "Ver327"]
+    except Exception:
+        _avail_vers = ["Ver324", "Ver326", "Ver327"]
+
+    _idx_a = _avail_vers.index("Ver326") if "Ver326" in _avail_vers else 0
+    _idx_b = _avail_vers.index("Ver327") if "Ver327" in _avail_vers else (len(_avail_vers) - 1)
+
+    _pc_c1, _pc_c2, _pc_c3 = st.columns(3)
+    with _pc_c1:
+        _app_a = st.selectbox(
+            "比較元 (A)",
+            options=_avail_vers,
+            index=_idx_a,
+            key="v326_paired_ver_a",
+        )
+    with _pc_c2:
+        _app_b = st.selectbox(
+            "比較先 (B)",
+            options=_avail_vers,
+            index=_idx_b,
+            key="v326_paired_ver_b",
+        )
+    with _pc_c3:
+        _pc_lim = st.number_input(
+            "最大取得R数（各版）",
+            min_value=50,
+            max_value=2000,
+            value=400,
+            step=50,
+            key="v326_paired_swap_limit",
+        )
+
+    if st.button(f"ペア比較（{_app_a} vs {_app_b}）を実行", key="v326_paired_swap_btn", use_container_width=True):
+        if _app_a == _app_b:
+            st.warning("異なるバージョンを選択してください。")
+        else:
+            with st.spinner(f"{_app_a} / {_app_b} の closest_route と result_laps を突合中…"):
+                st.session_state["v326_paired_swap"] = _v326_paired_lap_swap_comparison(
+                    engine.DB_PATH,
+                    app_a=_app_a,
+                    app_b=_app_b,
+                    limit_races=int(_pc_lim),
+                )
+                st.session_state["v326_paired_last_a"] = _app_a
+                st.session_state["v326_paired_last_b"] = _app_b
+
     _pc = st.session_state.get("v326_paired_swap")
     if isinstance(_pc, dict) and _pc.get("ok"):
         _psm = _pc.get("summary") or {}
+        _last_a = _pc.get("app_a", st.session_state.get("v326_paired_last_a", "A"))
+        _last_b = _pc.get("app_b", st.session_state.get("v326_paired_last_b", "B"))
+
         st.write(
             f"共通race_key {_pc.get('common_races', 0)}R"
             f"（A routes {_pc.get('routes_a', 0)} / B routes {_pc.get('routes_b', 0)}）"
         )
-        # 簡易判定
+
         try:
             d4 = _psm.get("周4量比差")
             d5 = _psm.get("周5量比差")
             f4 = _psm.get("周4F1差")
             f5 = _psm.get("周5F1差")
-            r4b = _psm.get("量比_Ver326_周4")
-            r5b = _psm.get("量比_Ver326_周5")
+            r4b = _psm.get(f"量比_{_last_b}_周4")
+            r5b = _psm.get(f"量比_{_last_b}_周5")
             _msgs = []
             if d4 is not None and d5 is not None:
                 if float(d4) > 0.05 and float(d5) > 0.05 and (f4 is None or float(f4) >= -1) and (f5 is None or float(f5) >= -1):
-                    _msgs.append("✅ 周4・5の量比が上昇方向（F1悪化なし）→ C-Aは意図どおりの可能性")
+                    _msgs.append("✅ 周4・5の量比が上昇方向（F1悪化なし）→ 意図どおりの可能性")
                 elif (r4b is not None and float(r4b) > 1.15) or (r5b is not None and float(r5b) > 1.15):
                     _msgs.append("⚠️ 量比が1.15超 → 効きすぎの可能性")
                 elif abs(float(d4)) <= 0.05 and abs(float(d5)) <= 0.05:
-                    _msgs.append("⚠️ 量比差ほぼゼロ → C-Aが実質効いていない可能性")
+                    _msgs.append("⚠️ 量比差ほぼゼロ → 実質効いていない可能性")
                 if (f4 is not None and float(f4) < -2) or (f5 is not None and float(f5) < -2):
                     _msgs.append("⛔ 周4/5のF1が悪化 → ロールバック検討")
             if int(_pc.get("common_races") or 0) < 100:
@@ -37616,6 +37726,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                 st.info(_m)
         except Exception:
             pass
+
         dfp = _pc.get("by_lap")
         if isinstance(dfp, pd.DataFrame) and not dfp.empty:
             st.dataframe(
@@ -37623,18 +37734,18 @@ if selected_main_page == "🗃️ 登録情報確認":
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "量比_Ver324": st.column_config.NumberColumn(format="%.3f"),
-                    "量比_Ver326": st.column_config.NumberColumn(format="%.3f"),
+                    f"量比_{_last_a}": st.column_config.NumberColumn(format="%.3f"),
+                    f"量比_{_last_b}": st.column_config.NumberColumn(format="%.3f"),
                     "量比差(B-A)": st.column_config.NumberColumn(format="%+.3f"),
-                    "F1%_Ver324": st.column_config.NumberColumn(format="%.1f"),
-                    "F1%_Ver326": st.column_config.NumberColumn(format="%.1f"),
+                    f"F1%_{_last_a}": st.column_config.NumberColumn(format="%.1f"),
+                    f"F1%_{_last_b}": st.column_config.NumberColumn(format="%.1f"),
                     "F1差(B-A)": st.column_config.NumberColumn(format="%+.1f"),
                 },
             )
             st.download_button(
-                "版ペア比較CSV",
+                f"版ペア比較CSV（{_last_a} vs {_last_b}）",
                 dfp.to_csv(index=False).encode("utf-8-sig"),
-                file_name="v326_paired_lap_swap.csv",
+                file_name=f"paired_lap_swap_{_last_a}_{_last_b}.csv",
                 mime="text/csv",
                 use_container_width=True,
                 key="v326_paired_csv",
