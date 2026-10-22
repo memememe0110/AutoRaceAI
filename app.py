@@ -33,6 +33,12 @@ import streamlit.components.v1 as components
 import engine
 import math
 
+
+# Ver326: Streamlitの再実行・セッション切断に影響されないプロセス単位の起動同期状態。
+@st.cache_resource
+def _v326_get_boot_sync_state():
+    return {"done": False, "lock": threading.Lock()}
+
 # Ver320: 「/停止」を発走後事故(競走中止等)にしない。
 # engine._v121_extract_started_and_incident_cars は着順「-」の車を、
 # 欠車語が無いとデフォルトで 発走後事故車=競走中止等 にしていた。
@@ -39612,10 +39618,15 @@ except Exception as _v266_exc:
     st.warning("Ver266誤差解析の表示に失敗しました: " + _runtime_exception_text(_v266_exc))
 
 # ---------------------------------------------------------
-# Ver326: 画面描画完了後に1回だけGitHub同期を実行（アプローチA）
+# Ver326: 画面描画完了後、プロセス起動後に1回だけGitHub同期を実行
 # ---------------------------------------------------------
-if not st.session_state.get("github_startup_sync_done", False):
-    st.session_state["github_startup_sync_done"] = True
+_v326_boot_sync_state = _v326_get_boot_sync_state()
+with _v326_boot_sync_state["lock"]:
+    _v326_should_boot_sync = not _v326_boot_sync_state["done"]
+    if _v326_should_boot_sync:
+        _v326_boot_sync_state["done"] = True
+
+if _v326_should_boot_sync:
     with st.spinner("初回起動時のDB安全同期を実行中…（画面が固まる場合はそのままお待ちください）"):
         try:
             _pok, _pmsg = _v326_sync_db_from_github_and_rerun()
