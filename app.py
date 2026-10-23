@@ -2351,6 +2351,8 @@ def _v278_bg_ensure_table(db_path: str) -> None:
                 cols={str(r[1]) for r in con.execute("PRAGMA table_info(v278_background_jobs)").fetchall()}
                 if "pause_requested" not in cols:
                     con.execute("ALTER TABLE v278_background_jobs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0")
+                if "odds_only" not in cols:
+                    con.execute("ALTER TABLE v278_background_jobs ADD COLUMN odds_only INTEGER NOT NULL DEFAULT 0")
             except Exception:
                 pass
             con.commit()
@@ -3460,7 +3462,7 @@ def _v284_backfill_transition_audit_from_latest_histories(db_path: str, app_vers
         return result
 
 
-def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool, resume_done_offset: int = 0, resume_total_target: int = 0, diagnostic_auto: bool = False) -> None:
+def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool, resume_done_offset: int = 0, resume_total_target: int = 0, diagnostic_auto: bool = False, odds_only: bool = False) -> None:
     # Ver326 C-A / Ver327: 起動直前に立てた pending を消費。ジョブ中だけ実験フラグを有効化。
     _ca_job = bool(globals().pop("_V326_CA_PENDING_FOR_WORKER", False))
     _v327_job = bool(globals().pop("_V327_PENDING_FOR_WORKER", False))
@@ -3612,6 +3614,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 _progress_chunk,
                 force_current=bool(force_current),
                 diagnostic_auto=bool(diagnostic_auto),
+                odds_only=bool(odds_only),
                 cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
                 pause_cb=lambda: _v278_bg_pause_loop(db_path, job_id),
                 exclude_race_keys=_processed_keys or None,
@@ -3713,6 +3716,16 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             except Exception:
                 pass
             try:
+                _runtime_clear_prediction_caches()
+            except Exception:
+                pass
+            try:
+                with sqlite3.connect(str(db_path), timeout=10.0) as _c_gc:
+                    _c_gc.execute("PRAGMA busy_timeout=10000")
+                    _c_gc.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            try:
                 import gc as _gc_chunk
                 _gc_chunk.collect()
             except Exception:
@@ -3731,6 +3744,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 result["roi_return_rate"] = None
         except Exception:
             result["roi_return_rate"] = None
+        result["odds_only"] = bool(odds_only)
         result["message"] = (
             f"確認{result.get('checked',0)} / 再シム{result.get('rerun',0)}"
             f" / チャンク{result.get('chunk_count',0)}×{_chunk_n}R区切り"
@@ -3872,7 +3886,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             except Exception:
                 pass
 
-def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnostic_auto: bool = False, enable_ca: bool = False, enable_v327: bool = False) -> dict:
+def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnostic_auto: bool = False, enable_ca: bool = False, enable_v327: bool = False, odds_only: bool = False) -> dict:
     _v278_bg_ensure_table(db_path)
     if _v278_bg_has_running_job(db_path):
         return {"ok":False,"reason":"すでにバックグラウンド再シミュレーションが動いています（取込とは同時可・再シムは1本のみ）。"}
@@ -3923,18 +3937,20 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
                 if enable_ca else str(_V231_APP_VERSION)
             )
         )
+        _job_message = (
+            "Ver327 late_release実験 準備中（オッズあり・未処理のみ）" if enable_v327 and odds_only and not force_current else
+            "Ver327 late_release実験 準備中（オッズあり・保存済みも再計算）" if enable_v327 and odds_only else
+            "Ver327 late_release実験 準備中（未処理のみ）" if enable_v327 and not force_current else
+            "Ver327 late_release実験 準備中（保存済みも再計算）" if enable_v327 else
+            "Ver326 C-A実験 準備中（未処理のみ）" if enable_ca and not force_current else
+            "Ver326 C-A実験 準備中（保存済みも再計算）" if enable_ca else "準備中"
+        )
         cur=con.execute("""
             INSERT INTO v278_background_jobs(
-                job_type,app_version,status,created_at,updated_at,limit_count,force_current,message
-            ) VALUES ('batch_rerun',?,?,?,?,?,?,?)
+                job_type,app_version,status,created_at,updated_at,limit_count,force_current,odds_only,message
+            ) VALUES ('batch_rerun',?,?,?,?,?,?,?,?)
         """,(
-            _job_ver,"queued",now,now,
-            int(limit_count),1 if force_current else 0,
-            ("Ver327 late_release実験 準備中（未処理のみ）" if enable_v327 and not force_current
-             else ("Ver327 late_release実験 準備中（保存済みも再計算）" if enable_v327
-                   else ("Ver326 C-A実験 準備中（未処理のみ）" if enable_ca and not force_current
-                         else ("Ver326 C-A実験 準備中（保存済みも再計算）" if enable_ca
-                               else "準備中")))),
+            _job_ver,"queued",now,now,int(limit_count),1 if force_current else 0,1 if odds_only else 0,_job_message,
         ))
         try:
             con.execute(
@@ -3949,7 +3965,7 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
     globals()["_V327_PENDING_FOR_WORKER"] = bool(enable_v327)
     th=threading.Thread(
         target=_v278_bg_worker,
-        args=(str(db_path),job_id,int(limit_count),bool(force_current),0,0,bool(diagnostic_auto)),
+        args=(str(db_path),job_id,int(limit_count),bool(force_current),0,0,bool(diagnostic_auto),bool(odds_only)),
         daemon=True,
         name=f"autorace-bg-rerun-{job_id}",
     )
@@ -3962,6 +3978,7 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
         "enable_ca": bool(enable_ca or enable_v327),
         "enable_v327": bool(enable_v327),
         "force_current": bool(force_current),
+        "odds_only": bool(odds_only),
         "skip_version": str(_skip_ver),
         "approx_total": int(_approx_total278),
         "app_version": (
@@ -4067,8 +4084,8 @@ def _v290_spawn_recovery_worker(db_path: str, old_job: dict, reason: str) -> dic
             cur=con.execute("""
                 INSERT INTO v278_background_jobs(
                     job_type,app_version,status,created_at,updated_at,started_at,
-                    limit_count,force_current,done_count,total_count,current_label,message
-                ) VALUES ('batch_rerun',?,'running',?,?,?,?,0,?,?,?,?)
+                    limit_count,force_current,odds_only,done_count,total_count,current_label,message
+                ) VALUES ('batch_rerun',?,'running',?,?,?,?,?,0,?,?,?,?)
             """,(
                 str(_V231_APP_VERSION),now,now,now,limit0,
                 done0,total0,str(old_job.get("current_label") or ""),
@@ -4166,6 +4183,7 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
                 str(globals().get("_V326_APP_VERSION") or "Ver326") if _ca_resume else str(_V231_APP_VERSION)
             )
         )
+        _odds_only_resume = bool(job.get("odds_only") or False)
 
         with sqlite3.connect(str(db_path),timeout=1.0) as con:
             con.execute("PRAGMA busy_timeout=1000")
@@ -4186,10 +4204,10 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
             cur=con.execute("""
                 INSERT INTO v278_background_jobs(
                     job_type,app_version,status,created_at,updated_at,started_at,
-                    limit_count,force_current,done_count,total_count,current_label,message
-                ) VALUES ('batch_rerun',?,'running',?,?,?,?,0,?,?,?,?)
+                    limit_count,force_current,odds_only,done_count,total_count,current_label,message
+                ) VALUES ('batch_rerun',?,'running',?,?,?,?,?,0,?,?,?,?)
             """,(
-                _resume_ver,now,now,now,limit0,
+                _resume_ver,now,now,now,limit0,1 if _odds_only_resume else 0,
                 done0,total0,str(job.get("current_label") or ""),
                 (
                     f"Ver327 late_release {done0}/{total0}から手動再開（未処理のみ）"
@@ -4208,7 +4226,7 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
         globals()["_V327_PENDING_FOR_WORKER"] = bool(_v327_resume)
         th=threading.Thread(
             target=_v278_bg_worker,
-            args=(str(db_path),new_jid,limit0,False,done0,total0),
+            args=(str(db_path),new_jid,limit0,False,done0,total0,False,_odds_only_resume),
             daemon=True,
             name=f"autorace-bg-rerun-manual-resume-{new_jid}",
         )
@@ -4222,6 +4240,7 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
             "total": total0,
             "enable_ca": bool(_ca_resume),
             "app_version": _resume_ver,
+            "odds_only": bool(_odds_only_resume),
         }
     except Exception as exc:
         return {"ok":False,"reason":f"{type(exc).__name__}: {exc}"}
@@ -4756,7 +4775,7 @@ def _v310_auto_diagnostic_race_keys(db_path: str, current_ver: str, limit: int) 
         return []
 
 
-def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None, pause_cb=None, diagnostic_auto: bool = False, exclude_race_keys=None) -> dict:
+def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None, pause_cb=None, diagnostic_auto: bool = False, exclude_race_keys=None, odds_only: bool = False) -> dict:
     out={
         "checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[],
         "roi_evaluated":0,"roi_no_odds":0,"roi_no_payout":0,
@@ -4814,6 +4833,22 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         if not rk or rk in seen:
             continue
         seen.add(rk); unique.append(h)
+    # Ver327: 保存オッズありのレースだけを比較対象にする。
+    if bool(odds_only):
+        try:
+            with sqlite3.connect(str(db_path), timeout=10.0) as _co327:
+                _odds_keys327={str(r[0]).strip() for r in _co327.execute(
+                    """SELECT race_key FROM v221_odds_runs
+                       WHERE COALESCE(count_3tan,0)+COALESCE(count_3fuku,0)+
+                             COALESCE(count_2tansho,0)+COALESCE(count_2fuku,0)>0"""
+                ).fetchall() if r and r[0]}
+            _before_odds327=len(unique)
+            unique=[h for h in unique if str(h.get('race_key') or '').strip() in _odds_keys327]
+            out['skipped_no_odds']=int(out.get('skipped_no_odds',0) or 0)+int(_before_odds327-len(unique))
+        except Exception:
+            unique=[]
+            out['odds_filter_error']='v221_odds_runs を参照できませんでした。'
+
     if diagnostic_auto:
         _diag_keys310=set(_v310_auto_diagnostic_race_keys(db_path,current_ver,max(1,int(limit))))
         unique=[h for h in unique if str(h.get('race_key') or '').strip() in _diag_keys310]
@@ -30111,6 +30146,14 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             key="v327_force_current",
             help="OFF=未処理のみ（続きから）。ON=保存済みも含めて最初から。",
         )
+        _v327_odds_only = st.checkbox(
+            "オッズありのレースだけをVer327再シミュ対象にする",
+            value=True,
+            key="v327_odds_only",
+            help="保存済みv221オッズが1件以上あるレースだけを対象にします。",
+        )
+        if _v327_odds_only:
+            st.caption("対象条件: 保存済みオッズあり。オッズなしレースはVer327再シミュ対象外です。")
 
         _v327_job = _v278_bg_get_active_of(str(db_path), ("batch_rerun",))
         _v327_st = str((_v327_job or {}).get("status") or "")
@@ -30166,12 +30209,13 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 diagnostic_auto=False,
                 enable_ca=True,
                 enable_v327=True,
+                odds_only=bool(_v327_odds_only),
             )
             st.session_state["v327_resim_last"] = _started327
             if _started327.get("ok"):
                 st.success(
                     f"開始 job_id={_started327.get('job_id')} / 保存版={_started327.get('app_version')} "
-                    f"/ 対象約{_started327.get('approx_total', '?')}R / force={_started327.get('force_current')} "
+                    f"/ 対象約{_started327.get('approx_total', '?')}R / force={_started327.get('force_current')} / オッズのみ={_started327.get('odds_only')} "
                     "（C-A gap=0.60 + late_release閾値緩和）"
                 )
                 st.rerun()
@@ -30183,7 +30227,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             st.caption(
                 f"Ver327前回開始: ok={_v327_last.get('ok')} job={_v327_last.get('job_id')} "
                 f"ver={_v327_last.get('app_version')} force={_v327_last.get('force_current')} "
-                f"approx={_v327_last.get('approx_total')} reason={_v327_last.get('reason','')}"
+                f"odds_only={_v327_last.get('odds_only')} approx={_v327_last.get('approx_total')} reason={_v327_last.get('reason','')}"
             )
         st.caption("撤回条件: Ver326対比のVer327 周6量比 > 1.15 → Ver327実験停止。")
     try:
