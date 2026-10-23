@@ -4216,7 +4216,7 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
                 INSERT INTO v278_background_jobs(
                     job_type,app_version,status,created_at,updated_at,started_at,
                     limit_count,force_current,odds_only,done_count,total_count,current_label,message
-                ) VALUES ('batch_rerun',?,'running',?,?,?,?,?,0,?,?,?,?)
+                ) VALUES ('batch_rerun',?,'running',?,?,?,?,?,?,?,?,?,?)
             """,(
                 _resume_ver,now,now,now,limit0,1 if _odds_only_resume else 0,
                 done0,total0,str(job.get("current_label") or ""),
