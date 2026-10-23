@@ -3902,18 +3902,27 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
     try:
         _v231_ensure_prediction_history_table(db_path)
         with sqlite3.connect(str(db_path),timeout=30.0) as _con278:
+            _odds_exists278 = (
+                " AND EXISTS ("
+                "SELECT 1 FROM v221_odds_runs o "
+                "WHERE o.race_key = race_key "
+                "AND COALESCE(o.count_3tan,0)+COALESCE(o.count_3fuku,0)+"
+                "COALESCE(o.count_2tansho,0)+COALESCE(o.count_2fuku,0)>0)"
+                if bool(odds_only) else ""
+            )
             if bool(force_current):
-                _approx_total278=int(_con278.execute("""
+                _approx_total278=int(_con278.execute(f"""
                     SELECT COUNT(*) FROM (
                         SELECT race_key FROM v231_prediction_history
                         WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+                        {_odds_exists278}
                         GROUP BY race_key
                         ORDER BY MAX(history_id) DESC LIMIT ?
                     )
                 """,(max(1,int(limit_count)),)).fetchone()[0] or 0)
             else:
-                # 当該版がまだ無いレースだけ数える → 途中再開でも最初からにならない
-                _approx_total278=int(_con278.execute("""
+                # 当該版がまだ無いレースだけ数える。odds_only時は保存済みオッズありに限定。
+                _approx_total278=int(_con278.execute(f"""
                     SELECT COUNT(*) FROM (
                         SELECT h.race_key
                         FROM v231_prediction_history h
@@ -3922,6 +3931,7 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
                               SELECT 1 FROM v231_prediction_history c
                               WHERE c.race_key=h.race_key AND c.app_version=?
                           )
+                          {(" AND EXISTS (SELECT 1 FROM v221_odds_runs o WHERE o.race_key=h.race_key AND COALESCE(o.count_3tan,0)+COALESCE(o.count_3fuku,0)+COALESCE(o.count_2tansho,0)+COALESCE(o.count_2fuku,0)>0)" if bool(odds_only) else "")}
                         GROUP BY h.race_key
                         ORDER BY MAX(h.history_id) DESC LIMIT ?
                     )
@@ -4079,15 +4089,16 @@ def _v290_spawn_recovery_worker(db_path: str, old_job: dict, reason: str) -> dic
             con.commit()
 
         now=_v228_now_jst_iso()
+        _old_odds_only = int(old_job.get("odds_only") or 0)
         with sqlite3.connect(str(db_path),timeout=1.0) as con:
             con.execute("PRAGMA busy_timeout=1000")
             cur=con.execute("""
                 INSERT INTO v278_background_jobs(
                     job_type,app_version,status,created_at,updated_at,started_at,
                     limit_count,force_current,odds_only,done_count,total_count,current_label,message
-                ) VALUES ('batch_rerun',?,'running',?,?,?,?,?,0,?,?,?,?)
+                ) VALUES ('batch_rerun',?,'running',?,?,?,?,?,?,?,?,?,?)
             """,(
-                str(_V231_APP_VERSION),now,now,now,limit0,
+                str(_V231_APP_VERSION),now,now,now,limit0,0,_old_odds_only,
                 done0,total0,str(old_job.get("current_label") or ""),
                 f"{done0}/{total0}から残りを自動再開しました。"
             ))
@@ -4096,7 +4107,7 @@ def _v290_spawn_recovery_worker(db_path: str, old_job: dict, reason: str) -> dic
 
         th=threading.Thread(
             target=_v278_bg_worker,
-            args=(str(db_path),jid_new,limit0,False,done0,total0),
+            args=(str(db_path),jid_new,limit0,False,done0,total0,False,bool(_old_odds_only)),
             daemon=True,
             name=f"autorace-bg-rerun-recover-{jid_new}",
         )
