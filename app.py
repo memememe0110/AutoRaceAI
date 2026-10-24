@@ -33,6 +33,12 @@ import streamlit.components.v1 as components
 import engine
 import math
 
+
+# Ver326: Streamlitの再実行・セッション切断に影響されないプロセス単位の起動同期状態。
+@st.cache_resource
+def _v326_get_boot_sync_state():
+    return {"done": False, "lock": threading.Lock()}
+
 # Ver320: 「/停止」を発走後事故(競走中止等)にしない。
 # engine._v121_extract_started_and_incident_cars は着順「-」の車を、
 # 欠車語が無いとデフォルトで 発走後事故車=競走中止等 にしていた。
@@ -113,6 +119,23 @@ _V326_CATCH_GAP_CAP_MAIN = 0.78
 _V326_CATCH_GAP_CAP_EXP = 0.60
 _V326_CA_WORKER_ACTIVE = False  # BG再シミュ中の本線リセット抑制
 
+# Ver327: late_release閾値緩和の分離実験。本線Ver326は変更しない。
+_V327_APP_VERSION = "Ver327"
+_V327_LATE_RELEASE_EXPERIMENT = False
+_V327_LATE_RELEASE_WORKER_ACTIVE = False
+
+
+def _v327_active() -> bool:
+    """Ver327 late_release実験が有効か。workerではglobal、通常予測ではsessionを参照。"""
+    if bool(globals().get("_V327_LATE_RELEASE_EXPERIMENT")) or bool(
+        globals().get("_V327_LATE_RELEASE_WORKER_ACTIVE")
+    ):
+        return True
+    try:
+        return bool(st.session_state.get("v327_late_release_experiment"))
+    except Exception:
+        return False
+
 
 def _v326_ca_active() -> bool:
     if bool(globals().get("_V326_ENABLE_CA")) or bool(globals().get("_V326_CA_WORKER_ACTIVE")):
@@ -131,6 +154,8 @@ def _v326_catch_gap_cap() -> float:
 
 
 def _v326_effective_save_version() -> str:
+    if _v327_active():
+        return str(globals().get("_V327_APP_VERSION") or "Ver327")
     if _v326_ca_active():
         return str(globals().get("_V326_APP_VERSION") or "Ver326")
     return str(globals().get("APP_VERSION") or globals().get("_V231_APP_VERSION") or "Ver324")
@@ -2326,6 +2351,8 @@ def _v278_bg_ensure_table(db_path: str) -> None:
                 cols={str(r[1]) for r in con.execute("PRAGMA table_info(v278_background_jobs)").fetchall()}
                 if "pause_requested" not in cols:
                     con.execute("ALTER TABLE v278_background_jobs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0")
+                if "odds_only" not in cols:
+                    con.execute("ALTER TABLE v278_background_jobs ADD COLUMN odds_only INTEGER NOT NULL DEFAULT 0")
             except Exception:
                 pass
             con.commit()
@@ -3435,22 +3462,33 @@ def _v284_backfill_transition_audit_from_latest_histories(db_path: str, app_vers
         return result
 
 
-def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool, resume_done_offset: int = 0, resume_total_target: int = 0, diagnostic_auto: bool = False) -> None:
-    # Ver326 C-A: 起動直前に立てた pending を消費。ジョブ中だけ gap cap=0.60 / 保存版 Ver326。
+def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool, resume_done_offset: int = 0, resume_total_target: int = 0, diagnostic_auto: bool = False, odds_only: bool = False) -> None:
+    # Ver326 C-A / Ver327: 起動直前に立てた pending を消費。ジョブ中だけ実験フラグを有効化。
     _ca_job = bool(globals().pop("_V326_CA_PENDING_FOR_WORKER", False))
+    _v327_job = bool(globals().pop("_V327_PENDING_FOR_WORKER", False))
     _prev_ca_en = bool(globals().get("_V326_ENABLE_CA"))
     _prev_ca_worker = bool(globals().get("_V326_CA_WORKER_ACTIVE"))
+    _prev_v327_en = bool(globals().get("_V327_LATE_RELEASE_EXPERIMENT"))
+    _prev_v327_worker = bool(globals().get("_V327_LATE_RELEASE_WORKER_ACTIVE"))
     _prev_v231 = str(globals().get("_V231_APP_VERSION") or "Ver324")
-    if _ca_job:
+    if _ca_job or _v327_job:
         globals()["_V326_ENABLE_CA"] = True
         globals()["_V326_CA_WORKER_ACTIVE"] = True
-        globals()["_V231_APP_VERSION"] = str(globals().get("_V326_APP_VERSION") or "Ver326")
+        if _v327_job:
+            globals()["_V327_LATE_RELEASE_EXPERIMENT"] = True
+            globals()["_V327_LATE_RELEASE_WORKER_ACTIVE"] = True
+            globals()["_V231_APP_VERSION"] = str(globals().get("_V327_APP_VERSION") or "Ver327")
+        else:
+            globals()["_V231_APP_VERSION"] = str(globals().get("_V326_APP_VERSION") or "Ver326")
     try:
         _v278_bg_update(
             db_path, job_id,
             status="running",
             started_at=_v228_now_jst_iso(),
-            message=("Ver326 C-A実験: 対象レースを整理しています。" if _ca_job else "対象レースを整理しています。"),
+            message=(
+                "Ver327 late_release実験: 対象レースを整理しています。" if _v327_job else
+                ("Ver326 C-A実験: 対象レースを整理しています。" if _ca_job else "対象レースを整理しています。")
+            ),
         )
         # Ver314: 一定レースごとにGitHubへ自動保存（クラッシュ時の消失を防ぐ）
         _autosave_every = int(globals().get("_V314_AUTOSAVE_EVERY_N") or 15)
@@ -3576,6 +3614,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 _progress_chunk,
                 force_current=bool(force_current),
                 diagnostic_auto=bool(diagnostic_auto),
+                odds_only=bool(odds_only),
                 cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
                 pause_cb=lambda: _v278_bg_pause_loop(db_path, job_id),
                 exclude_race_keys=_processed_keys or None,
@@ -3677,6 +3716,16 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             except Exception:
                 pass
             try:
+                _runtime_clear_prediction_caches()
+            except Exception:
+                pass
+            try:
+                with sqlite3.connect(str(db_path), timeout=10.0) as _c_gc:
+                    _c_gc.execute("PRAGMA busy_timeout=10000")
+                    _c_gc.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            try:
                 import gc as _gc_chunk
                 _gc_chunk.collect()
             except Exception:
@@ -3695,6 +3744,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 result["roi_return_rate"] = None
         except Exception:
             result["roi_return_rate"] = None
+        result["odds_only"] = bool(odds_only)
         result["message"] = (
             f"確認{result.get('checked',0)} / 再シム{result.get('rerun',0)}"
             f" / チャンク{result.get('chunk_count',0)}×{_chunk_n}R区切り"
@@ -3818,9 +3868,11 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
         except Exception:
             pass
         try:
-            if _ca_job:
+            if _ca_job or _v327_job:
                 globals()["_V326_ENABLE_CA"] = _prev_ca_en
                 globals()["_V326_CA_WORKER_ACTIVE"] = _prev_ca_worker
+                globals()["_V327_LATE_RELEASE_EXPERIMENT"] = _prev_v327_en
+                globals()["_V327_LATE_RELEASE_WORKER_ACTIVE"] = _prev_v327_worker
                 globals()["_V231_APP_VERSION"] = _prev_v231
         except Exception:
             try:
@@ -3828,35 +3880,49 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 _ml = bool(globals().get("_V326_ENABLE_CA_MAINLINE", True))
                 globals()["_V326_ENABLE_CA"] = _ml
                 globals()["_V326_CA_WORKER_ACTIVE"] = False
+                globals()["_V327_LATE_RELEASE_EXPERIMENT"] = False
+                globals()["_V327_LATE_RELEASE_WORKER_ACTIVE"] = False
                 globals()["_V231_APP_VERSION"] = str(APP_VERSION or ("Ver326" if _ml else "Ver324"))
             except Exception:
                 pass
 
-def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnostic_auto: bool = False, enable_ca: bool = False) -> dict:
+def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnostic_auto: bool = False, enable_ca: bool = False, enable_v327: bool = False, odds_only: bool = False) -> dict:
     _v278_bg_ensure_table(db_path)
     if _v278_bg_has_running_job(db_path):
         return {"ok":False,"reason":"すでにバックグラウンド再シミュレーションが動いています（取込とは同時可・再シムは1本のみ）。"}
     now=_v228_now_jst_iso()
-    # 未処理判定の対象版: C-A実験は Ver326、本線は _V231_APP_VERSION
+    # 未処理判定の対象版: Ver327実験 > Ver326 C-A > 本線
     _skip_ver = (
-        str(globals().get("_V326_APP_VERSION") or "Ver326")
-        if enable_ca else str(_V231_APP_VERSION)
+        str(globals().get("_V327_APP_VERSION") or "Ver327")
+        if enable_v327 else (
+            str(globals().get("_V326_APP_VERSION") or "Ver326")
+            if enable_ca else str(_V231_APP_VERSION)
+        )
     )
     try:
         _v231_ensure_prediction_history_table(db_path)
         with sqlite3.connect(str(db_path),timeout=30.0) as _con278:
+            _odds_exists278 = (
+                " AND EXISTS ("
+                "SELECT 1 FROM v221_odds_runs o "
+                "WHERE o.race_key = race_key "
+                "AND COALESCE(o.count_3tan,0)+COALESCE(o.count_3fuku,0)+"
+                "COALESCE(o.count_2tansho,0)+COALESCE(o.count_2fuku,0)>0)"
+                if bool(odds_only) else ""
+            )
             if bool(force_current):
-                _approx_total278=int(_con278.execute("""
+                _approx_total278=int(_con278.execute(f"""
                     SELECT COUNT(*) FROM (
                         SELECT race_key FROM v231_prediction_history
                         WHERE race_key IS NOT NULL AND TRIM(race_key)<>''
+                        {_odds_exists278}
                         GROUP BY race_key
                         ORDER BY MAX(history_id) DESC LIMIT ?
                     )
                 """,(max(1,int(limit_count)),)).fetchone()[0] or 0)
             else:
-                # 当該版がまだ無いレースだけ数える → 途中再開でも最初からにならない
-                _approx_total278=int(_con278.execute("""
+                # 当該版がまだ無いレースだけ数える。odds_only時は保存済みオッズありに限定。
+                _approx_total278=int(_con278.execute(f"""
                     SELECT COUNT(*) FROM (
                         SELECT h.race_key
                         FROM v231_prediction_history h
@@ -3865,6 +3931,7 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
                               SELECT 1 FROM v231_prediction_history c
                               WHERE c.race_key=h.race_key AND c.app_version=?
                           )
+                          {(" AND EXISTS (SELECT 1 FROM v221_odds_runs o WHERE o.race_key=h.race_key AND COALESCE(o.count_3tan,0)+COALESCE(o.count_3fuku,0)+COALESCE(o.count_2tansho,0)+COALESCE(o.count_2fuku,0)>0)" if bool(odds_only) else "")}
                         GROUP BY h.race_key
                         ORDER BY MAX(h.history_id) DESC LIMIT ?
                     )
@@ -3874,19 +3941,26 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
     with sqlite3.connect(str(db_path), timeout=30.0) as con:
         con.execute("PRAGMA busy_timeout=30000")
         _job_ver = (
-            str(globals().get("_V326_APP_VERSION") or "Ver326")
-            if enable_ca else str(_V231_APP_VERSION)
+            str(globals().get("_V327_APP_VERSION") or "Ver327")
+            if enable_v327 else (
+                str(globals().get("_V326_APP_VERSION") or "Ver326")
+                if enable_ca else str(_V231_APP_VERSION)
+            )
+        )
+        _job_message = (
+            "Ver327 late_release実験 準備中（オッズあり・未処理のみ）" if enable_v327 and odds_only and not force_current else
+            "Ver327 late_release実験 準備中（オッズあり・保存済みも再計算）" if enable_v327 and odds_only else
+            "Ver327 late_release実験 準備中（未処理のみ）" if enable_v327 and not force_current else
+            "Ver327 late_release実験 準備中（保存済みも再計算）" if enable_v327 else
+            "Ver326 C-A実験 準備中（未処理のみ）" if enable_ca and not force_current else
+            "Ver326 C-A実験 準備中（保存済みも再計算）" if enable_ca else "準備中"
         )
         cur=con.execute("""
             INSERT INTO v278_background_jobs(
-                job_type,app_version,status,created_at,updated_at,limit_count,force_current,message
-            ) VALUES ('batch_rerun',?,?,?,?,?,?,?)
+                job_type,app_version,status,created_at,updated_at,limit_count,force_current,odds_only,message
+            ) VALUES ('batch_rerun',?,?,?,?,?,?,?,?)
         """,(
-            _job_ver,"queued",now,now,
-            int(limit_count),1 if force_current else 0,
-            ("Ver326 C-A実験 準備中（未処理のみ）" if enable_ca and not force_current
-             else ("Ver326 C-A実験 準備中（保存済みも再計算）" if enable_ca
-                   else "準備中")),
+            _job_ver,"queued",now,now,int(limit_count),1 if force_current else 0,1 if odds_only else 0,_job_message,
         ))
         try:
             con.execute(
@@ -3897,10 +3971,11 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
             pass
         con.commit()
         job_id=int(cur.lastrowid or 0)
-    globals()["_V326_CA_PENDING_FOR_WORKER"] = bool(enable_ca)
+    globals()["_V326_CA_PENDING_FOR_WORKER"] = bool(enable_ca or enable_v327)
+    globals()["_V327_PENDING_FOR_WORKER"] = bool(enable_v327)
     th=threading.Thread(
         target=_v278_bg_worker,
-        args=(str(db_path),job_id,int(limit_count),bool(force_current),0,0,bool(diagnostic_auto)),
+        args=(str(db_path),job_id,int(limit_count),bool(force_current),0,0,bool(diagnostic_auto),bool(odds_only)),
         daemon=True,
         name=f"autorace-bg-rerun-{job_id}",
     )
@@ -3910,13 +3985,17 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
     return {
         "ok": True,
         "job_id": job_id,
-        "enable_ca": bool(enable_ca),
+        "enable_ca": bool(enable_ca or enable_v327),
+        "enable_v327": bool(enable_v327),
         "force_current": bool(force_current),
+        "odds_only": bool(odds_only),
         "skip_version": str(_skip_ver),
         "approx_total": int(_approx_total278),
         "app_version": (
-            str(globals().get("_V326_APP_VERSION") or "Ver326") if enable_ca
-            else str(_V231_APP_VERSION)
+            str(globals().get("_V327_APP_VERSION") or "Ver327") if enable_v327 else (
+                str(globals().get("_V326_APP_VERSION") or "Ver326") if enable_ca
+                else str(_V231_APP_VERSION)
+            )
         ),
     }
 
@@ -4010,15 +4089,16 @@ def _v290_spawn_recovery_worker(db_path: str, old_job: dict, reason: str) -> dic
             con.commit()
 
         now=_v228_now_jst_iso()
+        _old_odds_only = int(old_job.get("odds_only") or 0)
         with sqlite3.connect(str(db_path),timeout=1.0) as con:
             con.execute("PRAGMA busy_timeout=1000")
             cur=con.execute("""
                 INSERT INTO v278_background_jobs(
                     job_type,app_version,status,created_at,updated_at,started_at,
-                    limit_count,force_current,done_count,total_count,current_label,message
-                ) VALUES ('batch_rerun',?,'running',?,?,?,?,0,?,?,?,?)
+                    limit_count,force_current,odds_only,done_count,total_count,current_label,message
+                ) VALUES ('batch_rerun',?,'running',?,?,?,?,?,?,?,?,?,?)
             """,(
-                str(_V231_APP_VERSION),now,now,now,limit0,
+                str(_V231_APP_VERSION),now,now,now,limit0,0,_old_odds_only,
                 done0,total0,str(old_job.get("current_label") or ""),
                 f"{done0}/{total0}から残りを自動再開しました。"
             ))
@@ -4027,7 +4107,7 @@ def _v290_spawn_recovery_worker(db_path: str, old_job: dict, reason: str) -> dic
 
         th=threading.Thread(
             target=_v278_bg_worker,
-            args=(str(db_path),jid_new,limit0,False,done0,total0),
+            args=(str(db_path),jid_new,limit0,False,done0,total0,False,bool(_old_odds_only)),
             daemon=True,
             name=f"autorace-bg-rerun-recover-{jid_new}",
         )
@@ -4100,14 +4180,21 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
         limit0=max(1,int(job.get("limit_count") or total0 or 80))
         now=_v228_now_jst_iso()
         _old_ver = str(job.get("app_version") or "").strip()
+        _v327_resume = _old_ver in (
+            str(globals().get("_V327_APP_VERSION") or "Ver327"),
+            "Ver327",
+        )
         _ca_resume = _old_ver in (
             str(globals().get("_V326_APP_VERSION") or "Ver326"),
             "Ver326",
+            "Ver327",
         )
         _resume_ver = (
-            str(globals().get("_V326_APP_VERSION") or "Ver326")
-            if _ca_resume else str(_V231_APP_VERSION)
+            str(globals().get("_V327_APP_VERSION") or "Ver327") if _v327_resume else (
+                str(globals().get("_V326_APP_VERSION") or "Ver326") if _ca_resume else str(_V231_APP_VERSION)
+            )
         )
+        _odds_only_resume = bool(job.get("odds_only") or False)
 
         with sqlite3.connect(str(db_path),timeout=1.0) as con:
             con.execute("PRAGMA busy_timeout=1000")
@@ -4128,25 +4215,29 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
             cur=con.execute("""
                 INSERT INTO v278_background_jobs(
                     job_type,app_version,status,created_at,updated_at,started_at,
-                    limit_count,force_current,done_count,total_count,current_label,message
-                ) VALUES ('batch_rerun',?,'running',?,?,?,?,0,?,?,?,?)
+                    limit_count,force_current,odds_only,done_count,total_count,current_label,message
+                ) VALUES ('batch_rerun',?,'running',?,?,?,?,?,?,?,?,?,?)
             """,(
-                _resume_ver,now,now,now,limit0,
+                _resume_ver,now,now,now,limit0,1 if _odds_only_resume else 0,
                 done0,total0,str(job.get("current_label") or ""),
                 (
-                    f"Ver326 C-A {done0}/{total0}から手動再開（未処理のみ）"
-                    if _ca_resume else
-                    f"{done0}/{total0}から手動再開しました。"
+                    f"Ver327 late_release {done0}/{total0}から手動再開（未処理のみ）"
+                    if _v327_resume else (
+                        f"Ver326 C-A {done0}/{total0}から手動再開（未処理のみ）"
+                        if _ca_resume else
+                        f"{done0}/{total0}から手動再開しました。"
+                    )
                 ),
             ))
             con.commit()
             new_jid=int(cur.lastrowid or 0)
 
-        # C-Aジョブ再開時は worker 先頭で gap=0.60 / 保存版 Ver326 を有効化
+        # C-A / Ver327ジョブ再開時は worker 先頭で対応フラグを有効化
         globals()["_V326_CA_PENDING_FOR_WORKER"] = bool(_ca_resume)
+        globals()["_V327_PENDING_FOR_WORKER"] = bool(_v327_resume)
         th=threading.Thread(
             target=_v278_bg_worker,
-            args=(str(db_path),new_jid,limit0,False,done0,total0),
+            args=(str(db_path),new_jid,limit0,False,done0,total0,False,_odds_only_resume),
             daemon=True,
             name=f"autorace-bg-rerun-manual-resume-{new_jid}",
         )
@@ -4160,6 +4251,7 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
             "total": total0,
             "enable_ca": bool(_ca_resume),
             "app_version": _resume_ver,
+            "odds_only": bool(_odds_only_resume),
         }
     except Exception as exc:
         return {"ok":False,"reason":f"{type(exc).__name__}: {exc}"}
@@ -4427,7 +4519,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
         _v276_foreground_prediction_event.set()
         with _V276ForegroundPredictionPriority(db_path):
             _t0=time_module.perf_counter()
-            _champion311_applied=bool(engine.v311_set_champion_model_state())
+            _champion311_applied=bool(getattr(engine, "v311_set_champion_model_state", lambda: False)())
             df,bets,output,entries,meta=engine.ver16_run_prediction(
                 prediction_text,trials,seed,manual_excluded=excluded
             )
@@ -4694,7 +4786,7 @@ def _v310_auto_diagnostic_race_keys(db_path: str, current_ver: str, limit: int) 
         return []
 
 
-def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None, pause_cb=None, diagnostic_auto: bool = False, exclude_race_keys=None) -> dict:
+def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_cb=None, force_current: bool = False, cancel_cb=None, pause_cb=None, diagnostic_auto: bool = False, exclude_race_keys=None, odds_only: bool = False) -> dict:
     out={
         "checked":0,"rerun":0,"skipped_current":0,"no_text":0,"errors":[],"labels":[],
         "roi_evaluated":0,"roi_no_odds":0,"roi_no_payout":0,
@@ -4752,6 +4844,22 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
         if not rk or rk in seen:
             continue
         seen.add(rk); unique.append(h)
+    # Ver327: 保存オッズありのレースだけを比較対象にする。
+    if bool(odds_only):
+        try:
+            with sqlite3.connect(str(db_path), timeout=10.0) as _co327:
+                _odds_keys327={str(r[0]).strip() for r in _co327.execute(
+                    """SELECT race_key FROM v221_odds_runs
+                       WHERE COALESCE(count_3tan,0)+COALESCE(count_3fuku,0)+
+                             COALESCE(count_2tansho,0)+COALESCE(count_2fuku,0)>0"""
+                ).fetchall() if r and r[0]}
+            _before_odds327=len(unique)
+            unique=[h for h in unique if str(h.get('race_key') or '').strip() in _odds_keys327]
+            out['skipped_no_odds']=int(out.get('skipped_no_odds',0) or 0)+int(_before_odds327-len(unique))
+        except Exception:
+            unique=[]
+            out['odds_filter_error']='v221_odds_runs を参照できませんでした。'
+
     if diagnostic_auto:
         _diag_keys310=set(_v310_auto_diagnostic_race_keys(db_path,current_ver,max(1,int(limit))))
         unique=[h for h in unique if str(h.get('race_key') or '').strip() in _diag_keys310]
@@ -6354,7 +6462,7 @@ def _v324_late_release_audit_diagnostic(
 ) -> dict:
     """周5/6の late_release_audit_v273 を予測履歴から集計（読み取り専用）。
 
-    列: function_called / eligible / triggered / score_below_required /
+    列: function_called / eligible / triggered / score_below_required / score_zero_guard /
         v282_borderline_guard / residual_samples_lt5 / gate_lt_080 / trial_missing
     周5痩せが「境界ガード」由来か「スコア不足」由来かを切り分ける。
     """
@@ -6376,6 +6484,7 @@ def _v324_late_release_audit_diagnostic(
         "eligible",
         "triggered",
         "score_below_required",
+        "score_zero_guard",
         "v282_borderline_guard",
         "residual_samples_lt5",
         "gate_lt_080",
@@ -6538,6 +6647,7 @@ def _v324_late_release_audit_diagnostic(
         triggered = int(d.get("triggered") or 0)
         guard = int(d.get("v282_borderline_guard") or 0)
         score_miss = int(d.get("score_below_required") or 0)
+        score_zero = int(d.get("score_zero_guard") or 0)
         rows.append(
             {
                 "周回": lap,
@@ -6548,6 +6658,7 @@ def _v324_late_release_audit_diagnostic(
                 "発動率_対呼出%": (triggered / called * 100.0) if called else None,
                 "発動率_対対象%": (triggered / eligible * 100.0) if eligible else None,
                 "スコア不足": score_miss,
+                "Ver327スコア0ガード": score_zero,
                 "v282境界ガード": guard,
                 "境界ガード率_対呼出%": (guard / called * 100.0) if called else None,
                 "残差不足": int(d.get("residual_samples_lt5") or 0),
@@ -10050,7 +10161,30 @@ def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_t
         _ = reasons.append("trial_missing")
 
     base_threshold = 4 if h >= 60.0 else 3
+    _experiment_v327 = _v327_active()
+    if _experiment_v327:
+        base_threshold = max(1, base_threshold - 1)  # 3→2 / 4→3
     required = base_threshold
+
+    # Ver327: 根拠ゼロ(score=0)の通り抜けは防止。
+    if _experiment_v327 and score < 1:
+        diag = {
+            "eligible": True,
+            "reason": "score_zero_guard",
+            "score": score,
+            "threshold": required,
+            "base_threshold": base_threshold,
+            "factor": 1.0,
+            "reasons": reasons,
+            "gate": gate,
+            "samples": samples,
+            "time_adjust": tadj,
+            "trial": trial,
+            "trial_median": tmed,
+            "handicap": h,
+            "lap": lap_i,
+        }
+        return (1.0, diag) if return_diag else 1.0
 
     if score < required:
         diag = {
@@ -10921,12 +11055,12 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     late_release_audit_v273={
         5: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
             "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
-            "score_below_required":0,"v282_borderline_guard":0,
+            "score_below_required":0,"score_zero_guard":0,"v282_borderline_guard":0,
             "residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0,
             "errors":0,"last_error":""},
         6: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
             "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
-            "score_below_required":0,"residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0,
+            "score_below_required":0,"score_zero_guard":0,"residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0,
             "errors":0,"last_error":""},
     }
     try:
@@ -11262,6 +11396,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                                 late_release_audit_v273[_lap_diag274]['factor_sum']+=float(_late_factor272)
                             elif str(_late_diag274.get('reason') or '')=='score_below_required':
                                 late_release_audit_v273[_lap_diag274]['score_below_required']+=1
+                            elif str(_late_diag274.get('reason') or '')=='score_zero_guard':
+                                late_release_audit_v273[_lap_diag274]['score_zero_guard']+=1
                             elif str(_late_diag274.get('reason') or '')=='v282_borderline_guard':
                                 if _lap_diag274 == 5:
                                     late_release_audit_v273[_lap_diag274]['v282_borderline_guard']+=1
@@ -11461,11 +11597,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["Ver273_6周目30m以上判定"]=int(late_release_audit_v273[6]["rear30_seen"])
     out["Ver273_6周目関数呼出"]=int(late_release_audit_v273[6]["function_called"])
     out["Ver273_5周目スコア不足"]=int(late_release_audit_v273[5]["score_below_required"])
+    out["Ver327_5周目スコア0ガード"]=int(late_release_audit_v273[5].get("score_zero_guard",0))
     out["Ver282_5周目境界抑制"]=int(late_release_audit_v273[5].get("v282_borderline_guard",0))
     out["Ver273_5周目残差不足"]=int(late_release_audit_v273[5]["residual_samples_lt5"])
     out["Ver273_5周目ゲート不足"]=int(late_release_audit_v273[5]["gate_lt_080"])
     out["Ver273_5周目試走不足"]=int(late_release_audit_v273[5]["trial_missing"])
     out["Ver273_6周目スコア不足"]=int(late_release_audit_v273[6]["score_below_required"])
+    out["Ver327_6周目スコア0ガード"]=int(late_release_audit_v273[6].get("score_zero_guard",0))
     out["Ver273_6周目残差不足"]=int(late_release_audit_v273[6]["residual_samples_lt5"])
     out["Ver273_6周目ゲート不足"]=int(late_release_audit_v273[6]["gate_lt_080"])
     out["Ver273_6周目試走不足"]=int(late_release_audit_v273[6]["trial_missing"])
@@ -16859,7 +16997,7 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
     seed = int(seed if seed is not None else 20260719)
     try:
         if bool(globals().get("use_champion_model", True)):
-            engine.v311_set_champion_model_state()
+            getattr(engine, "v311_set_champion_model_state", lambda: False)()
         else:
             engine.v305_clear_model_state_override()
     except Exception:
@@ -16928,7 +17066,7 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
     view = {
         "df": df, "bets": bets, "output": output, "entries": entries, "meta": meta,
         "finish_prob": finish_prob, "race_key": key,
-        "trials": int(trials), "excluded": [], "app_version": _V231_APP_VERSION,
+        "trials": int(trials), "excluded": [], "app_version": _v326_effective_save_version(),
         "simulation_mode": _V231_SIMULATION_MODE,
         "prediction_time": _v228_now_jst_iso(), "seed": int(seed),
         "settings_hash": _v231_settings_hash(int(trials), int(seed), []),
@@ -16943,7 +17081,7 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
         try:
             slim = {
                 "meta": meta, "race_key": key, "trials": int(trials), "seed": int(seed),
-                "app_version": _V231_APP_VERSION, "prediction_time": view["prediction_time"],
+                "app_version": _v326_effective_save_version(), "prediction_time": view["prediction_time"],
                 "df": df, "bets": bets, "entries": entries, "finish_prob": finish_prob,
             }
             history_id = int(_v231_save_prediction_history(db_path, key, text, venue, slim, int(trials), int(seed)) or 0)
@@ -30219,7 +30357,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
         )
         if st.session_state.get("v326_ca_experiment_mode"):
             st.warning("実験モード中: 予測は Ver326 として保存されます。本線比較用の通常予測はOFFにしてから行ってください。")
-        # Ver326 未処理件数
+
         try:
             _v326_pop = _v304_roi_population_status(str(db_path), str(globals().get("_V326_APP_VERSION") or "Ver326"))
             if not _v326_pop.get("error"):
@@ -30230,6 +30368,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 )
         except Exception:
             _v326_pop = {}
+
         _ca_lim = st.number_input(
             "C-A再シミュ最大レース数（1回の上限）",
             min_value=1, max_value=500, value=40, step=10,
@@ -30249,7 +30388,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             key="v326_ca_force_current",
             help="OFF=未処理のみ（続きから）。ON=保存済みも含めて最初から。",
         )
-        # 稼働中ジョブの停止・再開（C-A含む）— 再シミュ種別のみ（取込と混同しない）
+
         _ca_job = _v278_bg_get_active_of(str(db_path), ("batch_rerun",))
         _ca_st = str((_ca_job or {}).get("status") or "")
         _ca_jid = int((_ca_job or {}).get("job_id") or 0)
@@ -30289,6 +30428,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                     st.rerun()
                 else:
                     st.error("再開失敗: " + str(_res.get("reason") or "不明"))
+
         if st.button(
             "Ver326 C-A でバックグラウンド再シミュ開始",
             type="primary",
@@ -30314,6 +30454,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 st.rerun()
             else:
                 st.error(str(_started.get("reason") or _started))
+
         _ca_last = st.session_state.get("v326_ca_resim_last")
         if isinstance(_ca_last, dict):
             st.caption(
@@ -30325,6 +30466,132 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             f"現行フラグ: CA_active={_v326_ca_active()} / gap_cap={_v326_catch_gap_cap():.2f} / "
             f"save_ver={_v326_effective_save_version()}"
         )
+
+    # ===== Ver327はVer326とは独立したExpander =====
+    with st.expander("🧪 Ver327 レイト・リリース閾値緩和実験（本線Ver326は不変）", expanded=False):
+        st.caption(
+            "周5のlate_releaseスコア不足（88.5%）に対する分離実験。"
+            "base_thresholdを3→2 / 4→3に緩和し、score=0は従来どおり不発。"
+            "本線Ver326のC-A gap=0.60・◎ゲート・買い目・重みは変更しません。"
+        )
+        _v327_exp_ui = st.checkbox(
+            "Ver327 閾値緩和を有効化（セッション）",
+            value=bool(st.session_state.get("v327_late_release_experiment")),
+            key="v327_late_release_experiment",
+            help="このセッションの通常予測をVer327として保存し、late_release閾値緩和を適用します。BG再シムは下の専用ボタンから起動します。",
+        )
+        if _v327_exp_ui:
+            st.warning("Ver327実験中: late_release閾値緩和を適用。予測保存版はVer327です。本線Ver326は変更されません。")
+
+        try:
+            _v327_pop = _v304_roi_population_status(
+                str(db_path), str(globals().get("_V327_APP_VERSION") or "Ver327")
+            )
+            if not _v327_pop.get("error"):
+                st.info(
+                    f"Ver327採点済み {_v327_pop.get('current_evaluated', 0)}R ｜ "
+                    f"残り（未処理） {_v327_pop.get('remaining', 0)}R ｜ "
+                    f"完全再シム可能 {_v327_pop.get('replayable_remaining', 0)}R"
+                )
+        except Exception:
+            _v327_pop = {}
+
+        _v327_lim = st.number_input(
+            "Ver327 再シミュ最大レース数（1回の上限）",
+            min_value=1, max_value=500, value=40, step=10,
+            key="v327_resim_limit",
+            help="例: 200 を指定しても内部は20Rごとに区切って保存・メモリ解放します。"
+        )
+        _v327_force = st.checkbox(
+            "Ver327保存済みレースも再計算（最初からやり直し）",
+            value=False,
+            key="v327_force_current",
+            help="OFF=未処理のみ（続きから）。ON=保存済みも含めて最初から。",
+        )
+        _v327_odds_only = st.checkbox(
+            "オッズありのレースだけをVer327再シミュ対象にする",
+            value=True,
+            key="v327_odds_only",
+            help="保存済みv221オッズが1件以上あるレースだけを対象にします。",
+        )
+        if _v327_odds_only:
+            st.caption("対象条件: 保存済みオッズあり。オッズなしレースはVer327再シミュ対象外です。")
+
+        _v327_job = _v278_bg_get_active_of(str(db_path), ("batch_rerun",))
+        _v327_st = str((_v327_job or {}).get("status") or "")
+        _v327_jid = int((_v327_job or {}).get("job_id") or 0)
+        _v327_done = int((_v327_job or {}).get("done_count") or 0)
+        _v327_total = int((_v327_job or {}).get("total_count") or 0)
+        _v327_job_ver = str((_v327_job or {}).get("app_version") or "")
+        _v327_active_ui = _v327_st in ("queued", "running", "pause_requested", "paused", "cancel_requested")
+        if _v327_active_ui and _v327_jid:
+            st.caption(
+                f"稼働中ジョブ: id={_v327_jid} ver={_v327_job_ver} status={_v327_st} "
+                f"{_v327_done}/{_v327_total or '?'}｜{str((_v327_job or {}).get('current_label') or '')}"
+            )
+            if _v327_total > 0:
+                st.progress(
+                    min(1.0, max(0.0, float(_v327_done) / float(_v327_total))),
+                    text=f"{_v327_done}/{_v327_total}",
+                )
+            _v327_c1, _v327_c2, _v327_c3 = st.columns(3)
+            if _v327_c1.button("🔄 進捗更新", key="v327_refresh", use_container_width=True):
+                st.rerun()
+            if _v327_c2.button("⏹ 現在レース後に停止", key="v327_stop", use_container_width=True):
+                _v278_bg_request_cancel(str(db_path), _v327_jid)
+                st.warning("停止要求を送信しました。現在レース終了後に止まります。")
+                st.rerun()
+            if _v327_c3.button(
+                f"▶ {_v327_done}/{_v327_total or '?'}から再開",
+                key="v327_resume",
+                use_container_width=True,
+                disabled=_v327_st in ("queued", "running", "pause_requested"),
+            ):
+                _v327_res = _v290_manual_resume_batch(str(db_path), _v327_job or {})
+                if _v327_res.get("ok"):
+                    st.success(
+                        f"再開 job={_v327_res.get('job_id')} ver={_v327_res.get('app_version')} "
+                        f"C-A={_v327_res.get('enable_ca')} / Ver327=True（未処理のみ）"
+                    )
+                    st.rerun()
+                else:
+                    st.error("再開失敗: " + str(_v327_res.get("reason") or "不明"))
+
+        if st.button(
+            "Ver327 late_release緩和で再シム開始",
+            type="primary",
+            use_container_width=True,
+            key="v327_resim_go",
+            disabled=(_ca_active_ui or _v327_active_ui),
+        ):
+            _started327 = _v278_bg_start(
+                str(db_path),
+                limit_count=int(_v327_lim or 40),
+                force_current=bool(_v327_force),
+                diagnostic_auto=False,
+                enable_ca=True,
+                enable_v327=True,
+                odds_only=bool(_v327_odds_only),
+            )
+            st.session_state["v327_resim_last"] = _started327
+            if _started327.get("ok"):
+                st.success(
+                    f"開始 job_id={_started327.get('job_id')} / 保存版={_started327.get('app_version')} "
+                    f"/ 対象約{_started327.get('approx_total', '?')}R / force={_started327.get('force_current')} / オッズのみ={_started327.get('odds_only')} "
+                    "（C-A gap=0.60 + late_release閾値緩和）"
+                )
+                st.rerun()
+            else:
+                st.error(str(_started327.get("reason") or _started327))
+
+        _v327_last = st.session_state.get("v327_resim_last")
+        if isinstance(_v327_last, dict):
+            st.caption(
+                f"Ver327前回開始: ok={_v327_last.get('ok')} job={_v327_last.get('job_id')} "
+                f"ver={_v327_last.get('app_version')} force={_v327_last.get('force_current')} "
+                f"odds_only={_v327_last.get('odds_only')} approx={_v327_last.get('approx_total')} reason={_v327_last.get('reason','')}"
+            )
+        st.caption("撤回条件: Ver326対比のVer327 周6量比 > 1.15 → Ver327実験停止。")
     try:
         _stamp305fix=(str(db_path),Path(str(db_path)).stat().st_mtime_ns,"Ver305-rec-only-fix1")
         if st.session_state.get("_v305_rec_only_fix_stamp") != _stamp305fix:
@@ -32843,7 +33110,7 @@ def _v319_archive_old_version_predictions(db_path: str, keep_versions: list[str]
     _default_keep = [
         str(APP_VERSION or ""),
         str(globals().get("_V231_APP_VERSION") or ""),
-        "Ver319", "Ver322", "Ver323", "Ver324", "Ver325", "Ver326", "Ver327",
+        "Ver319", "Ver322", "Ver323", "Ver324", "Ver325", "Ver326",
     ]
     keep = set(str(v) for v in (keep_versions if keep_versions is not None else _default_keep) if v)
     report = {"moved": 0, "tables": {}, "ok": False}
@@ -33198,25 +33465,24 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
     return _ok_push284,_msg_push284
 
 
-# Ver276 DB安全化: 起動時にGitHub DBで現在DBを自動上書きしない。
-# GitHub側が古い/破損DBでも、アップロード済みの正常DBを保持する。
-if "github_pull_done" not in st.session_state:
-    st.session_state["github_pull_done"] = True
+def _v326_sync_db_from_github_and_rerun() -> tuple[bool, str]:
+    """GitHubからDBを再読込し、成功時はキャッシュ破棄とリランを行う（手動ボタン・起動時共通）。"""
     try:
-        _boot_sz = Path(str(engine.DB_PATH)).stat().st_size if Path(str(engine.DB_PATH)).exists() else 0
-    except Exception:
-        _boot_sz = 0
-    if _boot_sz < 5 * 1024 * 1024:
-        try:
-            _pok, _pmsg = pull_db_from_github()
-            st.session_state["github_pull_message"] = (_pok, str(_pmsg))
-        except Exception as _pexc:
-            st.session_state["github_pull_message"] = (False, f"起動時読込失敗: {type(_pexc).__name__}: {_pexc}")
-    else:
-        st.session_state["github_pull_message"] = (
-            True,
-            "起動時の強制上書きは停止中です。『GitHubからDBを再読込』でdivergedも安全統合します。",
-        )
+        ok, msg = pull_db_from_github()
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+    if ok:
+        _ = st.session_state.pop("_v296_sidebar_db_summary_cache", None)
+        _ = st.session_state.pop("_v296_sidebar_manifest_cache", None)
+        _ = st.session_state.pop("_v290_identity_cache", None)
+        st.session_state["_v284_force_identity_refresh"] = True
+        st.session_state["_v290_startup_ready"] = False
+        st.session_state["github_pull_message"] = (True, msg)
+        st.rerun()
+    
+    return ok, msg
+
 
 
 def _v278_bg_get_latest_active(db_path: str) -> dict:
@@ -33460,12 +33726,18 @@ if not st.session_state.get("v284_boot_github_restore_checked",False):
 _v290_load_stage("DB固定監視を確認しています…")
 _v284_identity_key="v284_db_identity_baseline"
 _v284_identity_block_key="v284_db_identity_block"
+
+# Ver326: バックグラウンドの再シミュレーションが動いている間は、
+# 巨大なDBスナップショット作成によるメモリ不足（OOM）を防ぐため、
+# 固定監視（フルスキャン）をスキップして前回のキャッシュを使う。
 if _v296_bg_fast_rerun:
     _v284_identity_now=dict(st.session_state.get(_v284_identity_key) or {})
     if not _v284_identity_now.get("ok"):
-        _v284_identity_now=_v284_current_db_identity()
+        # キャッシュがない場合も、このタイミングでの重い生成は避ける。
+        _v284_identity_now={"ok":False,"reason":"BG実行中のため監視スキップ"}
 else:
     _v284_identity_now=_v284_current_db_identity()
+
 if _v284_identity_now.get("ok"):
     _v284_identity_base=st.session_state.get(_v284_identity_key)
     if not isinstance(_v284_identity_base,dict) or not _v284_identity_base.get("ok"):
@@ -33851,15 +34123,9 @@ with st.sidebar:
         disabled=(not ready) or _bg_busy_sidebar,
         help="バックグラウンド再シミュレーション中はDB上書き防止のため無効です。" if _bg_busy_sidebar else None,
     ):
-        ok, msg = pull_db_from_github()
-        (st.success if ok else st.error)(msg)
-        if ok:
-            _ = st.session_state.pop("_v296_sidebar_db_summary_cache",None)
-            _ = st.session_state.pop("_v296_sidebar_manifest_cache",None)
-            _ = st.session_state.pop("_v290_identity_cache",None)
-            st.session_state["_v284_force_identity_refresh"] = True
-            st.session_state["_v290_startup_ready"] = False  # 再読込後は1回だけ初期表示
-            st.rerun()
+        ok, msg = _v326_sync_db_from_github_and_rerun()
+        if not ok:
+            st.error(msg)
 
     # Ver305: GitHub DBを現在DBへ反映せず、取得だけして端末保存する。
     # diverged解消用の比較・手動統合に使える。現在DBは一切変更しない。
@@ -33922,7 +34188,7 @@ with st.sidebar:
     for _pv in [
         str(APP_VERSION or ""),
         str(globals().get("_V231_APP_VERSION") or ""),
-        "Ver327", "Ver326", "Ver325", "Ver324", "Ver323", "Ver322", "Ver319",
+        "Ver326", "Ver325", "Ver324", "Ver323", "Ver322", "Ver319",
     ]:
         if _pv and _pv not in _protect_default:
             _protect_default.append(_pv)
@@ -33935,7 +34201,7 @@ with st.sidebar:
         options=_ver_choices,
         default=_default_sel,
         key="v319_archive_keep_versions",
-        help="ここに無いバージョンだけがバックアップ表へ移動します。比較用の Ver322〜Ver327 は既定で残します。",
+        help="ここに無いバージョンだけがバックアップ表へ移動します。比較用の Ver322〜Ver326 は既定で残します。",
     )
     if st.button("古いVer予測をバックアップへ退避", use_container_width=True,
                  help="選択したバージョン以外の予測履歴をアーカイブ表へ移します。同じDB内なので容量はほぼ減りません。"):
@@ -35044,7 +35310,7 @@ elif selected_main_page == "🏁 予測":
             with _V276ForegroundPredictionPriority(engine.DB_PATH):
                 with st.spinner("高速6周イベントシミュレーションを実行中…"):
                     _t0 = time_module.perf_counter()
-                    _champion311_applied = bool(use_champion_model and engine.v311_set_champion_model_state())
+                    _champion311_applied = bool(use_champion_model and getattr(engine, "v311_set_champion_model_state", lambda: False)())
                     if not use_champion_model:
                         engine.v305_clear_model_state_override()
                     df, bets, output, entries, meta = engine.ver16_run_prediction(prediction_text, int(trials), int(seed), manual_excluded=manual_excluded)
@@ -35111,7 +35377,7 @@ elif selected_main_page == "🏁 予測":
                 "future_audit": {},
                 "day_trend": {},
                 "prediction_timing": prediction_timing,
-                "app_version": _V231_APP_VERSION,
+                "app_version": _v326_effective_save_version(),
                 "simulation_mode": _V231_SIMULATION_MODE,
                 "settings_hash": _v231_settings_hash(int(trials), int(seed), [int(x) for x in manual_excluded]),
                 "prediction_time": _v228_now_jst_iso(),
@@ -35808,13 +36074,7 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.error(f"開催一覧の取得に失敗: {exc}")
         meets = st.session_state.get("v319_op_meetings") or []
         if meets:
-            _src = str((meets[0] or {}).get("source") or "")
-            _src_label = "autorace公式" if _src == "autorace" else ("oddspark" if _src == "oddspark" else "")
-            st.success(
-                "取得できた開催: "
-                + "、".join(f"{m['venue']}" for m in meets)
-                + (f"（{_src_label}）" if _src_label else "")
-            )
+            st.write("取得できた開催: " + "、".join(f"{m['venue']}" for m in meets))
         ymd = fetch_date.strftime("%Y%m%d")
         venues = [fetch_venue] if fetch_venue in RESULT_VENUES else [m["venue"] for m in meets]
         _rnos = [int(fetch_race_no)] if int(fetch_race_no or 0) >= 1 else []
@@ -37785,53 +38045,90 @@ if selected_main_page == "🗃️ 登録情報確認":
     elif isinstance(_ps, dict) and _ps.get("reason") and _ps.get("reason") != "OK":
         st.warning(str(_ps.get("reason")))
 
-    # --- Ver326: 同一レース版ペア比較（隣接スワップ量比・F1） ---
-    st.markdown("##### 🔁 C-A検証：同一レースでの版ペア比較（324 vs 326）")
+    # --- 同一レース版ペア比較（バージョン選択可能・読み取り専用） ---
+    st.markdown("##### 🔁 C-A検証：同一レースでの版ペア比較")
     st.caption(
         "同一 race_key に限定して、隣接スワップ量比とF1を版間比較します。"
-        "周4-5の量比が1.0方向へ寄り、F1が悪化していなければ C-A は機能しています。"
-        "1.0を超えてオーバーシュートした場合は C-A が効きすぎのサインです。"
+        "周4-5の量比が1.0方向へ寄り、F1が悪化していなければ C-A や late_release が機能しています。"
+        "1.0を超えてオーバーシュートした場合は効きすぎのサインです。"
         "読み取り専用。予測・◎・買い目は変更しません。"
     )
-    _pc_lim = st.number_input(
-        "最大取得R数（各版）",
-        min_value=50,
-        max_value=2000,
-        value=400,
-        step=50,
-        key="v326_paired_swap_limit",
-    )
-    if st.button("同一レース版ペア比較を実行", key="v326_paired_swap_btn", use_container_width=True):
-        with st.spinner("324/326両版の closest_route と result_laps を突合中…"):
-            st.session_state["v326_paired_swap"] = _v326_paired_lap_swap_comparison(
-                engine.DB_PATH,
-                app_a="Ver324",
-                app_b="Ver326",
-                limit_races=int(_pc_lim),
-            )
+
+    try:
+        _avail_vers = _v319_list_prediction_app_versions(engine.DB_PATH)
+        if not _avail_vers:
+            _avail_vers = ["Ver324", "Ver326", "Ver327"]
+    except Exception:
+        _avail_vers = ["Ver324", "Ver326", "Ver327"]
+
+    _idx_a = _avail_vers.index("Ver326") if "Ver326" in _avail_vers else 0
+    _idx_b = _avail_vers.index("Ver327") if "Ver327" in _avail_vers else (len(_avail_vers) - 1)
+
+    _pc_c1, _pc_c2, _pc_c3 = st.columns(3)
+    with _pc_c1:
+        _app_a = st.selectbox(
+            "比較元 (A)",
+            options=_avail_vers,
+            index=_idx_a,
+            key="v326_paired_ver_a",
+        )
+    with _pc_c2:
+        _app_b = st.selectbox(
+            "比較先 (B)",
+            options=_avail_vers,
+            index=_idx_b,
+            key="v326_paired_ver_b",
+        )
+    with _pc_c3:
+        _pc_lim = st.number_input(
+            "最大取得R数（各版）",
+            min_value=50,
+            max_value=2000,
+            value=400,
+            step=50,
+            key="v326_paired_swap_limit",
+        )
+
+    if st.button(f"ペア比較（{_app_a} vs {_app_b}）を実行", key="v326_paired_swap_btn", use_container_width=True):
+        if _app_a == _app_b:
+            st.warning("異なるバージョンを選択してください。")
+        else:
+            with st.spinner(f"{_app_a} / {_app_b} の closest_route と result_laps を突合中…"):
+                st.session_state["v326_paired_swap"] = _v326_paired_lap_swap_comparison(
+                    engine.DB_PATH,
+                    app_a=_app_a,
+                    app_b=_app_b,
+                    limit_races=int(_pc_lim),
+                )
+                st.session_state["v326_paired_last_a"] = _app_a
+                st.session_state["v326_paired_last_b"] = _app_b
+
     _pc = st.session_state.get("v326_paired_swap")
     if isinstance(_pc, dict) and _pc.get("ok"):
         _psm = _pc.get("summary") or {}
+        _last_a = _pc.get("app_a", st.session_state.get("v326_paired_last_a", "A"))
+        _last_b = _pc.get("app_b", st.session_state.get("v326_paired_last_b", "B"))
+
         st.write(
             f"共通race_key {_pc.get('common_races', 0)}R"
             f"（A routes {_pc.get('routes_a', 0)} / B routes {_pc.get('routes_b', 0)}）"
         )
-        # 簡易判定
+
         try:
             d4 = _psm.get("周4量比差")
             d5 = _psm.get("周5量比差")
             f4 = _psm.get("周4F1差")
             f5 = _psm.get("周5F1差")
-            r4b = _psm.get("量比_Ver326_周4")
-            r5b = _psm.get("量比_Ver326_周5")
+            r4b = _psm.get(f"量比_{_last_b}_周4")
+            r5b = _psm.get(f"量比_{_last_b}_周5")
             _msgs = []
             if d4 is not None and d5 is not None:
                 if float(d4) > 0.05 and float(d5) > 0.05 and (f4 is None or float(f4) >= -1) and (f5 is None or float(f5) >= -1):
-                    _msgs.append("✅ 周4・5の量比が上昇方向（F1悪化なし）→ C-Aは意図どおりの可能性")
+                    _msgs.append("✅ 周4・5の量比が上昇方向（F1悪化なし）→ 意図どおりの可能性")
                 elif (r4b is not None and float(r4b) > 1.15) or (r5b is not None and float(r5b) > 1.15):
                     _msgs.append("⚠️ 量比が1.15超 → 効きすぎの可能性")
                 elif abs(float(d4)) <= 0.05 and abs(float(d5)) <= 0.05:
-                    _msgs.append("⚠️ 量比差ほぼゼロ → C-Aが実質効いていない可能性")
+                    _msgs.append("⚠️ 量比差ほぼゼロ → 実質効いていない可能性")
                 if (f4 is not None and float(f4) < -2) or (f5 is not None and float(f5) < -2):
                     _msgs.append("⛔ 周4/5のF1が悪化 → ロールバック検討")
             if int(_pc.get("common_races") or 0) < 100:
@@ -37840,6 +38137,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                 st.info(_m)
         except Exception:
             pass
+
         dfp = _pc.get("by_lap")
         if isinstance(dfp, pd.DataFrame) and not dfp.empty:
             st.dataframe(
@@ -37847,18 +38145,18 @@ if selected_main_page == "🗃️ 登録情報確認":
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "量比_Ver324": st.column_config.NumberColumn(format="%.3f"),
-                    "量比_Ver326": st.column_config.NumberColumn(format="%.3f"),
+                    f"量比_{_last_a}": st.column_config.NumberColumn(format="%.3f"),
+                    f"量比_{_last_b}": st.column_config.NumberColumn(format="%.3f"),
                     "量比差(B-A)": st.column_config.NumberColumn(format="%+.3f"),
-                    "F1%_Ver324": st.column_config.NumberColumn(format="%.1f"),
-                    "F1%_Ver326": st.column_config.NumberColumn(format="%.1f"),
+                    f"F1%_{_last_a}": st.column_config.NumberColumn(format="%.1f"),
+                    f"F1%_{_last_b}": st.column_config.NumberColumn(format="%.1f"),
                     "F1差(B-A)": st.column_config.NumberColumn(format="%+.1f"),
                 },
             )
             st.download_button(
-                "版ペア比較CSV",
+                f"版ペア比較CSV（{_last_a} vs {_last_b}）",
                 dfp.to_csv(index=False).encode("utf-8-sig"),
-                file_name="v326_paired_lap_swap.csv",
+                file_name=f"paired_lap_swap_{_last_a}_{_last_b}.csv",
                 mime="text/csv",
                 use_container_width=True,
                 key="v326_paired_csv",
@@ -37871,7 +38169,7 @@ if selected_main_page == "🗃️ 登録情報確認":
     st.caption(
         "v231 payload から三連単順位を復元し、result_payouts の当たり券が上位何％だったかを版別に比較します。"
         "DB書き込みなし。予測・◎・買い目ロジックは変更しません。"
-        "median_pct が小さい／上位％以内率が高い → 予測本体の採用候補。"
+        "326の median_pct が小さい／上位％以内率が高い → 予測本体の採用候補。"
     )
     # DBに実在する app_version を動的取得（Ver327 等の追加版も自動で出る）
     try:
@@ -37883,7 +38181,6 @@ if selected_main_page == "🗃️ 登録情報確認":
             str(APP_VERSION or "Ver326"),
             "Ver327", "Ver326", "Ver325", "Ver324", "Ver322",
         ]
-    # 重複除去・現行版を先頭寄りに
     _rank_avail_vers = list(dict.fromkeys(
         [str(v) for v in _rank_avail_vers if str(v or "").strip()]
     ))
@@ -38899,6 +39196,7 @@ if selected_main_page == "🗃️ 登録情報確認":
                                             "5周対象": int(_a5.get("eligible",0) or 0),
                                             "5周発動": int(_a5.get("triggered",0) or 0),
                                             "5周スコア不足": int(_a5.get("score_below_required",0) or 0),
+                                            "5周スコア0ガード": int(_a5.get("score_zero_guard",0) or 0),
                                             "5周境界抑制": int(_a5.get("v282_borderline_guard",0) or 0),
                                             "5周残差不足": int(_a5.get("residual_samples_lt5",0) or 0),
                                             "5周ゲート不足": int(_a5.get("gate_lt_080",0) or 0),
@@ -39752,3 +40050,27 @@ try:
         _v266_render_error_analysis(engine.DB_PATH)
 except Exception as _v266_exc:
     st.warning("Ver266誤差解析の表示に失敗しました: " + _runtime_exception_text(_v266_exc))
+
+# ---------------------------------------------------------
+# Ver326: 画面描画完了後、プロセス起動後に1回だけGitHub同期を実行
+# ---------------------------------------------------------
+_v326_boot_sync_state = _v326_get_boot_sync_state()
+with _v326_boot_sync_state["lock"]:
+    _v326_should_boot_sync = not _v326_boot_sync_state["done"]
+    if _v326_should_boot_sync:
+        _v326_boot_sync_state["done"] = True
+
+if _v326_should_boot_sync:
+    with st.spinner("初回起動時のDB安全同期を実行中…（画面が固まる場合はそのままお待ちください）"):
+        try:
+            _pok, _pmsg = _v326_sync_db_from_github_and_rerun()
+            if not _pok:
+                st.session_state["github_pull_message"] = (False, str(_pmsg))
+                st.toast(f"⚠️ DB自動同期に失敗: {_pmsg}", icon="⚠️")
+        except Exception as _pexc:
+            st.session_state["github_pull_message"] = (
+                False,
+                f"起動時GitHub DB同期失敗: {type(_pexc).__name__}: {_pexc}"
+            )
+            st.toast(f"⚠️ 同期エラー: {_pexc}", icon="⚠️")
+
