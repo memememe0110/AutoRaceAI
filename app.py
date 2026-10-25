@@ -134,6 +134,37 @@ except Exception as _v326_sim_patch_exc:
     except Exception:
         pass
 
+
+# Ver326: engine.ver16_run_prediction 内の IntCastingNaNError を明示エラーへ変換
+_V326_ORIG_VER16_RUN = None
+_V326_VER16_WRAP_ERROR = ""
+
+
+def _v326_safe_ver16_run_prediction(*args, **kwargs):
+    try:
+        return _V326_ORIG_VER16_RUN(*args, **kwargs)
+    except Exception as exc:
+        en = type(exc).__name__
+        msg = str(exc)
+        if "IntCasting" in en or "Cannot convert non-finite" in msg or "non-finite values" in msg:
+            raise ValueError(
+                "予測エンジン内部で数値欠損(NaN)が整数変換に入りました（通常はありえません）。"
+                "出走表の車番・試走T・ハンデ、または履歴結合を確認してください。"
+                f" [{en}: {msg}]"
+            ) from exc
+        raise
+
+
+try:
+    _V326_ORIG_VER16_RUN = engine.ver16_run_prediction
+    engine.ver16_run_prediction = _v326_safe_ver16_run_prediction
+except Exception as _v326_ver16_exc:
+    _V326_VER16_WRAP_ERROR = f"{type(_v326_ver16_exc).__name__}: {_v326_ver16_exc}"
+    try:
+        print(f"[Ver326] ver16_run_prediction wrap failed: {_V326_VER16_WRAP_ERROR}")
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # AutoRaceAI runtime configuration / state
 # Ver265 refactor: version, modes and mutable caches are initialized in one
@@ -10982,7 +11013,22 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     if not car_col or not ec:
         return df,bets,{"enabled":False,"reason":"車番列なし"}
     work=df.copy(); work["_car"]=pd.to_numeric(work[car_col],errors="coerce")
-    work=work.dropna(subset=["_car"]).copy(); work["_car"]=work["_car"].astype(int)
+    work = work.copy()
+    work["_car"] = pd.to_numeric(work["_car"], errors="coerce")
+    if work["_car"].isna().any():
+        _bad_names = []
+        try:
+            _nm = "選手名" if "選手名" in work.columns else None
+            for _, _r in work.loc[work["_car"].isna()].iterrows():
+                _bad_names.append(str(_r.get(_nm) if _nm else _r.get("_car") or "?"))
+        except Exception:
+            pass
+        raise ValueError(
+            "6周Sim入口で車番NaN（通常はありえません）: "
+            + ", ".join(_bad_names[:8])
+        )
+    work = work.dropna(subset=["_car"]).copy()
+    work["_car"] = work["_car"].astype(int)
     emap={}
     for _,r in entries.iterrows():
         try: emap[int(r[ec])]=r
@@ -14846,7 +14892,7 @@ def _v319_parse_sprace_car_rows(html: str) -> list[dict]:
         trial = dev = rank = avg_r = best_r = finish10 = rate2 = rate3 = car_name = ""
         # 短縮名, 試走T/偏差, ランク, V, 良10走, 近10走, 車名
         if len(tds) >= 2:
-            tm = re.search(r"(3\.\d{2})", tds[1])
+            tm = re.search(r"(\d+\.\d+)", tds[1])
             dm = re.search(r"(0\.\d{2,3})", tds[1])
             if tm:
                 trial = tm.group(1)
@@ -14896,6 +14942,47 @@ def _v319_parse_sprace_car_rows(html: str) -> list[dict]:
             "kessha": bool(is_kessha),
         })
     return rows
+
+
+
+def _v319_validate_card_players(players: list, venue: str = "", race_no: int = 0) -> None:
+    """出走表の必須項目を検証。欠損は通常ありえないので明示エラー。"""
+    if not players:
+        raise ValueError(f"{venue} {race_no}R：出走表の選手が0件です。")
+    problems = []
+    cars = []
+    for p in players:
+        if not isinstance(p, dict):
+            continue
+        if p.get("kessha"):
+            continue
+        car = p.get("car")
+        try:
+            car_i = int(float(car))
+            cars.append(car_i)
+        except Exception:
+            problems.append(f"車番不正:{car!r}/{p.get('name') or ''}")
+            continue
+        name = str(p.get("name") or "")
+        trial = str(p.get("trial") or "").strip()
+        if not re.match(r"^\d+\.\d+$", trial):
+            problems.append(f"{car_i}号{name}:試走T欠損{trial!r}")
+        hand = p.get("hand")
+        try:
+            if hand is None or str(hand).strip() in ("", "-", "None"):
+                # ハンデ0は合法。空のみ問題
+                problems.append(f"{car_i}号{name}:ハンデ欠損")
+            else:
+                _ = int(float(hand))
+        except Exception:
+            problems.append(f"{car_i}号{name}:ハンデ不正{hand!r}")
+    if not cars:
+        raise ValueError(f"{venue} {race_no}R：有効な出走車がありません。")
+    if problems:
+        raise ValueError(
+            f"{venue} {race_no}R：出走表データ欠損（通常はありえません）: "
+            + " / ".join(problems[:10])
+        )
 
 
 def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int, ymd: str) -> str:
@@ -18299,11 +18386,6 @@ def _v319_import_one_race(
                 "next_action": "retry",
             }
         players = _v319_parse_sprace_car_rows(sp_html) or _v319_parse_sprace_players(sp_html)
-        card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
-        kessha_cars = sorted(set(
-            _v319_detect_kessha_from_players(players)
-            + _v319_detect_kessha_from_card_text(card_text)
-        ))
         if not players:
             return {
                 "status": "error",
@@ -18312,6 +18394,13 @@ def _v319_import_one_race(
                 "key": key_guess,
                 "next_action": "retry",
             }
+        # 予測前に必須項目を検証（欠損は IntCastingNaN より先に明示エラー）
+        _v319_validate_card_players(players, venue, race_no)
+        card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
+        kessha_cars = sorted(set(
+            _v319_detect_kessha_from_players(players)
+            + _v319_detect_kessha_from_card_text(card_text)
+        ))
         # 欠損補完は予測続行するが、CSV/UIで気づけるようメッセージに残す
         _fill_note = _v319_card_fill_note()
         if _fill_note:
