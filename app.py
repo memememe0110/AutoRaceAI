@@ -94,6 +94,46 @@ except Exception as _v320_patch_exc:
     except Exception:
         pass
 
+# Ver326: IntCastingNaNError 防止。
+# engine.prepare_simulation_arrays が df["車"].astype(int) をそのまま行い、
+# 出走表欠損で車番が NaN だと予測全体が落ちる。車番を数値化してから渡す。
+_V326_ENGINE_SIM_PATCH_ERROR = ""
+_V326_SIM_ARRAY_DROP_CARS: list = []
+
+
+def _v326_safe_prepare_simulation_arrays(df):
+    """車番 NaN/非数は通常ありえないので、黙って落とさず明示エラーにする。"""
+    work = df.copy() if hasattr(df, "copy") else df
+    if "車" in getattr(work, "columns", []):
+        cars = pd.to_numeric(work["車"], errors="coerce")
+        bad = cars.isna()
+        if bool(bad.any()):
+            names = []
+            try:
+                for _, r in work.loc[bad].iterrows():
+                    names.append(str(r.get("選手名") or r.get("車") or "?"))
+            except Exception:
+                names = [str(i) for i in work.loc[bad].index.tolist()]
+            raise ValueError(
+                "出走表の車番が欠損しています（通常はありえません）。"
+                "取得経路（oddspark/autorace）またはパーサを確認してください。"
+                + (f" 対象: {', '.join(names[:8])}" if names else "")
+            )
+        work = work.copy()
+        work["車"] = cars.astype(int)
+    return _V326_ORIG_PREPARE_SIMULATION_ARRAYS(work)
+
+
+try:
+    _V326_ORIG_PREPARE_SIMULATION_ARRAYS = engine.prepare_simulation_arrays
+    engine.prepare_simulation_arrays = _v326_safe_prepare_simulation_arrays
+except Exception as _v326_sim_patch_exc:
+    _V326_ENGINE_SIM_PATCH_ERROR = f"{type(_v326_sim_patch_exc).__name__}: {_v326_sim_patch_exc}"
+    try:
+        print(f"[Ver326] prepare_simulation_arrays patch failed: {_V326_ENGINE_SIM_PATCH_ERROR}")
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # AutoRaceAI runtime configuration / state
 # Ver265 refactor: version, modes and mutable caches are initialized in one
@@ -124,6 +164,14 @@ _V327_APP_VERSION = "Ver327"
 _V327_LATE_RELEASE_EXPERIMENT = False
 _V327_LATE_RELEASE_WORKER_ACTIVE = False
 
+# Ver328: 中盤(1-4)追い抜き底上げ + 6周目の無意味追い抜き抑制。本線不変。
+_V328_APP_VERSION = "Ver328"
+_V328_EXPERIMENT = False
+_V328_WORKER_ACTIVE = False
+_V328_EARLY_BASE_BOOST = 0.08          # lap<=4 の logit 加算
+_V328_LAP6_GAP_THRESH = 0.80           # 3位との差（秒）目安
+_V328_LAP6_P_SCALE = 0.40              # 5位以下かつ大差時の p 減衰
+
 
 def _v327_active() -> bool:
     """Ver327 late_release実験が有効か。workerではglobal、通常予測ではsessionを参照。"""
@@ -133,6 +181,16 @@ def _v327_active() -> bool:
         return True
     try:
         return bool(st.session_state.get("v327_late_release_experiment"))
+    except Exception:
+        return False
+
+
+def _v328_active() -> bool:
+    """Ver328 中盤底上げ+6周抑制実験。本線・Ver327とは独立。"""
+    if bool(globals().get("_V328_EXPERIMENT")) or bool(globals().get("_V328_WORKER_ACTIVE")):
+        return True
+    try:
+        return bool(st.session_state.get("v328_mid_boost_experiment"))
     except Exception:
         return False
 
@@ -154,12 +212,13 @@ def _v326_catch_gap_cap() -> float:
 
 
 def _v326_effective_save_version() -> str:
+    if _v328_active():
+        return str(globals().get("_V328_APP_VERSION") or "Ver328")
     if _v327_active():
         return str(globals().get("_V327_APP_VERSION") or "Ver327")
     if _v326_ca_active():
         return str(globals().get("_V326_APP_VERSION") or "Ver326")
     return str(globals().get("APP_VERSION") or globals().get("_V231_APP_VERSION") or "Ver324")
-
 # Ver284 DB safety patch: protected fingerprint v3 / current+previous rollback guard
 
 # Ver322 S1: temperature scaling (logit space). T=1 → no-op. odds_gate=9999 → full rollback.
@@ -11353,6 +11412,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
 
                 _early_logit290 -= _front_st_guard294
                 logit=-0.28 + ability*0.90 + hist*0.82 + direct*0.82 + late_pressure + empirical_pass_delta + learned_transition + residual_transition + actual_transition + player_total_transition + weak_front_bonus + chain_bonus + _early_logit290 - wall - front_hold - handicap_wall - chain_fatigue - pack_wall
+                # Ver328: 周1〜4のベース追い抜きをわずかに底上げ（中盤の隊列入れ替えを増やす）
+                if _v328_active() and int(lap) <= 4:
+                    logit += float(globals().get("_V328_EARLY_BASE_BOOST") or 0.08)
                 _branch_noise=0.16
                 logit += rng.normal(0,_branch_noise)
                 try:
@@ -11413,6 +11475,16 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                         if _lap_err275 in (5,6):
                             late_release_audit_v273[_lap_err275]["errors"]+=1
                             late_release_audit_v273[_lap_err275]["last_error"]=f"{type(_e_late275).__name__}: {_e_late275}"
+                    except Exception:
+                        pass
+                # Ver328: 6周目・5位以下で3位と大差がある場合の無意味追い抜きを抑制
+                if _v328_active() and int(lap) == 6:
+                    try:
+                        _gap3_v328 = float(gaps[min(3, len(gaps) - 1)]) if gaps else 0.0
+                        _thresh_v328 = float(globals().get("_V328_LAP6_GAP_THRESH") or 0.80)
+                        _scale_v328 = float(globals().get("_V328_LAP6_P_SCALE") or 0.40)
+                        if i >= 4 and _gap3_v328 > _thresh_v328:
+                            p = float(np.clip(p * _scale_v328, 0.035, 0.88))
                     except Exception:
                         pass
                 # Ver289:
@@ -14378,6 +14450,44 @@ def _v319_norm_player_name(name: str) -> str:
     return re.sub(r"[\s　]+", "", str(name or ""))
 
 
+# 出走表の欠損補完ログ（予測は続行しつつ、取込メッセージで気づけるようにする）
+_V319_LAST_CARD_FILL: dict = {
+    "source": "",
+    "trial_default": 0,
+    "hand_default": 0,
+    "dev_default": 0,
+    "cars": 0,
+}
+
+
+def _v319_reset_card_fill() -> None:
+    _V319_LAST_CARD_FILL.update(
+        {
+            "source": "",
+            "trial_default": 0,
+            "hand_default": 0,
+            "dev_default": 0,
+            "cars": 0,
+        }
+    )
+
+
+def _v319_card_fill_note() -> str:
+    """取込メッセージ用。補完が1件以上なら警告文言を返す。"""
+    d = _V319_LAST_CARD_FILL
+    bits = []
+    if int(d.get("trial_default") or 0) > 0:
+        bits.append(f"試走T既定{int(d['trial_default'])}台")
+    if int(d.get("hand_default") or 0) > 0:
+        bits.append(f"ハンデ既定{int(d['hand_default'])}台")
+    if int(d.get("dev_default") or 0) > 0:
+        bits.append(f"偏差既定{int(d['dev_default'])}台")
+    if not bits:
+        return ""
+    src = str(d.get("source") or "card")
+    return f" ⚠{src}欠損補完:" + "・".join(bits)
+
+
 def _v319_synthesize_sprace_html_from_program(
     body: dict, venue: str, race_no: int, ymd: str
 ) -> str:
@@ -14388,12 +14498,14 @@ def _v319_synthesize_sprace_html_from_program(
         f"<html><body><div>{date_s} {venue} {int(race_no)}R 予選 3100m 良走路</div>",
         "<table>",
     ]
+    n_trial_def = n_hand_def = n_dev_def = n_cars = 0
     for p in body.get("playerList") or []:
         if not isinstance(p, dict):
             continue
         car = int(p.get("carNo") or 0)
         if car < 1:
             continue
+        n_cars += 1
         pcd = str(p.get("playerCode") or "").strip()
         name = str(p.get("playerName") or "").strip()
         lg = re.sub(r"\s+", "", str(p.get("placeName") or venue or ""))
@@ -14401,14 +14513,36 @@ def _v319_synthesize_sprace_html_from_program(
         grad = p.get("graduationCode")
         age_s = f"{age}歳/{grad}期" if age is not None and grad else ""
         hand = p.get("handicap")
-        hand_s = str(int(hand)) if hand is not None else "0"
-        trial = str(p.get("trialRunTime") or "")
+        try:
+            if hand is None or str(hand).strip() in ("", "-", "None"):
+                hand_s = "0"
+                n_hand_def += 1
+            else:
+                hand_s = str(int(float(hand)))
+        except Exception:
+            hand_s = "0"
+            n_hand_def += 1
+        trial = str(p.get("trialRunTime") or "").strip()
+        # 試走T欠損は通常ありえない → 既定値で誤魔化さず明示エラー
+        if not re.match(r"^\d+\.\d+$", trial):
+            absent = p.get("absent")
+            is_kessha = absent not in (None, "", 0, "0", False)
+            if not is_kessha:
+                raise ValueError(
+                    f"出走表の試走Tが欠損しています（通常はありえません）: "
+                    f"{car}号 {name or ''} trial={trial!r}。"
+                    "autorace/oddspark の取得結果を確認してください。"
+                )
+            trial = ""  # 欠車のみ空許容
+            n_trial_def += 1
         dev_raw = str(p.get("raceDev") or "").strip()
         # raceDev は "081" 形式 → 0.81 目安
         if dev_raw.isdigit() and len(dev_raw) >= 2:
             dev = f"0.{dev_raw[-2:]}"
         else:
-            dev = dev_raw or ""
+            if not dev_raw:
+                n_dev_def += 1
+            dev = dev_raw or "0.00"
         rank = str(p.get("rank") or "")
         rate2 = str(p.get("rate2") or "")
         rate3 = str(p.get("rate3") or "")
@@ -14430,7 +14564,7 @@ def _v319_synthesize_sprace_html_from_program(
         # parse_sprace_car_rows は name td 以降を tds[0]=短縮名, tds[1]=試走T/偏差 と読む
         short = re.sub(r"[\s　]+", "", name)[:3]
         parts.append(f"<td>{short}</td>")
-        parts.append(f"<td>{trial or '-'}<br>{dev or ''}</td>")
+        parts.append(f"<td>{trial}<br>{dev}</td>")
         parts.append(f"<td>{rank}</td>")
         parts.append("<td></td>")
         parts.append("<td></td>")  # tds[4] 平均/最高（Programに無いので空）
@@ -14443,6 +14577,15 @@ def _v319_synthesize_sprace_html_from_program(
         parts.append(f"<td>{bike}</td>")
         parts.append("</tr>")
     parts.append("</table></body></html>")
+    _V319_LAST_CARD_FILL.update(
+        {
+            "source": "autorace",
+            "trial_default": int(n_trial_def),
+            "hand_default": int(n_hand_def),
+            "dev_default": int(n_dev_def),
+            "cars": int(n_cars),
+        }
+    )
     return "\n".join(parts)
 
 
@@ -14452,6 +14595,7 @@ def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int) -> str:
     place = _V319_OP_PLACE.get(str(venue) or "")
     if not ymd or not place:
         raise ValueError("開催日または開催場が不正です")
+    _v319_reset_card_fill()
     # 1) oddspark SP
     try:
         url = (
@@ -14462,6 +14606,7 @@ def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int) -> str:
         if str(html or "").strip() and (
             "playerCd=" in html or "stcNameFull" in html or "選手" in html
         ):
+            _V319_LAST_CARD_FILL["source"] = "oddspark"
             return html
     except Exception:
         pass
@@ -14764,9 +14909,36 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
             _ = lines.append("欠車")
         if p.get("age"):
             _ = lines.append(p["age"])
-        hand = p.get("hand") or "0"
+        hand_raw = p.get("hand")
+        hand_filled = False
+        try:
+            if hand_raw is None or str(hand_raw).strip() in ("", "-", "None"):
+                hand = "0"
+                hand_filled = True
+            else:
+                hand = str(int(float(hand_raw)))
+        except Exception:
+            hand = "0"
+            hand_filled = True
         st = p.get("st") or ""
-        trial = p.get("trial") or ""
+        trial = str(p.get("trial") or "").strip()
+        trial_filled = False
+        if not re.match(r"^\d+\.\d+$", trial):
+            if not p.get("kessha"):
+                raise ValueError(
+                    f"出走表の試走Tが欠損しています（通常はありえません）: "
+                    f"{p.get('car')}号 {name} trial={trial!r}"
+                )
+            trial_filled = True
+            trial = ""
+        if trial_filled:
+            _V319_LAST_CARD_FILL["trial_default"] = int(
+                _V319_LAST_CARD_FILL.get("trial_default") or 0
+            ) + 1
+        if hand_filled:
+            _V319_LAST_CARD_FILL["hand_default"] = int(
+                _V319_LAST_CARD_FILL.get("hand_default") or 0
+            ) + 1
         _ = lines.append(f"ハンデ{hand}m/ST{st or '-'}\t{trial}".rstrip())
         if p.get("dev") or p.get("rank"):
             _ = lines.append(f"{p.get('dev') or ''}\t{p.get('rank') or ''}".strip())
@@ -18115,6 +18287,10 @@ def _v319_import_one_race(
                 "key": key_guess,
                 "next_action": "retry",
             }
+        # 欠損補完は予測続行するが、CSV/UIで気づけるようメッセージに残す
+        _fill_note = _v319_card_fill_note()
+        if _fill_note:
+            hist_msg = str(hist_msg or "") + _fill_note
     except Exception as exc:
         return {
             "status": "error",
@@ -30592,6 +30768,35 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 f"odds_only={_v327_last.get('odds_only')} approx={_v327_last.get('approx_total')} reason={_v327_last.get('reason','')}"
             )
         st.caption("撤回条件: Ver326対比のVer327 周6量比 > 1.15 → Ver327実験停止。")
+
+    # ===== Ver328: 中盤底上げ + 6周目の無意味追い抜き抑制（本線・Ver327不変） =====
+    with st.expander("🧪 Ver328 中盤追い抜き底上げ＋6周抑制実験（本線Ver326は不変）", expanded=False):
+        st.caption(
+            "周1〜4のlogitに小さな底上げ（既定+0.08）で中盤の隊列入れ替えを増やし、"
+            "6周目は5位以下かつ3位と大差（≥0.80）の追い抜き確率を減衰（×0.40）。"
+            "本線Ver326 / Ver327 late_release は変更しません。保存版は Ver328。"
+        )
+        _v328_exp_ui = st.checkbox(
+            "Ver328 を有効化（セッション）",
+            value=bool(st.session_state.get("v328_mid_boost_experiment")),
+            key="v328_mid_boost_experiment",
+            help="このセッションの通常予測をVer328として保存します。BG再シムは未配線（セッション予測で検証）。",
+        )
+        if _v328_exp_ui:
+            st.warning(
+                "Ver328実験中: 中盤底上げ + 6周目無意味追い抜き抑制。"
+                "予測保存版はVer328です。本線Ver326は変更されません。"
+            )
+        st.caption(
+            f"現行: v328_active={_v328_active()} / early_boost={float(globals().get('_V328_EARLY_BASE_BOOST') or 0.08):.3f} / "
+            f"lap6_gap≥{float(globals().get('_V328_LAP6_GAP_THRESH') or 0.80):.2f} → p×{float(globals().get('_V328_LAP6_P_SCALE') or 0.40):.2f} / "
+            f"save_ver={_v326_effective_save_version()}"
+        )
+        st.caption(
+            "評価: ペア周回量比で周2〜5が1.0に近づくか、周6が1.15超にならないか、"
+            "三連単上位％がVer326対比で悪化しないかを見る。"
+        )
+
     try:
         _stamp305fix=(str(db_path),Path(str(db_path)).stat().st_mtime_ns,"Ver305-rec-only-fix1")
         if st.session_state.get("_v305_rec_only_fix_stamp") != _stamp305fix:
@@ -38057,9 +38262,9 @@ if selected_main_page == "🗃️ 登録情報確認":
     try:
         _avail_vers = _v319_list_prediction_app_versions(engine.DB_PATH)
         if not _avail_vers:
-            _avail_vers = ["Ver324", "Ver326", "Ver327"]
+            _avail_vers = ["Ver324", "Ver326", "Ver327", "Ver328"]
     except Exception:
-        _avail_vers = ["Ver324", "Ver326", "Ver327"]
+        _avail_vers = ["Ver324", "Ver326", "Ver327", "Ver328"]
 
     _idx_a = _avail_vers.index("Ver326") if "Ver326" in _avail_vers else 0
     _idx_b = _avail_vers.index("Ver327") if "Ver327" in _avail_vers else (len(_avail_vers) - 1)
@@ -38179,7 +38384,7 @@ if selected_main_page == "🗃️ 登録情報確認":
     if not _rank_avail_vers:
         _rank_avail_vers = [
             str(APP_VERSION or "Ver326"),
-            "Ver327", "Ver326", "Ver325", "Ver324", "Ver322",
+            "Ver328", "Ver327", "Ver326", "Ver325", "Ver324", "Ver322",
         ]
     _rank_avail_vers = list(dict.fromkeys(
         [str(v) for v in _rank_avail_vers if str(v or "").strip()]
