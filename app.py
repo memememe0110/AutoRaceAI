@@ -314,7 +314,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Ver314: 再シミュレーション中のGitHub自動途中保存間隔（レース数）
 # 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
-_V314_AUTOSAVE_EVERY_N = 20  # B13-J: C-A長時間再シムのOOM低減（40→20）
+_V314_AUTOSAVE_EVERY_N = 10  # B13-J: OOM低減（40→20→10）。約40R落ち対策
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
 # 古い全バージョンを毎回走査すると起動ループ落ちの原因になる。
@@ -3828,6 +3828,19 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             try:
                 import gc as _gc_chunk
                 _gc_chunk.collect()
+                # チャンク境界で取込系キャッシュも捨てる（再シム経路のメモリ右肩上がり抑制）
+                try:
+                    for _ck in (
+                        '_V319_HIST_DF_CACHE', '_V319_HIST_SKIPPED', '_V319_HIST_REFRESHED',
+                        '_V319_WX_CACHE', '_V319_SCHEMA_CACHE',
+                    ):
+                        _obj = globals().get(_ck)
+                        if isinstance(_obj, dict):
+                            _obj.clear()
+                        elif isinstance(_obj, set):
+                            _obj.clear()
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -5209,7 +5222,11 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 out['no_text']+=1
                 continue
             src_ver=str((hm or {}).get('app_version') or h.get('app_version') or (view or {}).get('app_version') or 'Unknown')
+            # BG再シムは trials を上限キャップ（20k据え置きはCloud OOMの主因）
             trials=int(h.get('trials') or (view or {}).get('trials') or 20000)
+            _trials_cap = int(globals().get('_V314_RESIM_TRIALS_CAP') or 8000)
+            if _trials_cap > 0:
+                trials = max(1000, min(int(trials), int(_trials_cap)))
             seed=int(h.get('seed') or (view or {}).get('seed') or 20260719)
             excluded=[int(x) for x in ((view or {}).get('excluded') or [])]
 
@@ -5360,13 +5377,31 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                 pass
             if callable(progress_cb):
                 progress_cb(idx,total,label)
-            # B13-J: レース単位で不要オブジェクトを回収（C-A長時間ジョブのメモリ右肩上がり抑制）
-            if int(idx or 0) % 5 == 0:
+            # B13-J強化: 毎レースで大オブジェクトを明示解放→GC（~40R落ち対策）
+            for _name in (
+                'df', 'bets', 'output', 'entries', 'meta', 'wall_audit',
+                'finish_prob', 'prediction_view', 'view', 'raw_text',
+                'prediction_text', '_bets_before_lap310', '_v273_audit_keep',
+                '_roi273', 'snap',
+            ):
                 try:
-                    import gc as _gc_b13j
-                    _gc_b13j.collect()
+                    if _name in locals():
+                        locals()[_name] = None  # noqa: ineffective on locals in some cases
                 except Exception:
                     pass
+            try:
+                del df, bets, output, entries, meta
+            except Exception:
+                pass
+            try:
+                del wall_audit, finish_prob, prediction_view, view
+            except Exception:
+                pass
+            try:
+                import gc as _gc_b13j
+                _gc_b13j.collect()
+            except Exception:
+                pass
     out['race_processing_seconds_v276']=round(time_module.perf_counter()-_run_t0_v276,3)
     if int(out.get("roi_cost_yen",0) or 0) > 0:
         out["roi_return_rate"]=float(out["roi_payout_yen"])/float(out["roi_cost_yen"])*100.0
@@ -11012,9 +11047,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     ec="車番" if "車番" in entries.columns else ("車" if "車" in entries.columns else None)
     if not car_col or not ec:
         return df,bets,{"enabled":False,"reason":"車番列なし"}
-    work=df.copy(); work["_car"]=pd.to_numeric(work[car_col],errors="coerce")
-    work = work.copy()
-    work["_car"] = pd.to_numeric(work["_car"], errors="coerce")
+    work=df.copy()
+    work["_car"]=pd.to_numeric(work[car_col],errors="coerce")
     if work["_car"].isna().any():
         _bad_names = []
         try:
