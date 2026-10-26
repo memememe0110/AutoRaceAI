@@ -314,7 +314,10 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 
 # Ver314: 再シミュレーション中のGitHub自動途中保存間隔（レース数）
 # 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
-_V314_AUTOSAVE_EVERY_N = 10  # B13-J: OOM低減（40→20→10）。約40R落ち対策
+_V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
+_V314_GH_AUTOSAVE_EVERY_N = 40  # GitHubも同じ間隔（push連打しない）
+_V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
+
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
 # 古い全バージョンを毎回走査すると起動ループ落ちの原因になる。
@@ -3591,7 +3594,9 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             ),
         )
         # Ver314: 一定レースごとにGitHubへ自動保存（クラッシュ時の消失を防ぐ）
-        _autosave_every = int(globals().get("_V314_AUTOSAVE_EVERY_N") or 15)
+        _autosave_every = int(globals().get("_V314_AUTOSAVE_EVERY_N") or 40)
+        # GitHub push は別間隔。短すぎると push 自体で OOM しやすい。
+        _gh_every = int(globals().get("_V314_GH_AUTOSAVE_EVERY_N") or 40)
         _last_gh_save_at = [0]  # list for closure mutability
         _gh_autosave_log = []
 
@@ -3604,11 +3609,11 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 _total_show=int(resume_done_offset or 0)+_total_raw
             _total_show=max(_total_show,_done_show)
             _msg = f"{_done_show}/{_total_show}｜{str(label or '')}"
-            # 途中自動保存: N件処理ごと（例: 15, 30, 45...）
+            # 途中 GitHub 保存は _gh_every 件ごと（チャンクGCより長く）
             if (
-                _autosave_every > 0
+                _gh_every > 0
                 and _done_show > 0
-                and (_done_show - int(_last_gh_save_at[0])) >= _autosave_every
+                and (_done_show - int(_last_gh_save_at[0])) >= _gh_every
             ):
                 try:
                     _v278_bg_update(
@@ -3787,18 +3792,21 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             except Exception:
                 pass
             try:
-                _ok_ch, _msg_ch = push_db_to_github(
-                    f"AutoRaceAI: 再シムチャンク{_chunk_i}境界保存 {_done_in_job}/{_job_limit}",
-                    _allow_during_resimulation=True,
-                    _lightweight=True,
-                )
-                _last_gh_save_at[0] = int(resume_done_offset or 0) + int(_done_in_job)
-                _gh_autosave_log.append({
-                    "at": int(_last_gh_save_at[0]),
-                    "ok": bool(_ok_ch),
-                    "message": str(_msg_ch or "")[:200],
-                    "chunk": int(_chunk_i),
-                })
+                _at_ch = int(resume_done_offset or 0) + int(_done_in_job)
+                # チャンク境界でも GH は _gh_every 以上空いたときだけ（連打防止）
+                if int(_gh_every or 0) > 0 and (_at_ch - int(_last_gh_save_at[0])) >= int(_gh_every):
+                    _ok_ch, _msg_ch = push_db_to_github(
+                        f"AutoRaceAI: 再シムチャンク{_chunk_i}境界保存 {_done_in_job}/{_job_limit}",
+                        _allow_during_resimulation=True,
+                        _lightweight=True,
+                    )
+                    _last_gh_save_at[0] = _at_ch
+                    _gh_autosave_log.append({
+                        "at": int(_last_gh_save_at[0]),
+                        "ok": bool(_ok_ch),
+                        "message": str(_msg_ch or "")[:200],
+                        "chunk": int(_chunk_i),
+                    })
             except Exception as _ch_exc:
                 _gh_autosave_log.append({
                     "at": int(resume_done_offset or 0) + int(_done_in_job),
@@ -4308,18 +4316,23 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
         limit0=max(1,int(job.get("limit_count") or total0 or 80))
         now=_v228_now_jst_iso()
         _old_ver = str(job.get("app_version") or "").strip()
-        _v327_resume = _old_ver in (
+        _v328_resume = _old_ver in (
+            str(globals().get("_V328_APP_VERSION") or "Ver328"),
+            "Ver328",
+        )
+        _v327_resume = (not _v328_resume) and _old_ver in (
             str(globals().get("_V327_APP_VERSION") or "Ver327"),
             "Ver327",
         )
-        _ca_resume = _old_ver in (
+        _ca_resume = _v328_resume or _v327_resume or _old_ver in (
             str(globals().get("_V326_APP_VERSION") or "Ver326"),
             "Ver326",
-            "Ver327",
         )
         _resume_ver = (
-            str(globals().get("_V327_APP_VERSION") or "Ver327") if _v327_resume else (
-                str(globals().get("_V326_APP_VERSION") or "Ver326") if _ca_resume else str(_V231_APP_VERSION)
+            str(globals().get("_V328_APP_VERSION") or "Ver328") if _v328_resume else (
+                str(globals().get("_V327_APP_VERSION") or "Ver327") if _v327_resume else (
+                    str(globals().get("_V326_APP_VERSION") or "Ver326") if _ca_resume else str(_V231_APP_VERSION)
+                )
             )
         )
         _odds_only_resume = bool(job.get("odds_only") or False)
@@ -4346,26 +4359,30 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
                     limit_count,force_current,odds_only,done_count,total_count,current_label,message
                 ) VALUES ('batch_rerun',?,'running',?,?,?,?,?,?,?,?,?,?)
             """,(
-                _resume_ver,now,now,now,limit0,1 if _odds_only_resume else 0,
+                _resume_ver,now,now,now,limit0,0,1 if _odds_only_resume else 0,
                 done0,total0,str(job.get("current_label") or ""),
                 (
-                    f"Ver327 late_release {done0}/{total0}から手動再開（未処理のみ）"
-                    if _v327_resume else (
-                        f"Ver326 C-A {done0}/{total0}から手動再開（未処理のみ）"
-                        if _ca_resume else
-                        f"{done0}/{total0}から手動再開しました。"
+                    f"Ver328 {done0}/{total0}から手動再開（未処理のみ）"
+                    if _v328_resume else (
+                        f"Ver327 late_release {done0}/{total0}から手動再開（未処理のみ）"
+                        if _v327_resume else (
+                            f"Ver326 C-A {done0}/{total0}から手動再開（未処理のみ）"
+                            if _ca_resume else
+                            f"{done0}/{total0}から手動再開しました。"
+                        )
                     )
                 ),
             ))
             con.commit()
             new_jid=int(cur.lastrowid or 0)
 
-        # C-A / Ver327ジョブ再開時は worker 先頭で対応フラグを有効化
+        # C-A / Ver327 / Ver328 ジョブ再開時は worker 先頭で対応フラグを有効化
         globals()["_V326_CA_PENDING_FOR_WORKER"] = bool(_ca_resume)
         globals()["_V327_PENDING_FOR_WORKER"] = bool(_v327_resume)
+        globals()["_V328_PENDING_FOR_WORKER"] = bool(_v328_resume)
         th=threading.Thread(
             target=_v278_bg_worker,
-            args=(str(db_path),new_jid,limit0,False,done0,total0,False,_odds_only_resume),
+            args=(str(db_path),new_jid,limit0,False,done0,total0,False,bool(_odds_only_resume),bool(_v328_resume)),
             daemon=True,
             name=f"autorace-bg-rerun-manual-resume-{new_jid}",
         )
@@ -4378,6 +4395,7 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
             "done": done0,
             "total": total0,
             "enable_ca": bool(_ca_resume),
+            "enable_v328": bool(_v328_resume),
             "app_version": _resume_ver,
             "odds_only": bool(_odds_only_resume),
         }
@@ -5347,6 +5365,8 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
                     out["roi_no_odds"]+=1
                 elif "払戻" in _reason273:
                     out["roi_no_payout"]+=1
+            if len(out.get("roi_rows") or []) >= 30:
+                out["roi_rows"] = list(out["roi_rows"][-20:])
             out["roi_rows"].append({
                 "race": label,
                 "race_key": race_key,
@@ -12189,27 +12209,71 @@ def _v315_drop_kessha_rows(rows: pd.DataFrame, kessha: list[int]) -> pd.DataFram
 
 
 def _v319_detect_kessha_from_card_text(text: str) -> list[int]:
-    """出走表テキストから欠車・出走取消の車番を抽出。"""
+    """出走表テキストから欠車・出走取消の車番を抽出。
+
+    注意: 公式貼り付けには「車級」列の単独数字行（例: `1\t着順 ...`）が混ざる。
+    これを車番と誤認すると、直後の欠車行に引きずられて 1番が欠車になる。
+    選手行らしい文脈（選手名/LG、歳/期、ハンデ）があるときだけ採用する。
+    """
     s = str(text or "")
     if not s.strip():
         return []
     found: set[int] = set()
-    for m in re.finditer(
-        r"(?m)^(?:予想印\s*)?([1-8])\s*[\t\s]+[^\n]{0,80}\n[^\n]*欠車",
-        s,
-    ):
+
+    def _looks_like_player_line(line: str) -> bool:
+        t = str(line or "")
+        # 車級・成績行を除外
+        if re.match(r"^\s*[1-8]\s*[\t ]+着順", t):
+            return False
+        if re.search(r"2連\s*[\d.]+%|3連\s*[\d.]+%", t) and "ハンデ" not in t and "歳" not in t:
+            return False
+        # 選手行の手がかり
+        if re.search(r"\([^\)]*(浜松|伊勢崎|川口|飯塚|山陽|浜名|伊勢|船橋)\)", t):
+            return True
+        if re.search(r"\d+歳\s*/\s*\d+期", t):
+            return True
+        if "ハンデ" in t and re.search(r"ST\s*[\d.]+", t):
+            return True
+        # 印 + 車番 + 氏名（全角/半角スペース）
+        if re.match(r"^\s*(?:[◎○▲△×注]\s*)?[1-8]\s+\S{2,}", t) and "着順" not in t:
+            return True
+        if re.match(r"^\s*(?:予想印\s*)?[1-8]\t\S+", t) and "着順" not in t:
+            return True
+        return False
+
+    # 1) 車番行の直後〜数行以内に欠車（選手行のみ）
+    for m in re.finditer(r"(?m)^(.*)$", s):
+        pass  # placeholder no-op to keep structure clear
+
+    lines = s.splitlines()
+    for i, line in enumerate(lines):
+        if "欠車" not in line and "出走取消" not in line and "出走取り消し" not in line:
+            continue
+        # 同一行に車番と欠車
+        m_same = re.search(
+            r"(?:^|[\s　])(?:予想印\s*)?(?:[◎○▲△×注]\s*)?([1-8])\s*(?:番)?[^\n]{0,40}(?:欠車|出走取消|出走取り消し)",
+            line,
+        )
+        if m_same and _looks_like_player_line(line):
+            found.add(int(m_same.group(1)))
+            continue
+        # 直前1〜2行が選手行ならその車番
+        for back in (1, 2):
+            if i - back < 0:
+                break
+            prev = lines[i - back]
+            m_prev = re.match(
+                r"^\s*(?:予想印\s*)?(?:[◎○▲△×注]\s*)?([1-8])(?:\s|\t)+",
+                prev,
+            )
+            if m_prev and _looks_like_player_line(prev):
+                found.add(int(m_prev.group(1)))
+                break
+
+    # 2) 「3番 … 欠車」表記
+    for m in re.finditer(r"([1-8])\s*番[^\n]{0,40}(?:欠車|出走取消|出走取り消し)", s):
         found.add(int(m.group(1)))
-    for m in re.finditer(r"(?m)^(?:予想印\s*)?([1-8])\s*[\t\s]+[^\n]{0,60}欠車", s):
-        found.add(int(m.group(1)))
-    for m in re.finditer(r"([1-8])\s*番[^\n]{0,40}欠車", s):
-        found.add(int(m.group(1)))
-    for m in re.finditer(
-        r"(?m)^([1-8])\t[^\n]+\n(?:[^\n]*\n){0,3}[^\n]*欠車",
-        s,
-    ):
-        found.add(int(m.group(1)))
-    for m in re.finditer(r"(?m)^([1-8])\s+.*欠車", s):
-        found.add(int(m.group(1)))
+
     return sorted(found)
 
 
@@ -30981,6 +31045,48 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 st.rerun()
             else:
                 st.error(str(_started328.get("reason") or _started328))
+
+        # Ver236/237相当: 停止・手動再開（再シミュレーション画面と同じ制御）
+        _job328 = _v278_bg_get_latest_active(str(db_path)) if callable(globals().get("_v278_bg_get_latest_active")) else _v278_bg_get_job(str(db_path))
+        if not isinstance(_job328, dict):
+            _job328 = {}
+        _st328 = str(_job328.get("status") or "")
+        _jid328 = int(_job328.get("job_id") or 0)
+        _done328 = int(_job328.get("done_count") or 0)
+        _tot328 = int(_job328.get("total_count") or 0)
+        _ver328j = str(_job328.get("app_version") or "")
+        if _jid328 and _st328 in ("queued", "running", "pause_requested", "paused", "cancel_requested"):
+            st.info(
+                f"BGジョブ job={_jid328} ver={_ver328j} status={_st328} "
+                f"{_done328}/{_tot328 or '?'}｜{str(_job328.get('current_label') or '')}"
+            )
+            _c328a, _c328b, _c328c = st.columns(3)
+            with _c328a:
+                if st.button("⏹ 現在レース後に停止", key="v328_stop_job", use_container_width=True):
+                    _v278_bg_request_cancel(str(db_path), _jid328)
+                    st.success("停止要求を送信しました。現在レース終了後に停止します。")
+                    st.rerun()
+            with _c328b:
+                if st.button(
+                    f"▶ {_done328}/{_tot328 or '?'}から再開",
+                    key="v328_resume_job",
+                    use_container_width=True,
+                    disabled=_st328 in ("queued", "running") and _st328 != "cancel_requested",
+                ):
+                    _r328 = _v290_manual_resume_batch(str(db_path), _job328)
+                    if _r328.get("ok"):
+                        st.success(
+                            f"{int(_r328.get('done') or 0)}/{int(_r328.get('total') or 0)}から再開 "
+                            f"(job={_r328.get('job_id')} ver={_r328.get('app_version')})"
+                        )
+                        st.rerun()
+                    else:
+                        st.error("再開失敗: " + str(_r328.get("reason") or "不明"))
+            with _c328c:
+                if st.button("🔄 進捗更新", key="v328_refresh_job", use_container_width=True):
+                    st.rerun()
+            st.caption("停止後の再開は未処理のみ続行（force_current=False）。Ver328フラグも引き継ぎます。")
+
         _v328_last = st.session_state.get("v328_resim_last")
         if isinstance(_v328_last, dict):
             st.caption(
@@ -30993,6 +31099,7 @@ def _v215_render_return_dashboard(db_path: str) -> None:
             "評価: ペア周回量比で周2〜5が1.0に近づくか、周6が1.15超にならないか、"
             "三連単上位％がVer326対比で悪化しないかを見る。"
         )
+        st.caption("保存間隔: Ver236/237相当 約40Rごと（軽量GitHub保存＋GC）。")
 
     try:
         _stamp305fix=(str(db_path),Path(str(db_path)).stat().st_mtime_ns,"Ver305-rec-only-fix1")
