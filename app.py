@@ -125,8 +125,17 @@ def _v326_safe_prepare_simulation_arrays(df):
 
 
 try:
-    _V326_ORIG_PREPARE_SIMULATION_ARRAYS = engine.prepare_simulation_arrays
-    engine.prepare_simulation_arrays = _v326_safe_prepare_simulation_arrays
+    # Streamlit 再実行で多重ラップしない（入れ子 ValueError の原因）
+    if not getattr(engine, "_v326_prepare_sim_patched", False):
+        _V326_ORIG_PREPARE_SIMULATION_ARRAYS = engine.prepare_simulation_arrays
+        engine.prepare_simulation_arrays = _v326_safe_prepare_simulation_arrays
+        engine._v326_prepare_sim_patched = True
+    elif globals().get("_V326_ORIG_PREPARE_SIMULATION_ARRAYS") is None:
+        # 別ワーカー等でフラグだけ残った場合の保険
+        _V326_ORIG_PREPARE_SIMULATION_ARRAYS = getattr(
+            engine, "_v326_prepare_sim_orig", engine.prepare_simulation_arrays
+        )
+    engine._v326_prepare_sim_orig = globals().get("_V326_ORIG_PREPARE_SIMULATION_ARRAYS")
 except Exception as _v326_sim_patch_exc:
     _V326_ENGINE_SIM_PATCH_ERROR = f"{type(_v326_sim_patch_exc).__name__}: {_v326_sim_patch_exc}"
     try:
@@ -143,21 +152,32 @@ _V326_VER16_WRAP_ERROR = ""
 def _v326_safe_ver16_run_prediction(*args, **kwargs):
     try:
         return _V326_ORIG_VER16_RUN(*args, **kwargs)
+    except ValueError as exc:
+        # 既に整形済みなら再ラップしない（多重入れ子防止）
+        raise
     except Exception as exc:
         en = type(exc).__name__
         msg = str(exc)
         if "IntCasting" in en or "Cannot convert non-finite" in msg or "non-finite values" in msg:
+            # 原因は1段だけ残す（長い入れ子を作らない）
+            root = msg.split(" [")[0] if " [" in msg else msg
             raise ValueError(
                 "予測エンジン内部で数値欠損(NaN)が整数変換に入りました（通常はありえません）。"
                 "出走表の車番・試走T・ハンデ、または履歴結合を確認してください。"
-                f" [{en}: {msg}]"
-            ) from exc
+                f" [{en}: {root[:200]}]"
+            ) from None
         raise
 
 
 try:
-    _V326_ORIG_VER16_RUN = engine.ver16_run_prediction
-    engine.ver16_run_prediction = _v326_safe_ver16_run_prediction
+    # 再実行のたびにラップを重ねない
+    if not getattr(engine, "_v326_ver16_patched", False):
+        _V326_ORIG_VER16_RUN = engine.ver16_run_prediction
+        engine.ver16_run_prediction = _v326_safe_ver16_run_prediction
+        engine._v326_ver16_patched = True
+        engine._v326_ver16_orig = _V326_ORIG_VER16_RUN
+    else:
+        _V326_ORIG_VER16_RUN = getattr(engine, "_v326_ver16_orig", None) or globals().get("_V326_ORIG_VER16_RUN")
 except Exception as _v326_ver16_exc:
     _V326_VER16_WRAP_ERROR = f"{type(_v326_ver16_exc).__name__}: {_v326_ver16_exc}"
     try:
@@ -18642,7 +18662,7 @@ def _v319_import_one_race(
                     "message": (
                         f"{venue} {race_no}R：予測に失敗しました。"
                         f" オッズ入力と結果登録は実行していません。"
-                        f" ({pred.get('reason') or '不明'})"
+                        f" ({str(pred.get('reason') or '不明')[:300]})"
                         f"{hist_msg}"
                     ),
                     "key": key_guess,
@@ -18671,7 +18691,7 @@ def _v319_import_one_race(
                 "message": (
                     f"{venue} {race_no}R：予測に失敗しました。"
                     f" オッズ入力と結果登録は実行していません。"
-                    f" ({type(exc).__name__}: {exc})"
+                    f" ({type(exc).__name__}: {str(exc)[:300]})"
                     f"{hist_msg}"
                 ),
                 "key": key_guess,
