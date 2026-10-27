@@ -14745,10 +14745,21 @@ def _v319_synthesize_sprace_html_from_program(
         # parse_sprace_car_rows / parse_sprace_players の正規表現に合わせる
         # param= と href=playerCd= を同一 td 属性として並べ、</strong>(所属) を直結
         parts.append("<tr>")
+        # ST: startTime / start_time / st 系（無い場合のみ 0.00）
+        st_raw = p.get("startTime")
+        if st_raw is None:
+            st_raw = p.get("start_time")
+        if st_raw is None:
+            st_raw = p.get("st")
+        try:
+            st_f = float(st_raw)
+            st_s = f"{st_f:.2f}" if st_f == st_f else "0.00"
+        except Exception:
+            st_s = "0.00"
         parts.append(
             f'<td class="stcNameFull" param="{car}" '
             f'href="/autorace/SpPlayerDetail.do?playerCd={pcd}">'
-            f"<strong>{name}</strong>({lg}) {age_s} {hand_s}m/ST0.00 {kessha_span}</td>"
+            f"<strong>{name}</strong>({lg}) {age_s} {hand_s}m/ST{st_s} {kessha_span}</td>"
         )
         # parse_sprace_car_rows は name td 以降を tds[0]=短縮名, tds[1]=試走T/偏差 と読む
         short = re.sub(r"[\s　]+", "", name)[:3]
@@ -15103,6 +15114,91 @@ def _v319_validate_card_players(players: list, venue: str = "", race_no: int = 0
         )
 
 
+
+def _v319_fill_player_stats_from_history(db_path: str, player_name: str, before_ymd: str = "") -> dict:
+    """DB履歴から平均競走T・最高競走T・近10走・試走偏差(標本SD)を補完。"""
+    out = {"avg_r": "", "best_r": "", "finish10": "", "rate2": "", "rate3": "", "dev": "", "st": ""}
+    name = str(player_name or "").strip()
+    try:
+        name = _v319_norm_player_name(name)
+    except Exception:
+        pass
+    if not name or not db_path:
+        return out
+    ymd = re.sub(r"[^0-9]", "", str(before_ymd or ""))[:8]
+    try:
+        with sqlite3.connect(str(db_path), timeout=8.0) as con:
+            con.row_factory = sqlite3.Row
+            # result_entries 優先
+            q = """
+                SELECT re.finish, re.trial_time, re.race_time, re.start_time, rr.race_date
+                FROM result_entries re
+                JOIN result_races rr ON rr.race_key = re.race_key
+                WHERE REPLACE(REPLACE(COALESCE(re.player_name,''),'　',' '),' ','') LIKE ?
+            """
+            params = [f"%{name.replace(' ', '').replace('　', '')}%"]
+            if len(ymd) == 8:
+                q += " AND REPLACE(COALESCE(rr.race_date,''),'-','') < ?"
+                params.append(ymd)
+            q += " ORDER BY REPLACE(COALESCE(rr.race_date,''),'-','') DESC LIMIT 30"
+            rows = con.execute(q, params).fetchall()
+            if not rows:
+                return out
+            finishes = []
+            trials = []
+            races = []
+            sts = []
+            for r in rows:
+                try:
+                    f = r["finish"]
+                    if f is not None and str(f).strip() not in ("", "-", "欠車"):
+                        finishes.append(int(float(f)))
+                except Exception:
+                    pass
+                try:
+                    t = r["trial_time"]
+                    if t is not None and float(t) > 0:
+                        trials.append(float(t))
+                except Exception:
+                    pass
+                try:
+                    rt = r["race_time"]
+                    if rt is not None and float(rt) > 0:
+                        races.append(float(rt))
+                except Exception:
+                    pass
+                try:
+                    st = r["start_time"]
+                    if st is not None and float(st) > 0:
+                        sts.append(float(st))
+                except Exception:
+                    pass
+            # 近10走着別 1-2-3-4+
+            top = finishes[:10]
+            if top:
+                c1 = sum(1 for x in top if x == 1)
+                c2 = sum(1 for x in top if x == 2)
+                c3 = sum(1 for x in top if x == 3)
+                c4 = sum(1 for x in top if x >= 4)
+                out["finish10"] = f"{c1}-{c2}-{c3}-{c4}"
+                n = max(len(top), 1)
+                out["rate2"] = f"{(c1 + c2) * 100.0 / n:.1f}"
+                out["rate3"] = f"{(c1 + c2 + c3) * 100.0 / n:.1f}"
+            if races:
+                out["avg_r"] = f"{(sum(races)/len(races)):.3f}"
+                out["best_r"] = f"{min(races):.3f}"
+            if len(trials) >= 3:
+                mean = sum(trials) / len(trials)
+                var = sum((x - mean) ** 2 for x in trials) / max(len(trials) - 1, 1)
+                sd = var ** 0.5
+                out["dev"] = f"{sd:.3f}"
+            if sts:
+                out["st"] = f"{(sum(sts)/len(sts)):.2f}"
+    except Exception:
+        return out
+    return out
+
+
 def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int, ymd: str) -> str:
     raw = _v319_html_to_text(html)
     dm = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日(?:\([^)]+\))?)", raw)
@@ -15131,6 +15227,12 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
     if hm:
         _ = lines.append(f"湿度：{hm.group(1)}%")
     _ = lines.append("出走表")
+    # 履歴補完用 DB（取込時は engine.DB_PATH）
+    try:
+        _db_for_fill = str(getattr(engine, "DB_PATH", "") or "")
+    except Exception:
+        _db_for_fill = ""
+
     for p in cars:
         lg = p.get("lg") or venue
         name = p.get("name") or ""
@@ -15152,7 +15254,7 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
         except Exception:
             hand = "0"
             hand_filled = True
-        st = p.get("st") or ""
+        st = str(p.get("st") or "").strip()
         trial = str(p.get("trial") or "").strip()
         trial_filled = False
         if not re.match(r"^\d+\.\d+$", trial):
@@ -15163,6 +15265,33 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
                 )
             trial_filled = True
             trial = ""
+        # 欠損の任意項目を履歴から補完（試走偏差は特に重要）
+        _need_hist = (
+            not str(p.get("dev") or "").strip()
+            or not str(p.get("avg_r") or "").strip()
+            or not str(p.get("best_r") or "").strip()
+            or not str(p.get("finish10") or "").strip()
+            or st in ("", "-", "None", "0", "0.0", "0.00")
+        )
+        hist = {}
+        if _need_hist and _db_for_fill and name:
+            try:
+                hist = _v319_fill_player_stats_from_history(_db_for_fill, name, ymd)
+            except Exception:
+                hist = {}
+        dev = str(p.get("dev") or "").strip()
+        if not re.match(r"^0?\.\d+$", dev) and hist.get("dev"):
+            dev = str(hist["dev"])
+            _V319_LAST_CARD_FILL["dev_default"] = int(_V319_LAST_CARD_FILL.get("dev_default") or 0) + 1
+        if st in ("", "-", "None", "0", "0.0", "0.00") and hist.get("st"):
+            st = str(hist["st"])
+        avg_r = str(p.get("avg_r") or "").strip() or str(hist.get("avg_r") or "")
+        best_r = str(p.get("best_r") or "").strip() or str(hist.get("best_r") or "")
+        finish10 = str(p.get("finish10") or "").strip() or str(hist.get("finish10") or "")
+        rate2 = str(p.get("rate2") or "").strip() or str(hist.get("rate2") or "")
+        rate3 = str(p.get("rate3") or "").strip() or str(hist.get("rate3") or "")
+        rank = str(p.get("rank") or "").strip()
+
         if trial_filled:
             _V319_LAST_CARD_FILL["trial_default"] = int(
                 _V319_LAST_CARD_FILL.get("trial_default") or 0
@@ -15171,22 +15300,33 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
             _V319_LAST_CARD_FILL["hand_default"] = int(
                 _V319_LAST_CARD_FILL.get("hand_default") or 0
             ) + 1
-        _ = lines.append(f"ハンデ{hand}m/ST{(st if str(st).strip() not in ('', '-', 'None') else '0.00')}\t{trial}".rstrip())
-        if p.get("dev") or p.get("rank"):
-            _ = lines.append(f"{p.get('dev') or ''}\t{p.get('rank') or ''}".strip())
-        if p.get("avg_r") or p.get("best_r"):
-            bit = []
-            if p.get("avg_r"):
-                _ = bit.append(f"平均競走T {p['avg_r']}")
-            if p.get("best_r"):
-                _ = bit.append(f"最高競走T {p['best_r']}")
+
+        # エンジン parser が拾いやすい明示ラベル形式
+        st_out = st if str(st).strip() not in ("", "-", "None") else "0.00"
+        _ = lines.append(f"ハンデ{hand}m/ST{st_out}")
+        if trial:
+            # 「試 3.75 0.086」形式 → 試走T + 試走偏差を同時に拾わせる
+            if re.match(r"^0?\.\d+$", dev):
+                _ = lines.append(f"試 {trial} {dev}")
+            else:
+                _ = lines.append(f"試走T {trial}")
+                if dev:
+                    _ = lines.append(f"試走偏差 {dev}")
+        if rank:
+            _ = lines.append(rank)
+        bit = []
+        if avg_r:
+            bit.append(f"平均競走T {avg_r}")
+        if best_r:
+            bit.append(f"最高競走T {best_r}")
+        if bit:
             _ = lines.append(" ".join(bit))
-        if p.get("finish10"):
-            _ = lines.append(f"着順 {p['finish10']}")
-        if p.get("rate2"):
-            _ = lines.append(f"2連 {p['rate2']}%")
-        if p.get("rate3"):
-            _ = lines.append(f"3連 {p['rate3']}%")
+        if finish10:
+            _ = lines.append(f"着順 {finish10}")
+        if rate2:
+            _ = lines.append(f"2連 {rate2}%")
+        if rate3:
+            _ = lines.append(f"3連 {rate3}%")
         if p.get("car_name"):
             _ = lines.append(p["car_name"])
     return "\n".join([ln for ln in lines if ln is not None])
