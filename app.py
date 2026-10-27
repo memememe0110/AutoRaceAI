@@ -15136,7 +15136,9 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
         name = p.get("name") or ""
         _ = lines.append(f"{p.get('car')}\t{name}({lg})")
         if p.get("kessha"):
+            # 欠車は除外用に残し、数値行はエンジンに渡さない
             _ = lines.append("欠車")
+            continue
         if p.get("age"):
             _ = lines.append(p["age"])
         hand_raw = p.get("hand")
@@ -15169,7 +15171,7 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
             _V319_LAST_CARD_FILL["hand_default"] = int(
                 _V319_LAST_CARD_FILL.get("hand_default") or 0
             ) + 1
-        _ = lines.append(f"ハンデ{hand}m/ST{st or '-'}\t{trial}".rstrip())
+        _ = lines.append(f"ハンデ{hand}m/ST{(st if str(st).strip() not in ('', '-', 'None') else '0.00')}\t{trial}".rstrip())
         if p.get("dev") or p.get("rank"):
             _ = lines.append(f"{p.get('dev') or ''}\t{p.get('rank') or ''}".strip())
         if p.get("avg_r") or p.get("best_r"):

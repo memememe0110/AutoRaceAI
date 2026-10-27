@@ -5,6 +5,19 @@ from datetime import datetime, date
 from pathlib import Path
 import numpy as np
 import pandas as pd
+
+def _safe_rank_as_int(series, method="min", ascending=False):
+    """NaN混入でも IntCastingNaNError にしない順位化。"""
+    s = pd.to_numeric(series, errors="coerce")
+    if s.isna().all():
+        # 全部欠損 → 1..n を仮順位（予測継続可能にする）
+        return pd.Series(range(1, len(s) + 1), index=s.index, dtype=int)
+    r = s.rank(method=method, ascending=ascending)
+    # NaN 行は末尾順位
+    fill = float(r.max()) + 1.0 if r.notna().any() else 1.0
+    return r.fillna(fill).astype(int)
+
+
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.cell.cell import MergedCell
@@ -2064,7 +2077,7 @@ def calculate_excel_model(metrics, settings):
 
 def prepare_simulation_arrays(df):
     """Ver7.2: 近況好調を実戦展開へ強く反映する配列。"""
-    cars = df["車"].astype(int).to_numpy()
+    cars = pd.to_numeric(df["車"], errors="coerce").fillna(-1).astype(int).to_numpy()
     handicap = pd.to_numeric(df["ハンデ"], errors="coerce").fillna(0.0).to_numpy(float)
     st = pd.to_numeric(df["平均ST"], errors="coerce").fillna(0.20).clip(0.06, 0.40).to_numpy(float)
     st_std = pd.to_numeric(df.get("ST標準偏差", pd.Series(0.045, index=df.index)), errors="coerce").fillna(0.045).clip(0.015, 0.12).to_numpy(float)
@@ -5964,7 +5977,7 @@ def v24_apply_race_context_bonus(df, entries=None, track_temp=30.0):
 
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + total
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        out["改善後順位"] = _safe_rank_as_int(out["改善後総合点"], method="min", ascending=False)
     # シミュレーションが参照する当日指数にも小さく反映。二重加点を避けて0.35倍。
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + total * 0.35
@@ -6132,7 +6145,7 @@ def v25_player_condition_affinity(df, entries=None, meta=None, db_path=DB_PATH):
     out["条件適性信頼度"] = confidences
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0)+bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        out["改善後順位"] = _safe_rank_as_int(out["改善後総合点"], method="min", ascending=False)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0)+bonus*.42
     if "予測競走T" in out.columns:
@@ -6304,7 +6317,7 @@ def v59_apply_escape_history(df, entries=None, meta=None, db_path=None):
     bonus_s = pd.to_numeric(out["逃げ履歴補正"], errors="coerce").fillna(0.0)
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus_s
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        out["改善後順位"] = _safe_rank_as_int(out["改善後総合点"], method="min", ascending=False)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus_s * 0.34
     if "予測競走T" in out.columns:
@@ -6487,7 +6500,7 @@ def v60_apply_lap_and_heat_learning(df, entries=None, meta=None, db_path=None):
     bonus=pd.to_numeric(out["Ver60総合補正"],errors="coerce").fillna(0.0)
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"],errors="coerce").fillna(0.0)+bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min",ascending=False).astype(int)
+        out["改善後順位"] = _safe_rank_as_int(out["改善後総合点"], method="min", ascending=False)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"],errors="coerce").fillna(50.0)+bonus*0.42
     if "予測競走T" in out.columns:
@@ -8135,13 +8148,13 @@ def v39_apply_adaptive_weights(df, db_path=DB_PATH):
     features=v39_feature_frame(df)
     base=pd.to_numeric(df.get("改善後総合点",pd.Series(0,index=df.index)),errors="coerce").fillna(0.0)
     df["調整前総合点"]=base
-    df["調整前順位"]=base.rank(method="min",ascending=False).astype(int)
+    df["調整前順位"]=_safe_rank_as_int(base, method="min", ascending=False)
     centered=sum(weights[k]*(features[k]-.5) for k in V39_DEFAULT_WEIGHTS)
     # 最大でも概ね±2点。元モデルを壊さず、蓄積データで少しずつ方向修正する。
     bonus=(centered*4.0).clip(-2.0,2.0)
     df["学習重み補正"]=bonus
     df["改善後総合点"]=base+bonus
-    df["改善後順位"]=df["改善後総合点"].rank(method="min",ascending=False).astype(int)
+    df["改善後順位"] = _safe_rank_as_int(df["改善後総合点"], method="min", ascending=False)
     for k in V39_DEFAULT_WEIGHTS:
         df[f"学習特徴_{k}"]=features[k]
     return df
@@ -8371,14 +8384,14 @@ def v40_apply_adaptive_weights(df, db_path=DB_PATH):
     features = v40_feature_frame(df)
     base = pd.to_numeric(df.get("改善後総合点", pd.Series(0, index=df.index)), errors="coerce").fillna(0.0)
     df["調整前総合点"] = base
-    df["調整前順位"] = base.rank(method="min", ascending=False).astype(int)
+    df["調整前順位"] = _safe_rank_as_int(base, method="min", ascending=False)
 
     centered = sum(weights[k] * (features[k] - 0.5) for k in V40_DEFAULT_WEIGHTS)
     # 追加評価は元モデルを破壊しない範囲。最大およそ±3点。
     bonus = (centered * 6.0).clip(-3.0, 3.0)
     df["学習重み補正"] = bonus
     df["改善後総合点"] = base + bonus
-    df["改善後順位"] = df["改善後総合点"].rank(method="min", ascending=False).astype(int)
+    df["改善後順位"] = _safe_rank_as_int(df["改善後総合点"], method="min", ascending=False)
     for k in V40_DEFAULT_WEIGHTS:
         df[f"学習特徴_{k}"] = features[k]
 
@@ -9818,8 +9831,8 @@ def v50_trifecta_weight_impact(df, limit=20):
     for combo in set(b)|set(a):
         rows.append({"組み合わせ":combo,"調整前確率":b.get(combo,0.0),"調整後確率":a.get(combo,0.0),"確率変化":a.get(combo,0.0)-b.get(combo,0.0)})
     frame=pd.DataFrame(rows)
-    frame["上昇幅順位"] = frame["確率変化"].rank(method="min", ascending=False).astype(int)
-    frame["調整後順位"] = frame["調整後確率"].rank(method="min", ascending=False).astype(int)
+    frame["上昇幅順位"] = _safe_rank_as_int(frame["確率変化"], method="min", ascending=False)
+    frame["調整後順位"] = _safe_rank_as_int(frame["調整後確率"], method="min", ascending=False)
     return frame.sort_values(["確率変化","調整後確率"], ascending=False).head(int(limit)).reset_index(drop=True)
 
 
@@ -11067,7 +11080,7 @@ def v24_apply_race_context_bonus(df, entries=None, track_temp=30.0):
     out["近10走勢い補正"] = np.round(bonus, 3)
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        out["改善後順位"] = _safe_rank_as_int(out["改善後総合点"], method="min", ascending=False)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.30
     if "予測競走T" in out.columns:
@@ -11287,7 +11300,7 @@ def v65_apply_weather_condition_learning(df, entries=None, meta=None, db_path=No
     out["天候適性根拠"] = reasons
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        out["改善後順位"] = _safe_rank_as_int(out["改善後総合点"], method="min", ascending=False)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.38
     if "予測競走T" in out.columns:
@@ -12095,7 +12108,7 @@ def _v74_metrics(df, weights):
         for name,col in _V74_COLMAP.items():
             score += w[name] * pd.to_numeric(g[col], errors='coerce').fillna(.5).to_numpy(float)
         g['_score']=score
-        g['_pred_rank']=g['_score'].rank(method='min', ascending=False).astype(int)
+        g['_pred_rank']=_safe_rank_as_int(g['_score'], method='min', ascending=False)
         g['_actual_rank']=pd.to_numeric(g['finish'], errors='coerce').astype(int)
         n=max(1,len(g))
         winner=g.sort_values('_actual_rank').iloc[0]
@@ -12956,7 +12969,7 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
     ] * n
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        out["改善後順位"] = _safe_rank_as_int(out["改善後総合点"], method="min", ascending=False)
     if "当日レース指数" in out.columns:
         out["当日レース指数"] = pd.to_numeric(out["当日レース指数"], errors="coerce").fillna(50.0) + bonus * 0.40
     if "予測競走T" in out.columns:
@@ -13588,7 +13601,7 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
 
     if "改善後総合点" in out.columns:
         out["開催場補正前総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0)
-        out["開催場補正前順位"] = out["開催場補正前総合点"].rank(method="min", ascending=False).astype(int)
+        out["開催場補正前順位"] = _safe_rank_as_int(out["開催場補正前総合点"], method="min", ascending=False)
     if "予測競走T" in out.columns:
         out["開催場補正前予測T"] = pd.to_numeric(out["予測競走T"], errors="coerce")
 
@@ -13638,7 +13651,7 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
 
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = out["開催場補正前総合点"] + bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        out["改善後順位"] = _safe_rank_as_int(out["改善後総合点"], method="min", ascending=False)
         out["開催場補正後総合点"] = out["改善後総合点"]
         out["開催場補正後順位"] = out["改善後順位"]
         out["開催場順位変化"] = out["開催場補正前順位"] - out["開催場補正後順位"]
@@ -13938,7 +13951,7 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
     # 旧補正に追加し、最終列を更新。
     if "改善後総合点" in out.columns:
         out["改善後総合点"] = pd.to_numeric(out["改善後総合点"], errors="coerce").fillna(0.0) + total_extra_bonus
-        out["改善後順位"] = out["改善後総合点"].rank(method="min", ascending=False).astype(int)
+        out["改善後順位"] = _safe_rank_as_int(out["改善後総合点"], method="min", ascending=False)
         out["開催場補正後総合点"] = out["改善後総合点"]
         out["開催場補正後順位"] = out["改善後順位"]
         if "開催場補正前順位" in out.columns:
