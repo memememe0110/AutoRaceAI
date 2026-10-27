@@ -10980,13 +10980,36 @@ def v152_parse_entry_block(block):
         row["ハンデ"] = 0 if hs.group(1) == "-" else int(hs.group(1))
         row["ST"] = float(hs.group(2))
         row["試走T"] = np.nan if hs.group(3) == "-" else float(hs.group(3))
+    else:
+        # 「ハンデ0m/ST0.13」と「試 3.41」が別トークンの形式
+        hs2 = re.search(
+            r"ハンデ\s*([+-]?\d+|-)\s*m\s*/\s*ST\s*([+-]?\d?\.\d{2,3})",
+            compact, re.I,
+        )
+        if hs2:
+            row["ハンデ"] = 0 if hs2.group(1) == "-" else int(hs2.group(1))
+            row["ST"] = float(hs2.group(2))
+        tm_lab = re.search(
+            r"(?:試走T|試)\s*(?:再|再試)?\s*([3-9]\.\d{2,3})",
+            compact, re.I,
+        )
+        if tm_lab and (row.get("試走T") is None or (isinstance(row.get("試走T"), float) and pd.isna(row.get("試走T")))):
+            row["試走T"] = float(tm_lab.group(1))
 
     # 試走偏差と現ランクが同じ行に並ぶ形式。「0.087 B-135」
-    dev_rank = re.search(r"(?:^|\s)(0\.\d{3})\s+([SAB]-\d+)(?:\s|$)", compact)
+    dev_rank = re.search(r"(?:^|\s)(0\.\d{2,3})\s+([SAB]-\d+)(?:\s|$)", compact)
     if dev_rank:
         row["試走偏差"] = float(dev_rank.group(1))
         row["現ランク"] = dev_rank.group(2)
         row["級別"] = dev_rank.group(2).split("-")[0]
+    else:
+        # 「試 3.41 0.086」や「試走偏差 0.086」
+        dm2 = re.search(
+            r"(?:試\s*[3-9]\.\d{2,3}\s+|試走偏差\s*)(0\.\d{2,3})",
+            compact,
+        )
+        if dm2 and (row.get("試走偏差") is None or (isinstance(row.get("試走偏差"), float) and pd.isna(row.get("試走偏差")))):
+            row["試走偏差"] = float(dm2.group(1))
 
     prev = re.search(r"\(前\s*([SAB]-\d+)\)", compact)
     if prev:

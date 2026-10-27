@@ -14725,13 +14725,23 @@ def _v319_synthesize_sprace_html_from_program(
             trial = ""  # 欠車のみ空許容
             n_trial_def += 1
         dev_raw = str(p.get("raceDev") or "").strip()
-        # raceDev は "081" 形式 → 0.81 目安
-        if dev_raw.isdigit() and len(dev_raw) >= 2:
-            dev = f"0.{dev_raw[-2:]}"
+        # raceDev は "081" / "86" / "0.086" → 試走偏差 0.086 形式（3桁）
+        if re.match(r"^0\.\d{2,3}$", dev_raw):
+            # 既に 0.xx
+            dev = f"{float(dev_raw):.3f}"
+        elif dev_raw.isdigit():
+            # 3桁なら千分率（081→0.081）、2桁なら百分率の可能性低いので千分率扱い
+            if len(dev_raw) >= 3:
+                dev = f"{int(dev_raw[-3:]) / 1000.0:.3f}"
+            else:
+                dev = f"{int(dev_raw) / 1000.0:.3f}"
         else:
             if not dev_raw:
                 n_dev_def += 1
-            dev = dev_raw or "0.00"
+            try:
+                dev = f"{float(dev_raw):.3f}"
+            except Exception:
+                dev = ""
         rank = str(p.get("rank") or "")
         rate2 = str(p.get("rate2") or "")
         rate3 = str(p.get("rate3") or "")
@@ -15129,7 +15139,15 @@ def _v319_fill_player_stats_from_history(db_path: str, player_name: str, before_
     try:
         with sqlite3.connect(str(db_path), timeout=8.0) as con:
             con.row_factory = sqlite3.Row
-            # result_entries 優先
+            # テーブル未作成の起動直後でも落とさない
+            try:
+                tabs = {str(r[0]) for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+            except Exception:
+                tabs = set()
+            if "result_entries" not in tabs or "result_races" not in tabs:
+                return out
             q = """
                 SELECT re.finish, re.trial_time, re.race_time, re.start_time, rr.race_date
                 FROM result_entries re
@@ -15301,18 +15319,25 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
                 _V319_LAST_CARD_FILL.get("hand_default") or 0
             ) + 1
 
-        # エンジン parser が拾いやすい明示ラベル形式
+        # 公式と同じ形: 「ハンデ0m/ST0.13\t3.41」→「0.086\tB-110」
+        # Ver64 パーサ（ST直後の試走T / 0.xxx ランク）が確実に拾う
         st_out = st if str(st).strip() not in ("", "-", "None") else "0.00"
-        _ = lines.append(f"ハンデ{hand}m/ST{st_out}")
         if trial:
-            # 「試 3.75 0.086」形式 → 試走T + 試走偏差を同時に拾わせる
-            if re.match(r"^0?\.\d+$", dev):
-                _ = lines.append(f"試 {trial} {dev}")
-            else:
-                _ = lines.append(f"試走T {trial}")
-                if dev:
-                    _ = lines.append(f"試走偏差 {dev}")
-        if rank:
+            _ = lines.append(f"ハンデ{hand}m/ST{st_out}\t{trial}")
+        else:
+            _ = lines.append(f"ハンデ{hand}m/ST{st_out}")
+        # 偏差は必ず 0.xxx（3桁）。ランクと同行列
+        dev_out = ""
+        if re.match(r"^0?\.\d+$", str(dev or "")):
+            try:
+                dev_out = f"{float(dev):.3f}"
+            except Exception:
+                dev_out = ""
+        if dev_out and rank:
+            _ = lines.append(f"{dev_out}\t{rank}")
+        elif dev_out:
+            _ = lines.append(dev_out)
+        elif rank:
             _ = lines.append(rank)
         bit = []
         if avg_r:
@@ -17531,6 +17556,13 @@ def _v319_clear_prediction(db_path: str, race_key: str) -> None:
 
 def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719, raw_text: str = "", manual_excluded: list | None = None) -> dict:
     """出走表（SP）があればそれを使い、なければ結果のレース前項目だけで予測する。"""
+    # 取込経路の OOM 低減（本線手動予測の既定20kは UI 側。ここは上限キャップ）
+    try:
+        _cap = int(globals().get("_V314_RESIM_TRIALS_CAP") or 8000)
+        if _cap > 0:
+            trials = max(1000, min(int(trials or 8000), _cap))
+    except Exception:
+        trials = min(int(trials or 8000), 8000)
     text = str(raw_text or "").strip()
     audit = {"source": "sprace"} if text else {}
     if not text:
@@ -18620,6 +18652,13 @@ def _v319_import_one_race(
         except Exception:
             return False
 
+    def _gc_soft() -> None:
+        try:
+            import gc as _gc_imp
+            _gc_imp.collect()
+        except Exception:
+            pass
+
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     venue = str(venue or "").strip()
     race_no = int(race_no)
@@ -18750,6 +18789,7 @@ def _v319_import_one_race(
             "next_action": "retry",
         }
 
+    _gc_soft()
     # --- 3) 予測（未保存時）＋出走数不一致／版違いなら再予測 ---
     pred_ok = _v319_prediction_exists(db_path, key_guess)
     card_n = len(players or [])
@@ -18899,6 +18939,7 @@ def _v319_import_one_race(
             }
     else:
         _step("オッズ")
+    _gc_soft()
     void_peek_raw = ""
     if fetch_odds:
         try:
