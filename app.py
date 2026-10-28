@@ -13648,6 +13648,58 @@ def _v319_html_to_text(html: str) -> str:
     return html
 
 
+# 公式APIセッション（CSRF+cookie）を再利用して取込を高速化
+_V319_AR_SESSION: dict = {
+    "opener": None,
+    "token": "",
+    "page_url": "",
+    "slug": "",
+    "fetched_at": 0.0,
+}
+_V319_AR_PROGRAM_CACHE: dict = {}  # (ymd, venue, race_no) -> body
+_V319_AR_SESSION_TTL = 300.0  # 秒
+
+
+def _v319_autorace_session_get(slug: str, date_s: str, race_no: int, timeout: int = 15):
+    """CSRF付き opener を取得（TTL内は再利用）。"""
+    import time as _t
+    global _V319_AR_SESSION
+    now = _t.time()
+    sess = _V319_AR_SESSION
+    page_url = f"https://autorace.jp/race_info/Odds/{slug}/{date_s}_{int(race_no)}/pop"
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+    reuse = (
+        sess.get("opener") is not None
+        and str(sess.get("token") or "")
+        and str(sess.get("slug") or "") == str(slug)
+        and (now - float(sess.get("fetched_at") or 0.0)) < float(_V319_AR_SESSION_TTL)
+    )
+    if reuse:
+        return sess["opener"], sess["token"], sess.get("page_url") or page_url, ua
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    page = opener.open(
+        urllib.request.Request(page_url, headers={"User-Agent": ua}),
+        timeout=min(15, int(timeout or 15)),
+    ).read().decode("utf-8", "replace")
+    token_m = re.search(r'csrf-token" content="([^"]+)"', page)
+    token = token_m.group(1) if token_m else ""
+    if not token:
+        raise RuntimeError("autorace CSRF token missing")
+    _V319_AR_SESSION = {
+        "opener": opener,
+        "token": token,
+        "page_url": page_url,
+        "slug": str(slug),
+        "fetched_at": now,
+    }
+    return opener, token, page_url, ua
+
+
 def _v319_autorace_api_post(
     path: str,
     ymd: str,
@@ -13655,9 +13707,9 @@ def _v319_autorace_api_post(
     race_no: int = 1,
     timeout: int = 20,
 ) -> dict | None:
-    """autorace.jp 公式 JSON API（Odds / Program / RaceResult 共通）。
+    """autorace.jp 公式 JSON API（Odds / Program / RaceResult / OtherRaceInfo 共通）。
 
-    CSRF付きPOST。失敗時は None。
+    CSRFセッションを再利用。失敗時は None。
     """
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     code = _V319_AR_PLACE_CODE.get(str(venue) or "")
@@ -13668,24 +13720,17 @@ def _v319_autorace_api_post(
     path = str(path or "").strip()
     if not path.startswith("/"):
         path = "/" + path
-    # Odds ページから CSRF を取る（どの API でも同じトークン体系）
-    page_url = f"https://autorace.jp/race_info/Odds/{slug}/{date_s}_{int(race_no)}/pop"
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    ua = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+    # Program はレース単位で短時間キャッシュ（同一Rの多重取得を防ぐ）
+    if path.rstrip("/") == "/race_info/Program":
+        ck = (ymd, str(venue), int(race_no))
+        if ck in _V319_AR_PROGRAM_CACHE:
+            return _V319_AR_PROGRAM_CACHE[ck]
     try:
-        page = opener.open(
-            urllib.request.Request(page_url, headers={"User-Agent": ua}),
-            timeout=min(15, int(timeout or 20)),
-        ).read().decode("utf-8", "replace")
+        opener, token, page_url, ua = _v319_autorace_session_get(
+            slug, date_s, int(race_no), timeout=min(15, int(timeout or 20))
+        )
     except Exception:
         return None
-    token_m = re.search(r'csrf-token" content="([^"]+)"', page)
-    token = token_m.group(1) if token_m else ""
     payload = json.dumps(
         {"placeCode": int(code), "raceDate": date_s, "raceNo": int(race_no)}
     ).encode("utf-8")
@@ -13709,11 +13754,49 @@ def _v319_autorace_api_post(
         )
         data = json.loads(raw)
     except Exception:
-        return None
+        # セッション失効時は1回だけ張り直す
+        try:
+            global _V319_AR_SESSION
+            _V319_AR_SESSION = {
+                "opener": None, "token": "", "page_url": "", "slug": "", "fetched_at": 0.0
+            }
+            opener, token, page_url, ua = _v319_autorace_session_get(
+                slug, date_s, int(race_no), timeout=min(15, int(timeout or 20))
+            )
+            req = urllib.request.Request(
+                f"https://autorace.jp{path}",
+                data=payload,
+                headers={
+                    "User-Agent": ua,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "X-CSRF-TOKEN": token,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": page_url,
+                    "Origin": "https://autorace.jp",
+                },
+                method="POST",
+            )
+            raw = opener.open(req, timeout=max(5, int(timeout or 20))).read().decode(
+                "utf-8", "replace"
+            )
+            data = json.loads(raw)
+        except Exception:
+            return None
     if str(data.get("result") or "") != "Success":
         return None
     body = data.get("body")
-    return body if isinstance(body, dict) else None
+    if not isinstance(body, dict):
+        return None
+    if path.rstrip("/") == "/race_info/Program":
+        _V319_AR_PROGRAM_CACHE[(ymd, str(venue), int(race_no))] = body
+        # キャッシュ肥大防止
+        if len(_V319_AR_PROGRAM_CACHE) > 40:
+            try:
+                _V319_AR_PROGRAM_CACHE.pop(next(iter(_V319_AR_PROGRAM_CACHE)))
+            except Exception:
+                _V319_AR_PROGRAM_CACHE.clear()
+    return body
 
 
 
@@ -18964,6 +19047,14 @@ def _v319_import_one_race(
         except Exception:
             pass
 
+    # 取込の予測 trials 上限（1Rあたりの時間を抑える）
+    try:
+        _cap = int(globals().get("_V314_RESIM_TRIALS_CAP") or 8000)
+        if _cap > 0:
+            trials = max(1000, min(int(trials or 8000), _cap))
+    except Exception:
+        trials = min(int(trials or 8000), 8000)
+
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     venue = str(venue or "").strip()
     race_no = int(race_no)
@@ -19196,11 +19287,27 @@ def _v319_import_one_race(
                 "key": key_guess,
                 "next_action": "cancelled",
             }
-        filled = _v319_fill_player_histories(
-            db_path, players, min_rows=30,
-            before_ymd=ymd, before_venue=venue, before_race=race_no,
-            cancel_cb=cancel_cb,
-        )
+        # 公式近10走保存後、全員が十分な履歴を持っていれば HTTP 履歴取得を省略
+        _fast_hist = False
+        try:
+            _names_chk0 = [
+                str(p.get("name") or "").strip()
+                for p in (players or [])
+                if str(p.get("name") or "").strip()
+            ]
+            if _names_chk0:
+                _cnt0 = _v319_player_history_counts_batch(db_path, _names_chk0)
+                _fast_hist = all(int(_cnt0.get(nm) or 0) >= 15 for nm in _names_chk0)
+        except Exception:
+            _fast_hist = False
+        if _fast_hist:
+            filled = {"added": 0, "skipped": len(players or []), "errors": 0, "details": ["充足スキップ(公式近10走済)"]}
+        else:
+            filled = _v319_fill_player_histories(
+                db_path, players, min_rows=30,
+                before_ymd=ymd, before_venue=venue, before_race=race_no,
+                cancel_cb=cancel_cb,
+            )
         if filled.get("cancelled"):
             return {
                 "status": "cancelled",
