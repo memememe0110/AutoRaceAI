@@ -13716,6 +13716,365 @@ def _v319_autorace_api_post(
     return body if isinstance(body, dict) else None
 
 
+
+_V319_AR_PLACE_CODE_REV = {v: k for k, v in _V319_AR_PLACE_CODE.items()}
+
+
+
+_V319_SITUATION_CODE = {
+    0: "良",
+    1: "斑",
+    2: "湿",
+    3: "風",
+    4: "良",
+    5: "斑",
+}
+
+
+def _v319_autorace_other_race_info(ymd: str, venue: str, race_no: int) -> dict | None:
+    """公式 OtherRaceInfo（天候・気温・湿度・走路温度・レース名など）。"""
+    body = _v319_autorace_api_post("/race_info/OtherRaceInfo", ymd, venue, int(race_no))
+    return body if isinstance(body, dict) else None
+
+
+def _v319_other_info_to_meta_lines(info: dict) -> list[str]:
+    """OtherRaceInfo → 予測テキスト用メタ行（実データのみ、捏造なし）。"""
+    if not isinstance(info, dict):
+        return []
+    lines = []
+    title = str(info.get("title") or "").strip()
+    race_name = str(info.get("raceName") or "").strip()
+    grade = str(info.get("gradeName") or "").strip()
+    try:
+        dist = int(info.get("distance") or 0)
+    except Exception:
+        dist = 0
+    try:
+        rn = int(info.get("raceNo") or 0)
+    except Exception:
+        rn = 0
+    start_t = str(info.get("raceStartTime") or "").strip()
+    # レース単位の天候・気温を優先（race*）、無ければ開催単位
+    weather = str(info.get("raceWeather") or info.get("weather") or "").strip()
+    try:
+        sit = int(info.get("raceSituationCode") if info.get("raceSituationCode") is not None else info.get("situationCode"))
+    except Exception:
+        sit = None
+    surf = _V319_SITUATION_CODE.get(sit, "") if sit is not None else ""
+    temp = info.get("raceTemp") if info.get("raceTemp") not in (None, "") else info.get("temp")
+    humid = info.get("raceHumid") if info.get("raceHumid") not in (None, "") else info.get("humid")
+    road = info.get("raceRoadtemp") if info.get("raceRoadtemp") not in (None, "") else info.get("roadtemp")
+    place = str(info.get("placeName") or "").strip()
+    day = info.get("paragraphday")
+
+    if title:
+        lines.append(title)
+    head = []
+    if rn:
+        head.append(f"{rn}R")
+    if race_name:
+        head.append(race_name)
+    if dist:
+        head.append(f"{dist}m")
+    if grade:
+        head.append(grade)
+    if head:
+        lines.append(" ".join(head))
+    if start_t:
+        lines.append(f"{start_t}発走")
+    if day not in (None, ""):
+        try:
+            lines.append(f"{int(day)}日目")
+        except Exception:
+            pass
+    # 走路 / 温度
+    surf_s = f"{surf}走路" if surf else ""
+    if surf_s and road not in (None, ""):
+        lines.append(f"{surf_s} /{road}℃")
+    elif surf_s:
+        lines.append(surf_s)
+    elif road not in (None, ""):
+        lines.append(f"走路温度：{road}℃")
+    if weather:
+        lines.append(weather)
+    if temp not in (None, ""):
+        lines.append(f"気温：{temp}℃")
+    if humid not in (None, ""):
+        lines.append(f"湿度：{humid}%")
+    return lines
+
+
+def _v319_autorace_program_body(ymd: str, venue: str, race_no: int) -> dict | None:
+    """公式 Program API body（playerList + latest10List 等）。"""
+    return _v319_autorace_api_post("/race_info/Program", ymd, venue, int(race_no))
+
+
+def _v319_autorace_profile_body(player_cd: str, venue: str = "川口") -> dict | None:
+    """公式 Profile API（選手詳細・直近5走）。venue は CSRF 用の参照ページに使う。"""
+    pcd = str(player_cd or "").strip()
+    if not pcd:
+        return None
+    # Profile は placeCode 不要だが CSRF 取得に Odds ページが必要なので
+    # 既存 API POST を流用できない。専用実装。
+    slug = _V319_AR_PLACE_SLUG.get(str(venue) or "") or "kawaguchi"
+    ymd = __import__("datetime").datetime.now().strftime("%Y-%m-%d")
+    page_url = f"https://autorace.jp/race_info/Player/{slug}/{pcd}"
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+    try:
+        page = opener.open(
+            urllib.request.Request(page_url, headers={"User-Agent": ua}),
+            timeout=15,
+        ).read().decode("utf-8", "replace")
+    except Exception:
+        # フォールバック: Odds ページ
+        try:
+            page_url = f"https://autorace.jp/race_info/Odds/{slug}/{ymd}_1/pop"
+            page = opener.open(
+                urllib.request.Request(page_url, headers={"User-Agent": ua}),
+                timeout=15,
+            ).read().decode("utf-8", "replace")
+        except Exception:
+            return None
+    token_m = re.search(r'csrf-token" content="([^"]+)"', page)
+    token = token_m.group(1) if token_m else ""
+    payload = json.dumps({"playerCode": str(pcd)}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://autorace.jp/race_info/Profile",
+        data=payload,
+        headers={
+            "User-Agent": ua,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-CSRF-TOKEN": token,
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": page_url,
+            "Origin": "https://autorace.jp",
+        },
+        method="POST",
+    )
+    try:
+        raw = opener.open(req, timeout=20).read().decode("utf-8", "replace")
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if str(data.get("result") or "") != "Success":
+        return None
+    body = data.get("body")
+    return body if isinstance(body, dict) else None
+
+
+def _v319_program_players_from_body(body: dict, venue: str = "") -> list[dict]:
+    """Program body → 内部 players 形式。"""
+    if not isinstance(body, dict):
+        return []
+    # Odds 由来の stAve を後でマージできるよう code→stAve
+    out = []
+    for p in body.get("playerList") or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            car = int(p.get("carNo") or 0)
+        except Exception:
+            car = 0
+        if car < 1:
+            continue
+        name = str(p.get("playerName") or "").strip()
+        pcd = str(p.get("playerCode") or "").strip()
+        lg = re.sub(r"\s+", "", str(p.get("placeName") or venue or ""))
+        age = p.get("age")
+        grad = p.get("graduationCode")
+        age_s = f"{age}歳/{grad}期" if age is not None and grad else ""
+        hand = p.get("handicap")
+        try:
+            hand_s = str(int(float(hand))) if hand is not None and str(hand).strip() not in ("", "-") else "0"
+        except Exception:
+            hand_s = "0"
+        trial = str(p.get("trialRunTime") or p.get("trialTime") or "").strip()
+        # raceDev: "097" → 0.097
+        dev_raw = str(p.get("raceDev") or "").strip()
+        dev = ""
+        if re.match(r"^0\.\d{2,3}$", dev_raw):
+            try:
+                dev = f"{float(dev_raw):.3f}"
+            except Exception:
+                dev = dev_raw
+        elif dev_raw.isdigit():
+            try:
+                if len(dev_raw) >= 3:
+                    dev = f"{int(dev_raw[-3:]) / 1000.0:.3f}"
+                else:
+                    dev = f"{int(dev_raw) / 1000.0:.3f}"
+            except Exception:
+                dev = ""
+        rank = str(p.get("rank") or "").strip()
+        rate2 = str(p.get("rate2") or "").strip()
+        rate3 = str(p.get("rate3") or "").strip()
+        bike = str(p.get("bikeName") or "").strip()
+        absent = p.get("absent")
+        is_kessha = absent not in (None, "", 0, "0", False)
+        # 当日STのみ（stAve等の別指標で埋めない）
+        st = str(p.get("stTime") or p.get("startTime") or p.get("st") or "").strip()
+        out.append({
+            "car": car,
+            "player_cd": pcd,
+            "name": name,
+            "lg": lg,
+            "age": age_s,
+            "hand": hand_s,
+            "st": st,
+            "trial": trial,
+            "dev": dev,
+            "rank": rank,
+            "avg_r": "",
+            "best_r": "",
+            "finish10": "",
+            "rate2": rate2,
+            "rate3": rate3,
+            "car_name": bike,
+            "name_key": _v319_norm_player_name(name),
+            "kessha": bool(is_kessha),
+        })
+    # latest90 から平均競走T等
+    l90 = body.get("latest90List") or {}
+    if isinstance(l90, dict):
+        by_cd = {str(p.get("player_cd")): p for p in out}
+        for pcd, stats in l90.items():
+            if not isinstance(stats, dict):
+                continue
+            pl = by_cd.get(str(pcd))
+            if not pl:
+                continue
+            if stats.get("goodTrackRaceAve"):
+                pl["avg_r"] = str(stats.get("goodTrackRaceAve"))
+            if stats.get("goodTrackRaceBest"):
+                pl["best_r"] = str(stats.get("goodTrackRaceBest"))
+            # 近10走着別
+            oc = stats.get("latest10OrderCount") or {}
+            if isinstance(oc, dict) and any(str(oc.get(x) or "") for x in ("1", "2", "3", "ohter")):
+                try:
+                    c1 = int(oc.get("1") or 0)
+                    c2 = int(oc.get("2") or 0)
+                    c3 = int(oc.get("3") or 0)
+                    c4 = int(oc.get("ohter") or oc.get("other") or 0)
+                    pl["finish10"] = f"{c1}-{c2}-{c3}-{c4}"
+                    n = max(c1 + c2 + c3 + c4, 1)
+                    if not pl.get("rate2"):
+                        pl["rate2"] = f"{(c1 + c2) * 100.0 / n:.1f}"
+                    if not pl.get("rate3"):
+                        pl["rate3"] = f"{(c1 + c2 + c3) * 100.0 / n:.1f}"
+                except Exception:
+                    pass
+    return out
+
+
+def _v319_program_history_rows(body: dict, name_by_cd: dict | None = None) -> list[dict]:
+    """Program latest10List → 選手履歴行。"""
+    if not isinstance(body, dict):
+        return []
+    name_by_cd = name_by_cd or {}
+    # playerList からも名前を取る
+    for p in body.get("playerList") or []:
+        if isinstance(p, dict) and p.get("playerCode"):
+            name_by_cd[str(p.get("playerCode"))] = str(p.get("playerName") or "").strip()
+    place_rev = {v: k for k, v in _V319_AR_PLACE_CODE.items()}
+    rows = []
+    hist = body.get("latest10List") or {}
+    if not isinstance(hist, dict):
+        return []
+    for pcd, races in hist.items():
+        if not isinstance(races, list):
+            continue
+        pname = name_by_cd.get(str(pcd), "")
+        for r in races:
+            if not isinstance(r, dict):
+                continue
+            try:
+                pc = int(r.get("placeCode") or 0)
+            except Exception:
+                pc = 0
+            venue = place_rev.get(pc) or re.sub(r"\s+", "", str(r.get("placeName") or ""))
+            try:
+                rn = int(r.get("raceNo") or 0)
+            except Exception:
+                rn = 0
+            order = r.get("order")
+            try:
+                fin = int(order) if order is not None and str(order).strip().isdigit() else None
+            except Exception:
+                fin = None
+            acc = str(r.get("accidentName") or r.get("materializedName") or "") or ""
+            if fin is None and acc:
+                pass
+            rows.append({
+                "選手名": pname,
+                "開催日": str(r.get("raceDate") or "")[:10],
+                "開催場": venue,
+                "レース": rn,
+                "レース名": "",
+                "レース種別": "",
+                "着順": fin,
+                "走路": "",
+                "天候": "",
+                "ハンデ": 0,
+                "車番": 0,
+                "試走T": r.get("trialTime") or "",
+                "競走T": r.get("raceTime") or "",
+                "ST": r.get("stTime") or "",
+                "事故": acc,
+                "player_cd": str(pcd),
+            })
+    return rows
+
+
+def _v319_profile_history_rows(body: dict, player_name: str = "") -> list[dict]:
+    """Profile latest5ResultList → 履歴行。"""
+    if not isinstance(body, dict):
+        return []
+    place_rev = {v: k for k, v in _V319_AR_PLACE_CODE.items()}
+    rows = []
+    for r in body.get("latest5ResultList") or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            pc = int(r.get("placeCode") or 0)
+        except Exception:
+            pc = 0
+        venue = place_rev.get(pc) or re.sub(r"\s+", "", str(r.get("placeName") or ""))
+        try:
+            rn = int(r.get("raceNo") or 0)
+        except Exception:
+            rn = 0
+        order = r.get("order")
+        try:
+            fin = int(order) if order is not None and str(order).strip().isdigit() else None
+        except Exception:
+            fin = None
+        rows.append({
+            "選手名": player_name,
+            "開催日": str(r.get("raceDate") or "")[:10],
+            "開催場": venue,
+            "レース": rn,
+            "レース名": str(r.get("raceType") or ""),
+            "レース種別": "",
+            "着順": fin,
+            "走路": "",
+            "天候": "",
+            "ハンデ": 0,
+            "車番": 0,
+            "試走T": r.get("traialTime") or r.get("trialTime") or "",
+            "競走T": r.get("raceTime") or "",
+            "ST": r.get("st") or "",
+            "事故": "",
+        })
+    return rows
+
+
 def _v319_autorace_odds_api_probe(ymd: str, venue: str, race_no: int = 1) -> dict | None:
     """開催有無判定用。Odds API body（playerListあり）を返す。"""
     body = _v319_autorace_api_post("/race_info/Odds", ymd, venue, race_no)
@@ -13773,71 +14132,33 @@ def _v319_list_autorace_races(ymd: str, venue: str, max_races: int = 12) -> list
 
 
 def _v319_list_oddspark_meetings(ymd: str) -> list[dict]:
-    """開催一覧。oddspark が 403 のときは autorace.jp 公式APIへフォールバック。"""
+    """開催一覧。autorace.jp 公式優先。"""
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     if len(ymd) != 8:
         return []
-    # 1) oddspark（従来）。403/失敗時は無視
-    try:
-        url = f"https://www.oddspark.com/autorace/KaisaiRaceList.do?raceDy={ymd}"
-        html = _v319_http_get(url, timeout=12, retries=2)
-        found = []
-        for cd in sorted(set(re.findall(r"placeCd=(\d+)", html))):
-            venue = _V319_OP_PLACE_REV.get(cd) or _V319_OP_PLACE_REV.get(str(cd).zfill(2))
-            if venue:
-                found.append(
-                    {
-                        "venue": venue,
-                        "place_cd": str(cd).zfill(2),
-                        "ymd": ymd,
-                        "source": "oddspark",
-                    }
-                )
-        if found:
-            return found
-    except Exception:
-        pass
-    # 2) autorace.jp 公式オッズAPI（オッズ取得と同じ経路）
     found = _v319_list_autorace_meetings(ymd)
     if found:
         return found
     raise RuntimeError(
-        "開催一覧を取得できませんでした（oddspark 403 かつ autorace 公式でも0場）。"
+        "開催一覧を取得できませんでした（autorace公式で0場）。"
         "開催日を確認するか、開催場を手動選択してください。"
     )
 
 
 def _v319_list_oddspark_races(ymd: str, place_cd: str) -> list[int]:
+    """レース番号一覧。autorace.jp 公式優先。"""
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     place_cd = str(place_cd or "").zfill(2)
-    nos = set()
-    url = f"https://www.oddspark.com/autorace/RaceList.do?raceDy={ymd}&placeCd={place_cd}"
-    try:
-        html = _v319_http_get(url, timeout=12, retries=2)
-    except Exception:
-        html = ""
-    if html:
-        for dy, cd, n in re.findall(
-            r"raceDy=(\d+)[^\"']{0,120}placeCd=(\d+)[^\"']{0,80}raceNo=(\d+)", html
-        ):
-            if dy == ymd and str(cd).zfill(2) == place_cd and n.isdigit():
-                nos.add(int(n))
-        for cd, dy, n in re.findall(
-            r"placeCd=(\d+)[^\"']{0,120}raceDy=(\d+)[^\"']{0,80}raceNo=(\d+)", html
-        ):
-            if dy == ymd and str(cd).zfill(2) == place_cd and n.isdigit():
-                nos.add(int(n))
-    if nos:
-        return [n for n in sorted(nos) if 1 <= n <= 12]
-    # oddspark 失敗時: autorace 公式で補完
     venue = _V319_OP_PLACE_REV.get(place_cd) or _V319_OP_PLACE_REV.get(
         str(place_cd).zfill(2)
     )
     if venue:
         try:
-            return _v319_list_autorace_races(ymd, venue)
+            nos = _v319_list_autorace_races(ymd, venue)
+            if nos:
+                return [n for n in sorted(nos) if 1 <= int(n) <= 12]
         except Exception:
-            return []
+            pass
     return []
 
 
@@ -14387,27 +14708,28 @@ def _v319_autorace_result_to_text(body: dict, venue: str, race_no: int, ymd: str
 
 
 def _v319_fetch_oddspark_result(ymd: str, venue: str, race_no: int) -> str:
-    """結果テキスト取得。oddspark → autorace.jp RaceResult API の順。"""
+    """結果テキスト取得。autorace.jp 公式優先（oddspark は最終手段）。"""
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     place = _V319_OP_PLACE.get(str(venue))
-    if not ymd or not place:
-        raise ValueError("開催日または開催場が不正です")
-    # 1) oddspark HTML（従来。Cloud で通る場合あり）
-    try:
-        url = (
-            "https://www.oddspark.com/autorace/RaceResult.do"
-            f"?raceDy={ymd}&placeCd={place}&raceNo={int(race_no)}"
-        )
-        html = _v319_http_get(url, timeout=12, retries=2)
-        if "着" in html or "払戻" in html:
-            return _v319_normalize_oddspark_result_text(html, venue, int(race_no), ymd)
-    except Exception:
-        pass
-    # 2) autorace.jp 公式 RaceResult API（オッズと同じ経路）
+    if not ymd:
+        raise ValueError("開催日が不正です")
+    # 1) autorace.jp 公式 RaceResult API
     body = _v319_autorace_api_post("/race_info/RaceResult", ymd, venue, int(race_no))
-    if not body or not (body.get("raceResult") or body.get("refundInfo")):
-        raise ValueError("結果ページを取得できませんでした（oddspark/autorace）")
-    return _v319_autorace_result_to_text(body, venue, int(race_no), ymd)
+    if body and (body.get("raceResult") or body.get("refundInfo") or body.get("playerList")):
+        return _v319_autorace_result_to_text(body, venue, int(race_no), ymd)
+    # 2) oddspark HTML（非推奨・ブロック時はスキップ）
+    if place:
+        try:
+            url = (
+                "https://www.oddspark.com/autorace/RaceResult.do"
+                f"?raceDy={ymd}&placeCd={place}&raceNo={int(race_no)}"
+            )
+            html = _v319_http_get(url, timeout=10, retries=1)
+            if "着" in html or "払戻" in html or "中止" in html:
+                return _v319_normalize_oddspark_result_text(html, venue, int(race_no), ymd)
+        except Exception:
+            pass
+    raise ValueError("結果ページを取得できませんでした（autorace公式）")
 
 
 def _v319_float_odd(val) -> float | None:
@@ -14761,15 +15083,19 @@ def _v319_synthesize_sprace_html_from_program(
             st_raw = p.get("start_time")
         if st_raw is None:
             st_raw = p.get("st")
+        st_s = ""
         try:
-            st_f = float(st_raw)
-            st_s = f"{st_f:.2f}" if st_f == st_f else "0.00"
+            if st_raw is not None and str(st_raw).strip() not in ("", "-", "None", "nan"):
+                st_f = float(st_raw)
+                if st_f == st_f:
+                    st_s = f"{st_f:.2f}"
         except Exception:
-            st_s = "0.00"
+            st_s = ""
+        _st_part = f"/ST{st_s}" if st_s else ""
         parts.append(
             f'<td class="stcNameFull" param="{car}" '
             f'href="/autorace/SpPlayerDetail.do?playerCd={pcd}">'
-            f"<strong>{name}</strong>({lg}) {age_s} {hand_s}m/ST{st_s} {kessha_span}</td>"
+            f"<strong>{name}</strong>({lg}) {age_s} {hand_s}m{_st_part} {kessha_span}</td>"
         )
         # parse_sprace_car_rows は name td 以降を tds[0]=短縮名, tds[1]=試走T/偏差 と読む
         short = re.sub(r"[\s　]+", "", name)[:3]
@@ -14800,31 +15126,29 @@ def _v319_synthesize_sprace_html_from_program(
 
 
 def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int) -> str:
-    """出走表HTML。oddspark SpRaceInfo → autorace Program API 合成HTML。"""
+    """出走表HTML。autorace Program API 優先（oddspark 非依存）。"""
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
-    place = _V319_OP_PLACE.get(str(venue) or "")
-    if not ymd or not place:
-        raise ValueError("開催日または開催場が不正です")
-    _v319_reset_card_fill()
-    # 1) oddspark SP
+    venue = str(venue or "").strip()
+    # 1) autorace 公式 Program
+    body = _v319_autorace_program_body(ymd, venue, int(race_no))
+    if isinstance(body, dict) and (body.get("playerList") or []):
+        return _v319_synthesize_sprace_html_from_program(body, venue, int(race_no), ymd)
+    # 2) oddspark（残存経路・非推奨）
     try:
-        url = (
-            "https://sp.oddspark.com/autorace/SpRaceInfo.do"
-            f"?kaisaiBi={ymd}&joCode={place}&joCd={place}&raceNo={int(race_no)}"
-        )
-        html = _v319_http_get(url, timeout=12, retries=2)
-        if str(html or "").strip() and (
-            "playerCd=" in html or "stcNameFull" in html or "選手" in html
-        ):
-            _V319_LAST_CARD_FILL["source"] = "oddspark"
-            return html
+        place = _V319_OP_PLACE.get(venue)
+        if place:
+            url = (
+                "https://www.oddspark.com/autorace/SpRaceInfo.do"
+                f"?raceDy={ymd}&placeCd={place}&raceNo={int(race_no)}"
+            )
+            html = _v319_http_get(url, timeout=12, retries=1)
+            if html and len(html) > 500 and "player" in html.lower():
+                return html
     except Exception:
         pass
-    # 2) autorace.jp Program API → 合成HTML
-    body = _v319_autorace_api_post("/race_info/Program", ymd, venue, int(race_no))
-    if not body or not (body.get("playerList") or []):
-        raise ValueError("出走表を取得できませんでした（oddspark/autorace）")
-    return _v319_synthesize_sprace_html_from_program(body, venue, int(race_no), ymd)
+    if isinstance(body, dict):
+        return _v319_synthesize_sprace_html_from_program(body, venue, int(race_no), ymd)
+    raise ValueError(f"{venue} {int(race_no)}R：公式出走表を取得できませんでした")
 
 
 _V319_WX_CACHE: dict[str, dict] = {}
@@ -15319,13 +15643,17 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
                 _V319_LAST_CARD_FILL.get("hand_default") or 0
             ) + 1
 
-        # 公式と同じ形: 「ハンデ0m/ST0.13\t3.41」→「0.086\tB-110」
-        # Ver64 パーサ（ST直後の試走T / 0.xxx ランク）が確実に拾う
-        st_out = st if str(st).strip() not in ("", "-", "None") else "0.00"
-        if trial:
-            _ = lines.append(f"ハンデ{hand}m/ST{st_out}\t{trial}")
+        # 公式と同じ形。当日STが無いときは捏造せず ST を省略する
+        st_s = str(st or "").strip()
+        has_st = st_s not in ("", "-", "None", "nan")
+        if has_st and trial:
+            _ = lines.append(f"ハンデ{hand}m/ST{st_s}\t{trial}")
+        elif has_st:
+            _ = lines.append(f"ハンデ{hand}m/ST{st_s}")
+        elif trial:
+            _ = lines.append(f"ハンデ{hand}m\t{trial}")
         else:
-            _ = lines.append(f"ハンデ{hand}m/ST{st_out}")
+            _ = lines.append(f"ハンデ{hand}m")
         # 偏差は必ず 0.xxx（3桁）。ランクと同行列
         dev_out = ""
         if re.match(r"^0?\.\d+$", str(dev or "")):
@@ -16084,14 +16412,10 @@ def _v319_parse_sp_player_history_rows(html: str, player_name: str) -> list[dict
 
 
 def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int = 15, retries: int = 2):
-    """PC版を優先。有効HTMLが取れたら PC2/SP は打たない（空履歴でも）。
+    """選手履歴。autorace 公式 Profile 優先（oddspark PlayerDetail は使わない）。
 
-    Ver324:
-      - timeout 15 / retries 2（Ver322相当。通信耐性を戻す）
-      - 速度は並列取得（ThreadPool）とスキップキャッシュで確保
-      - 同一 player_cd はジョブ内メモ化
-      - 全リクエスト例外で空になった場合はキャッシュしない（次レースで再試行）
-      - 中止要求時はフォールバック連鎖を止め、例外を握りつぶさない
+    Profile の直近5走 + （呼び出し側で Program latest10 も別途保存）。
+    全失敗時は None。
     """
     global _V319_HIST_DF_CACHE
     pcd = str(player_cd or "").strip()
@@ -16103,70 +16427,34 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int
         except Exception:
             return cached
 
-    def _is_cancel_exc(exc: BaseException) -> bool:
-        msg = str(exc or "")
-        return ("import cancel requested" in msg) or ("abort requested" in msg)
-
     if _v326_abort_any():
         raise RuntimeError("import cancel requested")
 
-    hist: list[dict] = []
-    pc_err = ""
-    pc_ok = False
-    # 1) PC版（historyDispType=d を優先、空ページでも有効HTMLなら打ち切り）
-    if pcd:
-        for url in (
-            f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}&historyDispType=d",
-            f"https://www.oddspark.com/autorace/PlayerDetail.do?playerCd={pcd}",
-        ):
-            if _v326_abort_any():
-                raise RuntimeError("import cancel requested")
+    rows: list[dict] = []
+    ok = False
+    # 1) autorace Profile
+    try:
+        body = _v319_autorace_profile_body(pcd, venue="川口")
+        if isinstance(body, dict):
+            ok = True
+            rows = _v319_profile_history_rows(body, name)
+            # 名前補完
             try:
-                html = _v319_http_get(url, timeout=int(timeout or 15), retries=int(retries if retries is not None else 2))
-                if html and len(html) > 500:
-                    pc_ok = True
-                hist = _v319_parse_pc_player_history_html(html, name)
-                if hist:
-                    break
-                if pc_ok:
-                    # 有効HTMLだが履歴0 → PC2/SPを打たない
-                    break
-            except Exception as exc:
-                if _is_cancel_exc(exc) or _v326_abort_any():
-                    raise RuntimeError("import cancel requested") from exc
-                pc_err = f"{type(exc).__name__}:{exc}"
-                hist = []
-    # 2) SP版: PCが完全失敗したときだけ
-    sp_rows: list[dict] = []
-    if pcd and not pc_ok:
-        if _v326_abort_any():
-            raise RuntimeError("import cancel requested")
-        try:
-            sp_url = (
-                "https://sp.oddspark.com/autorace/SpPlayerDetail.do"
-                f"?playerCd={pcd}&historyDispType=d"
-            )
-            sp_html = _v319_http_get(sp_url, timeout=int(timeout or 15), retries=int(retries if retries is not None else 2))
-            sp_rows = _v319_parse_sp_player_history_rows(sp_html, name)
-        except Exception as exc:
-            if _is_cancel_exc(exc) or _v326_abort_any():
-                raise RuntimeError("import cancel requested") from exc
-            sp_rows = []
-    if not hist and sp_rows:
-        hist = sp_rows
-        out = pd.DataFrame(hist) if hist else pd.DataFrame()
-    elif hist and sp_rows:
-        df = pd.DataFrame(hist)
-        out = _v319_merge_sp_enrich(df, sp_rows)
-    elif hist:
-        out = pd.DataFrame(hist)
-    else:
-        out = pd.DataFrame()
-    # Ver324: 有効HTMLを1回も得られていない（全リクエスト失敗）→ None
-    # 呼び出し側は errors 扱いし、スキップキャッシュに書かない。
-    # 本当に履歴0件（pc_ok=True, hist=[]）は空DFのまま返す。
-    _all_failed = (not pc_ok) and (not hist) and (not sp_rows)
-    if _all_failed:
+                pn = str(((body.get("profile") or {}) if isinstance(body.get("profile"), dict) else {}).get("playerName") or "")
+                if pn and not name:
+                    name = pn
+                    for r in rows:
+                        r["選手名"] = name
+            except Exception:
+                pass
+    except Exception as exc:
+        if "import cancel requested" in str(exc) or _v326_abort_any():
+            raise RuntimeError("import cancel requested") from exc
+        rows = []
+
+    # 2) oddspark は使わない（403常態）。結果は空でも ok なら空DF。
+    out = pd.DataFrame(rows) if rows else pd.DataFrame()
+    if not ok and out.empty:
         return None
     if pcd:
         try:
@@ -16174,6 +16462,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int
         except Exception:
             _V319_HIST_DF_CACHE[pcd] = out
     return out
+
 
 
 def _v319_fetch_sp_player_history_enrich(player_cd: str) -> list[dict]:
@@ -16846,23 +17135,36 @@ def _v319_fill_player_histories(
                             "details": details, "cancelled": True,
                         }
                     df = None
-                # 取得失敗（None）は常に errors。スキップ・永続キャッシュに書かない。
-                if df is None:
-                    errors += 1
-                    _ = details.append(f"{name}:取得失敗(再試行対象/cd={pcd or '-'})")
-                    continue
-                if df.empty:
-                    if have <= 0:
+                # 公式HTTP失敗・空のときは result_entries から履歴を再構築（oddspark 403対策）
+                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                    try:
+                        _fb = _v319_history_from_results(
+                            db_path, name, before_ymd or before_d or latest_d or "",
+                            before_venue, before_race, con=con,
+                        )
+                    except Exception:
+                        _fb = None
+                    if _fb is not None and isinstance(_fb, pd.DataFrame) and not _fb.empty:
+                        df = _fb
+                        _ = details.append(
+                            f"{name}:公式取得不可→結果DBから{len(df)}件補完"
+                        )
+                    elif df is None:
                         errors += 1
-                        _ = details.append(f"{name}:履歴0件(cd={pcd or '-'})")
+                        _ = details.append(f"{name}:取得失敗(再試行対象/cd={pcd or '-'})")
+                        continue
                     else:
-                        skipped += 1
-                        _ = details.append(f"{name}:公式0件/既存{have}")
-                    # 公式0件の成功応答は「対象日まで確認済み」としてキャッシュ可
-                    if before_d and pcd and have > 0:
-                        _V319_HIST_SKIPPED[cache_key] = before_d or "1"
-                        _v319_persistent_skip_mark(db_path, pcd, before_d, latest_d, con=con)
-                    continue
+                        # 空DF
+                        if have <= 0:
+                            errors += 1
+                            _ = details.append(f"{name}:履歴0件(cd={pcd or '-'})")
+                        else:
+                            skipped += 1
+                            _ = details.append(f"{name}:公式0件/既存{have}")
+                        if before_d and pcd and have > 0:
+                            _V319_HIST_SKIPPED[cache_key] = before_d or "1"
+                            _v319_persistent_skip_mark(db_path, pcd, before_d, latest_d, con=con)
+                        continue
 
                 if "車番" not in df.columns:
                     df["車番"] = 0
@@ -17686,7 +17988,10 @@ def _v319_is_void_or_cancelled_result(text: str) -> dict:
     }
     if not s.strip():
         return flags
-    if re.search(r"レース中止|競走中止|(?:^|\n)\s*中止\s*(?:\n|$)", s):
+    if re.search(
+        r"レース中止|競走中止|(?:^|\n)\s*中止\s*(?:\n|$)|(?:^|\n)\s*\d{1,2}R\s*\n\s*中止\b",
+        s,
+    ):
         flags["cancelled"] = True
         flags["void"] = True
         flags["reason"] = "レース中止"
@@ -18685,21 +18990,184 @@ def _v319_import_one_race(
                 "next_action": "retry",
             }
         players = _v319_parse_sprace_car_rows(sp_html) or _v319_parse_sprace_players(sp_html)
-        if not players:
-            return {
-                "status": "error",
-                "phase": "fetch_card",
-                "message": f"{venue} {race_no}R：出走表から選手を取得できませんでした。予測と結果登録は実行していません。",
-                "key": key_guess,
-                "next_action": "retry",
-            }
+        # 中止・不成立: 出走表が空でも結果側に中止があれば void 登録
+        _void_early = _v319_is_void_or_cancelled_result(str(sp_html or ""))
+        if not players or _void_early.get("void"):
+            if not _void_early.get("void"):
+                try:
+                    _rt = _v319_fetch_oddspark_result(ymd, venue, race_no)
+                except Exception:
+                    _rt = ""
+                _void_early = _v319_is_void_or_cancelled_result(_rt)
+                if not _void_early.get("void"):
+                    # autorace RaceResult も確認
+                    try:
+                        _ar = _v319_autorace_api_post("/race_info/RaceResult", ymd, venue, race_no)
+                        _ar_txt = str(_ar or "")
+                        if isinstance(_ar, dict):
+                            _ar_txt = json.dumps(_ar, ensure_ascii=False)
+                        _void_early = _v319_is_void_or_cancelled_result(_ar_txt)
+                        # API フラグ系
+                        if not _void_early.get("void") and isinstance(_ar, dict):
+                            for _k in ("raceStatus", "status", "raceStatusName", "cancelFlg"):
+                                _v = str(_ar.get(_k) or "")
+                                if any(x in _v for x in ("中止", "不成立", "取消", "キャンセル")):
+                                    _void_early = {"void": True, "cancelled": True, "reason": "レース中止"}
+                                    break
+                    except Exception:
+                        pass
+            if _void_early.get("void"):
+                try:
+                    _reg = _v319_register_void_result(
+                        db_path, str(sp_html or ""), venue, ymd, race_no,
+                        reason=str(_void_early.get("reason") or "レース中止"),
+                    )
+                    return {
+                        "status": "ok",
+                        "phase": "completed",
+                        "message": (
+                            f"{key_guess} / 中止登録"
+                            f"（{_void_early.get('reason') or 'レース中止'}）"
+                            f"{' / ' + str(_reg.get('message') or '') if isinstance(_reg, dict) else ''}"
+                        ),
+                        "key": key_guess,
+                        "next_action": "done",
+                    }
+                except Exception as _vexc:
+                    return {
+                        "status": "error",
+                        "phase": "register_void",
+                        "message": f"{venue} {race_no}R：中止登録に失敗しました。 ({type(_vexc).__name__}: {_vexc})",
+                        "key": key_guess,
+                        "next_action": "retry",
+                    }
+            if not players:
+                return {
+                    "status": "error",
+                    "phase": "fetch_card",
+                    "message": f"{venue} {race_no}R：出走表から選手を取得できませんでした。予測と結果登録は実行していません。",
+                    "key": key_guess,
+                    "next_action": "retry",
+                }
         # 予測前に必須項目を検証（欠損は IntCastingNaN より先に明示エラー）
-        _v319_validate_card_players(players, venue, race_no)
+        try:
+            _v319_validate_card_players(players, venue, race_no)
+        except ValueError as _val_exc:
+            # 「有効な出走車がありません」+ 中止なら void 登録
+            if "有効な出走車" in str(_val_exc):
+                try:
+                    _rt2 = _v319_fetch_oddspark_result(ymd, venue, race_no)
+                except Exception:
+                    _rt2 = str(sp_html or "")
+                _void2 = _v319_is_void_or_cancelled_result(_rt2)
+                if _void2.get("void"):
+                    _reg2 = _v319_register_void_result(
+                        db_path, _rt2 or str(sp_html or ""), venue, ymd, race_no,
+                        reason=str(_void2.get("reason") or "レース中止"),
+                    )
+                    return {
+                        "status": "ok",
+                        "phase": "completed",
+                        "message": f"{key_guess} / 中止登録（{_void2.get('reason') or 'レース中止'}）",
+                        "key": key_guess,
+                        "next_action": "done",
+                    }
+            raise
         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
         kessha_cars = sorted(set(
             _v319_detect_kessha_from_players(players)
             + _v319_detect_kessha_from_card_text(card_text)
         ))
+        # 公式 OtherRaceInfo（天候・気温・湿度・レース名）を予測テキスト先頭へ
+        try:
+            _ori = _v319_autorace_other_race_info(ymd, venue, race_no)
+            if isinstance(_ori, dict):
+                _meta_lines = _v319_other_info_to_meta_lines(_ori)
+                if _meta_lines:
+                    _body = str(card_text or "").strip()
+                    card_text = "\n".join(_meta_lines) + ("\n" + _body if _body else "")
+        except Exception:
+            pass
+        # 公式 Program の latest10List を選手履歴へ先行保存（oddspark不要）
+        try:
+            _prog = _v319_autorace_program_body(ymd, venue, race_no)
+            if isinstance(_prog, dict):
+                _hrows = _v319_program_history_rows(_prog)
+                _by_name: dict = {}
+                for _hr in _hrows:
+                    _nm = str(_hr.get("選手名") or "").strip()
+                    if not _nm:
+                        continue
+                    _by_name.setdefault(_nm, []).append(_hr)
+                _saved_hist = 0
+                for _nm, _lst in _by_name.items():
+                    try:
+                        _hdf = pd.DataFrame(_lst)
+                        if _hdf.empty:
+                            continue
+                        _rep = engine.v47_save_player_history(_hdf, db_path=db_path) or {}
+                        _saved_hist += int(_rep.get("changed") or _rep.get("saved") or len(_lst) or 0)
+                    except Exception:
+                        pass
+                if _saved_hist:
+                    hist_msg = str(hist_msg or "") + f" / 公式近10走+{_saved_hist}"
+                try:
+                    _pl2 = _v319_program_players_from_body(_prog, venue)
+                    # 当日STは Program に無い → 結果が出ていれば RaceResult の st を使う
+                    # stAve 等の別項目では絶対に埋めない
+                    try:
+                        _need_st = any(not str(x.get("st") or "").strip() for x in (_pl2 or []))
+                        if _need_st:
+                            _rb = _v319_autorace_api_post("/race_info/RaceResult", ymd, venue, int(race_no))
+                            _rr = (_rb or {}).get("raceResult") if isinstance(_rb, dict) else None
+                            if isinstance(_rr, list) and _rr:
+                                _st_by_car = {}
+                                for _row in _rr:
+                                    if not isinstance(_row, dict):
+                                        continue
+                                    try:
+                                        _c = int(_row.get("carNo") or 0)
+                                    except Exception:
+                                        continue
+                                    _stv = str(_row.get("st") or "").strip()
+                                    if _c and _stv:
+                                        _st_by_car[_c] = _stv
+                                    # trial も結果側にあれば当日値を優先
+                                    _tr = str(_row.get("traialTime") or _row.get("trialTime") or "").strip()
+                                    if _c and _tr:
+                                        for _px in (_pl2 or []):
+                                            if int(_px.get("car") or 0) == _c and not str(_px.get("trial") or "").strip():
+                                                _px["trial"] = _tr
+                                for _px in (_pl2 or []):
+                                    try:
+                                        _c = int(_px.get("car") or 0)
+                                    except Exception:
+                                        continue
+                                    if not str(_px.get("st") or "").strip() and _c in _st_by_car:
+                                        _px["st"] = _st_by_car[_c]
+                    except Exception:
+                        pass
+                    if _pl2:
+                        _map = {int(x.get("car") or 0): x for x in _pl2}
+                        for _pp in players:
+                            try:
+                                _c = int(_pp.get("car") or 0)
+                            except Exception:
+                                continue
+                            _src = _map.get(_c)
+                            if not _src:
+                                continue
+                            for _k in ("st", "dev", "trial", "avg_r", "best_r", "finish10", "rate2", "rate3", "rank"):
+                                if (not str(_pp.get(_k) or "").strip()) and str(_src.get(_k) or "").strip():
+                                    _pp[_k] = _src[_k]
+                        card_text = _v319_build_prediction_text_from_sprace(
+                            _v319_synthesize_sprace_html_from_program(_prog, venue, race_no, ymd),
+                            venue, race_no, ymd,
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # 欠損補完は予測続行するが、CSV/UIで気づけるようメッセージに残す
         _fill_note = _v319_card_fill_note()
         if _fill_note:
