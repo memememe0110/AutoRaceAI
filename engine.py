@@ -9574,6 +9574,8 @@ def _v47_normalize_date(value):
 
 def _v47_normalize_venue(value):
     s = "" if value is None else str(value).strip()
+    # 公式 placeName は「浜　松」など全角空白入り
+    s = s.replace("　", "").replace(" ", "").replace("　", "")
     if s in {"", "-", "—", "–", "―", "None", "nan"}:
         return None
     aliases = {"川口":"川口", "伊勢崎":"伊勢崎", "浜松":"浜松", "飯塚":"飯塚", "山陽":"山陽"}
@@ -14702,3 +14704,62 @@ def v72_ticket_outlier_details(
     })[["レース", "出走数", "的中組み合わせ", "予測順位", "上位累積確率", "三連単上位累積確率"]].sort_values(
         ["三連単上位累積確率", "レース"], ascending=[False, True]
     ).reset_index(drop=True)
+
+
+def v131_save_pending_player_history(df, db_path=DB_PATH):
+    """保留履歴を確定して保存する（app.py からの pending 救済）。
+
+    AttributeError 防止用。重複処理を確定扱いにして v47 経路で保存する。
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return {"changed": 0, "saved": 0, "verified": 0, "pending_count": 0, "pending": pd.DataFrame()}
+    work = df.copy()
+    if "重複処理" not in work.columns:
+        work["重複処理"] = "入力したRで新規登録"
+    else:
+        need = work["重複処理"].fillna("").astype(str).isin(
+            ["", "選択してください", "nan", "None"]
+        )
+        work.loc[need, "重複処理"] = "入力したRで新規登録"
+    work["_v58_duplicate_confirmed"] = True
+    # レース番号が空でもレース名があれば仮Rは付けない。R欠落は日付+場で既存救済を試す。
+    try:
+        if "レース" in work.columns:
+            work["レース"] = work["レース"].map(_v47_normalize_race_no)
+    except Exception:
+        pass
+    # 開催場正規化
+    try:
+        if "開催場" in work.columns:
+            work["開催場"] = work["開催場"].map(_v47_normalize_venue)
+    except Exception:
+        pass
+    report = v47_save_player_history(work, db_path=db_path) or {}
+    changed = int(report.get("changed") or report.get("saved") or 0)
+    # まだ pending が残る場合、必須が揃っている行だけ v15 直保存
+    pending = report.get("pending")
+    if isinstance(pending, pd.DataFrame) and not pending.empty:
+        try:
+            force = pending.copy()
+            # Rが無ければ 0 ではなく、行を落とさず開催日があれば保存できるようレース名を補う
+            if "レース名" not in force.columns:
+                force["レース名"] = ""
+            miss_r = force["レース"].isna() if "レース" in force.columns else pd.Series([True]*len(force))
+            force.loc[miss_r, "レース名"] = force.loc[miss_r, "レース名"].replace("", "不明")
+            force.loc[miss_r & (force["レース名"].fillna("") == ""), "レース名"] = "不明"
+            force["重複処理"] = "入力したRで新規登録"
+            force["_v58_duplicate_confirmed"] = True
+            report2 = v47_save_player_history(force, db_path=db_path) or {}
+            changed += int(report2.get("changed") or report2.get("saved") or 0)
+            pending = report2.get("pending")
+        except Exception:
+            pass
+    pend_n = int(len(pending)) if isinstance(pending, pd.DataFrame) else int(report.get("pending_count") or 0)
+    return {
+        "changed": changed,
+        "saved": changed,
+        "verified": changed,
+        "pending_count": pend_n,
+        "pending": pending if isinstance(pending, pd.DataFrame) else pd.DataFrame(),
+    }
+

@@ -14081,7 +14081,7 @@ def _v319_program_history_rows(body: dict, name_by_cd: dict | None = None) -> li
                 pc = int(r.get("placeCode") or 0)
             except Exception:
                 pc = 0
-            venue = place_rev.get(pc) or re.sub(r"\s+", "", str(r.get("placeName") or ""))
+            venue = place_rev.get(pc) or re.sub(r"[\s　]+", "", str(r.get("placeName") or ""))
             try:
                 rn = int(r.get("raceNo") or 0)
             except Exception:
@@ -14128,7 +14128,7 @@ def _v319_profile_history_rows(body: dict, player_name: str = "") -> list[dict]:
             pc = int(r.get("placeCode") or 0)
         except Exception:
             pc = 0
-        venue = place_rev.get(pc) or re.sub(r"\s+", "", str(r.get("placeName") or ""))
+        venue = place_rev.get(pc) or re.sub(r"[\s　]+", "", str(r.get("placeName") or ""))
         try:
             rn = int(r.get("raceNo") or 0)
         except Exception:
@@ -17501,6 +17501,12 @@ def _v319_fill_player_histories(
                 except Exception:
                     pass
 
+                try:
+                    parsed = parsed.copy()
+                    parsed["重複処理"] = "入力したRで新規登録"
+                    parsed["_v58_duplicate_confirmed"] = True
+                except Exception:
+                    pass
                 report = engine.v47_save_player_history(parsed, db_path=db_path) or {}
                 changed = int(report.get("changed") or report.get("saved") or 0)
                 pending_df = report.get("pending")
@@ -17527,9 +17533,11 @@ def _v319_fill_player_histories(
                         repaired.loc[need, "重複処理"] = "入力したRで新規登録"
                     repaired["_v58_duplicate_confirmed"] = True
                     try:
-                        report2 = engine.v131_save_pending_player_history(
-                            repaired, db_path=db_path
-                        ) or {}
+                        _save_fn = getattr(engine, "v131_save_pending_player_history", None)
+                        if callable(_save_fn):
+                            report2 = _save_fn(repaired, db_path=db_path) or {}
+                        else:
+                            report2 = engine.v47_save_player_history(repaired, db_path=db_path) or {}
                         changed += int(
                             report2.get("verified")
                             or report2.get("changed")
@@ -17538,7 +17546,17 @@ def _v319_fill_player_histories(
                         )
                         pending_left = int(report2.get("pending_count") or 0)
                     except Exception as _pend_exc:
-                        _ = details.append(f"{name}:pending失敗:{type(_pend_exc).__name__}")
+                        try:
+                            report2b = engine.v47_save_player_history(repaired, db_path=db_path) or {}
+                            changed += int(report2b.get("changed") or report2b.get("saved") or 0)
+                            pending_left = int(report2b.get("pending_count") or 0)
+                            _ = details.append(
+                                f"{name}:pending迂回:{type(_pend_exc).__name__}+{int(report2b.get('changed') or report2b.get('saved') or 0)}"
+                            )
+                        except Exception as _e2:
+                            _ = details.append(
+                                f"{name}:pending失敗:{type(_pend_exc).__name__}/{type(_e2).__name__}:{_e2}"
+                            )
 
                 if changed <= 0 and len(parsed) >= 5:
                     try:
@@ -19197,7 +19215,21 @@ def _v319_import_one_race(
                         if _hdf.empty:
                             continue
                         _rep = engine.v47_save_player_history(_hdf, db_path=db_path) or {}
-                        _saved_hist += int(_rep.get("changed") or _rep.get("saved") or len(_lst) or 0)
+                        _ch = int(_rep.get("changed") or _rep.get("saved") or 0)
+                        if _ch <= 0:
+                            try:
+                                _hdf2 = _hdf.copy()
+                                _hdf2["重複処理"] = "入力したRで新規登録"
+                                _hdf2["_v58_duplicate_confirmed"] = True
+                                _fn = getattr(engine, "v131_save_pending_player_history", None)
+                                if callable(_fn):
+                                    _rep = _fn(_hdf2, db_path=db_path) or {}
+                                else:
+                                    _rep = engine.v47_save_player_history(_hdf2, db_path=db_path) or {}
+                                _ch = int(_rep.get("changed") or _rep.get("saved") or 0)
+                            except Exception:
+                                pass
+                        _saved_hist += _ch
                     except Exception:
                         pass
                 if _saved_hist:
