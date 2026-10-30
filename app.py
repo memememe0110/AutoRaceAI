@@ -14115,8 +14115,78 @@ def _v319_program_history_rows(body: dict, name_by_cd: dict | None = None) -> li
     return rows
 
 
-def _v319_profile_history_rows(body: dict, player_name: str = "") -> list[dict]:
-    """Profile latest5ResultList → 履歴行。"""
+def _v319_profile_parse_finish(order) -> int | None:
+    """Profile order: 7 / '7' / '７着' / '7着' → int。"""
+    if order is None:
+        return None
+    s = str(order).strip()
+    if not s or s.lower() in {"nan", "none", "-"}:
+        return None
+    # 全角数字 → 半角
+    trans = str.maketrans("０１２３４５６７８９", "0123456789")
+    s = s.translate(trans)
+    m = re.search(r"(\d{1,2})", s)
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+    except Exception:
+        return None
+    return n if 1 <= n <= 12 else None
+
+
+def _v319_profile_parse_date(raw, year_hint: str = "") -> str:
+    """Profile raceDate: '10/25' or '2026-10-25' → YYYY-MM-DD。
+
+    年なしは year_hint（YYYY or YYYYMMDD）または当年を使う。
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    # すでに YYYY-MM-DD
+    m = re.match(r"^(20\d{2})[-/](\d{1,2})[-/](\d{1,2})$", s)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    # MM/DD or M/D
+    m = re.match(r"^(\d{1,2})[-/](\d{1,2})$", s)
+    if m:
+        yh = re.sub(r"[^0-9]", "", str(year_hint or ""))
+        if len(yh) >= 4:
+            year = int(yh[:4])
+        else:
+            try:
+                year = int(time_module.strftime("%Y"))
+            except Exception:
+                year = 2026
+        mo, dy = int(m.group(1)), int(m.group(2))
+        # 未来日すぎるなら前年（年末の 12/31 を翌年1月に取った場合など）
+        try:
+            import datetime as _dt
+            cand = _dt.date(year, mo, dy)
+            today = _dt.date.today()
+            if cand > today + _dt.timedelta(days=14) and year > 2000:
+                cand = _dt.date(year - 1, mo, dy)
+            return cand.strftime("%Y-%m-%d")
+        except Exception:
+            return f"{year:04d}-{mo:02d}-{dy:02d}"
+    # その他は正規化に任せる
+    try:
+        if hasattr(engine, "_v47_normalize_date"):
+            d = engine._v47_normalize_date(s)
+            return str(d or "")
+    except Exception:
+        pass
+    return s[:10]
+
+
+def _v319_profile_history_rows(
+    body: dict, player_name: str = "", year_hint: str = ""
+) -> list[dict]:
+    """Profile latest5ResultList → 履歴行。
+
+    APIの raceDate は '10/25' 形式が多く、年なし。order は '７着'。
+    traialTime は公式の typo キー。
+    """
     if not isinstance(body, dict):
         return []
     place_rev = {v: k for k, v in _V319_AR_PLACE_CODE.items()}
@@ -14133,26 +14203,38 @@ def _v319_profile_history_rows(body: dict, player_name: str = "") -> list[dict]:
             rn = int(r.get("raceNo") or 0)
         except Exception:
             rn = 0
-        order = r.get("order")
+        fin = _v319_profile_parse_finish(r.get("order"))
+        ymd = _v319_profile_parse_date(r.get("raceDate"), year_hint=year_hint)
+        trial = r.get("traialTime") or r.get("trialTime") or r.get("trialRunTime") or ""
+        race_t = r.get("raceTime") or ""
+        st = r.get("st") or ""
         try:
-            fin = int(order) if order is not None and str(order).strip().isdigit() else None
+            hand = r.get("handicap")
+            hand = int(hand) if hand is not None and str(hand).strip() not in {"", "None"} else 0
         except Exception:
-            fin = None
+            hand = 0
+        try:
+            car = r.get("carNumber") or r.get("carNo")
+            car = int(car) if car is not None and str(car).strip().isdigit() else 0
+        except Exception:
+            car = 0
+        if not ymd or not venue or rn <= 0:
+            continue
         rows.append({
             "選手名": player_name,
-            "開催日": str(r.get("raceDate") or "")[:10],
+            "開催日": ymd,
             "開催場": venue,
             "レース": rn,
-            "レース名": str(r.get("raceType") or ""),
-            "レース種別": "",
+            "レース名": str(r.get("raceType") or r.get("gradeName") or "") or "一般戦",
+            "レース種別": str(r.get("raceType") or ""),
             "着順": fin,
             "走路": "",
             "天候": "",
-            "ハンデ": 0,
-            "車番": 0,
-            "試走T": r.get("traialTime") or r.get("trialTime") or "",
-            "競走T": r.get("raceTime") or "",
-            "ST": r.get("st") or "",
+            "ハンデ": hand,
+            "車番": car,
+            "試走T": trial,
+            "競走T": race_t,
+            "ST": st,
             "事故": "",
         })
     return rows
@@ -16494,10 +16576,17 @@ def _v319_parse_sp_player_history_rows(html: str, player_name: str) -> list[dict
     return out
 
 
-def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int = 15, retries: int = 2):
+def _v319_fetch_player_history_df(
+    player_cd: str,
+    player_name: str,
+    timeout: int = 15,
+    retries: int = 2,
+    year_hint: str = "",
+):
     """選手履歴。autorace 公式 Profile 優先（oddspark PlayerDetail は使わない）。
 
     Profile の直近5走 + （呼び出し側で Program latest10 も別途保存）。
+    year_hint: 開催日 YYYYMMDD（Profileの '10/25' に年を付ける）。
     全失敗時は None。
     """
     global _V319_HIST_DF_CACHE
@@ -16520,7 +16609,7 @@ def _v319_fetch_player_history_df(player_cd: str, player_name: str, timeout: int
         body = _v319_autorace_profile_body(pcd, venue="川口")
         if isinstance(body, dict):
             ok = True
-            rows = _v319_profile_history_rows(body, name)
+            rows = _v319_profile_history_rows(body, name, year_hint=year_hint)
             # 名前補完
             try:
                 pn = str(((body.get("profile") or {}) if isinstance(body.get("profile"), dict) else {}).get("playerName") or "")
@@ -17009,11 +17098,24 @@ def _v319_force_save_history_df(db_path: str, name: str, df) -> dict:
     work["開催場"] = work["開催場"].map(
         lambda x: str(x or "").replace("　", "").replace(" ", "").strip() or None
     )
-    # 日付
+    # 日付（Profileの 10/25 等は _v319_profile_parse_date 済みを想定。念のため正規化）
     try:
-        work["開催日"] = work["開催日"].map(
-            lambda x: engine._v47_normalize_date(x) if hasattr(engine, "_v47_normalize_date") else x
-        )
+        def _fix_date(x):
+            s = str(x or "").strip()
+            if not s:
+                return None
+            # すでに YYYY-MM-DD
+            if re.match(r"^20\d{2}-\d{2}-\d{2}$", s):
+                return s
+            if hasattr(engine, "_v47_normalize_date"):
+                d = engine._v47_normalize_date(s)
+                ds = str(d or "")
+                # 年がおかしい（1-10-25 等）は捨てる
+                if ds.startswith("20"):
+                    return ds
+                return None
+            return s
+        work["開催日"] = work["開催日"].map(_fix_date)
     except Exception:
         pass
     # レース番号
@@ -17318,7 +17420,9 @@ def _v319_fill_player_histories(
                         "details": details, "cancelled": True,
                     }
                 try:
-                    df = _v319_fetch_player_history_df(pcd, name)
+                    df = _v319_fetch_player_history_df(
+                        pcd, name, year_hint=str(before_d or before_ymd or "")
+                    )
                 except Exception as _fetch_exc:
                     _msg = str(_fetch_exc or "")
                     if ("import cancel requested" in _msg) or _v326_abort_any():
