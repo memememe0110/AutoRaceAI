@@ -19016,36 +19016,26 @@ def _v319_import_player_history_one_race(
     if warnings > 0:
         hist_msg += f" / 警告{warnings}"
 
-    # 履歴が0件の選手が残っていれば error、全員そろえば ok
+    # 履歴0件でも error にしない（新人・公式明細不足）。警告だけ出す。
     missing = []
+    low_hist = []
     _names_chk = [str(p.get("name") or "").strip() for p in players if str(p.get("name") or "").strip()]
     _cnt_map = _v319_player_history_counts_batch(db_path, _names_chk)
     for nm in _names_chk:
-        if int(_cnt_map.get(nm) or 0) <= 0:
+        c = int(_cnt_map.get(nm) or 0)
+        if c <= 0:
             _ = missing.append(nm)
-    # Ver325: 履歴0件の選手がいるときだけ中止。errors のみは警告付き続行。
-    if missing:
-        who = ", ".join(missing[:5])
-        return {
-            "status": "error",
-            "phase": "save_player_history",
-            "message": (
-                f"{venue} {race_no}R：選手履歴が不足しています。不足選手：{who}。"
-                f" {hist_msg}" + (f"｜{detail}" if detail else "")
-            ),
-            "key": key_guess,
-            "player_history_saved": bool(added > 0),
-            "added": added,
-            "next_action": "retry",
-            "notify": True,
-            "notify_message": f"【履歴失敗】{venue}{race_no}R：{who}の履歴が不足。",
-        }
-
+        elif c < 5:
+            _ = low_hist.append(f"{nm}({c}件)")
     warn = ""
+    if missing:
+        warn += f" ⚠履歴0件:{','.join(missing[:5])}"
+    if low_hist:
+        warn += f" ⚠履歴少:{','.join(low_hist[:5])}"
     if errors > 0:
-        warn = f" ⚠取得失敗{errors}件（既存履歴で続行）"
+        warn += f" ⚠取得失敗{errors}件（続行）"
     elif warnings > 0:
-        warn = f" ⚠DB競合{warnings}件（既存履歴で続行・致命ではない）"
+        warn += f" ⚠DB競合{warnings}件（続行）"
     return {
         "status": "ok",
         "phase": "save_player_history",
@@ -19058,14 +19048,24 @@ def _v319_import_player_history_one_race(
         "added": added,
         "errors": errors,
         "warnings": warnings,
+        "missing_history": missing,
+        "low_history": low_hist,
         "next_action": "done",
-        "notify": bool(errors > 0 or warnings > 0),
+        "notify": bool(missing or low_hist or errors > 0 or warnings > 0),
         "notify_message": (
-            f"【履歴警告】{venue}{race_no}R：取得失敗{errors}件。既存履歴で続行。"
-            if errors > 0
-            else (
-                f"【履歴注意】{venue}{race_no}R：DB競合{warnings}件。既存履歴で続行。"
-                if warnings > 0 else ""
+            f"【履歴注意】{venue}{race_no}R："
+            + (
+                f"履歴0件 {','.join(missing[:5])}"
+                if missing
+                else (
+                    f"履歴少 {','.join(low_hist[:5])}"
+                    if low_hist
+                    else (
+                        f"取得失敗{errors}件"
+                        if errors > 0
+                        else f"DB競合{warnings}件"
+                    )
+                )
             )
         ),
     }
@@ -19147,7 +19147,7 @@ def _v319_import_one_race(
 
     順序固定:
       出走表 → 選手履歴 → 予測(+検証) → (任意)オッズ → (任意)結果登録
-    履歴失敗時は予測・結果を実行せず failed で返す。
+    履歴0件でも予測・結果は続行（不足は警告表示）。通信例外など本物の失敗時のみ error。
     register_result=True のとき、オッズ未完了なら結果登録しない。
     fetch_odds / register_result で予測のみ・オッズのみも可能。
     """
@@ -37453,7 +37453,7 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.error(f"結果HTTP取得失敗: {type(_rx).__name__}: {_rx}")
 
     with st.expander("公式結果を自動取得して登録", expanded=False):
-        st.caption("順番は出走表→選手履歴→予測保存確認→オッズ→結果登録です。履歴失敗時は予測しません。GitHub自動保存はしません。")
+        st.caption("順番は出走表→選手履歴→予測保存確認→オッズ→結果登録です。履歴0件でも予測は続行（不足は警告）。GitHub自動保存はしません。")
         dcol, vcol, rcol = st.columns(3)
         fetch_date = dcol.date_input("開催日", value=date.today(), key="v319_op_fetch_date")
         fetch_venue = vcol.selectbox("開催場", ["開催を探す"] + RESULT_VENUES, key="v319_op_fetch_venue")
