@@ -336,7 +336,9 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 # 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHubも同じ間隔（push連打しない）
-_V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
+_V314_RESIM_TRIALS_CAP = 8000
+_V326_BUILD_TAG = "20261031_histfix"  # デプロイ確認用。取込メッセージに出る
+  # BG再シム trials 上限（本線予測20kは維持）
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -17196,6 +17198,90 @@ def _v319_force_save_history_df(db_path: str, name: str, df) -> dict:
         except Exception as exc:
             out["details"].append(f"v15失敗:{type(exc).__name__}:{exc}")
 
+    # 3) 最終手段: v15_player_history_imports へ直接 INSERT（engine保存が0のとき）
+    if changed <= 0:
+        try:
+            import sqlite3 as _sq
+            import hashlib as _hh
+            from datetime import datetime as _dt
+            n_ins = 0
+            with _sq.connect(str(db_path)) as con:
+                # テーブル無ければ何もしない
+                tabs = {
+                    r[0]
+                    for r in con.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if "v15_player_history_imports" in tabs:
+                    cols = {
+                        r[1]
+                        for r in con.execute("PRAGMA table_info(v15_player_history_imports)").fetchall()
+                    }
+                    for _, row in work.iterrows():
+                        pname = str(row.get("選手名") or name or "").strip()
+                        rdate = str(row.get("開催日") or "").strip()
+                        venue = str(row.get("開催場") or "").strip()
+                        try:
+                            rno = int(row.get("レース") or 0)
+                        except Exception:
+                            rno = 0
+                        if not pname or not rdate.startswith("20") or not venue or rno <= 0:
+                            continue
+                        key_src = f"{pname}|{rdate}|{venue}|{rno}|{row.get('着順')}|{row.get('試走T')}|{row.get('競走T')}"
+                        hkey = _hh.sha1(key_src.encode("utf-8")).hexdigest()[:40]
+                        exists = con.execute(
+                            "SELECT 1 FROM v15_player_history_imports WHERE history_key=? LIMIT 1",
+                            (hkey,),
+                        ).fetchone()
+                        if exists:
+                            continue
+                        # 最低限の列だけ入れる
+                        fields = ["history_key", "player_name", "race_date", "venue"]
+                        vals = [hkey, pname, rdate, venue]
+                        if "race_no" in cols:
+                            fields.append("race_no"); vals.append(rno)
+                        if "rank" in cols:
+                            try:
+                                fields.append("rank"); vals.append(int(row.get("着順")) if row.get("着順") is not None else None)
+                            except Exception:
+                                fields.append("rank"); vals.append(None)
+                        if "trial_time" in cols:
+                            fields.append("trial_time")
+                            try:
+                                vals.append(float(row.get("試走T")) if str(row.get("試走T") or "").strip() else None)
+                            except Exception:
+                                vals.append(None)
+                        if "race_time" in cols:
+                            fields.append("race_time")
+                            try:
+                                vals.append(float(row.get("競走T")) if str(row.get("競走T") or "").strip() else None)
+                            except Exception:
+                                vals.append(None)
+                        if "st" in cols:
+                            fields.append("st")
+                            try:
+                                vals.append(float(row.get("ST")) if str(row.get("ST") or "").strip() else None)
+                            except Exception:
+                                vals.append(None)
+                        if "created_at" in cols:
+                            fields.append("created_at"); vals.append(_dt.now().isoformat(timespec="seconds"))
+                        if "race_name" in cols:
+                            fields.append("race_name"); vals.append(str(row.get("レース名") or "") or None)
+                        ph = ",".join("?" * len(fields))
+                        con.execute(
+                            f"INSERT OR IGNORE INTO v15_player_history_imports ({','.join(fields)}) VALUES ({ph})",
+                            tuple(vals),
+                        )
+                        n_ins += 1
+                    con.commit()
+            if n_ins:
+                changed = n_ins
+                pending_n = 0
+                out["details"].append(f"direct_sql+{n_ins}")
+        except Exception as exc:
+            out["details"].append(f"direct_sql失敗:{type(exc).__name__}")
+
     out["changed"] = int(changed)
     out["pending_count"] = int(pending_n)
     return out
@@ -19548,6 +19634,10 @@ def _v319_import_one_race(
                 "next_action": "cancelled",
             }
         hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
+        try:
+            hist_msg = str(hist_msg or "") + f" / build:{globals().get('_V326_BUILD_TAG', '?')}"
+        except Exception:
+            pass
         err_n = int(filled.get("errors") or 0)
         # 履歴0件でも予測は止めない（公式が明細を出さない選手がいるため）。
         # ただし件数は必ずメッセージに出し、不足が分かるようにする。
