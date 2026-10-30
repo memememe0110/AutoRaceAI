@@ -16989,6 +16989,116 @@ def _v319_build_player_history_lines(
 
 
 
+
+def _v319_force_save_history_df(db_path: str, name: str, df) -> dict:
+    """公式取得の履歴行を確実にDBへ入れる。
+
+    pending/検証で 0 件のまま止まらないよう、正規化→確定フラグ→v47→v15直保存の順で試す。
+    """
+    out = {"changed": 0, "pending_count": 0, "details": []}
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return out
+    work = df.copy()
+    # 必須列
+    for col in ("選手名", "開催日", "開催場", "レース", "レース名", "着順", "試走T", "競走T", "ST", "ハンデ"):
+        if col not in work.columns:
+            work[col] = None
+    work["選手名"] = work["選手名"].fillna("").astype(str)
+    work.loc[work["選手名"].str.strip() == "", "選手名"] = str(name or "").strip()
+    # 開催場の全角空白除去
+    work["開催場"] = work["開催場"].map(
+        lambda x: str(x or "").replace("　", "").replace(" ", "").strip() or None
+    )
+    # 日付
+    try:
+        work["開催日"] = work["開催日"].map(
+            lambda x: engine._v47_normalize_date(x) if hasattr(engine, "_v47_normalize_date") else x
+        )
+    except Exception:
+        pass
+    # レース番号
+    try:
+        work["レース"] = work["レース"].map(
+            lambda x: engine._v47_normalize_race_no(x) if hasattr(engine, "_v47_normalize_race_no") else x
+        )
+    except Exception:
+        pass
+    # Rが無い行はレース名を補って validate を通す（公式にRがある行はそのまま）
+    miss_r = work["レース"].isna() | (work["レース"].astype(str).isin(["", "None", "nan", "0"]))
+    work.loc[miss_r & (work["レース名"].fillna("").astype(str).str.strip() == ""), "レース名"] = "一般戦"
+    work["重複処理"] = "入力したRで新規登録"
+    work["_v58_duplicate_confirmed"] = True
+
+    changed = 0
+    pending_n = 0
+    # 1) v47
+    try:
+        rep = engine.v47_save_player_history(work, db_path=db_path) or {}
+        changed += int(rep.get("changed") or rep.get("saved") or 0)
+        pend = rep.get("pending")
+        pending_n = int(rep.get("pending_count") or 0)
+        if isinstance(pend, pd.DataFrame) and not pend.empty:
+            pend = pend.copy()
+            pend["重複処理"] = "入力したRで新規登録"
+            pend["_v58_duplicate_confirmed"] = True
+            if "レース名" not in pend.columns:
+                pend["レース名"] = "一般戦"
+            else:
+                pend.loc[
+                    pend["レース名"].fillna("").astype(str).str.strip().isin(["", "nan", "None"]),
+                    "レース名",
+                ] = "一般戦"
+            fn = getattr(engine, "v131_save_pending_player_history", None)
+            if callable(fn):
+                rep2 = fn(pend, db_path=db_path) or {}
+            else:
+                rep2 = engine.v47_save_player_history(pend, db_path=db_path) or {}
+            changed += int(rep2.get("changed") or rep2.get("saved") or rep2.get("verified") or 0)
+            pending_n = int(rep2.get("pending_count") or 0)
+    except Exception as exc:
+        out["details"].append(f"v47失敗:{type(exc).__name__}")
+
+    # 2) まだ 0 なら validate の valid を v15 直保存
+    if changed <= 0:
+        try:
+            if hasattr(engine, "v47_validate_player_history"):
+                valid, pending = engine.v47_validate_player_history(work)
+            else:
+                valid, pending = work, pd.DataFrame()
+            if isinstance(valid, pd.DataFrame) and not valid.empty:
+                ch, sk = engine.v15_save_player_history(valid, db_path=db_path)
+                changed += int(ch or 0)
+                out["details"].append(f"v15直保存:{int(ch or 0)}")
+            # pending も レース名補完して再試行
+            if isinstance(pending, pd.DataFrame) and not pending.empty:
+                pending = pending.copy()
+                pending["レース名"] = pending.get("レース名", "一般戦")
+                pending.loc[
+                    pending["レース名"].fillna("").astype(str).str.strip().isin(["", "nan", "None"]),
+                    "レース名",
+                ] = "一般戦"
+                if "保留理由" in pending.columns:
+                    pending = pending.drop(columns=["保留理由"], errors="ignore")
+                pending["重複処理"] = "入力したRで新規登録"
+                pending["_v58_duplicate_confirmed"] = True
+                # 再 validate
+                if hasattr(engine, "v47_validate_player_history"):
+                    valid2, _ = engine.v47_validate_player_history(pending)
+                else:
+                    valid2 = pending
+                if isinstance(valid2, pd.DataFrame) and not valid2.empty:
+                    ch2, _ = engine.v15_save_player_history(valid2, db_path=db_path)
+                    changed += int(ch2 or 0)
+                    out["details"].append(f"pending→v15:{int(ch2 or 0)}")
+            pending_n = 0
+        except Exception as exc:
+            out["details"].append(f"v15失敗:{type(exc).__name__}:{exc}")
+
+    out["changed"] = int(changed)
+    out["pending_count"] = int(pending_n)
+    return out
+
+
 def _v319_fill_player_histories(
     db_path: str,
     players: list[dict],
@@ -17501,16 +17611,14 @@ def _v319_fill_player_histories(
                 except Exception:
                     pass
 
-                try:
-                    parsed = parsed.copy()
-                    parsed["重複処理"] = "入力したRで新規登録"
-                    parsed["_v58_duplicate_confirmed"] = True
-                except Exception:
-                    pass
-                report = engine.v47_save_player_history(parsed, db_path=db_path) or {}
-                changed = int(report.get("changed") or report.get("saved") or 0)
-                pending_df = report.get("pending")
-                pending_left = int(report.get("pending_count") or 0)
+                force = _v319_force_save_history_df(db_path, name, parsed)
+                changed = int(force.get("changed") or 0)
+                pending_left = int(force.get("pending_count") or 0)
+                pending_df = pd.DataFrame()
+                if force.get("details"):
+                    _ = details.extend([f"{name}:{d}" for d in force["details"][:3]])
+                # 互換: 旧 pending 再試行ブロックは changed>0 なら実質スキップ
+                report = {"changed": changed, "pending_count": pending_left, "pending": pending_df}
 
                 # Ver320 post-fix: パーサが R を拾えなかった行を結果DBから補完
                 try:
@@ -19214,22 +19322,8 @@ def _v319_import_one_race(
                         _hdf = pd.DataFrame(_lst)
                         if _hdf.empty:
                             continue
-                        _rep = engine.v47_save_player_history(_hdf, db_path=db_path) or {}
-                        _ch = int(_rep.get("changed") or _rep.get("saved") or 0)
-                        if _ch <= 0:
-                            try:
-                                _hdf2 = _hdf.copy()
-                                _hdf2["重複処理"] = "入力したRで新規登録"
-                                _hdf2["_v58_duplicate_confirmed"] = True
-                                _fn = getattr(engine, "v131_save_pending_player_history", None)
-                                if callable(_fn):
-                                    _rep = _fn(_hdf2, db_path=db_path) or {}
-                                else:
-                                    _rep = engine.v47_save_player_history(_hdf2, db_path=db_path) or {}
-                                _ch = int(_rep.get("changed") or _rep.get("saved") or 0)
-                            except Exception:
-                                pass
-                        _saved_hist += _ch
+                        _fr = _v319_force_save_history_df(db_path, _nm, _hdf)
+                        _saved_hist += int(_fr.get("changed") or 0)
                     except Exception:
                         pass
                 if _saved_hist:
@@ -19335,8 +19429,9 @@ def _v319_import_one_race(
         if _fast_hist:
             filled = {"added": 0, "skipped": len(players or []), "errors": 0, "details": ["充足スキップ(公式近10走済)"]}
         else:
+            # 公式のみでは近5〜10走が上限。30件要求は oddspark 前提なので緩和する
             filled = _v319_fill_player_histories(
-                db_path, players, min_rows=30,
+                db_path, players, min_rows=5,
                 before_ymd=ymd, before_venue=venue, before_race=race_no,
                 cancel_cb=cancel_cb,
             )
@@ -19350,35 +19445,32 @@ def _v319_import_one_race(
             }
         hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
         err_n = int(filled.get("errors") or 0)
-        # Ver325: 履歴0件の選手がいるときだけ予測中止。errors のみは警告付きで続行。
+        # 履歴0件でも予測は止めない（公式が明細を出さない選手がいるため）。
+        # ただし件数は必ずメッセージに出し、不足が分かるようにする。
         missing = []
+        low_hist = []
         _names_chk = [str(p.get("name") or "").strip() for p in players if str(p.get("name") or "").strip()]
         _cnt_map = _v319_player_history_counts_batch(db_path, _names_chk)
         for nm in _names_chk:
-            if int(_cnt_map.get(nm) or 0) <= 0:
+            c = int(_cnt_map.get(nm) or 0)
+            if c <= 0:
                 _ = missing.append(nm)
-        if missing:
-            detail = " / ".join(str(x) for x in (filled.get("details") or [])[:8])
-            who = ", ".join(missing[:5])
-            return {
-                "status": "error",
-                "phase": "save_player_history",
-                "message": (
-                    f"{venue} {race_no}R：選手履歴が不完全なため予測・結果登録を中止しました。"
-                    f" 不足選手：{who}。"
-                    f" 失敗段階：選手履歴保存"
-                    f"{hist_msg}"
-                    + (f"｜{detail}" if detail else "")
-                ),
-                "key": key_guess,
-                "player_history_saved": False,
-                "next_action": "retry",
-                "notify": True,
-                "notify_message": (
-                    f"【履歴失敗】{venue}{race_no}R：{who}の履歴が不足。"
-                    f" 予測は実行していません。"
-                ),
-            }
+            elif c < 5:
+                _ = low_hist.append(f"{nm}({c}件)")
+        if missing or low_hist:
+            parts = []
+            if missing:
+                parts.append("履歴0件:" + ",".join(missing[:5]))
+            if low_hist:
+                parts.append("履歴少:" + ",".join(low_hist[:5]))
+            hist_msg = str(hist_msg or "") + " / ⚠" + " ".join(parts)
+            # 取込結果CSV・通知でも分かるように details へ残す
+            try:
+                _det = list(filled.get("details") or [])
+                _det.append("履歴注意:" + " ".join(parts))
+                filled["details"] = _det
+            except Exception:
+                pass
         # errors のみ: メッセージに残し、予測は続行
         if err_n > 0:
             hist_msg += f" ⚠取得失敗{err_n}件（既存履歴で予測続行）"

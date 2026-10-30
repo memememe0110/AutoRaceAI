@@ -7889,11 +7889,20 @@ def v36_update_player_histories(meta, results, laps=None, db_path=DB_PATH):
     starters = int(len(results))
     rows=[]
     for _, r in results.iterrows():
+        # レース番号を必ず入れる（履歴件数・重複キー・学習の正本）
+        try:
+            _race_no = int(meta.get("レース") or meta.get("race_no") or 0)
+        except Exception:
+            _race_no = 0
+        if _race_no <= 0:
+            _race_no = None
         rows.append({
             "選手名": str(r.get("選手名", "")).strip(),
             "開催日": meta.get("開催日"),
             "開催場": meta.get("開催場"),
-            "レース種別": meta.get("レース種別") or f"{meta.get('レース','')}R",
+            "レース": _race_no,
+            "レース名": meta.get("レース名") or meta.get("レース種別") or "",
+            "レース種別": meta.get("レース種別") or (f"{_race_no}R" if _race_no else ""),
             "着順": r.get("着順"),
             "出走": starters,
             "天候": meta.get("天候", ""),
