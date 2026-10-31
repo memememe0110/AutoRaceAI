@@ -336,9 +336,8 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 # 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHubも同じ間隔（push連打しない）
-_V314_RESIM_TRIALS_CAP = 8000
-_V326_BUILD_TAG = "20261031_histfix"  # デプロイ確認用。取込メッセージに出る
-  # BG再シム trials 上限（本線予測20kは維持）
+_V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
+_V326_BUILD_TAG = "20261031_histfix2"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -16596,10 +16595,13 @@ def _v319_fetch_player_history_df(
     name = str(player_name or "").strip()
     if pcd and pcd in _V319_HIST_DF_CACHE:
         cached = _V319_HIST_DF_CACHE[pcd]
+        # 空DFのキャッシュは失敗固定になるので再取得する
         try:
-            return cached.copy() if hasattr(cached, "copy") else cached
+            if cached is not None and hasattr(cached, "empty") and not bool(cached.empty):
+                return cached.copy() if hasattr(cached, "copy") else cached
+            # empty → fall through to re-fetch
         except Exception:
-            return cached
+            pass
 
     if _v326_abort_any():
         raise RuntimeError("import cancel requested")
@@ -17370,7 +17372,14 @@ def _v319_fill_player_histories(
                 _ex = ThreadPoolExecutor(max_workers=_n_workers)
                 try:
                     _futs = [
-                        _ex.submit(_v319_fetch_player_history_df, _pcd, _nm)
+                        _ex.submit(
+                            _v319_fetch_player_history_df,
+                            _pcd,
+                            _nm,
+                            15,
+                            2,
+                            str(before_d_job or before_ymd or ""),
+                        )
                         for _pcd, _nm in _prefetch
                     ]
                     _pending = set(_futs)
@@ -17569,7 +17578,10 @@ def _v319_fill_player_histories(
                 else:
                     df["レース"] = 0
 
-                # 対象日以前に限定
+                # 公式明細は「保存用」と「当該R予測に使える分」を分ける。
+                # Profile は直近数走のみのため、過去Rの再取込では
+                # 当該R以前が0件でも、公式行そのものはDBへ残す。
+                df_official = df.copy()
                 if before_ymd:
                     _rows = [
                         r for _, r in df.iterrows()
@@ -17577,13 +17589,15 @@ def _v319_fill_player_histories(
                     ]
                     df = pd.DataFrame(_rows)
                     if df.empty:
-                        if have <= 0:
+                        _ = details.append(
+                            f"{name}:当該R以前の履歴0件(公式{len(df_official)}件は保存対象)"
+                        )
+                        # 予測用は空でも、保存は公式全件で続行
+                        df = df_official
+                        if have <= 0 and df_official.empty:
                             errors += 1
-                            _ = details.append(f"{name}:当該R以前の履歴0件")
-                        else:
-                            skipped += 1
-                            _ = details.append(f"{name}:当該R以前は追加なし")
-                        continue
+                            continue
+                        # have==0 でも公式行があれば保存へ進む（errors にしない）
 
                 # result_entries からの補完
                 extra = _v319_history_from_results(
