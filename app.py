@@ -337,7 +337,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHubも同じ間隔（push連打しない）
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261031_histcnt1"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261031_qfrag2"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -12520,6 +12520,16 @@ def _v280_backfill_incident_history(db_path: str) -> dict:
 _v146_fragment = getattr(st, "fragment", lambda func: func)
 
 
+def _v326_safe_fragment_rerun() -> None:
+    """可能なら fragment だけ再実行。未対応環境は全画面 rerun しない。"""
+    try:
+        st.rerun(scope="fragment")
+    except TypeError:
+        return
+    except Exception:
+        return
+
+
 @_v146_fragment
 def _v326_render_queue_reorder_fragment(db_path: str, job_type: str = "official_import") -> None:
     """取込キュー並び替えを部分再実行（B13-F）。st.rerun() を使わず枠内だけ更新。"""
@@ -12587,7 +12597,100 @@ def _v326_render_queue_reorder_fragment(db_path: str, job_type: str = "official_
     with st.expander("キュー全件を表示", expanded=False):
         st.dataframe(_qdf, use_container_width=True, hide_index=True)
 
+    # 削除も fragment 内（multiselect/削除ボタンで全画面再計算しない）
+    try:
+        _non_run = _qdf[_qdf["status"].astype(str) != "running"]
+        _del_opts = [int(x) for x in _non_run["task_id"].tolist()]
+    except Exception:
+        try:
+            _del_opts = [int(x) for x in _qdf["task_id"].tolist()]
+        except Exception:
+            _del_opts = []
+    if _del_opts:
+        _del_ids = st.multiselect(
+            "削除する task_id（running以外）",
+            options=_del_opts,
+            key=f"v326_q_del_ids_{job_type}",
+        )
+        if st.button("🗑 選択行を削除", use_container_width=True, key=f"v326_q_del_go_{job_type}"):
+            n = _v326_delete_queue_tasks(db_path, _del_ids)
+            if n:
+                st.success(f"{n} 件削除しました（この枠だけ更新）")
+            else:
+                st.info("削除対象がありませんでした")
+            if n:
+                _v326_safe_fragment_rerun()
+    else:
+        st.caption("削除可能な task はありません。")
 
+    c_a, c_b, c_c = st.columns(3)
+    if c_a.button("done/skip掃除", use_container_width=True, key=f"v326_q_frag_clr_fin_{job_type}"):
+        n = _v326_clear_queue_finished(db_path, job_type, include_error=False)
+        st.info(f"done/skipped を {n} 件削除" if n else "掃除対象なし")
+        if n:
+            _v326_safe_fragment_rerun()
+    if c_b.button("🗑 pending全消去", use_container_width=True, key=f"v326_q_frag_clr_pend_{job_type}"):
+        n = _v326_clear_queue_pending(db_path, job_type, include_running=True)
+        st.success(f"pending/running を {n} 件削除" if n else "対象なし")
+        if n:
+            _v326_safe_fragment_rerun()
+    if c_c.button("🗑 キュー全消去", use_container_width=True, key=f"v326_q_frag_clr_all_{job_type}"):
+        n = _v326_clear_queue_all(db_path, job_type)
+        st.success(f"キュー全消去 {n} 件" if n else "キューは空です")
+        if n:
+            _v326_safe_fragment_rerun()
+
+
+@_v146_fragment
+def _v326_render_import_progress_fragment(db_path: str) -> None:
+    """公式取込ジョブ進捗。更新・中止で全画面再計算しない。"""
+    try:
+        job_imp = _v278_bg_get_active_of(db_path, ("official_import", "official_import_hist")) or {}
+    except Exception:
+        job_imp = {}
+    if not job_imp:
+        return
+    status = str(job_imp.get("status") or "")
+    try:
+        done = int(job_imp.get("done") or 0)
+        total = int(job_imp.get("total") or 0)
+    except Exception:
+        done, total = 0, 0
+    st.markdown("#### 取込の進捗")
+    st.caption(
+        f"状態: {status} ｜ {done}/{total or '?'} ｜ "
+        f"{job_imp.get('current_label') or '-'} ｜ {job_imp.get('message') or status}"
+    )
+    if total > 0:
+        try:
+            st.progress(min(1.0, max(0.0, float(done) / float(max(total, 1)))))
+        except Exception:
+            pass
+    c1, c2 = st.columns(2)
+    if c1.button("進捗を更新", use_container_width=True, key="v319_op_refresh_job_frag"):
+        _v326_safe_fragment_rerun()
+    if status in ("queued", "running", "paused", "pause_requested", "cancel_requested") and c2.button(
+        "取込を中止",
+        use_container_width=True,
+        key="v319_op_cancel_job_frag",
+        disabled=(status == "cancel_requested"),
+    ):
+        try:
+            _v278_bg_request_cancel(db_path, int(job_imp.get("job_id") or 0))
+            st.warning("中止を受け付けました。区切りで止まります。")
+        except Exception as exc:
+            st.warning(f"中止フラグは立てました（{exc}）")
+        _v326_safe_fragment_rerun()
+    blob = job_imp.get("result_blob")
+    if blob and status in ("completed", "cancelled", "failed", "running", "paused"):
+        try:
+            rep = pickle.loads(zlib.decompress(bytes(blob)))
+            if isinstance(rep, dict) and rep.get("details") is not None:
+                st.session_state["v319_op_last_report"] = rep
+        except Exception:
+            pass
+    if status == "cancelled":
+        st.warning(job_imp.get("message") or "取込を中止しました。")
 
 
 # Ver217: 予測後の重いDB保存を待たず、オッズ入力を先に表示する。
@@ -36260,7 +36363,7 @@ st.markdown("""
 </style>
 <div class="v161-nav-card">
  <div class="v161-nav-title">🧭 表示する画面</div>
- <div class="v161-nav-note">下の選択欄で画面を切り替えます。通常の実行ボタンとは別のメニューです。</div>
+ <div class="v161-nav-note">下の選択欄で画面を切り替えます。切替時は選んだ画面だけ描画します。キュー操作は枠内更新です。</div>
 </div>
 """, unsafe_allow_html=True)
 _current_page = st.session_state.get("v155_main_page", _main_pages[0])
@@ -36389,7 +36492,10 @@ def _v278_render_background_quick_page(db_path: str) -> None:
         # 稼働中はthread参照の有無に関係なく、必ず更新ボタンを表示する。
         a,b=st.columns(2)
         if a.button("🔄 進捗を更新",key="v278_quick_refresh",use_container_width=True):
-            st.rerun()
+            try:
+                st.rerun(scope="fragment")
+            except Exception:
+                st.rerun()
         if b.button(
             "⏹ 現在レース後に停止",
             key="v278_quick_stop",
@@ -37907,32 +38013,8 @@ if selected_main_page == "✅ 結果登録・解析":
             if n:
                 st.rerun()
         # B13-F: 並び替えは fragment（部分更新）。一覧・削除もここで完結。
+        # 並び替え・全件表示・削除は fragment（部分更新・全画面再計算なし）
         _v326_render_queue_reorder_fragment(str(engine.DB_PATH), "official_import")
-        try:
-            _qdf_del = _v326_list_queue_tasks(engine.DB_PATH, "official_import", limit=120)
-        except Exception:
-            _qdf_del = None
-        if _qdf_del is not None and not getattr(_qdf_del, "empty", True):
-            try:
-                _non_run = _qdf_del[_qdf_del["status"].astype(str) != "running"]
-                _del_opts = [int(x) for x in _non_run["task_id"].tolist()]
-            except Exception:
-                try:
-                    _del_opts = [int(x) for x in _qdf_del["task_id"].tolist()]
-                except Exception:
-                    _del_opts = []
-            _del_ids = st.multiselect(
-                "削除する task_id（running以外）",
-                options=_del_opts,
-                key="v326_q_del_ids",
-            )
-            if st.button("🗑 選択行を削除", use_container_width=True, key="v326_q_del_go"):
-                n = _v326_delete_queue_tasks(engine.DB_PATH, _del_ids)
-                st.info(f"{n} 件削除しました")
-                if n:
-                    st.rerun()
-        else:
-            st.caption("キューは空です。「＋条件をキューに追加」→「▶実行」または「バックグラウンドで実行」の順で使ってください。")
 
         b1, b2 = st.columns(2)
         with b1:
@@ -38052,7 +38134,10 @@ if selected_main_page == "✅ 結果登録・解析":
             )
             cprog1, cprog2 = st.columns(2)
             if cprog1.button("進捗を更新", use_container_width=True, key="v319_op_refresh_job"):
-                st.rerun()
+                try:
+                    st.rerun(scope="fragment")
+                except Exception:
+                    st.rerun()
             if status in ("queued", "running", "paused", "pause_requested", "cancel_requested") and cprog2.button(
                 "取込を中止", use_container_width=True, key="v319_op_cancel_job",
                 disabled=(status == "cancel_requested"),
@@ -38060,10 +38145,11 @@ if selected_main_page == "✅ 結果登録・解析":
                 try:
                     _v278_bg_request_cancel(engine.DB_PATH, int(job_imp.get("job_id") or 0))
                     st.warning("中止を受け付けました。選手履歴の区切りなど、数秒〜数十秒で止まります。")
-                    st.rerun()
                 except Exception as exc:
-                    # フラグは request_cancel 内で先に立つので、DB locked でも中止は有効
                     st.warning(f"中止フラグは立てました（{exc}）。処理の区切りで停止します。")
+                try:
+                    st.rerun(scope="fragment")
+                except Exception:
                     st.rerun()
             blob = job_imp.get("result_blob")
             # 完了・中止・失敗・実行中いずれも、途中結果があれば表示用に取り込む
