@@ -337,7 +337,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHubも同じ間隔（push連打しない）
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261031_parsefix1"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261031_histcnt1"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -17092,6 +17092,10 @@ def _v319_force_save_history_df(db_path: str, name: str, df) -> dict:
     out = {"changed": 0, "pending_count": 0, "details": []}
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return out
+    try:
+        out["_before_n"] = int(_v319_player_history_count(db_path, name) or 0)
+    except Exception:
+        out["_before_n"] = 0
     work = df.copy()
     # 必須列
     for col in ("選手名", "開催日", "開催場", "レース", "レース名", "着順", "試走T", "競走T", "ST", "ハンデ"):
@@ -17285,6 +17289,23 @@ def _v319_force_save_history_df(db_path: str, name: str, df) -> dict:
                 out["details"].append(f"direct_sql+{n_ins}")
         except Exception as exc:
             out["details"].append(f"direct_sql失敗:{type(exc).__name__}")
+
+    # 保存APIの changed が 0 でも、実際に件数が増えていればそれを採用
+    try:
+        before_n = int(out.get("_before_n") or 0)
+    except Exception:
+        before_n = 0
+    try:
+        after_n = int(_v319_player_history_count(db_path, name) or 0)
+        delta_n = max(0, after_n - before_n)
+        if delta_n > int(changed or 0):
+            out["details"].append(f"件数差分で補正:{changed}→{delta_n}")
+            changed = delta_n
+        elif int(changed or 0) > 0 and delta_n == 0:
+            # APIは増分を返したが件数キーが違う場合でも changed は残す
+            out["details"].append(f"API変更{changed}/件数差{delta_n}")
+    except Exception as _exc:
+        out["details"].append(f"件数再計算失敗:{type(_exc).__name__}")
 
     out["changed"] = int(changed)
     out["pending_count"] = int(pending_n)
@@ -19675,7 +19696,15 @@ def _v319_import_one_race(
                 "key": key_guess,
                 "next_action": "cancelled",
             }
-        hist_msg = f" / 履歴+{int(filled.get('added') or 0)}"
+        _add_n = int(filled.get("added") or 0)
+        _skip_n = int(filled.get("skipped") or 0)
+        if _add_n > 0:
+            hist_msg = f" / 履歴+{_add_n}"
+        elif _skip_n > 0:
+            # 追加0でも「履歴が無い」ではなく「既に入っていて追加なし」
+            hist_msg = f" / 履歴+0(既存スキップ{_skip_n})"
+        else:
+            hist_msg = f" / 履歴+0"
         try:
             hist_msg = str(hist_msg or "") + f" / build:{globals().get('_V326_BUILD_TAG', '?')}"
         except Exception:
@@ -40369,6 +40398,11 @@ if selected_main_page == "🗃️ 登録情報確認":
                                 FROM v15_player_history_imports
                                 WHERE player_name=? ORDER BY race_date DESC, created_at DESC
                                 """, con, params=(selected,))
+                        # 登録日時はUTC保存のため表示・CSVは日本時間へ
+                        try:
+                            history = _jst_datetime_columns(history)
+                        except Exception:
+                            pass
                         st.write(f"{selected}：履歴 {len(history)}件")
                         display_history = history.drop(columns=[c for c in ["履歴ID", "履歴キー"] if c in history.columns], errors="ignore")
                         st.dataframe(display_history, use_container_width=True, hide_index=True, height=430)
