@@ -337,7 +337,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHubも同じ間隔（push連打しない）
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261031_histfix2"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261031_histfix4"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -14219,8 +14219,16 @@ def _v319_profile_history_rows(
             car = int(car) if car is not None and str(car).strip().isdigit() else 0
         except Exception:
             car = 0
-        if not ymd or not venue or rn <= 0:
+        if not ymd or not venue:
             continue
+        # raceNo 欠落時は着順から仮R（900+着順）。捨てない。
+        if rn <= 0 and fin is not None:
+            try:
+                rn = 900 + int(fin)
+            except Exception:
+                rn = 0
+        if rn <= 0:
+            rn = 700  # 最低限の識別子（同日複数は後でキー衝突の可能性あり）
         rows.append({
             "選手名": player_name,
             "開催日": ymd,
@@ -17228,8 +17236,13 @@ def _v319_force_save_history_df(db_path: str, name: str, df) -> dict:
                             rno = int(row.get("レース") or 0)
                         except Exception:
                             rno = 0
-                        if not pname or not rdate.startswith("20") or not venue or rno <= 0:
+                        if not pname or not rdate.startswith("20") or not venue:
                             continue
+                        if rno <= 0:
+                            try:
+                                rno = 900 + int(row.get("着順") or 0)
+                            except Exception:
+                                rno = 700
                         key_src = f"{pname}|{rdate}|{venue}|{rno}|{row.get('着順')}|{row.get('試走T')}|{row.get('競走T')}"
                         hkey = _hh.sha1(key_src.encode("utf-8")).hexdigest()[:40]
                         exists = con.execute(
@@ -17518,6 +17531,11 @@ def _v319_fill_player_histories(
                     df = _v319_fetch_player_history_df(
                         pcd, name, year_hint=str(before_d or before_ymd or "")
                     )
+                    try:
+                        _nprof = 0 if df is None else int(len(df))
+                        _ = details.append(f"{name}:Profile取得{_nprof}件(cd={pcd or '-'})")
+                    except Exception:
+                        pass
                 except Exception as _fetch_exc:
                     _msg = str(_fetch_exc or "")
                     if ("import cancel requested" in _msg) or _v326_abort_any():
@@ -17663,6 +17681,7 @@ def _v319_fill_player_histories(
                         if before_ymd and not _v319_hist_row_before(
                             r, before_ymd, before_venue, before_race
                         ):
+                            # 既存選手の「当該R以前外」は穴埋め対象外
                             continue
                         # 既存キーでも R欠落で再構築対象のものは通す
                         if k in have_keys and k not in dirty_keys:
@@ -17679,15 +17698,32 @@ def _v319_fill_player_histories(
                         if before_ymd and not _v319_hist_row_before(
                             r, before_ymd, before_venue, before_race
                         ):
-                            continue
+                            # 履歴0件の選手は公式直近を種として保存する
+                            # （当該R予測の特徴量には使えないが、DB 0件固定を防ぐ）
+                            if have > 0:
+                                continue
                         seen.add(k)
                         if k in have_keys and k not in dirty_keys:
                             continue
                         _ = keep.append(r)
                     # min_rows を満たすよう先頭から切る（新規のみ）
-                    if len(keep) > target_count:
+                    # ただし履歴0件の種保存は公式全件を優先
+                    if have > 0 and len(keep) > target_count:
                         keep = keep[:target_count]
 
+                if not keep:
+                    # 最終フォールバック: 履歴0件なら公式行をそのまま種にする
+                    if have <= 0 and len(df) > 0:
+                        for _, r in df.iterrows():
+                            k = _v319_hist_row_key(r)
+                            if not k[0] or k in seen:
+                                continue
+                            seen.add(k)
+                            _ = keep.append(r)
+                        if keep:
+                            _ = details.append(
+                                f"{name}:履歴0件のため公式{len(keep)}件を種保存"
+                            )
                 if not keep:
                     skipped += 1
                     _ = details.append(f"{name}:追加対象なし(既存{have}/公式{len(official_keys)})")
@@ -17819,8 +17855,11 @@ def _v319_fill_player_histories(
                 changed = int(force.get("changed") or 0)
                 pending_left = int(force.get("pending_count") or 0)
                 pending_df = pd.DataFrame()
+                _ = details.append(
+                    f"{name}:保存診断(keep{len(keep)}/parsed{0 if parsed is None else len(parsed)}/changed{changed}/pending{pending_left})"
+                )
                 if force.get("details"):
-                    _ = details.extend([f"{name}:{d}" for d in force["details"][:3]])
+                    _ = details.extend([f"{name}:{d}" for d in force["details"][:5]])
                 # 互換: 旧 pending 再試行ブロックは changed>0 なら実質スキップ
                 report = {"changed": changed, "pending_count": pending_left, "pending": pending_df}
 
