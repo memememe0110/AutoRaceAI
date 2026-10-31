@@ -5220,7 +5220,15 @@ def v152_split_entry_blocks(text):
     current = None
 
     def is_handicap_st_line(value):
-        return bool(re.search(r"(?:[+-]?\d+|-)\s*m\s*/\s*ST\s*[+-]?\d?\.\d{2,3}", value, re.I))
+        s = str(value or "").strip()
+        # 標準: 0m/ST0.15
+        if re.search(r"(?:[+-]?\d+|-)\s*m\s*/\s*ST\s*[+-]?\d?\.\d{2,3}", s, re.I):
+            return True
+        # ST無し: 0m / 0m 3.53（保存済み予測テキストで発生）
+        if re.fullmatch(r"(?:[+-]?\d+|-)\s*m(?:\s+(?:再|再試)?[3-9]\.\d{2,3})?", s, re.I):
+            return True
+        return False
+
 
     def looks_like_player_name(value):
         value = value.strip()
@@ -5317,6 +5325,7 @@ def v152_parse_entry_block(block):
     # 当日試走
     # 公式スマホ表示では「ST0.18 再3.45」のように再試走を示す「再」が付く。
     # 平均試走T（後段）を誤取得しないよう、ハンデ/ST直後の値を最優先する。
+    # STが無い「ハンデ0m 3.53」形式も公式保存テキストであり得る。
     trial = np.nan
     tm2 = re.search(
         r"ST\s*(?:[+-]?\d?\.\d{2,3}|-)\s+(?:再|再試)?\s*([3-9]\.\d{2,3}|-)",
@@ -5325,8 +5334,17 @@ def v152_parse_entry_block(block):
     )
     if tm2 and tm2.group(1) != "-":
         trial = float(tm2.group(1))
-    else:
-        # 「試3.45」「試走T 3.45」「試走T 再3.45」にも対応する。
+    if pd.isna(trial):
+        # ハンデXm(/STx.xx)? の直後の 3.xx（ST無し対応）
+        tm_h = re.search(
+            r"(?:[+-]?\d+|-)\s*m(?:\s*/\s*ST\s*[+-]?\d?\.\d{2,3})?\s+(?:再|再試)?\s*([3-9]\.\d{2,3})",
+            compact,
+            re.I,
+        )
+        if tm_h:
+            trial = float(tm_h.group(1))
+    if pd.isna(trial):
+        # 「試3.45」「試走T 3.45」「試走T 再3.45」
         tm = re.search(
             r"(?:試走T|試)\s*(?:再|再試)?\s*([3-9]\.\d{2,3}|-)",
             compact,
@@ -11000,6 +11018,17 @@ def v152_parse_entry_block(block):
         if hs2:
             row["ハンデ"] = 0 if hs2.group(1) == "-" else int(hs2.group(1))
             row["ST"] = float(hs2.group(2))
+        # ST無し: 「0m 3.53」「ハンデ0m 3.53」（保存済み予測で発生）
+        hs3 = re.search(
+            r"(?:ハンデ\s*)?([+-]?\d+|-)\s*m\s+([3-9]\.\d{2,3})",
+            compact, re.I,
+        )
+        if hs3:
+            if row.get("ハンデ") is None:
+                row["ハンデ"] = 0 if hs3.group(1) == "-" else int(hs3.group(1))
+            _t = row.get("試走T")
+            if _t is None or (isinstance(_t, float) and pd.isna(_t)):
+                row["試走T"] = float(hs3.group(2))
         tm_lab = re.search(
             r"(?:試走T|試)\s*(?:再|再試)?\s*([3-9]\.\d{2,3})",
             compact, re.I,
@@ -13242,13 +13271,19 @@ def v15_parse_entries(text, manual_excluded=None):
     """オーバーミッドナイト形式を先に判定し、欠損値を列ずれさせず読む。"""
     special = v86_parse_overmidnight_entries(text)
     if not special.empty and special["車番"].nunique() >= 2:
-        excluded = dict(v17_detect_nonstarters(text))
-        if manual_excluded is not None:
-            excluded = {int(car): "手動欠車" for car in manual_excluded}
-        special = special.copy()
-        special["出走状態"] = special["車番"].map(lambda x: excluded.get(int(x), "出走"))
-        special["解析対象"] = ~special["車番"].astype(int).isin(excluded)
-        return special[special["解析対象"]].sort_values("車番").reset_index(drop=True)
+        # 試走Tが半数以上取れていない誤判定は通常縦型パーサへ落とす
+        # （ST無し「ハンデ0m 3.53」を過ナイト形式が食うと試走Tが消える）
+        n_cars = int(special["車番"].nunique())
+        n_trial = int(special["試走T"].notna().sum()) if "試走T" in special.columns else 0
+        # 全車（ほぼ全車）で試走Tが取れたときだけ過ナイト形式を採用
+        if n_trial >= n_cars and n_cars >= 2:
+            excluded = dict(v17_detect_nonstarters(text))
+            if manual_excluded is not None:
+                excluded = {int(car): "手動欠車" for car in manual_excluded}
+            special = special.copy()
+            special["出走状態"] = special["車番"].map(lambda x: excluded.get(int(x), "出走"))
+            special["解析対象"] = ~special["車番"].astype(int).isin(excluded)
+            return special[special["解析対象"]].sort_values("車番").reset_index(drop=True)
     return _v86_previous_parse_entries(text, manual_excluded=manual_excluded)
 
 
