@@ -20900,6 +20900,39 @@ def _v319_import_one_race(
 
 
 
+def _v326_notify_import_cancelled(db_path: str, job_id: int, *, done: int = 0, skip: int = 0, error: int = 0, pending: int = 0) -> None:
+    """公式取込の中止確定を完了通知と同じntfyトピックへ送る。失敗しても取込状態には影響させない。"""
+    try:
+        topic = str(
+            __import__("os").environ.get("AUTORACE_NTFY_TOPIC")
+            or __import__("os").environ.get("GENERAL_REMINDER_NTFY_TOPIC")
+            or "notify"
+        ).strip() or "notify"
+        body = (
+            f"公式取込を中止しました\n"
+            f"完了{int(done)} / スキップ{int(skip)} / 失敗{int(error)}\n"
+            f"pending残{int(pending)}（再開可）\n"
+            f"job={int(job_id)}"
+        )
+        payload = {
+            "topic": topic,
+            "title": "AutoRaceAI 取込中止完了",
+            "message": body,
+            "priority": 4,
+            "tags": ["warning", "no_entry"],
+        }
+        request = urllib.request.Request(
+            "https://ntfy.sh",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        with urllib.request.urlopen(request, timeout=8) as response:
+            response.read()
+    except Exception:
+        pass
+
+
 def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
     details = []
     ok = skip = err = 0
@@ -20998,34 +21031,11 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     message=_cancel_msg,
                     result_blob=blob,
                 )
-                # 中止完了も ntfy 通知
-                try:
-                    topic = str(
-                        globals().get("GENERAL_REMINDER_NTFY_TOPIC")
-                        or "notify"
-                    ).strip() or "notify"
-                    _body = (
-                        f"公式取込を中止しました\n"
-                        f"完了{ok} / スキップ{skip} / 失敗{err}\n"
-                        f"pending残{_qs.get('pending',0)}（再開可）"
-                    )
-                    _payload = {
-                        "topic": topic,
-                        "title": "AutoRaceAI 取込中止",
-                        "message": _body,
-                        "priority": 3,
-                        "tags": ["warning", "no_entry"],
-                    }
-                    _req = urllib.request.Request(
-                        "https://ntfy.sh",
-                        data=json.dumps(_payload, ensure_ascii=False).encode("utf-8"),
-                        method="POST",
-                        headers={"Content-Type": "application/json; charset=utf-8"},
-                    )
-                    with urllib.request.urlopen(_req, timeout=8) as _resp:
-                        _resp.read()
-                except Exception:
-                    pass
+                # 中止確定通知は完了通知と同じntfyトピックへ送る。
+                _v326_notify_import_cancelled(
+                    db_path, job_id, done=ok, skip=skip, error=err,
+                    pending=int(_qs.get("pending") or 0),
+                )
                 try:
                     _v326_abort_clear(job_id)
                 except Exception:
@@ -21143,6 +21153,10 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                             f"｜pending残{_qs.get('pending',0)}（次回再開可）"
                         ),
                         result_blob=blob,
+                    )
+                    _v326_notify_import_cancelled(
+                        db_path, job_id, done=ok, skip=skip, error=err,
+                        pending=int(_qs.get("pending") or 0),
                     )
                     return
                 item["status"] = one.get("status") or "ok"
