@@ -15921,8 +15921,16 @@ def _v319_synthesize_sprace_html_from_program(
         except Exception:
             hand_s = "0"
             n_hand_def += 1
-        trial = str(p.get("trialRunTime") or "").strip()
-        # 試走T欠損は通常ありえない → 既定値で誤魔化さず明示エラー
+        # Program API は trialRunTime / trialTime の両系統があり得る。
+        # parser 側と同じ優先順位で拾い、別キーに入っている試走Tを
+        # 「欠損」と誤判定しない。
+        trial = str(
+            p.get("trialRunTime")
+            or p.get("trialTime")
+            or p.get("traialTime")
+            or ""
+        ).strip()
+        # 試走T欠損は既定値で捏造せず、strict_trial の方針に従う
         if not re.match(r"^\d+\.\d+$", trial):
             absent = p.get("absent")
             is_kessha = absent not in (None, "", 0, "0", False)
