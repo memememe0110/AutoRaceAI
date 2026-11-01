@@ -15787,7 +15787,7 @@ def _v319_card_fill_note() -> str:
 
 
 def _v319_synthesize_sprace_html_from_program(
-    body: dict, venue: str, race_no: int, ymd: str
+    body: dict, venue: str, race_no: int, ymd: str, strict_trial: bool = True
 ) -> str:
     """autorace Program API → SpRace 互換の簡易HTML（parse_sprace_car_rows向け）。"""
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
@@ -15825,7 +15825,7 @@ def _v319_synthesize_sprace_html_from_program(
         if not re.match(r"^\d+\.\d+$", trial):
             absent = p.get("absent")
             is_kessha = absent not in (None, "", 0, "0", False)
-            if not is_kessha:
+            if not is_kessha and strict_trial:
                 raise ValueError(
                     f"出走表の試走Tが欠損しています（通常はありえません）: "
                     f"{car}号 {name or ''} trial={trial!r}。"
@@ -15912,14 +15912,16 @@ def _v319_synthesize_sprace_html_from_program(
     return "\n".join(parts)
 
 
-def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int) -> str:
+def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int, strict_trial: bool = True) -> str:
     """出走表HTML。autorace Program API 優先（oddspark 非依存）。"""
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     venue = str(venue or "").strip()
     # 1) autorace 公式 Program
     body = _v319_autorace_program_body(ymd, venue, int(race_no))
     if isinstance(body, dict) and (body.get("playerList") or []):
-        return _v319_synthesize_sprace_html_from_program(body, venue, int(race_no), ymd)
+        return _v319_synthesize_sprace_html_from_program(
+            body, venue, int(race_no), ymd, strict_trial=strict_trial
+        )
     # 2) oddspark（残存経路・非推奨）
     try:
         place = _V319_OP_PLACE.get(venue)
@@ -15934,7 +15936,9 @@ def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int) -> str:
     except Exception:
         pass
     if isinstance(body, dict):
-        return _v319_synthesize_sprace_html_from_program(body, venue, int(race_no), ymd)
+        return _v319_synthesize_sprace_html_from_program(
+            body, venue, int(race_no), ymd, strict_trial=strict_trial
+        )
     raise ValueError(f"{venue} {int(race_no)}R：公式出走表を取得できませんでした")
 
 
@@ -16328,7 +16332,9 @@ def _v319_fill_player_stats_from_history(db_path: str, player_name: str, before_
     return out
 
 
-def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int, ymd: str) -> str:
+def _v319_build_prediction_text_from_sprace(
+    html: str, venue: str, race_no: int, ymd: str, strict_trial: bool = True
+) -> str:
     raw = _v319_html_to_text(html)
     dm = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日(?:\([^)]+\))?)", raw)
     date_s = dm.group(1) if dm else f"{ymd[:4]}年{int(ymd[4:6])}月{int(ymd[6:8])}日"
@@ -16387,7 +16393,7 @@ def _v319_build_prediction_text_from_sprace(html: str, venue: str, race_no: int,
         trial = str(p.get("trial") or "").strip()
         trial_filled = False
         if not re.match(r"^\d+\.\d+$", trial):
-            if not p.get("kessha"):
+            if not p.get("kessha") and strict_trial:
                 raise ValueError(
                     f"出走表の試走Tが欠損しています（通常はありえません）: "
                     f"{p.get('car')}号 {name} trial={trial!r}"
@@ -19841,7 +19847,7 @@ def _v319_import_official_results(
 
 def _v319_import_player_history_one_race(
     db_path: str, ymd: str, venue: str, race_no: int,
-    min_rows: int = 30, on_step=None,
+    min_rows: int = 30, on_step=None, cancel_cb=None,
 ) -> dict:
     """1レース分の「選手履歴だけ」公式取込。
 
@@ -19855,16 +19861,34 @@ def _v319_import_player_history_one_race(
             except Exception:
                 pass
 
+    def _cancelled() -> bool:
+        if not cancel_cb:
+            return False
+        try:
+            return bool(cancel_cb())
+        except Exception:
+            return False
+
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     venue = str(venue or "").strip()
     race_no = int(race_no)
     key_guess = f"{ymd}_{venue}_{race_no}R"
 
+    if _cancelled():
+        return {
+            "status": "cancelled",
+            "phase": "fetch_card",
+            "message": f"{venue} {race_no}R：中止要求により中断しました。",
+            "key": key_guess,
+            "next_action": "cancelled",
+            "task_mode": "history_only",
+        }
+
     # --- 1) 出走表から選手を取得（選手履歴には選手名と選手CDが必要） ---
     players = []
     _step("出走表")
     try:
-        sp_html = _v319_fetch_sprace_html(ymd, venue, race_no)
+        sp_html = _v319_fetch_sprace_html(ymd, venue, race_no, strict_trial=False)
         if not str(sp_html or "").strip():
             return {
                 "status": "error",
@@ -19882,6 +19906,15 @@ def _v319_import_player_history_one_race(
                 "key": key_guess,
                 "next_action": "retry",
             }
+        if _cancelled():
+            return {
+                "status": "cancelled",
+                "phase": "fetch_card",
+                "message": f"{venue} {race_no}R：中止要求により中断しました。",
+                "key": key_guess,
+                "next_action": "cancelled",
+                "task_mode": "history_only",
+            }
     except Exception as exc:
         return {
             "status": "error",
@@ -19897,6 +19930,15 @@ def _v319_import_player_history_one_race(
 
     # --- 2) 選手履歴のみ保存（公式PC版/SP版 PlayerDetail → DB） ---
     _step("選手履歴")
+    if _cancelled():
+        return {
+            "status": "cancelled",
+            "phase": "save_player_history",
+            "message": f"{venue} {race_no}R：中止要求により中断しました。",
+            "key": key_guess,
+            "next_action": "cancelled",
+            "task_mode": "history_only",
+        }
     try:
         filled = _v319_fill_player_histories(
             db_path, players, min_rows=int(min_rows or 30),
@@ -19960,6 +20002,7 @@ def _v319_import_player_history_one_race(
         "missing_history": missing,
         "low_history": low_hist,
         "next_action": "done",
+        "task_mode": "history_only",
         "notify": bool(missing or low_hist or errors > 0 or warnings > 0),
         "notify_message": (
             f"【履歴注意】{venue}{race_no}R："
@@ -21085,6 +21128,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     one = _v319_import_player_history_one_race(
                         db_path, ymd_t, vn, n,
                         min_rows=int(req.get("min_rows") or 30),
+                        cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
                         on_step=lambda msg, vn=vn, n=n, i=i: _v278_bg_update(
                             db_path, job_id,
                             current_label=f"{vn} {n}R",
@@ -21116,6 +21160,9 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         "message": one.get("message") or "中止",
                         "phase": one.get("phase") or "",
                         "task_id": task_id,
+                        "task_mode": str(
+                            one.get("task_mode") or task.get("task_mode") or "normal"
+                        ),
                     })
                     try:
                         if task_id:
