@@ -20107,118 +20107,85 @@ def _v319_import_one_race(
                 "next_action": "retry",
             }
         players = _v319_parse_sprace_car_rows(sp_html) or _v319_parse_sprace_players(sp_html)
-        # 中止・不成立: 出走表が空でも結果側に中止があれば void 登録
+
+        # ===== 中止判定を最優先（players の有無より先） =====
+        # 1) sp_html の生テキスト（oddspark経路のときのみ有効）
         _void_early = _v319_is_void_or_cancelled_result(str(sp_html or ""))
-        if not players or _void_early.get("void"):
-            if not _void_early.get("void"):
+
+        # 2) players が空 or 全員 kessha → 結果APIで確定判定
+        if not _void_early.get("void"):
+            _n_valid = sum(
+                1 for p in (players or [])
+                if isinstance(p, dict) and not p.get("kessha")
+            )
+            if (not players) or (_n_valid == 0):
                 try:
-                    _rt = _v319_fetch_oddspark_result(ymd, venue, race_no)
-                except Exception:
-                    _rt = ""
-                _void_early = _v319_is_void_or_cancelled_result(_rt)
-                if not _void_early.get("void"):
-                    # autorace RaceResult も確認
-                    try:
-                        _ar = _v319_autorace_api_post("/race_info/RaceResult", ymd, venue, race_no)
-                        _ar_txt = str(_ar or "")
-                        if isinstance(_ar, dict):
+                    _ar = _v319_autorace_api_post("/race_info/RaceResult", ymd, venue, race_no)
+                    if isinstance(_ar, dict):
+                        for _k in ("raceStatus", "status", "raceStatusName", "cancelFlg"):
+                            _v = str(_ar.get(_k) or "")
+                            if any(x in _v for x in ("中止", "不成立", "取消", "キャンセル")):
+                                _void_early = {"void": True, "cancelled": True, "reason": _v or "レース中止"}
+                                break
+                        if not _void_early.get("void"):
                             _ar_txt = json.dumps(_ar, ensure_ascii=False)
-                        _void_early = _v319_is_void_or_cancelled_result(_ar_txt)
-                        # API フラグ系
-                        if not _void_early.get("void") and isinstance(_ar, dict):
-                            for _k in ("raceStatus", "status", "raceStatusName", "cancelFlg"):
-                                _v = str(_ar.get(_k) or "")
-                                if any(x in _v for x in ("中止", "不成立", "取消", "キャンセル")):
-                                    _void_early = {"void": True, "cancelled": True, "reason": "レース中止"}
-                                    break
-                    except Exception:
-                        pass
-            if _void_early.get("void"):
-                try:
-                    _reg = _v319_register_void_result(
-                        db_path, str(sp_html or ""), venue, ymd, race_no,
-                        reason=str(_void_early.get("reason") or "レース中止"),
-                    )
-                    return {
-                        "status": "ok",
-                        "phase": "completed",
-                        "message": (
-                            f"{key_guess} / 中止登録"
-                            f"（{_void_early.get('reason') or 'レース中止'}）"
-                            f"{' / ' + str(_reg.get('message') or '') if isinstance(_reg, dict) else ''}"
-                        ),
-                        "key": key_guess,
-                        "next_action": "done",
-                    }
-                except Exception as _vexc:
-                    return {
-                        "status": "error",
-                        "phase": "register_void",
-                        "message": f"{venue} {race_no}R：中止登録に失敗しました。 ({type(_vexc).__name__}: {_vexc})",
-                        "key": key_guess,
-                        "next_action": "retry",
-                    }
-            if not players:
-                return {
-                    "status": "error",
-                    "phase": "fetch_card",
-                    "message": f"{venue} {race_no}R：出走表から選手を取得できませんでした。予測と結果登録は実行していません。",
-                    "key": key_guess,
-                    "next_action": "retry",
-                }
-        # 予測前に必須項目を検証（欠損は IntCastingNaN より先に明示エラー）
-        try:
-            _v319_validate_card_players(players, venue, race_no)
-        except ValueError as _val_exc:
-            # 「有効な出走車がありません」→ 中止/不成立を優先。判定できなければ skip
-            if "有効な出走車" in str(_val_exc):
-                try:
-                    _rt2 = _v319_fetch_oddspark_result(ymd, venue, race_no)
+                            _void_early = _v319_is_void_or_cancelled_result(_ar_txt)
                 except Exception:
-                    _rt2 = str(sp_html or "")
-                _void2 = _v319_is_void_or_cancelled_result(_rt2)
-                if not _void2.get("void"):
+                    pass
+
+                # 3) それでも確定しない場合、oddspark結果テキストでも最終確認
+                if not _void_early.get("void"):
                     try:
-                        _ar2 = _v319_autorace_api_post("/race_info/RaceResult", ymd, venue, race_no)
-                        _ar_txt2 = json.dumps(_ar2, ensure_ascii=False) if isinstance(_ar2, dict) else str(_ar2 or "")
-                        _void2 = _v319_is_void_or_cancelled_result(_ar_txt2)
-                        if not _void2.get("void") and isinstance(_ar2, dict):
-                            for _k in ("raceStatus", "status", "raceStatusName", "cancelFlg"):
-                                _v = str(_ar2.get(_k) or "")
-                                if any(x in _v for x in ("中止", "不成立", "取消", "キャンセル")):
-                                    _void2 = {"void": True, "cancelled": True, "reason": "レース中止"}
-                                    break
+                        _rt = _v319_fetch_oddspark_result(ymd, venue, race_no)
+                        _void_early = _v319_is_void_or_cancelled_result(_rt)
                     except Exception:
                         pass
-                if _void2.get("void"):
-                    try:
-                        _reg2 = _v319_register_void_result(
-                            db_path, _rt2 or str(sp_html or ""), venue, ymd, race_no,
-                            reason=str(_void2.get("reason") or "レース中止"),
-                        )
-                        return {
-                            "status": "ok",
-                            "phase": "completed",
-                            "message": f"{key_guess} / 中止登録（{_void2.get('reason') or 'レース中止'}）",
-                            "key": key_guess,
-                            "next_action": "done",
-                        }
-                    except Exception as _vexc2:
-                        return {
-                            "status": "skip",
-                            "phase": "fetch_card",
-                            "message": f"{venue} {race_no}R：中止候補だが登録失敗 ({type(_vexc2).__name__})",
-                            "key": key_guess,
-                            "next_action": "done",
-                        }
+
+        # 4) 中止確定 → 即登録して終了（players が7人いても）
+        if _void_early.get("void"):
+            try:
+                _reg = _v319_register_void_result(
+                    db_path, str(sp_html or ""), venue, ymd, race_no,
+                    reason=str(_void_early.get("reason") or "レース中止"),
+                )
                 return {
-                    "status": "skip",
-                    "phase": "fetch_card",
-                    "message": f"{venue} {race_no}R：有効な出走車なし（中止・不成立の可能性）。予測スキップ。",
+                    "status": "ok",
+                    "phase": "completed_void",
+                    "message": (
+                        f"{key_guess} / 中止登録"
+                        f"（{_void_early.get('reason') or 'レース中止'}）"
+                        + (f" / {_reg.get('message') or ''}" if isinstance(_reg, dict) else "")
+                    ),
                     "key": key_guess,
                     "next_action": "done",
                 }
-            raise
+            except Exception as _vexc:
+                return {
+                    "status": "error",
+                    "phase": "register_void",
+                    "message": (
+                        f"{venue} {race_no}R：中止登録に失敗しました。"
+                        f" ({type(_vexc).__name__}: {_vexc})"
+                    ),
+                    "key": key_guess,
+                    "next_action": "retry",
+                }
+
+        # 5) 中止でない → ここで初めて players の検証
+        if not players:
+            return {
+                "status": "error",
+                "phase": "fetch_card",
+                "message": (
+                    f"{venue} {race_no}R：出走表から選手を取得できませんでした。"
+                    f"（中止判定も行いましたが確定しませんでした）"
+                ),
+                "key": key_guess,
+                "next_action": "retry",
+            }
+
+        # 6) 有効出走車の検証（中止判定済みのため、ここでエラーなら本物の破損）
+        _v319_validate_card_players(players, venue, race_no)
         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
         kessha_cars = sorted(set(
             _v319_detect_kessha_from_players(players)
