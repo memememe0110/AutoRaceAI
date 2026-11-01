@@ -2887,7 +2887,7 @@ def _v326_queue_write_retry(fn, *, retries: int = 5, delay: float = 0.08):
 
 
 def _v326_ensure_import_queue(db_path: str) -> None:
-    """v326_import_queue を冪等作成。"""
+    """v326_import_queue を冪等作成。Step 2 では task_mode を UNIQUE 制約に含める。"""
     def _run():
         with _v326_queue_connect(db_path, 30.0) as con:
             con.execute(
@@ -2908,12 +2908,6 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                 )
                 """
             )
-            con.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_v326_queue_pickup
-                ON v326_import_queue (job_type, status, sort_order, task_id)
-                """
-            )
             for _col, _typ in (
                 ("task_mode", "TEXT NOT NULL DEFAULT 'normal'"),
                 ("fetch_odds", "INTEGER NOT NULL DEFAULT 1"),
@@ -2928,6 +2922,79 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                     )
                 except Exception:
                     pass
+
+            # Step 2: 旧 UNIQUE(job_type, ymd, venue, race_no) を
+            # UNIQUE(job_type, task_mode, ymd, venue, race_no) に置換する。
+            # 既存行はすべて task_mode='normal' のまま保持し、task_id も維持する。
+            _need_rebuild = False
+            try:
+                _idx_rows = con.execute("PRAGMA index_list(v326_import_queue)").fetchall()
+                for _idx in _idx_rows:
+                    # index_list: seq, name, unique, origin, partial
+                    if int(_idx[2] or 0) != 1:
+                        continue
+                    _iname = str(_idx[1] or "")
+                    _cols = [str(r[2] or "") for r in con.execute(
+                        f'PRAGMA index_info("{_iname.replace(chr(34), chr(34)*2)}")'
+                    ).fetchall()]
+                    if _cols == ["job_type", "ymd", "venue", "race_no"]:
+                        _need_rebuild = True
+                        break
+                    if _cols == ["job_type", "task_mode", "ymd", "venue", "race_no"]:
+                        _need_rebuild = False
+                        break
+            except Exception:
+                _need_rebuild = False
+
+            if _need_rebuild:
+                con.execute("DROP INDEX IF EXISTS idx_v326_queue_pickup")
+                con.execute("DROP TABLE IF EXISTS v326_import_queue_step2_new")
+                con.execute(
+                    """
+                    CREATE TABLE v326_import_queue_step2_new (
+                        task_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job_type    TEXT    NOT NULL,
+                        task_mode   TEXT    NOT NULL DEFAULT 'normal',
+                        ymd         TEXT    NOT NULL,
+                        venue       TEXT    NOT NULL,
+                        race_no     INTEGER NOT NULL,
+                        status      TEXT    NOT NULL DEFAULT 'pending',
+                        sort_order  INTEGER NOT NULL DEFAULT 0,
+                        message     TEXT    DEFAULT '',
+                        created_at  TEXT    NOT NULL,
+                        updated_at  TEXT    NOT NULL,
+                        fetch_odds  INTEGER NOT NULL DEFAULT 1,
+                        register_result INTEGER NOT NULL DEFAULT 1,
+                        skip_existing INTEGER NOT NULL DEFAULT 1,
+                        replace_existing INTEGER NOT NULL DEFAULT 0,
+                        predict_if_missing INTEGER NOT NULL DEFAULT 1,
+                        UNIQUE (job_type, task_mode, ymd, venue, race_no)
+                    )
+                    """
+                )
+                con.execute(
+                    """
+                    INSERT INTO v326_import_queue_step2_new
+                        (task_id, job_type, task_mode, ymd, venue, race_no, status, sort_order,
+                         message, created_at, updated_at, fetch_odds, register_result,
+                         skip_existing, replace_existing, predict_if_missing)
+                    SELECT task_id, job_type, COALESCE(task_mode, 'normal'), ymd, venue, race_no,
+                           status, sort_order, message, created_at, updated_at,
+                           COALESCE(fetch_odds, 1), COALESCE(register_result, 1),
+                           COALESCE(skip_existing, 1), COALESCE(replace_existing, 0),
+                           COALESCE(predict_if_missing, 1)
+                      FROM v326_import_queue
+                    """
+                )
+                con.execute("DROP TABLE v326_import_queue")
+                con.execute("ALTER TABLE v326_import_queue_step2_new RENAME TO v326_import_queue")
+
+            con.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_v326_queue_pickup
+                ON v326_import_queue (job_type, status, sort_order, task_id)
+                """
+            )
             con.commit()
     with _V326_QUEUE_LOCK:
         _v326_queue_write_retry(_run)
@@ -38665,7 +38732,7 @@ if selected_main_page == "✅ 結果登録・解析":
             f"共通キュー: pending {_hist_qs2.get('pending',0)} / running {_hist_qs2.get('running',0)} / "
             f"done {_hist_qs2.get('done',0)} / error {_hist_qs2.get('error',0)}"
         )
-        st.caption("※ Step 1では既存のUNIQUE制約を維持するため、同じRが通常取込タスクとして既に存在する場合は重複追加されません。")
+        st.caption("※ Step 2では task_mode も UNIQUE 判定に含めるため、同じRでも通常取込と選手履歴のみを別タスクとして登録できます。")
 
     saved_results = _v233_list_saved_results(engine.DB_PATH, 250)
     if saved_results:
