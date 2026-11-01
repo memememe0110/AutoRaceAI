@@ -15260,18 +15260,52 @@ def _v319_registered_race_nos(db_path: str, ymd: str, venue: str) -> list[int]:
 
 
 def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[int]:
-    """1Rから当日の最大Rまで連番。抜けた1Rは補う。"""
-    place = _V319_OP_PLACE.get(str(venue) or "")
-    found = []
-    if place:
+    """当日実在/公開確認できたRだけを列挙する。存在しないRはキューへ積まない。"""
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    venue = str(venue or "").strip()
+    if len(ymd) != 8 or not venue:
+        return []
+
+    found: list[int] = []
+    miss = 0
+    try:
+        _max_r = max(1, int(max_races or 12))
+    except Exception:
+        _max_r = 12
+
+    for n in range(1, _max_r + 1):
+        ok = False
+        # Odds APIでplayerListが確認できるR
         try:
-            found = _v319_list_oddspark_races(ymd, place)
+            _od = _v319_autorace_odds_api_probe(ymd, venue, n)
+            ok = bool(_od)
         except Exception:
-            found = []
-    found = [int(n) for n in found if 1 <= int(n) <= int(max_races or 12)]
-    if found:
-        return list(range(1, max(found) + 1))
-    return list(range(1, min(int(max_races or 12), 9) + 1))
+            ok = False
+
+        # Odds側で取れない場合は公式Program APIで補完
+        if not ok:
+            try:
+                _prog = _v319_autorace_program_body(ymd, venue, n)
+                if isinstance(_prog, dict) and (_prog.get("playerList") or []):
+                    ok = True
+            except Exception:
+                ok = False
+
+        if ok:
+            found.append(n)
+            miss = 0
+        else:
+            miss += 1
+            # 開催途中の欠番を1Rだけ救済し、2連続未確認で打ち切る
+            if found and miss >= 2:
+                break
+            # 1～3Rまで全て未確認なら開催なし/未公開として空を返す
+            if not found and n >= 3:
+                break
+
+        time_module.sleep(0.12)
+
+    return found
 
 
 def _v319_html_cells(row_html: str) -> list[str]:
@@ -19958,20 +19992,22 @@ def _v319_import_player_history_one_race(
         sp_html = _v319_fetch_sprace_html(ymd, venue, race_no, strict_trial=False)
         if not str(sp_html or "").strip():
             return {
-                "status": "error",
+                "status": "skip",
                 "phase": "fetch_card",
-                "message": f"{venue} {race_no}R：出走表が空です。選手履歴は登録していません。",
+                "message": f"{venue} {race_no}R：出走表未公開／存在しないRとしてスキップしました。",
                 "key": key_guess,
-                "next_action": "retry",
+                "next_action": "done",
+                "task_mode": "history_only",
             }
         players = _v319_parse_sprace_car_rows(sp_html) or _v319_parse_sprace_players(sp_html)
         if not players:
             return {
-                "status": "error",
+                "status": "skip",
                 "phase": "fetch_card",
-                "message": f"{venue} {race_no}R：出走表から選手を取得できませんでした。選手履歴は登録していません。",
+                "message": f"{venue} {race_no}R：有効な出走車を確認できないためスキップしました。",
                 "key": key_guess,
-                "next_action": "retry",
+                "next_action": "done",
+                "task_mode": "history_only",
             }
         if _cancelled():
             return {
@@ -20219,11 +20255,11 @@ def _v319_import_one_race(
         sp_html = _v319_fetch_sprace_html(ymd, venue, race_no)
         if not str(sp_html or "").strip():
             return {
-                "status": "error",
+                "status": "skip",
                 "phase": "fetch_card",
-                "message": f"{venue} {race_no}R：出走表が空です。予測と結果登録は実行していません。",
+                "message": f"{venue} {race_no}R：出走表未公開／存在しないRとしてスキップしました。",
                 "key": key_guess,
-                "next_action": "retry",
+                "next_action": "done",
             }
         players = _v319_parse_sprace_car_rows(sp_html) or _v319_parse_sprace_players(sp_html)
 
@@ -20293,17 +20329,31 @@ def _v319_import_one_race(
         # 5) 中止でない → ここで初めて players の検証
         if not players:
             return {
-                "status": "error",
+                "status": "skip",
                 "phase": "fetch_card",
                 "message": (
-                    f"{venue} {race_no}R：出走表から選手を取得できませんでした。"
+                    f"{venue} {race_no}R：有効な出走車を確認できないためスキップしました。"
                     f"（中止判定も行いましたが確定しませんでした）"
                 ),
                 "key": key_guess,
-                "next_action": "retry",
+                "next_action": "done",
             }
 
-        # 6) 有効出走車の検証（中止判定済みのため、ここでエラーなら本物の破損）
+        # 6) 有効出走車が0件なら、存在しないR／未公開／開催短縮としてスキップ
+        _n_valid_after = sum(
+            1 for p in (players or [])
+            if isinstance(p, dict) and not p.get("kessha")
+        )
+        if _n_valid_after == 0:
+            return {
+                "status": "skip",
+                "phase": "fetch_card",
+                "message": f"{venue} {race_no}R：有効な出走車がありません。スキップしました。",
+                "key": key_guess,
+                "next_action": "done",
+            }
+
+        # 7) 有効出走車の検証。通常取込は従来どおり試走T等を厳格検証
         _v319_validate_card_players(players, venue, race_no)
         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
         kessha_cars = sorted(set(
