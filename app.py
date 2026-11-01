@@ -19659,6 +19659,24 @@ def _v319_register_fetched_result(
     race_no_hint=None,
 ) -> dict:
     meta_r, rows_r, laps_r, payouts_r = engine.v35_parse_result_text(raw_text, venue, "")
+    # Ver326: グランドノート重複防御。
+    # result_laps は (race_key, lap_label, position) が一意なので、
+    # 同じ周回・順位がHTML/テキストの二重抽出で複数行になっている場合は
+    # 保存前に1行へ正規化する。車番が異なる衝突は黙って捨てず、登録を止めて
+    # 元データの確認が必要な状態として明示する。
+    if isinstance(laps_r, pd.DataFrame) and not laps_r.empty:
+        _lap_key_cols = [c for c in ("周回", "順位") if c in laps_r.columns]
+        if len(_lap_key_cols) == 2:
+            _dup = laps_r[laps_r.duplicated(subset=_lap_key_cols, keep=False)]
+            if not _dup.empty and "車番" in _dup.columns:
+                _conflict = (_dup.groupby(_lap_key_cols)["車番"].nunique(dropna=True) > 1).any()
+                if _conflict:
+                    raise ValueError(
+                        "グランドノートに同一周回・同一順位で異なる車番が混在しています。"
+                        "結果ページの重複抽出を確認してください。"
+                    )
+            if not _dup.empty:
+                laps_r = laps_r.drop_duplicates(subset=_lap_key_cols, keep="first").reset_index(drop=True)
     # Ver320: parser がレース番号を落としても hint/本文から補完
     meta_r = _v320_fill_race_no_in_meta(meta_r, raw_text, race_no_hint=race_no_hint)
     meta_r, rows_r, nonstarter_numbers = _v224_restore_nonstarter_rows(raw_text, meta_r, rows_r)

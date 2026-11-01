@@ -7818,7 +7818,20 @@ def v35_save_result_and_analyze(meta, results, laps=None, payouts=None, db_path=
     with sqlite3.connect(db_path) as con:
         con.execute("DELETE FROM result_laps WHERE race_key=?", (key,))
         if isinstance(laps, pd.DataFrame) and not laps.empty:
-            for _, r in laps.iterrows():
+            # result_laps の UNIQUE(race_key, lap_label, position) を守る最終防御。
+            # 自動取込以外から直接呼ばれても、同じ周回・順位の重複INSERTを防ぐ。
+            _laps_save = laps.copy()
+            _lap_key_cols = [c for c in ("周回", "順位") if c in _laps_save.columns]
+            if len(_lap_key_cols) == 2:
+                _dup = _laps_save[_laps_save.duplicated(subset=_lap_key_cols, keep=False)]
+                if not _dup.empty and "車番" in _dup.columns:
+                    _conflict = (_dup.groupby(_lap_key_cols)["車番"].nunique(dropna=True) > 1).any()
+                    if _conflict:
+                        raise ValueError(
+                            "result_lapsに同一周回・同一順位で異なる車番が存在します。"
+                        )
+                _laps_save = _laps_save.drop_duplicates(subset=_lap_key_cols, keep="first").reset_index(drop=True)
+            for _, r in _laps_save.iterrows():
                 con.execute("INSERT INTO result_laps VALUES(?,?,?,?,?)",
                             (key, str(r["周回"]), int(r["周回番号"]), int(r["順位"]), int(r["車番"])))
         con.execute("DELETE FROM result_payouts WHERE race_key=?", (key,))
