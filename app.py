@@ -2895,6 +2895,7 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                 CREATE TABLE IF NOT EXISTS v326_import_queue (
                     task_id     INTEGER PRIMARY KEY AUTOINCREMENT,
                     job_type    TEXT    NOT NULL,
+                    task_mode   TEXT    NOT NULL DEFAULT 'normal',
                     ymd         TEXT    NOT NULL,
                     venue       TEXT    NOT NULL,
                     race_no     INTEGER NOT NULL,
@@ -2914,6 +2915,7 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                 """
             )
             for _col, _typ in (
+                ("task_mode", "TEXT NOT NULL DEFAULT 'normal'"),
                 ("fetch_odds", "INTEGER NOT NULL DEFAULT 1"),
                 ("register_result", "INTEGER NOT NULL DEFAULT 1"),
                 ("skip_existing", "INTEGER NOT NULL DEFAULT 1"),
@@ -2939,6 +2941,7 @@ def _v326_enqueue_tasks(
     sort_order: int = 0,
     insert_first: bool = False,
     *,
+    task_mode: str = "normal",
     fetch_odds: bool = True,
     register_result: bool = True,
     skip_existing: bool = True,
@@ -2952,6 +2955,9 @@ def _v326_enqueue_tasks(
     オプション列は追加時点のチェック状態を保存する。
     """
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
+    task_mode = str(task_mode or "normal").strip().lower()
+    if task_mode not in ("normal", "history_only"):
+        task_mode = "normal"
     now = _v228_now_jst_iso()
     task_list = []
     for venue, race_no in list(tasks or []):
@@ -3002,15 +3008,15 @@ def _v326_enqueue_tasks(
                 cur = con.execute(
                     """
                     INSERT OR IGNORE INTO v326_import_queue
-                        (job_type, ymd, venue, race_no, status, sort_order,
+                        (job_type, task_mode, ymd, venue, race_no, status, sort_order,
                          message, created_at, updated_at,
                          fetch_odds, register_result, skip_existing,
                          replace_existing, predict_if_missing)
-                    VALUES (?, ?, ?, ?, 'pending', ?, '', ?, ?,
+                    VALUES (?, ?, ?, ?, ?, 'pending', ?, '', ?, ?,
                             ?, ?, ?, ?, ?)
                     """,
                     (
-                        str(job_type), ymd, venue, rn, int(effective_so), now, now,
+                        str(job_type), task_mode, ymd, venue, rn, int(effective_so), now, now,
                         _fo, _rr, _se, _rp, _pm,
                     ),
                 )
@@ -3085,7 +3091,7 @@ def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
         with _v326_queue_connect(db_path, 30.0) as con:
             row = con.execute(
                 """
-                SELECT task_id, ymd, venue, race_no,
+                SELECT task_id, task_mode, ymd, venue, race_no,
                        COALESCE(fetch_odds, 1),
                        COALESCE(register_result, 1),
                        COALESCE(skip_existing, 1),
@@ -3115,14 +3121,15 @@ def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
             # Ver324: 0 は falsy なので `x or 1` すると意図が反転する。NULL のみ default。
             return {
                 "task_id": task_id,
-                "ymd": str(row[1] or ""),
-                "venue": str(row[2] or ""),
-                "race_no": int(row[3] or 0),
-                "fetch_odds": bool(int(row[4])) if row[4] is not None else True,
-                "register_result": bool(int(row[5])) if row[5] is not None else True,
-                "skip_existing": bool(int(row[6])) if row[6] is not None else True,
-                "replace": bool(int(row[7])) if row[7] is not None else False,
-                "predict_if_missing": bool(int(row[8])) if row[8] is not None else True,
+                "task_mode": str(row[1] or "normal"),
+                "ymd": str(row[2] or ""),
+                "venue": str(row[3] or ""),
+                "race_no": int(row[4] or 0),
+                "fetch_odds": bool(int(row[5])) if row[5] is not None else True,
+                "register_result": bool(int(row[6])) if row[6] is not None else True,
+                "skip_existing": bool(int(row[7])) if row[7] is not None else True,
+                "replace": bool(int(row[8])) if row[8] is not None else False,
+                "predict_if_missing": bool(int(row[9])) if row[9] is not None else True,
             }
 
     with _V326_QUEUE_LOCK:
@@ -3159,7 +3166,8 @@ def _v326_list_queue_tasks(
         with _v326_queue_connect(db_path, 15.0) as con:
             df = pd.read_sql_query(
                 """
-                SELECT task_id, job_type, ymd, venue, race_no, status,
+                SELECT task_id, job_type, COALESCE(task_mode,'normal') AS task_mode,
+                       ymd, venue, race_no, status,
                        sort_order, message, created_at, updated_at,
                        COALESCE(fetch_odds,1) AS fetch_odds,
                        COALESCE(register_result,1) AS register_result,
@@ -12624,7 +12632,8 @@ def _v326_render_queue_reorder_fragment(db_path: str, job_type: str = "official_
                 continue
             if _tid <= 0:
                 continue
-            _label = f"{_row.get('ymd', '')} {_row.get('venue', '')} {_row.get('race_no', '')}R"
+            _mode_label = "履歴のみ" if str(_row.get("task_mode") or "normal") == "history_only" else "通常"
+            _label = f"{_row.get('ymd', '')} {_row.get('venue', '')} {_row.get('race_no', '')}R｜{_mode_label}"
             c_lab, c_top, c_up, c_dn, c_bot = st.columns([4, 1, 1, 1, 1])
             c_lab.write(_label)
             if c_top.button("⇈", key=f"v326_q_top_{_tid}", help="先頭へ", use_container_width=True):
@@ -21052,7 +21061,8 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 done_count=max(0, int(ok) + int(skip) + int(err)),
                 total_count=max(1, total),
             )
-            item = {"venue": vn, "R": n, "status": "", "message": "", "task_id": task_id}
+            item = {"venue": vn, "R": n, "status": "", "message": "", "task_id": task_id,
+                     "task_mode": str(task.get("task_mode") or "normal")}
             try:
                 # task 行のオプション優先（追加時の意図を保持）。無ければ job の req。
                 _t_skip = task.get("skip_existing")
@@ -21060,23 +21070,36 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 _t_pred = task.get("predict_if_missing")
                 _t_odds = task.get("fetch_odds")
                 _t_reg = task.get("register_result")
-                one = _v319_import_one_race(
-                    db_path, ymd_t, vn, n,
-                    skip_existing=bool(_t_skip if _t_skip is not None else req.get("skip_existing")),
-                    replace=bool(_t_repl if _t_repl is not None else req.get("replace")),
-                    predict_if_missing=bool(_t_pred if _t_pred is not None else req.get("predict_if_missing")),
-                    trials=int(req.get("trials") or 20000),
-                    seed=int(req.get("seed") or 20260719),
-                    fetch_odds=bool(_t_odds if _t_odds is not None else req.get("fetch_odds", True)),
-                    register_result=bool(_t_reg if _t_reg is not None else req.get("register_result", True)),
-                    cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
-                    on_step=lambda msg, vn=vn, n=n, i=i: _v278_bg_update(
-                        db_path, job_id,
-                        current_label=f"{vn} {n}R",
-                        message=f"登録{ok}/skip{skip}/err{err}｜今は{msg}",
-                        done_count=i - 1,
-                    ),
-                )
+                _task_mode = str(task.get("task_mode") or req.get("task_mode") or "normal").strip().lower()
+                if _task_mode == "history_only":
+                    one = _v319_import_player_history_one_race(
+                        db_path, ymd_t, vn, n,
+                        min_rows=int(req.get("min_rows") or 30),
+                        on_step=lambda msg, vn=vn, n=n, i=i: _v278_bg_update(
+                            db_path, job_id,
+                            current_label=f"{vn} {n}R",
+                            message=f"履歴のみ｜登録{ok}/skip{skip}/err{err}｜今は{msg}",
+                            done_count=i - 1,
+                        ),
+                    )
+                else:
+                    one = _v319_import_one_race(
+                        db_path, ymd_t, vn, n,
+                        skip_existing=bool(_t_skip if _t_skip is not None else req.get("skip_existing")),
+                        replace=bool(_t_repl if _t_repl is not None else req.get("replace")),
+                        predict_if_missing=bool(_t_pred if _t_pred is not None else req.get("predict_if_missing")),
+                        trials=int(req.get("trials") or 20000),
+                        seed=int(req.get("seed") or 20260719),
+                        fetch_odds=bool(_t_odds if _t_odds is not None else req.get("fetch_odds", True)),
+                        register_result=bool(_t_reg if _t_reg is not None else req.get("register_result", True)),
+                        cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
+                        on_step=lambda msg, vn=vn, n=n, i=i: _v278_bg_update(
+                            db_path, job_id,
+                            current_label=f"{vn} {n}R",
+                            message=f"登録{ok}/skip{skip}/err{err}｜今は{msg}",
+                            done_count=i - 1,
+                        ),
+                    )
                 if str(one.get("status") or "") == "cancelled":
                     details.append({
                         "venue": vn, "R": n, "status": "cancelled",
@@ -21295,6 +21318,8 @@ def _v319_bg_import_start(
     enqueue: bool = True,
     run_worker: bool = True,
     insert_first: bool = False,
+    task_mode: str = "normal",
+    min_rows: int = 30,
 ) -> dict:
     """enqueue=True で条件をキュー追加。run_worker=True で実行開始。
 
@@ -21328,6 +21353,7 @@ def _v319_bg_import_start(
             enqueued = int(_v326_enqueue_tasks(
                 db_path, "official_import", ymd, tasks,
                 sort_order=0, insert_first=bool(insert_first),
+                task_mode=str(task_mode or "normal"),
                 fetch_odds=bool(fetch_odds),
                 register_result=bool(register_result),
                 skip_existing=bool(skip_existing),
@@ -21379,6 +21405,8 @@ def _v319_bg_import_start(
         "race_nos": _rnos,
         "fetch_odds": bool(fetch_odds),
         "register_result": bool(register_result),
+        "task_mode": str(task_mode or "normal"),
+        "min_rows": int(min_rows or 30),
     }
     th = threading.Thread(
         target=_v319_bg_import_worker, args=(str(db_path), job_id, req),
@@ -36452,6 +36480,57 @@ def _v301_build_analysis_light_db_zip(
 
 with st.sidebar:
     _v278_render_bg_compact("sidebar")
+    # 共通取込キュー: サイドバーからも中止・再開できる。
+    try:
+        _sq_job = _v278_bg_get_active_of(engine.DB_PATH, ("official_import",)) or {}
+        _sq_status = str(_sq_job.get("status") or "")
+        _sq_pending = int((_v326_queue_summary(engine.DB_PATH, "official_import") or {}).get("pending") or 0)
+        if _sq_job and _sq_status in ("queued", "running", "pause_requested", "paused", "cancel_requested"):
+            st.markdown("#### 📋 取込キュー操作")
+            _sq_done = int(_sq_job.get("done_count") or 0)
+            _sq_total = int(_sq_job.get("total_count") or 0)
+            if _sq_total > 0:
+                st.progress(min(1.0, max(0.0, _sq_done / float(_sq_total))), text=f"{_sq_done}/{_sq_total}R")
+            st.caption(
+                f"{_sq_status}｜{str(_sq_job.get('current_label') or '-')}｜"
+                f"pending {_sq_pending}"
+            )
+            _sq1, _sq2 = st.columns(2)
+            if _sq1.button(
+                "⏹ 中止", use_container_width=True, key="v326_sidebar_import_cancel",
+                disabled=_sq_status == "cancel_requested",
+            ):
+                _v278_bg_request_cancel(engine.DB_PATH, int(_sq_job.get("job_id") or 0))
+                st.toast("取込の中止要求を送信しました。現在レース後に停止します。")
+                st.rerun()
+            if _sq2.button(
+                "🔄 更新", use_container_width=True, key="v326_sidebar_import_refresh",
+            ):
+                st.rerun()
+        else:
+            _sq_active_pending = _sq_pending > 0
+            if _sq_active_pending:
+                st.markdown("#### 📋 取込キュー操作")
+                st.caption(f"pending {_sq_pending}R｜いつでも再開できます")
+                if st.button(
+                    "▶ 取込キューを再開", type="primary", use_container_width=True,
+                    key="v326_sidebar_import_resume",
+                ):
+                    _sq_resume = _v319_bg_import_start(
+                        engine.DB_PATH, _v228_now_jst_iso()[:10].replace("-", ""), [""],
+                        skip_existing=True, replace=False, predict_if_missing=True,
+                        trials=int(st.session_state.get("trials") or 20000),
+                        seed=int(st.session_state.get("seed") or 20260719),
+                        race_nos=[], fetch_odds=True, register_result=True,
+                        enqueue=False, run_worker=True,
+                    )
+                    if _sq_resume.get("ok"):
+                        st.success(f"取込キューを再開しました（ジョブ {_sq_resume.get('job_id')}）。")
+                        st.rerun()
+                    else:
+                        st.warning(_sq_resume.get("reason") or "再開できませんでした")
+    except Exception:
+        pass
     st.header("予測設定")
     trials = st.selectbox("試行回数", [3000, 10000, 20000], index=2)
     seed = st.number_input("乱数シード", min_value=0, value=20260719, step=1)
@@ -38439,21 +38518,26 @@ if selected_main_page == "✅ 結果登録・解析":
         _v326_render_official_import_panel()
 
 
-    # ===== Ver319: 選手履歴だけを自動登録 =====
-    with st.expander("👤 選手履歴だけを自動登録（予測・オッズ・結果登録なし）", expanded=False):
+    # ===== Ver319: 選手履歴だけを公式取込キューへ追加 =====
+    with st.expander("👤 選手履歴だけをキューに追加", expanded=False):
         st.caption(
-            "出走表から選手を取得し、選手履歴だけを公式ページから保存します。"
-            "予測・オッズ取得・結果登録は一切行いません。"
+            "通常の公式取込と同じ v326_import_queue を使います。"
+            "選手履歴だけのタスクは task_mode=history_only で保存し、予測・オッズ・結果登録は行いません。"
         )
         hcol1, hcol2 = st.columns(2)
         hist_date = hcol1.date_input("開催日", value=date.today(), key="v319_hist_date")
         hist_venue = hcol2.selectbox(
             "開催場", ["開催を探す"] + RESULT_VENUES, key="v319_hist_venue"
         )
+        hist_race_count = st.number_input(
+            "選手履歴だけ登録するレース数", min_value=1, max_value=12, value=12, step=1,
+            key="v319_hist_race_count",
+            help="1Rから指定レース数までをキューへ追加します。例: 3なら1〜3R。"
+        )
         hist_min_rows = st.number_input(
             "最低履歴件数", min_value=5, max_value=200, value=30, step=5,
             key="v319_hist_min_rows",
-            help="この件数に満たない選手は、公式ページから履歴を取り直します。",
+            help="この件数に満たない選手は、公式ページから履歴を取り直します。"
         )
         hist_ymd = hist_date.strftime("%Y%m%d")
         hist_meets = st.session_state.get("v319_op_meetings") or []
@@ -38463,102 +38547,64 @@ if selected_main_page == "✅ 結果登録・解析":
         )
         hb1, hb2 = st.columns(2)
         with hb1:
-            hist_start_fg = st.button(
-                "今すぐ選手履歴を登録", use_container_width=True, key="v319_hist_import",
+            hist_queue_add = st.button(
+                "＋選手履歴をキューに追加", use_container_width=True, key="v319_hist_queue_add",
             )
         with hb2:
-            hist_start_bg = st.button(
-                "バックグラウンドで登録", type="primary", use_container_width=True,
-                key="v319_hist_import_bg",
+            hist_queue_run = st.button(
+                "▶ キューを実行/再開", type="primary", use_container_width=True,
+                key="v319_hist_queue_run",
             )
-        if hist_start_fg or hist_start_bg:
+        if hist_queue_add:
             if not hist_venues:
                 st.warning("開催場を選ぶか、先に「この日の開催を確認」を実行してください。")
-            elif hist_start_bg:
-                started = _v319_bg_history_start(
-                    engine.DB_PATH, hist_ymd, hist_venues, min_rows=int(hist_min_rows),
-                )
-                if started.get("ok"):
+            else:
+                _hist_tasks = []
+                for _hv in hist_venues:
+                    for _hn in range(1, int(hist_race_count) + 1):
+                        _hist_tasks.append((str(_hv), int(_hn)))
+                try:
+                    _hist_added = _v326_enqueue_tasks(
+                        engine.DB_PATH, "official_import", hist_ymd, _hist_tasks,
+                        task_mode="history_only",
+                        fetch_odds=False, register_result=False,
+                        skip_existing=True, replace=False, predict_if_missing=False,
+                    )
                     st.success(
-                        f"選手履歴のバックグラウンド取込を開始しました（ジョブ {started.get('job_id')}）。"
-                        "画面を離れても進みます。"
+                        f"選手履歴タスクを {_hist_added}R キューへ追加しました。"
+                        " 通常取込と同じキューで、途中停止後も pending から再開できます。"
+                    )
+                    st.rerun()
+                except Exception as _hist_qexc:
+                    st.error(f"選手履歴キュー追加失敗: {type(_hist_qexc).__name__}: {_hist_qexc}")
+        if hist_queue_run:
+            _hist_qs = _v326_queue_summary(engine.DB_PATH, "official_import")
+            if int(_hist_qs.get("pending") or 0) + int(_hist_qs.get("running") or 0) <= 0:
+                st.warning("実行する pending がありません。先に「＋選手履歴をキューに追加」してください。")
+            else:
+                _hist_started = _v319_bg_import_start(
+                    engine.DB_PATH, hist_ymd, hist_venues or [""],
+                    skip_existing=True, replace=False, predict_if_missing=False,
+                    trials=int(st.session_state.get("trials") or 20000),
+                    seed=int(st.session_state.get("seed") or 20260719),
+                    race_nos=[], fetch_odds=False, register_result=False,
+                    enqueue=False, run_worker=True,
+                    task_mode="history_only", min_rows=int(hist_min_rows),
+                )
+                if _hist_started.get("ok"):
+                    st.success(
+                        f"取込キューを実行しました（ジョブ {_hist_started.get('job_id')}）。"
+                        "通常取込タスクが入っている場合も、同じキューを順番に処理します。"
                     )
                     st.rerun()
                 else:
-                    st.warning(started.get("reason") or "開始できませんでした")
-            else:
-                all_hrep = {"ok": 0, "skip": 0, "error": 0, "added": 0, "details": []}
-                with st.spinner(f"{hist_ymd} {','.join(hist_venues)} の選手履歴を取得しています…"):
-                    for vn in hist_venues:
-                        rep = _v319_import_player_history_only(
-                            engine.DB_PATH, hist_ymd, vn, min_rows=int(hist_min_rows),
-                        )
-                        for hk in ("ok", "skip", "error", "added"):
-                            all_hrep[hk] += int(rep.get(hk) or 0)
-                        all_hrep["details"].extend(rep.get("details") or [])
-                st.session_state["v319_hist_last_report"] = all_hrep
-                st.success(
-                    f"選手履歴の登録が完了しました。履歴登録：{all_hrep['ok']}R / "
-                    f"変化なし：{all_hrep['skip']}R / 失敗：{all_hrep['error']}R / "
-                    f"履歴+{all_hrep['added']}件"
-                )
-
-        job_hist = _v278_bg_get_active_of(engine.DB_PATH, ("player_history_import",))
-        if str((job_hist or {}).get("job_type") or "") == "player_history_import":
-            st.markdown("#### 選手履歴取込の進捗")
-            done = int(job_hist.get("done_count") or 0)
-            total = int(job_hist.get("total_count") or 0)
-            status = str(job_hist.get("status") or "")
-            if total > 0:
-                st.progress(min(1.0, max(0.0, done / float(total))), text=f"{done}/{total}R")
-            else:
-                st.info("対象レースを数えています…")
-            st.caption(
-                f"今：{job_hist.get('current_label') or '-'} ｜ "
-                f"{job_hist.get('message') or status}"
-            )
-            hc1, hc2 = st.columns(2)
-            if hc1.button("進捗を更新", use_container_width=True, key="v319_hist_refresh_job"):
-                st.rerun()
-            if status in ("queued", "running", "paused", "pause_requested", "cancel_requested") and hc2.button(
-                "取込を中止", use_container_width=True, key="v319_hist_cancel_job",
-                disabled=(status == "cancel_requested"),
-            ):
-                try:
-                    _v278_bg_request_cancel(engine.DB_PATH, int(job_hist.get("job_id") or 0))
-                    st.warning("中止を受け付けました。処理の区切りで停止します。")
-                    st.rerun()
-                except Exception as exc:
-                    st.warning(f"中止フラグは立てました（{exc}）。処理の区切りで停止します。")
-                    st.rerun()
-            hblob = job_hist.get("result_blob")
-            if hblob and status in ("completed", "cancelled", "failed", "running", "paused"):
-                try:
-                    hrep = pickle.loads(zlib.decompress(bytes(hblob)))
-                    if isinstance(hrep, dict) and hrep.get("details") is not None:
-                        st.session_state["v319_hist_last_report"] = hrep
-                except Exception:
-                    pass
-        last_hrep = st.session_state.get("v319_hist_last_report")
-        if last_hrep:
-            st.markdown("#### 選手履歴の取込結果（レースごと）")
-            if last_hrep.get("summary"):
-                st.caption(str(last_hrep.get("summary")))
-            hdet = last_hrep.get("details") or []
-            if hdet:
-                st.dataframe(pd.DataFrame(hdet), use_container_width=True, hide_index=True)
-                try:
-                    hcsv = pd.DataFrame(hdet).to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        "この結果をCSVダウンロード",
-                        data=hcsv,
-                        file_name=f"player_history_{_v228_now_jst_iso()[:10]}.csv",
-                        mime="text/csv",
-                        key="v319_hist_partial_csv",
-                    )
-                except Exception:
-                    pass
-        st.caption("GitHubへは自動保存しません。問題なければサイドバーのDB保存を使ってください。")
+                    st.warning(_hist_started.get("reason") or "開始できませんでした")
+        _hist_qs2 = _v326_queue_summary(engine.DB_PATH, "official_import")
+        st.caption(
+            f"共通キュー: pending {_hist_qs2.get('pending',0)} / running {_hist_qs2.get('running',0)} / "
+            f"done {_hist_qs2.get('done',0)} / error {_hist_qs2.get('error',0)}"
+        )
+        st.caption("※ Step 1では既存のUNIQUE制約を維持するため、同じRが通常取込タスクとして既に存在する場合は重複追加されません。")
 
     saved_results = _v233_list_saved_results(engine.DB_PATH, 250)
     if saved_results:
