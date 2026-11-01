@@ -337,7 +337,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHubも同じ間隔（push連打しない）
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261031_qfrag2"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261101_cancel1"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -2540,7 +2540,7 @@ def _v278_bg_reap_stale_jobs(db_path: str, stale_minutes: float = 20.0, force: b
     """放置・完了漏れジョブを解放する。
 
     - done_count >= total_count > 0 なのに active → completed
-    - cancel_requested のまま90秒以上 → cancelled
+    - cancel_requested のまま35秒以上 → cancelled
     - updated_at/started_at が stale_minutes 超過 → failed
     画面描画を止めないよう、短タイムアウト＋30秒に1回まで。
     """
@@ -2595,7 +2595,7 @@ def _v278_bg_reap_stale_jobs(db_path: str, stale_minutes: float = 20.0, force: b
                             t0 = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                             if t0.tzinfo is None:
                                 t0 = t0.replace(tzinfo=timezone(timedelta(hours=9)))
-                            age_ok = (now - t0).total_seconds() >= 90.0
+                            age_ok = (now - t0).total_seconds() >= 30.0
                     except Exception:
                         age_ok = True
                     if age_ok:
@@ -2683,6 +2683,59 @@ def _v278_bg_has_running_of(db_path: str, job_types: tuple | list | str) -> bool
         return bool(int(row[0] or 0))
     except Exception:
         return False
+
+
+
+def _v278_bg_get_recent_finished(db_path: str, job_types: tuple | list | str, within_min: float = 90.0) -> dict:
+    """直近の完了・中止・失敗ジョブ（進捗表示が消えないように）。"""
+    if isinstance(job_types, str):
+        job_types = (job_types,)
+    types = tuple(str(t) for t in job_types if t)
+    if not types:
+        return {}
+    try:
+        _v278_bg_ensure_table(db_path)
+        ph = ",".join("?" * len(types))
+        with sqlite3.connect(str(db_path), timeout=3.0) as con:
+            con.execute("PRAGMA busy_timeout=3000")
+            row = con.execute(
+                f"""
+                SELECT job_id, job_type, status, message, current_label,
+                       done_count, total_count, result_blob, finished_at, updated_at
+                  FROM v278_background_jobs
+                 WHERE job_type IN ({ph})
+                   AND status IN ('cancelled','completed','failed')
+                 ORDER BY COALESCE(finished_at, updated_at) DESC
+                 LIMIT 1
+                """,
+                types,
+            ).fetchone()
+        if not row:
+            return {}
+        cols = [
+            "job_id", "job_type", "status", "message", "current_label",
+            "done_count", "total_count", "result_blob", "finished_at", "updated_at",
+        ]
+        out = {c: row[i] for i, c in enumerate(cols)}
+        # 古すぎる完了は出さない
+        try:
+            fin = str(out.get("finished_at") or out.get("updated_at") or "")
+            if fin and within_min > 0:
+                from datetime import datetime, timedelta
+                # ISO-ish
+                fin2 = fin.replace("Z", "+00:00")
+                try:
+                    dt = datetime.fromisoformat(fin2)
+                except Exception:
+                    return out
+                now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+                if (now - dt).total_seconds() > float(within_min) * 60:
+                    return {}
+        except Exception:
+            pass
+        return out
+    except Exception:
+        return {}
 
 
 def _v278_bg_get_active_of(db_path: str, job_types: tuple | list | str) -> dict:
@@ -12642,6 +12695,376 @@ def _v326_render_queue_reorder_fragment(db_path: str, job_type: str = "official_
 
 
 @_v146_fragment
+def _v326_render_official_import_panel() -> None:
+    """公式取込パネル。日付・開催場・チェック変更は枠内だけ再実行。"""
+    st.caption("順番は出走表→選手履歴→予測保存確認→オッズ→結果登録です。履歴0件でも予測は続行（不足は警告）。GitHub自動保存はしません。")
+    dcol, vcol, rcol = st.columns(3)
+    fetch_date = dcol.date_input("開催日", value=date.today(), key="v319_op_fetch_date")
+    fetch_venue = vcol.selectbox("開催場", ["開催を探す"] + RESULT_VENUES, key="v319_op_fetch_venue")
+    fetch_race_no = rcol.number_input(
+        "レース番号（1レース指定）",
+        min_value=0,
+        max_value=12,
+        value=0,
+        step=1,
+        key="v319_op_fetch_race_no_v326",
+        help="0=開催全レース（結果登録含む） / 1〜12=その1レースだけ",
+    )
+    skip_existing = st.checkbox("登録済みは飛ばす", value=True, key="v319_op_skip_existing")
+    replace_existing = st.checkbox("登録済みを置き換える", value=False, key="v319_op_replace_existing")
+    predict_missing = st.checkbox(
+        "未予測／他バージョン予測なら再予測",
+        value=True,
+        key="v319_op_predict_missing",
+        help="現行版（例: Ver326）の予測が無いレースは、他版の予測があっても再予測します。",
+    )
+    fetch_odds_opt = st.checkbox("オッズも取得する", value=True, key="v319_op_fetch_odds")
+    register_result_opt = st.checkbox("結果も登録する", value=True, key="v319_op_register_result")
+    if st.button("この日の開催を確認", use_container_width=True, key="v319_op_list_meetings"):
+        try:
+            ymd = fetch_date.strftime("%Y%m%d")
+            meets = _v319_list_oddspark_meetings(ymd)
+            st.session_state["v319_op_meetings"] = meets
+        except Exception as exc:
+            st.error(f"開催一覧の取得に失敗: {exc}")
+    meets = st.session_state.get("v319_op_meetings") or []
+    if meets:
+        st.write("取得できた開催: " + "、".join(f"{m['venue']}" for m in meets))
+    ymd = fetch_date.strftime("%Y%m%d")
+    venues = [fetch_venue] if fetch_venue in RESULT_VENUES else [m["venue"] for m in meets]
+    _rnos = [int(fetch_race_no)] if int(fetch_race_no or 0) >= 1 else []
+    _imp_kw = dict(
+        skip_existing=bool(skip_existing and not replace_existing),
+        replace=bool(replace_existing),
+        predict_if_missing=bool(predict_missing),
+        trials=int(st.session_state.get("trials") or 20000),
+        seed=int(st.session_state.get("seed") or 20260719),
+        race_nos=_rnos,
+        fetch_odds=bool(fetch_odds_opt),
+        register_result=bool(register_result_opt),
+    )
+
+    # 取り込み済み／把握済み確認（再HTTPなし。回収率の判定対象とは別）
+    # 現行版の予測のみを「把握」とする（旧版のみあるRは 0R）
+    try:
+        _cur_ver = str(
+            globals().get("_V231_APP_VERSION")
+            or globals().get("APP_VERSION")
+            or "Ver326"
+        ).strip()
+        _reg_lines = []
+        for _vn in (venues or []):
+            if _vn not in RESULT_VENUES:
+                continue
+            _reg_nos = _v319_registered_race_nos(engine.DB_PATH, ymd, _vn)
+            try:
+                _pred_nos = _v319_prediction_race_nos_for_version(
+                    engine.DB_PATH, ymd, _vn, app_version=_cur_ver
+                )
+            except Exception:
+                _pred_nos = []
+            try:
+                _any_nos = _v319_known_race_nos(engine.DB_PATH, ymd, _vn)
+            except Exception:
+                _any_nos = list(_reg_nos)
+            # 1〜12 のみ
+            _reg_nos = [n for n in _reg_nos if isinstance(n, int) and 1 <= n <= 12]
+            _pred_nos = [n for n in _pred_nos if isinstance(n, int) and 1 <= n <= 12]
+            _any_nos = [n for n in _any_nos if isinstance(n, int) and 1 <= n <= 12]
+            _old_only = sorted(set(_any_nos) - set(_pred_nos))
+            _mx = max([0] + list(_any_nos) + list(_reg_nos) + list(_pred_nos) + [8])
+            _miss_pred = [n for n in range(1, _mx + 1) if n not in set(_pred_nos)]
+            _miss_reg = [n for n in range(1, _mx + 1) if n not in set(_reg_nos)]
+            _line = (
+                f"**{_vn}**（{_cur_ver}）: "
+                f"現行版予測 {len(_pred_nos)}R"
+                + (f"（{','.join(str(n) for n in _pred_nos)}）" if _pred_nos else "（0R・なし）")
+                + f" ／ result登録 {len(_reg_nos)}R"
+                + (f"（{','.join(str(n) for n in _reg_nos)}）" if _reg_nos else "（なし）")
+            )
+            if _old_only:
+                _line += (
+                    f" ／ 旧版のみ予測: {','.join(str(n)+'R' for n in _old_only)}"
+                    f"（現行では未把握＝再予測対象）"
+                )
+            if _miss_pred and _pred_nos:
+                _line += f" ／ 現行版未予測: {','.join(str(n)+'R' for n in _miss_pred)}"
+            elif not _pred_nos and _mx > 0:
+                _line += f" ／ 現行版未予測: 1〜{_mx}R（すべて）"
+            if _miss_reg:
+                _line += f" ／ result未登録: {','.join(str(n)+'R' for n in _miss_reg)}"
+            _reg_lines.append(_line)
+        if _reg_lines:
+            st.info(
+                "📦 この日のR把握状況（再取込不要・既存DB）\n\n"
+                + "\n\n".join(_reg_lines)
+                + f"\n\n※「現行版予測」は {_cur_ver} の予測／プランのみ。"
+                + " 旧版だけあるRは把握に入れず 0R 扱いです。"
+                + "\n※result登録は版非依存（着順・払戻）。"
+                + "\n※回収率の「レース数」は判定対象なので別数字で正常です。"
+            )
+    except Exception:
+        pass
+
+    # --- 取込キュー（プレイリスト） ---
+    try:
+        _v326_ensure_import_queue(engine.DB_PATH)
+        _qs = _v326_queue_summary(engine.DB_PATH, "official_import")
+    except Exception:
+        _qs = {"total": 0, "pending": 0, "running": 0, "done": 0, "skipped": 0, "error": 0}
+    st.markdown("#### 📋 取込キュー（プレイリスト）")
+    st.caption(
+        f"pending {_qs.get('pending',0)} / running {_qs.get('running',0)} / "
+        f"done {_qs.get('done',0)} / skipped {_qs.get('skipped',0)} / error {_qs.get('error',0)}"
+        "　※キューの定義は UI、実行は worker（自動で1〜12を足しません）"
+        "　※再シミュとは別セッションで同時実行できます"
+    )
+    _pend_n = int(_qs.get("pending") or 0)
+    _run_n = int(_qs.get("running") or 0)
+    if _pend_n > 0:
+        st.warning(
+            f"キューに pending が {_pend_n} 件残っています。"
+            "「▶実行」や「バックグラウンドで取得」は **キューの pending だけ**を処理します（入力条件の再追加はしません）。"
+            "別のレースを入れるときは「＋条件をキューに追加」、不要なら「🗑 pending全消去」。"
+        )
+    elif _run_n > 0:
+        st.info(f"実行中が {_run_n} 件あります（追加は可能・完了を待つか中止してください）。")
+    q1, q2, q3, q4 = st.columns(4)
+    add_q = q1.button("＋条件をキューに追加", use_container_width=True, key="v326_q_add")
+    run_q = q2.button("▶ キューを実行/再開", type="primary", use_container_width=True, key="v326_q_run")
+    re_err = q3.button("失敗を再投入", use_container_width=True, key="v326_q_reerr")
+    clr_fin = q4.button("done/skip掃除", use_container_width=True, key="v326_q_clr")
+    q5, q6 = st.columns(2)
+    clr_pend = q5.button("🗑 pending全消去", use_container_width=True, key="v326_q_clr_pend")
+    clr_all = q6.button("🗑 キュー全消去", use_container_width=True, key="v326_q_clr_all")
+    _ins_first = st.checkbox(
+        "＋条件をキューに追加するとき、先頭に割り込み追加",
+        value=False, key="v326_q_add_first",
+        help="既存 pending の前に挿入します。「先に処理したい」ものを優先できます。",
+    )
+    if add_q:
+        if not venues:
+            st.warning("開催場を選ぶか、先に開催確認してください。")
+        else:
+            r = _v319_bg_import_start(
+                engine.DB_PATH, ymd, venues, **_imp_kw,
+                enqueue=True, run_worker=False,
+                insert_first=bool(_ins_first),
+            )
+            if r.get("ok"):
+                st.success(r.get("reason") or f"キューに{r.get('enqueued',0)}件追加")
+                st.rerun()
+            else:
+                st.warning(r.get("reason") or "追加できませんでした")
+    if run_q:
+        r = _v319_bg_import_start(
+            engine.DB_PATH, ymd, venues or [""], **_imp_kw, enqueue=False, run_worker=True
+        )
+        if r.get("ok"):
+            st.success(f"キュー実行を開始（ジョブ {r.get('job_id')}）")
+            st.rerun()
+        else:
+            st.warning(r.get("reason") or "開始できませんでした")
+    if re_err:
+        n = _v326_requeue_errors(engine.DB_PATH, "official_import")
+        st.info(f"error → pending に {n} 件戻しました" if n else "再投入する error はありません")
+        if n:
+            st.rerun()
+    if clr_fin:
+        n = _v326_clear_queue_finished(engine.DB_PATH, "official_import", include_error=False)
+        st.info(f"done/skipped を {n} 件削除しました")
+        if n:
+            st.rerun()
+    if clr_pend:
+        n = _v326_clear_queue_pending(engine.DB_PATH, "official_import", include_running=True)
+        st.success(f"pending/running を {n} 件削除しました")
+        if n:
+            st.rerun()
+    if clr_all:
+        n = _v326_clear_queue_all(engine.DB_PATH, "official_import")
+        st.success(f"キューを全消去しました（{n} 件）")
+        if n:
+            st.rerun()
+    # B13-F: 並び替えは fragment（部分更新）。一覧・削除もここで完結。
+    # 並び替え・全件表示・削除は fragment（部分更新・全画面再計算なし）
+    _v326_render_queue_reorder_fragment(str(engine.DB_PATH), "official_import")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        start_fg = st.button("今すぐ取得して登録", use_container_width=True, key="v319_op_import")
+    with b2:
+        start_bg = st.button("バックグラウンドで実行（キューのみ）", type="primary", use_container_width=True, key="v319_op_import_bg")
+    if start_fg or start_bg:
+        if not venues:
+            st.warning("開催場を選ぶか、先に開催確認してください。")
+        elif start_bg:
+            # 実行のみ: 既存 pending を処理（条件の再 enqueue はしない）
+            # 削除したレースが「レース番号=0」で復活しないよう、enqueue=False
+            _left = int(_qs.get("pending") or 0) + int(_qs.get("running") or 0)
+            if _left <= 0:
+                st.warning(
+                    "キューが空です。先に「＋条件をキューに追加」でレースを入れてから、"
+                    "「バックグラウンドで取得」または「▶ キューを実行/再開」を押してください。"
+                )
+            else:
+                started = _v319_bg_import_start(
+                    engine.DB_PATH, ymd, venues, **_imp_kw, enqueue=False, run_worker=True
+                )
+                if started.get("ok"):
+                    st.success(
+                        f"キュー実行を開始（ジョブ {started.get('job_id')} / pending {_left} 件）。"
+                        "画面を離れても進みます。新規レースは追加しません。"
+                    )
+                    st.rerun()
+                else:
+                    st.warning(started.get("reason") or "開始できませんでした")
+        else:
+            all_rep = {"ok": 0, "skip": 0, "error": 0, "details": []}
+            with st.spinner(f"{ymd} {','.join(venues)} を取得しています…"):
+                _v319_prev_state = _v287_calibration_state(engine.DB_PATH)
+                _V287_IMPORT_STATE_RESET.clear()
+                _V287_IMPORT_STATE_RESET.update(_v319_prev_state)
+                for vn in venues:
+                    _rnos = [int(fetch_race_no)] if int(fetch_race_no or 0) >= 1 else None
+                    rep = _v319_import_official_results(
+                        engine.DB_PATH,
+                        ymd,
+                        vn,
+                        skip_existing=bool(skip_existing and not replace_existing),
+                        replace=bool(replace_existing),
+                        predict_if_missing=bool(predict_missing),
+                        trials=int(st.session_state.get("trials") or 20000),
+                        seed=int(st.session_state.get("seed") or 20260719),
+                        race_nos=_rnos,
+                        fetch_odds=bool(fetch_odds_opt),
+                        register_result=bool(register_result_opt),
+                    )
+                    all_rep["ok"] += int(rep.get("ok") or 0)
+                    all_rep["skip"] += int(rep.get("skip") or 0)
+                    all_rep["error"] += int(rep.get("error") or 0)
+                    all_rep["details"].extend(rep.get("details") or [])
+                # 取込で予測が増えていたら、取込終了後に1回だけ全件で再集計する。
+                _v287_do_full = False
+                try:
+                    _v287_now_state = _v287_calibration_state(engine.DB_PATH)
+                    _v287_do_full = (
+                        int(_v287_now_state.get("history_id") or 0)
+                        != int(_v319_prev_state.get("history_id") or 0)
+                    )
+                except Exception:
+                    _v287_do_full = False
+                if _v287_do_full:
+                    try:
+                        _v287_inc = _v287_recalculate_global_transition_calibration(
+                            engine.DB_PATH, force_full=True
+                        )
+                        all_rep["v287_recalc"] = {
+                            "mode": str((_v287_inc or {}).get("mode") or "full"),
+                            "ok": bool((_v287_inc or {}).get("ok")),
+                            "calibrations": int((_v287_inc or {}).get("calibrations") or 0),
+                            "reason": str((_v287_inc or {}).get("reason") or ""),
+                        }
+                    except Exception as _v287_full_exc:
+                        all_rep["v287_recalc"] = {
+                            "mode": "full", "ok": False, "calibrations": 0,
+                            "reason": "%s: %s" % (type(_v287_full_exc).__name__, _v287_full_exc),
+                        }
+                else:
+                    all_rep["v287_recalc"] = {
+                        "mode": "incremental", "ok": True, "calibrations": 0, "reason": "",
+                    }
+            st.session_state["v319_op_last_report"] = all_rep
+            failed_items = [
+                d for d in (all_rep.get("details") or [])
+                if str(d.get("status") or "") in ("error", "failed")
+            ]
+            st.success(
+                f"自動取得が完了しました。完了：{all_rep['ok']}R / スキップ：{all_rep['skip']}R / 失敗：{all_rep['error']}R"
+            )
+            if failed_items:
+                st.warning(
+                    "失敗レース: "
+                    + " / ".join(
+                        f"{d.get('venue','')}{d.get('R','')}R {d.get('message','')}"
+                        for d in failed_items[:8]
+                    )
+                )
+            st.caption("GitHubへは自動保存しません。問題なければサイドバーのDB保存を使ってください。")
+
+    job_imp = _v278_bg_get_active_of(engine.DB_PATH, ("official_import",)) or {}
+    if not job_imp:
+        job_imp = _v278_bg_get_recent_finished(
+            engine.DB_PATH, ("official_import", "official_import_hist"), within_min=120.0
+        ) or {}
+    if job_imp and str(job_imp.get("job_type") or "") in ("official_import", "official_import_hist", ""):
+        st.markdown("#### 取込の進捗")
+        done = int(job_imp.get("done_count") or 0)
+        total = int(job_imp.get("total_count") or 0)
+        status = str(job_imp.get("status") or "")
+        if total > 0:
+            st.progress(min(1.0, max(0.0, done / float(total))), text=f"{done}/{total}R")
+        else:
+            st.info("対象レースを数えています…")
+        st.caption(
+            f"今：{job_imp.get('current_label') or '-'} ｜ "
+            f"{job_imp.get('message') or status}"
+        )
+        cprog1, cprog2 = st.columns(2)
+        if cprog1.button("進捗を更新", use_container_width=True, key="v319_op_refresh_job"):
+            try:
+                st.rerun(scope="fragment")
+            except Exception:
+                st.rerun()
+        if status in ("queued", "running", "paused", "pause_requested", "cancel_requested") and cprog2.button(
+            "取込を中止", use_container_width=True, key="v319_op_cancel_job",
+            disabled=(status == "cancel_requested"),
+        ):
+            try:
+                _v278_bg_request_cancel(engine.DB_PATH, int(job_imp.get("job_id") or 0))
+                st.warning("中止を受け付けました。選手履歴の区切りなど、数秒〜数十秒で止まります。")
+            except Exception as exc:
+                st.warning(f"中止フラグは立てました（{exc}）。処理の区切りで停止します。")
+            try:
+                st.rerun(scope="fragment")
+            except Exception:
+                st.rerun()
+        blob = job_imp.get("result_blob")
+        # 完了・中止・失敗・実行中いずれも、途中結果があれば表示用に取り込む
+        if blob and status in ("completed", "cancelled", "failed", "running", "paused"):
+            try:
+                rep = pickle.loads(zlib.decompress(bytes(blob)))
+                if isinstance(rep, dict) and rep.get("details") is not None:
+                    st.session_state["v319_op_last_report"] = rep
+            except Exception:
+                pass
+        if status == "cancelled":
+            st.warning(
+                job_imp.get("message")
+                or "取込を中止しました。下にここまでの結果を表示します。"
+            )
+    last_rep = st.session_state.get("v319_op_last_report")
+    if last_rep:
+        st.markdown("#### 取込結果（レースごと）")
+        if last_rep.get("summary"):
+            st.caption(str(last_rep.get("summary")))
+        det = last_rep.get("details") or []
+        if det:
+            st.dataframe(pd.DataFrame(det), use_container_width=True, hide_index=True)
+            try:
+                csv_bytes = pd.DataFrame(det).to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "この結果をCSVダウンロード",
+                    data=csv_bytes,
+                    file_name=f"import_partial_{_v228_now_jst_iso()[:10]}.csv",
+                    mime="text/csv",
+                    key="v319_op_partial_csv",
+                )
+            except Exception:
+                pass
+
+
+
+@_v146_fragment
 def _v326_render_import_progress_fragment(db_path: str) -> None:
     """公式取込ジョブ進捗。更新・中止で全画面再計算しない。"""
     try:
@@ -12649,11 +13072,19 @@ def _v326_render_import_progress_fragment(db_path: str) -> None:
     except Exception:
         job_imp = {}
     if not job_imp:
+        try:
+            job_imp = _v278_bg_get_recent_finished(
+                db_path, ("official_import", "official_import_hist"), within_min=120.0
+            ) or {}
+        except Exception:
+            job_imp = {}
+    if not job_imp:
         return
     status = str(job_imp.get("status") or "")
     try:
-        done = int(job_imp.get("done") or 0)
-        total = int(job_imp.get("total") or 0)
+        # v278_background_jobs は done_count / total_count
+        done = int(job_imp.get("done_count") or job_imp.get("done") or 0)
+        total = int(job_imp.get("total_count") or job_imp.get("total") or 0)
     except Exception:
         done, total = 0, 0
     st.markdown("#### 取込の進捗")
@@ -13998,6 +14429,8 @@ def _v319_autorace_program_body(ymd: str, venue: str, race_no: int) -> dict | No
 
 def _v319_autorace_profile_body(player_cd: str, venue: str = "川口") -> dict | None:
     """公式 Profile API（選手詳細・直近5走）。venue は CSRF 用の参照ページに使う。"""
+    if _v326_abort_any():
+        raise RuntimeError("import cancel requested")
     pcd = str(player_cd or "").strip()
     if not pcd:
         return None
@@ -14325,6 +14758,28 @@ def _v319_profile_history_rows(
         # レース番号が本物で取れない行は保存しない（仮Rは作らない）
         if not ymd or not venue or rn <= 0:
             continue
+        # 走路・天候: Profile に載っている実データのみ（無ければ空のまま。捏造しない）
+        surf = ""
+        try:
+            sit = r.get("situationCode")
+            if sit is None:
+                sit = r.get("raceSituationCode")
+            if sit is not None and str(sit).strip() != "":
+                surf = str(_V319_SITUATION_CODE.get(int(sit), "") or "")
+        except Exception:
+            surf = ""
+        if not surf:
+            for _sk in ("situationName", "surface", "trackCondition", "roadCondition", "courseCondition"):
+                _sv = str(r.get(_sk) or "").strip()
+                if _sv and _sv not in {"None", "null"}:
+                    surf = _sv.replace("走路", "").strip() or _sv
+                    break
+        weather = ""
+        for _wk in ("raceWeather", "weather", "weatherName"):
+            _wv = str(r.get(_wk) or "").strip()
+            if _wv and _wv not in {"None", "null"}:
+                weather = _wv
+                break
         rows.append({
             "選手名": player_name,
             "開催日": ymd,
@@ -14333,8 +14788,8 @@ def _v319_profile_history_rows(
             "レース名": str(r.get("raceType") or r.get("gradeName") or "") or "一般戦",
             "レース種別": str(r.get("raceType") or ""),
             "着順": fin,
-            "走路": "",
-            "天候": "",
+            "走路": surf,
+            "天候": weather,
             "ハンデ": hand,
             "車番": car,
             "試走T": trial,
@@ -14343,6 +14798,59 @@ def _v319_profile_history_rows(
             "事故": "",
         })
     return rows
+
+
+
+def _v319_enrich_history_surface_from_otherinfo(rows: list) -> list:
+    """走路が空の履歴行に OtherRaceInfo の situationCode を埋める（キャッシュ付き）。"""
+    if not rows:
+        return rows
+    cache = getattr(_v319_enrich_history_surface_from_otherinfo, "_cache", {})
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            out.append(r)
+            continue
+        rec = dict(r)
+        surf = str(rec.get("走路") or "").strip()
+        if surf:
+            out.append(rec)
+            continue
+        ymd = _v319_ymd_digits(rec.get("開催日"))
+        venue = str(rec.get("開催場") or "").replace("　", "").strip()
+        try:
+            rn = int(rec.get("レース") or 0)
+        except Exception:
+            rn = 0
+        if not ymd or not venue or rn <= 0:
+            out.append(rec)
+            continue
+        ck = (ymd, venue, rn)
+        if ck not in cache:
+            try:
+                info = _v319_autorace_other_race_info(ymd, venue, rn) or {}
+                try:
+                    sit = info.get("raceSituationCode")
+                    if sit is None:
+                        sit = info.get("situationCode")
+                    s = str(_V319_SITUATION_CODE.get(int(sit), "") or "") if sit is not None and str(sit).strip() != "" else ""
+                except Exception:
+                    s = ""
+                w = str(info.get("raceWeather") or info.get("weather") or "").strip()
+                cache[ck] = (s, w)
+            except Exception:
+                cache[ck] = ("", "")
+        s, w = cache.get(ck, ("", ""))
+        if s:
+            rec["走路"] = s
+        if w and not str(rec.get("天候") or "").strip():
+            rec["天候"] = w
+        out.append(rec)
+    try:
+        _v319_enrich_history_surface_from_otherinfo._cache = cache
+    except Exception:
+        pass
+    return out
 
 
 def _v319_autorace_odds_api_probe(ymd: str, venue: str, race_no: int = 1) -> dict | None:
@@ -16718,6 +17226,11 @@ def _v319_fetch_player_history_df(
         if isinstance(body, dict):
             ok = True
             rows = _v319_profile_history_rows(body, name, year_hint=year_hint)
+            # Profile に走路が無い行だけ OtherRaceInfo で補完（実データのみ）
+            try:
+                rows = _v319_enrich_history_surface_from_otherinfo(rows)
+            except Exception:
+                pass
             # 名前補完
             try:
                 pn = str(((body.get("profile") or {}) if isinstance(body.get("profile"), dict) else {}).get("playerName") or "")
@@ -17448,6 +17961,7 @@ def _v319_fill_player_histories(
     errors = 0
     warnings = 0  # DB locked 等の一時競合（既存履歴で続行）
     details = []
+    player_adds: list = []  # [{name, have, after, delta}]
     min_rows = int(min_rows or 30)
     # con を自分で開いたときだけ閉じる（_exclusive と独立）。
     # 以前は _own_con2 = (con is None and _exclusive) のため、
@@ -17488,7 +18002,8 @@ def _v319_fill_player_histories(
                 try:
                     _hv, _lt = _v319_player_history_latest_fast(db_path, _nm, con=con)
                     _lt = _v319_ymd_digits(_lt)
-                    if int(_hv or 0) >= min_rows and _lt and before_d_job and _lt >= before_d_job:
+                    # 最新日が対象日より後だけ prefetch 省略。同日は1回公式確認する。
+                    if int(_hv or 0) >= min_rows and _lt and before_d_job and _lt > before_d_job:
                         continue
                 except Exception:
                     pass
@@ -17549,16 +18064,18 @@ def _v319_fill_player_histories(
 
         for p in players:
             # 中止要求: 選手単位で即抜ける（長いHTTP中も次選手前に止まる）
-            if callable(cancel_cb):
+            if _v326_abort_any() or (callable(cancel_cb) and bool(cancel_cb())):
                 try:
-                    if bool(cancel_cb()):
-                        details.append("中止要求により選手履歴取込を中断")
-                        return {
-                            "added": added, "skipped": skipped, "errors": errors,
-                            "details": details, "cancelled": True,
-                        }
+                    if callable(cancel_cb):
+                        bool(cancel_cb())  # 触ってフラグ再確認
                 except Exception:
                     pass
+                details.append("中止要求により選手履歴取込を中断")
+                return {
+                    "added": added, "skipped": skipped, "errors": errors,
+                    "details": details, "cancelled": True,
+                    "player_adds": player_adds if "player_adds" in locals() else [],
+                }
             name = p.get("name") or ""
             pcd = str(p.get("player_cd") or "").strip()
             cache_key = pcd or _v319_norm_player_name(name)
@@ -17607,8 +18124,27 @@ def _v319_fill_player_histories(
                 latest_d = _v319_ymd_digits(latest_d)
                 is_existing = (have >= min_rows and bool(latest_d))
 
-                # Ver320/321: 1度十分に登録済みなら、公式再取得・keys照合をしない。
-                if is_existing and ((not before_d) or (latest_d >= before_d)):
+                # 件数十分でも「対象日の公式確認済み」でなければ Profile を見に行く。
+                # （最新日>=対象日でも、同日他Rや未保存の直近走が Profile に残ることがある）
+                # スキップしてよい条件:
+                #   1) 対象日なし
+                #   2) 最新日が対象日より後
+                #   3) 最新日>=対象日 かつ 同日の公式確認キャッシュあり
+                _skip_ok = False
+                if is_existing and not before_d:
+                    _skip_ok = True
+                elif is_existing and before_d and latest_d > before_d:
+                    _skip_ok = True
+                elif is_existing and before_d and latest_d >= before_d:
+                    try:
+                        _ps_day = _v319_persistent_skip_lookup(db_path, pcd, before_d, con=con) if pcd else None
+                    except Exception:
+                        _ps_day = None
+                    if (_ps_day and _ps_day.get("skip")) or (
+                        str(_V319_HIST_SKIPPED.get(cache_key) or "") == before_d
+                    ):
+                        _skip_ok = True
+                if _skip_ok:
                     skipped += 1
                     _V319_HIST_SKIPPED[cache_key] = before_d or latest_d or "1"
                     _ = details.append(
@@ -17617,7 +18153,7 @@ def _v319_fill_player_histories(
                     )
                     continue
 
-                # ここから先だけ keys 照合・公式HTTPが必要（件数不足 or 対象日より古い）
+                # ここから先だけ keys 照合・公式HTTPが必要
                 state = _v319_player_history_state(db_path, name, con=con) or {}
                 have_keys = set(state.get("keys") or set())
                 # Ver320: R欠落だけでは再取得しない。
@@ -18059,6 +18595,13 @@ def _v319_fill_player_histories(
                 after = int(_v319_player_history_count(db_path, name, con=con) or 0)
                 delta = max(changed, max(0, after - have))
                 added += delta
+                if delta > 0:
+                    player_adds.append({
+                        "name": name,
+                        "have": int(have),
+                        "after": int(after),
+                        "delta": int(delta),
+                    })
                 if need_refresh:
                     _V319_HIST_REFRESHED.add(cache_key)
                 # 選手ごとに commit → 取込中でも他画面の読み取りが通りやすい
@@ -18144,6 +18687,7 @@ def _v319_fill_player_histories(
             "errors": errors,
             "warnings": warnings,
             "details": details,
+            "player_adds": player_adds,
         }
     finally:
         if _own_con:
@@ -19626,25 +20170,54 @@ def _v319_import_one_race(
         try:
             _v319_validate_card_players(players, venue, race_no)
         except ValueError as _val_exc:
-            # 「有効な出走車がありません」+ 中止なら void 登録
+            # 「有効な出走車がありません」→ 中止/不成立を優先。判定できなければ skip
             if "有効な出走車" in str(_val_exc):
                 try:
                     _rt2 = _v319_fetch_oddspark_result(ymd, venue, race_no)
                 except Exception:
                     _rt2 = str(sp_html or "")
                 _void2 = _v319_is_void_or_cancelled_result(_rt2)
+                if not _void2.get("void"):
+                    try:
+                        _ar2 = _v319_autorace_api_post("/race_info/RaceResult", ymd, venue, race_no)
+                        _ar_txt2 = json.dumps(_ar2, ensure_ascii=False) if isinstance(_ar2, dict) else str(_ar2 or "")
+                        _void2 = _v319_is_void_or_cancelled_result(_ar_txt2)
+                        if not _void2.get("void") and isinstance(_ar2, dict):
+                            for _k in ("raceStatus", "status", "raceStatusName", "cancelFlg"):
+                                _v = str(_ar2.get(_k) or "")
+                                if any(x in _v for x in ("中止", "不成立", "取消", "キャンセル")):
+                                    _void2 = {"void": True, "cancelled": True, "reason": "レース中止"}
+                                    break
+                    except Exception:
+                        pass
                 if _void2.get("void"):
-                    _reg2 = _v319_register_void_result(
-                        db_path, _rt2 or str(sp_html or ""), venue, ymd, race_no,
-                        reason=str(_void2.get("reason") or "レース中止"),
-                    )
-                    return {
-                        "status": "ok",
-                        "phase": "completed",
-                        "message": f"{key_guess} / 中止登録（{_void2.get('reason') or 'レース中止'}）",
-                        "key": key_guess,
-                        "next_action": "done",
-                    }
+                    try:
+                        _reg2 = _v319_register_void_result(
+                            db_path, _rt2 or str(sp_html or ""), venue, ymd, race_no,
+                            reason=str(_void2.get("reason") or "レース中止"),
+                        )
+                        return {
+                            "status": "ok",
+                            "phase": "completed",
+                            "message": f"{key_guess} / 中止登録（{_void2.get('reason') or 'レース中止'}）",
+                            "key": key_guess,
+                            "next_action": "done",
+                        }
+                    except Exception as _vexc2:
+                        return {
+                            "status": "skip",
+                            "phase": "fetch_card",
+                            "message": f"{venue} {race_no}R：中止候補だが登録失敗 ({type(_vexc2).__name__})",
+                            "key": key_guess,
+                            "next_action": "done",
+                        }
+                return {
+                    "status": "skip",
+                    "phase": "fetch_card",
+                    "message": f"{venue} {race_no}R：有効な出走車なし（中止・不成立の可能性）。予測スキップ。",
+                    "key": key_guess,
+                    "next_action": "done",
+                }
             raise
         card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
         kessha_cars = sorted(set(
@@ -19801,11 +20374,49 @@ def _v319_import_one_race(
             }
         _add_n = int(filled.get("added") or 0)
         _skip_n = int(filled.get("skipped") or 0)
+        _det = filled.get("details") or []
+        _padd = filled.get("player_adds") or []
+        try:
+            _n_hole = sum(
+                1 for d in _det
+                if ("穴なし" in str(d)) or ("追加対象なし" in str(d)) or ("公式0件/既存" in str(d))
+            )
+            _n_suff = sum(1 for d in _det if "充足スキップ" in str(d))
+            _n_cache = sum(
+                1 for d in _det
+                if ("キャッシュ即スキップ" in str(d)) or ("永続スキップ" in str(d)) or ("確認済" in str(d))
+            )
+        except Exception:
+            _n_hole = _n_suff = _n_cache = 0
+        # 追加があった選手を必ずメッセージに出す（スキップと混同しない）
         if _add_n > 0:
-            hist_msg = f" / 履歴+{_add_n}"
+            try:
+                _parts = []
+                for _a in list(_padd)[:8]:
+                    if not isinstance(_a, dict):
+                        continue
+                    _nm = str(_a.get("name") or "").strip() or "?"
+                    _dlt = int(_a.get("delta") or 0)
+                    _hv = int(_a.get("have") or 0)
+                    _af = int(_a.get("after") or 0)
+                    if _dlt > 0:
+                        _parts.append(f"{_nm}+{_dlt}({_hv}→{_af})")
+                if _parts:
+                    hist_msg = f" / 履歴+{_add_n}(" + ",".join(_parts) + ")"
+                else:
+                    hist_msg = f" / 履歴+{_add_n}"
+            except Exception:
+                hist_msg = f" / 履歴+{_add_n}"
+            if _skip_n > 0:
+                hist_msg += f"/他スキップ{_skip_n}"
+        elif _n_hole > 0:
+            hist_msg = f" / 履歴+0(公式直近は登録済{_n_hole})"
+        elif _n_cache > 0:
+            hist_msg = f" / 履歴+0(同日確認済スキップ{_n_cache})"
+        elif _n_suff > 0:
+            hist_msg = f" / 履歴+0(充足スキップ{_n_suff})"
         elif _skip_n > 0:
-            # 追加0でも「履歴が無い」ではなく「既に入っていて追加なし」
-            hist_msg = f" / 履歴+0(既存スキップ{_skip_n})"
+            hist_msg = f" / 履歴+0(スキップ{_skip_n})"
         else:
             hist_msg = f" / 履歴+0"
         try:
@@ -20399,17 +21010,50 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     _v278_cancel_flag_clear(job_id)
                 except Exception:
                     pass
+                _cancel_msg = (
+                    f"今：中止｜登録{ok} スキップ{skip} エラー{err}"
+                    f"｜pending残{_qs.get('pending',0)}（次回再開可）"
+                )
                 _v278_bg_update(
                     db_path, job_id, status="cancelled",
                     finished_at=_v228_now_jst_iso(),
                     done_count=i,
                     current_label="中止",
-                    message=(
-                        f"今：中止｜登録{ok} スキップ{skip} エラー{err}"
-                        f"｜pending残{_qs.get('pending',0)}（次回再開可）"
-                    ),
+                    message=_cancel_msg,
                     result_blob=blob,
                 )
+                # 中止完了も ntfy 通知
+                try:
+                    topic = str(
+                        globals().get("GENERAL_REMINDER_NTFY_TOPIC")
+                        or "notify"
+                    ).strip() or "notify"
+                    _body = (
+                        f"公式取込を中止しました\n"
+                        f"完了{ok} / スキップ{skip} / 失敗{err}\n"
+                        f"pending残{_qs.get('pending',0)}（再開可）"
+                    )
+                    _payload = {
+                        "topic": topic,
+                        "title": "AutoRaceAI 取込中止",
+                        "message": _body,
+                        "priority": 3,
+                        "tags": ["warning", "no_entry"],
+                    }
+                    _req = urllib.request.Request(
+                        "https://ntfy.sh",
+                        data=json.dumps(_payload, ensure_ascii=False).encode("utf-8"),
+                        method="POST",
+                        headers={"Content-Type": "application/json; charset=utf-8"},
+                    )
+                    with urllib.request.urlopen(_req, timeout=8) as _resp:
+                        _resp.read()
+                except Exception:
+                    pass
+                try:
+                    _v326_abort_clear(job_id)
+                except Exception:
+                    pass
                 return
             task = None
             try:
@@ -37824,366 +38468,9 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.error(f"結果HTTP取得失敗: {type(_rx).__name__}: {_rx}")
 
     with st.expander("公式結果を自動取得して登録", expanded=False):
-        st.caption("順番は出走表→選手履歴→予測保存確認→オッズ→結果登録です。履歴0件でも予測は続行（不足は警告）。GitHub自動保存はしません。")
-        dcol, vcol, rcol = st.columns(3)
-        fetch_date = dcol.date_input("開催日", value=date.today(), key="v319_op_fetch_date")
-        fetch_venue = vcol.selectbox("開催場", ["開催を探す"] + RESULT_VENUES, key="v319_op_fetch_venue")
-        fetch_race_no = rcol.number_input(
-            "レース番号（1レース指定）",
-            min_value=0,
-            max_value=12,
-            value=0,
-            step=1,
-            key="v319_op_fetch_race_no_v326",
-            help="0=開催全レース（結果登録含む） / 1〜12=その1レースだけ",
-        )
-        skip_existing = st.checkbox("登録済みは飛ばす", value=True, key="v319_op_skip_existing")
-        replace_existing = st.checkbox("登録済みを置き換える", value=False, key="v319_op_replace_existing")
-        predict_missing = st.checkbox(
-            "未予測／他バージョン予測なら再予測",
-            value=True,
-            key="v319_op_predict_missing",
-            help="現行版（例: Ver326）の予測が無いレースは、他版の予測があっても再予測します。",
-        )
-        fetch_odds_opt = st.checkbox("オッズも取得する", value=True, key="v319_op_fetch_odds")
-        register_result_opt = st.checkbox("結果も登録する", value=True, key="v319_op_register_result")
-        if st.button("この日の開催を確認", use_container_width=True, key="v319_op_list_meetings"):
-            try:
-                ymd = fetch_date.strftime("%Y%m%d")
-                meets = _v319_list_oddspark_meetings(ymd)
-                st.session_state["v319_op_meetings"] = meets
-            except Exception as exc:
-                st.error(f"開催一覧の取得に失敗: {exc}")
-        meets = st.session_state.get("v319_op_meetings") or []
-        if meets:
-            st.write("取得できた開催: " + "、".join(f"{m['venue']}" for m in meets))
-        ymd = fetch_date.strftime("%Y%m%d")
-        venues = [fetch_venue] if fetch_venue in RESULT_VENUES else [m["venue"] for m in meets]
-        _rnos = [int(fetch_race_no)] if int(fetch_race_no or 0) >= 1 else []
-        _imp_kw = dict(
-            skip_existing=bool(skip_existing and not replace_existing),
-            replace=bool(replace_existing),
-            predict_if_missing=bool(predict_missing),
-            trials=int(trials),
-            seed=int(seed),
-            race_nos=_rnos,
-            fetch_odds=bool(fetch_odds_opt),
-            register_result=bool(register_result_opt),
-        )
+        # fragment: プルダウン操作で全画面を白くしない
+        _v326_render_official_import_panel()
 
-        # 取り込み済み／把握済み確認（再HTTPなし。回収率の判定対象とは別）
-        # 現行版の予測のみを「把握」とする（旧版のみあるRは 0R）
-        try:
-            _cur_ver = str(
-                globals().get("_V231_APP_VERSION")
-                or globals().get("APP_VERSION")
-                or "Ver326"
-            ).strip()
-            _reg_lines = []
-            for _vn in (venues or []):
-                if _vn not in RESULT_VENUES:
-                    continue
-                _reg_nos = _v319_registered_race_nos(engine.DB_PATH, ymd, _vn)
-                try:
-                    _pred_nos = _v319_prediction_race_nos_for_version(
-                        engine.DB_PATH, ymd, _vn, app_version=_cur_ver
-                    )
-                except Exception:
-                    _pred_nos = []
-                try:
-                    _any_nos = _v319_known_race_nos(engine.DB_PATH, ymd, _vn)
-                except Exception:
-                    _any_nos = list(_reg_nos)
-                # 1〜12 のみ
-                _reg_nos = [n for n in _reg_nos if isinstance(n, int) and 1 <= n <= 12]
-                _pred_nos = [n for n in _pred_nos if isinstance(n, int) and 1 <= n <= 12]
-                _any_nos = [n for n in _any_nos if isinstance(n, int) and 1 <= n <= 12]
-                _old_only = sorted(set(_any_nos) - set(_pred_nos))
-                _mx = max([0] + list(_any_nos) + list(_reg_nos) + list(_pred_nos) + [8])
-                _miss_pred = [n for n in range(1, _mx + 1) if n not in set(_pred_nos)]
-                _miss_reg = [n for n in range(1, _mx + 1) if n not in set(_reg_nos)]
-                _line = (
-                    f"**{_vn}**（{_cur_ver}）: "
-                    f"現行版予測 {len(_pred_nos)}R"
-                    + (f"（{','.join(str(n) for n in _pred_nos)}）" if _pred_nos else "（0R・なし）")
-                    + f" ／ result登録 {len(_reg_nos)}R"
-                    + (f"（{','.join(str(n) for n in _reg_nos)}）" if _reg_nos else "（なし）")
-                )
-                if _old_only:
-                    _line += (
-                        f" ／ 旧版のみ予測: {','.join(str(n)+'R' for n in _old_only)}"
-                        f"（現行では未把握＝再予測対象）"
-                    )
-                if _miss_pred and _pred_nos:
-                    _line += f" ／ 現行版未予測: {','.join(str(n)+'R' for n in _miss_pred)}"
-                elif not _pred_nos and _mx > 0:
-                    _line += f" ／ 現行版未予測: 1〜{_mx}R（すべて）"
-                if _miss_reg:
-                    _line += f" ／ result未登録: {','.join(str(n)+'R' for n in _miss_reg)}"
-                _reg_lines.append(_line)
-            if _reg_lines:
-                st.info(
-                    "📦 この日のR把握状況（再取込不要・既存DB）\n\n"
-                    + "\n\n".join(_reg_lines)
-                    + f"\n\n※「現行版予測」は {_cur_ver} の予測／プランのみ。"
-                    + " 旧版だけあるRは把握に入れず 0R 扱いです。"
-                    + "\n※result登録は版非依存（着順・払戻）。"
-                    + "\n※回収率の「レース数」は判定対象なので別数字で正常です。"
-                )
-        except Exception:
-            pass
-
-        # --- 取込キュー（プレイリスト） ---
-        try:
-            _v326_ensure_import_queue(engine.DB_PATH)
-            _qs = _v326_queue_summary(engine.DB_PATH, "official_import")
-        except Exception:
-            _qs = {"total": 0, "pending": 0, "running": 0, "done": 0, "skipped": 0, "error": 0}
-        st.markdown("#### 📋 取込キュー（プレイリスト）")
-        st.caption(
-            f"pending {_qs.get('pending',0)} / running {_qs.get('running',0)} / "
-            f"done {_qs.get('done',0)} / skipped {_qs.get('skipped',0)} / error {_qs.get('error',0)}"
-            "　※キューの定義は UI、実行は worker（自動で1〜12を足しません）"
-            "　※再シミュとは別セッションで同時実行できます"
-        )
-        _pend_n = int(_qs.get("pending") or 0)
-        _run_n = int(_qs.get("running") or 0)
-        if _pend_n > 0:
-            st.warning(
-                f"キューに pending が {_pend_n} 件残っています。"
-                "「▶実行」や「バックグラウンドで取得」は **キューの pending だけ**を処理します（入力条件の再追加はしません）。"
-                "別のレースを入れるときは「＋条件をキューに追加」、不要なら「🗑 pending全消去」。"
-            )
-        elif _run_n > 0:
-            st.info(f"実行中が {_run_n} 件あります（追加は可能・完了を待つか中止してください）。")
-        q1, q2, q3, q4 = st.columns(4)
-        add_q = q1.button("＋条件をキューに追加", use_container_width=True, key="v326_q_add")
-        run_q = q2.button("▶ キューを実行/再開", type="primary", use_container_width=True, key="v326_q_run")
-        re_err = q3.button("失敗を再投入", use_container_width=True, key="v326_q_reerr")
-        clr_fin = q4.button("done/skip掃除", use_container_width=True, key="v326_q_clr")
-        q5, q6 = st.columns(2)
-        clr_pend = q5.button("🗑 pending全消去", use_container_width=True, key="v326_q_clr_pend")
-        clr_all = q6.button("🗑 キュー全消去", use_container_width=True, key="v326_q_clr_all")
-        _ins_first = st.checkbox(
-            "＋条件をキューに追加するとき、先頭に割り込み追加",
-            value=False, key="v326_q_add_first",
-            help="既存 pending の前に挿入します。「先に処理したい」ものを優先できます。",
-        )
-        if add_q:
-            if not venues:
-                st.warning("開催場を選ぶか、先に開催確認してください。")
-            else:
-                r = _v319_bg_import_start(
-                    engine.DB_PATH, ymd, venues, **_imp_kw,
-                    enqueue=True, run_worker=False,
-                    insert_first=bool(_ins_first),
-                )
-                if r.get("ok"):
-                    st.success(r.get("reason") or f"キューに{r.get('enqueued',0)}件追加")
-                    st.rerun()
-                else:
-                    st.warning(r.get("reason") or "追加できませんでした")
-        if run_q:
-            r = _v319_bg_import_start(
-                engine.DB_PATH, ymd, venues or [""], **_imp_kw, enqueue=False, run_worker=True
-            )
-            if r.get("ok"):
-                st.success(f"キュー実行を開始（ジョブ {r.get('job_id')}）")
-                st.rerun()
-            else:
-                st.warning(r.get("reason") or "開始できませんでした")
-        if re_err:
-            n = _v326_requeue_errors(engine.DB_PATH, "official_import")
-            st.info(f"error → pending に {n} 件戻しました" if n else "再投入する error はありません")
-            if n:
-                st.rerun()
-        if clr_fin:
-            n = _v326_clear_queue_finished(engine.DB_PATH, "official_import", include_error=False)
-            st.info(f"done/skipped を {n} 件削除しました")
-            if n:
-                st.rerun()
-        if clr_pend:
-            n = _v326_clear_queue_pending(engine.DB_PATH, "official_import", include_running=True)
-            st.success(f"pending/running を {n} 件削除しました")
-            if n:
-                st.rerun()
-        if clr_all:
-            n = _v326_clear_queue_all(engine.DB_PATH, "official_import")
-            st.success(f"キューを全消去しました（{n} 件）")
-            if n:
-                st.rerun()
-        # B13-F: 並び替えは fragment（部分更新）。一覧・削除もここで完結。
-        # 並び替え・全件表示・削除は fragment（部分更新・全画面再計算なし）
-        _v326_render_queue_reorder_fragment(str(engine.DB_PATH), "official_import")
-
-        b1, b2 = st.columns(2)
-        with b1:
-            start_fg = st.button("今すぐ取得して登録", use_container_width=True, key="v319_op_import")
-        with b2:
-            start_bg = st.button("バックグラウンドで実行（キューのみ）", type="primary", use_container_width=True, key="v319_op_import_bg")
-        if start_fg or start_bg:
-            if not venues:
-                st.warning("開催場を選ぶか、先に開催確認してください。")
-            elif start_bg:
-                # 実行のみ: 既存 pending を処理（条件の再 enqueue はしない）
-                # 削除したレースが「レース番号=0」で復活しないよう、enqueue=False
-                _left = int(_qs.get("pending") or 0) + int(_qs.get("running") or 0)
-                if _left <= 0:
-                    st.warning(
-                        "キューが空です。先に「＋条件をキューに追加」でレースを入れてから、"
-                        "「バックグラウンドで取得」または「▶ キューを実行/再開」を押してください。"
-                    )
-                else:
-                    started = _v319_bg_import_start(
-                        engine.DB_PATH, ymd, venues, **_imp_kw, enqueue=False, run_worker=True
-                    )
-                    if started.get("ok"):
-                        st.success(
-                            f"キュー実行を開始（ジョブ {started.get('job_id')} / pending {_left} 件）。"
-                            "画面を離れても進みます。新規レースは追加しません。"
-                        )
-                        st.rerun()
-                    else:
-                        st.warning(started.get("reason") or "開始できませんでした")
-            else:
-                all_rep = {"ok": 0, "skip": 0, "error": 0, "details": []}
-                with st.spinner(f"{ymd} {','.join(venues)} を取得しています…"):
-                    _v319_prev_state = _v287_calibration_state(engine.DB_PATH)
-                    _V287_IMPORT_STATE_RESET.clear()
-                    _V287_IMPORT_STATE_RESET.update(_v319_prev_state)
-                    for vn in venues:
-                        _rnos = [int(fetch_race_no)] if int(fetch_race_no or 0) >= 1 else None
-                        rep = _v319_import_official_results(
-                            engine.DB_PATH,
-                            ymd,
-                            vn,
-                            skip_existing=bool(skip_existing and not replace_existing),
-                            replace=bool(replace_existing),
-                            predict_if_missing=bool(predict_missing),
-                            trials=int(trials),
-                            seed=int(seed),
-                            race_nos=_rnos,
-                            fetch_odds=bool(fetch_odds_opt),
-                            register_result=bool(register_result_opt),
-                        )
-                        all_rep["ok"] += int(rep.get("ok") or 0)
-                        all_rep["skip"] += int(rep.get("skip") or 0)
-                        all_rep["error"] += int(rep.get("error") or 0)
-                        all_rep["details"].extend(rep.get("details") or [])
-                    # 取込で予測が増えていたら、取込終了後に1回だけ全件で再集計する。
-                    _v287_do_full = False
-                    try:
-                        _v287_now_state = _v287_calibration_state(engine.DB_PATH)
-                        _v287_do_full = (
-                            int(_v287_now_state.get("history_id") or 0)
-                            != int(_v319_prev_state.get("history_id") or 0)
-                        )
-                    except Exception:
-                        _v287_do_full = False
-                    if _v287_do_full:
-                        try:
-                            _v287_inc = _v287_recalculate_global_transition_calibration(
-                                engine.DB_PATH, force_full=True
-                            )
-                            all_rep["v287_recalc"] = {
-                                "mode": str((_v287_inc or {}).get("mode") or "full"),
-                                "ok": bool((_v287_inc or {}).get("ok")),
-                                "calibrations": int((_v287_inc or {}).get("calibrations") or 0),
-                                "reason": str((_v287_inc or {}).get("reason") or ""),
-                            }
-                        except Exception as _v287_full_exc:
-                            all_rep["v287_recalc"] = {
-                                "mode": "full", "ok": False, "calibrations": 0,
-                                "reason": "%s: %s" % (type(_v287_full_exc).__name__, _v287_full_exc),
-                            }
-                    else:
-                        all_rep["v287_recalc"] = {
-                            "mode": "incremental", "ok": True, "calibrations": 0, "reason": "",
-                        }
-                st.session_state["v319_op_last_report"] = all_rep
-                failed_items = [
-                    d for d in (all_rep.get("details") or [])
-                    if str(d.get("status") or "") in ("error", "failed")
-                ]
-                st.success(
-                    f"自動取得が完了しました。完了：{all_rep['ok']}R / スキップ：{all_rep['skip']}R / 失敗：{all_rep['error']}R"
-                )
-                if failed_items:
-                    st.warning(
-                        "失敗レース: "
-                        + " / ".join(
-                            f"{d.get('venue','')}{d.get('R','')}R {d.get('message','')}"
-                            for d in failed_items[:8]
-                        )
-                    )
-                st.caption("GitHubへは自動保存しません。問題なければサイドバーのDB保存を使ってください。")
-
-        job_imp = _v278_bg_get_active_of(engine.DB_PATH, ("official_import",))
-        if str((job_imp or {}).get("job_type") or "") == "official_import":
-            st.markdown("#### 取込の進捗")
-            done = int(job_imp.get("done_count") or 0)
-            total = int(job_imp.get("total_count") or 0)
-            status = str(job_imp.get("status") or "")
-            if total > 0:
-                st.progress(min(1.0, max(0.0, done / float(total))), text=f"{done}/{total}R")
-            else:
-                st.info("対象レースを数えています…")
-            st.caption(
-                f"今：{job_imp.get('current_label') or '-'} ｜ "
-                f"{job_imp.get('message') or status}"
-            )
-            cprog1, cprog2 = st.columns(2)
-            if cprog1.button("進捗を更新", use_container_width=True, key="v319_op_refresh_job"):
-                try:
-                    st.rerun(scope="fragment")
-                except Exception:
-                    st.rerun()
-            if status in ("queued", "running", "paused", "pause_requested", "cancel_requested") and cprog2.button(
-                "取込を中止", use_container_width=True, key="v319_op_cancel_job",
-                disabled=(status == "cancel_requested"),
-            ):
-                try:
-                    _v278_bg_request_cancel(engine.DB_PATH, int(job_imp.get("job_id") or 0))
-                    st.warning("中止を受け付けました。選手履歴の区切りなど、数秒〜数十秒で止まります。")
-                except Exception as exc:
-                    st.warning(f"中止フラグは立てました（{exc}）。処理の区切りで停止します。")
-                try:
-                    st.rerun(scope="fragment")
-                except Exception:
-                    st.rerun()
-            blob = job_imp.get("result_blob")
-            # 完了・中止・失敗・実行中いずれも、途中結果があれば表示用に取り込む
-            if blob and status in ("completed", "cancelled", "failed", "running", "paused"):
-                try:
-                    rep = pickle.loads(zlib.decompress(bytes(blob)))
-                    if isinstance(rep, dict) and rep.get("details") is not None:
-                        st.session_state["v319_op_last_report"] = rep
-                except Exception:
-                    pass
-            if status == "cancelled":
-                st.warning(
-                    job_imp.get("message")
-                    or "取込を中止しました。下にここまでの結果を表示します。"
-                )
-        last_rep = st.session_state.get("v319_op_last_report")
-        if last_rep:
-            st.markdown("#### 取込結果（レースごと）")
-            if last_rep.get("summary"):
-                st.caption(str(last_rep.get("summary")))
-            det = last_rep.get("details") or []
-            if det:
-                st.dataframe(pd.DataFrame(det), use_container_width=True, hide_index=True)
-                try:
-                    csv_bytes = pd.DataFrame(det).to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        "この結果をCSVダウンロード",
-                        data=csv_bytes,
-                        file_name=f"import_partial_{_v228_now_jst_iso()[:10]}.csv",
-                        mime="text/csv",
-                        key="v319_op_partial_csv",
-                    )
-                except Exception:
-                    pass
 
     # ===== Ver319: 選手履歴だけを自動登録 =====
     with st.expander("👤 選手履歴だけを自動登録（予測・オッズ・結果登録なし）", expanded=False):
