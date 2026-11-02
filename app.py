@@ -36403,32 +36403,39 @@ def _v284_current_db_identity() -> dict:
     変更時だけ主要件数fingerprintとDB本体+WALのstreaming SHA256を実行する。
     """
     try:
-        p=Path(str(engine.DB_PATH)).resolve()
-        sig=_v290_db_stat_signature(p)
-        cached=st.session_state.get("_v290_identity_cache")
-        if isinstance(cached,dict) and cached.get("sig")==sig and isinstance(cached.get("value"),dict):
+        p = Path(str(engine.DB_PATH)).resolve()
+        sig = _v290_db_stat_signature(p)
+        cached = st.session_state.get("_v290_identity_cache")
+        if (
+            isinstance(cached, dict)
+            and cached.get("sig") == sig
+            and isinstance(cached.get("value"), dict)
+        ):
             return dict(cached["value"])
 
-        force=bool(st.session_state.pop("_v284_force_identity_refresh",False))
-        _ = force  # 明示refreshでも変更時計算の経路を維持
+        # 明示リフレッシュ要求は消費だけする（キャッシュ判定はsigで済む）
+        _ = st.session_state.pop("_v284_force_identity_refresh", False)
 
-        fp=_v283_db_fingerprint_file(str(p))
-        sha=_v284_streaming_sha256(
-            p,
-            Path(str(p)+"-wal"),
-        )
-        value={
-            "ok":bool(fp.get("ok")),
-            "path":str(p),
-            "sha256":sha,
-            "size":int(fp.get("size") or 0),
-            "fingerprint":fp,
+        # ここから先は「DBが実際に変わった」時だけ走る
+        fp = _v283_db_fingerprint_file(str(p))
+        sha = _v284_streaming_sha256(p, Path(str(p) + "-wal"))
+
+        value = {
+            "ok": bool(fp.get("ok")),
+            "path": str(p),
+            "sha256": sha,
+            "size": int(fp.get("size") or 0),
+            "fingerprint": fp,
         }
-        st.session_state["_v290_identity_cache"]={"sig":sig,"value":dict(value)}
-        st.session_state["_v290_identity_full_ts"]=time_module.time()
+        st.session_state["_v290_identity_cache"] = {"sig": sig, "value": dict(value)}
+        st.session_state["_v290_identity_full_ts"] = time_module.time()
         return value
     except Exception as exc:
-        return {"ok":False,"path":str(getattr(engine,"DB_PATH","")),"reason":f"{type(exc).__name__}: {exc}"}
+        return {
+            "ok": False,
+            "path": str(getattr(engine, "DB_PATH", "")),
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
 
 def _v284_db_identity_regressed(now: dict, baseline: dict) -> tuple[bool,list[str]]:
     reasons=[]
