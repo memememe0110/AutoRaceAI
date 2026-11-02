@@ -335,7 +335,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 # Ver314: 再シミュレーション中のGitHub自動途中保存間隔（レース数）
 # 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
-_V314_GH_AUTOSAVE_EVERY_N = 20  # 再シミュレーションと同じ20Rごとの軽量GitHub保存
+_V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
 _V326_BUILD_TAG = "20261101_cancel1"  # デプロイ確認用。取込メッセージに出る
 
@@ -2423,6 +2423,7 @@ def _v273_virtual_roi_score(
 # 状態はst.session_stateではなくSQLiteへ保存するため、画面移動・再描画後も確認できる。
 _V278_BG_THREADS = globals().get("_V278_BG_THREADS", {})
 _V278_BG_LOCK = globals().get("_V278_BG_LOCK", threading.Lock())
+_V278_GH_AUTOSAVE_LOCK = globals().get("_V278_GH_AUTOSAVE_LOCK", threading.Lock())
 
 _V278_TABLE_READY: set[str] = set()
 
@@ -3758,54 +3759,70 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 _total_show=int(resume_done_offset or 0)+_total_raw
             _total_show=max(_total_show,_done_show)
             _msg = f"{_done_show}/{_total_show}｜{str(label or '')}"
-            # 途中 GitHub 保存は _gh_every 件ごと（チャンクGCより長く）
+            # 途中GitHub保存は40Rごと。保存処理はworker本体と分離し、
+            # 保存中でも再シムを止めない。GitHub保存は同時に1本だけ実行する。
             if (
                 _gh_every > 0
                 and _done_show > 0
                 and (_done_show - int(_last_gh_save_at[0])) >= _gh_every
             ):
-                try:
+                if _V278_GH_AUTOSAVE_LOCK.acquire(blocking=False):
+                    _save_at = int(_done_show)
+                    _save_total = int(_total_show)
+                    _save_msg = f"AutoRaceAI: 再シム途中自動保存 {_save_at}/{_save_total}"
                     _v278_bg_update(
                         db_path, job_id,
                         done_count=_done_show,
                         total_count=_total_show,
                         current_label=str(label or ""),
-                        message=_msg + f"｜GitHub自動保存中({_done_show}R)...",
+                        message=_msg + f"｜GitHub自動保存をバックグラウンド実行({_done_show}R)...",
                     )
-                    _ok_as, _msg_as = push_db_to_github(
-                        f"AutoRaceAI: 再シム途中自動保存 {_done_show}/{_total_show}",
-                        _allow_during_resimulation=True,
-                        _lightweight=True,
-                        _pin_identity=gh_pin_identity,
-                        _guard_block=gh_guard_block,
-                    )
-                    try:
-                        import gc as _gc_as
-                        _gc_as.collect()
-                    except Exception:
-                        pass
-                    if _ok_as:
-                        _last_gh_save_at[0] = int(_done_show)
-                        _gh_autosave_log.append({
-                            "at": int(_done_show),
-                            "ok": True,
-                            "message": str(_msg_as or "")[:200],
-                        })
-                        _msg = _msg + f"｜✓自動保存済({_done_show}R)"
-                    else:
-                        _gh_autosave_log.append({
-                            "at": int(_done_show),
-                            "ok": False,
-                            "message": str(_msg_as or "")[:200],
-                        })
-                        _msg = _msg + "｜⚠自動保存失敗(後で再試行)"
-                except Exception as _as_exc:
-                    _gh_autosave_log.append({
-                        "at": int(_done_show),
-                        "ok": False,
-                        "message": f"{type(_as_exc).__name__}: {_as_exc}"[:200],
-                    })
-                    _msg = _msg + "｜⚠自動保存エラー"
+
+                    def _run_gh_autosave(_at=_save_at, _total=_save_total, _commit_msg=_save_msg):
+                        try:
+                            _ok_as, _msg_as = push_db_to_github(
+                                _commit_msg,
+                                _allow_during_resimulation=True,
+                                _lightweight=True,
+                                _pin_identity=gh_pin_identity,
+                                _guard_block=gh_guard_block,
+                                _worker_thread=True,
+                            )
+                            if _ok_as:
+                                _last_gh_save_at[0] = int(_at)
+                            _gh_autosave_log.append({
+                                "at": int(_at),
+                                "ok": bool(_ok_as),
+                                "message": str(_msg_as or "")[:200],
+                            })
+                            try:
+                                _v278_bg_update(
+                                    db_path, job_id,
+                                    message=(
+                                        f"{_at}/{_total}｜✓GitHub軽量自動保存完了"
+                                        if _ok_as else
+                                        f"{_at}/{_total}｜⚠GitHub軽量自動保存失敗（後で再試行）"
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                        except Exception as _as_exc:
+                            _gh_autosave_log.append({
+                                "at": int(_at),
+                                "ok": False,
+                                "message": f"{type(_as_exc).__name__}: {_as_exc}"[:200],
+                            })
+                        finally:
+                            _V278_GH_AUTOSAVE_LOCK.release()
+
+                    threading.Thread(
+                        target=_run_gh_autosave,
+                        daemon=True,
+                        name=f"autorace-gh-autosave-{job_id}-{_save_at}",
+                    ).start()
+                    _msg = _msg + f"｜GitHub保存開始({_done_show}R)"
+                else:
+                    _msg = _msg + "｜GitHub保存中（次回進捗で再確認）"
             # B13-J: 進捗更新のたびに軽くGC（特にautosave直後）
             try:
                 import gc as _gc_b13j_prog
@@ -34441,6 +34458,7 @@ def _v282_push_chunked_db(
     chunk_size: int = 8 * 1024 * 1024,
     fingerprint: dict | None = None,
     preserve_previous_manifest: bool = False,
+    _from_worker: bool = False,
 ) -> tuple[bool, str]:
     """Ver305 atomic delta backup.
 
@@ -34481,16 +34499,17 @@ def _v282_push_chunked_db(
         and str((current_manifest or {}).get("sha256") or "") == digest
         and int((current_manifest or {}).get("size") or -1) == len(snapshot_bytes)
     ):
-        try:
-            st.session_state["v305_remote_db_cache"] = {
-                "branch": branch,
-                "generation": int((current_manifest or {}).get("generation") or 0),
-                "sha256": digest,
-                "size": len(snapshot_bytes),
-                "bytes": bytes(snapshot_bytes),
-            }
-        except Exception:
-            pass
+        if not _from_worker:
+            try:
+                st.session_state["v305_remote_db_cache"] = {
+                    "branch": branch,
+                    "generation": int((current_manifest or {}).get("generation") or 0),
+                    "sha256": digest,
+                    "size": len(snapshot_bytes),
+                    "bytes": bytes(snapshot_bytes),
+                }
+            except Exception:
+                pass
         return True, (
             f"DB登録成功｜GitHub DBは既に同一世代です "
             f"（{len(snapshot_bytes)/1024/1024:.1f}MB / Git更新0回）"
@@ -34772,17 +34791,18 @@ def _v282_push_chunked_db(
             " 次回保存時に再確認してください。"
         )
 
-    # 次回包含確認用cache。
-    try:
-        st.session_state["v305_remote_db_cache"] = {
-            "branch": branch,
-            "generation": generation,
-            "sha256": digest,
-            "size": len(snapshot_bytes),
-            "bytes": bytes(snapshot_bytes),
-        }
-    except Exception:
-        pass
+    # 次回包含確認用cache。workerからはsession_stateへ触れない。
+    if not _from_worker:
+        try:
+            st.session_state["v305_remote_db_cache"] = {
+                "branch": branch,
+                "generation": generation,
+                "sha256": digest,
+                "size": len(snapshot_bytes),
+                "bytes": bytes(snapshot_bytes),
+            }
+        except Exception:
+            pass
 
     return True, (
         f"DB登録成功｜GitHub原子的差分保存成功 "
@@ -35051,19 +35071,29 @@ def pull_db_from_github() -> tuple[bool, str]:
         return False, f"GitHub DB取得エラー: {type(exc).__name__}: {exc}"
 
 
-def _v278_consistent_db_snapshot_bytes(db_path: str) -> bytes:
-    """WAL利用中でも最新コミットを含む整合SQLiteスナップショットを返す。"""
+def _v278_consistent_db_snapshot_bytes(db_path: str, max_seconds: float | None = None, busy_timeout_ms: int = 60000) -> bytes:
+    """WAL利用中でも最新コミットを含む整合SQLiteスナップショットを返す。
+
+    max_seconds指定時はバックアップ処理に上限を設け、workerから呼んでも
+    SQLiteロック待ちで無期限にぶら下がらないようにする。
+    """
     src_path=Path(db_path)
     if not src_path.exists():
         raise FileNotFoundError(str(src_path))
     tmp_dir=Path(tempfile.mkdtemp(prefix="autorace_db_snapshot_"))
     snap_path=tmp_dir/"autorace_players_snapshot.sqlite3"
+    started=time_module.monotonic()
     try:
-        with sqlite3.connect(str(src_path), timeout=60.0) as src:
-            src.execute("PRAGMA busy_timeout=60000")
-            with sqlite3.connect(str(snap_path), timeout=60.0) as dst:
-                src.backup(dst)
+        with sqlite3.connect(str(src_path), timeout=max(1.0, float(busy_timeout_ms or 60000)/1000.0)) as src:
+            src.execute(f"PRAGMA busy_timeout={max(0, int(busy_timeout_ms or 60000))}")
+            with sqlite3.connect(str(snap_path), timeout=30.0) as dst:
+                def _backup_progress(_status, _remaining, _total):
+                    if max_seconds is not None and (time_module.monotonic() - started) > float(max_seconds):
+                        raise TimeoutError(f"SQLiteスナップショット作成が{float(max_seconds):.0f}秒を超えました")
+                src.backup(dst, pages=1000, progress=_backup_progress, sleep=0.05)
                 dst.commit()
+        if max_seconds is not None and (time_module.monotonic() - started) > float(max_seconds):
+            raise TimeoutError(f"SQLiteスナップショット作成が{float(max_seconds):.0f}秒を超えました")
         data=snap_path.read_bytes()
         if not data.startswith(b"SQLite format 3\x00"):
             raise RuntimeError("SQLiteスナップショットの生成に失敗しました")
@@ -35816,7 +35846,23 @@ def _v319_archive_old_version_predictions(db_path: str, keep_versions: list[str]
     return report
 
 
-def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = False, _lightweight: bool = False, _pin_identity=None, _guard_block=None) -> tuple[bool, str]:
+def _v284_compare_worker_identity(now: dict, baseline: dict) -> tuple[bool,list[str]]:
+    """worker専用。session_stateを一切触らずDB identityの退行だけ判定する。"""
+    reasons=[]
+    if not now.get("ok") or not baseline.get("ok"):
+        return True,["DB識別情報を取得できません"]
+    if str(now.get("path")) != str(baseline.get("path")):
+        reasons.append(f"DBパス変更: {baseline.get('path')} → {now.get('path')}")
+    try:
+        cmp=_v283_compare_db_fingerprints(now.get("fingerprint") or {},baseline.get("fingerprint") or {})
+        if not cmp.get("safe"):
+            reasons.extend(cmp.get("regressions") or [])
+    except Exception as exc:
+        reasons.append(f"DB識別情報比較エラー: {type(exc).__name__}: {exc}")
+    return bool(reasons),reasons
+
+
+def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = False, _lightweight: bool = False, _pin_identity=None, _guard_block=None, _worker_thread: bool = False) -> tuple[bool, str]:
     # Ver309: バックグラウンド再シミュレーション中はGitHub同期を行わない。
     # ローカルSQLiteへの登録・更新はそのまま継続し、再シミュレーション終了後に
     # まとめて1回だけGitHubへ保存する。これにより待機中の選手履歴登録などが
@@ -35834,9 +35880,23 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
     # 保存ボタン押下時にも、アップロード正本よりDBが後退していないか最終確認。
     # バックグラウンドworkerから呼ばれる場合は、起動元で取得した値だけを使い、
     # workerスレッド内からst.session_stateを参照しない。
-    _pin284 = _pin_identity if _pin_identity is not None else st.session_state.get("v284_uploaded_master_identity")
+    if _worker_thread:
+        _pin284 = _pin_identity if isinstance(_pin_identity, dict) else {}
+        _guard284 = list(_guard_block or [])
+    else:
+        _pin284 = (
+            _pin_identity
+            if _pin_identity is not None
+            else st.session_state.get("v284_uploaded_master_identity")
+        )
+        _guard284 = list(
+            _guard_block
+            if _guard_block is not None
+            else (st.session_state.get("v284_db_identity_block") or [])
+        )
     _deferred_guard284=[]
-    if isinstance(_pin284,dict) and _pin284.get("ok"):
+    _worker_pinned_path = str((_pin284 or {}).get("path") or "") if _worker_thread else ""
+    if isinstance(_pin284,dict) and _pin284.get("ok") and not _worker_thread:
         _nowpin284=_v284_current_db_identity()
         if not _nowpin284.get("ok"):
             return False,"GitHub保存を中止しました。保存直前のDB識別情報を取得できません。"
@@ -35847,12 +35907,10 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
             )
         _badpin284,_why284=_v284_db_identity_regressed(_nowpin284,_pin284)
         if _badpin284:
-            # Ver305自動統合:
-            # 件数減少だけでは保存禁止にしない。後段でGitHub current実体と
-            # 自然キーの行単位包含を確認し、divergedならsafe-unionする。
             _deferred_guard284.extend(list(_why284 or []))
 
-    _guard284 = list(_guard_block or []) if _guard_block is not None else (st.session_state.get("v284_db_identity_block") or [])
+    if _worker_thread and _worker_pinned_path and str(Path(engine.DB_PATH).resolve()) != str(Path(_worker_pinned_path).resolve()):
+        return False,"DB参照先が変更されています。バックグラウンドGitHub保存を中止しました。"
     _hard_guard284=[
         str(x) for x in _guard284
         if "DBパス変更:" in str(x) or "DB識別情報を取得できません" in str(x)
@@ -35869,9 +35927,29 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
         return False,"保存するDBがありません。"
 
     try:
-        snapshot_bytes=_v278_consistent_db_snapshot_bytes(str(db_path))
+        snapshot_bytes=_v278_consistent_db_snapshot_bytes(
+            str(db_path),
+            max_seconds=(90.0 if _worker_thread else None),
+            busy_timeout_ms=(5000 if _worker_thread else 60000),
+        )
     except Exception as exc:
         return False,f"DB整合スナップショット作成エラー: {type(exc).__name__}: {exc}"
+
+    if _worker_thread and isinstance(_pin284,dict) and _pin284.get("ok"):
+        _nowpin284={
+            "ok": True,
+            "path": str(db_path.resolve()),
+            "sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
+            "size": len(snapshot_bytes),
+        }
+        try:
+            _fp284_worker=_v283_db_fingerprint_bytes(snapshot_bytes)
+            _nowpin284["fingerprint"]=_fp284_worker
+            _badpin284,_why284=_v284_compare_worker_identity(_nowpin284,_pin284)
+            if _badpin284:
+                _deferred_guard284.extend(list(_why284 or []))
+        except Exception as _id_exc284:
+            return False,f"GitHub保存前DB識別情報の確認に失敗しました: {type(_id_exc284).__name__}: {_id_exc284}"
 
     # 破損DBは絶対に保存しない。
     ok_validate,msg_validate=_v276_validate_db_bytes(snapshot_bytes,"GitHub保存前DB")
@@ -35900,6 +35978,7 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
             snapshot_bytes, commit_message,
             fingerprint=local_fp,
             preserve_previous_manifest=False,
+            _from_worker=_worker_thread,
         )
         if _ok_push284:
             try:
