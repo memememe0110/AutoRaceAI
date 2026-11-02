@@ -4097,6 +4097,9 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             _gh309_ok, _gh309_msg = push_db_to_github(
                 "AutoRaceAI: 再シミュレーション完了後のDB軽量保存",
                 _lightweight=True,
+                _pin_identity=gh_pin_identity,
+                _guard_block=gh_guard_block,
+                _worker_thread=True,
             )
             result["github_deferred_save_ok"] = bool(_gh309_ok)
             result["github_deferred_save_message"] = str(_gh309_msg or "")
@@ -36344,7 +36347,7 @@ def _v284_current_db_identity() -> dict:
             and isinstance(cached, dict)
             and isinstance(cached.get("value"), dict)
             and cached["value"].get("ok")
-            and (now_ts - last_full) < 45.0
+            and (now_ts - last_full) < 120.0
         ):
             try:
                 cur_size=int(p.stat().st_size)
@@ -36394,13 +36397,34 @@ def _v296_bg_fast_rerun_active() -> bool:
     except Exception:
         return False
 
+def _v284_recent_completed_job(db_path: str, within_min: float = 5.0) -> bool:
+    """直近N分以内に成功したバッチジョブがあるか。
+    ジョブがDBを書き換えた直後は、巨大なDB identity再計算を一時停止して
+    完了直後のrerunによるメモリ急増を防ぐ。
+    """
+    try:
+        with sqlite3.connect(str(db_path), timeout=2.0) as con:
+            con.execute("PRAGMA busy_timeout=2000")
+            row = con.execute(
+                """SELECT COUNT(*) FROM v278_background_jobs
+                   WHERE job_type IN ('batch_rerun','official_import')
+                     AND status='completed'
+                     AND finished_at IS NOT NULL
+                     AND datetime(finished_at) > datetime('now', ?)""",
+                (f"-{int(within_min)} minutes",),
+            ).fetchone()
+        return bool(row and int(row[0]) > 0)
+    except Exception:
+        return False
+
 _v296_bg_fast_rerun=_v296_bg_fast_rerun_active()
+_v284_recent_ok=_v284_recent_completed_job(engine.DB_PATH)
 
 # Ver284: アップロード済み正本がある場合、rerunでDB実体が後退していたら
 # GitHub操作や画面処理より前に同じ engine.DB_PATH へ原子的に復元する。
 _v284_pinned_bytes=st.session_state.get("v284_uploaded_master_bytes")
 _v284_pinned_id=st.session_state.get("v284_uploaded_master_identity")
-if (not _v296_bg_fast_rerun) and isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_id,dict) and _v284_pinned_id.get("ok"):
+if (not _v296_bg_fast_rerun) and (not _v284_recent_ok) and isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_id,dict) and _v284_pinned_id.get("ok"):
     _v284_before_restore=_v284_current_db_identity()
     _v284_restore_needed=False
     if not _v284_before_restore.get("ok"):
@@ -36442,11 +36466,17 @@ _v284_identity_block_key="v284_db_identity_block"
 # Ver326: バックグラウンドの再シミュレーションが動いている間は、
 # 巨大なDBスナップショット作成によるメモリ不足（OOM）を防ぐため、
 # 固定監視（フルスキャン）をスキップして前回のキャッシュを使う。
-if _v296_bg_fast_rerun:
+if _v296_bg_fast_rerun or _v284_recent_ok:
     _v284_identity_now=dict(st.session_state.get(_v284_identity_key) or {})
     if not _v284_identity_now.get("ok"):
-        # キャッシュがない場合も、このタイミングでの重い生成は避ける。
-        _v284_identity_now={"ok":False,"reason":"BG実行中のため監視スキップ"}
+        # バックグラウンド実行中、または完了直後は重いidentity生成を避ける。
+        _v284_identity_now={
+            "ok":False,
+            "reason": (
+                "BG実行中のため監視スキップ"
+                if _v296_bg_fast_rerun else "直近ジョブ完了直後のため監視スキップ"
+            ),
+        }
 else:
     _v284_identity_now=_v284_current_db_identity()
 
@@ -36459,7 +36489,7 @@ if _v284_identity_now.get("ok"):
         _v284_bad,_v284_reasons=_v284_db_identity_regressed(_v284_identity_now,_v284_identity_base)
         st.session_state[_v284_identity_block_key]=_v284_reasons if _v284_bad else []
         # 件数が増えた正常DBは新基準へ昇格。SHA変化だけでは巻き戻り扱いにしない。
-        if not _v284_bad and not _v296_bg_fast_rerun:
+        if not _v284_bad and not _v296_bg_fast_rerun and not _v284_recent_ok:
             st.session_state[_v284_identity_key]=_v284_identity_now
 
 
