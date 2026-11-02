@@ -335,7 +335,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 # Ver314: 再シミュレーション中のGitHub自動途中保存間隔（レース数）
 # 50R前後は落ちにくい実績があるため、余裕を見て15Rごとに保存する。
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
-_V314_GH_AUTOSAVE_EVERY_N = 40  # GitHubも同じ間隔（push連打しない）
+_V314_GH_AUTOSAVE_EVERY_N = 20  # 再シミュレーションと同じ20Rごとの軽量GitHub保存
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
 _V326_BUILD_TAG = "20261101_cancel1"  # デプロイ確認用。取込メッセージに出る
 
@@ -3704,7 +3704,7 @@ def _v284_backfill_transition_audit_from_latest_histories(db_path: str, app_vers
         return result
 
 
-def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool, resume_done_offset: int = 0, resume_total_target: int = 0, diagnostic_auto: bool = False, odds_only: bool = False, enable_v328: bool = False) -> None:
+def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: bool, resume_done_offset: int = 0, resume_total_target: int = 0, diagnostic_auto: bool = False, odds_only: bool = False, enable_v328: bool = False, gh_pin_identity=None, gh_guard_block=None) -> None:
     # Ver326 C-A / Ver327 / Ver328: 起動直前に立てた pending を消費。ジョブ中だけ実験フラグを有効化。
     _ca_job = bool(globals().pop("_V326_CA_PENDING_FOR_WORKER", False))
     _v327_job = bool(globals().pop("_V327_PENDING_FOR_WORKER", False))
@@ -3776,6 +3776,8 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                         f"AutoRaceAI: 再シム途中自動保存 {_done_show}/{_total_show}",
                         _allow_during_resimulation=True,
                         _lightweight=True,
+                        _pin_identity=gh_pin_identity,
+                        _guard_block=gh_guard_block,
                     )
                     try:
                         import gc as _gc_as
@@ -4255,9 +4257,12 @@ def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnost
     globals()["_V326_CA_PENDING_FOR_WORKER"] = bool(enable_ca or enable_v327 or enable_v328)
     globals()["_V327_PENDING_FOR_WORKER"] = bool(enable_v327)
     globals()["_V328_PENDING_FOR_WORKER"] = bool(enable_v328)
+    # workerへ渡すGitHub保存用の正本ガード情報をUIスレッド側で先に取得。
+    _gh_pin_for_worker = st.session_state.get("v284_uploaded_master_identity")
+    _gh_guard_for_worker = list(st.session_state.get("v284_db_identity_block") or [])
     th=threading.Thread(
         target=_v278_bg_worker,
-        args=(str(db_path),job_id,int(limit_count),bool(force_current),0,0,bool(diagnostic_auto),bool(odds_only),bool(enable_v328)),
+        args=(str(db_path),job_id,int(limit_count),bool(force_current),0,0,bool(diagnostic_auto),bool(odds_only),bool(enable_v328),_gh_pin_for_worker,_gh_guard_for_worker),
         daemon=True,
         name=f"autorace-bg-rerun-{job_id}",
     )
@@ -4390,9 +4395,11 @@ def _v290_spawn_recovery_worker(db_path: str, old_job: dict, reason: str) -> dic
             con.commit()
             jid_new=int(cur.lastrowid or 0)
 
+        _gh_pin_for_worker = st.session_state.get("v284_uploaded_master_identity")
+        _gh_guard_for_worker = list(st.session_state.get("v284_db_identity_block") or [])
         th=threading.Thread(
             target=_v278_bg_worker,
-            args=(str(db_path),jid_new,limit0,False,done0,total0,False,bool(_old_odds_only)),
+            args=(str(db_path),jid_new,limit0,False,done0,total0,False,bool(_old_odds_only),False,_gh_pin_for_worker,_gh_guard_for_worker),
             daemon=True,
             name=f"autorace-bg-rerun-recover-{jid_new}",
         )
@@ -4529,9 +4536,11 @@ def _v290_manual_resume_batch(db_path: str, job: dict) -> dict:
         globals()["_V326_CA_PENDING_FOR_WORKER"] = bool(_ca_resume)
         globals()["_V327_PENDING_FOR_WORKER"] = bool(_v327_resume)
         globals()["_V328_PENDING_FOR_WORKER"] = bool(_v328_resume)
+        _gh_pin_for_worker = st.session_state.get("v284_uploaded_master_identity")
+        _gh_guard_for_worker = list(st.session_state.get("v284_db_identity_block") or [])
         th=threading.Thread(
             target=_v278_bg_worker,
-            args=(str(db_path),new_jid,limit0,False,done0,total0,False,bool(_odds_only_resume),bool(_v328_resume)),
+            args=(str(db_path),new_jid,limit0,False,done0,total0,False,bool(_odds_only_resume),bool(_v328_resume),_gh_pin_for_worker,_gh_guard_for_worker),
             daemon=True,
             name=f"autorace-bg-rerun-manual-resume-{new_jid}",
         )
@@ -35807,7 +35816,7 @@ def _v319_archive_old_version_predictions(db_path: str, keep_versions: list[str]
     return report
 
 
-def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = False, _lightweight: bool = False) -> tuple[bool, str]:
+def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = False, _lightweight: bool = False, _pin_identity=None, _guard_block=None) -> tuple[bool, str]:
     # Ver309: バックグラウンド再シミュレーション中はGitHub同期を行わない。
     # ローカルSQLiteへの登録・更新はそのまま継続し、再シミュレーション終了後に
     # まとめて1回だけGitHubへ保存する。これにより待機中の選手履歴登録などが
@@ -35823,7 +35832,9 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
             )
 
     # 保存ボタン押下時にも、アップロード正本よりDBが後退していないか最終確認。
-    _pin284=st.session_state.get("v284_uploaded_master_identity")
+    # バックグラウンドworkerから呼ばれる場合は、起動元で取得した値だけを使い、
+    # workerスレッド内からst.session_stateを参照しない。
+    _pin284 = _pin_identity if _pin_identity is not None else st.session_state.get("v284_uploaded_master_identity")
     _deferred_guard284=[]
     if isinstance(_pin284,dict) and _pin284.get("ok"):
         _nowpin284=_v284_current_db_identity()
@@ -35841,7 +35852,7 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
             # 自然キーの行単位包含を確認し、divergedならsafe-unionする。
             _deferred_guard284.extend(list(_why284 or []))
 
-    _guard284=st.session_state.get("v284_db_identity_block") or []
+    _guard284 = list(_guard_block or []) if _guard_block is not None else (st.session_state.get("v284_db_identity_block") or [])
     _hard_guard284=[
         str(x) for x in _guard284
         if "DBパス変更:" in str(x) or "DB識別情報を取得できません" in str(x)
