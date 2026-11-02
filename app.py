@@ -3961,20 +3961,51 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                 pass
             try:
                 _at_ch = int(resume_done_offset or 0) + int(_done_in_job)
-                # チャンク境界でも GH は _gh_every 以上空いたときだけ（連打防止）
-                if int(_gh_every or 0) > 0 and (_at_ch - int(_last_gh_save_at[0])) >= int(_gh_every):
-                    _ok_ch, _msg_ch = push_db_to_github(
-                        f"AutoRaceAI: 再シムチャンク{_chunk_i}境界保存 {_done_in_job}/{_job_limit}",
-                        _allow_during_resimulation=True,
-                        _lightweight=True,
+                # チャンク境界保存も必ず別スレッド化し、進捗側autosaveと同じLockで排他する。
+                # 進捗側が40R保存中ならここでは重複起動せず、次の進捗タイミングに任せる。
+                if (
+                    int(_gh_every or 0) > 0
+                    and (_at_ch - int(_last_gh_save_at[0])) >= int(_gh_every)
+                    and _V278_GH_AUTOSAVE_LOCK.acquire(blocking=False)
+                ):
+                    _chunk_save_msg = (
+                        f"AutoRaceAI: 再シムチャンク{_chunk_i}境界保存 "
+                        f"{_done_in_job}/{_job_limit}"
                     )
-                    _last_gh_save_at[0] = _at_ch
-                    _gh_autosave_log.append({
-                        "at": int(_last_gh_save_at[0]),
-                        "ok": bool(_ok_ch),
-                        "message": str(_msg_ch or "")[:200],
-                        "chunk": int(_chunk_i),
-                    })
+                    def _run_chunk_gh_autosave(
+                        _at=int(_at_ch), _msg=str(_chunk_save_msg), _chunk=int(_chunk_i)
+                    ):
+                        try:
+                            _ok_ch, _msg_ch = push_db_to_github(
+                                _msg,
+                                _allow_during_resimulation=True,
+                                _lightweight=True,
+                                _pin_identity=gh_pin_identity,
+                                _guard_block=gh_guard_block,
+                                _worker_thread=True,
+                            )
+                            if _ok_ch:
+                                _last_gh_save_at[0] = int(_at)
+                            _gh_autosave_log.append({
+                                "at": int(_at),
+                                "ok": bool(_ok_ch),
+                                "message": str(_msg_ch or "")[:200],
+                                "chunk": int(_chunk),
+                            })
+                        except Exception as _ch_exc:
+                            _gh_autosave_log.append({
+                                "at": int(_at),
+                                "ok": False,
+                                "message": f"{type(_ch_exc).__name__}: {_ch_exc}"[:200],
+                                "chunk": int(_chunk),
+                            })
+                        finally:
+                            _V278_GH_AUTOSAVE_LOCK.release()
+                    threading.Thread(
+                        target=_run_chunk_gh_autosave,
+                        daemon=True,
+                        name=f"autorace-gh-chunk-save-{job_id}-{_at_ch}",
+                    ).start()
             except Exception as _ch_exc:
                 _gh_autosave_log.append({
                     "at": int(resume_done_offset or 0) + int(_done_in_job),
@@ -4097,9 +4128,6 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             _gh309_ok, _gh309_msg = push_db_to_github(
                 "AutoRaceAI: 再シミュレーション完了後のDB軽量保存",
                 _lightweight=True,
-                _pin_identity=gh_pin_identity,
-                _guard_block=gh_guard_block,
-                _worker_thread=True,
             )
             result["github_deferred_save_ok"] = bool(_gh309_ok)
             result["github_deferred_save_message"] = str(_gh309_msg or "")
@@ -34066,79 +34094,6 @@ def _v283_db_fingerprint_bytes(data: bytes) -> dict:
             tmp_path.unlink(missing_ok=True)
 
 
-def _v283_db_fingerprint_file(db_path: str) -> dict:
-    """DB本体をメモリへコピーせず、SQLiteファイルから主要件数＋最新時刻を取得する。"""
-    out={"ok":False,"counts":{},"latest":"","size":0,"reason":""}
-    try:
-        p=Path(str(db_path)).resolve()
-        if not p.exists():
-            out["reason"]="DBなし"
-            return out
-        out["size"]=int(p.stat().st_size)
-        with sqlite3.connect(str(p),timeout=30.0) as con:
-            con.execute("PRAGMA busy_timeout=30000")
-            tables={str(r[0]) for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()}
-
-            protected=[
-                "players","race_history","player_lap_history",
-                "result_races","result_entries","result_laps","result_payouts",
-                "prediction_feedback","prediction_snapshots",
-                "v231_prediction_history","v252_lap_prediction_snapshots","v266_pred_time_snapshots",
-                "v221_odds_runs","v221_odds_values",
-                "v67_prediction_tickets","v67_ticket_feedback",
-                "v187_mixed_plan_runs","v187_mixed_plan_feedback",
-                "v187_mixed_plan_tickets","v187_mixed_ticket_feedback",
-                "v222_prediction_restore","v223_result_view_restore","v238_result_raw_archive",
-                "v40_prediction_feature_snapshots","v41_registration_batches",
-                "weight_adjustment_history",
-            ]
-            counts={}
-            for t in protected:
-                if t in tables:
-                    q='"'+t.replace('"','""')+'"'
-                    counts[t]=int(con.execute(f"SELECT COUNT(*) FROM {q}").fetchone()[0] or 0)
-            out["counts"]=counts
-
-            latest_candidates=[]
-            latest_specs=[
-                ("race_history","race_date"),
-                ("result_races","registered_at"),
-                ("v231_prediction_history","prediction_time"),
-                ("v221_odds_runs","created_at"),
-                ("v187_mixed_plan_runs","created_at"),
-            ]
-            for t,c in latest_specs:
-                if t in tables:
-                    cols={str(r[1]) for r in con.execute(f'PRAGMA table_info("{t}")').fetchall()}
-                    if c in cols:
-                        v=con.execute(f'SELECT MAX(COALESCE("{c}", "")) FROM "{t}"').fetchone()[0]
-                        if v:
-                            _ = latest_candidates.append(str(v))
-            out["latest"]=max(latest_candidates) if latest_candidates else ""
-            out["ok"]=True
-            return out
-    except Exception as exc:
-        out["reason"]=f"{type(exc).__name__}: {exc}"
-        return out
-
-
-def _v284_streaming_sha256(*paths) -> str:
-    """指定ファイルを1MiBずつ読み、DB本体＋WALをメモリへ丸ごと載せずSHA256化する。"""
-    h=hashlib.sha256()
-    for path in paths:
-        try:
-            with open(str(path),"rb") as f:
-                while True:
-                    chunk=f.read(1024*1024)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-        except FileNotFoundError:
-            continue
-    return h.hexdigest()
-
 
 def _v284_db_row_keysets_from_bytes(data: bytes) -> dict:
     """主要保存テーブルを自然キーで比較できる形へ変換する。
@@ -36397,45 +36352,57 @@ def _v290_db_stat_signature(path_value) -> tuple:
         return (str(path_value),)
 
 def _v284_current_db_identity() -> dict:
-    """DB identityをメモリ上の全体snapshotなしで取得する。
+    """DB identity with WAL-aware stat cache to avoid rebuilding a 50MB snapshot multiple times per rerun.
 
-    通常のrerunはsize+mtimeのstat signatureだけでキャッシュ判定し、
-    変更時だけ主要件数fingerprintとDB本体+WALのstreaming SHA256を実行する。
+    B13-E: 操作中の rerun では、起動済みかつ直近に完全指紋がある場合、
+    サイズが大幅減少していない限りフルスナップショットを省略する（最大45秒に1回）。
+    GitHub再読込・明示リフレッシュ時は st.session_state['_v284_force_identity_refresh']=True で強制。
     """
     try:
-        p = Path(str(engine.DB_PATH)).resolve()
-        sig = _v290_db_stat_signature(p)
-        cached = st.session_state.get("_v290_identity_cache")
-        if (
-            isinstance(cached, dict)
-            and cached.get("sig") == sig
-            and isinstance(cached.get("value"), dict)
-        ):
+        p=Path(str(engine.DB_PATH)).resolve()
+        sig=_v290_db_stat_signature(p)
+        cached=st.session_state.get("_v290_identity_cache")
+        if isinstance(cached,dict) and cached.get("sig")==sig and isinstance(cached.get("value"),dict):
             return dict(cached["value"])
-
-        # 明示リフレッシュ要求は消費だけする（キャッシュ判定はsigで済む）
-        _ = st.session_state.pop("_v284_force_identity_refresh", False)
-
-        # ここから先は「DBが実際に変わった」時だけ走る
-        fp = _v283_db_fingerprint_file(str(p))
-        sha = _v284_streaming_sha256(p, Path(str(p) + "-wal"))
-
-        value = {
-            "ok": bool(fp.get("ok")),
-            "path": str(p),
-            "sha256": sha,
-            "size": int(fp.get("size") or 0),
-            "fingerprint": fp,
+        force=bool(st.session_state.pop("_v284_force_identity_refresh", False))
+        ready=bool(st.session_state.get("_v290_startup_ready", False))
+        last_full=float(st.session_state.get("_v290_identity_full_ts") or 0.0)
+        now_ts=time_module.time()
+        # 起動後の操作: 45秒以内の完全指紋があり、サイズがほぼ減っていなければ再利用
+        if (
+            (not force)
+            and ready
+            and isinstance(cached, dict)
+            and isinstance(cached.get("value"), dict)
+            and cached["value"].get("ok")
+            and (now_ts - last_full) < 45.0
+        ):
+            try:
+                cur_size=int(p.stat().st_size)
+                old_size=int(cached["value"].get("size") or 0)
+                # 2%超の縮小のみ「要フル再計算」（通常の追記・更新はスキップ）
+                if old_size > 0 and cur_size >= int(old_size * 0.98):
+                    val=dict(cached["value"])
+                    val["size"]=cur_size
+                    val["light"]=True
+                    st.session_state["_v290_identity_cache"]={"sig":sig,"value":dict(val)}
+                    return val
+            except Exception:
+                pass
+        data=_v278_consistent_db_snapshot_bytes(str(p))
+        fp=_v283_db_fingerprint_bytes(data)
+        value={
+            "ok":bool(fp.get("ok")),
+            "path":str(p),
+            "sha256":hashlib.sha256(data).hexdigest(),
+            "size":len(data),
+            "fingerprint":fp,
         }
-        st.session_state["_v290_identity_cache"] = {"sig": sig, "value": dict(value)}
-        st.session_state["_v290_identity_full_ts"] = time_module.time()
+        st.session_state["_v290_identity_cache"]={"sig":sig,"value":dict(value)}
+        st.session_state["_v290_identity_full_ts"]=now_ts
         return value
     except Exception as exc:
-        return {
-            "ok": False,
-            "path": str(getattr(engine, "DB_PATH", "")),
-            "reason": f"{type(exc).__name__}: {exc}",
-        }
+        return {"ok":False,"path":str(getattr(engine,"DB_PATH","")),"reason":f"{type(exc).__name__}: {exc}"}
 
 def _v284_db_identity_regressed(now: dict, baseline: dict) -> tuple[bool,list[str]]:
     reasons=[]
@@ -36458,34 +36425,13 @@ def _v296_bg_fast_rerun_active() -> bool:
     except Exception:
         return False
 
-def _v284_recent_completed_job(db_path: str, within_min: float = 5.0) -> bool:
-    """直近N分以内に成功したバッチジョブがあるか。
-    ジョブがDBを書き換えた直後は、巨大なDB identity再計算を一時停止して
-    完了直後のrerunによるメモリ急増を防ぐ。
-    """
-    try:
-        with sqlite3.connect(str(db_path), timeout=2.0) as con:
-            con.execute("PRAGMA busy_timeout=2000")
-            row = con.execute(
-                """SELECT COUNT(*) FROM v278_background_jobs
-                   WHERE job_type IN ('batch_rerun','official_import')
-                     AND status='completed'
-                     AND finished_at IS NOT NULL
-                     AND datetime(finished_at) > datetime('now', ?)""",
-                (f"-{int(within_min)} minutes",),
-            ).fetchone()
-        return bool(row and int(row[0]) > 0)
-    except Exception:
-        return False
-
 _v296_bg_fast_rerun=_v296_bg_fast_rerun_active()
-_v284_recent_ok=_v284_recent_completed_job(engine.DB_PATH)
 
 # Ver284: アップロード済み正本がある場合、rerunでDB実体が後退していたら
 # GitHub操作や画面処理より前に同じ engine.DB_PATH へ原子的に復元する。
 _v284_pinned_bytes=st.session_state.get("v284_uploaded_master_bytes")
 _v284_pinned_id=st.session_state.get("v284_uploaded_master_identity")
-if (not _v296_bg_fast_rerun) and (not _v284_recent_ok) and isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_id,dict) and _v284_pinned_id.get("ok"):
+if (not _v296_bg_fast_rerun) and isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_id,dict) and _v284_pinned_id.get("ok"):
     _v284_before_restore=_v284_current_db_identity()
     _v284_restore_needed=False
     if not _v284_before_restore.get("ok"):
@@ -36527,17 +36473,11 @@ _v284_identity_block_key="v284_db_identity_block"
 # Ver326: バックグラウンドの再シミュレーションが動いている間は、
 # 巨大なDBスナップショット作成によるメモリ不足（OOM）を防ぐため、
 # 固定監視（フルスキャン）をスキップして前回のキャッシュを使う。
-if _v296_bg_fast_rerun or _v284_recent_ok:
+if _v296_bg_fast_rerun:
     _v284_identity_now=dict(st.session_state.get(_v284_identity_key) or {})
     if not _v284_identity_now.get("ok"):
-        # バックグラウンド実行中、または完了直後は重いidentity生成を避ける。
-        _v284_identity_now={
-            "ok":False,
-            "reason": (
-                "BG実行中のため監視スキップ"
-                if _v296_bg_fast_rerun else "直近ジョブ完了直後のため監視スキップ"
-            ),
-        }
+        # キャッシュがない場合も、このタイミングでの重い生成は避ける。
+        _v284_identity_now={"ok":False,"reason":"BG実行中のため監視スキップ"}
 else:
     _v284_identity_now=_v284_current_db_identity()
 
@@ -36550,7 +36490,7 @@ if _v284_identity_now.get("ok"):
         _v284_bad,_v284_reasons=_v284_db_identity_regressed(_v284_identity_now,_v284_identity_base)
         st.session_state[_v284_identity_block_key]=_v284_reasons if _v284_bad else []
         # 件数が増えた正常DBは新基準へ昇格。SHA変化だけでは巻き戻り扱いにしない。
-        if not _v284_bad and not _v296_bg_fast_rerun and not _v284_recent_ok:
+        if not _v284_bad and not _v296_bg_fast_rerun:
             st.session_state[_v284_identity_key]=_v284_identity_now
 
 
