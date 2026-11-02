@@ -35090,7 +35090,7 @@ def _v278_consistent_db_snapshot_bytes(db_path: str, max_seconds: float | None =
                 def _backup_progress(_status, _remaining, _total):
                     if max_seconds is not None and (time_module.monotonic() - started) > float(max_seconds):
                         raise TimeoutError(f"SQLiteスナップショット作成が{float(max_seconds):.0f}秒を超えました")
-                src.backup(dst, pages=1000, progress=_backup_progress, sleep=0.05)
+                src.backup(dst, pages=1000, progress=_backup_progress)
                 dst.commit()
         if max_seconds is not None and (time_module.monotonic() - started) > float(max_seconds):
             raise TimeoutError(f"SQLiteスナップショット作成が{float(max_seconds):.0f}秒を超えました")
