@@ -34066,6 +34066,79 @@ def _v283_db_fingerprint_bytes(data: bytes) -> dict:
             tmp_path.unlink(missing_ok=True)
 
 
+def _v283_db_fingerprint_file(db_path: str) -> dict:
+    """DB本体をメモリへコピーせず、SQLiteファイルから主要件数＋最新時刻を取得する。"""
+    out={"ok":False,"counts":{},"latest":"","size":0,"reason":""}
+    try:
+        p=Path(str(db_path)).resolve()
+        if not p.exists():
+            out["reason"]="DBなし"
+            return out
+        out["size"]=int(p.stat().st_size)
+        with sqlite3.connect(str(p),timeout=30.0) as con:
+            con.execute("PRAGMA busy_timeout=30000")
+            tables={str(r[0]) for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+
+            protected=[
+                "players","race_history","player_lap_history",
+                "result_races","result_entries","result_laps","result_payouts",
+                "prediction_feedback","prediction_snapshots",
+                "v231_prediction_history","v252_lap_prediction_snapshots","v266_pred_time_snapshots",
+                "v221_odds_runs","v221_odds_values",
+                "v67_prediction_tickets","v67_ticket_feedback",
+                "v187_mixed_plan_runs","v187_mixed_plan_feedback",
+                "v187_mixed_plan_tickets","v187_mixed_ticket_feedback",
+                "v222_prediction_restore","v223_result_view_restore","v238_result_raw_archive",
+                "v40_prediction_feature_snapshots","v41_registration_batches",
+                "weight_adjustment_history",
+            ]
+            counts={}
+            for t in protected:
+                if t in tables:
+                    q='"'+t.replace('"','""')+'"'
+                    counts[t]=int(con.execute(f"SELECT COUNT(*) FROM {q}").fetchone()[0] or 0)
+            out["counts"]=counts
+
+            latest_candidates=[]
+            latest_specs=[
+                ("race_history","race_date"),
+                ("result_races","registered_at"),
+                ("v231_prediction_history","prediction_time"),
+                ("v221_odds_runs","created_at"),
+                ("v187_mixed_plan_runs","created_at"),
+            ]
+            for t,c in latest_specs:
+                if t in tables:
+                    cols={str(r[1]) for r in con.execute(f'PRAGMA table_info("{t}")').fetchall()}
+                    if c in cols:
+                        v=con.execute(f'SELECT MAX(COALESCE("{c}", "")) FROM "{t}"').fetchone()[0]
+                        if v:
+                            _ = latest_candidates.append(str(v))
+            out["latest"]=max(latest_candidates) if latest_candidates else ""
+            out["ok"]=True
+            return out
+    except Exception as exc:
+        out["reason"]=f"{type(exc).__name__}: {exc}"
+        return out
+
+
+def _v284_streaming_sha256(*paths) -> str:
+    """指定ファイルを1MiBずつ読み、DB本体＋WALをメモリへ丸ごと載せずSHA256化する。"""
+    h=hashlib.sha256()
+    for path in paths:
+        try:
+            with open(str(path),"rb") as f:
+                while True:
+                    chunk=f.read(1024*1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+        except FileNotFoundError:
+            continue
+    return h.hexdigest()
+
 
 def _v284_db_row_keysets_from_bytes(data: bytes) -> dict:
     """主要保存テーブルを自然キーで比較できる形へ変換する。
@@ -36324,11 +36397,10 @@ def _v290_db_stat_signature(path_value) -> tuple:
         return (str(path_value),)
 
 def _v284_current_db_identity() -> dict:
-    """DB identity with WAL-aware stat cache to avoid rebuilding a 50MB snapshot multiple times per rerun.
+    """DB identityをメモリ上の全体snapshotなしで取得する。
 
-    B13-E: 操作中の rerun では、起動済みかつ直近に完全指紋がある場合、
-    サイズが大幅減少していない限りフルスナップショットを省略する（最大45秒に1回）。
-    GitHub再読込・明示リフレッシュ時は st.session_state['_v284_force_identity_refresh']=True で強制。
+    通常のrerunはsize+mtimeのstat signatureだけでキャッシュ判定し、
+    変更時だけ主要件数fingerprintとDB本体+WALのstreaming SHA256を実行する。
     """
     try:
         p=Path(str(engine.DB_PATH)).resolve()
@@ -36336,42 +36408,24 @@ def _v284_current_db_identity() -> dict:
         cached=st.session_state.get("_v290_identity_cache")
         if isinstance(cached,dict) and cached.get("sig")==sig and isinstance(cached.get("value"),dict):
             return dict(cached["value"])
-        force=bool(st.session_state.pop("_v284_force_identity_refresh", False))
-        ready=bool(st.session_state.get("_v290_startup_ready", False))
-        last_full=float(st.session_state.get("_v290_identity_full_ts") or 0.0)
-        now_ts=time_module.time()
-        # 起動後の操作: 45秒以内の完全指紋があり、サイズがほぼ減っていなければ再利用
-        if (
-            (not force)
-            and ready
-            and isinstance(cached, dict)
-            and isinstance(cached.get("value"), dict)
-            and cached["value"].get("ok")
-            and (now_ts - last_full) < 120.0
-        ):
-            try:
-                cur_size=int(p.stat().st_size)
-                old_size=int(cached["value"].get("size") or 0)
-                # 2%超の縮小のみ「要フル再計算」（通常の追記・更新はスキップ）
-                if old_size > 0 and cur_size >= int(old_size * 0.98):
-                    val=dict(cached["value"])
-                    val["size"]=cur_size
-                    val["light"]=True
-                    st.session_state["_v290_identity_cache"]={"sig":sig,"value":dict(val)}
-                    return val
-            except Exception:
-                pass
-        data=_v278_consistent_db_snapshot_bytes(str(p))
-        fp=_v283_db_fingerprint_bytes(data)
+
+        force=bool(st.session_state.pop("_v284_force_identity_refresh",False))
+        _ = force  # 明示refreshでも変更時計算の経路を維持
+
+        fp=_v283_db_fingerprint_file(str(p))
+        sha=_v284_streaming_sha256(
+            p,
+            Path(str(p)+"-wal"),
+        )
         value={
             "ok":bool(fp.get("ok")),
             "path":str(p),
-            "sha256":hashlib.sha256(data).hexdigest(),
-            "size":len(data),
+            "sha256":sha,
+            "size":int(fp.get("size") or 0),
             "fingerprint":fp,
         }
         st.session_state["_v290_identity_cache"]={"sig":sig,"value":dict(value)}
-        st.session_state["_v290_identity_full_ts"]=now_ts
+        st.session_state["_v290_identity_full_ts"]=time_module.time()
         return value
     except Exception as exc:
         return {"ok":False,"path":str(getattr(engine,"DB_PATH","")),"reason":f"{type(exc).__name__}: {exc}"}
