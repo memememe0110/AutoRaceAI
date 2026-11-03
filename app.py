@@ -42888,6 +42888,13 @@ def _v330a_ui_run_one(snapshot, race_key):
     import math as _math
     raw_text = _v330a_ui_load_raw(snapshot, race_key)
     actual = _v330a_ui_actual(snapshot, race_key)
+    try:
+        if "_v278_bg_has_running_job" in globals() and _v278_bg_has_running_job(engine.DB_PATH):
+            raise RuntimeError("BG job実行中のため検証を中止しました。完了後に再実行してください。")
+    except RuntimeError:
+        raise
+    except Exception as _bg_check_exc:
+        raise RuntimeError(f"BG job状態を確認できないため検証を中止しました: {_bg_check_exc}")
     old_db_path = engine.DB_PATH
     old_env = os.environ.get("AUTORACE_330_VALIDATION_MODE")
     old_globals = {k: globals().get(k) for k in ("_V328_EXPERIMENT", "_V328_WORKER_ACTIVE", "_V330A_EXPERIMENT")}
@@ -42967,6 +42974,19 @@ def _v330a_ui_save_result(result):
 
 
 if _V330A_VALIDATION_PAGE:
+    # 本番DBを差し替える処理ではないが、engine.DB_PATHをsnapshotへ一時固定するため
+    # BG再シミュレーション中の同時実行は安全側で禁止する。
+    try:
+        _v330a_bg_busy = (
+            "_v278_bg_has_running_job" in globals()
+            and _v278_bg_has_running_job(engine.DB_PATH)
+        )
+    except Exception as _bg_check_exc:
+        st.error(f"BG job状態を確認できないため検証を停止しました: {_bg_check_exc}")
+        st.stop()
+    if _v330a_bg_busy:
+        st.error("BG job実行中は検証を開始できません。完了後に再読み込みしてください。")
+        st.stop()
     st.markdown("---")
     st.header("Ver330-A Phase 2：Ver326 Lap1検証")
     st.warning("検証専用ページです。本番DBは読み取り専用スナップショットで参照します。結果は本番DBと別の一時SQLiteへ保存します。")
@@ -42974,13 +42994,13 @@ if _V330A_VALIDATION_PAGE:
         _snap = _v330a_ui_make_snapshot()
         _all_common = _v330a_ui_common_set(_snap)
         _target = [k for k in _all_common if k not in _V330A_UI_EXCLUDED]
-        if len(_all_common) != 378 or len(_target) != _V330A_UI_EXPECTED:
+        if len(_all_common) != _V330A_UI_EXPECTED or len(_target) != _V330A_UI_EXPECTED:
             st.error(f"対象件数が想定外です。共通セット={len(_all_common)}R / 除外後={len(_target)}R。実行を停止しました。")
         else:
             _saved = _v330a_ui_saved_rows()
             _done = {str(r.get("race_key")) for r in _saved if r.get("ok") is True}
             _remaining = [k for k in _target if k not in _done]
-            st.caption("対象377R（共通セット378Rから全返還の20260809_川口_12Rを除外）。試行数20,000 / seed=12345")
+            st.caption("対象377R（Lap1ありの共通セット377R）。全返還の20260809_川口_12RはLap1なしのためSQL段階で対象外。試行数20,000 / seed=12345")
             st.write(f"成功 {_done.__len__()}R / 残り {len(_remaining)}R")
             _a, _b = st.columns(2)
             with _a:
