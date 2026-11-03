@@ -223,6 +223,15 @@ _V328_EARLY_BASE_BOOST = 0.08          # lap<=4 の logit 加算
 _V328_LAP6_GAP_THRESH = 0.80           # 3位との差（秒）目安
 _V328_LAP6_P_SCALE = 0.40              # 5位以下かつ大差時の p 減衰
 
+# Ver330-A: Ver328の周1〜4 +0.08は撤去し、周6抑制だけを独立検証する。
+_V330A_APP_VERSION = "Ver330-A"
+_V330A_EXPERIMENT = False
+
+
+def _v330a_active() -> bool:
+    """Ver330-A: 周6抑制のみを独立して有効化する。"""
+    return bool(globals().get("_V330A_EXPERIMENT"))
+
 
 def _v327_active() -> bool:
     """Ver327 late_release実験が有効か。workerではglobal、通常予測ではsessionを参照。"""
@@ -11614,7 +11623,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         base_budget += 700  # 混戦だけ追加試行
     elif top_mass > 0.65:
         base_budget -= 350  # 強く集中したレースは早めに収束
-    sim_trials=max(1400,min(requested_trials,base_budget))
+    _v330a_full_validation = str(os.environ.get("AUTORACE_330_VALIDATION_MODE") or "") == "1"
+    sim_trials = (requested_trials if _v330a_full_validation else max(1400, min(requested_trials, base_budget)))
     counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
     lap_order_counts={lap:{} for lap in range(1,7)}
     finish_position_counts={c:{pos:0 for pos in range(1,len(cars)+1)} for c in cars}
@@ -11630,6 +11640,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                            "top3_entries":0,"top3_exits":0} for lap in range(1,7)}
     transition_pair_audit={}
     top3_order_audit={}
+    # Ver330-A検証用: 各周の状態を試行順にrolling hash化。予測・保存には使用しない。
+    _v330a_state_fp = {
+        lap: {"hash": hashlib.sha256(), "gap_sum": 0.0, "momentum_sum": 0.0,
+              "slowdown_sum": 0.0, "pass_count": 0} for lap in range(1, 7)
+    }
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
     # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
@@ -11850,8 +11865,9 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                             late_release_audit_v273[_lap_err275]["last_error"]=f"{type(_e_late275).__name__}: {_e_late275}"
                     except Exception:
                         pass
-                # Ver328: 6周目・5位以下で3位と大差がある場合の無意味追い抜きを抑制
-                if _v328_active() and int(lap) == 6:
+                # Ver328 / Ver330-A: 6周目・5位以下で3位と大差がある場合の無意味追い抜きを抑制。
+                # Ver330-Aではこの周6抑制だけを残し、周1〜4 +0.08は一切適用しない。
+                if (_v328_active() or _v330a_active()) and int(lap) == 6:
                     try:
                         _gap3_v328 = float(gaps[min(3, len(gaps) - 1)]) if gaps else 0.0
                         _thresh_v328 = float(globals().get("_V328_LAP6_GAP_THRESH") or 0.80)
@@ -11956,6 +11972,30 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             lap_tuple=tuple(order)
             _ = sim_lap_path.append(lap_tuple)
             lap_order_counts[lap][lap_tuple]=lap_order_counts[lap].get(lap_tuple,0)+1
+            # Ver330-A検証用の1行状態指紋。ログ比較専用で、Sim結果やDB保存には影響しない。
+            try:
+                _fp330a = _v330a_state_fp[int(lap)]
+                _gap_sum330a = float(sum(float(x) for x in gaps))
+                _mom_sum330a = float(sum(float(momentum.get(c, 0.0) or 0.0) for c in cars))
+                _slow_sum330a = float(sum(float(slowdown.get(c, 0.0) or 0.0) for c in cars))
+                _pass_count330a = int(sum(int(v or 0) for v in lap_pass_count.values()))
+                _state330a = {
+                    "sim_index": int(sim_index),
+                    "order": [int(x) for x in order],
+                    "gaps": [round(float(x), 10) for x in gaps],
+                    "momentum": {str(c): round(float(momentum.get(c, 0.0) or 0.0), 10) for c in cars},
+                    "slowdown": {str(c): round(float(slowdown.get(c, 0.0) or 0.0), 10) for c in cars},
+                    "pass_count": _pass_count330a,
+                }
+                _fp330a["hash"].update(
+                    (json.dumps(_state330a, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                )
+                _fp330a["gap_sum"] += _gap_sum330a
+                _fp330a["momentum_sum"] += _mom_sum330a
+                _fp330a["slowdown_sum"] += _slow_sum330a
+                _fp330a["pass_count"] += _pass_count330a
+            except Exception:
+                pass
         final_tuple=tuple(order)
         final_order_counts[final_tuple]=final_order_counts.get(final_tuple,0)+1
         for _pos284,_car284 in enumerate(order,start=1):
@@ -11981,7 +12021,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 else:
                     convergence_checks = 0
             previous_signature = signature
-            if convergence_checks >= 2 and top_mass >= 0.48:
+            if (not _v330a_full_validation) and convergence_checks >= 2 and top_mass >= 0.48:
                 break
     sim_trials=max(1, completed_trials)
     _v242_sim_seconds=time_module.perf_counter()-_v242_sim_started
@@ -12194,12 +12234,96 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             "top3_orders":{"-".join(map(str,k)):int(v) for k,v in top3_order_audit.items()},
             "purpose":"原因分析専用。予測値への後補正なし",
         },
+        "ver330a_state_fingerprint":{
+            str(lap):{
+                "hash":_v330a_state_fp[lap]["hash"].hexdigest(),
+                "gap_sum":round(float(_v330a_state_fp[lap]["gap_sum"]), 8),
+                "momentum_sum":round(float(_v330a_state_fp[lap]["momentum_sum"]), 8),
+                "slowdown_sum":round(float(_v330a_state_fp[lap]["slowdown_sum"]), 8),
+                "pass_count":int(_v330a_state_fp[lap]["pass_count"]),
+            } for lap in range(1, 7)
+        },
+        "ver330a_validation_lap_order_counts": (
+            {str(lap): {"-".join(map(str,k)): int(v) for k,v in lap_order_counts[lap].items()} for lap in range(1, 7)}
+            if _v330a_full_validation else {}
+        ),
+        "ver330a_validation_full_trials": bool(_v330a_full_validation),
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
         "message":f"Ver265ではVer257相当の展開係数へ戻し、実測の試走→競走タイム変換残差を開催場・選手・ハンデ帯で縮小学習して基礎能力へ小さく反映します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
     }
     return out,new_bets,audit
 
+
+
+# Ver330-A compare mode: Streamlit UI/DB登録を行わず、固定snapshot上で1R比較だけ実行する。
+def _v330a_compare_mode_run() -> None:
+    if str(os.environ.get("AUTORACE_VER330A_COMPARE") or "") != "1":
+        return
+    out_path = str(os.environ.get("AUTORACE_COMPARE_OUT") or "").strip()
+    mode = str(os.environ.get("AUTORACE_COMPARE_MODE") or "Ver326").strip()
+    snapshot = str(os.environ.get("AUTORACE_COMPARE_DB") or "").strip()
+    race_key = str(os.environ.get("AUTORACE_COMPARE_RACE_KEY") or "").strip()
+    trials = int(os.environ.get("AUTORACE_COMPARE_TRIALS") or "8000")
+    seed = int(os.environ.get("AUTORACE_COMPARE_SEED") or "12345")
+    result = {"ok": False, "mode": mode, "race_key": race_key, "trials": trials, "seed": seed}
+    try:
+        if snapshot:
+            engine.DB_PATH = str(Path(snapshot).resolve())
+        db_path = str(engine.DB_PATH)
+        with sqlite3.connect(f"file:{Path(db_path).resolve().as_posix()}?mode=ro", uri=True, timeout=10.0) as con:
+            con.execute("PRAGMA query_only=ON")
+            if not race_key:
+                row = con.execute(
+                    "SELECT race_key FROM v222_prediction_restore "
+                    "WHERE COALESCE(raw_text,'')<>'' ORDER BY rowid DESC LIMIT 1"
+                ).fetchone()
+                race_key = str(row[0] or "") if row else ""
+            row = con.execute(
+                "SELECT raw_text, venue_override FROM v222_prediction_restore WHERE race_key=?",
+                (race_key,),
+            ).fetchone()
+        if not row or not str(row[0] or "").strip():
+            raise RuntimeError(f"v222_prediction_restoreにraw_textがありません: {race_key}")
+        raw_text = str(row[0] or "")
+        venue_override = str(row[1] or "")
+        # 予測エンジンへ渡す原文は1回だけ読み、326/Aで完全に同一入力を使う。
+        if venue_override:
+            raw_text = raw_text
+        random.seed(seed)
+        np.random.seed(seed)
+        globals()["_V328_EXPERIMENT"] = False
+        globals()["_V328_WORKER_ACTIVE"] = False
+        globals()["_V330A_EXPERIMENT"] = (mode == "Ver330-A")
+        df, bets, output, entries, meta = engine.ver16_run_prediction(
+            raw_text, trials=trials, seed=seed, manual_excluded=[]
+        )
+        # ここでのみ6周Simを実行。保存・学習更新・履歴登録・GitHub同期は呼ばない。
+        _sim_df, _sim_bets, audit = _v230_six_lap_simulation(
+            df, bets, entries, meta, int(trials), int(seed)
+        )
+        fp = dict((audit or {}).get("ver330a_state_fingerprint") or {})
+        result.update({
+            "ok": True,
+            "race_key": race_key,
+            "mode": mode,
+            "fingerprint": fp,
+            "sim_trials": int((audit or {}).get("v284_transition_audit", {}).get("trials") or 0),
+            "lap_order_counts": dict((audit or {}).get("ver330a_validation_lap_order_counts") or {}),
+            "validation_full_trials": bool((audit or {}).get("ver330a_validation_full_trials")),
+        })
+    except Exception as exc:
+        result.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    if out_path:
+        Path(out_path).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("VER330A_COMPARE_RESULT=" + json.dumps(result, ensure_ascii=False, sort_keys=True))
+    try:
+        st.stop()
+    except Exception:
+        raise SystemExit(0)
+
+
+_v330a_compare_mode_run()
 
 
 def _v320_teishi_cars_from_text(result_text: str) -> list[int]:
