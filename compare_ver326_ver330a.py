@@ -194,10 +194,20 @@ def compare(fp326: dict, fp330: dict) -> dict:
         print(f"WARNING: sim_trials mismatch: 326={sim326} 330A={sim330}")
     lap2_5_identical = all(r["identical"] for r in rows if 2 <= r["lap"] <= 5)
     lap6_diff = any(not r["identical"] for r in rows if r["lap"] == 6)
-    axis_a_valid = bool(sim326 == sim330 and lap2_5_identical)
+    fingerprints_present = bool(
+        rows
+        and all(r["ver326"] and r["ver330a"] for r in rows)
+    )
+    axis_a_valid = bool(
+        sim326 == sim330
+        and sim326 > 0
+        and fingerprints_present
+        and lap2_5_identical
+    )
     return {
         "axis_a_valid": axis_a_valid,
         "lap2_5_bit_identical": lap2_5_identical,
+        "fingerprints_present": fingerprints_present,
         "lap6_diff": lap6_diff,
         "rows": rows,
         "ver326_sim_count": sim326,
@@ -263,7 +273,7 @@ def main() -> int:
     print(f"lap6 diff: {summary['lap6_diff']}")
     print(f"results: {run_dir}")
 
-    if not summary["lap2_5_bit_identical"]:
+    if not summary["axis_a_valid"]:
         return 2
     return 0
 
