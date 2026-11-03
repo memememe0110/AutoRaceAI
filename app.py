@@ -42818,7 +42818,8 @@ def _v330a_ui_make_snapshot(force=False):
             with sqlite3.connect(str(_V330A_UI_SNAPSHOT), timeout=30) as target:
                 source.backup(target)
                 target.commit()
-        _V330A_UI_SNAPSHOT.chmod(0o444)
+        # エンジン内部のキャッシュ等の書き込みは隔離snapshotだけに許可する。
+        # 本番DBは上の source 接続で mode=ro + query_only のまま。
     return _V330A_UI_SNAPSHOT
 
 
@@ -42886,6 +42887,9 @@ def _v330a_ui_actual(snapshot, race_key):
 
 def _v330a_ui_run_one(snapshot, race_key):
     import math as _math
+    # 各レースの直前に元DB（engine.DB_PATH）からsnapshotを作り直し、
+    # 前レースで発生したエンジン内部書き込みを次レースへ持ち越さない。
+    _v330a_ui_make_snapshot(force=True)
     raw_text = _v330a_ui_load_raw(snapshot, race_key)
     actual = _v330a_ui_actual(snapshot, race_key)
     try:
