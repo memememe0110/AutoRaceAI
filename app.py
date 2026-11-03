@@ -42995,11 +42995,33 @@ if _V330A_VALIDATION_PAGE:
     st.header("Ver330-A Phase 2：Ver326 Lap1検証")
     st.warning("検証専用ページです。本番DBは読み取り専用スナップショットで参照します。結果は本番DBと別の一時SQLiteへ保存します。")
     try:
-        _snap = _v330a_ui_make_snapshot()
+        # 前回実行で残った古いsnapshot（読み取り専用権限や不完全な状態）を破棄し、
+        # 現在の本番DBから必ず新規作成する。
+        _V330A_UI_SNAPSHOT.unlink(missing_ok=True)
+        _snap = _v330a_ui_make_snapshot(force=True)
         _all_common = _v330a_ui_common_set(_snap)
         _target = [k for k in _all_common if k not in _V330A_UI_EXCLUDED]
         if len(_all_common) != _V330A_UI_EXPECTED or len(_target) != _V330A_UI_EXPECTED:
             st.error(f"対象件数が想定外です。共通セット={len(_all_common)}R / 除外後={len(_target)}R。実行を停止しました。")
+            # 件数不一致時に、参照DB・snapshot・主要テーブル件数を画面へ表示する。
+            try:
+                _snap_size = _V330A_UI_SNAPSHOT.stat().st_size
+            except Exception:
+                _snap_size = -1
+            st.write(f"診断: engine.DB_PATH={engine.DB_PATH}")
+            st.write(f"診断: snapshot={_V330A_UI_SNAPSHOT} size={_snap_size}")
+            with _v330a_ui_ro_connect(_snap) as _c:
+                for _q in (
+                    "SELECT COUNT(*) FROM v231_prediction_history",
+                    "SELECT COUNT(*) FROM v231_prediction_history WHERE app_version='Ver326'",
+                    "SELECT COUNT(*) FROM v231_prediction_history WHERE app_version='Ver328'",
+                    "SELECT COUNT(*) FROM result_laps WHERE lap_label='1周目'",
+                ):
+                    try:
+                        _n = _c.execute(_q).fetchone()[0]
+                        st.write(f"診断: {_q} → {_n}")
+                    except Exception as _qe:
+                        st.write(f"診断: {_q} → エラー {_qe}")
         else:
             _saved = _v330a_ui_saved_rows()
             _done = {str(r.get("race_key")) for r in _saved if r.get("ok") is True}
