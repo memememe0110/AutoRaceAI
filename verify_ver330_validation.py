@@ -83,7 +83,11 @@ def contamination_check(db: Path, versions=VERSIONS) -> dict:
             tuple(versions),
         ).fetchall()
         predicted = {str(r[0]) for r in ph_rows if str(r[0] or "").strip()}
-        actual_rows = con.execute("SELECT DISTINCT race_key FROM result_laps WHERE lap_label='1周目'").fetchall()
+        actual_condition, actual_value = result_lap1_condition(con)
+        actual_rows = con.execute(
+            f"SELECT DISTINCT race_key FROM result_laps WHERE {actual_condition}",
+            (actual_value,),
+        ).fetchall()
         actual = {str(r[0]) for r in actual_rows if str(r[0] or "").strip()}
         contamination = sorted(predicted - actual)
         common = sorted(predicted & actual)
@@ -122,10 +126,20 @@ def contamination_check(db: Path, versions=VERSIONS) -> dict:
     }
 
 
+def result_lap1_condition(con) -> tuple[str, str]:
+    cols = columns(con, "result_laps")
+    if "lap_label" in cols:
+        return "lap_label=?", "1周目"
+    if "lap_no" in cols:
+        return "lap_no=?", 1
+    raise RuntimeError("result_lapsにlap_label/lap_noのいずれもありません")
+
+
 def actual_lap_order(con, race_key: str) -> tuple[int, ...] | None:
+    condition, value = result_lap1_condition(con)
     rows = con.execute(
-        "SELECT position, car_no FROM result_laps WHERE race_key=? AND (lap_label='1周目' OR lap_no=1) ORDER BY position",
-        (race_key,),
+        f"SELECT position, car_no FROM result_laps WHERE race_key=? AND {condition} ORDER BY position",
+        (race_key, value),
     ).fetchall()
     if not rows:
         return None

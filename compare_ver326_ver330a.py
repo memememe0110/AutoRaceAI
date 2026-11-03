@@ -83,6 +83,7 @@ def run_mode(
             "AUTORACE_COMPARE_TRIALS": str(int(trials)),
             "AUTORACE_COMPARE_SEED": str(int(seed)),
             "AUTORACE_COMPARE_OUT": str(out_path),
+            "AUTORACE_330_VALIDATION_MODE": "1",
             "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
         }
     )
@@ -187,14 +188,21 @@ def compare(fp326: dict, fp330: dict) -> dict:
                 "ver330a": y,
             }
         )
+    sim326 = int(fp326.get("sim_trials") or 0)
+    sim330 = int(fp330.get("sim_trials") or 0)
+    if sim326 != sim330:
+        print(f"WARNING: sim_trials mismatch: 326={sim326} 330A={sim330}")
     lap2_5_identical = all(r["identical"] for r in rows if 2 <= r["lap"] <= 5)
     lap6_diff = any(not r["identical"] for r in rows if r["lap"] == 6)
+    axis_a_valid = bool(sim326 == sim330 and lap2_5_identical)
     return {
+        "axis_a_valid": axis_a_valid,
         "lap2_5_bit_identical": lap2_5_identical,
         "lap6_diff": lap6_diff,
         "rows": rows,
-        "ver326_sim_count": int(fp326.get("sim_trials") or 0),
-        "ver330a_sim_count": int(fp330.get("sim_trials") or 0),
+        "ver326_sim_count": sim326,
+        "ver330a_sim_count": sim330,
+        "sim_count_identical": bool(sim326 == sim330),
     }
 
 

@@ -246,7 +246,9 @@ def _v327_active() -> bool:
 
 
 def _v328_active() -> bool:
-    """Ver328 中盤底上げ+6周抑制実験。本線・Ver327とは独立。"""
+    """Ver328 中盤底上げ+6周抑制実験。本線・Ver327とは独立。比較検証モードでは強制OFF。"""
+    if str(os.environ.get("AUTORACE_VER330A_COMPARE") or "") == "1":
+        return False
     if bool(globals().get("_V328_EXPERIMENT")) or bool(globals().get("_V328_WORKER_ACTIVE")):
         return True
     try:
@@ -11972,30 +11974,31 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             lap_tuple=tuple(order)
             _ = sim_lap_path.append(lap_tuple)
             lap_order_counts[lap][lap_tuple]=lap_order_counts[lap].get(lap_tuple,0)+1
-            # Ver330-A検証用の1行状態指紋。ログ比較専用で、Sim結果やDB保存には影響しない。
-            try:
-                _fp330a = _v330a_state_fp[int(lap)]
-                _gap_sum330a = float(sum(float(x) for x in gaps))
-                _mom_sum330a = float(sum(float(momentum.get(c, 0.0) or 0.0) for c in cars))
-                _slow_sum330a = float(sum(float(slowdown.get(c, 0.0) or 0.0) for c in cars))
-                _pass_count330a = int(sum(int(v or 0) for v in lap_pass_count.values()))
-                _state330a = {
-                    "sim_index": int(sim_index),
-                    "order": [int(x) for x in order],
-                    "gaps": [round(float(x), 10) for x in gaps],
-                    "momentum": {str(c): round(float(momentum.get(c, 0.0) or 0.0), 10) for c in cars},
-                    "slowdown": {str(c): round(float(slowdown.get(c, 0.0) or 0.0), 10) for c in cars},
-                    "pass_count": _pass_count330a,
-                }
-                _fp330a["hash"].update(
-                    (json.dumps(_state330a, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-                )
-                _fp330a["gap_sum"] += _gap_sum330a
-                _fp330a["momentum_sum"] += _mom_sum330a
-                _fp330a["slowdown_sum"] += _slow_sum330a
-                _fp330a["pass_count"] += _pass_count330a
-            except Exception:
-                pass
+            # Ver330-A検証用の1行状態指紋。比較検証モードだけで計算し、通常実行の負荷をゼロにする。
+            if _v330a_full_validation:
+                try:
+                    _fp330a = _v330a_state_fp[int(lap)]
+                    _gap_sum330a = float(sum(float(x) for x in gaps))
+                    _mom_sum330a = float(sum(float(momentum.get(c, 0.0) or 0.0) for c in cars))
+                    _slow_sum330a = float(sum(float(slowdown.get(c, 0.0) or 0.0) for c in cars))
+                    _pass_count330a = int(sum(int(v or 0) for v in lap_pass_count.values()))
+                    _state330a = {
+                        "sim_index": int(sim_index),
+                        "order": [int(x) for x in order],
+                        "gaps": [round(float(x), 10) for x in gaps],
+                        "momentum": {str(c): round(float(momentum.get(c, 0.0) or 0.0), 10) for c in cars},
+                        "slowdown": {str(c): round(float(slowdown.get(c, 0.0) or 0.0), 10) for c in cars},
+                        "pass_count": _pass_count330a,
+                    }
+                    _fp330a["hash"].update(
+                        (json.dumps(_state330a, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                    )
+                    _fp330a["gap_sum"] += _gap_sum330a
+                    _fp330a["momentum_sum"] += _mom_sum330a
+                    _fp330a["slowdown_sum"] += _slow_sum330a
+                    _fp330a["pass_count"] += _pass_count330a
+                except Exception:
+                    pass
         final_tuple=tuple(order)
         final_order_counts[final_tuple]=final_order_counts.get(final_tuple,0)+1
         for _pos284,_car284 in enumerate(order,start=1):
@@ -12234,15 +12237,16 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             "top3_orders":{"-".join(map(str,k)):int(v) for k,v in top3_order_audit.items()},
             "purpose":"原因分析専用。予測値への後補正なし",
         },
-        "ver330a_state_fingerprint":{
-            str(lap):{
+        "ver330a_state_fingerprint":(
+            {str(lap):{
                 "hash":_v330a_state_fp[lap]["hash"].hexdigest(),
                 "gap_sum":round(float(_v330a_state_fp[lap]["gap_sum"]), 8),
                 "momentum_sum":round(float(_v330a_state_fp[lap]["momentum_sum"]), 8),
                 "slowdown_sum":round(float(_v330a_state_fp[lap]["slowdown_sum"]), 8),
                 "pass_count":int(_v330a_state_fp[lap]["pass_count"]),
-            } for lap in range(1, 7)
-        },
+            } for lap in range(1, 7)}
+            if _v330a_full_validation else {}
+        ),
         "ver330a_validation_lap_order_counts": (
             {str(lap): {"-".join(map(str,k)): int(v) for k,v in lap_order_counts[lap].items()} for lap in range(1, 7)}
             if _v330a_full_validation else {}
@@ -12287,16 +12291,18 @@ def _v330a_compare_mode_run() -> None:
             raise RuntimeError(f"v222_prediction_restoreにraw_textがありません: {race_key}")
         raw_text = str(row[0] or "")
         venue_override = str(row[1] or "")
-        # 予測エンジンへ渡す原文は1回だけ読み、326/Aで完全に同一入力を使う。
+        # 通常予測経路と同じく、venue_override がある場合は入力本文へ明示的に付加する。
+        # 326/Aの両方で同一の合成入力を使用する。
+        prediction_text = raw_text
         if venue_override:
-            raw_text = raw_text
+            prediction_text = f"開催場: {venue_override}\n" + raw_text
         random.seed(seed)
         np.random.seed(seed)
         globals()["_V328_EXPERIMENT"] = False
         globals()["_V328_WORKER_ACTIVE"] = False
         globals()["_V330A_EXPERIMENT"] = (mode == "Ver330-A")
         df, bets, output, entries, meta = engine.ver16_run_prediction(
-            raw_text, trials=trials, seed=seed, manual_excluded=[]
+            prediction_text, trials=trials, seed=seed, manual_excluded=[]
         )
         # ここでのみ6周Simを実行。保存・学習更新・履歴登録・GitHub同期は呼ばない。
         _sim_df, _sim_bets, audit = _v230_six_lap_simulation(
