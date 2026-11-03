@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pickle
+import random
 import re
 import shutil
 import sqlite3
@@ -42769,11 +42770,271 @@ except Exception as _v266_exc:
     st.warning("Ver266誤差解析の表示に失敗しました: " + _runtime_exception_text(_v266_exc))
 
 # ---------------------------------------------------------
+# Ver330-A iPhone用 Phase 2: Ver326 Lap1検証UI
+# URLに ?v330a_validation=1 を付けた場合だけ表示する。
+# 本番DBは読み取り専用スナップショットで参照し、結果は別SQLiteへ保存。
+# ---------------------------------------------------------
+def _v330a_is_validation_page() -> bool:
+    try:
+        return str(st.query_params.get("v330a_validation", "")) == "1"
+    except Exception:
+        try:
+            return str((st.experimental_get_query_params().get("v330a_validation") or [""])[0]) == "1"
+        except Exception:
+            return False
+
+_V330A_VALIDATION_PAGE = _v330a_is_validation_page()
+_V330A_UI_EXCLUDED = {"20260809_川口_12R"}
+_V330A_UI_EXPECTED = 377
+_V330A_UI_TRIALS = 20000
+_V330A_UI_SEED = 12345
+_V330A_UI_DIR = Path(tempfile.gettempdir()) / "autorace_ver330a_validation"
+_V330A_UI_DIR.mkdir(parents=True, exist_ok=True)
+_V330A_UI_RESULTS_DB = _V330A_UI_DIR / "lap1_results.sqlite3"
+_V330A_UI_SNAPSHOT = _V330A_UI_DIR / "readonly_snapshot.sqlite3"
+
+
+def _v330a_ui_result_db():
+    con = sqlite3.connect(str(_V330A_UI_RESULTS_DB), timeout=30)
+    con.execute("PRAGMA busy_timeout=30000")
+    con.execute("""CREATE TABLE IF NOT EXISTS lap1_results (
+        race_key TEXT PRIMARY KEY, payload_json TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""")
+    con.commit()
+    return con
+
+
+def _v330a_ui_make_snapshot(force=False):
+    src = Path(str(engine.DB_PATH)).resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"本番DBが見つかりません: {src}")
+    if force or not _V330A_UI_SNAPSHOT.exists():
+        try:
+            _V330A_UI_SNAPSHOT.chmod(0o644)
+        except Exception:
+            pass
+        with sqlite3.connect(f"file:{src.as_posix()}?mode=ro", uri=True, timeout=30) as source:
+            source.execute("PRAGMA query_only=ON")
+            with sqlite3.connect(str(_V330A_UI_SNAPSHOT), timeout=30) as target:
+                source.backup(target)
+                target.commit()
+        _V330A_UI_SNAPSHOT.chmod(0o444)
+    return _V330A_UI_SNAPSHOT
+
+
+def _v330a_ui_ro_connect(path):
+    con = sqlite3.connect(f"file:{Path(path).resolve().as_posix()}?mode=ro", uri=True, timeout=30)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA query_only=ON")
+    return con
+
+
+def _v330a_ui_common_set(snapshot):
+    with _v330a_ui_ro_connect(snapshot) as con:
+        tables = {str(r[0]) for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        ptab = next((t for t in ("v231_prediction_history", "prediction_history", "predictions") if t in tables), None)
+        if not ptab or "result_laps" not in tables:
+            raise RuntimeError("予測履歴またはresult_lapsテーブルがありません")
+        pcols = {str(r[1]) for r in con.execute(f'PRAGMA table_info("{ptab}")')}
+        if not {"race_key", "app_version"}.issubset(pcols):
+            raise RuntimeError(f"{ptab}にrace_key/app_version列がありません")
+        lcols = {str(r[1]) for r in con.execute('PRAGMA table_info("result_laps")')}
+        if "lap_label" in lcols:
+            cond, val = "lap_label=?", "1周目"
+        elif "lap_no" in lcols:
+            cond, val = "lap_no=?", 1
+        else:
+            raise RuntimeError("result_lapsにlap_label/lap_no列がありません")
+        keys = con.execute(
+             f"""SELECT DISTINCT a.race_key FROM "{ptab}" a
+                JOIN "{ptab}" b ON b.race_key=a.race_key
+                WHERE a.app_version='Ver326' AND b.app_version='Ver328'
+                AND EXISTS (SELECT 1 FROM result_laps l WHERE l.race_key=a.race_key AND {cond})
+                ORDER BY a.race_key""", (val,)
+        ).fetchall()
+        return [str(r[0]) for r in keys if str(r[0] or "").strip()]
+
+
+def _v330a_ui_load_raw(snapshot, race_key):
+    with _v330a_ui_ro_connect(snapshot) as con:
+        row = con.execute(
+            "SELECT raw_text, venue_override FROM v222_prediction_restore WHERE race_key=?", (race_key,)
+        ).fetchone()
+    if not row or not str(row["raw_text"] or "").strip():
+        raise RuntimeError("v222_prediction_restoreにraw_textがありません")
+    raw = str(row["raw_text"])
+    venue = str(row["venue_override"] or "")
+    return (f"開催場: {venue}\n" + raw) if venue else raw
+
+
+def _v330a_ui_actual(snapshot, race_key):
+    with _v330a_ui_ro_connect(snapshot) as con:
+        cols = {str(r[1]) for r in con.execute('PRAGMA table_info("result_laps")')}
+        if "lap_label" in cols:
+            cond, val = "lap_label=?", "1周目"
+        else:
+            cond, val = "lap_no=?", 1
+        rows = con.execute(
+            f"SELECT position, car_no FROM result_laps WHERE race_key=? AND {cond} ORDER BY position",
+            (race_key, val)
+        ).fetchall()
+    actual = tuple(int(r["car_no"]) for r in rows if r["car_no"] is not None)
+    if len(actual) < 3 or len(set(actual)) != len(actual):
+        raise RuntimeError("実Lap1順位が不完全です")
+    return actual
+
+
+def _v330a_ui_run_one(snapshot, race_key):
+    import math as _math
+    raw_text = _v330a_ui_load_raw(snapshot, race_key)
+    actual = _v330a_ui_actual(snapshot, race_key)
+    old_db_path = engine.DB_PATH
+    old_env = os.environ.get("AUTORACE_330_VALIDATION_MODE")
+    old_globals = {k: globals().get(k) for k in ("_V328_EXPERIMENT", "_V328_WORKER_ACTIVE", "_V330A_EXPERIMENT")}
+    try:
+        # エンジンのDB参照先を読み取り専用スナップショットに固定。
+        engine.DB_PATH = str(snapshot)
+        globals()["_V328_EXPERIMENT"] = False
+        globals()["_V328_WORKER_ACTIVE"] = False
+        globals()["_V330A_EXPERIMENT"] = False  # Ver326基準を実行
+        random.seed(_V330A_UI_SEED)
+        np.random.seed(_V330A_UI_SEED)
+        df, bets, _output, entries, meta = engine.ver16_run_prediction(
+            raw_text, trials=_V330A_UI_TRIALS, seed=_V330A_UI_SEED, manual_excluded=[]
+        )
+        os.environ["AUTORACE_330_VALIDATION_MODE"] = "1"
+        _sim_df, _sim_bets, audit = _v230_six_lap_simulation(
+            df, bets, entries, meta, _V330A_UI_TRIALS, _V330A_UI_SEED
+        )
+        counts = ((audit or {}).get("ver330a_validation_lap_order_counts") or {}).get("1") or {}
+        parsed = {tuple(int(x) for x in str(k).split("-")): int(v) for k, v in counts.items()}
+        if not parsed:
+            raise RuntimeError("Lap1パターン件数が空です")
+        observed = sum(parsed.values())
+        if observed != _V330A_UI_TRIALS:
+            raise RuntimeError(f"試行数不一致: {observed}/{_V330A_UI_TRIALS}")
+        cnt = int(parsed.get(actual, 0))
+        ranked = sorted(parsed.values(), reverse=True)
+        rank = 1 + sum(v > cnt for v in parsed.values()) if cnt > 0 else len(parsed) + 1
+        prob = cnt / float(_V330A_UI_TRIALS)
+        top1 = ranked[0] / float(_V330A_UI_TRIALS)
+        unique_n = len(parsed)
+        return {
+            "race_key": race_key, "car_count": len(actual),
+            "actual_pattern": "-".join(map(str, actual)),
+            "pattern_rank": rank, "pattern_count": cnt, "pattern_prob": prob,
+            "uniform_ratio": prob * _math.factorial(len(actual)),
+            "top1_prob": top1, "relative_lift": prob / top1 if top1 else 0.0,
+            "unique_pattern_count": unique_n,
+            "rank_cutoff_25pct": int(_math.ceil(unique_n * 0.25)),
+            "rank_pass": bool(rank <= _math.ceil(unique_n * 0.25)),
+            "uniform_pass": bool(prob * _math.factorial(len(actual)) >= 50.0),
+            "top1_pass": bool(top1 >= 0.02),
+            "relative_lift_pass": bool((prob / top1 if top1 else 0.0) >= 0.20),
+            "observed_trials": observed,
+        }
+    finally:
+        engine.DB_PATH = old_db_path
+        if old_env is None:
+            os.environ.pop("AUTORACE_330_VALIDATION_MODE", None)
+        else:
+            os.environ["AUTORACE_330_VALIDATION_MODE"] = old_env
+        for k, v in old_globals.items():
+            if v is None:
+                globals().pop(k, None)
+            else:
+                globals()[k] = v
+
+
+def _v330a_ui_saved_rows():
+    with _v330a_ui_result_db() as con:
+        rows = con.execute("SELECT payload_json FROM lap1_results ORDER BY race_key").fetchall()
+    out=[]
+    for row in rows:
+        try: out.append(json.loads(row[0]))
+        except Exception: pass
+    return out
+
+
+def _v330a_ui_save_result(result):
+    with _v330a_ui_result_db() as con:
+        con.execute(
+            "INSERT INTO lap1_results(race_key,payload_json,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(race_key) DO UPDATE SET payload_json=excluded.payload_json,updated_at=excluded.updated_at",
+            (result["race_key"], json.dumps(result, ensure_ascii=False), datetime.now().isoformat(timespec="seconds"))
+        )
+        con.commit()
+
+
+if _V330A_VALIDATION_PAGE:
+    st.markdown("---")
+    st.header("Ver330-A Phase 2：Ver326 Lap1検証")
+    st.warning("検証専用ページです。本番DBは読み取り専用スナップショットで参照します。結果は本番DBと別の一時SQLiteへ保存します。")
+    try:
+        _snap = _v330a_ui_make_snapshot()
+        _all_common = _v330a_ui_common_set(_snap)
+        _target = [k for k in _all_common if k not in _V330A_UI_EXCLUDED]
+        if len(_all_common) != 378 or len(_target) != _V330A_UI_EXPECTED:
+            st.error(f"対象件数が想定外です。共通セット={len(_all_common)}R / 除外後={len(_target)}R。実行を停止しました。")
+        else:
+            _saved = _v330a_ui_saved_rows()
+            _done = {str(r.get("race_key")) for r in _saved if r.get("ok") is True}
+            _remaining = [k for k in _target if k not in _done]
+            st.caption("対象377R（共通セット378Rから全返還の20260809_川口_12Rを除外）。試行数20,000 / seed=12345")
+            st.write(f"成功 {_done.__len__()}R / 残り {len(_remaining)}R")
+            _a, _b = st.columns(2)
+            with _a:
+                _chunk_size = st.selectbox("1回の実行数", [1, 2, 5, 10], index=1, key="v330a_ui_chunk_size")
+            with _b:
+                _run_chunk = st.button("次のチャンクを実行", key="v330a_ui_run_chunk", disabled=not bool(_remaining))
+            if _run_chunk and _remaining:
+                _progress = st.progress(0.0)
+                _status = st.empty()
+                _chunk = _remaining[:int(_chunk_size)]
+                for _i, _race_key in enumerate(_chunk):
+                    _status.write(f"{_i+1}/{len(_chunk)}：{_race_key}")
+                    try:
+                        _one = _v330a_ui_run_one(_snap, _race_key)
+                        _one["ok"] = True
+                    except Exception as _exc:
+                        _one = {"race_key": _race_key, "ok": False, "error": f"{type(_exc).__name__}: {_exc}"}
+                    _v330a_ui_save_result(_one)
+                    _progress.progress((_i+1)/len(_chunk))
+                st.success(f"チャンク完了。{len(_chunk)}Rを処理しました。")
+                st.rerun()
+            _rows = _v330a_ui_saved_rows()
+            if _rows:
+                _export = pd.DataFrame(_rows)
+                _success = _export[_export.get("ok", pd.Series(False, index=_export.index)).eq(True)]
+                st.dataframe(_export, use_container_width=True)
+                if len(_success):
+                    st.markdown("**成功分の中央値**")
+                    for _col in ("pattern_rank", "uniform_ratio", "top1_prob", "relative_lift"):
+                        if _col in _success:
+                            _val = pd.to_numeric(_success[_col], errors="coerce").dropna()
+                            if len(_val): st.write(f"- {_col}: {_val.median():.4f}")
+                st.download_button("途中結果CSVを保存", _export.to_csv(index=False).encode("utf-8-sig"),
+                                   f"ver326_lap1_metrics_{len(_success)}R.csv", "text/csv")
+                _upload = st.file_uploader("以前保存したCSVから途中結果を復元", type=["csv"], key="v330a_ui_restore_csv")
+                if _upload is not None and st.button("CSVの成功行を復元", key="v330a_ui_import_csv"):
+                    _import_df = pd.read_csv(_upload)
+                    _restored=0
+                    for _rec in _import_df.to_dict(orient="records"):
+                        if str(_rec.get("ok", "")).lower() not in ("true", "1") or not _rec.get("race_key"):
+                            continue
+                        _v330a_ui_save_result(_rec); _restored += 1
+                    st.success(f"{_restored}Rを復元しました")
+                    st.rerun()
+            st.caption("エラー行は成功件数に含めず、次回チャンクで再試行します。CSVは途中でも保存してください。")
+    except Exception as _v330a_ui_exc:
+        st.error(f"検証UI初期化エラー: {type(_v330a_ui_exc).__name__}: {_v330a_ui_exc}")
+
+# ---------------------------------------------------------
 # Ver326: 画面描画完了後、プロセス起動後に1回だけGitHub同期を実行
 # ---------------------------------------------------------
 _v326_boot_sync_state = _v326_get_boot_sync_state()
 with _v326_boot_sync_state["lock"]:
-    _v326_should_boot_sync = not _v326_boot_sync_state["done"]
+    _v326_should_boot_sync = (not _v326_boot_sync_state["done"]) and (not _V330A_VALIDATION_PAGE)
     if _v326_should_boot_sync:
         _v326_boot_sync_state["done"] = True
 

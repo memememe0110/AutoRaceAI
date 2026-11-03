@@ -36,6 +36,8 @@ import hashlib
 
 SEED_DEFAULT = 12345
 TRIALS_DEFAULT = 20000
+EXPECTED_LAP1_COUNT = 377
+EXCLUDED_NO_LAP1 = {"20260809_川口_12R"}  # 全返還でLap1順位が存在しない
 VERSIONS = ("Ver326", "Ver328")
 
 
@@ -304,7 +306,7 @@ def main() -> int:
     ap.add_argument("--trials", type=int, default=TRIALS_DEFAULT)
     ap.add_argument("--seed", type=int, default=SEED_DEFAULT)
     ap.add_argument("--timeout", type=float, default=1800.0)
-    ap.add_argument("--limit", type=int, default=0, help="Lap1のレース数を制限。0=全378R")
+    ap.add_argument("--limit", type=int, default=0, help="Lap1のレース数を制限。0=全377R")
     ap.add_argument("--out-dir", default="")
     args = ap.parse_args()
     if args.trials != 20000:
@@ -330,10 +332,13 @@ def main() -> int:
     if args.phase == "contamination":
         return 0
     if args.phase == "lap1":
-        if c["common_set_count"] != 378:
-            print(f"警告: common_setは378ではなく{c['common_set_count']}Rです。378R固定ならここで停止します。")
+        # 全返還レースはLap1順位が存在しないため、検証対象から明示的に除外する。
+        # contamination_check() の共通セットは378Rを返すが、Lap1評価は377Rで行う。
+        common_set = [k for k in c["common_set"] if k not in EXCLUDED_NO_LAP1]
+        if len(common_set) != EXPECTED_LAP1_COUNT:
+            print(f"警告: 除外後 {len(common_set)}R（期待{EXPECTED_LAP1_COUNT}R）")
             return 3
-        summary = run_lap1(db, app_path, out_dir, c["common_set"][:args.limit or None], args.trials, args.seed, args.timeout)
+        summary = run_lap1(db, app_path, out_dir, common_set[:args.limit or None], args.trials, args.seed, args.timeout)
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0 if summary["all_four_pass"] else 4
     if args.phase == "axis-a":
