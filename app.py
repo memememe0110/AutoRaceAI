@@ -3733,6 +3733,8 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
         else:
             globals()["_V231_APP_VERSION"] = str(globals().get("_V326_APP_VERSION") or "Ver326")
     try:
+        _hb_stop_evt = threading.Event()
+        _hb_thread = None
         _v278_bg_update(
             db_path, job_id,
             status="running",
@@ -3743,6 +3745,31 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
                  ("Ver326 C-A実験: 対象レースを整理しています。" if _ca_job else "対象レースを整理しています。"))
             ),
         )
+
+        # Ver329: 独立 heartbeat thread（20分reaper対策の本命）
+        # ver16_run_prediction 内で長時間固まっても updated_at を維持する。
+        # プロセスが OS kill された場合は救えない（それは別の OOM 問題）。
+        def _hb_loop_329():
+            while not _hb_stop_evt.wait(120):
+                try:
+                    with sqlite3.connect(str(db_path), timeout=2.0) as _hc:
+                        _hc.execute("PRAGMA busy_timeout=2000")
+                        _hc.execute(
+                            "UPDATE v278_background_jobs SET updated_at=? "
+                            "WHERE job_id=? AND status IN "
+                            "('running','pause_requested','paused')",
+                            (_v228_now_jst_iso(), int(job_id)),
+                        )
+                        _hc.commit()
+                except Exception:
+                    pass
+
+        _hb_thread = threading.Thread(
+            target=_hb_loop_329, daemon=True,
+            name=f"autorace-hb-{job_id}",
+        )
+        _hb_thread.start()
+
         # Ver314: 一定レースごとにGitHubへ自動保存（クラッシュ時の消失を防ぐ）
         _autosave_every = int(globals().get("_V314_AUTOSAVE_EVERY_N") or 40)
         # GitHub push は別間隔。短すぎると push 自体で OOM しやすい。
@@ -4179,6 +4206,10 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             error_text=f"{type(exc).__name__}: {exc}",
         )
     finally:
+        try:
+            _hb_stop_evt.set()
+        except Exception:
+            pass
         # B13-J: ジョブ終了時に明示GC（完了直後OOM対策）
         try:
             import gc as _gc_b13j_end
@@ -5474,8 +5505,16 @@ def _v262_batch_rerun_saved_histories(db_path: str, limit: int = 120, progress_c
             prediction_text=str(raw_text)
             if str(venue_override or '').strip():
                 prediction_text=f"開催場: {str(venue_override).strip()}\n"+prediction_text
+            # Ver329: 361R 特定用に race_key / src / trials を label に残す。
+            # 固まった時、DB の current_label から単体再現できる。
+            _trace_ver329 = (
+                f"{label}｜①基礎予測中"
+                f"｜key={race_key0}"
+                f"｜src={src_ver}"
+                f"｜trials={int(trials or 0)}"
+            )
             if callable(progress_cb):
-                progress_cb(idx-1,total,label+"｜①基礎予測中")
+                progress_cb(idx-1,total,_trace_ver329)
             df,bets,output,entries,meta=engine.ver16_run_prediction(prediction_text,trials,seed,manual_excluded=excluded)
             _bets_before_lap310 = dict(bets or {})
             if callable(progress_cb):
