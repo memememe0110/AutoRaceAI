@@ -31078,6 +31078,68 @@ def _v276_atomic_install_db_bytes(data: bytes, source_label: str = "DB") -> tupl
         temp.unlink(missing_ok=True)
 
 
+def _v284_master_pin_path() -> Path:
+    """アップロード正本をRAMではなくプロセス一時領域へ保持する。"""
+    return Path(tempfile.gettempdir()) / f"autorace_master_pin_{os.getpid()}.sqlite3"
+
+def _v284_write_master_pin_bytes(data: bytes) -> Path:
+    """正本DBを一時ファイルへ保存し、session_stateにはbytesを保持しない。"""
+    pin=_v284_master_pin_path()
+    tmp=pin.with_name(pin.name+".tmp")
+    tmp.write_bytes(data)
+    os.replace(str(tmp),str(pin))
+    return pin
+
+def _v276_atomic_install_db_file(source_path: Path, source_label: str = "DB") -> tuple[bool, str]:
+    """SQLiteファイルをRAMへ全読込せず、検証して原子的に差し替える。"""
+    source=Path(source_path)
+    if not source.exists():
+        return False, f"{source_label}がありません。"
+    try:
+        _v276_postcheck_db_file(source)
+    except Exception as exc:
+        return False, f"{source_label}の整合性チェックに失敗しました: {type(exc).__name__}: {exc}"
+    try:
+        if "_v278_bg_has_running_job" in globals() and _v278_bg_has_running_job(engine.DB_PATH):
+            return False, "バックグラウンド再シミュレーション中はDB差し替えを停止しています。完了後にもう一度実行してください。"
+    except Exception:
+        pass
+    target=Path(engine.DB_PATH)
+    target.parent.mkdir(parents=True,exist_ok=True)
+    temp=target.with_name(target.name+".installing")
+    backup=target.with_name(target.name+".before_replace")
+    try:
+        shutil.copy2(source,temp)
+        _v276_postcheck_db_file(temp)
+        _v276_checkpoint_existing_db(target)
+        if target.exists():
+            try:
+                shutil.copy2(target,backup)
+            except Exception:
+                shutil.copyfile(target,backup)
+        _v276_remove_sqlite_sidecars(target)
+        os.replace(str(temp),str(target))
+        _v276_remove_sqlite_sidecars(target)
+        _v276_postcheck_db_file(target)
+        engine.mount_and_init_db()
+        _v276_postcheck_db_file(target)
+        return True,"ok"
+    except Exception as exc:
+        _v276_remove_sqlite_sidecars(target)
+        try:
+            if backup.exists():
+                os.replace(str(backup),str(target))
+                _v276_remove_sqlite_sidecars(target)
+                try:
+                    engine.mount_and_init_db()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False,f"{source_label}の差し替えに失敗しました: {type(exc).__name__}: {exc}"
+    finally:
+        temp.unlink(missing_ok=True)
+
 def install_uploaded_db(uploaded) -> tuple[bool, str]:
     data = uploaded.getvalue()
     if not data.startswith(b"SQLite format 3\x00"):
@@ -31100,7 +31162,8 @@ def install_uploaded_db(uploaded) -> tuple[bool, str]:
         # Streamlit rerun等で実ファイルが古いDBへ戻った場合は、この正本から原子的に復元できる。
         st.session_state["v284_db_identity_baseline"]=_id284
         st.session_state["v284_db_identity_block"]=[]
-        st.session_state["v284_uploaded_master_bytes"]=bytes(data)
+        _pin284=_v284_write_master_pin_bytes(data)
+        st.session_state["v284_uploaded_master_path"]=str(_pin284)
         st.session_state["v284_uploaded_master_sha256"]=digest
         st.session_state["v284_uploaded_master_identity"]=_id284
     except Exception as exc:
@@ -36206,7 +36269,8 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
                 )
 
             # 以後の再描画・端末保存・固定監視も同じ正本を参照するよう更新。
-            st.session_state["v284_uploaded_master_bytes"]=bytes(_remote_compare_bytes284)
+            _pin284=_v284_write_master_pin_bytes(_remote_compare_bytes284)
+            st.session_state["v284_uploaded_master_path"]=str(_pin284)
             st.session_state["v284_uploaded_master_sha256"]=hashlib.sha256(_remote_compare_bytes284).hexdigest()
             _adopt_identity298=_v284_current_db_identity()
             if _adopt_identity298.get("ok"):
@@ -36244,7 +36308,8 @@ def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = Fa
                 return False,"diverged安全統合DBの現在DBへの反映に失敗しました: "+str(_install_merge_msg284)
             snapshot_bytes=bytes(_merged_bytes284)
             local_fp=_v283_db_fingerprint_bytes(snapshot_bytes)
-            st.session_state["v284_uploaded_master_bytes"]=snapshot_bytes
+            _pin284=_v284_write_master_pin_bytes(snapshot_bytes)
+            st.session_state["v284_uploaded_master_path"]=str(_pin284)
             st.session_state["v284_uploaded_master_sha256"]=hashlib.sha256(snapshot_bytes).hexdigest()
             _merged_identity284=_v284_current_db_identity()
             if _merged_identity284.get("ok"):
@@ -36553,9 +36618,9 @@ _v284_recent_ok=_v284_recent_completed_job(engine.DB_PATH)
 
 # Ver284: アップロード済み正本がある場合、rerunでDB実体が後退していたら
 # GitHub操作や画面処理より前に同じ engine.DB_PATH へ原子的に復元する。
-_v284_pinned_bytes=st.session_state.get("v284_uploaded_master_bytes")
+_v284_pinned_path=st.session_state.get("v284_uploaded_master_path")
 _v284_pinned_id=st.session_state.get("v284_uploaded_master_identity")
-if (not _v296_bg_fast_rerun) and (not _v284_recent_ok) and isinstance(_v284_pinned_bytes,(bytes,bytearray)) and isinstance(_v284_pinned_id,dict) and _v284_pinned_id.get("ok"):
+if (not _v296_bg_fast_rerun) and (not _v284_recent_ok) and isinstance(_v284_pinned_path,str) and isinstance(_v284_pinned_id,dict) and _v284_pinned_id.get("ok"):
     _v284_before_restore=_v284_current_db_identity()
     _v284_restore_needed=False
     if not _v284_before_restore.get("ok"):
@@ -36569,7 +36634,7 @@ if (not _v296_bg_fast_rerun) and (not _v284_recent_ok) and isinstance(_v284_pinn
             str(_v284_before_restore.get("path")) != str(_v284_pinned_id.get("path"))
         )
     if _v284_restore_needed:
-        _v284_restore_ok,_v284_restore_msg=_v276_atomic_install_db_bytes(bytes(_v284_pinned_bytes),"アップロード正本自動復元")
+        _v284_restore_ok,_v284_restore_msg=_v276_atomic_install_db_file(Path(_v284_pinned_path),"アップロード正本自動復元")
         if _v284_restore_ok:
             _v284_restored_id=_v284_current_db_identity()
             if _v284_restored_id.get("ok"):
