@@ -35,6 +35,43 @@ import engine
 import math
 
 
+# Ver330-A: 検証中のDB参照先変更・通常操作との競合をプロセス内で排他する。
+@st.cache_resource
+def _v330a_get_process_guard():
+    return {"lock": threading.RLock(), "running": False, "owner": ""}
+
+_V330A_PROCESS_GUARD = _v330a_get_process_guard()
+
+def _v330a_exclusive_db_operation(blocked_value):
+    """通常DB操作を検証チャンクと同じプロセスロックで直列化する。"""
+    def decorate(func):
+        def wrapped(*args, **kwargs):
+            guard = _V330A_PROCESS_GUARD
+            lock = guard["lock"]
+            if not lock.acquire(blocking=False):
+                return blocked_value
+            try:
+                if guard.get("running"):
+                    return blocked_value
+                return func(*args, **kwargs)
+            finally:
+                lock.release()
+        wrapped.__name__ = func.__name__
+        wrapped.__doc__ = func.__doc__
+        wrapped._v330a_guarded = True
+        return wrapped
+    return decorate
+
+def _v330a_query_flag(name):
+    try:
+        return str(st.query_params.get(name, "")) == "1"
+    except Exception:
+        try:
+            return str((st.experimental_get_query_params().get(name) or [""])[0]) == "1"
+        except Exception:
+            return False
+
+
 # Ver326: Streamlitの再実行・セッション切断に影響されないプロセス単位の起動同期状態。
 @st.cache_resource
 def _v326_get_boot_sync_state():
@@ -1005,6 +1042,14 @@ def _v266_render_error_analysis(db_path):
         st.caption("この表はVer評価専用です。原因学習の統計には混ぜません。")
 
 st.set_page_config(page_title="AutoRaceAI スマホ本予測", page_icon="🏁", layout="wide")
+
+# 検証チャンク中は通常画面自体を停止し、未ガードのDB操作も発生させない。
+if _V330A_PROCESS_GUARD.get("running") and not (
+    _v330a_query_flag("v330a_validation") or _v330a_query_flag("v330a_progress")
+):
+    st.warning("Ver330-A検証中です。DB競合防止のため通常画面は一時停止しています。検証完了後に再読み込みしてください。")
+    st.stop()
+
 if _V320_ENGINE_PATCH_ERROR:
     try:
         st.warning(
@@ -4256,6 +4301,7 @@ def _v278_bg_worker(db_path: str, job_id: int, limit_count: int, force_current: 
             except Exception:
                 pass
 
+@_v330a_exclusive_db_operation({"ok": False, "reason": "Ver330-A検証中またはDB処理中のためバックグラウンド再シミュを開始できません。"})
 def _v278_bg_start(db_path: str, limit_count: int, force_current: bool, diagnostic_auto: bool = False, enable_ca: bool = False, enable_v327: bool = False, odds_only: bool = False, enable_v328: bool = False) -> dict:
     _v278_bg_ensure_table(db_path)
     if _v278_bg_has_running_job(db_path):
@@ -5026,6 +5072,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             pass
 
 
+@_v330a_exclusive_db_operation({"ok": False, "reason": "Ver330-A検証中またはDB処理中のためバックグラウンド予測を開始できません。"})
 def _v279_bg_prediction_start(
     db_path: str, raw_text: str, venue_override: str, trials: int, seed: int, excluded: list[int],
     rerun_from_restored: bool = False, rerun_source_version: str = "", rerun_source_history_id: int = 0,
@@ -21741,6 +21788,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             pass
 
 
+@_v330a_exclusive_db_operation({"ok": False, "reason": "Ver330-A検証中またはDB処理中のためバックグラウンド取込を開始できません。"})
 def _v319_bg_import_start(
     db_path: str, ymd: str, venues: list[str],
     skip_existing: bool, replace: bool, predict_if_missing: bool,
@@ -22039,6 +22087,7 @@ def _v319_bg_history_worker(db_path: str, job_id: int, req: dict) -> None:
             pass
 
 
+@_v330a_exclusive_db_operation({"ok": False, "reason": "Ver330-A検証中またはDB処理中のため選手履歴処理を開始できません。"})
 def _v319_bg_history_start(
     db_path: str, ymd: str, venues: list[str],
     min_rows: int = 30, max_races: int = 12,
@@ -31271,6 +31320,7 @@ def _v276_atomic_install_db_file(source_path: Path, source_label: str = "DB") ->
     finally:
         temp.unlink(missing_ok=True)
 
+@_v330a_exclusive_db_operation((False, "Ver330-A検証中またはDB処理中のためDB差し替えを停止しました。完了後に再試行してください。"))
 def install_uploaded_db(uploaded) -> tuple[bool, str]:
     data = uploaded.getvalue()
     if not data.startswith(b"SQLite format 3\x00"):
@@ -36202,6 +36252,7 @@ def _v284_compare_worker_identity(now: dict, baseline: dict) -> tuple[bool,list[
     return bool(reasons),reasons
 
 
+@_v330a_exclusive_db_operation((False, "Ver330-A検証中またはDB処理中のためGitHub保存を停止しました。完了後に再試行してください。"))
 def push_db_to_github(commit_message: str, _allow_during_resimulation: bool = False, _lightweight: bool = False, _pin_identity=None, _guard_block=None, _worker_thread: bool = False) -> tuple[bool, str]:
     # Ver309: バックグラウンド再シミュレーション中はGitHub同期を行わない。
     # ローカルSQLiteへの登録・更新はそのまま継続し、再シミュレーション終了後に
@@ -42885,7 +42936,7 @@ def _v330a_ui_actual(snapshot, race_key):
     return actual
 
 
-def _v330a_ui_run_one(snapshot, race_key):
+def _v330a_ui_run_one_unlocked(snapshot, race_key):
     import math as _math
     # 各レースの直前に元DB（engine.DB_PATH）からsnapshotを作り直し、
     # 前レースで発生したエンジン内部書き込みを次レースへ持ち越さない。
@@ -42957,6 +43008,23 @@ def _v330a_ui_run_one(snapshot, race_key):
                 globals()[k] = v
 
 
+
+def _v330a_ui_run_one(snapshot, race_key):
+    guard = _V330A_PROCESS_GUARD
+    lock = guard["lock"]
+    # チャンク側が保持している場合はRLockで同一スレッド内の再入を許可。
+    with lock:
+        was_running = bool(guard.get("running"))
+        guard["running"] = True
+        guard["owner"] = "validation"
+        try:
+            return _v330a_ui_run_one_unlocked(snapshot, race_key)
+        finally:
+            if not was_running:
+                guard["running"] = False
+                guard["owner"] = ""
+
+
 def _v330a_ui_saved_rows():
     with _v330a_ui_result_db() as con:
         rows = con.execute("SELECT payload_json FROM lap1_results ORDER BY race_key").fetchall()
@@ -42977,13 +43045,65 @@ def _v330a_ui_save_result(result):
         con.commit()
 
 
+# ===== Ver330-A 進捗監視専用ページ（?v330a_progress=1） =====
+def _v330a_is_progress_page() -> bool:
+    try:
+        return str(st.query_params.get("v330a_progress", "")) == "1"
+    except Exception:
+        try:
+            return str((st.experimental_get_query_params().get("v330a_progress") or [""])[0]) == "1"
+        except Exception:
+            return False
+
+
+if _v330a_is_progress_page():
+    st.header("Ver330-A Phase 2：進捗モニタ")
+    st.caption("実行タブとは別に開いてください。保存済み結果を3秒ごとに読み直します。")
+
+    @st.fragment(run_every="3s")
+    def _v330a_progress_fragment():
+        try:
+            _monitor_rows = _v330a_ui_saved_rows()
+        except Exception as _monitor_exc:
+            st.error(f"結果DB読み取りエラー: {type(_monitor_exc).__name__}: {_monitor_exc}")
+            return
+        _ok_rows = [r for r in _monitor_rows if r.get("ok") is True]
+        _ng_rows = [r for r in _monitor_rows if r.get("ok") is not True]
+        st.metric("成功", f"{len(_ok_rows)} / {_V330A_UI_EXPECTED}")
+        st.progress(min(1.0, len(_ok_rows) / float(_V330A_UI_EXPECTED)))
+        _mc1, _mc2 = st.columns(2)
+        _mc1.metric("成功", len(_ok_rows))
+        _mc2.metric("エラー", len(_ng_rows))
+        if _ok_rows:
+            _monitor_df = pd.DataFrame(_ok_rows)
+            st.markdown("**直近5件**")
+            _recent_cols = [c for c in ("race_key", "pattern_rank", "uniform_ratio", "top1_prob", "relative_lift") if c in _monitor_df.columns]
+            st.dataframe(_monitor_df.tail(5)[_recent_cols], use_container_width=True)
+            st.markdown("**中央値（暫定）**")
+            for _metric_col in ("pattern_rank", "uniform_ratio", "top1_prob", "relative_lift"):
+                if _metric_col in _monitor_df.columns:
+                    _metric_values = pd.to_numeric(_monitor_df[_metric_col], errors="coerce").dropna()
+                    if len(_metric_values):
+                        st.write(f"- {_metric_col}: {_metric_values.median():.4f}")
+        if _ng_rows:
+            st.markdown("**エラー行（最新5件）**")
+            _error_df = pd.DataFrame(_ng_rows)
+            _error_cols = [c for c in ("race_key", "error") if c in _error_df.columns]
+            st.dataframe(_error_df.tail(5)[_error_cols], use_container_width=True)
+
+    _v330a_progress_fragment()
+    st.stop()
+
+
 if _V330A_VALIDATION_PAGE:
+    st.info("検証中は通常画面のDB操作・DB差し替え・GitHub保存・BG起動を停止します。検証タブと進捗モニタ以外は開かないでください。")
     # 本番DBを差し替える処理ではないが、engine.DB_PATHをsnapshotへ一時固定するため
     # BG再シミュレーション中の同時実行は安全側で禁止する。
     try:
         _v330a_bg_busy = (
-            "_v278_bg_has_running_job" in globals()
-            and _v278_bg_has_running_job(engine.DB_PATH)
+            ("_v278_bg_has_running_job" in globals() and _v278_bg_has_running_job(engine.DB_PATH))
+            or ("_v278_bg_has_running_of" in globals() and _v278_bg_has_running_of(engine.DB_PATH, ("official_import", "player_history_import")))
+            or ("_v319_bg_history_any_active" in globals() and _v319_bg_history_any_active(engine.DB_PATH))
         )
     except Exception as _bg_check_exc:
         st.error(f"BG job状態を確認できないため検証を停止しました: {_bg_check_exc}")
@@ -43030,24 +43150,38 @@ if _V330A_VALIDATION_PAGE:
             st.write(f"成功 {_done.__len__()}R / 残り {len(_remaining)}R")
             _a, _b = st.columns(2)
             with _a:
-                _chunk_size = st.selectbox("1回の実行数", [1, 2, 5, 10], index=1, key="v330a_ui_chunk_size")
+                _chunk_size = st.selectbox("1回の実行数", [1, 2, 5, 10], index=2, key="v330a_ui_chunk_size")
             with _b:
                 _run_chunk = st.button("次のチャンクを実行", key="v330a_ui_run_chunk", disabled=not bool(_remaining))
             if _run_chunk and _remaining:
-                _progress = st.progress(0.0)
-                _status = st.empty()
                 _chunk = _remaining[:int(_chunk_size)]
-                for _i, _race_key in enumerate(_chunk):
-                    _status.write(f"{_i+1}/{len(_chunk)}：{_race_key}")
+                _guard = _V330A_PROCESS_GUARD
+                _lock = _guard["lock"]
+                if not _lock.acquire(blocking=False):
+                    st.error("別のDB処理が実行中です。完了後に再試行してください。")
+                else:
+                    _guard["running"] = True
+                    _guard["owner"] = "validation"
                     try:
-                        _one = _v330a_ui_run_one(_snap, _race_key)
-                        _one["ok"] = True
-                    except Exception as _exc:
-                        _one = {"race_key": _race_key, "ok": False, "error": f"{type(_exc).__name__}: {_exc}"}
-                    _v330a_ui_save_result(_one)
-                    _progress.progress((_i+1)/len(_chunk))
-                st.success(f"チャンク完了。{len(_chunk)}Rを処理しました。")
-                st.rerun()
+                        with st.status(f"実行中… {len(_chunk)}R", expanded=True) as _status:
+                            for _i, _race_key in enumerate(_chunk):
+                                _status.write(f"{_i+1}/{len(_chunk)}：{_race_key}")
+                                time_module.sleep(0.05)
+                                try:
+                                    _one = _v330a_ui_run_one(_snap, _race_key)
+                                    _one["ok"] = True
+                                except Exception as _exc:
+                                    _one = {"race_key": _race_key, "ok": False, "error": f"{type(_exc).__name__}: {_exc}"}
+                                _v330a_ui_save_result(_one)
+                                _status.write(f"  → ok={_one['ok']}")
+                                time_module.sleep(0.05)
+                            _status.update(label=f"完了 {len(_chunk)}R", state="complete")
+                        st.toast(f"{len(_chunk)}R 完了", icon="✅")
+                    finally:
+                        _guard["running"] = False
+                        _guard["owner"] = ""
+                        _lock.release()
+                    st.rerun()
             _rows = _v330a_ui_saved_rows()
             if _rows:
                 _export = pd.DataFrame(_rows)
