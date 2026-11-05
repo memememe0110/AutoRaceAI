@@ -1,0 +1,123 @@
+name: Build DB Release
+run-name: "Build DB Release - ${{ github.run_number }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      db_branch:
+        description: 'Source DB branch (chunks)'
+        required: true
+        default: 'autorace-db'
+        type: string
+      db_path:
+        description: 'DB path on source branch'
+        required: true
+        default: 'autorace_players.sqlite3'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-db-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Show disk before anything
+        run: df -h /home/runner
+
+      - name: Checkout application source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: appsrc
+          fetch-depth: 1
+
+      - name: Checkout source DB branch (chunks)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.db_branch }}
+          path: db-branch
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Show disk after checkout
+        run: |
+          df -h /home/runner
+          du -sh db-branch/.git db-branch 2>/dev/null || true
+
+      - name: Free git objects immediately
+        run: rm -rf db-branch/.git
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Merge chunks into single SQLite
+        run: |
+          python appsrc/prepare_validation_db.py \
+            --db-root db-branch \
+            --db-path "${{ inputs.db_path }}" \
+            --output autorace_players.sqlite3
+
+      - name: Verify merged DB (integrity + required tables)
+        run: |
+          python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+          p = Path('autorace_players.sqlite3')
+          if not p.is_file() or p.stat().st_size < 100:
+              raise SystemExit(f'DB missing or too small: {p}')
+          if p.read_bytes()[:16] != b'SQLite format 3\x00':
+              raise SystemExit('Not a SQLite database')
+          with sqlite3.connect(f'file:{p.resolve().as_posix()}?mode=ro', uri=True) as con:
+              con.execute('PRAGMA query_only=ON')
+              integrity = con.execute('PRAGMA integrity_check').fetchone()[0]
+              if str(integrity).lower() != 'ok':
+                  raise SystemExit(f'integrity_check failed: {integrity}')
+              tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+              required = {'result_laps', 'v222_prediction_restore', 'v231_prediction_history'}
+              missing = sorted(required - tables)
+              if missing:
+                  raise SystemExit('Missing required tables: ' + ', '.join(missing))
+          print(f'DB verified: {p.stat().st_size:,} bytes')
+          PY
+
+      - name: Show merged DB info
+        run: |
+          df -h /home/runner
+          ls -lh autorace_players.sqlite3
+          sha256sum autorace_players.sqlite3
+
+      - name: Free chunks immediately
+        run: rm -rf db-branch
+
+      - name: Create date-tagged Release and upload DB
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          TAG="db-$(date -u +%Y%m%d-%H%M%S)"
+          SRC_SHA="$(git -C appsrc rev-parse --short HEAD)"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          gh release create "$TAG" --repo "$REPO" \
+            --title "DB ${TAG}" \
+            --notes "Built from ${{ inputs.db_branch }} (app ${SRC_SHA})"
+          gh release upload "$TAG" autorace_players.sqlite3 --repo "$REPO"
+          echo "Released: ${TAG}"
+
+      - name: Show Release summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ steps.release.outputs.tag }}" --repo "${{ github.repository }}" \
+            --json tagName,assets \
+            --jq '{tag: .tagName, assets: [.assets[] | {name, size}]}'
