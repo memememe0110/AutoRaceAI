@@ -169,31 +169,32 @@ def run_one_race(app_path: Path, snapshot: Path, race_key: str, mode: str, trial
         "run", str(app_path), "--server.headless=true",
         "--server.fileWatcherType=none", "--browser.gatherUsageStats=false",
     ]
-    proc = subprocess.Popen(cmd, cwd=str(app_path.parent), env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path = out_path.with_suffix(".log")
     start = time.monotonic()
-    logs: list[str] = []
-    try:
-        while time.monotonic() - start < timeout:
-            if out_path.exists():
-                break
-            line = proc.stdout.readline() if proc.stdout is not None else ""
-            if line:
-                logs.append(line.rstrip())
-            elif proc.poll() is not None:
-                break
-            else:
-                time.sleep(0.2)
-        if not out_path.exists():
-            raise TimeoutError(f"{mode} {race_key}: timeout {timeout:.0f}s; " + " | ".join(logs[-6:]))
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                proc.kill(); proc.wait(timeout=5)
+    with log_path.open("w", encoding="utf-8", errors="replace") as log:
+        proc = subprocess.Popen(cmd, cwd=str(app_path.parent), env=env,
+                                stdout=log, stderr=subprocess.STDOUT, text=True)
+        try:
+            while time.monotonic() - start < timeout:
+                if out_path.exists():
+                    break
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.5)
+            if not out_path.exists():
+                try:
+                    tail = log_path.read_text(encoding="utf-8", errors="replace")[-3500:]
+                except Exception:
+                    tail = ""
+                raise TimeoutError(f"{mode} {race_key}: timeout/process exit after {time.monotonic()-start:.1f}s; {tail}")
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait(timeout=5)
     data = json.loads(out_path.read_text(encoding="utf-8"))
     if not data.get("ok"):
         raise RuntimeError(f"{mode} {race_key}: {data.get('error') or data}")

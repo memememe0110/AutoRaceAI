@@ -42845,6 +42845,192 @@ _V330A_UI_RESULTS_DB = _V330A_UI_DIR / "lap1_results.sqlite3"
 _V330A_UI_SNAPSHOT = _V330A_UI_DIR / "readonly_snapshot.sqlite3"
 
 
+# ===== Ver330-A GitHub Actions一括検証ページ =====
+def _v330a_is_actions_page() -> bool:
+    try:
+        return str(st.query_params.get("v330a_actions", "")) == "1"
+    except Exception:
+        try:
+            return str((st.experimental_get_query_params().get("v330a_actions") or [""])[0]) == "1"
+        except Exception:
+            return False
+
+
+def _v330a_actions_contents(path: str, branch: str):
+    cfg = github_config()
+    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{urllib.parse.quote(path, safe='/')}?ref={urllib.parse.quote(branch, safe='')}"
+    status, body = github_request(url)
+    if status != 200 or not isinstance(body, dict):
+        return status, None
+    try:
+        return status, base64.b64decode(str(body.get("content") or "").replace("\n", ""))
+    except Exception:
+        return status, None
+
+
+def _v330a_actions_json(path: str, branch: str):
+    status, raw = _v330a_actions_contents(path, branch)
+    if status != 200 or raw is None:
+        return status, None
+    try:
+        return status, json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        return status, {"status": "invalid", "error": f"{type(exc).__name__}: {exc}"}
+
+
+_V330A_ACTIONS_PAGE = _v330a_is_actions_page()
+if _V330A_ACTIONS_PAGE:
+    st.title("Ver330-A Lap1 377R 一括検証")
+    st.caption("GitHub Actions上で計算します。Streamlit Cloudの同一プロセスGIL・/tmp再起動消失の影響を受けず、各R完了ごとにGitHubへチェックポイントを保存します。")
+    _cfg_actions = github_config()
+    _repo_actions = str(_cfg_actions.get("repo") or "").strip()
+    _code_branch_actions = str(_cfg_actions.get("branch") or "main")
+    _db_branch_actions = str(_cfg_actions.get("db_branch") or "autorace-db")
+    _db_path_actions = str(_cfg_actions.get("path") or "autorace_players.sqlite3")
+    if not _repo_actions or not _cfg_actions.get("token"):
+        st.error("Streamlit Secretsの GITHUB_TOKEN / GITHUB_REPO が未設定です。")
+        st.stop()
+    st.write(f"アプリbranch: `{_code_branch_actions}` / DB branch: `{_db_branch_actions}`")
+    st.write(f"DB path: `{_db_path_actions}` / 試行数: 20,000 / seed: 12345 / 対象: 377R")
+    _run_id_actions = ""
+    try:
+        _run_id_actions = str(st.query_params.get("run_id", "") or "").strip()
+    except Exception:
+        try:
+            _run_id_actions = str((st.experimental_get_query_params().get("run_id") or [""])[0]).strip()
+        except Exception:
+            pass
+    if not _run_id_actions:
+        _run_id_actions = str(st.session_state.get("v330a_actions_run_id") or "").strip()
+
+    _workflow_url_actions = f"https://github.com/{_repo_actions}/actions/workflows/ver330a-lap1.yml"
+    st.link_button("GitHub Actionsの実行状況を開く", _workflow_url_actions, use_container_width=True)
+    if not _run_id_actions:
+        _active_url_actions = (f"https://api.github.com/repos/{_repo_actions}/actions/workflows/"
+                               f"ver330a-lap1.yml/runs?branch={urllib.parse.quote(_code_branch_actions)}&event=workflow_dispatch&per_page=20")
+        _active_http_actions, _active_body_actions = github_request(_active_url_actions)
+        _active_run_actions = None
+        if _active_http_actions == 200 and isinstance(_active_body_actions, dict):
+            _active_run_actions = next((r for r in (_active_body_actions.get("workflow_runs") or [])
+                                        if str(r.get("status") or "") in ("queued", "in_progress")), None)
+        st.warning("開始ボタンを押すと377Rの一括検証が始まります。処理は最大40Rずつ10ジョブに分け、GitHub Actions内で自動的に続行します。")
+        if _active_run_actions:
+            st.info(f"別の一括検証が {_active_run_actions.get('status')} です。重複起動を防ぐため、新規開始を停止しています。")
+            st.link_button("実行中のActionsを開く", str(_active_run_actions.get("html_url") or _workflow_url_actions), use_container_width=True)
+        if st.button("▶ 377R一括検証を開始", type="primary", use_container_width=True, key="v330a_actions_start", disabled=bool(_active_run_actions)):
+            _new_run_id = "lap1_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+            _dispatch_url = f"https://api.github.com/repos/{_repo_actions}/actions/workflows/ver330a-lap1.yml/dispatches"
+            _dispatch_status, _dispatch_body = github_request(
+                _dispatch_url, method="POST",
+                payload={"ref": _code_branch_actions, "inputs": {
+                    "run_id": _new_run_id,
+                    "db_branch": _db_branch_actions,
+                    "db_path": _db_path_actions,
+                }},
+            )
+            if _dispatch_status == 204:
+                st.session_state["v330a_actions_run_id"] = _new_run_id
+                try:
+                    st.query_params["run_id"] = _new_run_id
+                except Exception:
+                    pass
+                st.success("GitHub Actionsへ起動要求を送信しました。進捗画面を開きます。")
+                st.rerun()
+            else:
+                _dispatch_message = (_dispatch_body or {}).get("message", _dispatch_body)
+                st.error(f"Actions起動に失敗しました（HTTP {_dispatch_status}）。{_dispatch_message}")
+                st.info("GITHUB_TOKENに Actions: Read and write と Contents: Read and write の権限が必要です。")
+        st.stop()
+
+    st.markdown(f"**Run ID:** `{_run_id_actions}`")
+    _progress_rel_actions = f"validation/ver330a_lap1/{_run_id_actions}/progress.json"
+    _csv_rel_actions = f"validation/ver330a_lap1/{_run_id_actions}/results.csv"
+
+    @st.fragment(run_every="10s")
+    def _v330a_actions_progress_fragment():
+        _runs_url = (f"https://api.github.com/repos/{_repo_actions}/actions/workflows/"
+                     f"ver330a-lap1.yml/runs?branch={urllib.parse.quote(_code_branch_actions)}&event=workflow_dispatch&per_page=20")
+        _runs_status, _runs_body = github_request(_runs_url)
+        _matched_run = None
+        if _runs_status == 200 and isinstance(_runs_body, dict):
+            for _candidate_run in (_runs_body.get("workflow_runs") or []):
+                _title = str(_candidate_run.get("display_title") or _candidate_run.get("name") or "")
+                if _run_id_actions in _title:
+                    _matched_run = _candidate_run
+                    break
+        if _matched_run:
+            st.caption(f"Actions状態: {_matched_run.get('status','-')} / 結果: {_matched_run.get('conclusion') or '実行中'}")
+        _status_code, _progress_obj = _v330a_actions_json(_progress_rel_actions, _db_branch_actions)
+        if _status_code == 404:
+            if _matched_run:
+                st.info(f"GitHub Actions { _matched_run.get('status','起動中') }。最初のレースが完了すると進捗が表示されます。")
+            else:
+                st.info("GitHub Actionsの起動待ち、または初期化中です。数秒後に自動更新します。")
+        elif _status_code != 200:
+            st.warning(f"進捗取得待ち（HTTP {_status_code}）。GitHub側の初期化中か、token権限を確認してください。")
+        elif isinstance(_progress_obj, dict):
+            _pstatus = str(_progress_obj.get("status") or "unknown")
+            _done_count = int(_progress_obj.get("done_count") or 0)
+            _total_count = int(_progress_obj.get("total") or 377)
+            _failed_count = int(_progress_obj.get("failed_count") or 0)
+            st.subheader({"running":"🟢 実行中","completed":"✅ 完了","failed":"⚠️ 停止・要確認"}.get(_pstatus,_pstatus))
+            st.metric("進捗", f"{_done_count} / {_total_count} R", f"{(_done_count/max(1,_total_count))*100:.1f}%")
+            st.progress(min(1.0, max(0.0, _done_count / float(max(1,_total_count)))))
+            _pc1, _pc2, _pc3 = st.columns(3)
+            _pc1.metric("成功", _done_count)
+            _pc2.metric("失敗", _failed_count)
+            _pc3.metric("未処理", max(0,_total_count-_done_count))
+            _current = str(_progress_obj.get("current_race") or "")
+            _last = str(_progress_obj.get("last_completed_race") or "")
+            if _current:
+                st.write(f"処理中: **{_current}**")
+            elif _last:
+                st.write(f"直近完了: **{_last}**")
+            _elapsed = int(_progress_obj.get("elapsed_seconds") or 0)
+            _remain = _progress_obj.get("estimated_remaining_seconds")
+            def _fmt_duration_actions(sec):
+                sec=max(0,int(sec or 0)); h=sec//3600; m=(sec%3600)//60
+                return f"{h}時間{m}分" if h else f"{m}分"
+            _tc1, _tc2 = st.columns(2)
+            _tc1.metric("経過時間", _fmt_duration_actions(_elapsed))
+            _tc2.metric("推定残り", _fmt_duration_actions(_remain) if _remain is not None else "算出中")
+            st.caption(f"開始: {_progress_obj.get('started_at','-')} / 最終更新: {_progress_obj.get('updated_at','-')}")
+            if _pstatus == "failed":
+                st.error(str(_progress_obj.get("last_error") or _progress_obj.get("error") or "処理が停止しました。"))
+            _summary = _progress_obj.get("summary_so_far") or _progress_obj.get("final_summary") or {}
+            _med = _summary.get("median") or {}
+            if _med:
+                st.markdown("**現在の中央値（暫定）**")
+                st.json(_med)
+        else:
+            st.warning("進捗JSONの形式を確認できませんでした。")
+
+    _v330a_actions_progress_fragment()
+    _resume_http_actions, _resume_obj_actions = _v330a_actions_json(_progress_rel_actions, _db_branch_actions)
+    if isinstance(_resume_obj_actions, dict) and str(_resume_obj_actions.get("status") or "") == "failed":
+        if st.button("失敗地点から同じRun IDで再開", type="primary", use_container_width=True, key="v330a_actions_resume"):
+            _resume_url_actions = f"https://api.github.com/repos/{_repo_actions}/actions/workflows/ver330a-lap1.yml/dispatches"
+            _resume_status_actions, _resume_body_actions = github_request(
+                _resume_url_actions, method="POST",
+                payload={"ref": _code_branch_actions, "inputs": {
+                    "run_id": _run_id_actions,
+                    "db_branch": _db_branch_actions,
+                    "db_path": _db_path_actions,
+                }},
+            )
+            if _resume_status_actions == 204:
+                st.success("同じRun IDで再開要求を送信しました。成功済みレースはスキップします。")
+                st.rerun()
+            else:
+                st.error(f"再開に失敗しました（HTTP {_resume_status_actions}）: {(_resume_body_actions or {}).get('message',_resume_body_actions)}")
+    _csv_status_actions, _csv_bytes_actions = _v330a_actions_contents(_csv_rel_actions, _db_branch_actions)
+    if _csv_status_actions == 200 and _csv_bytes_actions:
+        st.download_button("途中結果CSVを保存", _csv_bytes_actions,
+                           f"ver326_lap1_metrics_{_run_id_actions}.csv", "text/csv", use_container_width=True)
+    st.caption("進捗は10秒ごとにGitHubから取得します。別タブでも同じURLを開けば同じ進捗を確認できます。")
+    st.stop()
+
+
 def _v330a_ui_result_db():
     con = sqlite3.connect(str(_V330A_UI_RESULTS_DB), timeout=30)
     con.execute("PRAGMA busy_timeout=30000")
