@@ -1,61 +1,57 @@
 name: Ver330A Lap1 Validation
-run-name: "Ver330A Lap1 Validation - ${{ inputs.run_id }}"
+run-name: "Ver330A Lap1 - ${{ inputs.run_id }}"
 
 on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: 'Run ID (e.g., lap1_20261105_120000)'
+        description: 'Run ID'
         required: true
-        type: string
+        default: 'lap1_run1'
       db_branch:
-        description: 'DB branch name'
+        description: 'DB branch'
         required: true
         default: 'autorace-db'
-        type: string
       db_path:
-        description: 'DB path on DB branch'
+        description: 'DB path'
         required: true
         default: 'autorace_players.sqlite3'
-        type: string
+
+permissions:
+  contents: write
 
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     steps:
-      - name: Checkout code branch
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
 
-      - name: Checkout DB branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.db_branch }}
           path: db-branch
           fetch-depth: 1
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install -r requirements.txt
           pip install streamlit
 
-      - name: Prepare validation DB
+      - name: Prepare DB
         run: |
           python prepare_validation_db.py \
             --db-root db-branch \
             --db-path "${{ inputs.db_path }}" \
             --output validation_workdir/autorace_players.sqlite3
 
-      - name: Run validation batch
+      - name: Run batch
         run: |
           python run_ver330a_actions.py \
             --db validation_workdir/autorace_players.sqlite3 \
@@ -64,29 +60,6 @@ jobs:
             --results-rel validation/ver330a_lap1 \
             --run-id "${{ inputs.run_id }}" \
             --branch "${{ inputs.db_branch }}" \
-            --max-races 40 \
+            --max-races 100 \
             --trials 20000 \
             --seed 12345
-
-      - name: Continue with next batch (auto-chain)
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
-          RUN_ID: ${{ inputs.run_id }}
-          DB_BRANCH: ${{ inputs.db_branch }}
-          DB_PATH: ${{ inputs.db_path }}
-        run: |
-          PROGRESS=$(curl -s -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/$REPO/contents/validation/ver330a_lap1/$RUN_ID/progress.json?ref=$DB_BRANCH")
-          CONTENT=$(echo "$PROGRESS" | jq -r '.content // empty' | base64 -d 2>/dev/null)
-          STATUS=$(echo "$CONTENT" | jq -r '.status // "unknown"')
-          DONE=$(echo "$CONTENT" | jq -r '.done_count // 0')
-          if [ "$STATUS" = "running" ] && [ "$DONE" -lt 377 ]; then
-            curl -s -X POST \
-              -H "Authorization: token $GH_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$REPO/actions/workflows/ver330a-lap1.yml/dispatches" \
-              -d "{\"ref\":\"$BRANCH\",\"inputs\":{\"run_id\":\"$RUN_ID\",\"db_branch\":\"$DB_BRANCH\",\"db_path\":\"$DB_PATH\"}}"
-          fi
