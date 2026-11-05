@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Resumable, per-race Ver326 Lap1 validation worker for GitHub Actions.
 
-Results and progress are checkpointed to the checked-out DB branch after every race.
+Results and progress are checkpointed to a dedicated validation branch after every race.
 No production DB writes or learning/history updates are performed.
 """
 from __future__ import annotations
@@ -136,7 +136,7 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--db',required=True)
     ap.add_argument('--app',required=True)
-    ap.add_argument('--db-root',required=True)
+    ap.add_argument('--db-root',required=True, help='Git checkout root for validation outputs; not the source DB branch')
     ap.add_argument('--results-rel',required=True)
     ap.add_argument('--run-id',required=True)
     ap.add_argument('--branch',required=True)
