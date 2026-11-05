@@ -60,7 +60,7 @@ def main() -> int:
         if str(integrity).lower() != 'ok':
             raise SystemExit(f'SQLite integrity_check failed: {integrity}')
         tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        required = {'result_laps', 'v222_prediction_restore'}
+        required = {'result_laps', 'v222_prediction_restore', 'v231_prediction_history'}
         missing = sorted(required - tables)
         if missing:
             raise SystemExit('Required validation tables missing: ' + ', '.join(missing))
