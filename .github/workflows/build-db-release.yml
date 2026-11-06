@@ -25,55 +25,130 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
 
     steps:
-      - name: Show disk before anything
+      - name: Show disk before
         run: df -h /home/runner
 
-      - name: Checkout application source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          path: appsrc
-          fetch-depth: 1
-
-      - name: Checkout source DB branch (chunks)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.db_branch }}
-          path: db-branch
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Show disk after checkout
+      - name: Resolve immutable DB commit SHA
+        id: db_sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ inputs.db_branch }}
         run: |
-          df -h /home/runner
-          du -sh db-branch/.git db-branch 2>/dev/null || true
+          set -euo pipefail
+          SHA="$(gh api "repos/${REPO}/branches/${BRANCH}" --jq .commit.sha)"
+          if [ -z "$SHA" ]; then
+            echo "::error::Could not resolve ${BRANCH} SHA"; exit 1
+          fi
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${BRANCH} -> ${SHA}"
 
-      - name: Free git objects immediately
-        run: rm -rf db-branch/.git
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Merge chunks into single SQLite
+      - name: Download manifest via raw CDN (SHA-pinned)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.db_sha.outputs.sha }}
+          DB: ${{ inputs.db_path }}
         run: |
-          python appsrc/prepare_validation_db.py \
-            --db-root db-branch \
-            --db-path "${{ inputs.db_path }}" \
-            --output autorace_players.sqlite3
+          set -euo pipefail
+          mkdir -p chunks
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --max-time 60 \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "https://raw.githubusercontent.com/${REPO}/${SHA}/${DB}.chunks.json" \
+            -o chunks/manifest.json
+          python - <<'PY'
+          import json
+          m = json.load(open('chunks/manifest.json'))
+          assert m.get('format') == 'AutoRaceAI-sqlite-chunks-v4-atomic', 'Unexpected format'
+          parts = m['parts']; sizes = m['part_sizes']; shas = m['part_sha256']
+          assert len(parts) == len(sizes) == len(shas), 'Manifest array mismatch'
+          total = sum(int(s) for s in sizes)
+          assert total == int(m['size']), f'Total size mismatch: {total} != {m["size"]}'
+          n_8m = sum(1 for s in sizes if int(s) == 8*1024*1024)
+          n_other = len(sizes) - n_8m
+          assert len(parts) == 118, f'Expected 118 parts, got {len(parts)}'
+          assert n_8m == 117, f'Expected 117 x 8MiB, got {n_8m}'
+          assert n_other == 1, f'Expected 1 tail part, got {n_other}'
+          print(f"manifest OK: {len(parts)} parts ({n_8m} x 8MiB + {n_other} tail), total={total:,} bytes")
+          print(f"overall sha256={m['sha256']}")
+          PY
 
-      - name: Verify merged DB (integrity + required tables)
+      - name: Download all chunk parts in parallel (P=8, SHA-pinned)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.db_sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python - <<'PY' > /tmp/part_urls.txt
+          import json
+          m = json.load(open('chunks/manifest.json'))
+          for p in m['parts']:
+              print(p)
+          PY
+          echo "Total parts to download: $(wc -l < /tmp/part_urls.txt)"
+          time cat /tmp/part_urls.txt | xargs -P 8 -I {} bash -c '
+            set -euo pipefail
+            PART="{}"
+            NAME="$(basename "$PART")"
+            OUT="chunks/$NAME"
+            for attempt in 1 2 3 4 5; do
+              if curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors --max-time 120 \
+                -H "Authorization: token '"${GH_TOKEN}"'" \
+                "https://raw.githubusercontent.com/'"${REPO}"'/'"${SHA}"'/${PART}" \
+                -o "$OUT"; then
+                break
+              fi
+              echo "Retry $attempt failed for $PART"
+              sleep 3
+            done
+            test -s "$OUT" || { echo "GAVE UP: $PART"; exit 1; }
+          '
+          echo "Downloaded: $(ls chunks/*.part | wc -l)"
+          du -sh chunks/
+
+      - name: Concatenate and verify against manifest
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, hashlib, sys
+          from pathlib import Path
+          m = json.load(open('chunks/manifest.json'))
+          parts = m['parts']; sizes = m['part_sizes']; shas = m['part_sha256']
+          expected_total = int(m['size'])
+          expected_overall = m['sha256']
+          out = Path('autorace_players.sqlite3')
+          h = hashlib.sha256()
+          total = 0
+          with out.open('wb') as f:
+              for i, (part, exp_size, exp_sha) in enumerate(zip(parts, sizes, shas), 1):
+                  p = Path('chunks') / Path(part).name
+                  if not p.is_file():
+                      sys.exit(f'Missing chunk {i}: {p}')
+                  data = p.read_bytes()
+                  if len(data) != int(exp_size):
+                      sys.exit(f'Chunk {i} size mismatch: {len(data)} != {exp_size}')
+                  if hashlib.sha256(data).hexdigest() != exp_sha:
+                      sys.exit(f'Chunk {i} SHA mismatch')
+                  f.write(data); h.update(data); total += len(data)
+                  if i % 20 == 0 or i == len(parts):
+                      print(f'chunk {i}/{len(parts)} OK, cumulative={total:,}', flush=True)
+          if total != expected_total:
+              sys.exit(f'Total size mismatch: {total} != {expected_total}')
+          if h.hexdigest() != expected_overall:
+              sys.exit(f'Overall SHA mismatch')
+          print(f'FINAL OK: {out.stat().st_size:,} bytes, sha256={h.hexdigest()}')
+          PY
+
+      - name: Verify SQLite integrity and required tables
         run: |
           python - <<'PY'
           import sqlite3
           from pathlib import Path
           p = Path('autorace_players.sqlite3')
-          if not p.is_file() or p.stat().st_size < 100:
-              raise SystemExit(f'DB missing or too small: {p}')
           if p.read_bytes()[:16] != b'SQLite format 3\x00':
               raise SystemExit('Not a SQLite database')
           with sqlite3.connect(f'file:{p.resolve().as_posix()}?mode=ro', uri=True) as con:
@@ -89,35 +164,35 @@ jobs:
           print(f'DB verified: {p.stat().st_size:,} bytes')
           PY
 
-      - name: Show merged DB info
+      - name: Free chunks
+        run: rm -rf chunks
+
+      - name: Show disk after build
         run: |
           df -h /home/runner
           ls -lh autorace_players.sqlite3
-          sha256sum autorace_players.sqlite3
-
-      - name: Free chunks immediately
-        run: rm -rf db-branch
 
       - name: Create date-tagged Release and upload DB
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DB_SHA: ${{ steps.db_sha.outputs.sha }}
         run: |
           set -euo pipefail
-          REPO="${{ github.repository }}"
           TAG="db-$(date -u +%Y%m%d-%H%M%S)"
-          SRC_SHA="$(git -C appsrc rev-parse --short HEAD)"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           gh release create "$TAG" --repo "$REPO" \
             --title "DB ${TAG}" \
-            --notes "Built from ${{ inputs.db_branch }} (app ${SRC_SHA})"
+            --notes "Built from ${DB_SHA} (immutable)"
           gh release upload "$TAG" autorace_players.sqlite3 --repo "$REPO"
           echo "Released: ${TAG}"
 
       - name: Show Release summary
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
-          gh release view "${{ steps.release.outputs.tag }}" --repo "${{ github.repository }}" \
+          gh release view "${{ steps.release.outputs.tag }}" --repo "$REPO" \
             --json tagName,assets \
             --jq '{tag: .tagName, assets: [.assets[] | {name, size}]}'
