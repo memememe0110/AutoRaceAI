@@ -3,11 +3,11 @@
   "phase": "Ver326 Lap1",
   "status": "running",
   "total": 377,
-  "done_count": 0,
-  "failed_count": 1,
-  "current_race": "20260726_飯塚_2R",
+  "done_count": 1,
+  "failed_count": 0,
+  "current_race": "",
   "started_at": "2026-11-06T00:37:05+00:00",
-  "updated_at": "2026-11-06T10:46:57+00:00",
+  "updated_at": "2026-11-06T10:48:59+00:00",
   "trials": 20000,
   "seed": 12345,
   "batch_limit": 1,
@@ -22,5 +22,25 @@
       "20260809_川口_12R"
     ]
   },
-  "last_error": "TimeoutError: Ver326 20260726_飯塚_2R: timeout/process exit after 1800.2s; 2026-11-06 00:37:11.419 Uvicorn server started on :::8501\n\n  You can now view your Streamlit app in your browser.\n\n  Local URL: http://localhost:8501\n  Network URL: http://10.1.1.178:8501\n  External URL: http://4.149.237.151:8501\n\n"
+  "last_error": "TimeoutError: Ver326 20260726_飯塚_2R: timeout/process exit after 1800.2s; 2026-11-06 00:37:11.419 Uvicorn server started on :::8501\n\n  You can now view your Streamlit app in your browser.\n\n  Local URL: http://localhost:8501\n  Network URL: http://10.1.1.178:8501\n  External URL: http://4.149.237.151:8501\n\n",
+  "last_completed_race": "20260726_飯塚_2R",
+  "elapsed_seconds": 36714,
+  "estimated_remaining_seconds": 13804645,
+  "summary_so_far": {
+    "median": {
+      "n_races": 1,
+      "pattern_rank": 5.0,
+      "pattern_rank_cutoff_25pct_median": 752.0,
+      "uniform_ratio": 659.232,
+      "top1_prob": 0.02685,
+      "relative_lift": 0.6089385474860335
+    },
+    "pass": {
+      "pattern_rank": true,
+      "uniform_ratio": true,
+      "top1_prob": true,
+      "relative_lift": true
+    },
+    "all_four_pass": true
+  }
 }
