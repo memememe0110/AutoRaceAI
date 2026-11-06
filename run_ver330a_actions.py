@@ -165,11 +165,14 @@ def main():
     common, contamination = load_target_set(db)
 
     started=str(progress.get('started_at') or now_iso())
+    batch_started_at=now_iso()
     remaining=[k for k in common if k not in done]
     progress.update({
         'run_id':a.run_id,'phase':'Ver326 Lap1','status':'running',
         'total':verify.EXPECTED_LAP1_COUNT,'done_count':len(done),'failed_count':sum(1 for r in rows if str(r.get('ok','')).lower() not in ('true','1')),
         'current_race':'','started_at':started,'updated_at':now_iso(),
+        'batch_started_at':batch_started_at,
+        'last_error':'',
         'trials':a.trials,'seed':a.seed,'batch_limit':a.max_races,
         'db_sha256':_file_sha256(db),
         'target_check':contamination,
@@ -179,6 +182,7 @@ def main():
     git_checkpoint(db_root,a.branch,progress_path,csv_path,f'Ver330-A validation {a.run_id}: worker started')
 
     batch=remaining[:max(1,a.max_races)]
+    done_at_batch_start = len(done)
     for race_key in batch:
         progress.update({'current_race':race_key,'updated_at':now_iso(),'done_count':len(done)})
         progress_path.write_text(json.dumps(progress,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -208,11 +212,13 @@ def main():
         rows=[r for r in rows if str(r.get('race_key')) != race_key]+[row]
         done.add(race_key)
         write_rows(csv_path,rows)
-        elapsed=max(1,(datetime.now(timezone.utc)-datetime.fromisoformat(started.replace('Z','+00:00'))).total_seconds())
-        avg=elapsed/len(done)
+        elapsed=max(1,(datetime.now(timezone.utc)-datetime.fromisoformat(batch_started_at.replace('Z','+00:00'))).total_seconds())
+        batch_done_this_run = max(1, len(done) - done_at_batch_start)
+        avg = elapsed / batch_done_this_run
         progress.update({
             'status':'running','done_count':len(done),'failed_count':0,
             'current_race':'','last_completed_race':race_key,'updated_at':now_iso(),
+            'last_error':'',
             'elapsed_seconds':int(elapsed),'estimated_remaining_seconds':int(max(0,len(common)-len(done))*avg),
             'summary_so_far':summary_from_rows(rows),
         })
