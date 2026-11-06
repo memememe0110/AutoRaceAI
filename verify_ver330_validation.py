@@ -152,6 +152,8 @@ def actual_lap_order(con, race_key: str) -> tuple[int, ...] | None:
 
 
 def run_one_race(app_path: Path, snapshot: Path, race_key: str, mode: str, trials: int, seed: int, out_path: Path, timeout: float) -> dict:
+    import urllib.request
+    from playwright.sync_api import sync_playwright
     env = os.environ.copy()
     env.update({
         "AUTORACE_VER330A_COMPARE": "1",
@@ -166,28 +168,56 @@ def run_one_race(app_path: Path, snapshot: Path, race_key: str, mode: str, trial
     })
     streamlit = shutil.which("streamlit")
     cmd = ([streamlit] if streamlit else [sys.executable, "-m", "streamlit"]) + [
-        "run", str(app_path), "--server.headless=true",
-        "--server.fileWatcherType=none", "--browser.gatherUsageStats=false",
+        "run", str(app_path),
+        "--server.headless=true",
+        "--server.fileWatcherType=none",
+        "--browser.gatherUsageStats=false",
+        "--server.port=8501",
     ]
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.unlink(missing_ok=True)  # stale output protection
     log_path = out_path.with_suffix(".log")
     start = time.monotonic()
     with log_path.open("w", encoding="utf-8", errors="replace") as log:
         proc = subprocess.Popen(cmd, cwd=str(app_path.parent), env=env,
                                 stdout=log, stderr=subprocess.STDOUT, text=True)
         try:
-            while time.monotonic() - start < timeout:
-                if out_path.exists():
+            # Wait for streamlit health endpoint (up to 120s)
+            boot_deadline = start + 120
+            booted = False
+            while time.monotonic() < boot_deadline:
+                try:
+                    urllib.request.urlopen("http://127.0.0.1:8501/_stcore/health", timeout=2).read()
+                    booted = True
                     break
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.5)
+                except Exception:
+                    if proc.poll() is not None:
+                        raise RuntimeError(f"{mode} {race_key}: streamlit exited during boot")
+                    time.sleep(1)
+            if not booted:
+                raise RuntimeError(f"{mode} {race_key}: streamlit boot timeout (120s)")
+
+            # Trigger app.py script execution via headless Chromium
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+                try:
+                    page = browser.new_page()
+                    page.goto("http://127.0.0.1:8501/", timeout=60000, wait_until="domcontentloaded")
+                    while time.monotonic() - start < timeout:
+                        if out_path.exists():
+                            break
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(1)
+                finally:
+                    browser.close()
+
             if not out_path.exists():
                 try:
                     tail = log_path.read_text(encoding="utf-8", errors="replace")[-3500:]
                 except Exception:
                     tail = ""
-                raise TimeoutError(f"{mode} {race_key}: timeout/process exit after {time.monotonic()-start:.1f}s; {tail}")
+                raise TimeoutError(f"{mode} {race_key}: timeout after {time.monotonic()-start:.1f}s; {tail}")
         finally:
             if proc.poll() is None:
                 proc.terminate()
