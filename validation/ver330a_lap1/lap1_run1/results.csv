@@ -1,1 +1,10 @@
 ﻿race_key,car_count,actual_pattern,unique_pattern_count,pattern_rank,pattern_count,pattern_prob,uniform_ratio,top1_prob,relative_lift,observed_trials,rank_cutoff_25pct,rank_pass,uniform_pass,top1_pass,relative_lift_pass,sim_trials_reported,ok,error
+20260726_飯塚_2R,,,,,,,,,,,,,,,,,False,"TimeoutError: Ver326 20260726_飯塚_2R: timeout/process exit after 1800.2s; 2026-11-06 00:37:11.419 Uvicorn server started on :::8501
+
+  You can now view your Streamlit app in your browser.
+
+  Local URL: http://localhost:8501
+  Network URL: http://10.1.1.178:8501
+  External URL: http://4.149.237.151:8501
+
+"

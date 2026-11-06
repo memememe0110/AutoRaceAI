@@ -1,13 +1,13 @@
 {
   "run_id": "lap1_run1",
   "phase": "Ver326 Lap1",
-  "status": "running",
+  "status": "failed",
   "total": 377,
   "done_count": 0,
-  "failed_count": 0,
+  "failed_count": 1,
   "current_race": "20260726_飯塚_2R",
   "started_at": "2026-11-06T00:37:05+00:00",
-  "updated_at": "2026-11-06T00:37:07+00:00",
+  "updated_at": "2026-11-06T01:07:09+00:00",
   "trials": 20000,
   "seed": 12345,
   "batch_limit": 100,
@@ -21,5 +21,6 @@
     "excluded_no_lap1": [
       "20260809_川口_12R"
     ]
-  }
+  },
+  "last_error": "TimeoutError: Ver326 20260726_飯塚_2R: timeout/process exit after 1800.2s; 2026-11-06 00:37:11.419 Uvicorn server started on :::8501\n\n  You can now view your Streamlit app in your browser.\n\n  Local URL: http://localhost:8501\n  Network URL: http://10.1.1.178:8501\n  External URL: http://4.149.237.151:8501\n\n"
 }
