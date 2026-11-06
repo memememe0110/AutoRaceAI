@@ -92,7 +92,10 @@ def load_target_set(db: Path):
         actual={str(r[0]) for r in con.execute(
             f'SELECT DISTINCT race_key FROM result_laps WHERE {actual_cond}',(actual_value,)
         ).fetchall() if str(r[0] or '').strip()}
-    shared=v326 & v328
+        has_result={str(r[0]) for r in con.execute(
+            "SELECT DISTINCT race_key FROM result_races"
+        ).fetchall() if str(r[0] or '').strip()}
+    shared=(v326 & v328) & has_result
     missing_lap1=sorted(shared-actual)
     if set(missing_lap1) != set(verify.EXCLUDED_NO_LAP1):
         raise RuntimeError(f'Unexpected common-set Lap1 exclusions: {missing_lap1}')
