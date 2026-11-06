@@ -9,28 +9,15 @@ on:
         required: true
         default: 'lap1_run1'
         type: string
-      db_branch:
-        description: 'Read-only source DB branch'
-        required: true
-        default: 'autorace-db'
-        type: string
       results_branch:
         description: 'Dedicated validation output branch'
         required: true
         default: 'autorace-validation'
         type: string
-      db_path:
-        description: 'DB path on source DB branch'
-        required: true
-        default: 'autorace_players.sqlite3'
-        type: string
 
 permissions:
   contents: write
 
-# Serialize validation runs because they checkpoint to one results branch.
-# Normal registration is unaffected: it writes to autorace-db, while this job
-# only pushes validation artifacts to autorace-validation.
 concurrency:
   group: ver330a-lap1-validation
   cancel-in-progress: false
@@ -48,38 +35,63 @@ jobs:
           path: appsrc
           fetch-depth: 1
 
-      - name: Resolve immutable source DB commit (no DB download)
-        id: db_ref
+      - name: Resolve latest db-* Release tag
+        id: db_tag
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          DB_BRANCH: ${{ inputs.db_branch }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          AUTH_HEADER="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
-          DB_SHA="$(git -c http.extraheader="AUTHORIZATION: basic ${AUTH_HEADER}" \
-            ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" "refs/heads/${DB_BRANCH}" | awk 'NR==1 {print $1}')"
-          if [ -z "$DB_SHA" ]; then
-            echo "Could not resolve source DB branch: ${DB_BRANCH}" >&2
-            exit 1
+          TAG="$(gh release list --repo "$REPO" --limit 100 \
+                 --json tagName,publishedAt \
+                 --jq '[.[] | select(.tagName | startswith("db-"))] | sort_by(.publishedAt) | reverse | .[0].tagName')"
+          if [ -z "$TAG" ]; then
+            echo "::error::No db-* release found"; exit 1
           fi
-          echo "sha=${DB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "Source DB commit: ${DB_SHA}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved latest DB release: ${TAG}"
 
-      - name: Restore prepared DB cache
-        id: db_cache
-        uses: actions/cache/restore@v4
-        with:
-          path: validation_workdir/autorace_players.sqlite3
-          key: autorace-db-${{ inputs.db_branch }}-${{ steps.db_ref.outputs.sha }}-v1
+      - name: Show disk before download
+        run: df -h /home/runner
 
-      - name: Checkout source DB branch only on cache miss
-        if: steps.db_cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.db_ref.outputs.sha }}
-          path: db-branch
-          fetch-depth: 1
-          persist-credentials: false
+      - name: Download DB from Release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.db_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p validation_workdir
+          gh release download "$TAG" --repo "$REPO" \
+            --pattern "autorace_players.sqlite3" \
+            --dir validation_workdir
+          ls -lh validation_workdir/
+
+      - name: Verify DB integrity and required tables
+        run: |
+          python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+          p = Path('validation_workdir/autorace_players.sqlite3')
+          if not p.is_file() or p.stat().st_size < 100:
+              raise SystemExit(f'DB missing or too small: {p}')
+          if p.read_bytes()[:16] != b'SQLite format 3\x00':
+              raise SystemExit('Not a SQLite database')
+          with sqlite3.connect(f'file:{p.resolve().as_posix()}?mode=ro', uri=True) as con:
+              con.execute('PRAGMA query_only=ON')
+              integrity = con.execute('PRAGMA integrity_check').fetchone()[0]
+              if str(integrity).lower() != 'ok':
+                  raise SystemExit(f'integrity_check failed: {integrity}')
+              tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+              required = {'result_laps', 'v222_prediction_restore', 'v231_prediction_history'}
+              missing = sorted(required - tables)
+              if missing:
+                  raise SystemExit('Missing required tables: ' + ', '.join(missing))
+          print(f'DB ready: {p.stat().st_size:,} bytes')
+          PY
+
+      - name: Show disk after download
+        run: df -h /home/runner
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -91,41 +103,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install numpy pandas openpyxl streamlit
 
-      - name: Prepare and verify DB snapshot (cache miss only)
-        if: steps.db_cache.outputs.cache-hit != 'true'
-        run: |
-          python appsrc/prepare_validation_db.py \
-            --db-root db-branch \
-            --db-path "${{ inputs.db_path }}" \
-            --output validation_workdir/autorace_players.sqlite3
-
-      - name: Validate restored or prepared DB
-        run: |
-          python - <<'PY'
-          import sqlite3
-          from pathlib import Path
-          p = Path('validation_workdir/autorace_players.sqlite3')
-          if not p.is_file() or p.stat().st_size < 100:
-              raise SystemExit(f'Validation DB missing or unexpectedly small: {p}')
-          with sqlite3.connect(f'file:{p.resolve().as_posix()}?mode=ro', uri=True) as con:
-              con.execute('PRAGMA query_only=ON')
-              tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-              required = {'result_laps', 'v222_prediction_restore'}
-              missing = sorted(required - tables)
-              if missing:
-                  raise SystemExit('Cached DB missing required tables: ' + ', '.join(missing))
-          print(f'DB ready: {p.stat().st_size:,} bytes')
-          PY
-
-      # Save immediately after preparation, before the long race-validation job.
-      # This preserves the DB cache even if the later batch fails or times out.
-      - name: Save prepared DB cache (cache miss only)
-        if: steps.db_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: validation_workdir/autorace_players.sqlite3
-          key: autorace-db-${{ inputs.db_branch }}-${{ steps.db_ref.outputs.sha }}-v1
-
       - name: Checkout dedicated validation results branch
         uses: actions/checkout@v4
         with:
@@ -134,18 +111,25 @@ jobs:
           fetch-depth: 1
 
       - name: Run next batch (up to 100 races)
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          RESULTS_BRANCH: ${{ inputs.results_branch }}
         run: |
           python appsrc/run_ver330a_actions.py \
             --db validation_workdir/autorace_players.sqlite3 \
             --app appsrc/app.py \
             --db-root validation-output \
             --results-rel validation/ver330a_lap1 \
-            --run-id "${{ inputs.run_id }}" \
-            --branch "${{ inputs.results_branch }}" \
+            --run-id "$RUN_ID" \
+            --branch "$RESULTS_BRANCH" \
             --max-races 100 \
             --trials 20000 \
             --seed 12345 \
             --timeout 1800
+
+      - name: Show disk after batch
+        if: always()
+        run: df -h /home/runner
 
       - name: Upload this batch report
         if: always()
