@@ -3,11 +3,11 @@
   "phase": "Ver326 Lap1",
   "status": "running",
   "total": 377,
-  "done_count": 152,
+  "done_count": 153,
   "failed_count": 0,
-  "current_race": "20260919_伊勢崎_7R",
+  "current_race": "",
   "started_at": "2026-11-06T00:37:05+00:00",
-  "updated_at": "2026-11-06T16:23:08+00:00",
+  "updated_at": "2026-11-06T16:25:18+00:00",
   "trials": 20000,
   "seed": 12345,
   "batch_limit": 200,
@@ -23,17 +23,17 @@
     ]
   },
   "last_error": "",
-  "last_completed_race": "20260919_伊勢崎_6R",
-  "elapsed_seconds": 14173,
-  "estimated_remaining_seconds": 28730,
+  "last_completed_race": "20260919_伊勢崎_7R",
+  "elapsed_seconds": 14304,
+  "estimated_remaining_seconds": 28608,
   "summary_so_far": {
     "median": {
-      "n_races": 152,
+      "n_races": 153,
       "pattern_rank": 22.0,
-      "pattern_rank_cutoff_25pct_median": 815.0,
-      "uniform_ratio": 66.52799999999999,
-      "top1_prob": 0.028825,
-      "relative_lift": 0.24298445073797725
+      "pattern_rank_cutoff_25pct_median": 820.0,
+      "uniform_ratio": 64.512,
+      "top1_prob": 0.02865,
+      "relative_lift": 0.23887587822014053
     },
     "pass": {
       "pattern_rank": true,
