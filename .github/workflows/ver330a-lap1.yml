@@ -14,6 +14,11 @@ on:
         required: true
         default: 'autorace-validation'
         type: string
+      max_races:
+        description: 'Races per batch (use 1 for first diagnostic, then 40)'
+        required: true
+        default: '1'
+        type: string
 
 permissions:
   contents: write
@@ -98,10 +103,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install validation dependencies
+      - name: Install validation dependencies (with Playwright)
         run: |
           python -m pip install --upgrade pip
           python -m pip install numpy pandas openpyxl streamlit
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
 
       - name: Checkout dedicated validation results branch
         uses: actions/checkout@v4
@@ -110,10 +117,11 @@ jobs:
           path: validation-output
           fetch-depth: 1
 
-      - name: Run next batch (up to 100 races)
+      - name: Run next batch (up to ${{ inputs.max_races }} races)
         env:
           RUN_ID: ${{ inputs.run_id }}
           RESULTS_BRANCH: ${{ inputs.results_branch }}
+          MAX_RACES: ${{ inputs.max_races }}
         run: |
           python appsrc/run_ver330a_actions.py \
             --db validation_workdir/autorace_players.sqlite3 \
@@ -122,7 +130,7 @@ jobs:
             --results-rel validation/ver330a_lap1 \
             --run-id "$RUN_ID" \
             --branch "$RESULTS_BRANCH" \
-            --max-races 100 \
+            --max-races "$MAX_RACES" \
             --trials 20000 \
             --seed 12345 \
             --timeout 1800
