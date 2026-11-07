@@ -65,33 +65,57 @@ def run_mode(verify, app_path, snapshot, race_key, mode, trials, seed, timeout, 
 
 
 def compare(a: dict, b: dict) -> dict:
+    """Axis A 判定。
+
+    集約hashは全試行のRNGストリームを含むため、Ver330-Aのlap6変更が
+    試行1以降のlap1-5にも波及してDIFFになる。実装独立性の判定は
+    「試行0だけ」の trial0_hash で行う。
+    """
     fa = a.get("fingerprint") or {}
     fb = b.get("fingerprint") or {}
     rows = []
     for lap in range(1, 7):
         x = fa.get(str(lap)) or {}
         y = fb.get(str(lap)) or {}
-        rows.append({"lap": lap, "identical": x == y, "ver326": x, "ver330a": y})
-    lap2_5 = all(r["identical"] for r in rows if 2 <= r["lap"] <= 5)
-    lap6_diff = any(not r["identical"] for r in rows if r["lap"] == 6)
+        trial0_a = str(x.get("trial0_hash") or "")
+        trial0_b = str(y.get("trial0_hash") or "")
+        rows.append({
+            "lap": lap,
+            "identical": x == y,
+            "trial0_identical": bool(trial0_a and trial0_a == trial0_b),
+            "ver326": x,
+            "ver330a": y,
+        })
+    trial0_lap2_5 = all(r["trial0_identical"] for r in rows if 2 <= r["lap"] <= 5)
+    trial0_lap6_diff = any(not r["trial0_identical"] for r in rows if r["lap"] == 6)
     fingerprints_present = bool(
-        rows and all(r["ver326"] and r["ver330a"] for r in rows)
+        rows
+        and all(
+            r["ver326"] and r["ver330a"] and r["ver326"].get("trial0_hash")
+            for r in rows
+        )
     )
     sim326 = int(a.get("sim_trials") or a.get("trials") or 0)
     sim330 = int(b.get("sim_trials") or b.get("trials") or 0)
     return {
-        "lap2_5_bit_identical": bool(lap2_5),
-        "lap6_diff": bool(lap6_diff),
+        "trial0_lap2_5_identical": bool(trial0_lap2_5),
+        "trial0_lap6_diff": bool(trial0_lap6_diff),
+        "lap2_5_bit_identical": bool(trial0_lap2_5),
+        "lap6_diff": bool(trial0_lap6_diff),
         "fingerprints_present": fingerprints_present,
         "sim_count_identical": bool(sim326 == sim330 and sim326 > 0),
         "ver326_sim_count": sim326,
         "ver330a_sim_count": sim330,
-        # Axis A 正式合格: 周2-5一致 かつ 周6に差 かつ fingerprint存在
         "axis_a_valid": bool(
-            fingerprints_present and lap2_5 and lap6_diff and sim326 == sim330 and sim326 > 0
+            fingerprints_present
+            and trial0_lap2_5
+            and trial0_lap6_diff
+            and sim326 == sim330
+            and sim326 > 0
         ),
         "rows": rows,
     }
+
 
 
 def main() -> int:
@@ -151,19 +175,26 @@ def main() -> int:
 
     summary = {
         "axis_a_valid": result["axis_a_valid"],
+        "trial0_lap2_5_identical": result.get("trial0_lap2_5_identical"),
+        "trial0_lap6_diff": result.get("trial0_lap6_diff"),
         "lap2_5_bit_identical": result["lap2_5_bit_identical"],
         "lap6_diff": result["lap6_diff"],
         "fingerprints_present": result["fingerprints_present"],
         "race_key": result["race_key"],
     }
     print(json.dumps(summary, ensure_ascii=False))
-    for r in result["rows"]:
-        flag = "IDENTICAL" if r["identical"] else "DIFF"
-        print(f"lap={r['lap']} {flag}")
+    for row in result["rows"]:
+        t0 = "IDENTICAL" if row.get("trial0_identical") else "DIFF"
+        agg = "IDENTICAL" if row.get("identical") else "DIFF"
+        print(f"lap={row['lap']} trial0={t0} aggregate={agg}")
 
     if a.self_check:
         # self-check: 全lap一致が成功（axis_a_validの定義とは別）
-        all_identical = all(row.get("identical") for row in result.get("rows") or [])
+        _rows = result.get("rows") or []
+        if _rows and any("trial0_identical" in row for row in _rows):
+            all_identical = all(bool(row.get("trial0_identical")) for row in _rows)
+        else:
+            all_identical = all(row.get("identical") for row in _rows)
         result["self_check_identical"] = bool(all_identical)
         out_path.write_text(
             __import__("json").dumps(result, ensure_ascii=False, indent=2),

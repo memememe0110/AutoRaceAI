@@ -386,7 +386,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261108_voidmiss1"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261108_trial0fp1"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -11693,7 +11693,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     # Ver330-A検証用: 各周の状態を試行順にrolling hash化。予測・保存には使用しない。
     _v330a_state_fp = {
         lap: {"hash": hashlib.sha256(), "gap_sum": 0.0, "momentum_sum": 0.0,
-              "slowdown_sum": 0.0, "pass_count": 0} for lap in range(1, 7)
+              "slowdown_sum": 0.0, "pass_count": 0,
+              "trial0_hash": None} for lap in range(1, 7)
     }
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
@@ -12038,9 +12039,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                         "slowdown": {str(c): round(float(slowdown.get(c, 0.0) or 0.0), 10) for c in cars},
                         "pass_count": _pass_count330a,
                     }
-                    _fp330a["hash"].update(
-                        (json.dumps(_state330a, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-                    )
+                    _payload330a = (
+                        json.dumps(_state330a, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                        + chr(10)
+                    ).encode("utf-8")
+                    _fp330a["hash"].update(_payload330a)
+                    # 試行0のみ：lap6修正によるRNGカスケード前の状態を単独記録
+                    if int(sim_index) == 0:
+                        _fp330a["trial0_hash"] = hashlib.sha256(_payload330a).hexdigest()
                     _fp330a["gap_sum"] += _gap_sum330a
                     _fp330a["momentum_sum"] += _mom_sum330a
                     _fp330a["slowdown_sum"] += _slow_sum330a
@@ -12285,13 +12291,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             "top3_orders":{"-".join(map(str,k)):int(v) for k,v in top3_order_audit.items()},
             "purpose":"原因分析専用。予測値への後補正なし",
         },
-        "ver330a_state_fingerprint":(
-            {str(lap):{
-                "hash":_v330a_state_fp[lap]["hash"].hexdigest(),
-                "gap_sum":round(float(_v330a_state_fp[lap]["gap_sum"]), 8),
-                "momentum_sum":round(float(_v330a_state_fp[lap]["momentum_sum"]), 8),
-                "slowdown_sum":round(float(_v330a_state_fp[lap]["slowdown_sum"]), 8),
-                "pass_count":int(_v330a_state_fp[lap]["pass_count"]),
+        "ver330a_state_fingerprint": (
+            {str(lap): {
+                "hash": _v330a_state_fp[lap]["hash"].hexdigest(),
+                "trial0_hash": (_v330a_state_fp[lap].get("trial0_hash") or ""),
+                "gap_sum": round(float(_v330a_state_fp[lap]["gap_sum"]), 8),
+                "momentum_sum": round(float(_v330a_state_fp[lap]["momentum_sum"]), 8),
+                "slowdown_sum": round(float(_v330a_state_fp[lap]["slowdown_sum"]), 8),
+                "pass_count": int(_v330a_state_fp[lap]["pass_count"]),
             } for lap in range(1, 7)}
             if _v330a_full_validation else {}
         ),
