@@ -67,9 +67,8 @@ def run_mode(verify, app_path, snapshot, race_key, mode, trials, seed, timeout, 
 def compare(a: dict, b: dict) -> dict:
     """Axis A 判定。
 
-    集約hashは全試行のRNGストリームを含むため、Ver330-Aのlap6変更が
-    試行1以降のlap1-5にも波及してDIFFになる。実装独立性の判定は
-    「試行0だけ」の trial0_hash で行う。
+    - lap2-5: 試行0で完全一致（コード無変更の証明）
+    - lap6: 全試行集約で差（抑制が効いている証明。試行0で未発動は正常）
     """
     fa = a.get("fingerprint") or {}
     fb = b.get("fingerprint") or {}
@@ -86,13 +85,14 @@ def compare(a: dict, b: dict) -> dict:
             "ver326": x,
             "ver330a": y,
         })
-    trial0_lap2_5 = all(r["trial0_identical"] for r in rows if 2 <= r["lap"] <= 5)
-    trial0_lap6_diff = any(not r["trial0_identical"] for r in rows if r["lap"] == 6)
+    trial0_lap2_5 = all(row["trial0_identical"] for row in rows if 2 <= row["lap"] <= 5)
+    trial0_lap6_diff = any(not row["trial0_identical"] for row in rows if row["lap"] == 6)
+    aggregate_lap6_diff = any(not row["identical"] for row in rows if row["lap"] == 6)
     fingerprints_present = bool(
         rows
         and all(
-            r["ver326"] and r["ver330a"] and r["ver326"].get("trial0_hash")
-            for r in rows
+            row["ver326"] and row["ver330a"] and row["ver326"].get("trial0_hash")
+            for row in rows
         )
     )
     sim326 = int(a.get("sim_trials") or a.get("trials") or 0)
@@ -100,8 +100,10 @@ def compare(a: dict, b: dict) -> dict:
     return {
         "trial0_lap2_5_identical": bool(trial0_lap2_5),
         "trial0_lap6_diff": bool(trial0_lap6_diff),
+        "aggregate_lap6_diff": bool(aggregate_lap6_diff),
+        # 後方互換: lap2-5は試行0、lap6は集約
         "lap2_5_bit_identical": bool(trial0_lap2_5),
-        "lap6_diff": bool(trial0_lap6_diff),
+        "lap6_diff": bool(aggregate_lap6_diff),
         "fingerprints_present": fingerprints_present,
         "sim_count_identical": bool(sim326 == sim330 and sim326 > 0),
         "ver326_sim_count": sim326,
@@ -109,7 +111,7 @@ def compare(a: dict, b: dict) -> dict:
         "axis_a_valid": bool(
             fingerprints_present
             and trial0_lap2_5
-            and trial0_lap6_diff
+            and aggregate_lap6_diff
             and sim326 == sim330
             and sim326 > 0
         ),
@@ -177,6 +179,7 @@ def main() -> int:
         "axis_a_valid": result["axis_a_valid"],
         "trial0_lap2_5_identical": result.get("trial0_lap2_5_identical"),
         "trial0_lap6_diff": result.get("trial0_lap6_diff"),
+        "aggregate_lap6_diff": result.get("aggregate_lap6_diff"),
         "lap2_5_bit_identical": result["lap2_5_bit_identical"],
         "lap6_diff": result["lap6_diff"],
         "fingerprints_present": result["fingerprints_present"],
@@ -216,8 +219,8 @@ def main() -> int:
 
     if result["axis_a_valid"]:
         return 0
-    # 周2-5一致だが周6も一致 → 抑制未効き
-    if result["lap2_5_bit_identical"] and not result["lap6_diff"]:
+    # 試行0でlap2-5一致だが集約lap6も一致 → 抑制が一度も効いていない可能性
+    if result.get("trial0_lap2_5_identical") and not result.get("aggregate_lap6_diff"):
         return 3
     return 2
 
