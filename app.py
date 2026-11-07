@@ -386,7 +386,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261108_misspred1"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261108_voidmiss1"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -13125,16 +13125,47 @@ def _v326_render_official_import_panel() -> None:
             _pred_nos = [n for n in _pred_nos if isinstance(n, int) and 1 <= n <= 12]
             _any_nos = [n for n in _any_nos if isinstance(n, int) and 1 <= n <= 12]
             _old_only = sorted(set(_any_nos) - set(_pred_nos))
-            _mx = max([0] + list(_any_nos) + list(_reg_nos) + list(_pred_nos) + [8])
-            _miss_pred = [n for n in range(1, _mx + 1) if n not in set(_pred_nos)]
-            _miss_reg = [n for n in range(1, _mx + 1) if n not in set(_reg_nos)]
-            # 未予測Rを強調（長い1行infoは見にくい）
+            try:
+                _invalid_nos = _v319_void_or_invalid_race_nos(engine.DB_PATH, ymd, _vn)
+            except Exception:
+                _invalid_nos = []
+            _invalid_set = set(_invalid_nos)
+            _mx = max(
+                [0]
+                + list(_any_nos)
+                + list(_reg_nos)
+                + list(_pred_nos)
+                + list(_invalid_nos)
+                + [8]
+            )
+            # 不成立・中止・全返還は予測対象外（未予測に数えない）
+            _miss_pred = [
+                n
+                for n in range(1, _mx + 1)
+                if n not in set(_pred_nos) and n not in _invalid_set
+            ]
+            _miss_reg = [
+                n
+                for n in range(1, _mx + 1)
+                if n not in set(_reg_nos) and n not in _invalid_set
+            ]
+            # 旧版のみのうち不成立は警告対象から外す
+            _old_only = [n for n in _old_only if n not in _invalid_set]
+            # 未予測Rを強調（不成立は対象外として分離）
             _pred_s = ",".join(f"{n}R" for n in sorted(_pred_nos)) if _pred_nos else "なし"
             _miss_s = ",".join(f"{n}R" for n in _miss_pred) if _miss_pred else ""
-            if not _miss_pred and _pred_nos:
+            _inv_s = ",".join(f"{n}R" for n in _invalid_nos) if _invalid_nos else ""
+            _inv_tail = (
+                f" ／ 不成立・中止 {len(_invalid_nos)}R（対象外：{_inv_s}）"
+                if _invalid_nos
+                else ""
+            )
+            if not _miss_pred and (_pred_nos or _invalid_nos):
                 st.success(
-                    f"🏁 **{_vn}**（{_cur_ver}）　✅ 全 **{len(_pred_nos)}R** 予測済み"
-                    f"（{_pred_s}）／ result **{len(_reg_nos)}R**"
+                    f"🏁 **{_vn}**（{_cur_ver}）　✅ 予測対象はすべて済"
+                    + (f"（予測 {len(_pred_nos)}R：{_pred_s}）" if _pred_nos else "（予測0R）")
+                    + f"／ result **{len(_reg_nos)}R**"
+                    + _inv_tail
                 )
             elif _miss_pred:
                 st.error(
@@ -13142,11 +13173,13 @@ def _v326_render_official_import_panel() -> None:
                     + (f"（{_pred_s}）" if _pred_nos else "")
                     + f" ／ **未予測 {len(_miss_pred)}R：{_miss_s}**"
                     + (f" ／ result未登録 {len(_miss_reg)}R" if _miss_reg else "")
+                    + _inv_tail
                 )
             else:
                 st.warning(
                     f"🏁 **{_vn}**（{_cur_ver}）　予測・resultとも未確認"
                     f"（開催未検出の可能性）"
+                    + _inv_tail
                 )
             if _old_only:
                 st.warning(
@@ -13157,6 +13190,7 @@ def _v326_render_official_import_panel() -> None:
         if _reg_lines:
             st.caption(
                 f"※現行版予測＝{_cur_ver} のみ。旧版だけのRは未把握。"
+                " 不成立・中止・全返還は未予測に含めず対象外。"
                 " resultは版非依存。回収率のレース数は別集計です。"
             )
     except Exception:
@@ -15537,6 +15571,114 @@ def _v319_registered_race_nos(db_path: str, ymd: str, venue: str) -> list[int]:
     except Exception:
         return []
     return out
+
+
+def _v319_void_or_invalid_race_nos(db_path: str, ymd: str, venue: str) -> list[int]:
+    """中止・不成立・全返還として登録済みのレース番号（予測対象外）。
+
+    判定（OR）:
+      - result_races.race_status に 中止/不成立/取消/キャンセル
+      - result_races.refund_status に 全返還
+      - learning_eligible = 0 かつ exclusion 理由に中止/不成立/全返還
+      - raw 結果 source が void / no_contest 系
+    """
+    ymd = re.sub(r"[^0-9]", "", str(ymd or ""))[:8]
+    venue = str(venue or "").strip()
+    if len(ymd) < 8 or not venue:
+        return []
+    date_s = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+    prefix = f"{ymd}_{venue}_"
+    out: set[int] = set()
+    void_re = re.compile(r"中止|不成立|取消|キャンセル|全返還")
+
+    def _add_no(n) -> None:
+        try:
+            ni = int(n)
+        except Exception:
+            return
+        if 1 <= ni <= 12:
+            out.add(ni)
+
+    def _rk_no(rk: str) -> None:
+        m2 = re.search(r"_(\d{1,2})R$", str(rk or ""))
+        if m2:
+            _add_no(m2.group(1))
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=10.0) as con:
+            con.execute("PRAGMA busy_timeout=10000")
+            cols = {r[1] for r in con.execute("PRAGMA table_info(result_races)").fetchall()}
+            select_cols = ["race_key", "race_no"]
+            for c in ("race_status", "refund_status", "learning_eligible", "learning_exclusion_reason"):
+                if c in cols:
+                    select_cols.append(c)
+            rows = con.execute(
+                f"""
+                SELECT {", ".join(select_cols)}
+                  FROM result_races
+                 WHERE race_key LIKE ?
+                    OR (COALESCE(race_date,'') IN (?, ?) AND COALESCE(venue,'') = ?)
+                """,
+                (f"{prefix}%", date_s, ymd, venue),
+            ).fetchall()
+            col_i = {c: i for i, c in enumerate(select_cols)}
+            for row in rows:
+                rk = str(row[col_i["race_key"]] or "")
+                rn = row[col_i["race_no"]]
+                st_s = str(row[col_i["race_status"]] or "") if "race_status" in col_i else ""
+                rf_s = str(row[col_i["refund_status"]] or "") if "refund_status" in col_i else ""
+                le = row[col_i["learning_eligible"]] if "learning_eligible" in col_i else 1
+                ler = (
+                    str(row[col_i["learning_exclusion_reason"]] or "")
+                    if "learning_exclusion_reason" in col_i
+                    else ""
+                )
+                blob = f"{st_s} {rf_s} {ler}"
+                is_void = bool(void_re.search(blob))
+                try:
+                    if le is not None and int(le) == 0 and void_re.search(ler or st_s or rf_s or ""):
+                        is_void = True
+                except Exception:
+                    pass
+                if is_void:
+                    if rn is not None and str(rn).strip() not in ("", "0", "None"):
+                        _add_no(rn)
+                    else:
+                        _rk_no(rk)
+
+            tables = {
+                r[0]
+                for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            for t in ("v238_exact_raw_results", "exact_raw_results", "raw_results"):
+                if t not in tables:
+                    continue
+                try:
+                    tcols = {r[1] for r in con.execute(f"PRAGMA table_info({t})").fetchall()}
+                except Exception:
+                    continue
+                if "race_key" not in tcols or "source" not in tcols:
+                    continue
+                try:
+                    rrows = con.execute(
+                        f"SELECT race_key, source FROM {t} WHERE race_key LIKE ?",
+                        (f"{prefix}%",),
+                    ).fetchall()
+                    for rk, srcv in rrows:
+                        if re.search(
+                            r"void|no_contest|cancelled|中止|不成立",
+                            str(srcv or ""),
+                            re.I,
+                        ):
+                            _rk_no(str(rk))
+                except Exception:
+                    continue
+    except Exception:
+        return sorted(out)
+    return sorted(out)
+
 
 
 def _v319_ordered_race_nos(ymd: str, venue: str, max_races: int = 12) -> list[int]:
