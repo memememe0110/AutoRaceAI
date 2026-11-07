@@ -5,10 +5,20 @@ on:
   workflow_dispatch:
     inputs:
       race_key:
-        description: 'Race key to test'
+        description: "Race key to test"
         required: true
-        default: '20260726_飯塚_2R'
+        default: "20260726_飯塚_2R"
         type: string
+      db_tag:
+        description: "Optional fixed db-* Release tag (empty = latest)"
+        required: false
+        default: ""
+        type: string
+      self_check:
+        description: "Ver326 vs Ver326 harness determinism check"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -26,20 +36,29 @@ jobs:
           path: appsrc
           fetch-depth: 1
 
-      - name: Resolve latest db-* Release tag
+      - name: Resolve DB Release tag
         id: db_tag
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.db_tag }}
         run: |
           set -euo pipefail
-          TAG="$(gh release list --repo "$REPO" --limit 100 \
-                 --json tagName,publishedAt \
-                 --jq '[.[] | select(.tagName | startswith("db-"))] | sort_by(.publishedAt) | reverse | .[0].tagName')"
+          if [ -n "${INPUT_TAG}" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="$(gh release list --repo "$REPO" --limit 100 \
+              --json tagName,publishedAt \
+              --jq '[.[] | select(.tagName | startswith("db-"))] | sort_by(.publishedAt) | reverse | .[0].tagName')"
+          fi
+          if [ -z "${TAG}" ] || [ "${TAG}" = "null" ]; then
+            echo "No db-* release found" >&2
+            exit 1
+          fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Resolved DB release: ${TAG}"
 
-      - name: Download DB from Release asset
+      - name: Download DB from Release
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -47,15 +66,34 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p validation_workdir
-          gh release download "$TAG" --repo "$REPO" \
-            --pattern "autorace_players.sqlite3" \
-            --dir validation_workdir
-          ls -lh validation_workdir/
+          # 単一SQLiteがあればそれを使う。無ければチャンク再構成を試す。
+          if gh release download "$TAG" --repo "$REPO" \
+               --pattern "autorace_players.sqlite3" \
+               --dir validation_workdir 2>/dev/null; then
+            echo "Downloaded single sqlite asset"
+          else
+            echo "Single sqlite not found; trying chunks + prepare_validation_db.py"
+            gh release download "$TAG" --repo "$REPO" \
+              --pattern "*.chunks.json" \
+              --pattern "autorace_players.sqlite3.part*" \
+              --dir validation_workdir || true
+            if [ -f appsrc/prepare_validation_db.py ]; then
+              python appsrc/prepare_validation_db.py \
+                --workdir validation_workdir \
+                --out validation_workdir/autorace_players.sqlite3
+            else
+              echo "prepare_validation_db.py missing and no single sqlite" >&2
+              ls -la validation_workdir/ || true
+              exit 1
+            fi
+          fi
+          test -f validation_workdir/autorace_players.sqlite3
+          ls -lh validation_workdir/autorace_players.sqlite3
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies (with Playwright)
         run: |
@@ -67,6 +105,11 @@ jobs:
         env:
           RACE_KEY: ${{ inputs.race_key }}
         run: |
+          set -euo pipefail
+          EXTRA=""
+          if [ "${{ inputs.self_check }}" = "true" ]; then
+            EXTRA="--self-check"
+          fi
           python appsrc/run_ver330a_axis_a.py \
             --db validation_workdir/autorace_players.sqlite3 \
             --app appsrc/app.py \
@@ -74,7 +117,10 @@ jobs:
             --trials 20000 \
             --seed 12345 \
             --timeout 1800 \
-            --out axis_a_result.json
+            --out axis_a_result.json \
+            $EXTRA
+          echo "----- axis_a_result.json -----"
+          cat axis_a_result.json
 
       - name: Upload result
         if: always()
