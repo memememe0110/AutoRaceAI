@@ -386,7 +386,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261106_histlabel1"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261108_misspred1"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -13128,33 +13128,36 @@ def _v326_render_official_import_panel() -> None:
             _mx = max([0] + list(_any_nos) + list(_reg_nos) + list(_pred_nos) + [8])
             _miss_pred = [n for n in range(1, _mx + 1) if n not in set(_pred_nos)]
             _miss_reg = [n for n in range(1, _mx + 1) if n not in set(_reg_nos)]
-            _line = (
-                f"**{_vn}**（{_cur_ver}）: "
-                f"現行版予測 {len(_pred_nos)}R"
-                + (f"（{','.join(str(n) for n in _pred_nos)}）" if _pred_nos else "（0R・なし）")
-                + f" ／ result登録 {len(_reg_nos)}R"
-                + (f"（{','.join(str(n) for n in _reg_nos)}）" if _reg_nos else "（なし）")
-            )
-            if _old_only:
-                _line += (
-                    f" ／ 旧版のみ予測: {','.join(str(n)+'R' for n in _old_only)}"
-                    f"（現行では未把握＝再予測対象）"
+            # 未予測Rを強調（長い1行infoは見にくい）
+            _pred_s = ",".join(f"{n}R" for n in sorted(_pred_nos)) if _pred_nos else "なし"
+            _miss_s = ",".join(f"{n}R" for n in _miss_pred) if _miss_pred else ""
+            if not _miss_pred and _pred_nos:
+                st.success(
+                    f"🏁 **{_vn}**（{_cur_ver}）　✅ 全 **{len(_pred_nos)}R** 予測済み"
+                    f"（{_pred_s}）／ result **{len(_reg_nos)}R**"
                 )
-            if _miss_pred and _pred_nos:
-                _line += f" ／ 現行版未予測: {','.join(str(n)+'R' for n in _miss_pred)}"
-            elif not _pred_nos and _mx > 0:
-                _line += f" ／ 現行版未予測: 1〜{_mx}R（すべて）"
-            if _miss_reg:
-                _line += f" ／ result未登録: {','.join(str(n)+'R' for n in _miss_reg)}"
-            _reg_lines.append(_line)
+            elif _miss_pred:
+                st.error(
+                    f"🏁 **{_vn}**（{_cur_ver}）　予測OK **{len(_pred_nos)}R**"
+                    + (f"（{_pred_s}）" if _pred_nos else "")
+                    + f" ／ **未予測 {len(_miss_pred)}R：{_miss_s}**"
+                    + (f" ／ result未登録 {len(_miss_reg)}R" if _miss_reg else "")
+                )
+            else:
+                st.warning(
+                    f"🏁 **{_vn}**（{_cur_ver}）　予測・resultとも未確認"
+                    f"（開催未検出の可能性）"
+                )
+            if _old_only:
+                st.warning(
+                    f"　⚠️ **{_vn}** 旧版のみ予測（再予測対象）: "
+                    + ",".join(f"{n}R" for n in _old_only)
+                )
+            _reg_lines.append(_vn)
         if _reg_lines:
-            st.info(
-                "📦 この日のR把握状況（再取込不要・既存DB）\n\n"
-                + "\n\n".join(_reg_lines)
-                + f"\n\n※「現行版予測」は {_cur_ver} の予測／プランのみ。"
-                + " 旧版だけあるRは把握に入れず 0R 扱いです。"
-                + "\n※result登録は版非依存（着順・払戻）。"
-                + "\n※回収率の「レース数」は判定対象なので別数字で正常です。"
+            st.caption(
+                f"※現行版予測＝{_cur_ver} のみ。旧版だけのRは未把握。"
+                " resultは版非依存。回収率のレース数は別集計です。"
             )
     except Exception:
         pass
@@ -13359,7 +13362,7 @@ def _v326_render_official_import_panel() -> None:
         else:
             st.info("対象レースを数えています…")
         st.caption(
-            f"段階：{job_imp.get('current_label') or '-'} ｜ "
+            f"今：{job_imp.get('current_label') or '-'} ｜ "
             f"{job_imp.get('message') or status}"
         )
         cprog1, cprog2 = st.columns(2)
