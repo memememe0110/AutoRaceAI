@@ -1,13 +1,13 @@
 {
   "run_id": "lap1_run1",
   "phase": "Ver326 Lap1",
-  "status": "running",
+  "status": "completed",
   "total": 377,
   "done_count": 377,
   "failed_count": 0,
   "current_race": "",
   "started_at": "2026-11-06T00:37:05+00:00",
-  "updated_at": "2026-11-07T17:18:48+00:00",
+  "updated_at": "2026-11-07T17:18:49+00:00",
   "trials": 20000,
   "seed": 12345,
   "batch_limit": 100,
@@ -43,5 +43,23 @@
     },
     "all_four_pass": true
   },
-  "batch_started_at": "2026-11-07T15:55:39+00:00"
+  "batch_started_at": "2026-11-07T15:55:39+00:00",
+  "finished_at": "2026-11-07T17:18:49+00:00",
+  "final_summary": {
+    "median": {
+      "n_races": 377,
+      "pattern_rank": 26.0,
+      "pattern_rank_cutoff_25pct_median": 719.0,
+      "uniform_ratio": 61.488,
+      "top1_prob": 0.02855,
+      "relative_lift": 0.20423546302943288
+    },
+    "pass": {
+      "pattern_rank": true,
+      "uniform_ratio": true,
+      "top1_prob": true,
+      "relative_lift": true
+    },
+    "all_four_pass": true
+  }
 }
