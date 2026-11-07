@@ -1,0 +1,86 @@
+name: Ver330A Axis A
+run-name: "Ver330A Axis A - ${{ inputs.race_key }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      race_key:
+        description: 'Race key to test'
+        required: true
+        default: '20260726_飯塚_2R'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  axis-a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout application source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: appsrc
+          fetch-depth: 1
+
+      - name: Resolve latest db-* Release tag
+        id: db_tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="$(gh release list --repo "$REPO" --limit 100 \
+                 --json tagName,publishedAt \
+                 --jq '[.[] | select(.tagName | startswith("db-"))] | sort_by(.publishedAt) | reverse | .[0].tagName')"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved DB release: ${TAG}"
+
+      - name: Download DB from Release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.db_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p validation_workdir
+          gh release download "$TAG" --repo "$REPO" \
+            --pattern "autorace_players.sqlite3" \
+            --dir validation_workdir
+          ls -lh validation_workdir/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies (with Playwright)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas openpyxl streamlit playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Run Axis A
+        env:
+          RACE_KEY: ${{ inputs.race_key }}
+        run: |
+          python appsrc/run_ver330a_axis_a.py \
+            --db validation_workdir/autorace_players.sqlite3 \
+            --app appsrc/app.py \
+            --race-key "$RACE_KEY" \
+            --trials 20000 \
+            --seed 12345 \
+            --timeout 1800 \
+            --out axis_a_result.json
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: axis-a-${{ inputs.race_key }}-${{ github.run_number }}
+          path: axis_a_result.json
+          if-no-files-found: error
+          retention-days: 30
