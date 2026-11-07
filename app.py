@@ -386,7 +386,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261101_cancel1"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261106_histlabel1"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -13359,7 +13359,7 @@ def _v326_render_official_import_panel() -> None:
         else:
             st.info("対象レースを数えています…")
         st.caption(
-            f"今：{job_imp.get('current_label') or '-'} ｜ "
+            f"段階：{job_imp.get('current_label') or '-'} ｜ "
             f"{job_imp.get('message') or status}"
         )
         cprog1, cprog2 = st.columns(2)
@@ -18339,6 +18339,7 @@ def _v319_fill_player_histories(
     con=None,
     _exclusive: bool = False,
     cancel_cb=None,
+    on_step=None,
 ) -> dict:
     """選手履歴を公式PC版 PlayerDetail から取得して保存。
 
@@ -18364,6 +18365,13 @@ def _v319_fill_player_histories(
     details = []
     player_adds: list = []  # [{name, have, after, delta}]
     min_rows = int(min_rows or 30)
+    def _hist_step(msg: str) -> None:
+        if not callable(on_step):
+            return
+        try:
+            on_step(str(msg))
+        except Exception:
+            pass
     # con を自分で開いたときだけ閉じる（_exclusive と独立）。
     # 以前は _own_con2 = (con is None and _exclusive) のため、
     # 通常呼び出し（con=None, _exclusive=False）で接続がリークしていた。
@@ -18381,6 +18389,7 @@ def _v319_fill_player_histories(
 
         # Ver324速度: 公式HTTPが必要な選手だけ先に並列取得（結果は _V319_HIST_DF_CACHE へ）
         try:
+            _hist_step("選手履歴 事前取得")
             _prefetch = []
             for _pp in players:
                 _nm = str(_pp.get("name") or "").strip()
@@ -18463,7 +18472,8 @@ def _v319_fill_player_histories(
         except Exception:
             pass
 
-        for p in players:
+        _n_pl = max(1, len(players or []))
+        for _pi, p in enumerate(players, 1):
             # 中止要求: 選手単位で即抜ける（長いHTTP中も次選手前に止まる）
             if _v326_abort_any() or (callable(cancel_cb) and bool(cancel_cb())):
                 try:
@@ -18479,6 +18489,7 @@ def _v319_fill_player_histories(
                 }
             name = p.get("name") or ""
             pcd = str(p.get("player_cd") or "").strip()
+            _hist_step(f"選手履歴 {_pi}/{_n_pl} {str(name).strip() or pcd or '?'}")
             cache_key = pcd or _v319_norm_player_name(name)
             already_refreshed = cache_key in _V319_HIST_REFRESHED
             # Ver320: dict[cache_key] = before_d。同一開催日なら前レースで充足確認済み
@@ -20349,6 +20360,8 @@ def _v319_import_player_history_one_race(
         filled = _v319_fill_player_histories(
             db_path, players, min_rows=int(min_rows or 30),
             before_ymd=ymd, before_venue=venue, before_race=race_no,
+            cancel_cb=cancel_cb,
+            on_step=on_step,
         )
     except Exception as exc:
         return {
@@ -20802,6 +20815,7 @@ def _v319_import_one_race(
                 db_path, players, min_rows=5,
                 before_ymd=ymd, before_venue=venue, before_race=race_no,
                 cancel_cb=cancel_cb,
+                on_step=on_step,
             )
         if filled.get("cancelled"):
             return {
@@ -21551,7 +21565,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
                         on_step=lambda msg, vn=vn, n=n, i=i: _v278_bg_update(
                             db_path, job_id,
-                            current_label=f"{vn} {n}R",
+                            current_label=f"{vn} {n}R｜{msg}",
                             message=f"履歴のみ｜登録{ok}/skip{skip}/err{err}｜今は{msg}",
                             done_count=i - 1,
                         ),
@@ -21569,7 +21583,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
                         on_step=lambda msg, vn=vn, n=n, i=i: _v278_bg_update(
                             db_path, job_id,
-                            current_label=f"{vn} {n}R",
+                            current_label=f"{vn} {n}R｜{msg}",
                             message=f"登録{ok}/skip{skip}/err{err}｜今は{msg}",
                             done_count=i - 1,
                         ),
