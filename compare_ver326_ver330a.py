@@ -85,6 +85,7 @@ def run_mode(
             "AUTORACE_COMPARE_OUT": str(out_path),
             "AUTORACE_330_VALIDATION_MODE": "1",
             "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
+            "PYTHONHASHSEED": "0",
         }
     )
 

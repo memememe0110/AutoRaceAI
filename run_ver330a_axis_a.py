@@ -103,6 +103,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--out", required=True, help="結果JSON出力先")
+    ap.add_argument(
+        "--self-check",
+        action="store_true",
+        help="Ver326 vs Ver326 でハーネス決定性を確認（Axis A本番判定ではない）",
+    )
     a = ap.parse_args()
 
     if int(a.trials) != 20000 or int(a.seed) != 12345:
@@ -123,12 +128,13 @@ def main() -> int:
         td_path = Path(td)
         snapshot = td_path / "db_snapshot.sqlite3"
         make_snapshot(db, snapshot)
+        mode_b = "Ver326" if a.self_check else "Ver330-A"
         d326 = run_mode(
             verify, app, snapshot, a.race_key, "Ver326",
             a.trials, a.seed, a.timeout, td,
         )
         d330 = run_mode(
-            verify, app, snapshot, a.race_key, "Ver330-A",
+            verify, app, snapshot, a.race_key, mode_b,
             a.trials, a.seed, a.timeout, td,
         )
 
@@ -136,6 +142,9 @@ def main() -> int:
         "race_key": a.race_key,
         "trials": int(a.trials),
         "seed": int(a.seed),
+        "self_check": bool(a.self_check),
+        "mode_a": "Ver326",
+        "mode_b": ("Ver326" if a.self_check else "Ver330-A"),
         **compare(d326, d330),
     }
     out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -151,6 +160,28 @@ def main() -> int:
     for r in result["rows"]:
         flag = "IDENTICAL" if r["identical"] else "DIFF"
         print(f"lap={r['lap']} {flag}")
+
+    if a.self_check:
+        # self-check: 全lap一致が成功（axis_a_validの定義とは別）
+        all_identical = all(row.get("identical") for row in result.get("rows") or [])
+        result["self_check_identical"] = bool(all_identical)
+        out_path.write_text(
+            __import__("json").dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(
+            __import__("json").dumps(
+                {
+                    "self_check": True,
+                    "self_check_identical": bool(all_identical),
+                    "lap2_5_bit_identical": result["lap2_5_bit_identical"],
+                    "lap6_diff": result["lap6_diff"],
+                    "race_key": result["race_key"],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0 if all_identical else 2
 
     if result["axis_a_valid"]:
         return 0

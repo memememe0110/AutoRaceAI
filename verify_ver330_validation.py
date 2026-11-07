@@ -165,6 +165,8 @@ def run_one_race(app_path: Path, snapshot: Path, race_key: str, mode: str, trial
         "AUTORACE_COMPARE_OUT": str(out_path),
         "AUTORACE_330_VALIDATION_MODE": "1",
         "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
+        # set/dict の iterate 順をプロセス間で固定（lap1からDIFFになる主因対策）
+        "PYTHONHASHSEED": "0",
     })
     streamlit = shutil.which("streamlit")
     cmd = ([streamlit] if streamlit else [sys.executable, "-m", "streamlit"]) + [
