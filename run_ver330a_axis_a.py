@@ -1,25 +1,70 @@
 #!/usr/bin/env python3
-"""Ver330-A Axis A: lap2-5 bit-identical 検証。同一レース・seed・trialsで両モードを比較。"""
+"""Ver330-A Axis A: lap2-5 bit-identical 検証。
+
+同一 race_key / seed / trials で Ver326 と Ver330-A を実行し、
+fingerprint を比較する。
+
+合格条件（事前登録）:
+  - trials=20000, seed=12345
+  - lap2〜5 の fingerprint が完全一致
+  - lap6 に差がある（周6抑制が効いている）
+"""
 from __future__ import annotations
-import argparse, importlib.util, json, sys, tempfile
+
+import argparse
+import importlib.util
+import json
+import sqlite3
+import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location('verify_ver330_validation', HERE / 'verify_ver330_validation.py')
-verify = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = verify
-spec.loader.exec_module(verify)
 
 
-def run_mode(app_path, db, race_key, mode, trials, seed, timeout, tmp_dir):
-    out = Path(tmp_dir) / f"{mode.replace('-','_')}.json"
-    data = verify.run_one_race(app_path, db, race_key, mode, trials, seed, out, timeout)
+def _load_verify():
+    path = HERE / "verify_ver330_validation.py"
+    if not path.exists():
+        raise SystemExit(f"verify_ver330_validation.py がありません: {path}")
+    spec = importlib.util.spec_from_file_location("verify_ver330_validation", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def make_snapshot(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(
+        f"file:{src.resolve().as_posix()}?mode=ro", uri=True, timeout=30.0
+    ) as con_src:
+        con_src.execute("PRAGMA query_only=ON")
+        with sqlite3.connect(str(dst), timeout=30.0) as con_dst:
+            con_src.backup(con_dst)
+            con_dst.commit()
+
+
+def run_mode(verify, app_path, snapshot, race_key, mode, trials, seed, timeout, tmp_dir):
+    out = Path(tmp_dir) / f"{mode.replace('-', '_')}.json"
+    data = verify.run_one_race(
+        Path(app_path),
+        Path(snapshot),
+        race_key,
+        mode,
+        int(trials),
+        int(seed),
+        out,
+        float(timeout),
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{mode}: invalid result type {type(data)}")
     if not data.get("fingerprint"):
-        raise RuntimeError(f"{mode}: fingerprint missing")
+        raise RuntimeError(f"{mode}: fingerprint missing (keys={list(data.keys())})")
     return data
 
 
-def compare(a, b):
+def compare(a: dict, b: dict) -> dict:
     fa = a.get("fingerprint") or {}
     fb = b.get("fingerprint") or {}
     rows = []
@@ -29,46 +74,90 @@ def compare(a, b):
         rows.append({"lap": lap, "identical": x == y, "ver326": x, "ver330a": y})
     lap2_5 = all(r["identical"] for r in rows if 2 <= r["lap"] <= 5)
     lap6_diff = any(not r["identical"] for r in rows if r["lap"] == 6)
+    fingerprints_present = bool(
+        rows and all(r["ver326"] and r["ver330a"] for r in rows)
+    )
+    sim326 = int(a.get("sim_trials") or a.get("trials") or 0)
+    sim330 = int(b.get("sim_trials") or b.get("trials") or 0)
     return {
-        "lap2_5_bit_identical": lap2_5,
-        "lap6_diff": lap6_diff,
-        "axis_a_valid": bool(lap2_5 and lap6_diff),
+        "lap2_5_bit_identical": bool(lap2_5),
+        "lap6_diff": bool(lap6_diff),
+        "fingerprints_present": fingerprints_present,
+        "sim_count_identical": bool(sim326 == sim330 and sim326 > 0),
+        "ver326_sim_count": sim326,
+        "ver330a_sim_count": sim330,
+        # Axis A 正式合格: 周2-5一致 かつ 周6に差 かつ fingerprint存在
+        "axis_a_valid": bool(
+            fingerprints_present and lap2_5 and lap6_diff and sim326 == sim330 and sim326 > 0
+        ),
         "rows": rows,
     }
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--db", required=True)
-    ap.add_argument("--app", required=True)
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Ver330-A Axis A (lap2-5 identical, lap6 diff)")
+    ap.add_argument("--db", required=True, help="比較元DB（読み取り専用snapshotを作成）")
+    ap.add_argument("--app", required=True, help="app.py パス")
     ap.add_argument("--race-key", required=True)
     ap.add_argument("--trials", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--timeout", type=float, default=1800)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", required=True, help="結果JSON出力先")
     a = ap.parse_args()
-    if a.trials != 20000 or a.seed != 12345:
-        raise SystemExit("Pre-registered: trials=20000, seed=12345")
-    db = Path(a.db).resolve()
-    app = Path(a.app).resolve()
-    out_path = Path(a.out).resolve()
+
+    if int(a.trials) != 20000 or int(a.seed) != 12345:
+        raise SystemExit("Pre-registered Axis A: trials=20000, seed=12345 のみ許可")
+
+    db = Path(a.db).expanduser().resolve()
+    app = Path(a.app).expanduser().resolve()
+    out_path = Path(a.out).expanduser().resolve()
+    if not db.exists():
+        raise SystemExit(f"DBがありません: {db}")
+    if not app.exists():
+        raise SystemExit(f"app.pyがありません: {app}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as td:
-        d326 = run_mode(app, db, a.race_key, "Ver326", a.trials, a.seed, a.timeout, td)
-        d330 = run_mode(app, db, a.race_key, "Ver330-A", a.trials, a.seed, a.timeout, td)
+
+    verify = _load_verify()
+
+    with tempfile.TemporaryDirectory(prefix="axis_a_") as td:
+        td_path = Path(td)
+        snapshot = td_path / "db_snapshot.sqlite3"
+        make_snapshot(db, snapshot)
+        d326 = run_mode(
+            verify, app, snapshot, a.race_key, "Ver326",
+            a.trials, a.seed, a.timeout, td,
+        )
+        d330 = run_mode(
+            verify, app, snapshot, a.race_key, "Ver330-A",
+            a.trials, a.seed, a.timeout, td,
+        )
+
     result = {
         "race_key": a.race_key,
-        "trials": a.trials,
-        "seed": a.seed,
+        "trials": int(a.trials),
+        "seed": int(a.seed),
         **compare(d326, d330),
     }
     out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({
+
+    summary = {
         "axis_a_valid": result["axis_a_valid"],
         "lap2_5_bit_identical": result["lap2_5_bit_identical"],
         "lap6_diff": result["lap6_diff"],
-    }, ensure_ascii=False))
-    return 0 if result["axis_a_valid"] else 2
+        "fingerprints_present": result["fingerprints_present"],
+        "race_key": result["race_key"],
+    }
+    print(json.dumps(summary, ensure_ascii=False))
+    for r in result["rows"]:
+        flag = "IDENTICAL" if r["identical"] else "DIFF"
+        print(f"lap={r['lap']} {flag}")
+
+    if result["axis_a_valid"]:
+        return 0
+    # 周2-5一致だが周6も一致 → 抑制未効き
+    if result["lap2_5_bit_identical"] and not result["lap6_diff"]:
+        return 3
+    return 2
 
 
 if __name__ == "__main__":
