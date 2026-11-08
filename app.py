@@ -263,12 +263,37 @@ _V328_LAP6_P_SCALE = 0.40              # 5位以下かつ大差時の p 減衰
 
 # Ver330-A: Ver328の周1〜4 +0.08は撤去し、周6抑制だけを独立検証する。
 _V330A_APP_VERSION = "Ver330-A"
-_V330A_EXPERIMENT = False
+_V330A_EXPERIMENT = False  # デフォルトOFF。UIトグル or worker global で有効化
+_V330A_UI_TOGGLE_KEY = "v330a_toggle"
 
 
 def _v330a_active() -> bool:
-    """Ver330-A: 周6抑制のみを独立して有効化する。"""
-    return bool(globals().get("_V330A_EXPERIMENT"))
+    """Ver330-A: 周6抑制のみを独立して有効化する。
+
+    - 比較検証モード / worker: globals()[_V330A_EXPERIMENT]
+    - 通常UI: セッションの v330a_toggle（デフォルトOFF）
+    """
+    if bool(globals().get("_V330A_EXPERIMENT")):
+        return True
+    try:
+        return bool(st.session_state.get("v330a_toggle", False))
+    except Exception:
+        return False
+
+
+# Ver331 Lap1精度実験枠（中身は未実装。初期位置補正は次パッチ）
+_V331_APP_VERSION = "Ver331"
+_V331_LAP1_TUNE = False
+
+
+def _v331_lap1_tune_active() -> bool:
+    """Lap1初期位置補正など。デフォルトOFF。"""
+    if bool(globals().get("_V331_LAP1_TUNE")):
+        return True
+    try:
+        return bool(st.session_state.get("v331_lap1_tune", False))
+    except Exception:
+        return False
 
 
 def _v327_active() -> bool:
@@ -314,6 +339,10 @@ def _v326_catch_gap_cap() -> float:
 def _v326_effective_save_version() -> str:
     if _v328_active():
         return str(globals().get("_V328_APP_VERSION") or "Ver328")
+    if _v330a_active():
+        return str(globals().get("_V330A_APP_VERSION") or "Ver330-A")
+    if _v331_lap1_tune_active():
+        return str(globals().get("_V331_APP_VERSION") or "Ver331")
     if _v327_active():
         return str(globals().get("_V327_APP_VERSION") or "Ver327")
     if _v326_ca_active():
@@ -386,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261108_trial0fp1"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261108_v330a_p3"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -5056,6 +5085,11 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             result_blob=sqlite3.Binary(blob)
         )
         _v279_send_bg_prediction_complete_notification(result)
+        # 予測完了後は pin を外す（古いDB自動復元で今回の予測が消えるのを防ぐ）
+        try:
+            _v284_clear_uploaded_master_pin()
+        except Exception:
+            pass
     except Exception as exc:
         _v276_foreground_prediction_event.clear()
         _v278_bg_update(
@@ -5121,6 +5155,11 @@ def _v279_bg_prediction_start(
 
 def _v279_bg_prediction_load_completed(db_path: str, job: dict) -> tuple[dict,str,str]:
     try:
+        # メインスレッドでpin解除（worker側のsession_stateは効かない場合がある）
+        try:
+            _v284_clear_uploaded_master_pin()
+        except Exception:
+            pass
         result=(job or {}).get("result") or {}
         hid=int(result.get("history_id") or 0)
         if not hid:
@@ -13057,6 +13096,21 @@ def _v326_render_queue_reorder_fragment(db_path: str, job_type: str = "official_
 @_v146_fragment
 def _v326_render_official_import_panel() -> None:
     """公式取込パネル。日付・開催場・チェック変更は枠内だけ再実行。"""
+    # Ver330-A UIトグル（デフォルトOFF）。通常予測に周6抑制を載せる。
+    try:
+        if "v330a_toggle" not in st.session_state:
+            st.session_state["v330a_toggle"] = bool(globals().get("_V330A_EXPERIMENT"))
+        _v330a_toggle_now = st.checkbox(
+            "Ver330-A（周6抑制のみ）",
+            key="v330a_toggle",
+            help="ON時: 周6の5位以下・3位と大差の追い抜きを抑制。OFFで即戻せます。中盤底上げは含みません。",
+        )
+        # 同一プロセスの worker 向けに global も同期（session が届かない経路の保険）
+        globals()["_V330A_EXPERIMENT"] = bool(_v330a_toggle_now)
+        if _v330a_toggle_now:
+            st.caption(f"Ver330-A ON / save_ver={_v326_effective_save_version()}")
+    except Exception:
+        pass
     st.caption("順番は出走表→選手履歴→予測保存確認→オッズ→結果登録です。履歴0件でも予測は続行（不足は警告）。GitHub自動保存はしません。")
     dcol, vcol, rcol = st.columns(3)
     fetch_date = dcol.date_input("開催日", value=date.today(), key="v319_op_fetch_date")
@@ -31487,6 +31541,17 @@ def _v276_atomic_install_db_file(source_path: Path, source_label: str = "DB") ->
         temp.unlink(missing_ok=True)
 
 @_v330a_exclusive_db_operation((False, "Ver330-A検証中またはDB処理中のためDB差し替えを停止しました。完了後に再試行してください。"))
+
+def _v284_clear_uploaded_master_pin() -> None:
+    """アップロード／復元pinを外す。予測完了後に呼び、古いマスター復元で結果が消えるのを防ぐ。"""
+    try:
+        st.session_state.pop("v284_uploaded_master_path", None)
+        st.session_state.pop("v284_uploaded_master_identity", None)
+        st.session_state.pop("v284_uploaded_master_sha256", None)
+    except Exception:
+        pass
+
+
 def install_uploaded_db(uploaded) -> tuple[bool, str]:
     data = uploaded.getvalue()
     if not data.startswith(b"SQLite format 3\x00"):
@@ -33621,8 +33686,26 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 "Ver328実験中: 中盤底上げ + 6周目無意味追い抜き抑制。"
                 "予測保存版はVer328です。本線Ver326は変更されません。"
             )
+        _v330a_ui = st.checkbox(
+            "Ver330-A（周6抑制のみ・推奨実験）",
+            value=bool(st.session_state.get("v330a_toggle", False)),
+            key="v330a_toggle",
+            help="デフォルトOFF。ONで通常予測に周6の無意味追い抜き抑制のみ適用。中盤底上げは含みません。",
+        )
+        try:
+            globals()["_V330A_EXPERIMENT"] = bool(_v330a_ui)
+        except Exception:
+            pass
+        if _v330a_ui and not _v328_exp_ui:
+            st.info(
+                "Ver330-A 実験中: 周6抑制のみ（Axis A/B 合格済み）。"
+                f"保存版は {_V330A_APP_VERSION}。本線デフォルトはOFFのままです。"
+            )
+        elif _v330a_ui and _v328_exp_ui:
+            st.warning("Ver328が優先されます（中盤底上げ+周6抑制）。Ver330-A単独を試す場合はVer328をOFFに。")
         st.caption(
-            f"現行: v328_active={_v328_active()} / early_boost={float(globals().get('_V328_EARLY_BASE_BOOST') or 0.08):.3f} / "
+            f"現行: v328={_v328_active()} / v330a={_v330a_active()} / "
+            f"early_boost={float(globals().get('_V328_EARLY_BASE_BOOST') or 0.08):.3f} / "
             f"lap6_gap≥{float(globals().get('_V328_LAP6_GAP_THRESH') or 0.80):.2f} → p×{float(globals().get('_V328_LAP6_P_SCALE') or 0.40):.2f} / "
             f"save_ver={_v326_effective_save_version()}"
         )
@@ -36975,12 +37058,18 @@ if (not _v296_bg_fast_rerun) and (not _v284_recent_ok) and isinstance(_v284_pinn
         _v284_restore_needed=True
     else:
         _v284_regressed,_v284_restore_reasons=_v284_db_identity_regressed(_v284_before_restore,_v284_pinned_id)
-        # Ver305自動統合:
-        # 正常な重複整理・再構成で件数が減る場合があるため、件数減少だけでは
-        # 古いpinned DBへ自動巻き戻ししない。内容差はGitHub保存時に行単位で統合する。
-        _v284_restore_needed=(
-            str(_v284_before_restore.get("path")) != str(_v284_pinned_id.get("path"))
-        )
+        # 予測でDBが成長しただけでは復元しない（予測結果を守る）。
+        # 縮小・パス変更・破損時のみ pin 正本へ戻す。
+        try:
+            _cur_size284 = int(_v284_before_restore.get("size") or 0)
+        except Exception:
+            _cur_size284 = 0
+        try:
+            _pin_size284 = int(_v284_pinned_id.get("size") or 0)
+        except Exception:
+            _pin_size284 = 0
+        _path_diff284 = str(_v284_before_restore.get("path")) != str(_v284_pinned_id.get("path"))
+        _v284_restore_needed = bool(_path_diff284 or (_pin_size284 > 0 and _cur_size284 < _pin_size284))
     if _v284_restore_needed:
         _v284_restore_ok,_v284_restore_msg=_v276_atomic_install_db_file(Path(_v284_pinned_path),"アップロード正本自動復元")
         if _v284_restore_ok:
