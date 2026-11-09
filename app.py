@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261109_v330a_fix2"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261109_trial_msg2"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -16414,9 +16414,9 @@ def _v319_synthesize_sprace_html_from_program(
             is_kessha = absent not in (None, "", 0, "0", False)
             if not is_kessha and strict_trial:
                 raise ValueError(
-                    f"出走表の試走Tが欠損しています（通常はありえません）: "
-                    f"{car}号 {name or ''} trial={trial!r}。"
-                    "autorace/oddspark の取得結果を確認してください。"
+                    f"出走表の試走Tが空です: {car}号 {name or ''} trial={trial!r}。"
+                    "公式にまだ載っていない可能性大です。"
+                    "欠車でなければ試走後に再取得してください（既定値では埋めません）。"
                 )
             trial = ""  # 欠車のみ空許容
             n_trial_def += 1
@@ -16807,7 +16807,7 @@ def _v319_validate_card_players(players: list, venue: str = "", race_no: int = 0
         name = str(p.get("name") or "")
         trial = str(p.get("trial") or "").strip()
         if not re.match(r"^\d+\.\d+$", trial):
-            problems.append(f"{car_i}号{name}:試走T欠損{trial!r}")
+            problems.append(f"{car_i}号{name}:試走T空{trial!r}（公式未公開の可能性大→再取得）")
         hand = p.get("hand")
         try:
             if hand is None or str(hand).strip() in ("", "-", "None"):
@@ -16821,8 +16821,9 @@ def _v319_validate_card_players(players: list, venue: str = "", race_no: int = 0
         raise ValueError(f"{venue} {race_no}R：有効な出走車がありません。")
     if problems:
         raise ValueError(
-            f"{venue} {race_no}R：出走表データ欠損（通常はありえません）: "
+            f"{venue} {race_no}R：出走表データ不備: "
             + " / ".join(problems[:10])
+            + "。試走T空は公式にまだ載っていない可能性大です。試走後に再取得してください（既定値では埋めません）。"
         )
 
 
@@ -16982,8 +16983,9 @@ def _v319_build_prediction_text_from_sprace(
         if not re.match(r"^\d+\.\d+$", trial):
             if not p.get("kessha") and strict_trial:
                 raise ValueError(
-                    f"出走表の試走Tが欠損しています（通常はありえません）: "
-                    f"{p.get('car')}号 {name} trial={trial!r}"
+                    f"出走表の試走Tが空です: {p.get('car')}号 {name} trial={trial!r}。"
+                    "公式にまだ載っていない可能性大です。"
+                    "欠車でなければ試走後に再取得してください（既定値では埋めません）。"
                 )
             trial_filled = True
             trial = ""
