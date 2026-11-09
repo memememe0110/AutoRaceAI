@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261108_v330a_p3"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261109_v330a_fix2"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -5155,11 +5155,6 @@ def _v279_bg_prediction_start(
 
 def _v279_bg_prediction_load_completed(db_path: str, job: dict) -> tuple[dict,str,str]:
     try:
-        # メインスレッドでpin解除（worker側のsession_stateは効かない場合がある）
-        try:
-            _v284_clear_uploaded_master_pin()
-        except Exception:
-            pass
         result=(job or {}).get("result") or {}
         hid=int(result.get("history_id") or 0)
         if not hid:
@@ -31540,8 +31535,6 @@ def _v276_atomic_install_db_file(source_path: Path, source_label: str = "DB") ->
     finally:
         temp.unlink(missing_ok=True)
 
-@_v330a_exclusive_db_operation((False, "Ver330-A検証中またはDB処理中のためDB差し替えを停止しました。完了後に再試行してください。"))
-
 def _v284_clear_uploaded_master_pin() -> None:
     """アップロード／復元pinを外す。予測完了後に呼び、古いマスター復元で結果が消えるのを防ぐ。"""
     try:
@@ -31552,6 +31545,7 @@ def _v284_clear_uploaded_master_pin() -> None:
         pass
 
 
+@_v330a_exclusive_db_operation((False, "Ver330-A検証中またはDB処理中のためDB差し替えを停止しました。完了後に再試行してください。"))
 def install_uploaded_db(uploaded) -> tuple[bool, str]:
     data = uploaded.getvalue()
     if not data.startswith(b"SQLite format 3\x00"):
@@ -33686,16 +33680,8 @@ def _v215_render_return_dashboard(db_path: str) -> None:
                 "Ver328実験中: 中盤底上げ + 6周目無意味追い抜き抑制。"
                 "予測保存版はVer328です。本線Ver326は変更されません。"
             )
-        _v330a_ui = st.checkbox(
-            "Ver330-A（周6抑制のみ・推奨実験）",
-            value=bool(st.session_state.get("v330a_toggle", False)),
-            key="v330a_toggle",
-            help="デフォルトOFF。ONで通常予測に周6の無意味追い抜き抑制のみ適用。中盤底上げは含みません。",
-        )
-        try:
-            globals()["_V330A_EXPERIMENT"] = bool(_v330a_ui)
-        except Exception:
-            pass
+        # トグル本体は公式取込パネルのみ（Streamlit key重複防止）。ここでは状態表示のみ。
+        _v330a_ui = bool(st.session_state.get("v330a_toggle", False))
         if _v330a_ui and not _v328_exp_ui:
             st.info(
                 "Ver330-A 実験中: 周6抑制のみ（Axis A/B 合格済み）。"
