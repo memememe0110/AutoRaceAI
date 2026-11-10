@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261110_plan_ver"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261110_plan_relabel"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -31693,6 +31693,126 @@ def _v302_normalize_restore_plan_versions(db_path: str) -> int:
 
 
 
+
+def _v330a_relabel_plans_from_prediction_history(
+    db_path: str,
+    *,
+    from_versions: list | None = None,
+    to_version: str = "Ver330-A",
+    dry_run: bool = False,
+) -> dict:
+    """予測履歴に to_version があるレースについて、プランの誤ラベル(from)を to_version に直す。
+
+    再シミュレーションはしない。app_version メタデータのみ更新。
+    同一 race_key に複数プランがある場合も対象行すべてを更新する。
+    """
+    from_versions = [str(v).strip() for v in (from_versions or ["Ver326", ""]) if str(v).strip() or v == ""]
+    to_version = str(to_version or "Ver330-A").strip() or "Ver330-A"
+    out = {"ok": 0, "candidate": 0, "dry_run": bool(dry_run), "to_version": to_version, "from_versions": from_versions}
+    try:
+        _v187_ensure_mixed_learning_tables(db_path)
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(str(db_path), timeout=60.0) as con:
+            con.execute("PRAGMA busy_timeout=60000")
+            cols = {str(r[1]) for r in con.execute("PRAGMA table_info(v187_mixed_plan_runs)").fetchall()}
+            if "app_version" not in cols:
+                out["error"] = "v187_mixed_plan_runs.app_version がありません"
+                return out
+            has_hist = bool(
+                con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='v231_prediction_history'"
+                ).fetchone()
+            )
+            if not has_hist:
+                out["error"] = "v231_prediction_history がありません"
+                return out
+            # 予測履歴に to_version がある race_key
+            race_keys = [
+                str(r[0])
+                for r in con.execute(
+                    """
+                    SELECT DISTINCT race_key
+                      FROM v231_prediction_history
+                     WHERE COALESCE(app_version,'') = ?
+                    """,
+                    (to_version,),
+                ).fetchall()
+                if r and r[0]
+            ]
+            if not race_keys:
+                out["message"] = f"予測履歴に {to_version} がありません"
+                return out
+            # from_versions の空文字は NULL/空も対象
+            placeholders = ",".join("?" for _ in race_keys)
+            # candidate count
+            cand = con.execute(
+                f"""
+                SELECT COUNT(*)
+                  FROM v187_mixed_plan_runs
+                 WHERE race_key IN ({placeholders})
+                   AND (
+                        COALESCE(NULLIF(app_version,''), '') IN ({",".join("?" for v in from_versions if v)})
+                        OR (COALESCE(app_version,'') = '' AND ? = 1)
+                   )
+                   AND COALESCE(app_version,'') <> ?
+                """,
+                (
+                    *race_keys,
+                    *[v for v in from_versions if v],
+                    1 if "" in from_versions or not from_versions else 0,
+                    to_version,
+                ),
+            ).fetchone()
+            # simpler candidate query to avoid empty IN
+            q_from = list({v for v in from_versions if v})
+            if not q_from:
+                q_from = ["Ver326"]
+            from_ph = ",".join("?" for _ in q_from)
+            include_empty = 1 if ("" in from_versions or not from_versions) else 0
+            cand_row = con.execute(
+                f"""
+                SELECT COUNT(*)
+                  FROM v187_mixed_plan_runs
+                 WHERE race_key IN ({placeholders})
+                   AND COALESCE(app_version,'') <> ?
+                   AND (
+                        COALESCE(app_version,'') IN ({from_ph})
+                        OR (? = 1 AND COALESCE(app_version,'') = '')
+                   )
+                """,
+                (*race_keys, to_version, *q_from, include_empty),
+            ).fetchone()
+            candidate = int(cand_row[0] if cand_row else 0)
+            out["candidate"] = candidate
+            out["pred_races"] = len(race_keys)
+            if dry_run or candidate <= 0:
+                out["message"] = f"対象 {candidate} 件（予測 {to_version} が {len(race_keys)}R）"
+                return out
+            cur = con.execute(
+                f"""
+                UPDATE v187_mixed_plan_runs
+                   SET app_version = ?
+                 WHERE race_key IN ({placeholders})
+                   AND COALESCE(app_version,'') <> ?
+                   AND (
+                        COALESCE(app_version,'') IN ({from_ph})
+                        OR (? = 1 AND COALESCE(app_version,'') = '')
+                   )
+                """,
+                (to_version, *race_keys, to_version, *q_from, include_empty),
+            )
+            out["ok"] = int(cur.rowcount or 0)
+            con.commit()
+            out["message"] = f"{out['ok']} 件のプランを {to_version} に更新しました"
+            return out
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+
+
 def _v324_chatgpt_compact_export(df: pd.DataFrame, analysis_df: pd.DataFrame | None = None) -> str:
     """ChatGPT向けの小さいテキスト。集計＋代表レースのみ。"""
     lines: list[str] = []
@@ -33474,6 +33594,64 @@ def _v215_aggregate_return(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFr
 
 def _v215_render_return_dashboard(db_path: str) -> None:
     st.markdown("## 📊 回収率重視プラン実績")
+    with st.expander("🛠 過去プランの版ラベル修正（再シミュ不要）", expanded=False):
+        st.caption(
+            "修正前は回収率プランが常に Ver326 で保存されていました。"
+            "予測履歴に Ver330-A があるレースについて、プランの app_version だけを Ver330-A に直します。"
+            "確率・買い目・再シミュレーションは変更しません。"
+        )
+        _rl_from = st.multiselect(
+            "書き換え元ラベル",
+            options=["Ver326", "Unknown", "(空)"],
+            default=["Ver326", "(空)"],
+            key="v330a_relabel_from",
+        )
+        _rl_to = st.selectbox(
+            "書き換え先",
+            options=["Ver330-A", "Ver326", "Ver328", "Ver331"],
+            index=0,
+            key="v330a_relabel_to",
+        )
+        _c_prev, _c_go = st.columns(2)
+        if _c_prev.button("対象件数だけ確認", use_container_width=True, key="v330a_relabel_dry"):
+            _froms = []
+            for x in _rl_from:
+                if x == "(空)":
+                    _froms.append("")
+                elif x == "Unknown":
+                    _froms.append("Unknown")
+                else:
+                    _froms.append(str(x))
+            _prev = _v330a_relabel_plans_from_prediction_history(
+                str(db_path), from_versions=_froms, to_version=str(_rl_to), dry_run=True
+            )
+            st.session_state["v330a_relabel_last"] = _prev
+            if _prev.get("error"):
+                st.error(_prev["error"])
+            else:
+                st.info(_prev.get("message") or str(_prev))
+        if _c_go.button("版ラベルを書き換える", type="primary", use_container_width=True, key="v330a_relabel_go"):
+            _froms = []
+            for x in _rl_from:
+                if x == "(空)":
+                    _froms.append("")
+                elif x == "Unknown":
+                    _froms.append("Unknown")
+                else:
+                    _froms.append(str(x))
+            with st.spinner("プラン版ラベル更新中…"):
+                _done = _v330a_relabel_plans_from_prediction_history(
+                    str(db_path), from_versions=_froms, to_version=str(_rl_to), dry_run=False
+                )
+            st.session_state["v330a_relabel_last"] = _done
+            if _done.get("error"):
+                st.error(_done["error"])
+            else:
+                st.success(_done.get("message") or str(_done))
+                st.rerun()
+        _rl_last = st.session_state.get("v330a_relabel_last")
+        if isinstance(_rl_last, dict) and _rl_last:
+            st.caption(f"前回: {_rl_last}")
     with st.expander("Ver325: 保存オッズだけでプラン再計算（再シミュ不要）", expanded=False):
         st.caption(
             "予測の6周再シミュレーションはしません。"
