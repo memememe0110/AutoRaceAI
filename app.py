@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261109_q_append1"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261110_v331_phase1"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -11730,6 +11730,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     elif top_mass > 0.65:
         base_budget -= 350  # 強く集中したレースは早めに収束
     _v330a_full_validation = str(os.environ.get("AUTORACE_330_VALIDATION_MODE") or "") == "1"
+    # Phase1測定: 330/331 どちらの VALIDATION_MODE でも全trials・指紋・分布を保存
+    _v331_full_validation = (
+        _v330a_full_validation
+        or str(os.environ.get("AUTORACE_331_VALIDATION_MODE") or "") == "1"
+    )
+    if _v331_full_validation:
+        _v330a_full_validation = True
     sim_trials = (requested_trials if _v330a_full_validation else max(1400, min(requested_trials, base_budget)))
     counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
     lap_order_counts={lap:{} for lap in range(1,7)}
@@ -11756,7 +11763,17 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     chain_events={c:0 for c in cars}
     # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
     base_order=sorted(cars,key=lambda c:(handicap[c],c))
-    
+    _v331_trial0_initial = {}
+    _v331_actual_lap1 = ()
+    if _v331_full_validation and actual_lap_orders:
+        try:
+            _v331_actual_lap1 = tuple(int(x) for x in actual_lap_orders[0][1])
+        except Exception:
+            try:
+                _v331_actual_lap1 = tuple(int(x) for x in actual_lap_orders[0])
+            except Exception:
+                _v331_actual_lap1 = ()
+
     # Ver243: 上位展開の分布が十分に安定したら早期終了する。
     # 本命集中レースを無駄に最後まで回さず、混戦時は設定上限まで継続する。
     planned_trials = sim_trials
@@ -11793,7 +11810,24 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for i in range(1,len(order)):
             prev,cur=order[i-1],order[i]
             dh=max(0,handicap[cur]-handicap[prev])
-            _ = gaps.append(0.11+0.017*dh+rng.uniform(0.00,0.08))
+            _g0 = 0.11 + 0.017 * dh + rng.uniform(0.00, 0.08)
+            # Ver331: 初期gap補正プレースホルダ（係数は測定後に決定。現状は恒等）
+            if _v331_lap1_tune_active():
+                pass  # Phase2で scale/bias をここに入れる
+            _ = gaps.append(_g0)
+        # Ver331測定: trial0の初期 order/gaps を監査用に保持
+        if _v331_full_validation and sim_index == 0:
+            try:
+                _v331_trial0_initial = {
+                    "order": [int(x) for x in order],
+                    "gaps": [round(float(x), 10) for x in gaps],
+                    "handicap": {str(int(c)): int(handicap.get(c, 0) or 0) for c in cars},
+                    "start_score": {
+                        str(int(c)): round(float(start_score.get(c, 0.0)), 10) for c in cars
+                    },
+                }
+            except Exception:
+                _v331_trial0_initial = {}
         # 6周。後車から前車へ隣接追い抜き判定。
         sim_lap_path=[]
         momentum={c:0.0 for c in cars}
@@ -12363,6 +12397,25 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             if _v330a_full_validation else {}
         ),
         "ver330a_validation_full_trials": bool(_v330a_full_validation),
+        "ver331_lap1_audit": (
+            {
+                "trial0_initial": _v331_trial0_initial,
+                "lap1_distribution": (
+                    {
+                        "-".join(map(str, k)): int(v)
+                        for k, v in (lap_order_counts.get(1) or {}).items()
+                    }
+                    if _v331_full_validation
+                    else {}
+                ),
+                "lap1_actual": (
+                    "-".join(map(str, _v331_actual_lap1)) if _v331_actual_lap1 else ""
+                ),
+                "correction_active": bool(_v331_lap1_tune_active()),
+            }
+            if _v331_full_validation
+            else {}
+        ),
         "all_trifecta_combinations":len(ints),
         "prepare_seconds":round(_v242_prepare_seconds,3), "simulation_seconds":round(_v242_sim_seconds,3),
         "message":f"Ver265ではVer257相当の展開係数へ戻し、実測の試走→競走タイム変換残差を開催場・選手・ハンデ帯で縮小学習して基礎能力へ小さく反映します。要求{requested_trials:,}回、計画{planned_trials:,}回、実行{sim_trials:,}回。準備{_v242_prepare_seconds:.2f}秒／6周計算{_v242_sim_seconds:.2f}秒。全3連単を保存",
@@ -12411,7 +12464,10 @@ def _v330a_compare_mode_run() -> None:
         np.random.seed(seed)
         globals()["_V328_EXPERIMENT"] = False
         globals()["_V328_WORKER_ACTIVE"] = False
-        globals()["_V330A_EXPERIMENT"] = (mode == "Ver330-A")
+        # Phase2用: mode が Ver331 / Ver331-on なら 330A + Lap1補正ON
+        _v331_on = mode in ("Ver331", "Ver331-on")
+        globals()["_V330A_EXPERIMENT"] = (mode == "Ver330-A") or _v331_on
+        globals()["_V331_LAP1_TUNE"] = bool(_v331_on)
         df, bets, output, entries, meta = engine.ver16_run_prediction(
             prediction_text, trials=trials, seed=seed, manual_excluded=[]
         )
