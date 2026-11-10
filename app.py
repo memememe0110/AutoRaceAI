@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261110_hist_lock2"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261110_bg330"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -5122,6 +5122,10 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             error_text=f"{type(exc).__name__}: {exc}",
         )
     finally:
+        try:
+            globals()["_V330A_EXPERIMENT"] = bool(_prev_v330a)
+        except Exception:
+            pass
         _v276_foreground_prediction_event.clear()
         try:
             with _V279_BG_PRED_LOCK:
@@ -5146,6 +5150,10 @@ def _v279_bg_prediction_start(
         "復元内容のバックグラウンド再シミュレーションを開始します。"
         if bool(rerun_from_restored) else "バックグラウンド予測を開始します。"
     )
+    try:
+        _job_ver = str(_v326_effective_save_version()).strip()
+    except Exception:
+        _job_ver = str(globals().get("_V231_APP_VERSION") or "Ver326")
     with sqlite3.connect(str(db_path),timeout=30.0) as con:
         con.execute("PRAGMA busy_timeout=30000")
         cur=con.execute("""
@@ -5154,11 +5162,23 @@ def _v279_bg_prediction_start(
                 done_count,total_count,current_label,message
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """,(
-            job_type,str(_V231_APP_VERSION),"queued",now,now,1,0,0,4,"準備中",start_message
+            job_type,_job_ver,"queued",now,now,1,0,0,4,"準備中",start_message
         ))
         con.commit(); job_id=int(cur.lastrowid or 0)
     _excluded301=[int(x) for x in (excluded or [])]
     _input_fp301=_v301_bg_input_fingerprint(str(raw_text),str(venue_override or ""),_excluded301)
+    try:
+        _sv = str(_v326_effective_save_version()).strip()
+    except Exception:
+        _sv = str(globals().get("_V231_APP_VERSION") or "Ver326")
+    try:
+        _v330_on = bool(_v330a_active())
+    except Exception:
+        _v330_on = False
+    try:
+        globals()["_V330A_EXPERIMENT"] = bool(_v330_on)
+    except Exception:
+        pass
     request_data={
         "raw_text":str(raw_text),"venue_override":str(venue_override or ""),"trials":int(trials),
         "seed":int(seed),"excluded":_excluded301,
@@ -5166,6 +5186,8 @@ def _v279_bg_prediction_start(
         "rerun_from_restored":bool(rerun_from_restored),
         "rerun_source_version":str(rerun_source_version or ""),
         "rerun_source_history_id":int(rerun_source_history_id or 0),
+        "v330a_enabled": bool(_v330_on),
+        "save_version": _sv,
     }
     th=threading.Thread(
         target=_v279_bg_prediction_worker,args=(str(db_path),job_id,request_data),daemon=True,
@@ -19556,19 +19578,56 @@ def _v319_latest_prediction_app_version(db_path: str, race_key: str) -> str:
 
 
 def _v319_prediction_matches_current_version(db_path: str, race_key: str) -> bool:
-    """現行予測版（_V231_APP_VERSION / APP_VERSION）の予測があるか。
+    """保存予定版（トグル反映）の予測が1件でもあるか。
 
-    他バージョンのみ存在するレースは False（再予測対象）。
+    最新1件の版ではなく、保存予定版の行の有無で判定する。
+    Ver326のみ・トグルON(Ver330-A) → False（再予測）。
     """
-    cur = str(
-        globals().get("_V231_APP_VERSION")
-        or globals().get("APP_VERSION")
-        or "Ver326"
-    ).strip()
-    latest = _v319_latest_prediction_app_version(db_path, race_key)
-    if not latest:
+    try:
+        cur = str(_v326_effective_save_version()).strip()
+    except Exception:
+        cur = str(
+            globals().get("_V231_APP_VERSION")
+            or globals().get("APP_VERSION")
+            or "Ver326"
+        ).strip()
+    if not cur:
         return False
-    return latest == cur
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as con:
+            tables = {
+                r[0]
+                for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "v231_prediction_history" not in tables:
+                return False
+            cols = {
+                str(r[1])
+                for r in con.execute("PRAGMA table_info(v231_prediction_history)").fetchall()
+            }
+            if "app_version" not in cols:
+                return False
+            keys = [str(race_key)]
+            m = re.match(r"(\d{4})-?(\d{2})-?(\d{2})_(.+)_(\d+)R?", str(race_key))
+            if m:
+                ymd = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                keys = _v319_race_key_candidates(ymd, m.group(4), m.group(5))
+            ph = ",".join("?" * len(keys))
+            row = con.execute(
+                f"""
+                SELECT 1 FROM v231_prediction_history
+                 WHERE race_key IN ({ph})
+                   AND COALESCE(app_version,'') = ?
+                 LIMIT 1
+                """,
+                tuple(list(keys) + [cur]),
+            ).fetchone()
+            return bool(row)
+    except Exception:
+        latest = _v319_latest_prediction_app_version(db_path, race_key)
+        return bool(latest) and latest == cur
 
 
 def _v319_prediction_entry_count(db_path: str, race_key: str) -> int:
@@ -21312,11 +21371,14 @@ def _v319_import_one_race(
     # 現行版の予測が無い（他版のみ等）→ 未予測扱いで再予測
     if pred_ok and not _v319_prediction_matches_current_version(db_path, key_guess):
         _old_ver = _v319_latest_prediction_app_version(db_path, key_guess) or "?"
-        _cur_ver = str(
-            globals().get("_V231_APP_VERSION")
-            or globals().get("APP_VERSION")
-            or "Ver326"
-        ).strip()
+        try:
+            _cur_ver = str(_v326_effective_save_version()).strip()
+        except Exception:
+            _cur_ver = str(
+                globals().get("_V231_APP_VERSION")
+                or globals().get("APP_VERSION")
+                or "Ver326"
+            ).strip()
         try:
             # 他版の履歴は残し、新規 history を現行版で追加する（clear しない）
             pass
@@ -22255,6 +22317,19 @@ def _v319_bg_import_start(
         ))
         con.commit()
         job_id = int(cur.lastrowid or 0)
+    try:
+        _sv = str(_v326_effective_save_version()).strip()
+    except Exception:
+        _sv = str(globals().get("_V231_APP_VERSION") or "Ver326")
+    try:
+        _v330_on = bool(_v330a_active())
+    except Exception:
+        _v330_on = False
+    # UI描画で globals 同期済みでも worker 用に明示
+    try:
+        globals()["_V330A_EXPERIMENT"] = bool(_v330_on)
+    except Exception:
+        pass
     req = {
         "ymd": ymd, "venues": list(venues or []),
         "skip_existing": bool(skip_existing), "replace": bool(replace),
@@ -22265,6 +22340,8 @@ def _v319_bg_import_start(
         "register_result": bool(register_result),
         "task_mode": str(task_mode or "normal"),
         "min_rows": int(min_rows or 30),
+        "v330a_enabled": bool(_v330_on),
+        "save_version": _sv,
     }
     th = threading.Thread(
         target=_v319_bg_import_worker, args=(str(db_path), job_id, req),
