@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261110_grasp330"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261110_hist_lock"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -2934,6 +2934,8 @@ def _v326_abort_any() -> bool:
 
 
 _V326_QUEUE_LOCK = threading.Lock()
+_V319_HISTORY_WRITE_LOCK = threading.Lock()  # 履歴保存と予測のSQLite競合緩和
+
 
 
 def _v326_queue_connect(db_path: str, timeout: float = 30.0):
@@ -18484,32 +18486,64 @@ def _v319_force_save_history_df(db_path: str, name: str, df) -> dict:
 
     changed = 0
     pending_n = 0
-    # 1) v47
+
+    def _hist_write_retry(fn, *, tries: int = 6, label: str = "write"):
+        """SQLite locked / busy を指数バックオフで再試行。"""
+        last_exc = None
+        for attempt in range(max(1, int(tries))):
+            try:
+                return fn()
+            except Exception as exc:
+                last_exc = exc
+                msg = f"{type(exc).__name__}: {exc}".lower()
+                locked = (
+                    "locked" in msg
+                    or "busy" in msg
+                    or type(exc).__name__ == "OperationalError"
+                )
+                if not locked or attempt >= tries - 1:
+                    raise
+                try:
+                    time.sleep(0.35 * (2 ** attempt) + (0.05 * attempt))
+                except Exception:
+                    pass
+        if last_exc:
+            raise last_exc
+        return None
+
+    # 1) v47（予測・他履歴書込との競合で OperationalError になりやすい）
     try:
-        rep = engine.v47_save_player_history(work, db_path=db_path) or {}
-        changed += int(rep.get("changed") or rep.get("saved") or 0)
-        pend = rep.get("pending")
-        pending_n = int(rep.get("pending_count") or 0)
-        if isinstance(pend, pd.DataFrame) and not pend.empty:
-            pend = pend.copy()
-            pend["重複処理"] = "入力したRで新規登録"
-            pend["_v58_duplicate_confirmed"] = True
-            if "レース名" not in pend.columns:
-                pend["レース名"] = "一般戦"
-            else:
-                pend.loc[
-                    pend["レース名"].fillna("").astype(str).str.strip().isin(["", "nan", "None"]),
-                    "レース名",
-                ] = "一般戦"
-            fn = getattr(engine, "v131_save_pending_player_history", None)
-            if callable(fn):
-                rep2 = fn(pend, db_path=db_path) or {}
-            else:
-                rep2 = engine.v47_save_player_history(pend, db_path=db_path) or {}
-            changed += int(rep2.get("changed") or rep2.get("saved") or rep2.get("verified") or 0)
-            pending_n = int(rep2.get("pending_count") or 0)
+        with _V319_HISTORY_WRITE_LOCK:
+            def _do_v47():
+                rep0 = engine.v47_save_player_history(work, db_path=db_path) or {}
+                ch0 = int(rep0.get("changed") or rep0.get("saved") or 0)
+                pend0 = rep0.get("pending")
+                pn0 = int(rep0.get("pending_count") or 0)
+                ch1 = 0
+                if isinstance(pend0, pd.DataFrame) and not pend0.empty:
+                    pend0 = pend0.copy()
+                    pend0["重複処理"] = "入力したRで新規登録"
+                    pend0["_v58_duplicate_confirmed"] = True
+                    if "レース名" not in pend0.columns:
+                        pend0["レース名"] = "一般戦"
+                    else:
+                        pend0.loc[
+                            pend0["レース名"].fillna("").astype(str).str.strip().isin(["", "nan", "None"]),
+                            "レース名",
+                        ] = "一般戦"
+                    fn = getattr(engine, "v131_save_pending_player_history", None)
+                    if callable(fn):
+                        rep2 = fn(pend0, db_path=db_path) or {}
+                    else:
+                        rep2 = engine.v47_save_player_history(pend0, db_path=db_path) or {}
+                    ch1 = int(rep2.get("changed") or rep2.get("saved") or rep2.get("verified") or 0)
+                    pn0 = int(rep2.get("pending_count") or pn0 or 0)
+                return ch0 + ch1, pn0
+
+            ch_sum, pending_n = _hist_write_retry(_do_v47, tries=6, label="v47")
+            changed += int(ch_sum or 0)
     except Exception as exc:
-        out["details"].append(f"v47失敗:{type(exc).__name__}")
+        out["details"].append(f"v47失敗:{type(exc).__name__}:{exc}")
 
     # 2) まだ 0 なら validate の valid を v15 直保存
     if changed <= 0:
@@ -18519,7 +18553,10 @@ def _v319_force_save_history_df(db_path: str, name: str, df) -> dict:
             else:
                 valid, pending = work, pd.DataFrame()
             if isinstance(valid, pd.DataFrame) and not valid.empty:
-                ch, sk = engine.v15_save_player_history(valid, db_path=db_path)
+                def _do_v15():
+                    return engine.v15_save_player_history(valid, db_path=db_path)
+                with _V319_HISTORY_WRITE_LOCK:
+                    ch, sk = _hist_write_retry(_do_v15, tries=5, label="v15")
                 changed += int(ch or 0)
                 out["details"].append(f"v15直保存:{int(ch or 0)}")
             # pending も レース名補完して再試行
