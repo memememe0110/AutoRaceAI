@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261109_trial_msg2"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261109_q_append1"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -3106,6 +3106,7 @@ def _v326_enqueue_tasks(
 
     insert_first=True: 既存 pending の sort_order を +1 シフトし、
     新規行を sort_order=0 で先頭に挿入する。
+    insert_first=False（既定）: pending の最大 sort_order の次から末尾に追加する。
     オプション列は追加時点のチェック状態を保存する。
     """
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
@@ -3148,7 +3149,6 @@ def _v326_enqueue_tasks(
             except Exception:
                 pass
 
-    effective_so = 0 if insert_first else int(sort_order or 0)
     _fo = 1 if fetch_odds else 0
     _rr = 1 if register_result else 0
     _se = 1 if skip_existing else 0
@@ -3158,6 +3158,26 @@ def _v326_enqueue_tasks(
     def _run():
         inserted = 0
         with _v326_queue_connect(db_path, 30.0) as con:
+            if insert_first:
+                next_so = 0
+            else:
+                # 明示 sort_order 指定がなければ pending 末尾へ（並び替え後も常に最後）
+                try:
+                    so_arg = int(sort_order or 0)
+                except Exception:
+                    so_arg = 0
+                if so_arg > 0:
+                    next_so = so_arg
+                else:
+                    row = con.execute(
+                        """
+                        SELECT COALESCE(MAX(sort_order), -1)
+                          FROM v326_import_queue
+                         WHERE job_type = ? AND status = 'pending'
+                        """,
+                        (str(job_type),),
+                    ).fetchone()
+                    next_so = int(row[0] if row and row[0] is not None else -1) + 1
             for venue, rn in task_list:
                 cur = con.execute(
                     """
@@ -3170,11 +3190,13 @@ def _v326_enqueue_tasks(
                             ?, ?, ?, ?, ?)
                     """,
                     (
-                        str(job_type), task_mode, ymd, venue, rn, int(effective_so), now, now,
+                        str(job_type), task_mode, ymd, venue, rn, int(next_so), now, now,
                         _fo, _rr, _se, _rp, _pm,
                     ),
                 )
-                inserted += int(cur.rowcount or 0)
+                if int(cur.rowcount or 0) > 0:
+                    inserted += 1
+                    next_so += 1
             con.commit()
         return inserted
 
@@ -13283,11 +13305,15 @@ def _v326_render_official_import_panel() -> None:
     q5, q6 = st.columns(2)
     clr_pend = q5.button("🗑 pending全消去", use_container_width=True, key="v326_q_clr_pend")
     clr_all = q6.button("🗑 キュー全消去", use_container_width=True, key="v326_q_clr_all")
-    _ins_first = st.checkbox(
-        "＋条件をキューに追加するとき、先頭に割り込み追加",
-        value=False, key="v326_q_add_first",
-        help="既存 pending の前に挿入します。「先に処理したい」ものを優先できます。",
+    _ins_pos = st.radio(
+        "＋条件をキューに追加する位置",
+        options=["末尾（いちばん最後）", "先頭（割り込み）"],
+        index=0,
+        key="v326_q_add_pos",
+        horizontal=True,
+        help="並び替え後でも、新規は既定でキューのいちばん最後に追加します。先頭は急ぎ処理用。",
     )
+    _ins_first = str(_ins_pos or "").startswith("先頭")
     if add_q:
         if not venues:
             st.warning("開催場を選ぶか、先に開催確認してください。")
@@ -39475,9 +39501,17 @@ if selected_main_page == "✅ 結果登録・解析":
             "開催場", ["開催を探す"] + RESULT_VENUES, key="v319_hist_venue"
         )
         hist_race_count = st.number_input(
-            "選手履歴だけ登録するレース数", min_value=1, max_value=12, value=12, step=1,
+            "選手履歴だけ登録する最大レース番号", min_value=1, max_value=12, value=12, step=1,
             key="v319_hist_race_count",
-            help="1Rから指定レース数までをキューへ追加します。例: 3なら1〜3R。"
+            help="公式で実在するRだけを 1R〜この番号までキューへ追加します（存在しないRは入れません）。",
+        )
+        _hist_ins_pos = st.radio(
+            "選手履歴のみをキューに追加する位置",
+            options=["末尾（いちばん最後）", "先頭（割り込み）"],
+            index=0,
+            key="v319_hist_q_add_pos",
+            horizontal=True,
+            help="既定はキュー末尾。急ぎなら先頭に割り込み。",
         )
         hist_min_rows = st.number_input(
             "最低履歴件数", min_value=5, max_value=200, value=30, step=5,
@@ -39505,20 +39539,42 @@ if selected_main_page == "✅ 結果登録・解析":
                 st.warning("開催場を選ぶか、先に「この日の開催を確認」を実行してください。")
             else:
                 _hist_tasks = []
+                _hist_skipped_miss = 0
                 for _hv in hist_venues:
-                    for _hn in range(1, int(hist_race_count) + 1):
-                        _hist_tasks.append((str(_hv), int(_hn)))
+                    try:
+                        _real_rns = _v319_ordered_race_nos(hist_ymd, str(_hv), int(hist_race_count))
+                    except Exception:
+                        _real_rns = []
+                    if not _real_rns:
+                        # フォールバック禁止: 存在未確認の 1..N は積まない
+                        _hist_skipped_miss += int(hist_race_count or 0)
+                        continue
+                    for _hn in _real_rns:
+                        if 1 <= int(_hn) <= int(hist_race_count):
+                            _hist_tasks.append((str(_hv), int(_hn)))
                 try:
                     _hist_added = _v326_enqueue_tasks(
                         engine.DB_PATH, "official_import", hist_ymd, _hist_tasks,
                         task_mode="history_only",
+                        insert_first=str(_hist_ins_pos or "").startswith("先頭"),
                         fetch_odds=False, register_result=False,
                         skip_existing=True, replace=False, predict_if_missing=False,
                     )
-                    st.success(
-                        f"選手履歴タスクを {_hist_added}R キューへ追加しました。"
-                        " 通常取込と同じキューで、途中停止後も pending から再開できます。"
+                    _miss_note = (
+                        f" 実在未確認で除外 {_hist_skipped_miss}R。"
+                        if int(_hist_skipped_miss or 0) > 0 else ""
                     )
+                    if int(_hist_added or 0) <= 0:
+                        st.warning(
+                            "追加0件（既にキューにあるか、実在Rがありません）。"
+                            + _miss_note
+                        )
+                    else:
+                        st.success(
+                            f"選手履歴タスクを {_hist_added}R キュー末尾（または指定位置）へ追加しました。"
+                            " 通常取込と同じキューで、途中停止後も pending から再開できます。"
+                            + _miss_note
+                        )
                     st.rerun()
                 except Exception as _hist_qexc:
                     st.error(f"選手履歴キュー追加失敗: {type(_hist_qexc).__name__}: {_hist_qexc}")
