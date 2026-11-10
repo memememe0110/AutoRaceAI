@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261110_plan_relabel"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261110_grasp330"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -13232,13 +13232,18 @@ def _v326_render_official_import_panel() -> None:
     )
 
     # 取り込み済み／把握済み確認（再HTTPなし。回収率の判定対象とは別）
-    # 現行版の予測のみを「把握」とする（旧版のみあるRは 0R）
+    # 保存予定版（トグル反映）＋ Ver330-A の予測有無を併記
     try:
-        _cur_ver = str(
+        _base_ver = str(
             globals().get("_V231_APP_VERSION")
             or globals().get("APP_VERSION")
             or "Ver326"
         ).strip()
+        try:
+            _cur_ver = str(_v326_effective_save_version() or _base_ver).strip()
+        except Exception:
+            _cur_ver = _base_ver
+        _v330a_ver = str(globals().get("_V330A_APP_VERSION") or "Ver330-A").strip()
         _reg_lines = []
         for _vn in (venues or []):
             if _vn not in RESULT_VENUES:
@@ -13259,6 +13264,17 @@ def _v326_render_official_import_panel() -> None:
             _pred_nos = [n for n in _pred_nos if isinstance(n, int) and 1 <= n <= 12]
             _any_nos = [n for n in _any_nos if isinstance(n, int) and 1 <= n <= 12]
             _old_only = sorted(set(_any_nos) - set(_pred_nos))
+            _pred330_nos = []
+            try:
+                if _v330a_ver and _v330a_ver != _cur_ver:
+                    _pred330_nos = _v319_prediction_race_nos_for_version(
+                        engine.DB_PATH, ymd, _vn, app_version=_v330a_ver
+                    )
+                elif _v330a_ver == _cur_ver:
+                    _pred330_nos = list(_pred_nos)
+            except Exception:
+                _pred330_nos = []
+            _pred330_nos = [n for n in _pred330_nos if isinstance(n, int) and 1 <= n <= 12]
             try:
                 _invalid_nos = _v319_void_or_invalid_race_nos(engine.DB_PATH, ymd, _vn)
             except Exception:
@@ -13269,6 +13285,7 @@ def _v326_render_official_import_panel() -> None:
                 + list(_any_nos)
                 + list(_reg_nos)
                 + list(_pred_nos)
+                + list(_pred330_nos)
                 + list(_invalid_nos)
                 + [8]
             )
@@ -13320,10 +13337,33 @@ def _v326_render_official_import_panel() -> None:
                     f"　⚠️ **{_vn}** 旧版のみ予測（再予測対象）: "
                     + ",".join(f"{n}R" for n in _old_only)
                 )
+            # Ver330-A の予測有無（トグルOFF時でも併記）
+            if _v330a_ver and _v330a_ver != _cur_ver:
+                _miss330 = [
+                    n
+                    for n in range(1, _mx + 1)
+                    if n not in set(_pred330_nos) and n not in _invalid_set
+                ]
+                _ok330_s = ",".join(f"{n}R" for n in sorted(_pred330_nos)) if _pred330_nos else "なし"
+                _miss330_s = ",".join(f"{n}R" for n in _miss330) if _miss330 else ""
+                if not _miss330 and _pred330_nos:
+                    st.success(
+                        f"　✅ **{_vn}**（{_v330a_ver}）予測OK **{len(_pred330_nos)}R**（{_ok330_s}）"
+                    )
+                elif _miss330:
+                    st.warning(
+                        f"　📌 **{_vn}**（{_v330a_ver}）予測OK **{len(_pred330_nos)}R**"
+                        + (f"（{_ok330_s}）" if _pred330_nos else "")
+                        + f" ／ **未予測 {len(_miss330)}R：{_miss330_s}**"
+                    )
+                else:
+                    st.caption(f"　📌 **{_vn}**（{_v330a_ver}）予測 0R")
             _reg_lines.append(_vn)
         if _reg_lines:
             st.caption(
-                f"※現行版予測＝{_cur_ver} のみ。旧版だけのRは未把握。"
+                f"※保存予定版＝{_cur_ver}"
+                + (f"（ベース {_base_ver}）" if _cur_ver != _base_ver else "")
+                + f"。Ver330-A の未予測も併記。"
                 " 不成立・中止・全返還は未予測に含めず対象外。"
                 " resultは版非依存。回収率のレース数は別集計です。"
             )
