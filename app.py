@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261110_hist_lock"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261110_hist_lock2"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -18504,7 +18504,7 @@ def _v319_force_save_history_df(db_path: str, name: str, df) -> dict:
                 if not locked or attempt >= tries - 1:
                     raise
                 try:
-                    time.sleep(0.35 * (2 ** attempt) + (0.05 * attempt))
+                    time_module.sleep(0.35 * (2 ** attempt) + (0.05 * attempt))
                 except Exception:
                     pass
         if last_exc:
