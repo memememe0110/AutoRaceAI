@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261110_v331_phase1"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261110_plan_ver"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -16372,7 +16372,7 @@ def _v319_apply_odds_and_plan(
             finally:
                 globals()["_V325_ENABLE_G1"] = _prev_g1
             if isinstance(result, dict) and result.get("available"):
-                _save_ver = str(globals().get("_V325_APP_VERSION") or "Ver325") if _exp325 else str(APP_VERSION)
+                _save_ver = str(globals().get("_V325_APP_VERSION") or "Ver325") if _exp325 else _v326_effective_save_version()
                 _origin325 = "odds_replan" if use_saved_odds else "official_import"
                 plan_hash = str(_v187_save_mixed_plan(
                     db_path, str(race_key), result, app_version=_save_ver,
@@ -39015,7 +39015,7 @@ elif selected_main_page == "🏁 予測":
                 bets, view_trials, meta, fast_odds_maps, race_key=race_key,
                 # Ver302表示集計修正2: 復元で作られた回収率プランは現在Verではなく元予測Verへ保存する。
                 # これにより結果登録後の実績も元Verのレースとして集計され、新Ver側へ重複しない。
-                app_version=(_restored_source_ver if _restored_plan_mode else str(_V231_APP_VERSION)),
+                app_version=(_restored_source_ver if _restored_plan_mode else _v326_effective_save_version()),
                 save_enabled=True,
                 plan_origin=("source_version_restore" if _restored_plan_mode else "live"),
                 source_prediction_version=_restored_source_ver,
