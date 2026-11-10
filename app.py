@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261110_bg330"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261110_bg330fix"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -4998,10 +4998,29 @@ def _v279_send_bg_prediction_complete_notification(result: dict) -> None:
 
 
 def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) -> None:
+    _prev_v330a = bool(globals().get("_V330A_EXPERIMENT"))
     try:
+        # 予測タブの Ver330-A トグルを worker に反映（session なし）
+        try:
+            if "v330a_enabled" in (request_data or {}):
+                globals()["_V330A_EXPERIMENT"] = bool(request_data.get("v330a_enabled"))
+            elif str((request_data or {}).get("save_version") or "").strip() == "Ver330-A":
+                globals()["_V330A_EXPERIMENT"] = True
+        except Exception:
+            pass
+        try:
+            _save_ver = str(
+                (request_data or {}).get("save_version")
+                or _v326_effective_save_version()
+                or globals().get("_V231_APP_VERSION")
+                or "Ver326"
+            ).strip()
+        except Exception:
+            _save_ver = str(globals().get("_V231_APP_VERSION") or "Ver326")
         _v278_bg_update(
             db_path,job_id,status="running",started_at=_v228_now_jst_iso(),
-            done_count=0,total_count=4,current_label="基礎予測",message="基礎予測を実行しています。"
+            done_count=0,total_count=4,current_label="基礎予測",
+            message=f"基礎予測を実行しています（save_ver={_save_ver}）。",
         )
         raw_text=str(request_data.get("raw_text") or "")
         venue_override=str(request_data.get("venue_override") or "")
@@ -5069,7 +5088,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             "df":df,"bets":bets,"output":output,"entries":entries,"meta":meta,
             "finish_prob":finish_prob,"race_key":race_key,"trials":trials,"excluded":excluded,
             "learning_boundary":{},"future_audit":{},"day_trend":{},"prediction_timing":timing,
-            "app_version":_V231_APP_VERSION,"simulation_mode":_V231_SIMULATION_MODE,
+            "app_version":str((request_data or {}).get("save_version") or _save_ver or _V231_APP_VERSION),"simulation_mode":_V231_SIMULATION_MODE,
             "settings_hash":_v231_settings_hash(trials,seed,excluded),
             "prediction_time":_v228_now_jst_iso(),"seed":seed,
             "rerun_from_restored":bool(request_data.get("rerun_from_restored", False)),
@@ -5090,7 +5109,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             label=str(race_key)
         result={
             "history_id":int(history_id or 0),"race_key":str(race_key),"race_label":str(label),
-            "app_version":str(_V231_APP_VERSION),"timing":timing,
+            "app_version":str((request_data or {}).get("save_version") or _save_ver or _V231_APP_VERSION),"timing":timing,
             "rerun_from_restored":bool(request_data.get("rerun_from_restored", False)),
             "rerun_source_version":str(request_data.get("rerun_source_version") or ""),
             "rerun_source_history_id":int(request_data.get("rerun_source_history_id") or 0),
