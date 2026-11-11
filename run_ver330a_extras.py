@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ver331 Phase 1 extras worker: 7R control measurement (8-car, zero handicap spread).
 
-Runs the fixed eight-race control set using Ver326, 20,000 trials, seed 12345.
+Runs the fixed seven-race control set using Ver326, 20,000 trials, seed 12345.
 The source DB is read-only; results are checkpointed to a dedicated Git branch.
 """
 from __future__ import annotations
@@ -156,7 +156,7 @@ def _read_handicap_values(con, race_key):
 
 
 def verify_extra_targets(db: Path):
-    """Fail before simulation unless all eight races satisfy the control definition."""
+    """Fail before simulation unless all seven races satisfy the control definition."""
     report = {}
     with verify.ro_connect(db) as con:
         prediction_table = verify.prediction_table(con)
