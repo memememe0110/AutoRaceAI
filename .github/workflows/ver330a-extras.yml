@@ -1,4 +1,4 @@
-name: Ver331 Extras (3R control)
+name: Ver331 Extras gapC (3R control)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       run_id:
         description: "Run ID (e.g. lap1_v331_extras_20261111)"
         required: true
-        default: "lap1_v331_extras_20261111_3r"
+        default: "lap1_v331_gapC_20261111_3r"
       max_races:
         description: "Max races per invocation (1..3)"
         required: true
