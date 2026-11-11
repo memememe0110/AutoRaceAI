@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ver331 Phase 1 extras worker: 8R control measurement (8-car, zero handicap spread).
+"""Ver331 Phase 1 extras worker: 7R control measurement (8-car, zero handicap spread).
 
 Runs the fixed eight-race control set using Ver326, 20,000 trials, seed 12345.
 The source DB is read-only; results are checkpointed to a dedicated Git branch.
@@ -269,7 +269,7 @@ def main():
     parser.add_argument("--results-rel", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--branch", required=True)
-    parser.add_argument("--max-races", type=int, default=8)
+    parser.add_argument("--max-races", type=int, default=7)
     parser.add_argument("--trials", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--timeout", type=float, default=1800)
@@ -331,7 +331,7 @@ def main():
 
     progress.update({
         "run_id": args.run_id,
-        "phase": "Ver331 extras (8R control)",
+        "phase": "Ver331 extras (7R control)",
         "status": "running",
         "total": EXPECTED_EXTRA_COUNT,
         "done_count": len(done),
