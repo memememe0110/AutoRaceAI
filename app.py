@@ -12930,6 +12930,7 @@ def _v330a_compare_mode_run() -> None:
             "sim_trials": int((audit or {}).get("v284_transition_audit", {}).get("trials") or 0),
             "lap_order_counts": dict((audit or {}).get("ver330a_validation_lap_order_counts") or {}),
             "validation_full_trials": bool((audit or {}).get("ver330a_validation_full_trials")),
+            "ver331_gap_diag": dict((audit or {}).get("ver331_gap_diag") or {}),
         })
     except Exception as exc:
         result.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})

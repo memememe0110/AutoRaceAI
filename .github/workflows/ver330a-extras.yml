@@ -55,10 +55,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - name: Checkout code (main)
+      - name: Checkout code (dispatched ref)
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.ref_name }}
           path: code
 
       - name: Resolve latest db-* Release tag
