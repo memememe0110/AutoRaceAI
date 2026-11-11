@@ -1,0 +1,207 @@
+name: Ver331 Extras (8R control)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Run ID (e.g. lap1_v331_extras_20261111)"
+        required: true
+        default: "lap1_v331_extras_20261111"
+      max_races:
+        description: "Max races per invocation (1..8)"
+        required: true
+        default: "8"
+      trials:
+        description: "Trials (fixed 20000)"
+        required: true
+        default: "20000"
+      seed:
+        description: "Seed (fixed 12345)"
+        required: true
+        default: "12345"
+
+concurrency:
+  group: ver330a-extras-validation
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code (main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: code
+
+      - name: Resolve latest db-* Release tag
+        id: db_tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="$(gh release list --repo "$REPO" --limit 100 \
+                 --json tagName,publishedAt \
+                 --jq '[.[] | select(.tagName | startswith("db-"))] | sort_by(.publishedAt) | reverse | .[0].tagName')"
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::No db-* release found"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved latest DB release: ${TAG}"
+
+      - name: Download DB from Release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.db_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p validation_workdir
+          gh release download "$TAG" --repo "$REPO" \
+            --pattern "autorace_players.sqlite3" \
+            --dir validation_workdir
+          test -s validation_workdir/autorace_players.sqlite3
+          ls -lh validation_workdir/
+
+      - name: Verify DB integrity and required tables
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+
+          p = Path("validation_workdir/autorace_players.sqlite3")
+          if not p.is_file() or p.stat().st_size < 100:
+              raise SystemExit(f"DB missing or too small: {p}")
+          if p.read_bytes()[:16] != b"SQLite format 3\x00":
+              raise SystemExit("Not a SQLite database")
+
+          uri = f"file:{p.resolve().as_posix()}?mode=ro"
+          with sqlite3.connect(uri, uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+              if str(integrity).lower() != "ok":
+                  raise SystemExit(f"integrity_check failed: {integrity}")
+
+              tables = {
+                  row[0] for row in con.execute(
+                      "SELECT name FROM sqlite_master WHERE type='table'"
+                  )
+              }
+              required = {
+                  "result_laps",
+                  "result_entries",
+                  "v222_prediction_restore",
+                  "v231_prediction_history",
+              }
+              missing = sorted(required - tables)
+              if missing:
+                  raise SystemExit("Missing required tables: " + ", ".join(missing))
+
+              columns = {
+                  row[1] for row in con.execute(
+                      'PRAGMA table_info("result_entries")'
+                  )
+              }
+              required_columns = {"race_key", "handicap"}
+              missing_columns = sorted(required_columns - columns)
+              if missing_columns:
+                  raise SystemExit(
+                      "result_entries missing columns: " + ", ".join(missing_columns)
+                  )
+
+          print(f"DB ready: {p.stat().st_size:,} bytes")
+          PY
+
+      - name: Verify DB SHA256 matches Phase 1
+        run: |
+          set -euo pipefail
+          DB_PATH="$GITHUB_WORKSPACE/validation_workdir/autorace_players.sqlite3"
+          EXPECTED="d5e7c141ae0e66708a53b2e8ac4d7035d019aeaf98cba596bc83d9d2d128d7ac"
+          ACTUAL="$(sha256sum "$DB_PATH" | awk '{print $1}')"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::DB sha256 mismatch: $ACTUAL != $EXPECTED"
+            exit 1
+          fi
+          echo "DB sha256 OK: $ACTUAL"
+
+      - name: Prepare validation output branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          AUTH_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          if git ls-remote --exit-code --heads "$AUTH_URL" ver330a-extras >/dev/null 2>&1; then
+            git clone --depth 1 --branch ver330a-extras "$AUTH_URL" valroot
+          else
+            git clone --depth 1 "$AUTH_URL" valroot
+            cd valroot
+            git checkout --orphan ver330a-extras
+            git rm -rf . >/dev/null 2>&1 || true
+            git commit --allow-empty -m "Initialize ver330a-extras"
+            git push -u origin ver330a-extras
+            cd ..
+          fi
+          git -C valroot config user.name "AutoRaceAI Validation Bot"
+          git -C valroot config user.email "actions@users.noreply.github.com"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f code/requirements.txt ]; then
+            pip install -r code/requirements.txt
+          fi
+          pip install numpy pandas streamlit playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Compile check
+        working-directory: code
+        run: |
+          python -m py_compile app.py run_ver330a_extras.py verify_ver330_validation.py
+
+      - name: Run extras measurement
+        working-directory: code
+        env:
+          RUN_ID: ${{ github.event.inputs.run_id }}
+          MAX_RACES: ${{ github.event.inputs.max_races }}
+          TRIALS: ${{ github.event.inputs.trials }}
+          SEED: ${{ github.event.inputs.seed }}
+          DB_FILE: ${{ github.workspace }}/validation_workdir/autorace_players.sqlite3
+          APP_FILE: ${{ github.workspace }}/code/app.py
+          DB_ROOT: ${{ github.workspace }}/valroot
+        run: |
+          set -euo pipefail
+          python run_ver330a_extras.py \
+            --db "$DB_FILE" \
+            --app "$APP_FILE" \
+            --db-root "$DB_ROOT" \
+            --results-rel "validation/extras" \
+            --run-id "$RUN_ID" \
+            --branch ver330a-extras \
+            --max-races "$MAX_RACES" \
+            --trials "$TRIALS" \
+            --seed "$SEED"
+
+      - name: Upload logs on failure
+        if: failure()
+        env:
+          RUN_ID: ${{ github.event.inputs.run_id }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ver331-extras-logs-${{ github.event.inputs.run_id }}
+          path: |
+            valroot/validation/extras/${{ github.event.inputs.run_id }}/
+          if-no-files-found: ignore
