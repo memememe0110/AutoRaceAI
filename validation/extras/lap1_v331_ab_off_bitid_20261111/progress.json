@@ -3,11 +3,11 @@
   "phase": "Ver331 extras A/B control (3R)",
   "status": "running",
   "total": 3,
-  "done_count": 2,
+  "done_count": 3,
   "failed_count": 0,
-  "current_race": "20260802_浜松_5R",
+  "current_race": "",
   "started_at": "2026-11-11T13:03:39+00:00",
-  "updated_at": "2026-11-11T13:06:38+00:00",
+  "updated_at": "2026-11-11T13:07:53+00:00",
   "batch_started_at": "2026-11-11T13:03:39+00:00",
   "last_error": "",
   "trials": 20000,
@@ -70,17 +70,17 @@
       "handicap_spread": 0.0
     }
   },
-  "last_completed_race": "20260802_浜松_10R",
-  "elapsed_seconds": 177,
-  "estimated_remaining_seconds": 88,
+  "last_completed_race": "20260802_浜松_5R",
+  "elapsed_seconds": 254,
+  "estimated_remaining_seconds": 0,
   "summary_so_far": {
     "median": {
-      "n_races": 2,
-      "pattern_rank": 7792.0,
-      "pattern_rank_cutoff_25pct_median": 3204.0,
+      "n_races": 3,
+      "pattern_rank": 4403.0,
+      "pattern_rank_cutoff_25pct_median": 3303.0,
       "uniform_ratio": 2.016,
-      "top1_prob": 0.0005,
-      "relative_lift": 0.08333333333333334
+      "top1_prob": 0.0006,
+      "relative_lift": 0.07142857142857144
     },
     "pass": {
       "pattern_rank": false,
