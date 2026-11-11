@@ -1,7 +1,7 @@
 {
   "run_id": "lap1_v331_ab_off_20261111_3r",
   "phase": "Ver331 extras A/B control (3R)",
-  "status": "running",
+  "status": "completed",
   "total": 3,
   "done_count": 3,
   "failed_count": 0,
@@ -74,6 +74,24 @@
   "elapsed_seconds": 88,
   "estimated_remaining_seconds": 0,
   "summary_so_far": {
+    "median": {
+      "n_races": 3,
+      "pattern_rank": 971.0,
+      "pattern_rank_cutoff_25pct_median": 243.0,
+      "uniform_ratio": 0.0,
+      "top1_prob": 0.002,
+      "relative_lift": 0.0
+    },
+    "pass": {
+      "pattern_rank": false,
+      "uniform_ratio": false,
+      "top1_prob": false,
+      "relative_lift": false
+    },
+    "all_four_pass": false
+  },
+  "finished_at": "2026-11-11T16:43:11+00:00",
+  "final_summary": {
     "median": {
       "n_races": 3,
       "pattern_rank": 971.0,
