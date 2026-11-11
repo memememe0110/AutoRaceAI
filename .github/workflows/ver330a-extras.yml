@@ -1,25 +1,49 @@
-name: Ver331 Extras gapC (3R control)
+name: Ver331 Extras A/B control
 
 on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "Run ID (e.g. lap1_v331_extras_20261111)"
+        description: "Run ID (e.g. lap1_v331_ab_off_bitid_20261111)"
         required: true
-        default: "lap1_v331_gapC_20261111_3r"
+        default: "lap1_v331_ab_off_bitid_20261111"
+      mode:
+        description: "Comparison mode (Ver331-off=bit-identical, Ver331=TUNE on)"
+        type: choice
+        options:
+          - Ver331-off
+          - Ver331
+        default: Ver331-off
+      gap_mode:
+        description: "Gap mode A/B/C"
+        type: choice
+        options:
+          - A
+          - B
+          - C
+        default: A
+      ka:
+        description: "A coefficient (start_score diff)"
+        required: true
+        default: "0.0"
+      kb:
+        description: "B coefficient (strength diff)"
+        required: true
+        default: "0.0"
+      trials:
+        description: "Trials (1000 or 20000)"
+        required: true
+        default: "20000"
       max_races:
         description: "Max races per invocation (1..3)"
         required: true
         default: "3"
-      trials:
-        description: "Trials (fixed 20000)"
-        required: true
-        default: "20000"
       seed:
         description: "Seed (fixed 12345)"
         required: true
         default: "12345"
 
+concurrency:
 concurrency:
   group: ver330a-extras-validation
   cancel-in-progress: false
@@ -183,9 +207,16 @@ jobs:
           MAX_RACES: ${{ github.event.inputs.max_races }}
           TRIALS: ${{ github.event.inputs.trials }}
           SEED: ${{ github.event.inputs.seed }}
+          MODE: ${{ github.event.inputs.mode }}
+          GAP_MODE: ${{ github.event.inputs.gap_mode }}
+          KA: ${{ github.event.inputs.ka }}
+          KB: ${{ github.event.inputs.kb }}
           DB_FILE: ${{ github.workspace }}/validation_workdir/autorace_players.sqlite3
           APP_FILE: ${{ github.workspace }}/code/app.py
           DB_ROOT: ${{ github.workspace }}/valroot
+          AUTORACE_331_GAP_MODE: ${{ github.event.inputs.gap_mode }}
+          AUTORACE_331_KA: ${{ github.event.inputs.ka }}
+          AUTORACE_331_KB: ${{ github.event.inputs.kb }}
         run: |
           set -euo pipefail
           python run_ver330a_extras.py \
@@ -195,6 +226,10 @@ jobs:
             --results-rel "validation/extras" \
             --run-id "$RUN_ID" \
             --branch ver330a-extras \
+            --mode "$MODE" \
+            --gap-mode "$GAP_MODE" \
+            --ka "$KA" \
+            --kb "$KB" \
             --max-races "$MAX_RACES" \
             --trials "$TRIALS" \
             --seed "$SEED"
