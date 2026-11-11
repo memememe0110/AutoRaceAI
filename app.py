@@ -425,7 +425,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261111_v331_gapC2"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261111_hist_upsert"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -3172,20 +3172,19 @@ def _v326_enqueue_tasks(
     _pm = 1 if predict_if_missing else 0
 
     def _run():
-        """条件付き upsert。
+        """条件付き upsert（UNIQUE: job_type, task_mode, ymd, venue, race_no）。
 
         - 行なし → INSERT pending
-        - done/failed/error/skipped → pending に戻して再投入（Ver326後にVer330も回せる）
-        - pending → オプション更新のみ（同一なら skip）
+        - done/failed 等 → 同一 task_mode 行を pending に戻す（履歴再取込・版再予測）
+        - pending → オプション更新のみ
         - processing → 触らない
-        戻り値は「新規 or 再投入で仕事が発生した件数」。
+        IntegrityError 時も SELECT→reset にフォールバック（旧UNIQUE残骸対策）
         """
         inserted = 0
         with _v326_queue_connect(db_path, 30.0) as con:
             if insert_first:
                 next_so = 0
             else:
-                # 明示 sort_order 指定がなければ pending 末尾へ（並び替え後も常に最後）
                 try:
                     so_arg = int(sort_order or 0)
                 except Exception:
@@ -3203,27 +3202,33 @@ def _v326_enqueue_tasks(
                     ).fetchone()
                     next_so = int(row[0] if row and row[0] is not None else -1) + 1
             for venue, rn in task_list:
-                cur = con.execute(
-                    """
-                    INSERT OR IGNORE INTO v326_import_queue
-                        (job_type, task_mode, ymd, venue, race_no, status, sort_order,
-                         message, created_at, updated_at,
-                         fetch_odds, register_result, skip_existing,
-                         replace_existing, predict_if_missing)
-                    VALUES (?, ?, ?, ?, ?, 'pending', ?, '', ?, ?,
-                            ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(job_type), task_mode, ymd, venue, rn, int(next_so), now, now,
-                        _fo, _rr, _se, _rp, _pm,
-                    ),
-                )
-                if int(cur.rowcount or 0) > 0:
+                rowcount = 0
+                try:
+                    cur = con.execute(
+                        """
+                        INSERT OR IGNORE INTO v326_import_queue
+                            (job_type, task_mode, ymd, venue, race_no, status, sort_order,
+                             message, created_at, updated_at,
+                             fetch_odds, register_result, skip_existing,
+                             replace_existing, predict_if_missing)
+                        VALUES (?, ?, ?, ?, ?, 'pending', ?, '', ?, ?,
+                                ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(job_type), task_mode, ymd, venue, rn, int(next_so), now, now,
+                            _fo, _rr, _se, _rp, _pm,
+                        ),
+                    )
+                    rowcount = int(cur.rowcount or 0)
+                except sqlite3.IntegrityError:
+                    # 旧UNIQUEや競合時: IGNORE 相当として既存行処理へ
+                    rowcount = 0
+                if rowcount > 0:
                     inserted += 1
                     next_so += 1
                     continue
 
-                # UNIQUE で弾かれた → 既存行を検査して条件付き再投入
+                # 同一 UNIQUE キー（task_mode 込み）の既存行を優先
                 row = con.execute(
                     """
                     SELECT status,
@@ -3232,25 +3237,42 @@ def _v326_enqueue_tasks(
                            COALESCE(register_result, 1),
                            COALESCE(skip_existing, 1),
                            COALESCE(replace_existing, 0),
-                           COALESCE(predict_if_missing, 1)
+                           COALESCE(predict_if_missing, 1),
+                           task_id
                       FROM v326_import_queue
-                     WHERE job_type = ? AND ymd = ? AND venue = ? AND race_no = ?
-                     ORDER BY
-                        CASE COALESCE(task_mode, 'normal')
-                            WHEN ? THEN 0 ELSE 1 END,
-                        task_id DESC
+                     WHERE job_type = ?
+                       AND COALESCE(task_mode, 'normal') = ?
+                       AND ymd = ? AND venue = ? AND race_no = ?
                      LIMIT 1
                     """,
-                    (str(job_type), ymd, venue, rn, task_mode),
+                    (str(job_type), task_mode, ymd, venue, rn),
                 ).fetchone()
+                if not row:
+                    # 旧UNIQUEのみ（task_mode なし）で他mode行が座っている場合
+                    row = con.execute(
+                        """
+                        SELECT status,
+                               COALESCE(task_mode, 'normal'),
+                               COALESCE(fetch_odds, 1),
+                               COALESCE(register_result, 1),
+                               COALESCE(skip_existing, 1),
+                               COALESCE(replace_existing, 0),
+                               COALESCE(predict_if_missing, 1),
+                               task_id
+                          FROM v326_import_queue
+                         WHERE job_type = ? AND ymd = ? AND venue = ? AND race_no = ?
+                         ORDER BY task_id DESC
+                         LIMIT 1
+                        """,
+                        (str(job_type), ymd, venue, rn),
+                    ).fetchone()
                 if not row:
                     continue
                 st = str(row[0] or "").strip().lower()
+                tid = int(row[7] or 0)
                 if st == "processing":
-                    # 走行中は絶対に触らない
                     continue
                 if st in ("done", "failed", "error", "skipped", "cancelled", "ok"):
-                    # 完了/失敗済み → pending に戻して再実行（他版予測の追加用）
                     con.execute(
                         """
                         UPDATE v326_import_queue
@@ -3264,25 +3286,24 @@ def _v326_enqueue_tasks(
                                skip_existing = ?,
                                replace_existing = ?,
                                predict_if_missing = ?
-                         WHERE job_type = ? AND ymd = ? AND venue = ? AND race_no = ?
+                         WHERE task_id = ?
                            AND status = ?
                         """,
                         (
                             task_mode, int(next_so), now,
                             _fo, _rr, _se, _rp, _pm,
-                            str(job_type), ymd, venue, rn, st,
+                            tid, st,
                         ),
                     )
                     inserted += 1
                     next_so += 1
                     continue
                 if st == "pending":
-                    # 既に待ち → オプションだけ最新化（無言skipを避ける）
+                    old_mode = str(row[1] or "normal")
                     old_fo, old_rr, old_se, old_rp, old_pm = (
                         int(row[2] or 1), int(row[3] or 1), int(row[4] or 1),
                         int(row[5] or 0), int(row[6] or 1),
                     )
-                    old_mode = str(row[1] or "normal")
                     if (
                         old_mode != task_mode
                         or old_fo != _fo or old_rr != _rr
@@ -3298,16 +3319,15 @@ def _v326_enqueue_tasks(
                                    skip_existing = ?,
                                    replace_existing = ?,
                                    predict_if_missing = ?
-                             WHERE job_type = ? AND ymd = ? AND venue = ? AND race_no = ?
+                             WHERE task_id = ?
                                AND status = 'pending'
                             """,
                             (
                                 task_mode, now,
                                 _fo, _rr, _se, _rp, _pm,
-                                str(job_type), ymd, venue, rn,
+                                tid,
                             ),
                         )
-                    # pending のままなので inserted は増やさない（既にキュー内）
                     continue
             con.commit()
         return inserted
@@ -40150,18 +40170,22 @@ if selected_main_page == "✅ 結果登録・解析":
                     )
                     if int(_hist_added or 0) <= 0:
                         st.warning(
-                            "追加0件（既にキューにあるか、実在Rがありません）。"
+                            "追加0件（pending 既存・processing 中・または実在Rなし）。"
+                            " done 済みなら再投入で pending に戻ります。もう一度押すか、"
+                            "実行中なら完了を待ってください。"
                             + _miss_note
                         )
                     else:
                         st.success(
-                            f"選手履歴タスクを {_hist_added}R キュー末尾（または指定位置）へ追加しました。"
+                            f"選手履歴タスクを {_hist_added}R 追加/再投入（pending）しました。"
                             " 通常取込と同じキューで、途中停止後も pending から再開できます。"
                             + _miss_note
                         )
                     st.rerun()
                 except Exception as _hist_qexc:
-                    st.error(f"選手履歴キュー追加失敗: {type(_hist_qexc).__name__}: {_hist_qexc}")
+                    st.error(
+                        f"選手履歴キュー追加失敗: {type(_hist_qexc).__name__}: {_hist_qexc}"
+                    )
         if hist_queue_run:
             _hist_qs = _v326_queue_summary(engine.DB_PATH, "official_import")
             if int(_hist_qs.get("pending") or 0) + int(_hist_qs.get("running") or 0) <= 0:
