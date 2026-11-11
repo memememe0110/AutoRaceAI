@@ -1,4 +1,4 @@
-name: Ver331 Extras (8R control)
+name: Ver331 Extras (7R control)
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ on:
         required: true
         default: "lap1_v331_extras_20261111"
       max_races:
-        description: "Max races per invocation (1..8)"
+        description: "Max races per invocation (1..7)"
         required: true
-        default: "8"
+        default: "7"
       trials:
         description: "Trials (fixed 20000)"
         required: true
@@ -138,6 +138,9 @@ jobs:
         run: |
           set -euo pipefail
           AUTH_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          # identity は clone/commit より前に必須（orphan 初回で落ちないように）
+          git config --global user.name "AutoRaceAI Validation Bot"
+          git config --global user.email "actions@users.noreply.github.com"
           if git ls-remote --exit-code --heads "$AUTH_URL" ver330a-extras >/dev/null 2>&1; then
             git clone --depth 1 --branch ver330a-extras "$AUTH_URL" valroot
           else
