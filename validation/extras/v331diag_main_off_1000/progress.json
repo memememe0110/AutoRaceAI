@@ -1,0 +1,73 @@
+{
+  "run_id": "v331diag_main_off_1000",
+  "phase": "Ver331 extras A/B control (3R)",
+  "status": "running",
+  "total": 3,
+  "done_count": 0,
+  "failed_count": 0,
+  "current_race": "",
+  "started_at": "2026-11-11T19:37:36+00:00",
+  "updated_at": "2026-11-11T19:37:36+00:00",
+  "batch_started_at": "2026-11-11T19:37:36+00:00",
+  "last_error": "",
+  "trials": 1000,
+  "seed": 12345,
+  "batch_limit": 3,
+  "db_sha256": "d5e7c141ae0e66708a53b2e8ac4d7035d019aeaf98cba596bc83d9d2d128d7ac",
+  "target_check": {
+    "20261021_伊勢崎_12R": {
+      "venue": "伊勢崎",
+      "race_date": "2026-10-21",
+      "has_ver326_prediction": true,
+      "has_lap1_actual": true,
+      "lap1_car_count": 8,
+      "handicap_values": [
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0
+      ],
+      "handicap_spread": 0.0
+    },
+    "20260802_浜松_10R": {
+      "venue": "浜松",
+      "race_date": "2026-08-02",
+      "has_ver326_prediction": true,
+      "has_lap1_actual": true,
+      "lap1_car_count": 8,
+      "handicap_values": [
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0,
+        10.0
+      ],
+      "handicap_spread": 0.0
+    },
+    "20260802_浜松_5R": {
+      "venue": "浜松",
+      "race_date": "2026-08-02",
+      "has_ver326_prediction": true,
+      "has_lap1_actual": true,
+      "lap1_car_count": 8,
+      "handicap_values": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "handicap_spread": 0.0
+    }
+  }
+}
