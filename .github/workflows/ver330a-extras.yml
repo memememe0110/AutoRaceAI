@@ -44,7 +44,6 @@ on:
         default: "12345"
 
 concurrency:
-concurrency:
   group: ver330a-extras-validation
   cancel-in-progress: false
 
