@@ -1,13 +1,13 @@
 {
   "run_id": "lap1_v331_gapC_20261111_3r",
   "phase": "Ver331 gapC extras (3R control)",
-  "status": "running",
+  "status": "completed",
   "total": 3,
   "done_count": 3,
   "failed_count": 0,
   "current_race": "",
   "started_at": "2026-11-11T11:29:09+00:00",
-  "updated_at": "2026-11-11T11:34:43+00:00",
+  "updated_at": "2026-11-11T11:34:44+00:00",
   "batch_started_at": "2026-11-11T11:29:09+00:00",
   "last_error": "",
   "trials": 20000,
@@ -74,6 +74,24 @@
   "elapsed_seconds": 334,
   "estimated_remaining_seconds": 0,
   "summary_so_far": {
+    "median": {
+      "n_races": 3,
+      "pattern_rank": 4308.0,
+      "pattern_rank_cutoff_25pct_median": 3349.0,
+      "uniform_ratio": 2.016,
+      "top1_prob": 0.0005,
+      "relative_lift": 0.1
+    },
+    "pass": {
+      "pattern_rank": false,
+      "uniform_ratio": false,
+      "top1_prob": false,
+      "relative_lift": false
+    },
+    "all_four_pass": false
+  },
+  "finished_at": "2026-11-11T11:34:44+00:00",
+  "final_summary": {
     "median": {
       "n_races": 3,
       "pattern_rank": 4308.0,
