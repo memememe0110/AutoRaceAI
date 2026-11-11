@@ -1,1 +1,2 @@
 ﻿race_key,source,venue,race_date,car_count,actual_pattern,unique_pattern_count,pattern_rank,pattern_count,pattern_prob,uniform_ratio,top1_prob,relative_lift,observed_trials,rank_cutoff_25pct,rank_pass,uniform_pass,top1_pass,relative_lift_pass,sim_trials_reported,ok,error
+20261021_伊勢崎_12R,extra,伊勢崎,2026-10-21,,,,,,,,,,,,,,,,,False,RuntimeError: sim_trials mismatch: 1000 != 100
