@@ -13348,6 +13348,7 @@ def _v326_render_official_import_panel() -> None:
             # 未予測Rを強調（不成立は対象外として分離）
             _pred_s = ",".join(f"{n}R" for n in sorted(_pred_nos)) if _pred_nos else "なし"
             _miss_s = ",".join(f"{n}R" for n in _miss_pred) if _miss_pred else ""
+            _miss_reg_s = ",".join(f"{n}R" for n in sorted(_miss_reg)) if _miss_reg else ""
             _inv_s = ",".join(f"{n}R" for n in _invalid_nos) if _invalid_nos else ""
             _inv_tail = (
                 f" ／ 不成立・中止 {len(_invalid_nos)}R（対象外：{_inv_s}）"
@@ -13359,6 +13360,7 @@ def _v326_render_official_import_panel() -> None:
                     f"🏁 **{_vn}**（{_cur_ver}）　✅ 予測対象はすべて済"
                     + (f"（予測 {len(_pred_nos)}R：{_pred_s}）" if _pred_nos else "（予測0R）")
                     + f"／ result **{len(_reg_nos)}R**"
+                    + (f"（未登録 {len(_miss_reg)}R：{_miss_reg_s}）" if _miss_reg_s else "")
                     + _inv_tail
                 )
             elif _miss_pred:
@@ -13366,13 +13368,14 @@ def _v326_render_official_import_panel() -> None:
                     f"🏁 **{_vn}**（{_cur_ver}）　予測OK **{len(_pred_nos)}R**"
                     + (f"（{_pred_s}）" if _pred_nos else "")
                     + f" ／ **未予測 {len(_miss_pred)}R：{_miss_s}**"
-                    + (f" ／ result未登録 {len(_miss_reg)}R" if _miss_reg else "")
+                    + (f" ／ result未登録 {len(_miss_reg)}R：{_miss_reg_s}" if _miss_reg_s else "")
                     + _inv_tail
                 )
             else:
                 st.warning(
                     f"🏁 **{_vn}**（{_cur_ver}）　予測・resultとも未確認"
                     f"（開催未検出の可能性）"
+                    + (f" ／ result未登録候補 {_miss_reg_s}" if _miss_reg_s else "")
                     + _inv_tail
                 )
             if _old_only:
