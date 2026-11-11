@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261111_v330a_extra2"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261111_v330a_extra3"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -44135,7 +44135,8 @@ if _V330A_VALIDATION_PAGE:
                     ]
                     _done_extra = {
                         k for k, r in _saved_now_by_key.items()
-                        if r.get("ok") is True and str(r.get("source") or "") == "extra"
+                        if r.get("ok") is True
+                        and str(r.get("source") or "") == "extra"
                     }
                     if _conflicts:
                         st.error(
@@ -44145,24 +44146,35 @@ if _V330A_VALIDATION_PAGE:
                         )
                     else:
                         if _skip_done_extra:
-                            _extra_keys = [k for k in _extra_keys if k not in _done_extra]
+                            _extra_keys = [
+                                k for k in _extra_keys if k not in _done_extra
+                            ]
                         if not _extra_keys:
                             st.info("指定キーはすべて成功済みです。")
                         else:
                             _guard_e = _V330A_PROCESS_GUARD
                             _lock_e = _guard_e["lock"]
                             if not _lock_e.acquire(blocking=False):
-                                st.error("別のDB処理が実行中です。完了後に再試行してください。")
+                                st.error(
+                                    "別のDB処理が実行中です。完了後に再試行してください。"
+                                )
                             else:
                                 _guard_e["running"] = True
                                 _guard_e["owner"] = "extra"
                                 try:
-                                    with st.status(f"追加測定… {len(_extra_keys)}R", expanded=True) as _st_e:
+                                    with st.status(
+                                        f"追加測定… {len(_extra_keys)}R",
+                                        expanded=True,
+                                    ) as _st_e:
                                         for _i, _rk in enumerate(_extra_keys):
-                                            _st_e.write(f"{_i+1}/{len(_extra_keys)}：{_rk}")
+                                            _st_e.write(
+                                                f"{_i+1}/{len(_extra_keys)}：{_rk}"
+                                            )
                                             time_module.sleep(0.05)
                                             try:
-                                                _one = _v330a_ui_run_one(_snap, _rk, owner="extra")
+                                                _one = _v330a_ui_run_one(
+                                                    _snap, _rk, owner="extra"
+                                                )
                                                 _one["ok"] = True
                                                 _one["source"] = "extra"
                                             except Exception as _exc:
@@ -44173,10 +44185,18 @@ if _V330A_VALIDATION_PAGE:
                                                     "error": f"{type(_exc).__name__}: {_exc}",
                                                 }
                                             _v330a_ui_save_result(_one)
-                                            _st_e.write(f"  → ok={_one.get('ok')}")
+                                            _st_e.write(
+                                                f"  → ok={_one.get('ok')}"
+                                            )
                                             time_module.sleep(0.05)
-                                        _st_e.update(label=f"追加測定完了 {len(_extra_keys)}R", state="complete")
-                                    st.toast(f"追加 {len(_extra_keys)}R 完了", icon="✅")
+                                        _st_e.update(
+                                            label=f"追加測定完了 {len(_extra_keys)}R",
+                                            state="complete",
+                                        )
+                                    st.toast(
+                                        f"追加 {len(_extra_keys)}R 完了",
+                                        icon="✅",
+                                    )
                                 finally:
                                     _guard_e["running"] = False
                                     _guard_e["owner"] = ""
