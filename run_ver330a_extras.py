@@ -6,6 +6,8 @@ The source DB is read-only; results are checkpointed to a dedicated Git branch.
 """
 from __future__ import annotations
 
+import os
+
 import argparse
 import csv
 import json
@@ -256,6 +258,8 @@ def validate_run_id(run_id: str):
 
 
 def main():
+    # C案測定: worker 子プロセスへ伝播（mode=Ver331 と二重化）
+    os.environ.setdefault("AUTORACE_331_LAP1_TUNE", "1")
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", required=True)
     parser.add_argument("--app", required=True)

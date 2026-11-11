@@ -155,6 +155,8 @@ def run_one_race(app_path: Path, snapshot: Path, race_key: str, mode: str, trial
     import urllib.request
     from playwright.sync_api import sync_playwright
     env = os.environ.copy()
+    _mode_s = str(mode or "").strip()
+    _v331_env = "1" if _mode_s in ("Ver331", "Ver331-on") else "0"
     env.update({
         "AUTORACE_VER330A_COMPARE": "1",
         "AUTORACE_COMPARE_MODE": mode,
@@ -167,6 +169,8 @@ def run_one_race(app_path: Path, snapshot: Path, race_key: str, mode: str, trial
         "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
         # set/dict の iterate 順をプロセス間で固定（lap1からDIFFになる主因対策）
         "PYTHONHASHSEED": "0",
+        # Ver331 Lap1 gapC 測定: mode に連動（Ver326 時は 0 で bit-identical）
+        "AUTORACE_331_LAP1_TUNE": _v331_env,
     })
     streamlit = shutil.which("streamlit")
     cmd = ([streamlit] if streamlit else [sys.executable, "-m", "streamlit"]) + [

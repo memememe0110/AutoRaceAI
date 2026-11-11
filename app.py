@@ -425,7 +425,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261111_queue_upsert2"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261111_v331_gapC2"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -11963,7 +11963,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for i in range(1,len(order)):
             prev,cur=order[i-1],order[i]
             dh=max(0,handicap[cur]-handicap[prev])
-            # --- Ver331: rng.uniform は必ず1回・同じ位置（回数/順序維持）---
+            # --- Ver331: rng.uniform は必ず1回のみ（bit-identical維持）---
             _tune331 = bool(_v331_lap1_tune_active())
             _mode331 = str(globals().get("_V331_GAP_MODE") or "C")
             _hs0 = float(_hspread316 or 0.0) == 0.0
@@ -11971,27 +11971,32 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 _noise_hi = float(globals().get("_V331_C_NOISE") or 0.10)
             else:
                 _noise_hi = 0.08
-            _noise = rng.uniform(0.00, _noise_hi)
-            if _tune331 and _hs0:
-                if _mode331 == "C":
-                    _g0 = float(globals().get("_V331_C_BASE") or 0.14) + 0.017 * dh + _noise
-                else:
-                    _g0 = 0.11 + 0.017 * dh + _noise
-                    if _mode331 == "A":
-                        _g0 += float(globals().get("_V331_KA") or 0.0) * max(
-                            0.0,
-                            float(start_score.get(cur, 0.0) or 0.0)
-                            - float(start_score.get(prev, 0.0) or 0.0),
-                        )
-                    elif _mode331 == "B":
-                        _g0 += float(globals().get("_V331_KB") or 0.0) * max(
-                            0.0,
-                            float(strength.get(cur, 0.0) or 0.0)
-                            - float(strength.get(prev, 0.0) or 0.0),
-                        )
+            _noise = rng.uniform(0.00, _noise_hi)  # 唯一の RNG 呼び出し
+            if _tune331 and _hs0 and _mode331 == "C":
+                _g0 = float(globals().get("_V331_C_BASE") or 0.14) + 0.017 * dh + _noise
+            elif _tune331 and _hs0 and _mode331 == "A":
+                _g0 = (
+                    0.11 + 0.017 * dh + _noise
+                    + float(globals().get("_V331_KA") or 0.0)
+                    * max(
+                        0.0,
+                        float(start_score.get(cur, 0.0) or 0.0)
+                        - float(start_score.get(prev, 0.0) or 0.0),
+                    )
+                )
+            elif _tune331 and _hs0 and _mode331 == "B":
+                _g0 = (
+                    0.11 + 0.017 * dh + _noise
+                    + float(globals().get("_V331_KB") or 0.0)
+                    * max(
+                        0.0,
+                        float(strength.get(cur, 0.0) or 0.0)
+                        - float(strength.get(prev, 0.0) or 0.0),
+                    )
+                )
             else:
                 _g0 = 0.11 + 0.017 * dh + _noise
-            _ = gaps.append(_g0)
+            gaps.append(_g0)
         # Ver331測定: trial0の初期 order/gaps を監査用に保持
         if _v331_full_validation and sim_index == 0:
             try:
@@ -22025,6 +22030,8 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             else:
                 # 明示が無ければ OFF（本線 Ver326）
                 globals()["_V330A_EXPERIMENT"] = False
+            # 通常取込では Ver331 Lap1補正を絶対に漏らさない
+            globals()["_V331_LAP1_TUNE"] = False
         except Exception:
             pass
         try:
