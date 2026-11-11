@@ -11650,7 +11650,10 @@ def _v331_diag_init() -> dict:
         "gap_end_sum": {lap: 0.0 for lap in range(1, 7)},
         "pass_attempts": {lap: 0 for lap in range(1, 7)},
         "pass_successes": {lap: 0 for lap in range(1, 7)},
-        "lap1_spearman": {"sum": 0.0, "n": 0},
+        "lap1_spearman": {"sum": 0.0, "n": 0},            # 実lap1順 vs sim lap1順 (spearman_actual)
+        "lap1_spearman_strength": {"sum": 0.0, "n": 0},   # strength順 vs sim lap1順 (spearman_strength)
+        "lap1_strongest_pos": [0.0, 0],   # trial内strength最大車のlap1順位(1始まり)合計/件数
+        "lap1_weakest_pos": [0.0, 0],     # trial内strength最小車のlap1順位合計/件数
         "lap1_leader_counts": {},       # 代表車 = lap1先頭車の出現回数
     }
 
@@ -11684,6 +11687,10 @@ def _v331_diag_finalize(d: dict) -> dict:
         }
     sp = d.get("lap1_spearman") or {}
     sp_n = int(sp.get("n", 0) or 0)
+    ss = d.get("lap1_spearman_strength") or {}
+    ss_n = int(ss.get("n", 0) or 0)
+    _hi = d.get("lap1_strongest_pos") or [0.0, 0]
+    _lo = d.get("lap1_weakest_pos") or [0.0, 0]
     leaders = d.get("lap1_leader_counts") or {}
     rep = max(leaders.items(), key=lambda kv: kv[1])[0] if leaders else None
     return {
@@ -11708,8 +11715,12 @@ def _v331_diag_finalize(d: dict) -> dict:
         },
         "pass_attempts": {str(k): int(v) for k, v in (d.get("pass_attempts") or {}).items()},
         "pass_successes": {str(k): int(v) for k, v in (d.get("pass_successes") or {}).items()},
-        "lap1_spearman_mean": (round(float(sp.get("sum", 0.0)) / sp_n, 8) if sp_n else None),
-        "lap1_spearman_n": sp_n,
+        "spearman_actual": (round(float(sp.get("sum", 0.0)) / sp_n, 8) if sp_n else None),
+        "spearman_actual_n": sp_n,
+        "spearman_strength": (round(float(ss.get("sum", 0.0)) / ss_n, 8) if ss_n else None),
+        "spearman_strength_n": ss_n,
+        "strongest_car_lap1_pos_mean": (round(float(_hi[0]) / _hi[1], 8) if _hi[1] else None),
+        "weakest_car_lap1_pos_mean": (round(float(_lo[0]) / _lo[1], 8) if _lo[1] else None),
         "lap1_leader_counts": {str(k): int(v) for k, v in leaders.items()},
         "lap1_representative_car": (int(rep) if rep is not None else None),
     }
@@ -12499,6 +12510,20 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     _gd330a["lap1_leader_counts"][int(order[0])] = (
                         _gd330a["lap1_leader_counts"].get(int(order[0]), 0) + 1
                     )
+                    # 元定義: strength降順(強い順)と sim lap1順の Spearman。B案の直接効果の主指標。
+                    _str_rank331 = sorted(cars, key=lambda c: (-float(strength.get(c, 0.0) or 0.0), int(c)))
+                    _rho_s331 = _v331_spearman(_str_rank331, order)
+                    if _rho_s331 is not None:
+                        _gd330a["lap1_spearman_strength"]["sum"] += float(_rho_s331)
+                        _gd330a["lap1_spearman_strength"]["n"] += 1
+                    # 代表車: trial内の strength 最大車/最小車の lap1 終了順位
+                    _pos331 = {int(c): i for i, c in enumerate(order, start=1)}
+                    if _str_rank331:
+                        _gd330a["lap1_strongest_pos"][0] += float(_pos331[int(_str_rank331[0])])
+                        _gd330a["lap1_strongest_pos"][1] += 1
+                        _gd330a["lap1_weakest_pos"][0] += float(_pos331[int(_str_rank331[-1])])
+                        _gd330a["lap1_weakest_pos"][1] += 1
+                    # 併設: 実lap1順 vs sim lap1順（シミュレーション全体の再現度）
                     if _v331_actual_lap1:
                         _rho331 = _v331_spearman(order, _v331_actual_lap1)
                         if _rho331 is not None:
