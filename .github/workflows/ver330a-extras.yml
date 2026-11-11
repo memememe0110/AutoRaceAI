@@ -184,7 +184,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
@@ -192,7 +192,20 @@ jobs:
             pip install -r code/requirements.txt
           fi
           pip install numpy pandas streamlit playwright
-          python -m playwright install --with-deps chromium
+      - name: Install Chromium for Playwright
+        run: |
+          set -euo pipefail
+          # ubuntu-latest has Chromium shared libs already.
+          # Avoid apt --with-deps (DNS flakiness on runners).
+          # Install Chromium binary only with 3 retries.
+          for attempt in 1 2 3; do
+            if python -m playwright install chromium; then
+              exit 0
+            fi
+            echo "playwright install attempt ${attempt} failed; sleep $((attempt*15))s"
+            sleep $((attempt * 15))
+          done
+          exit 1
 
       - name: Compile check
         working-directory: code
