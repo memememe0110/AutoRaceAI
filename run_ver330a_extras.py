@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Ver331 Phase 1 extras worker: 7R control measurement (8-car, zero handicap spread).
+"""Ver331 Phase 1 extras worker: 3R control measurement (8-car, zero handicap spread).
 
-Runs the fixed seven-race control set using Ver326, 20,000 trials, seed 12345.
+Runs the fixed three-race control set using Ver326, 20,000 trials, seed 12345.
 The source DB is read-only; results are checkpointed to a dedicated Git branch.
 """
 from __future__ import annotations
@@ -29,18 +29,12 @@ spec.loader.exec_module(verify)
 
 # Fixed control set. Do not edit during a registered run.
 EXTRA_RACES = [
-    ("20261021_伊勢崎_12R", "伊勢崎", "2026-10-21"),
-    ("20261024_伊勢崎_10R", "伊勢崎", "2026-10-24"),
-    ("20261024_伊勢崎_11R", "伊勢崎", "2026-10-24"),
-    ("20261025_伊勢崎_9R", "伊勢崎", "2026-10-25"),
-    # 20261101_浜松_10R は除外:
-    #   result_entries 7行（car_no=4 欠落）・result_laps のLap1実績なし
-    #   8車spread=0 control群の定義を満たさない
-    ("20261101_浜松_11R", "浜松", "2026-11-01"),
-    ("20261101_浜松_1R",  "浜松", "2026-11-01"),
-    ("20261101_浜松_6R",  "浜松", "2026-11-01"),
+    # C案: Lap1完全 + 8車spread=0 の検証済み3Rのみ
+    ("20261021_伊勢崎_12R", "伊勢崎", "2026-10-21"),  # 10m
+    ("20260802_浜松_10R", "浜松", "2026-08-02"),      # 10m
+    ("20260802_浜松_5R", "浜松", "2026-08-02"),       # 0m
 ]
-EXPECTED_EXTRA_COUNT = 7
+EXPECTED_EXTRA_COUNT = 3
 LAP1_CAR_COUNT = 8
 LAP1_HANDICAP_SPREAD = 0
 HANDICAP_TABLE = "result_entries"
@@ -156,7 +150,7 @@ def _read_handicap_values(con, race_key):
 
 
 def verify_extra_targets(db: Path):
-    """Fail before simulation unless all seven races satisfy the control definition."""
+    """Fail before simulation unless all three races satisfy the control definition."""
     report = {}
     with verify.ro_connect(db) as con:
         prediction_table = verify.prediction_table(con)
@@ -269,7 +263,7 @@ def main():
     parser.add_argument("--results-rel", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--branch", required=True)
-    parser.add_argument("--max-races", type=int, default=7)
+    parser.add_argument("--max-races", type=int, default=3)
     parser.add_argument("--trials", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--timeout", type=float, default=1800)
@@ -331,7 +325,7 @@ def main():
 
     progress.update({
         "run_id": args.run_id,
-        "phase": "Ver331 extras (7R control)",
+        "phase": "Ver331 extras (3R control)",
         "status": "running",
         "total": EXPECTED_EXTRA_COUNT,
         "done_count": len(done),

@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261111_v330a_extra3"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261111_hist_nocache"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -14852,6 +14852,7 @@ def _v319_autorace_api_post(
     venue: str,
     race_no: int = 1,
     timeout: int = 20,
+    cache: bool = True,
 ) -> dict | None:
     """autorace.jp 公式 JSON API（Odds / Program / RaceResult / OtherRaceInfo 共通）。
 
@@ -14867,7 +14868,8 @@ def _v319_autorace_api_post(
     if not path.startswith("/"):
         path = "/" + path
     # Program はレース単位で短時間キャッシュ（同一Rの多重取得を防ぐ）
-    if path.rstrip("/") == "/race_info/Program":
+    # history_only は cache=False で素取得（空試走Tの汚染防止）
+    if cache and path.rstrip("/") == "/race_info/Program":
         ck = (ymd, str(venue), int(race_no))
         if ck in _V319_AR_PROGRAM_CACHE:
             return _V319_AR_PROGRAM_CACHE[ck]
@@ -14934,7 +14936,7 @@ def _v319_autorace_api_post(
     body = data.get("body")
     if not isinstance(body, dict):
         return None
-    if path.rstrip("/") == "/race_info/Program":
+    if cache and path.rstrip("/") == "/race_info/Program":
         _V319_AR_PROGRAM_CACHE[(ymd, str(venue), int(race_no))] = body
         # キャッシュ肥大防止
         if len(_V319_AR_PROGRAM_CACHE) > 40:
@@ -15033,9 +15035,13 @@ def _v319_other_info_to_meta_lines(info: dict) -> list[str]:
     return lines
 
 
-def _v319_autorace_program_body(ymd: str, venue: str, race_no: int) -> dict | None:
+def _v319_autorace_program_body(
+    ymd: str, venue: str, race_no: int, use_cache: bool = True
+) -> dict | None:
     """公式 Program API body（playerList + latest10List 等）。"""
-    return _v319_autorace_api_post("/race_info/Program", ymd, venue, int(race_no))
+    return _v319_autorace_api_post(
+        "/race_info/Program", ymd, venue, int(race_no), cache=use_cache
+    )
 
 
 def _v319_autorace_profile_body(player_cd: str, venue: str = "川口") -> dict | None:
@@ -16664,12 +16670,20 @@ def _v319_synthesize_sprace_html_from_program(
     return "\n".join(parts)
 
 
-def _v319_fetch_sprace_html(ymd: str, venue: str, race_no: int, strict_trial: bool = True) -> str:
+def _v319_fetch_sprace_html(
+    ymd: str,
+    venue: str,
+    race_no: int,
+    strict_trial: bool = True,
+    use_program_cache: bool = True,
+) -> str:
     """出走表HTML。autorace Program API 優先（oddspark 非依存）。"""
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     venue = str(venue or "").strip()
     # 1) autorace 公式 Program
-    body = _v319_autorace_program_body(ymd, venue, int(race_no))
+    body = _v319_autorace_program_body(
+        ymd, venue, int(race_no), use_cache=use_program_cache
+    )
     if isinstance(body, dict) and (body.get("playerList") or []):
         return _v319_synthesize_sprace_html_from_program(
             body, venue, int(race_no), ymd, strict_trial=strict_trial
@@ -20743,7 +20757,11 @@ def _v319_import_player_history_one_race(
     players = []
     _step("出走表")
     try:
-        sp_html = _v319_fetch_sprace_html(ymd, venue, race_no, strict_trial=False)
+        sp_html = _v319_fetch_sprace_html(
+            ymd, venue, race_no,
+            strict_trial=False,
+            use_program_cache=False,  # history_onlyはキャッシュ不使用（空試走T汚染防止）
+        )
         if not str(sp_html or "").strip():
             return {
                 "status": "skip",
