@@ -93,24 +93,46 @@ def write_rows(path: Path, rows):
 def git_checkpoint(
     db_root: Path, branch: str, progress_path: Path, csv_path: Path, message: str
 ):
+    """progress.json / results.csv / runs/*.json を checkpoint。
+
+    初回（runs/ 未作成）でも失敗しない。runs/*.log は追加しない。
+    """
+    run_dir_rel = progress_path.parent.relative_to(db_root).as_posix()
     rel_progress = progress_path.relative_to(db_root).as_posix()
     rel_csv = csv_path.relative_to(db_root).as_posix()
+    rel_runs = f"{run_dir_rel}/runs"
 
     def run(args):
         proc = subprocess.run(
-            args, cwd=db_root, text=True, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT
+            args,
+            cwd=db_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
         if proc.returncode:
             raise RuntimeError(
-                f"Git checkpoint failed ({' '.join(args)}): {proc.stdout[-2500:]}"
+                f"Git checkpoint failed ({' '.join(args)}): "
+                f"{proc.stdout[-2500:]}"
             )
         return proc.stdout
 
     run(["git", "config", "user.name", "AutoRaceAI Validation Bot"])
     run(["git", "config", "user.email", "actions@users.noreply.github.com"])
     run(["git", "add", "--", rel_progress, rel_csv])
-    status = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=db_root)
+    runs_dir = db_root / rel_runs
+    if runs_dir.is_dir():
+        json_paths = [
+            p.relative_to(db_root).as_posix()
+            for p in runs_dir.glob("*.json")
+            if p.is_file()
+        ]
+        if json_paths:
+            run(["git", "add", "--", *json_paths])
+    status = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=db_root,
+    )
     if status.returncode == 0:
         return
     if status.returncode != 1:
@@ -284,8 +306,10 @@ def main():
     args = parser.parse_args()
 
     # 1) 引数検証を env 設定より先に
-    if args.trials not in (1000, 20000) or args.seed != 12345:
-        raise SystemExit("Allowed settings: trials=1000 or 20000, seed=12345")
+    if args.trials not in (100, 1000, 20000) or args.seed != 12345:
+        raise SystemExit(
+            "Allowed settings: trials=100, 1000 or 20000, seed=12345"
+        )
     if not 1 <= args.max_races <= EXPECTED_EXTRA_COUNT:
         raise SystemExit(f"max-races must be 1..{EXPECTED_EXTRA_COUNT}")
     validate_run_id(args.run_id)
