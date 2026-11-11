@@ -11638,6 +11638,110 @@ def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_
     return result
 
 
+def _v331_diag_init() -> dict:
+    """Ver331 gap診断の集計器。検証モード専用。RNG・予測値には一切関与しない。"""
+    return {
+        "trials": 0,
+        "g0": {"g0_sum": 0.0, "g0_base_sum": 0.0, "g0_noise_sum": 0.0,
+               "g0_ka_sum": 0.0, "g0_kb_sum": 0.0,
+               "g0_ka_pairs_nonzero": 0, "g0_kb_pairs_nonzero": 0,
+               "g0_pairs_total": 0},
+        "strength_by_start_rank": {},   # rank(1始まり) -> [strength合計, 件数]
+        "gap_end_sum": {lap: 0.0 for lap in range(1, 7)},
+        "pass_attempts": {lap: 0 for lap in range(1, 7)},
+        "pass_successes": {lap: 0 for lap in range(1, 7)},
+        "lap1_spearman": {"sum": 0.0, "n": 0},            # 実lap1順 vs sim lap1順 (spearman_actual)
+        "lap1_spearman_strength": {"sum": 0.0, "n": 0},   # strength順 vs sim lap1順 (spearman_strength)
+        "lap1_strongest_pos": [0.0, 0],   # trial内strength最大車のlap1順位(1始まり)合計/件数
+        "lap1_weakest_pos": [0.0, 0],     # trial内strength最小車のlap1順位合計/件数
+        "errors": {},                   # 診断コード内の例外 {where: {count, first}}
+        "lap1_leader_counts": {},       # 代表車 = lap1先頭車の出現回数
+    }
+
+
+def _v331_diag_err(d, where: str, exc) -> None:
+    """診断コード内の例外を握りつぶさず、件数と初回内容を記録し stderr に1回だけ出す。"""
+    if d is None:
+        return
+    try:
+        rec = d.setdefault("errors", {}).setdefault(where, {"count": 0, "first": repr(exc)})
+        rec["count"] += 1
+        if rec["count"] == 1:
+            import sys as _sys331
+            print("[ver331_gap_diag] ERROR at %s: %r" % (where, exc), file=_sys331.stderr)
+    except Exception:
+        pass
+
+
+def _v331_spearman(order_a, order_b):
+    """2つの着順リスト(車番の並び)のSpearman順位相関。比較不能なら None。"""
+    try:
+        a = [int(x) for x in order_a]
+        b = [int(x) for x in order_b]
+    except Exception:
+        return None
+    n = len(a)
+    if n < 2 or n != len(b) or set(a) != set(b) or len(set(a)) != n:
+        return None
+    rank_b = {c: i for i, c in enumerate(b)}
+    d2 = sum((i - rank_b[c]) ** 2 for i, c in enumerate(a))
+    return 1.0 - (6.0 * d2) / (n * (n * n - 1.0))
+
+
+def _v331_diag_finalize(d: dict) -> dict:
+    """集計器をJSON化可能な dict に変換する。"""
+    if not d:
+        return {}
+    n_tr = max(1, int(d.get("trials", 0) or 0))
+    g0 = dict(d.get("g0") or {})
+    sbr = {}
+    for rank, (tot, cnt) in sorted((d.get("strength_by_start_rank") or {}).items()):
+        sbr[str(int(rank))] = {
+            "mean_strength": (round(float(tot) / cnt, 8) if cnt else None),
+            "n": int(cnt),
+        }
+    sp = d.get("lap1_spearman") or {}
+    sp_n = int(sp.get("n", 0) or 0)
+    ss = d.get("lap1_spearman_strength") or {}
+    ss_n = int(ss.get("n", 0) or 0)
+    _hi = d.get("lap1_strongest_pos") or [0.0, 0]
+    _lo = d.get("lap1_weakest_pos") or [0.0, 0]
+    leaders = d.get("lap1_leader_counts") or {}
+    rep = max(leaders.items(), key=lambda kv: kv[1])[0] if leaders else None
+    return {
+        "trials": int(d.get("trials", 0) or 0),
+        "diag_errors": dict(d.get("errors") or {}),
+        "g0": {
+            "g0_sum": round(float(g0.get("g0_sum", 0.0)), 8),
+            "g0_base_sum": round(float(g0.get("g0_base_sum", 0.0)), 8),
+            "g0_noise_sum": round(float(g0.get("g0_noise_sum", 0.0)), 8),
+            "g0_ka_sum": round(float(g0.get("g0_ka_sum", 0.0)), 8),
+            "g0_kb_sum": round(float(g0.get("g0_kb_sum", 0.0)), 8),
+            "g0_components_sum": round(
+                float(g0.get("g0_base_sum", 0.0)) + float(g0.get("g0_noise_sum", 0.0))
+                + float(g0.get("g0_ka_sum", 0.0)) + float(g0.get("g0_kb_sum", 0.0)), 8),
+            "g0_ka_pairs_nonzero": int(g0.get("g0_ka_pairs_nonzero", 0)),
+            "g0_kb_pairs_nonzero": int(g0.get("g0_kb_pairs_nonzero", 0)),
+            "g0_pairs_total": int(g0.get("g0_pairs_total", 0)),
+        },
+        "strength_by_start_rank": sbr,
+        "gap_end_sum": {str(k): round(float(v), 8) for k, v in (d.get("gap_end_sum") or {}).items()},
+        "gap_end_mean_per_trial": {
+            str(k): round(float(v) / n_tr, 8) for k, v in (d.get("gap_end_sum") or {}).items()
+        },
+        "pass_attempts": {str(k): int(v) for k, v in (d.get("pass_attempts") or {}).items()},
+        "pass_successes": {str(k): int(v) for k, v in (d.get("pass_successes") or {}).items()},
+        "spearman_actual": (round(float(sp.get("sum", 0.0)) / sp_n, 8) if sp_n else None),
+        "spearman_actual_n": sp_n,
+        "spearman_strength": (round(float(ss.get("sum", 0.0)) / ss_n, 8) if ss_n else None),
+        "spearman_strength_n": ss_n,
+        "strongest_car_lap1_pos_mean": (round(float(_hi[0]) / _hi[1], 8) if _hi[1] else None),
+        "weakest_car_lap1_pos_mean": (round(float(_lo[0]) / _lo[1], 8) if _lo[1] else None),
+        "lap1_leader_counts": {str(k): int(v) for k, v in leaders.items()},
+        "lap1_representative_car": (int(rep) if rep is not None else None),
+    }
+
+
 def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame, meta: dict, trials: int, seed: int):
     """1試行ごとにスタートと6周の壁・追い抜きを枝分かれさせるベータ版。"""
     if not isinstance(df,pd.DataFrame) or df.empty or not isinstance(entries,pd.DataFrame) or entries.empty:
@@ -11975,6 +12079,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
               "slowdown_sum": 0.0, "pass_count": 0,
               "trial0_hash": None} for lap in range(1, 7)
     }
+    # Ver331診断集計器（検証モードのみ。通常実行は None）。
+    _gd330a = _v331_diag_init() if _v330a_full_validation else None
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
     # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
@@ -12022,7 +12128,20 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             group=sorted(_base_group276,key=lambda c:start_score[c],reverse=True)
             order.extend(group)
         start_front[order[0]]+=1
+        # Ver331診断: スタート順位ごとの strength 集計（RNG非使用・読み取りのみ）
+        if _v330a_full_validation:
+            try:
+                _gd330a["trials"] += 1
+                for _r331, _c331 in enumerate(order, start=1):
+                    _slot331 = _gd330a["strength_by_start_rank"].setdefault(_r331, [0.0, 0])
+                    _slot331[0] += float(strength.get(_c331, 0.0) or 0.0)
+                    _slot331[1] += 1
+            except Exception as _e331:
+                _v331_diag_err(_gd330a, "part3_strength_by_start_rank", _e331)
         gaps=[0.0]
+        # (4-A) Ver331診断: _g0 成分ログの初期化
+        if _v330a_full_validation:
+            _g0_local = []
         for i in range(1,len(order)):
             prev,cur=order[i-1],order[i]
             dh=max(0,handicap[cur]-handicap[prev])
@@ -12060,6 +12179,45 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             else:
                 _g0 = 0.11 + 0.017 * dh + _noise
             gaps.append(_g0)
+            # (4-B) Ver331診断: _g0 の各成分を再評価して記録（_g0本体・RNGには触れない）
+            if _v330a_full_validation:
+                try:
+                    if _tune331 and _hs0 and _mode331 == "C":
+                        _g0_base_part = float(globals().get("_V331_C_BASE") or 0.14) + 0.017 * dh
+                    else:
+                        _g0_base_part = 0.11 + 0.017 * dh
+                    _g0_ka_part = 0.0
+                    _g0_kb_part = 0.0
+                    if _tune331 and _hs0 and _mode331 == "A":
+                        _g0_ka_part = float(_v331_ka()) * max(
+                            0.0,
+                            float(start_score.get(cur, 0.0) or 0.0)
+                            - float(start_score.get(prev, 0.0) or 0.0),
+                        )
+                    elif _tune331 and _hs0 and _mode331 == "B":
+                        _g0_kb_part = float(_v331_kb()) * max(
+                            0.0,
+                            float(strength.get(cur, 0.0) or 0.0)
+                            - float(strength.get(prev, 0.0) or 0.0),
+                        )
+                    _g0_local.append((float(_g0), _g0_base_part, float(_noise),
+                                      _g0_ka_part, _g0_kb_part))
+                except Exception as _e331:
+                    _v331_diag_err(_gd330a, "part4B_g0_components", _e331)
+        # (4-C) Ver331診断: gapループ終了後に _g0 成分を集計
+        if _v330a_full_validation:
+            try:
+                _g0d = _gd330a["g0"]
+                _g0d["g0_sum"] += sum(x[0] for x in _g0_local)
+                _g0d["g0_base_sum"] += sum(x[1] for x in _g0_local)
+                _g0d["g0_noise_sum"] += sum(x[2] for x in _g0_local)
+                _g0d["g0_ka_sum"] += sum(x[3] for x in _g0_local)
+                _g0d["g0_kb_sum"] += sum(x[4] for x in _g0_local)
+                _g0d["g0_ka_pairs_nonzero"] += sum(1 for x in _g0_local if x[3] > 0.0)
+                _g0d["g0_kb_pairs_nonzero"] += sum(1 for x in _g0_local if x[4] > 0.0)
+                _g0d["g0_pairs_total"] += len(_g0_local)
+            except Exception as _e331:
+                _v331_diag_err(_gd330a, "part4C_g0_aggregate", _e331)
         # Ver331測定: trial0の初期 order/gaps を監査用に保持
         if _v331_full_validation and sim_index == 0:
             try:
@@ -12309,7 +12467,11 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 if _wall_audit: _pa["wall_attempts"]+=1
                 if _mom_audit: _pa["momentum_attempts"]+=1
                 if _slow_audit: _pa["slowdown_attempts"]+=1
+                if _v330a_full_validation:
+                    _gd330a["pass_attempts"][int(lap)] += 1
                 if rng.random()<p:
+                    if _v330a_full_validation:
+                        _gd330a["pass_successes"][int(lap)] += 1
                     _ta["successes"]+=1; _pa["successes"]+=1
                     if _wall_audit: _ta["wall_successes"]+=1
                     if _mom_audit: _ta["momentum_successes"]+=1
@@ -12358,11 +12520,42 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             lap_tuple=tuple(order)
             _ = sim_lap_path.append(lap_tuple)
             lap_order_counts[lap][lap_tuple]=lap_order_counts[lap].get(lap_tuple,0)+1
+            # Ver331診断: lap1 の Spearman（実lap1順との順位相関）と代表車（lap1先頭車）
+            if _v330a_full_validation and int(lap) == 1:
+                try:
+                    _gd330a["lap1_leader_counts"][int(order[0])] = (
+                        _gd330a["lap1_leader_counts"].get(int(order[0]), 0) + 1
+                    )
+                    # 元定義: strength降順(強い順)と sim lap1順の Spearman。B案の直接効果の主指標。
+                    _str_rank331 = sorted(cars, key=lambda c: (-float(strength.get(c, 0.0) or 0.0), int(c)))
+                    _rho_s331 = _v331_spearman(_str_rank331, order)
+                    if _rho_s331 is not None:
+                        _gd330a["lap1_spearman_strength"]["sum"] += float(_rho_s331)
+                        _gd330a["lap1_spearman_strength"]["n"] += 1
+                    # 代表車: trial内の strength 最大車/最小車の lap1 終了順位
+                    _pos331 = {int(c): i for i, c in enumerate(order, start=1)}
+                    if _str_rank331:
+                        _gd330a["lap1_strongest_pos"][0] += float(_pos331[int(_str_rank331[0])])
+                        _gd330a["lap1_strongest_pos"][1] += 1
+                        _gd330a["lap1_weakest_pos"][0] += float(_pos331[int(_str_rank331[-1])])
+                        _gd330a["lap1_weakest_pos"][1] += 1
+                    # 併設: 実lap1順 vs sim lap1順（シミュレーション全体の再現度）
+                    if _v331_actual_lap1:
+                        _rho331 = _v331_spearman(order, _v331_actual_lap1)
+                        if _rho331 is not None:
+                            _gd330a["lap1_spearman"]["sum"] += float(_rho331)
+                            _gd330a["lap1_spearman"]["n"] += 1
+                except Exception as _e331:
+                    _v331_diag_err(_gd330a, "part7_lap1_spearman", _e331)
             # Ver330-A検証用の1行状態指紋。比較検証モードだけで計算し、通常実行の負荷をゼロにする。
             if _v330a_full_validation:
                 try:
                     _fp330a = _v330a_state_fp[int(lap)]
                     _gap_sum330a = float(sum(float(x) for x in gaps))
+                    try:
+                        _gd330a["gap_end_sum"][int(lap)] += _gap_sum330a
+                    except Exception as _e331:
+                        _v331_diag_err(_gd330a, "part5_gap_end_sum", _e331)
                     _mom_sum330a = float(sum(float(momentum.get(c, 0.0) or 0.0) for c in cars))
                     _slow_sum330a = float(sum(float(slowdown.get(c, 0.0) or 0.0) for c in cars))
                     _pass_count330a = int(sum(int(v or 0) for v in lap_pass_count.values()))
@@ -12637,6 +12830,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             } for lap in range(1, 7)}
             if _v330a_full_validation else {}
         ),
+        "ver331_gap_diag": (_v331_diag_finalize(_gd330a) if _v330a_full_validation else {}),
         "ver330a_validation_lap_order_counts": (
             {str(lap): {"-".join(map(str,k)): int(v) for k,v in lap_order_counts[lap].items()} for lap in range(1, 7)}
             if _v330a_full_validation else {}
@@ -12736,6 +12930,7 @@ def _v330a_compare_mode_run() -> None:
             "sim_trials": int((audit or {}).get("v284_transition_audit", {}).get("trials") or 0),
             "lap_order_counts": dict((audit or {}).get("ver330a_validation_lap_order_counts") or {}),
             "validation_full_trials": bool((audit or {}).get("ver330a_validation_full_trials")),
+            "ver331_gap_diag": dict((audit or {}).get("ver331_gap_diag") or {}),
         })
     except Exception as exc:
         result.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
