@@ -325,7 +325,7 @@ def main():
 
     progress.update({
         "run_id": args.run_id,
-        "phase": "Ver331 extras (3R control)",
+        "phase": "Ver331 gapC extras (3R control)",
         "status": "running",
         "total": EXPECTED_EXTRA_COUNT,
         "done_count": len(done),
@@ -377,8 +377,10 @@ def main():
 
         out_json = result_dir / "runs" / f"{race_key}.json"
         try:
+            # C案測定は mode=Ver331（compare経路で _V331_LAP1_TUNE=True）
+            # Ver326 のままだと compare が TUNE を強制OFFするため無効になる
             data = verify.run_one_race(
-                app, db, race_key, "Ver326",
+                app, db, race_key, "Ver331",
                 args.trials, args.seed, out_json, args.timeout
             )
             if not data.get("validation_full_trials"):

@@ -281,13 +281,23 @@ def _v330a_active() -> bool:
         return False
 
 
-# Ver331 Lap1精度実験枠（中身は未実装。初期位置補正は次パッチ）
+# ===== Ver331 Lap1 initial-gap tuning (hspread==0 only) =====
 _V331_APP_VERSION = "Ver331"
+# C案測定ビルド: master ON + mode C（測定後は False に戻す）
 _V331_LAP1_TUNE = False
+_V331_GAP_MODE = "C"   # "A" | "B" | "C"
+_V331_KA = 0.0         # A: start_score 差係数
+_V331_KB = 0.0         # B: strength 差係数
+_V331_C_BASE = 0.14    # C: base gap（legacy 0.11）
+_V331_C_NOISE = 0.10   # C: noise 上限（legacy 0.08）
 
 
 def _v331_lap1_tune_active() -> bool:
-    """Lap1初期位置補正など。デフォルトOFF。"""
+    """Lap1初期位置補正。デフォルトは _V331_LAP1_TUNE。env でも強制可。"""
+    if str(os.environ.get("AUTORACE_331_LAP1_TUNE") or "").strip() == "1":
+        return True
+    if str(os.environ.get("AUTORACE_331_LAP1_TUNE") or "").strip() == "0":
+        return False
     if bool(globals().get("_V331_LAP1_TUNE")):
         return True
     try:
@@ -415,7 +425,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261111_hist_nocache"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261111_queue_upsert2"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -3104,12 +3114,16 @@ def _v326_enqueue_tasks(
     replace: bool = False,
     predict_if_missing: bool = True,
 ) -> int:
-    """未登録分のみ pending 投入。既存行は触らない。戻り値=新規件数。
+    """キュー投入（条件付き upsert）。戻り値=新規 or 再投入件数。
 
-    insert_first=True: 既存 pending の sort_order を +1 シフトし、
-    新規行を sort_order=0 で先頭に挿入する。
-    insert_first=False（既定）: pending の最大 sort_order の次から末尾に追加する。
-    オプション列は追加時点のチェック状態を保存する。
+    - 行なし → INSERT pending
+    - done/failed 等 → pending に戻して再投入（Ver326後にVer330-Aも回せる）
+    - pending → オプション更新のみ
+    - processing → 触らない
+
+    insert_first=True: 既存 pending の sort_order を +1 シフトし先頭挿入。
+    insert_first=False（既定）: pending 末尾へ追加。
+    予測履歴は版ごとに残る（版違い再予測時は clear しない）。
     """
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     task_mode = str(task_mode or "normal").strip().lower()
@@ -3158,6 +3172,14 @@ def _v326_enqueue_tasks(
     _pm = 1 if predict_if_missing else 0
 
     def _run():
+        """条件付き upsert。
+
+        - 行なし → INSERT pending
+        - done/failed/error/skipped → pending に戻して再投入（Ver326後にVer330も回せる）
+        - pending → オプション更新のみ（同一なら skip）
+        - processing → 触らない
+        戻り値は「新規 or 再投入で仕事が発生した件数」。
+        """
         inserted = 0
         with _v326_queue_connect(db_path, 30.0) as con:
             if insert_first:
@@ -3199,6 +3221,94 @@ def _v326_enqueue_tasks(
                 if int(cur.rowcount or 0) > 0:
                     inserted += 1
                     next_so += 1
+                    continue
+
+                # UNIQUE で弾かれた → 既存行を検査して条件付き再投入
+                row = con.execute(
+                    """
+                    SELECT status,
+                           COALESCE(task_mode, 'normal'),
+                           COALESCE(fetch_odds, 1),
+                           COALESCE(register_result, 1),
+                           COALESCE(skip_existing, 1),
+                           COALESCE(replace_existing, 0),
+                           COALESCE(predict_if_missing, 1)
+                      FROM v326_import_queue
+                     WHERE job_type = ? AND ymd = ? AND venue = ? AND race_no = ?
+                     ORDER BY
+                        CASE COALESCE(task_mode, 'normal')
+                            WHEN ? THEN 0 ELSE 1 END,
+                        task_id DESC
+                     LIMIT 1
+                    """,
+                    (str(job_type), ymd, venue, rn, task_mode),
+                ).fetchone()
+                if not row:
+                    continue
+                st = str(row[0] or "").strip().lower()
+                if st == "processing":
+                    # 走行中は絶対に触らない
+                    continue
+                if st in ("done", "failed", "error", "skipped", "cancelled", "ok"):
+                    # 完了/失敗済み → pending に戻して再実行（他版予測の追加用）
+                    con.execute(
+                        """
+                        UPDATE v326_import_queue
+                           SET status = 'pending',
+                               task_mode = ?,
+                               sort_order = ?,
+                               message = '',
+                               updated_at = ?,
+                               fetch_odds = ?,
+                               register_result = ?,
+                               skip_existing = ?,
+                               replace_existing = ?,
+                               predict_if_missing = ?
+                         WHERE job_type = ? AND ymd = ? AND venue = ? AND race_no = ?
+                           AND status = ?
+                        """,
+                        (
+                            task_mode, int(next_so), now,
+                            _fo, _rr, _se, _rp, _pm,
+                            str(job_type), ymd, venue, rn, st,
+                        ),
+                    )
+                    inserted += 1
+                    next_so += 1
+                    continue
+                if st == "pending":
+                    # 既に待ち → オプションだけ最新化（無言skipを避ける）
+                    old_fo, old_rr, old_se, old_rp, old_pm = (
+                        int(row[2] or 1), int(row[3] or 1), int(row[4] or 1),
+                        int(row[5] or 0), int(row[6] or 1),
+                    )
+                    old_mode = str(row[1] or "normal")
+                    if (
+                        old_mode != task_mode
+                        or old_fo != _fo or old_rr != _rr
+                        or old_se != _se or old_rp != _rp or old_pm != _pm
+                    ):
+                        con.execute(
+                            """
+                            UPDATE v326_import_queue
+                               SET task_mode = ?,
+                                   updated_at = ?,
+                                   fetch_odds = ?,
+                                   register_result = ?,
+                                   skip_existing = ?,
+                                   replace_existing = ?,
+                                   predict_if_missing = ?
+                             WHERE job_type = ? AND ymd = ? AND venue = ? AND race_no = ?
+                               AND status = 'pending'
+                            """,
+                            (
+                                task_mode, now,
+                                _fo, _rr, _se, _rp, _pm,
+                                str(job_type), ymd, venue, rn,
+                            ),
+                        )
+                    # pending のままなので inserted は増やさない（既にキュー内）
+                    continue
             con.commit()
         return inserted
 
@@ -11853,10 +11963,34 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         for i in range(1,len(order)):
             prev,cur=order[i-1],order[i]
             dh=max(0,handicap[cur]-handicap[prev])
-            _g0 = 0.11 + 0.017 * dh + rng.uniform(0.00, 0.08)
-            # Ver331: 初期gap補正プレースホルダ（係数は測定後に決定。現状は恒等）
-            if _v331_lap1_tune_active():
-                pass  # Phase2で scale/bias をここに入れる
+            # --- Ver331: rng.uniform は必ず1回・同じ位置（回数/順序維持）---
+            _tune331 = bool(_v331_lap1_tune_active())
+            _mode331 = str(globals().get("_V331_GAP_MODE") or "C")
+            _hs0 = float(_hspread316 or 0.0) == 0.0
+            if _tune331 and _hs0 and _mode331 == "C":
+                _noise_hi = float(globals().get("_V331_C_NOISE") or 0.10)
+            else:
+                _noise_hi = 0.08
+            _noise = rng.uniform(0.00, _noise_hi)
+            if _tune331 and _hs0:
+                if _mode331 == "C":
+                    _g0 = float(globals().get("_V331_C_BASE") or 0.14) + 0.017 * dh + _noise
+                else:
+                    _g0 = 0.11 + 0.017 * dh + _noise
+                    if _mode331 == "A":
+                        _g0 += float(globals().get("_V331_KA") or 0.0) * max(
+                            0.0,
+                            float(start_score.get(cur, 0.0) or 0.0)
+                            - float(start_score.get(prev, 0.0) or 0.0),
+                        )
+                    elif _mode331 == "B":
+                        _g0 += float(globals().get("_V331_KB") or 0.0) * max(
+                            0.0,
+                            float(strength.get(cur, 0.0) or 0.0)
+                            - float(strength.get(prev, 0.0) or 0.0),
+                        )
+            else:
+                _g0 = 0.11 + 0.017 * dh + _noise
             _ = gaps.append(_g0)
         # Ver331測定: trial0の初期 order/gaps を監査用に保持
         if _v331_full_validation and sim_index == 0:
@@ -12507,9 +12641,16 @@ def _v330a_compare_mode_run() -> None:
         np.random.seed(seed)
         globals()["_V328_EXPERIMENT"] = False
         globals()["_V328_WORKER_ACTIVE"] = False
-        # Phase2用: mode が Ver331 / Ver331-on なら 330A + Lap1補正ON
+        # Phase2用:
+        #   Ver326     → 本線相当（331 OFF）
+        #   Ver330-A   → 周6抑制のみ
+        #   Ver331 / Ver331-on → Lap1 gap補正ON（_V331_GAP_MODE に従う）
+        #   Ver331-off → 331フラグ明示OFF（対照）
         _v331_on = mode in ("Ver331", "Ver331-on")
-        globals()["_V330A_EXPERIMENT"] = (mode == "Ver330-A") or _v331_on
+        if mode == "Ver331-off":
+            _v331_on = False
+        globals()["_V330A_EXPERIMENT"] = (mode == "Ver330-A")
+        # 331測定では330Aを混ぜない（初期gapのみの効果を見る）
         globals()["_V331_LAP1_TUNE"] = bool(_v331_on)
         df, bets, output, entries, meta = engine.ver16_run_prediction(
             prediction_text, trials=trials, seed=seed, manual_excluded=[]
@@ -21875,6 +22016,17 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
     details = []
     ok = skip = err = 0
     try:
+        # 起動スレッドの globals に依存せず、req から版を確定（Ver326とVer330-A両存用）
+        try:
+            if "v330a_enabled" in (req or {}):
+                globals()["_V330A_EXPERIMENT"] = bool(req.get("v330a_enabled"))
+            elif str((req or {}).get("save_version") or "").strip() == "Ver330-A":
+                globals()["_V330A_EXPERIMENT"] = True
+            else:
+                # 明示が無ければ OFF（本線 Ver326）
+                globals()["_V330A_EXPERIMENT"] = False
+        except Exception:
+            pass
         try:
             _v278_bg_update(
                 db_path, job_id,
