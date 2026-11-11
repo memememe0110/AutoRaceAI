@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ver331 Phase 1 extras worker: 3R control measurement (8-car, zero handicap spread).
 
-Runs the fixed three-race control set using Ver326, 20,000 trials, seed 12345.
+Runs the fixed three-race control set. modes: Ver331-off (bit-id) / Ver331 (A/B/C). trials 1000|20000, seed 12345.
 The source DB is read-only; results are checkpointed to a dedicated Git branch.
 """
 from __future__ import annotations
@@ -258,8 +258,6 @@ def validate_run_id(run_id: str):
 
 
 def main():
-    # C案測定: worker 子プロセスへ伝播（mode=Ver331 と二重化）
-    os.environ.setdefault("AUTORACE_331_LAP1_TUNE", "1")
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", required=True)
     parser.add_argument("--app", required=True)
@@ -272,16 +270,34 @@ def main():
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument(
+        "--mode", default="Ver331",
+        choices=["Ver326", "Ver331", "Ver331-on", "Ver331-off"],
+        help="Ver331-off: TUNE=0 bit-identical; Ver331/on: TUNE=1",
+    )
+    parser.add_argument("--gap-mode", default="A", choices=["A", "B", "C"])
+    parser.add_argument("--ka", default="0.0", help="Mode A coefficient")
+    parser.add_argument("--kb", default="0.0", help="Mode B coefficient")
+    parser.add_argument(
         "--expected-db-sha256", default=PHASE1_DB_SHA256,
         help="Fail if DB hash differs from Phase 1 hash."
     )
     args = parser.parse_args()
 
-    if args.trials != 20000 or args.seed != 12345:
-        raise SystemExit("Pre-registered settings are fixed: trials=20000, seed=12345")
+    # 1) 引数検証を env 設定より先に
+    if args.trials not in (1000, 20000) or args.seed != 12345:
+        raise SystemExit("Allowed settings: trials=1000 or 20000, seed=12345")
     if not 1 <= args.max_races <= EXPECTED_EXTRA_COUNT:
         raise SystemExit(f"max-races must be 1..{EXPECTED_EXTRA_COUNT}")
     validate_run_id(args.run_id)
+
+    # 2) 検証通過後に env（子プロセスへ継承）
+    if args.mode in ("Ver331", "Ver331-on"):
+        os.environ["AUTORACE_331_LAP1_TUNE"] = "1"
+    else:
+        os.environ["AUTORACE_331_LAP1_TUNE"] = "0"
+    os.environ["AUTORACE_331_GAP_MODE"] = str(args.gap_mode or "A")
+    os.environ["AUTORACE_331_KA"] = str(args.ka)
+    os.environ["AUTORACE_331_KB"] = str(args.kb)
 
     db = Path(args.db).resolve()
     app = Path(args.app).resolve()
@@ -329,7 +345,7 @@ def main():
 
     progress.update({
         "run_id": args.run_id,
-        "phase": "Ver331 gapC extras (3R control)",
+        "phase": "Ver331 extras A/B control (3R)",
         "status": "running",
         "total": EXPECTED_EXTRA_COUNT,
         "done_count": len(done),
@@ -384,7 +400,7 @@ def main():
             # C案測定は mode=Ver331（compare経路で _V331_LAP1_TUNE=True）
             # Ver326 のままだと compare が TUNE を強制OFFするため無効になる
             data = verify.run_one_race(
-                app, db, race_key, "Ver331",
+                app, db, race_key, str(args.mode),
                 args.trials, args.seed, out_json, args.timeout
             )
             if not data.get("validation_full_trials"):

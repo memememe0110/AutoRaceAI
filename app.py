@@ -283,20 +283,21 @@ def _v330a_active() -> bool:
 
 # ===== Ver331 Lap1 initial-gap tuning (hspread==0 only) =====
 _V331_APP_VERSION = "Ver331"
-# C案測定ビルド: master ON + mode C（測定後は False に戻す）
+# 本番デフォルトOFF。Actions/compare は env で ON（AUTORACE_331_LAP1_TUNE=1）
 _V331_LAP1_TUNE = False
-_V331_GAP_MODE = "C"   # "A" | "B" | "C"
-_V331_KA = 0.0         # A: start_score 差係数
-_V331_KB = 0.0         # B: strength 差係数
+_V331_GAP_MODE = "A"   # "A" | "B" | "C"（env AUTORACE_331_GAP_MODE で上書き）
+_V331_KA = 0.0         # A: start_score 差係数（env AUTORACE_331_KA）
+_V331_KB = 0.0         # B: strength 差係数（env AUTORACE_331_KB）
 _V331_C_BASE = 0.14    # C: base gap（legacy 0.11）
 _V331_C_NOISE = 0.10   # C: noise 上限（legacy 0.08）
 
 
 def _v331_lap1_tune_active() -> bool:
-    """Lap1初期位置補正。デフォルトは _V331_LAP1_TUNE。env でも強制可。"""
-    if str(os.environ.get("AUTORACE_331_LAP1_TUNE") or "").strip() == "1":
+    """Lap1初期位置補正。env > global > session。本番は False。"""
+    env = str(os.environ.get("AUTORACE_331_LAP1_TUNE") or "").strip()
+    if env == "1":
         return True
-    if str(os.environ.get("AUTORACE_331_LAP1_TUNE") or "").strip() == "0":
+    if env == "0":
         return False
     if bool(globals().get("_V331_LAP1_TUNE")):
         return True
@@ -304,6 +305,29 @@ def _v331_lap1_tune_active() -> bool:
         return bool(st.session_state.get("v331_lap1_tune", False))
     except Exception:
         return False
+
+
+def _v331_gap_mode() -> str:
+    """A/B/C。env AUTORACE_331_GAP_MODE 優先。"""
+    env = str(os.environ.get("AUTORACE_331_GAP_MODE") or "").strip().upper()
+    if env in ("A", "B", "C"):
+        return env
+    g = str(globals().get("_V331_GAP_MODE") or "A").strip().upper()
+    return g if g in ("A", "B", "C") else "A"
+
+
+def _v331_ka() -> float:
+    try:
+        return float(os.environ.get("AUTORACE_331_KA") or globals().get("_V331_KA") or 0.0)
+    except Exception:
+        return float(globals().get("_V331_KA") or 0.0)
+
+
+def _v331_kb() -> float:
+    try:
+        return float(os.environ.get("AUTORACE_331_KB") or globals().get("_V331_KB") or 0.0)
+    except Exception:
+        return float(globals().get("_V331_KB") or 0.0)
 
 
 def _v327_active() -> bool:
@@ -425,7 +449,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261111_hist_upsert"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261111_v331_ab"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -11985,7 +12009,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             dh=max(0,handicap[cur]-handicap[prev])
             # --- Ver331: rng.uniform は必ず1回のみ（bit-identical維持）---
             _tune331 = bool(_v331_lap1_tune_active())
-            _mode331 = str(globals().get("_V331_GAP_MODE") or "C")
+            _mode331 = str(_v331_gap_mode())
             _hs0 = float(_hspread316 or 0.0) == 0.0
             if _tune331 and _hs0 and _mode331 == "C":
                 _noise_hi = float(globals().get("_V331_C_NOISE") or 0.10)
@@ -11997,7 +12021,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             elif _tune331 and _hs0 and _mode331 == "A":
                 _g0 = (
                     0.11 + 0.017 * dh + _noise
-                    + float(globals().get("_V331_KA") or 0.0)
+                    + float(_v331_ka())
                     * max(
                         0.0,
                         float(start_score.get(cur, 0.0) or 0.0)
@@ -12007,7 +12031,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             elif _tune331 and _hs0 and _mode331 == "B":
                 _g0 = (
                     0.11 + 0.017 * dh + _noise
-                    + float(globals().get("_V331_KB") or 0.0)
+                    + float(_v331_kb())
                     * max(
                         0.0,
                         float(strength.get(cur, 0.0) or 0.0)
