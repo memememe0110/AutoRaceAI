@@ -415,7 +415,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261110_bg330fix"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261111_v330a_extra"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -13348,7 +13348,6 @@ def _v326_render_official_import_panel() -> None:
             # 未予測Rを強調（不成立は対象外として分離）
             _pred_s = ",".join(f"{n}R" for n in sorted(_pred_nos)) if _pred_nos else "なし"
             _miss_s = ",".join(f"{n}R" for n in _miss_pred) if _miss_pred else ""
-            _miss_reg_s = ",".join(f"{n}R" for n in sorted(_miss_reg)) if _miss_reg else ""
             _inv_s = ",".join(f"{n}R" for n in _invalid_nos) if _invalid_nos else ""
             _inv_tail = (
                 f" ／ 不成立・中止 {len(_invalid_nos)}R（対象外：{_inv_s}）"
@@ -13360,7 +13359,6 @@ def _v326_render_official_import_panel() -> None:
                     f"🏁 **{_vn}**（{_cur_ver}）　✅ 予測対象はすべて済"
                     + (f"（予測 {len(_pred_nos)}R：{_pred_s}）" if _pred_nos else "（予測0R）")
                     + f"／ result **{len(_reg_nos)}R**"
-                    + (f"（未登録 {len(_miss_reg)}R：{_miss_reg_s}）" if _miss_reg_s else "")
                     + _inv_tail
                 )
             elif _miss_pred:
@@ -13368,14 +13366,13 @@ def _v326_render_official_import_panel() -> None:
                     f"🏁 **{_vn}**（{_cur_ver}）　予測OK **{len(_pred_nos)}R**"
                     + (f"（{_pred_s}）" if _pred_nos else "")
                     + f" ／ **未予測 {len(_miss_pred)}R：{_miss_s}**"
-                    + (f" ／ result未登録 {len(_miss_reg)}R：{_miss_reg_s}" if _miss_reg_s else "")
+                    + (f" ／ result未登録 {len(_miss_reg)}R" if _miss_reg else "")
                     + _inv_tail
                 )
             else:
                 st.warning(
                     f"🏁 **{_vn}**（{_cur_ver}）　予測・resultとも未確認"
                     f"（開催未検出の可能性）"
-                    + (f" ／ result未登録候補 {_miss_reg_s}" if _miss_reg_s else "")
                     + _inv_tail
                 )
             if _old_only:
@@ -43803,15 +43800,30 @@ def _v330a_ui_common_set(snapshot):
 
 
 def _v330a_ui_load_raw(snapshot, race_key):
+    """v222_prediction_restore を優先。無ければ v231_prediction_history の最新履歴へフォールバック。"""
     with _v330a_ui_ro_connect(snapshot) as con:
         row = con.execute(
-            "SELECT raw_text, venue_override FROM v222_prediction_restore WHERE race_key=?", (race_key,)
+            "SELECT raw_text, venue_override FROM v222_prediction_restore WHERE race_key=?",
+            (race_key,),
         ).fetchone()
-    if not row or not str(row["raw_text"] or "").strip():
-        raise RuntimeError("v222_prediction_restoreにraw_textがありません")
-    raw = str(row["raw_text"])
-    venue = str(row["venue_override"] or "")
-    return (f"開催場: {venue}\n" + raw) if venue else raw
+        if row and str(row["raw_text"] or "").strip():
+            raw = str(row["raw_text"])
+            venue = str(row["venue_override"] or "")
+            return (f"開催場: {venue}\n" + raw) if venue else raw
+        row2 = con.execute(
+            "SELECT raw_text, venue_override FROM v231_prediction_history "
+            "WHERE race_key=? ORDER BY history_id DESC LIMIT 1",
+            (race_key,),
+        ).fetchone()
+        if row2 and str(row2["raw_text"] or "").strip():
+            raw = str(row2["raw_text"])
+            venue = str(row2["venue_override"] or "")
+            return (f"開催場: {venue}\n" + raw) if venue else raw
+    raise RuntimeError(
+        f"raw_text未取得: race_key={race_key}。"
+        "v222_prediction_restore にも v231_prediction_history にも raw_text がありません。"
+    )
+
 
 
 def _v330a_ui_actual(snapshot, race_key):
@@ -43904,20 +43916,22 @@ def _v330a_ui_run_one_unlocked(snapshot, race_key):
 
 
 
-def _v330a_ui_run_one(snapshot, race_key):
+def _v330a_ui_run_one(snapshot, race_key, owner="validation"):
     guard = _V330A_PROCESS_GUARD
     lock = guard["lock"]
     # チャンク側が保持している場合はRLockで同一スレッド内の再入を許可。
     with lock:
         was_running = bool(guard.get("running"))
+        was_owner = str(guard.get("owner") or "")
         guard["running"] = True
-        guard["owner"] = "validation"
+        guard["owner"] = str(owner or "validation")
         try:
             return _v330a_ui_run_one_unlocked(snapshot, race_key)
         finally:
             if not was_running:
                 guard["running"] = False
-                guard["owner"] = ""
+                guard["owner"] = was_owner
+
 
 
 def _v330a_ui_saved_rows():
@@ -44077,6 +44091,84 @@ if _V330A_VALIDATION_PAGE:
                         _guard["owner"] = ""
                         _lock.release()
                     st.rerun()
+
+            st.markdown("---")
+            st.markdown("#### 🧪 追加測定: race_key 直接指定（8車spread=0 対照群）")
+            st.caption(
+                "共通セット377R以外でも、race_key を直接指定して Lap1 指標を追加測定できます。"
+                "結果は同じ一時DBへ保存されます（本番DBには書きません）。"
+            )
+            _extra_text = st.text_area(
+                "race_key（1行1件）",
+                value=st.session_state.get("v330a_ui_extra_keys", ""),
+                height=120,
+                key="v330a_ui_extra_keys_input",
+                help="例: 20260726_飯塚_2R",
+            )
+            _ex1, _ex2 = st.columns(2)
+            with _ex1:
+                _run_extra = st.button("追加race_keyを実行", key="v330a_ui_run_extra")
+            with _ex2:
+                _skip_done_extra = st.checkbox(
+                    "成功済みはスキップ", value=True, key="v330a_ui_extra_skip_done"
+                )
+            if _run_extra:
+                st.session_state["v330a_ui_extra_keys"] = str(_extra_text or "")
+                _extra_keys = []
+                _seen_e = set()
+                for _line in str(_extra_text or "").replace(",", "\n").splitlines():
+                    _rk = str(_line or "").strip()
+                    if not _rk or _rk in _seen_e:
+                        continue
+                    _seen_e.add(_rk)
+                    _extra_keys.append(_rk)
+                if not _extra_keys:
+                    st.warning("race_key が空です。")
+                else:
+                    _done_extra = {
+                        str(r.get("race_key"))
+                        for r in _v330a_ui_saved_rows()
+                        if r.get("ok") is True
+                    }
+                    if _skip_done_extra:
+                        _extra_keys = [k for k in _extra_keys if k not in _done_extra]
+                    if not _extra_keys:
+                        st.info("指定キーはすべて成功済みです。")
+                    else:
+                        _guard_e = _V330A_PROCESS_GUARD
+                        _lock_e = _guard_e["lock"]
+                        if not _lock_e.acquire(blocking=False):
+                            st.error("別のDB処理が実行中です。完了後に再試行してください。")
+                        else:
+                            _guard_e["running"] = True
+                            _guard_e["owner"] = "extra"
+                            try:
+                                with st.status(f"追加測定… {len(_extra_keys)}R", expanded=True) as _st_e:
+                                    for _i, _rk in enumerate(_extra_keys):
+                                        _st_e.write(f"{_i+1}/{len(_extra_keys)}：{_rk}")
+                                        time_module.sleep(0.05)
+                                        try:
+                                            _one = _v330a_ui_run_one(_snap, _rk, owner="extra")
+                                            _one["ok"] = True
+                                            _one["source"] = "extra"
+                                        except Exception as _exc:
+                                            _one = {
+                                                "race_key": _rk,
+                                                "ok": False,
+                                                "source": "extra",
+                                                "error": f"{type(_exc).__name__}: {_exc}",
+                                            }
+                                        _v330a_ui_save_result(_one)
+                                        _st_e.write(f"  → ok={_one.get('ok')}")
+                                        time_module.sleep(0.05)
+                                    _st_e.update(label=f"追加測定完了 {len(_extra_keys)}R", state="complete")
+                                st.toast(f"追加 {len(_extra_keys)}R 完了", icon="✅")
+                            finally:
+                                _guard_e["running"] = False
+                                _guard_e["owner"] = ""
+                                _lock_e.release()
+                            st.rerun()
+
             _rows = _v330a_ui_saved_rows()
             if _rows:
                 _export = pd.DataFrame(_rows)
