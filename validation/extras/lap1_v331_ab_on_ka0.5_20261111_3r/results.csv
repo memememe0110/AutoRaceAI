@@ -1,1 +1,2 @@
 ﻿race_key,source,venue,race_date,car_count,actual_pattern,unique_pattern_count,pattern_rank,pattern_count,pattern_prob,uniform_ratio,top1_prob,relative_lift,observed_trials,rank_cutoff_25pct,rank_pass,uniform_pass,top1_pass,relative_lift_pass,sim_trials_reported,ok,error
+20261021_伊勢崎_12R,extra,伊勢崎,2026-10-21,8,1-2-3-6-8-5-7-4,965,966,0,0.0,0.0,0.002,0.0,1000,242,False,False,False,False,1000,True,
