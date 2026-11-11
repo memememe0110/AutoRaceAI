@@ -467,7 +467,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261111_v331_ab2"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261112_q_shiftn"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -3163,7 +3163,7 @@ def _v326_enqueue_tasks(
     - pending → オプション更新のみ
     - processing → 触らない
 
-    insert_first=True: 既存 pending の sort_order を +1 シフトし先頭挿入。
+    insert_first=True: 既存 pending の sort_order を +len(task_list) シフトし先頭挿入。
     insert_first=False（既定）: pending 末尾へ追加。
     予測履歴は版ごとに残る（版違い再予測時は clear しない）。
     """
@@ -3188,17 +3188,18 @@ def _v326_enqueue_tasks(
         pass
 
     if insert_first:
+        _shift_by = max(1, len(task_list))  # 追加件数だけ既存を押し出す
         with _V326_QUEUE_LOCK:
             def _shift():
                 with _v326_queue_connect(db_path, 30.0) as con:
                     con.execute(
                         """
                         UPDATE v326_import_queue
-                           SET sort_order = COALESCE(sort_order,0) + 1,
+                           SET sort_order = COALESCE(sort_order,0) + ?,
                                updated_at = ?
                          WHERE job_type = ? AND status = 'pending'
                         """,
-                        (now, str(job_type)),
+                        (int(_shift_by), now, str(job_type)),
                     )
                     con.commit()
                     return 1
