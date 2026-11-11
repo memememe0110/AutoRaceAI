@@ -285,7 +285,7 @@ def _v330a_active() -> bool:
 _V331_APP_VERSION = "Ver331"
 # 本番デフォルトOFF。Actions/compare は env で ON（AUTORACE_331_LAP1_TUNE=1）
 _V331_LAP1_TUNE = False
-_V331_GAP_MODE = "A"   # "A" | "B" | "C"（env AUTORACE_331_GAP_MODE で上書き）
+_V331_GAP_MODE = "C"   # "A" | "B" | "C"（env AUTORACE_331_GAP_MODE で上書き）
 _V331_KA = 0.0         # A: start_score 差係数（env AUTORACE_331_KA）
 _V331_KB = 0.0         # B: strength 差係数（env AUTORACE_331_KB）
 _V331_C_BASE = 0.14    # C: base gap（legacy 0.11）
@@ -308,26 +308,44 @@ def _v331_lap1_tune_active() -> bool:
 
 
 def _v331_gap_mode() -> str:
-    """A/B/C。env AUTORACE_331_GAP_MODE 優先。"""
+    """A/B/C。env AUTORACE_331_GAP_MODE 優先。フォールバックは C。"""
     env = str(os.environ.get("AUTORACE_331_GAP_MODE") or "").strip().upper()
     if env in ("A", "B", "C"):
         return env
-    g = str(globals().get("_V331_GAP_MODE") or "A").strip().upper()
-    return g if g in ("A", "B", "C") else "A"
+    g = str(globals().get("_V331_GAP_MODE") or "C").strip().upper()
+    return g if g in ("A", "B", "C") else "C"
 
 
 def _v331_ka() -> float:
+    """A案の start_score 差係数。env → globals → 0.0。NaN/inf/負数は0.0。"""
+    v = os.environ.get("AUTORACE_331_KA")
+    if v is not None and str(v).strip() != "":
+        try:
+            x = float(v)
+            return x if math.isfinite(x) and x >= 0.0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
     try:
-        return float(os.environ.get("AUTORACE_331_KA") or globals().get("_V331_KA") or 0.0)
-    except Exception:
-        return float(globals().get("_V331_KA") or 0.0)
+        x = float(globals().get("_V331_KA") or 0.0)
+        return x if math.isfinite(x) and x >= 0.0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _v331_kb() -> float:
+    """B案の strength 差係数。env → globals → 0.0。NaN/inf/負数は0.0。"""
+    v = os.environ.get("AUTORACE_331_KB")
+    if v is not None and str(v).strip() != "":
+        try:
+            x = float(v)
+            return x if math.isfinite(x) and x >= 0.0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
     try:
-        return float(os.environ.get("AUTORACE_331_KB") or globals().get("_V331_KB") or 0.0)
-    except Exception:
-        return float(globals().get("_V331_KB") or 0.0)
+        x = float(globals().get("_V331_KB") or 0.0)
+        return x if math.isfinite(x) and x >= 0.0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _v327_active() -> bool:
@@ -449,7 +467,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261111_v331_ab"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261111_v331_ab2"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
