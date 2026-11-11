@@ -11654,8 +11654,23 @@ def _v331_diag_init() -> dict:
         "lap1_spearman_strength": {"sum": 0.0, "n": 0},   # strength順 vs sim lap1順 (spearman_strength)
         "lap1_strongest_pos": [0.0, 0],   # trial内strength最大車のlap1順位(1始まり)合計/件数
         "lap1_weakest_pos": [0.0, 0],     # trial内strength最小車のlap1順位合計/件数
+        "errors": {},                   # 診断コード内の例外 {where: {count, first}}
         "lap1_leader_counts": {},       # 代表車 = lap1先頭車の出現回数
     }
+
+
+def _v331_diag_err(d, where: str, exc) -> None:
+    """診断コード内の例外を握りつぶさず、件数と初回内容を記録し stderr に1回だけ出す。"""
+    if d is None:
+        return
+    try:
+        rec = d.setdefault("errors", {}).setdefault(where, {"count": 0, "first": repr(exc)})
+        rec["count"] += 1
+        if rec["count"] == 1:
+            import sys as _sys331
+            print("[ver331_gap_diag] ERROR at %s: %r" % (where, exc), file=_sys331.stderr)
+    except Exception:
+        pass
 
 
 def _v331_spearman(order_a, order_b):
@@ -11695,6 +11710,7 @@ def _v331_diag_finalize(d: dict) -> dict:
     rep = max(leaders.items(), key=lambda kv: kv[1])[0] if leaders else None
     return {
         "trials": int(d.get("trials", 0) or 0),
+        "diag_errors": dict(d.get("errors") or {}),
         "g0": {
             "g0_sum": round(float(g0.get("g0_sum", 0.0)), 8),
             "g0_base_sum": round(float(g0.get("g0_base_sum", 0.0)), 8),
@@ -12120,8 +12136,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                     _slot331 = _gd330a["strength_by_start_rank"].setdefault(_r331, [0.0, 0])
                     _slot331[0] += float(strength.get(_c331, 0.0) or 0.0)
                     _slot331[1] += 1
-            except Exception:
-                pass
+            except Exception as _e331:
+                _v331_diag_err(_gd330a, "part3_strength_by_start_rank", _e331)
         gaps=[0.0]
         # (4-A) Ver331診断: _g0 成分ログの初期化
         if _v330a_full_validation:
@@ -12186,8 +12202,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                         )
                     _g0_local.append((float(_g0), _g0_base_part, float(_noise),
                                       _g0_ka_part, _g0_kb_part))
-                except Exception:
-                    pass
+                except Exception as _e331:
+                    _v331_diag_err(_gd330a, "part4B_g0_components", _e331)
         # (4-C) Ver331診断: gapループ終了後に _g0 成分を集計
         if _v330a_full_validation:
             try:
@@ -12200,8 +12216,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 _g0d["g0_ka_pairs_nonzero"] += sum(1 for x in _g0_local if x[3] > 0.0)
                 _g0d["g0_kb_pairs_nonzero"] += sum(1 for x in _g0_local if x[4] > 0.0)
                 _g0d["g0_pairs_total"] += len(_g0_local)
-            except Exception:
-                pass
+            except Exception as _e331:
+                _v331_diag_err(_gd330a, "part4C_g0_aggregate", _e331)
         # Ver331測定: trial0の初期 order/gaps を監査用に保持
         if _v331_full_validation and sim_index == 0:
             try:
@@ -12529,15 +12545,17 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                         if _rho331 is not None:
                             _gd330a["lap1_spearman"]["sum"] += float(_rho331)
                             _gd330a["lap1_spearman"]["n"] += 1
-                except Exception:
-                    pass
+                except Exception as _e331:
+                    _v331_diag_err(_gd330a, "part7_lap1_spearman", _e331)
             # Ver330-A検証用の1行状態指紋。比較検証モードだけで計算し、通常実行の負荷をゼロにする。
             if _v330a_full_validation:
                 try:
                     _fp330a = _v330a_state_fp[int(lap)]
                     _gap_sum330a = float(sum(float(x) for x in gaps))
-                    if _v330a_full_validation:
+                    try:
                         _gd330a["gap_end_sum"][int(lap)] += _gap_sum330a
+                    except Exception as _e331:
+                        _v331_diag_err(_gd330a, "part5_gap_end_sum", _e331)
                     _mom_sum330a = float(sum(float(momentum.get(c, 0.0) or 0.0) for c in cars))
                     _slow_sum330a = float(sum(float(slowdown.get(c, 0.0) or 0.0) for c in cars))
                     _pass_count330a = int(sum(int(v or 0) for v in lap_pass_count.values()))
