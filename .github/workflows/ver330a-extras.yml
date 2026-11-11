@@ -31,7 +31,7 @@ on:
         required: true
         default: "0.0"
       trials:
-        description: "Trials (1000 or 20000)"
+        description: "Trials (100, 1000 or 20000)"
         required: true
         default: "20000"
       max_races:
