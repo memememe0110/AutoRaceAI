@@ -1,5 +1,27 @@
 {
   "_comment": "Scheduled runs only collect on dates listed here. Dry-run records are never counted toward the 40R evaluation.",
-  "2026-11-13": {"config_id": "ver326_base_dryrun", "venues": ""},
-  "2026-11-14": {"config_id": "ver326_base", "venues": ""}
+  "2026-11-13": {
+    "config_id": "ver326_base_dryrun",
+    "venues": ""
+  },
+  "2026-11-14": {
+    "config_id": "ver326_base",
+    "venues": ""
+  },
+  "2026-11-15": {
+    "config_id": "ver326_base",
+    "venues": ""
+  },
+  "2026-11-16": {
+    "config_id": "ver326_base",
+    "venues": ""
+  },
+  "2026-11-17": {
+    "config_id": "ver326_base",
+    "venues": ""
+  },
+  "2026-11-18": {
+    "config_id": "ver326_base",
+    "venues": ""
+  }
 }
