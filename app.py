@@ -21539,10 +21539,13 @@ def _v319_import_one_race(
             + _v319_detect_kessha_from_card_text(card_text)
         ))
         # 公式 OtherRaceInfo（天候・気温・湿度・レース名）を予測テキスト先頭へ
+        # Ver326.1: Program 再構築で card_text が作り直されても付け直せるよう保持する
+        _meta_lines_keep: list = []
         try:
             _ori = _v319_autorace_other_race_info(ymd, venue, race_no)
             if isinstance(_ori, dict):
                 _meta_lines = _v319_other_info_to_meta_lines(_ori)
+                _meta_lines_keep = list(_meta_lines or [])
                 if _meta_lines:
                     _body = str(card_text or "").strip()
                     card_text = "\n".join(_meta_lines) + ("\n" + _body if _body else "")
@@ -21624,6 +21627,10 @@ def _v319_import_one_race(
                             _v319_synthesize_sprace_html_from_program(_prog, venue, race_no, ymd),
                             venue, race_no, ymd,
                         )
+                        # Ver326.1: 再構築で消えた天候・走路温度・気温・湿度の行を付け直す
+                        if _meta_lines_keep:
+                            _body = str(card_text or "").strip()
+                            card_text = "\n".join(_meta_lines_keep) + ("\n" + _body if _body else "")
                 except Exception:
                     pass
         except Exception:
@@ -40217,7 +40224,7 @@ elif selected_main_page == "🏁 予測":
                 },
             )
 
-            scenario_probs = engine.v27_scenario_probabilities(meta.get("走路温度", 30.0))
+            scenario_probs = engine.v27_scenario_probabilities(engine.ver16_safe_float(meta.get("走路温度"), 30.0))
             scenario_df = pd.DataFrame([{"展開": name, "確率": prob * 100} for name, prob in sorted(scenario_probs.items(), key=lambda x: x[1], reverse=True)])
             st.subheader("展開予想")
             st.dataframe(scenario_df, use_container_width=True, hide_index=True, column_config={"確率": st.column_config.NumberColumn("確率", format="%.1f%%")})

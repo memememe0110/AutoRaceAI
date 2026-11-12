@@ -6410,7 +6410,7 @@ def v60_apply_lap_and_heat_learning(df, entries=None, meta=None, db_path=None):
     except Exception:
         pass
     try:
-        track_temp = float((meta or {}).get("走路温度") or 30.0)
+        track_temp = ver16_safe_float((meta or {}).get("走路温度"), 30.0)  # Ver326.1: NaN→30℃
     except Exception:
         track_temp = 30.0
     band, heat_level = v60_heat_band(track_temp)
@@ -13022,7 +13022,7 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
     st_col = "ST" if "ST" in out.columns else "平均ST"
     trial_strength = _v84_rank01(out.get(trial_col, pd.Series(np.nan, index=out.index)), True)
     st_strength = _v84_rank01(out.get(st_col, pd.Series(np.nan, index=out.index)), True)
-    track_temp = number((meta or {}).get("走路温度"), 30.0)
+    track_temp = ver16_safe_float(number((meta or {}).get("走路温度"), 30.0), 30.0)  # Ver326.1: NaN→30℃
     hot_level = float(np.clip((track_temp - 48.0) / 8.0, 0.0, 1.0))
     front_diff = float(profile.get("前残り差", 0.0))
     chase_diff = float(profile.get("追込み3着内差", 0.0)) * 0.65 + float(profile.get("追込み1着差", 0.0)) * 0.35
@@ -13705,7 +13705,7 @@ def v84_apply_venue_learning(df, entries=None, meta=None, db_path=DB_PATH):
     st_col = "ST" if "ST" in out.columns else "平均ST"
     trial_strength = _v84_rank01(out.get(trial_col, pd.Series(np.nan, index=out.index)), True)
     st_strength = _v84_rank01(out.get(st_col, pd.Series(np.nan, index=out.index)), True)
-    track_temp = number((meta or {}).get("走路温度"), 30.0)
+    track_temp = ver16_safe_float(number((meta or {}).get("走路温度"), 30.0), 30.0)  # Ver326.1: NaN→30℃
     hot_level = float(np.clip((track_temp - 48.0) / 8.0, 0.0, 1.0))
     front_diff = float(profile.get("前残り差", 0.0))
     chase_diff = float(profile.get("追込み3着内差", 0.0)) * 0.65 + float(profile.get("追込み1着差", 0.0)) * 0.35
