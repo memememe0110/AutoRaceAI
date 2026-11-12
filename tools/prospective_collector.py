@@ -398,9 +398,20 @@ def integrity(p: Path) -> str:
 
 
 # ---------------------------------------------------------------- git push (results branch)
+def git_root(p: Path) -> Path | None:
+    for d in [p, *p.parents]:
+        if (d / ".git").exists():
+            return d
+    return None
+
+
 def git_push(store_dir: Path, store_file: str, msg: str, con) -> bool:
-    if not (store_dir / ".git").exists():
+    root = git_root(store_dir)
+    if root is None:
+        poll_log(con, None, "git_push", detail={"ok": False, "msg": msg, "errors": ["no git repository above store"]})
         return False
+    store_file = str((store_dir / store_file).resolve())
+    store_dir = root
     ok = False
     detail = []
     for i in range(4):
