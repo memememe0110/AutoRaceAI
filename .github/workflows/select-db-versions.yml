@@ -1,0 +1,210 @@
+name: Select DB Versions
+run-name: "Select DB versions ${{ inputs.since || 'default' }}"
+
+# Restore the immutable history DB from autorace-db, run SELECT-only queries,
+# and publish CSV results as an artifact. This workflow never writes to the DB
+# branch and never pushes a database or release.
+on:
+  workflow_dispatch:
+    inputs:
+      db_branch:
+        description: "Source DB branch"
+        required: true
+        default: "autorace-db"
+        type: string
+      since:
+        description: "Start timestamp/date (inclusive), e.g. 2026-11-12"
+        required: true
+        default: "2026-11-12"
+        type: string
+      until:
+        description: "End timestamp/date (exclusive), empty = no upper bound"
+        required: false
+        default: ""
+        type: string
+      limit:
+        description: "Maximum rows per query"
+        required: true
+        default: "200"
+        type: string
+  workflow_call:
+    inputs:
+      db_branch:
+        required: false
+        type: string
+        default: "autorace-db"
+      since:
+        required: false
+        type: string
+        default: "2026-11-12"
+      until:
+        required: false
+        type: string
+        default: ""
+      limit:
+        required: false
+        type: string
+        default: "200"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: select-db-versions
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+  DB_PATH: autorace_players.sqlite3
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout query tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve inputs
+        id: params
+        env:
+          IN_BRANCH: ${{ inputs.db_branch }}
+          IN_SINCE: ${{ inputs.since }}
+          IN_UNTIL: ${{ inputs.until }}
+          IN_LIMIT: ${{ inputs.limit }}
+        run: |
+          set -euo pipefail
+          branch="${IN_BRANCH:-autorace-db}"
+          since="${IN_SINCE:-2026-11-12}"
+          until="${IN_UNTIL:-}"
+          limit="${IN_LIMIT:-200}"
+          case "$limit" in
+            ''|*[!0-9]*) echo "limit must be an integer" >&2; exit 1 ;;
+          esac
+          test "$limit" -gt 0 || { echo "limit must be > 0" >&2; exit 1; }
+          {
+            echo "db_branch=$branch"
+            echo "since=$since"
+            echo "until=$until"
+            echo "limit=$limit"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch and verify immutable DB
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python tools/prospective_collector.py fetch-db \
+            --repo "$REPO" \
+            --branch "${{ steps.params.outputs.db_branch }}" \
+            --out work/autorace_players.sqlite3 \
+            --info-out work/db_info.json
+          df -h /home/runner
+
+      - name: Run SELECT-only version queries
+        env:
+          SINCE: ${{ steps.params.outputs.since }}
+          UNTIL: ${{ steps.params.outputs.until }}
+          LIMIT: ${{ steps.params.outputs.limit }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          import re
+          import sqlite3
+          from pathlib import Path
+
+          db = Path("work/autorace_players.sqlite3").resolve()
+          out = Path("work/query_results")
+          out.mkdir(parents=True, exist_ok=True)
+          since = os.environ["SINCE"].strip()
+          until = os.environ["UNTIL"].strip()
+          limit = int(os.environ["LIMIT"])
+          if not since:
+              raise SystemExit("since is required")
+          if not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?", since):
+              raise SystemExit("since must be YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
+          if until and not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?", until):
+              raise SystemExit("until must be YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
+
+          def write_csv(path, columns, rows):
+              with path.open("w", newline="", encoding="utf-8-sig") as f:
+                  w = csv.writer(f)
+                  w.writerow(columns)
+                  w.writerows(rows)
+
+          with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+              if str(integrity).lower() != "ok":
+                  raise SystemExit(f"integrity_check failed: {integrity}")
+              tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+              required = {"v231_prediction_history", "v187_mixed_plan_runs"}
+              missing = sorted(required - tables)
+              if missing:
+                  raise SystemExit("Missing required tables: " + ", ".join(missing))
+
+              upper_pred = ""
+              upper_plan = ""
+              pred_params = [since]
+              plan_params = [since]
+              if until:
+                  upper_pred = " AND prediction_time < ?"
+                  upper_plan = " AND created_at < ?"
+                  pred_params.append(until)
+                  plan_params.append(until)
+
+              pred_sql = f"""
+                  SELECT history_id, race_key, app_version, prediction_time, trials
+                    FROM v231_prediction_history
+                   WHERE prediction_time >= ?{upper_pred}
+                   ORDER BY prediction_time DESC
+                   LIMIT ?
+              """
+              plan_sql = f"""
+                  SELECT race_key, plan_hash, app_version, plan_origin, created_at
+                    FROM v187_mixed_plan_runs
+                   WHERE created_at >= ?{upper_plan}
+                   ORDER BY created_at DESC
+                   LIMIT ?
+              """
+              pred_rows = con.execute(pred_sql, (*pred_params, limit)).fetchall()
+              plan_rows = con.execute(plan_sql, (*plan_params, limit)).fetchall()
+
+          write_csv(out / "prediction_versions.csv",
+                    ["history_id", "race_key", "app_version", "prediction_time", "trials"], pred_rows)
+          write_csv(out / "mixed_plan_versions.csv",
+                    ["race_key", "plan_hash", "app_version", "plan_origin", "created_at"], plan_rows)
+
+          summary = {
+              "since": since,
+              "until": until,
+              "limit_per_query": limit,
+              "prediction_rows": len(pred_rows),
+              "mixed_plan_rows": len(plan_rows),
+              "integrity_check": integrity,
+          }
+          (out / "query_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(json.dumps(summary, ensure_ascii=False))
+          PY
+
+      - name: Upload SELECT results
+        uses: actions/upload-artifact@v4
+        with:
+          name: select-db-versions-${{ github.run_id }}
+          path: |
+            work/query_results/
+            work/db_info.json
+          if-no-files-found: error
+          retention-days: 7
