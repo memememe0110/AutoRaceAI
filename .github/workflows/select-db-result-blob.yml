@@ -1,0 +1,279 @@
+name: Inspect Background Job Result Blobs
+run-name: "SQL-D result_blob ${{ inputs.job_ids || '523,524' }}"
+
+# SQL-D: inspect only the selected background-job result blobs. The workflow
+# never writes to the DB, never stores the original blobs as artifacts, and
+# never executes pickle.loads().
+on:
+  workflow_dispatch:
+    inputs:
+      db_branch:
+        description: "Source DB branch"
+        required: true
+        default: "autorace-db"
+        type: string
+      job_ids:
+        description: "Comma-separated job IDs to inspect"
+        required: true
+        default: "523,524"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: select-db-result-blob
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout query tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve inputs
+        id: params
+        env:
+          IN_BRANCH: ${{ inputs.db_branch }}
+          IN_JOB_IDS: ${{ inputs.job_ids }}
+        run: |
+          set -euo pipefail
+          branch="${IN_BRANCH:-autorace-db}"
+          ids="${IN_JOB_IDS:-523,524}"
+          python - "$ids" <<'PY'
+          import sys
+          values = [x.strip() for x in sys.argv[1].split(',') if x.strip()]
+          if not values or any(not x.isdigit() for x in values):
+              raise SystemExit('job_ids must be a comma-separated list of integers')
+          if len(values) > 10:
+              raise SystemExit('at most 10 job IDs may be inspected')
+          print('validated job IDs:', ','.join(values))
+          PY
+          echo "db_branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "job_ids=$ids" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch and verify immutable DB
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python tools/prospective_collector.py fetch-db \
+            --repo "$REPO" \
+            --branch "${{ steps.params.outputs.db_branch }}" \
+            --out work/autorace_players.sqlite3 \
+            --info-out work/db_info.json
+          df -h /home/runner
+
+      - name: Inspect selected result_blob values without pickle execution
+        env:
+          JOB_IDS: ${{ steps.params.outputs.job_ids }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import lzma
+          import os
+          import pickletools
+          import sqlite3
+          import struct
+          import zlib
+          from pathlib import Path
+
+          db = Path("work/autorace_players.sqlite3").resolve()
+          out = Path("work/result_blob_results")
+          out.mkdir(parents=True, exist_ok=True)
+          raw_ids = [x.strip() for x in os.environ["JOB_IDS"].split(",") if x.strip()]
+          job_ids = [int(x) for x in raw_ids]
+          placeholders = ",".join("?" for _ in job_ids)
+
+          def bounded_decompress(blob, wbits, max_output=8 * 1024 * 1024):
+              d = zlib.decompressobj(wbits)
+              result = bytearray()
+              pos = 0
+              while pos < len(blob):
+                  piece = d.decompress(blob[pos:pos + 1024 * 1024], max_output - len(result))
+                  result.extend(piece)
+                  pos += 1024 * 1024
+                  if len(result) >= max_output:
+                      return bytes(result), True
+                  if d.eof:
+                      break
+              result.extend(d.flush(max_output - len(result)))
+              return bytes(result), len(result) >= max_output
+
+          def safe_text(data, limit=4000):
+              return data[:limit].decode("utf-8", errors="replace")
+
+          def inspect_payload(blob):
+              result = {
+                  "raw_size": len(blob),
+                  "raw_sha256": hashlib.sha256(blob).hexdigest(),
+                  "raw_prefix_hex": blob[:32].hex(),
+                  "pickle_loads_called": False,
+                  "decompression_attempts": [],
+              }
+              candidates = [("raw", blob, False)]
+              for name, wbits in [("zlib", 15), ("gzip", 31), ("deflate_raw", -15)]:
+                  try:
+                      data, truncated = bounded_decompress(blob, wbits)
+                      candidates.append((name, data, truncated))
+                      result["decompression_attempts"].append({
+                          "format": name, "ok": True, "size": len(data), "truncated": truncated
+                      })
+                  except Exception as e:
+                      result["decompression_attempts"].append({
+                          "format": name, "ok": False, "error": type(e).__name__ + ": " + str(e)[:300]
+                      })
+              # These formats are checked only as bytes; no deserialization occurs.
+              for name, fn in [("bz2", __import__("bz2").decompress), ("lzma", lzma.decompress)]:
+                  try:
+                      data = fn(blob)
+                      if len(data) <= 8 * 1024 * 1024:
+                          candidates.append((name, data, False))
+                          result["decompression_attempts"].append({"format": name, "ok": True, "size": len(data), "truncated": False})
+                      else:
+                          result["decompression_attempts"].append({"format": name, "ok": True, "size": len(data), "truncated": True})
+                  except Exception as e:
+                      result["decompression_attempts"].append({"format": name, "ok": False, "error": type(e).__name__ + ": " + str(e)[:300]})
+
+              analyses = []
+              seen = set()
+              for label, data, truncated in candidates:
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in seen:
+                      continue
+                  seen.add(digest)
+                  item = {
+                      "source": label,
+                      "size": len(data),
+                      "sha256": digest,
+                      "truncated": truncated,
+                      "prefix_hex": data[:32].hex(),
+                      "prefix_text": safe_text(data[:128], 128),
+                  }
+                  if data.startswith(b"SQLite format 3"):
+                      item["detected_format"] = "sqlite"
+                  elif data[:1] in (b"{", b"["):
+                      item["detected_format"] = "json-like"
+                      try:
+                          json.loads(data.decode("utf-8"))
+                          item["json_parse"] = "ok"
+                      except Exception as e:
+                          item["json_parse"] = type(e).__name__ + ": " + str(e)[:200]
+                  elif data[:1] == b"(" or data[:2] in (b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"):
+                      item["detected_format"] = "pickle-like"
+                      try:
+                          ops = []
+                          for op, arg, pos in pickletools.genops(data):
+                              ops.append({"opcode": op.name, "arg_repr": repr(arg)[:300], "position": pos})
+                              if len(ops) >= 200:
+                                  break
+                          item["pickle_opcode_count_preview"] = len(ops)
+                          item["pickle_opcodes"] = ops
+                          item["pickle_analysis"] = "opcode-only; pickle.loads not called"
+                      except Exception as e:
+                          item["pickle_analysis"] = type(e).__name__ + ": " + str(e)[:300]
+                  else:
+                      item["detected_format"] = "unknown-binary-or-text"
+                  analyses.append(item)
+              result["candidate_payloads"] = analyses
+              return result
+
+          with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+              if str(integrity).lower() != "ok":
+                  raise SystemExit(f"integrity_check failed: {integrity}")
+              cols = [r[1] for r in con.execute("PRAGMA table_info(v278_background_jobs)")]
+              required = {"job_id", "result_blob"}
+              if not required.issubset(cols):
+                  raise SystemExit("Missing required columns: " + ", ".join(sorted(required - set(cols))))
+              rows = con.execute(
+                  f"SELECT job_id, job_type, app_version, status, created_at, started_at, updated_at, finished_at, "
+                  f"done_count, total_count, error_text, result_blob FROM v278_background_jobs "
+                  f"WHERE job_id IN ({placeholders}) ORDER BY job_id",
+                  job_ids,
+              ).fetchall()
+
+          summaries = []
+          meta_columns = ["job_id", "job_type", "job_app_version", "status", "created_at", "started_at", "updated_at", "finished_at", "done_count", "total_count", "error_text"]
+          meta_rows = []
+          opcode_lines = []
+          found = set()
+          for row in rows:
+              job_id, job_type, app_version, status, created_at, started_at, updated_at, finished_at, done_count, total_count, error_text, blob = row
+              found.add(int(job_id))
+              summary = {
+                  "job_id": job_id,
+                  "job_type": job_type,
+                  "job_app_version": app_version,
+                  "status": status,
+                  "created_at": created_at,
+                  "started_at": started_at,
+                  "updated_at": updated_at,
+                  "finished_at": finished_at,
+                  "done_count": done_count,
+                  "total_count": total_count,
+                  "error_text": error_text,
+                  "result_blob_present": blob is not None,
+              }
+              if blob is not None:
+                  summary["blob_analysis"] = inspect_payload(bytes(blob))
+              else:
+                  summary["blob_analysis"] = None
+              summaries.append(summary)
+              meta_rows.append([job_id, job_type, app_version, status, created_at, started_at, updated_at, finished_at, done_count, total_count, error_text])
+              opcode_lines.append(f"=== JOB {job_id} ===")
+              for candidate in (summary.get("blob_analysis") or {}).get("candidate_payloads", []):
+                  opcode_lines.append(f"source={candidate.get('source')} format={candidate.get('detected_format')} size={candidate.get('size')}")
+                  for op in candidate.get("pickle_opcodes", []):
+                      opcode_lines.append(json.dumps(op, ensure_ascii=False))
+
+          missing = sorted(set(job_ids) - found)
+          report = {
+              "requested_job_ids": job_ids,
+              "found_job_ids": sorted(found),
+              "missing_job_ids": missing,
+              "integrity_check": integrity,
+              "pickle_loads_called": False,
+              "original_blob_saved_as_artifact": False,
+              "notes": [
+                  "Only selected rows were read with SELECT.",
+                  "Original result_blob bytes were not written to artifact files.",
+                  "pickletools opcode inspection was used; pickle.loads was not called.",
+              ],
+              "jobs": summaries,
+          }
+          (out / "result_blob_analysis.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+          (out / "result_blob_job_metadata.csv").write_text("", encoding="utf-8")
+          with (out / "result_blob_job_metadata.csv").open("w", newline="", encoding="utf-8-sig") as f:
+              w = csv.writer(f); w.writerow(meta_columns); w.writerows(meta_rows)
+          (out / "pickle_opcode_preview.txt").write_text("\n".join(opcode_lines), encoding="utf-8")
+          print(json.dumps({"requested": job_ids, "found": sorted(found), "missing": missing, "integrity_check": integrity, "pickle_loads_called": False}, ensure_ascii=False))
+          PY
+
+      - name: Upload SQL-D analysis (no original blobs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: select-db-result-blob-${{ github.run_id }}
+          path: |
+            work/result_blob_results/
+            work/db_info.json
+          if-no-files-found: error
+          retention-days: 7
