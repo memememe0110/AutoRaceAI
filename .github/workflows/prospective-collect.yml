@@ -1,0 +1,201 @@
+name: Prospective Collect (pilot)
+run-name: "Prospective collect ${{ inputs.date || 'scheduled' }}"
+
+# Method L pilot collector. Does not modify app.py / engine.py / the production DB.
+# app.py is pinned by SHA (APP_COMMIT); the collector itself comes from this workflow's commit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Meeting date (JST, YYYY-MM-DD). Empty = today (JST)'
+        required: false
+        default: ''
+        type: string
+      config_id:
+        description: 'ver326_base_dryrun or ver326_base'
+        required: true
+        default: 'ver326_base_dryrun'
+        type: string
+      venues:
+        description: 'Comma-separated venues (empty = all)'
+        required: false
+        default: ''
+        type: string
+      trials_ladder:
+        description: 'Trials ladder'
+        required: true
+        default: '20000,10000,5000'
+        type: string
+      max_minutes:
+        description: 'Collector run limit (minutes)'
+        required: true
+        default: '300'
+        type: string
+  schedule:
+    # JST 09:00 / 14:30 / 19:30 (only dates in tools/prospective_schedule.json are collected)
+    - cron: '0 0 * * *'
+    - cron: '30 5 * * *'
+    - cron: '30 10 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prospective-collect
+  cancel-in-progress: false
+
+env:
+  APP_COMMIT: 4d19bcd81cac845f895eee7122d13ceef001437f
+  RESULTS_BRANCH: prospective-collect
+  STORE_REL: prospective/prospective_collect.sqlite3
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Resolve run parameters
+        id: p
+        env:
+          IN_DATE: ${{ inputs.date }}
+          IN_CONFIG: ${{ inputs.config_id }}
+          IN_VENUES: ${{ inputs.venues }}
+          IN_LADDER: ${{ inputs.trials_ladder }}
+          IN_MAX: ${{ inputs.max_minutes }}
+        run: |
+          set -euo pipefail
+          D="${IN_DATE:-$(TZ=Asia/Tokyo date +%F)}"
+          echo "date=$D" >> "$GITHUB_OUTPUT"
+          echo "config=${IN_CONFIG}" >> "$GITHUB_OUTPUT"
+          echo "venues=${IN_VENUES}" >> "$GITHUB_OUTPUT"
+          echo "ladder=${IN_LADDER:-20000,10000,5000}" >> "$GITHUB_OUTPUT"
+          echo "max=${IN_MAX:-300}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout collector (this workflow's commit)
+        uses: actions/checkout@v4
+        with:
+          path: collector
+          fetch-depth: 1
+
+      - name: Gate scheduled runs by tools/prospective_schedule.json
+        id: gate
+        env:
+          D: ${{ steps.p.outputs.date }}
+          EV: ${{ github.event_name }}
+          IN_CONFIG: ${{ steps.p.outputs.config }}
+          IN_VENUES: ${{ steps.p.outputs.venues }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          d, ev = os.environ["D"], os.environ["EV"]
+          sch = json.load(open("collector/tools/prospective_schedule.json", encoding="utf-8"))
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+          if ev == "schedule":
+              e = sch.get(d)
+              if not e:
+                  out.write("go=0\n"); print(f"{d}: not a scheduled collection date"); raise SystemExit(0)
+              out.write(f"go=1\nconfig={e['config_id']}\nvenues={e.get('venues','')}\n")
+          else:
+              out.write(f"go=1\nconfig={os.environ['IN_CONFIG']}\nvenues={os.environ['IN_VENUES']}\n")
+          PY
+
+      - name: Checkout pinned app source
+        if: steps.gate.outputs.go == '1'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.APP_COMMIT }}
+          path: appsrc
+          fetch-depth: 1
+
+      - name: Set up Python
+        if: steps.gate.outputs.go == '1'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: steps.gate.outputs.go == '1'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas openpyxl streamlit playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Fetch DB from autorace-db (pinned to branch head SHA)
+        if: steps.gate.outputs.go == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python collector/tools/prospective_collector.py fetch-db \
+            --repo "${{ github.repository }}" --branch autorace-db \
+            --out work/autorace_players.sqlite3 --info-out work/db_info.json
+          df -h /home/runner
+
+      - name: Checkout (or create) results branch
+        if: steps.gate.outputs.go == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          URL="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          if git ls-remote --exit-code --heads "$URL" "$RESULTS_BRANCH" >/dev/null; then
+            git clone -q --depth 1 --branch "$RESULTS_BRANCH" "$URL" results
+          else
+            mkdir results && cd results && git init -q && git checkout -q --orphan "$RESULTS_BRANCH"
+            git remote add origin "$URL"
+            mkdir -p prospective && echo "Prospective collection store (append-only). Not the production DB." > prospective/README.md
+            git add prospective/README.md
+            git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -q -m "init results branch"
+            git push -q -u origin "$RESULTS_BRANCH"
+            cd ..
+          fi
+          git -C results config user.name "github-actions[bot]"
+          git -C results config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C results branch --set-upstream-to="origin/$RESULTS_BRANCH" || true
+          mkdir -p "results/$(dirname "$STORE_REL")"
+
+      - name: Run collector
+        if: steps.gate.outputs.go == '1'
+        env:
+          COLLECTOR_COMMIT: ${{ github.sha }}
+        run: |
+          python collector/tools/prospective_collector.py run \
+            --app appsrc/app.py --db work/autorace_players.sqlite3 --db-info work/db_info.json \
+            --store "results/$STORE_REL" --tmp work/tmp \
+            --config-id "${{ steps.gate.outputs.config }}" --venues "${{ steps.gate.outputs.venues }}" \
+            --date "${{ steps.p.outputs.date }}" --trials-ladder "${{ steps.p.outputs.ladder }}" \
+            --max-minutes "${{ steps.p.outputs.max }}" --code-commit "$APP_COMMIT"
+
+      - name: Verify pushed rows match local rows
+        if: always() && steps.gate.outputs.go == '1'
+        run: |
+          set -u
+          cd results
+          git fetch -q origin "$RESULTS_BRANCH" || true
+          git show "origin/$RESULTS_BRANCH:$STORE_REL" > /tmp/remote.sqlite3 2>/dev/null || true
+          python3 - <<'PY'
+          import sqlite3, os
+          loc = os.environ["STORE_REL"]
+          q = "SELECT (SELECT COUNT(*) FROM v332_prospective_alpha_log),(SELECT COUNT(*) FROM v332_prospective_results),(SELECT COUNT(*) FROM v332_commit_log)"
+          def cnt(p):
+              try:
+                  return sqlite3.connect(p).execute(q).fetchone()
+              except Exception as e:
+                  return ("err", str(e))
+          l, r = cnt(loc), cnt("/tmp/remote.sqlite3")
+          print("local", l, "remote", r)
+          if l != r:
+              print("::warning::local and remote row counts differ; the store is attached as an artifact")
+          PY
+
+      - name: Upload store and logs
+        if: always() && steps.gate.outputs.go == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: prospective-${{ steps.p.outputs.date }}-${{ github.run_id }}
+          path: |
+            results/prospective/
+            work/db_info.json
+            work/tmp/*.log
+          if-no-files-found: ignore
+          retention-days: 30
