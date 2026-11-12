@@ -9590,6 +9590,10 @@ def v46_delete_player_all(player_name, db_path=DB_PATH, delete_result_rows=False
 # ============================================================
 # Ver47: 選手履歴の必須項目検証・不足行保留
 # ============================================================
+import datetime as _v326_1_dt
+_V326_1_ISO_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
 def _v47_normalize_date(value):
     """日付を YYYY-MM-DD に統一。不正・空欄は None。"""
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -9597,6 +9601,16 @@ def _v47_normalize_date(value):
     s = str(value).strip()
     if s in {"", "-", "—", "–", "―", "None", "nan", "NaT"}:
         return None
+    # Ver326.1: ゼロ埋め済み YYYY-MM-DD の文字列は変換せずそのまま返す（結果は従来と同じ）。
+    # 履歴保存の重複チェックで全履歴の日付を毎回 pandas で変換していたのが取込遅延の原因。
+    if isinstance(value, str):
+        _m = _V326_1_ISO_DATE_RE.fullmatch(s)
+        if _m:
+            try:
+                _v326_1_dt.date(int(_m.group(1)), int(_m.group(2)), int(_m.group(3)))
+                return s
+            except ValueError:
+                pass
     s = s.replace("年", "/").replace("月", "/").replace("日", "")
     s = s.replace(".", "/").replace("-", "/")
     try:
