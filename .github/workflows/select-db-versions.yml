@@ -150,7 +150,7 @@ jobs:
               if str(integrity).lower() != "ok":
                   raise SystemExit(f"integrity_check failed: {integrity}")
               tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-              required = {"v231_prediction_history", "v187_mixed_plan_runs"}
+              required = {"v231_prediction_history", "v187_mixed_plan_runs", "v278_background_jobs"}
               missing = sorted(required - tables)
               if missing:
                   raise SystemExit("Missing required tables: " + ", ".join(missing))
@@ -182,10 +182,95 @@ jobs:
               pred_rows = con.execute(pred_sql, (*pred_params, limit)).fetchall()
               plan_rows = con.execute(plan_sql, (*plan_params, limit)).fetchall()
 
+              # SQL-C: inspect the real job schema first, then select Job 523/524/525
+              # and recent jobs without assuming column names beyond the table name.
+              job_schema = con.execute("PRAGMA table_info(v278_background_jobs)").fetchall()
+              job_columns = [str(r[1]) for r in job_schema]
+              qident = lambda x: '"' + str(x).replace('"', '""') + '"'
+              job_all_rows = []
+              if job_columns:
+                  job_select = ", ".join(qident(c) for c in job_columns)
+                  # Keep the read bounded for unusually large job tables.
+                  job_all_rows = con.execute(
+                      f"SELECT {job_select} FROM v278_background_jobs ORDER BY rowid DESC LIMIT ?",
+                      (max(limit * 10, 1000),),
+                  ).fetchall()
+              job_id_col = next((c for c in job_columns if c.lower() in {
+                  "job_id", "id", "jobid", "job_no", "job_number"
+              }), "")
+              target_job_rows = []
+              if job_id_col:
+                  target_job_rows = con.execute(
+                      f"SELECT {job_select} FROM v278_background_jobs "
+                      f"WHERE {qident(job_id_col)} IN (?,?,?) ORDER BY {qident(job_id_col)}",
+                      (523, 524, 525),
+                  ).fetchall()
+              # Merge recent rows and explicitly requested target rows by value.
+              seen_job_rows = set()
+              merged_job_rows = []
+              for row in target_job_rows + job_all_rows:
+                  marker = tuple(row)
+                  if marker not in seen_job_rows:
+                      seen_job_rows.add(marker)
+                      merged_job_rows.append(row)
+
           write_csv(out / "prediction_versions.csv",
                     ["history_id", "race_key", "app_version", "prediction_time", "trials"], pred_rows)
           write_csv(out / "mixed_plan_versions.csv",
                     ["race_key", "plan_hash", "app_version", "plan_origin", "created_at"], plan_rows)
+          write_csv(out / "background_jobs_schema.csv",
+                    ["cid", "name", "type", "notnull", "dflt_value", "pk"], job_schema)
+          write_csv(out / "background_jobs_523_524_525.csv", job_columns, merged_job_rows)
+
+          def parse_dt(value):
+              text = str(value or "").strip()
+              if not text:
+                  return None
+              try:
+                  return __import__("datetime").datetime.fromisoformat(text.replace("Z", "+00:00"))
+              except Exception:
+                  return None
+
+          def first_col(names, candidates):
+              lower = {str(n).lower(): n for n in names}
+              for candidate in candidates:
+                  if candidate in lower:
+                      return lower[candidate]
+              return ""
+
+          job_start_col = first_col(job_columns, ["started_at", "start_time", "started", "created_at", "created"])
+          job_finish_col = first_col(job_columns, ["finished_at", "finish_time", "ended_at", "completed_at", "updated_at"])
+          job_type_col = first_col(job_columns, ["job_type", "type"])
+          job_status_col = first_col(job_columns, ["status", "state"])
+          job_ver_col = first_col(job_columns, ["app_version", "version"])
+          job_request_col = first_col(job_columns, ["request_json", "request", "payload", "params", "config_json"])
+          timeline = []
+          for pred in pred_rows:
+              pred_dict = dict(zip(["history_id", "race_key", "app_version", "prediction_time", "trials"], pred))
+              pt = parse_dt(pred_dict.get("prediction_time"))
+              matches = []
+              for job in merged_job_rows:
+                  jd = dict(zip(job_columns, job))
+                  st = parse_dt(jd.get(job_start_col)) if job_start_col else None
+                  fin = parse_dt(jd.get(job_finish_col)) if job_finish_col else None
+                  if pt and st and pt >= st and (not fin or pt <= fin):
+                      matches.append(jd)
+              if not matches:
+                  matches = [{}]
+              for jd in matches:
+                  timeline.append([
+                      pred_dict.get("history_id"), pred_dict.get("race_key"),
+                      pred_dict.get("app_version"), pred_dict.get("prediction_time"),
+                      pred_dict.get("trials"), jd.get(job_id_col, ""),
+                      jd.get(job_type_col, ""), jd.get(job_status_col, ""),
+                      jd.get(job_start_col, ""), jd.get(job_finish_col, ""),
+                      jd.get(job_ver_col, ""), jd.get(job_request_col, ""),
+                  ])
+          write_csv(out / "prediction_job_timeline.csv", [
+              "history_id", "race_key", "prediction_app_version", "prediction_time", "trials",
+              "job_id", "job_type", "job_status", "job_started_at", "job_finished_at",
+              "job_app_version", "job_request_or_config",
+          ], timeline)
 
           summary = {
               "since": since,
@@ -193,6 +278,13 @@ jobs:
               "limit_per_query": limit,
               "prediction_rows": len(pred_rows),
               "mixed_plan_rows": len(plan_rows),
+              "background_job_schema_columns": len(job_columns),
+              "background_job_rows_exported": len(merged_job_rows),
+              "target_job_rows": len(target_job_rows),
+              "job_id_column": job_id_col,
+              "job_start_column": job_start_col,
+              "job_finish_column": job_finish_col,
+              "timeline_rows": len(timeline),
               "integrity_check": integrity,
           }
           (out / "query_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
