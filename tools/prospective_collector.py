@@ -712,9 +712,13 @@ def cmd_run(a) -> None:
             time.sleep(5)
     # reproducibility check on the first record made at the final N (④)
     final_n = ladder[li]
+    day_like = a.date.replace("-", "") + "_%"  # repro is per (date, config_id, final N)
     row = con.execute("SELECT id, race_key, raw_text, lap_order_counts_json FROM v332_prospective_alpha_log "
-                      "WHERE config_id=? AND requested_trials=? ORDER BY id LIMIT 1", (a.config_id, final_n)).fetchone()
-    done_repro = con.execute("SELECT 1 FROM v332_repro_log WHERE requested_trials=? AND identical IN (0,1)", (final_n,)).fetchone()
+                      "WHERE config_id=? AND requested_trials=? AND race_key LIKE ? ORDER BY id LIMIT 1",
+                      (a.config_id, final_n, day_like)).fetchone()
+    done_repro = con.execute("SELECT 1 FROM v332_repro_log r JOIN v332_prospective_alpha_log l ON l.id = r.alpha_log_id "
+                             "WHERE r.requested_trials=? AND r.identical IN (0,1) AND l.config_id=? AND l.race_key LIKE ?",
+                             (final_n, a.config_id, day_like)).fetchone()
     if row and a.repro and not done_repro:
         repro(a, con, row, final_n, tmp)
     summary = {"job_end": iso(now()), "final_N": final_n, "pushes": pushes, "pushes_ok": pushes_ok,
