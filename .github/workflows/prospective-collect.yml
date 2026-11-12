@@ -15,7 +15,7 @@ on:
       config_id:
         description: 'ver326_base_dryrun, ver326_base, ver326_1_base_dryrun or ver326_1_base'
         required: true
-        default: 'ver326_base_dryrun'
+        default: 'ver326_1_base_dryrun'
         type: string
       venues:
         description: 'Comma-separated venues (empty = all)'

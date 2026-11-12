@@ -814,7 +814,7 @@ def main() -> None:
         r.add_argument("--db-info", default="")
         r.add_argument("--store", required=True)
         r.add_argument("--tmp", default="/tmp/pc_tmp")
-        r.add_argument("--config-id", default="ver326_base_dryrun", choices=sorted(CONFIGS))
+        r.add_argument("--config-id", default="ver326_1_base_dryrun", choices=sorted(CONFIGS))
         r.add_argument("--seed", type=int, default=SEED_DEFAULT)
         r.add_argument("--timeout", type=float, default=1500)
         r.add_argument("--code-commit", required=True)
