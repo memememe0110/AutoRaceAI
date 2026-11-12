@@ -30,7 +30,7 @@ on:
       max_minutes:
         description: 'Collector run limit (minutes)'
         required: true
-        default: '300'
+        default: '340'
         type: string
   schedule:
     # JST 09:00 / 14:30 / 19:30 (only dates in tools/prospective_schedule.json are collected)
@@ -70,7 +70,7 @@ jobs:
           echo "config=${IN_CONFIG}" >> "$GITHUB_OUTPUT"
           echo "venues=${IN_VENUES}" >> "$GITHUB_OUTPUT"
           echo "ladder=${IN_LADDER:-20000,10000,5000}" >> "$GITHUB_OUTPUT"
-          echo "max=${IN_MAX:-300}" >> "$GITHUB_OUTPUT"
+          echo "max=${IN_MAX:-340}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout collector (this workflow's commit)
         uses: actions/checkout@v4
