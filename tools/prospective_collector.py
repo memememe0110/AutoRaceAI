@@ -554,7 +554,9 @@ def ori_body(builder, race):
 def fetch_result(a, con, builder, race) -> bool:
     ymd = race["date"].replace("-", "")
     rb = builder.api("/race_info/RaceResult", ymd, race["venue"], race["race_no"])
-    body = (rb or {}).get("body") if isinstance(rb, dict) else None
+    body = None
+    if isinstance(rb, dict):
+        body = rb.get("body") if isinstance(rb.get("body"), dict) else rb  # builder.api already unwraps body
     lap1 = fin = cars = None
     if isinstance(body, dict):
         for g in body.get("grandNoteList") or []:
