@@ -13,7 +13,7 @@ on:
         default: ''
         type: string
       config_id:
-        description: 'ver326_base_dryrun or ver326_base'
+        description: 'ver326_base_dryrun, ver326_base, ver326_1_base_dryrun or ver326_1_base'
         required: true
         default: 'ver326_base_dryrun'
         type: string
@@ -46,7 +46,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  APP_COMMIT: 4d19bcd81cac845f895eee7122d13ceef001437f
+  APP_COMMIT: 65c62b966a7ebd848d5194a4ac1e65e616228af9
   RESULTS_BRANCH: prospective-collect
   STORE_REL: prospective/prospective_collect.sqlite3
 

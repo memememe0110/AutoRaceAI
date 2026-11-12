@@ -34,6 +34,9 @@ RESULT_MAX_TRIES = 4  # first try + 3 retries
 CONFIGS = {
     "ver326_base": {"compare_mode": "Ver326", "env": {"AUTORACE_331_LAP1_TUNE": "0"}},
     "ver326_base_dryrun": {"compare_mode": "Ver326", "env": {"AUTORACE_331_LAP1_TUNE": "0"}},
+    # Ver326.1 = app 65c62b9 (weather / track temperature kept in the card, NaN temperature -> 30C)
+    "ver326_1_base": {"compare_mode": "Ver326", "env": {"AUTORACE_331_LAP1_TUNE": "0"}, "reattach_meta": True},
+    "ver326_1_base_dryrun": {"compare_mode": "Ver326", "env": {"AUTORACE_331_LAP1_TUNE": "0"}, "reattach_meta": True},
 }
 
 SCHEMA = """
@@ -204,6 +207,7 @@ class CardBuilder:
         self._orig_post = self.ns["_v319_autorace_api_post"]
         self.bodies: list = []
         self.forbid_result = True
+        self.reattach_meta = False
 
         def recording_post(path, ymd, venue, race_no=1, timeout=20, cache=True):
             if self.forbid_result and "RaceResult" in str(path):
@@ -261,10 +265,12 @@ class CardBuilder:
         card = ns["_v319_build_prediction_text_from_sprace"](sp_html, venue, race_no, ymd)
         out["path"].append("sprace")
         kessha = sorted(set(ns["_v319_detect_kessha_from_players"](players) + ns["_v319_detect_kessha_from_card_text"](card)))
+        ml_keep: list = []
         try:
             ori = ns["_v319_autorace_other_race_info"](ymd, venue, race_no)
             if isinstance(ori, dict):
                 ml = ns["_v319_other_info_to_meta_lines"](ori)
+                ml_keep = list(ml or [])
                 if ml:
                     body = str(card or "").strip()
                     card = "\n".join(ml) + ("\n" + body if body else "")
@@ -283,6 +289,12 @@ class CardBuilder:
                     card = ns["_v319_build_prediction_text_from_sprace"](
                         ns["_v319_synthesize_sprace_html_from_program"](prog, venue, race_no, ymd), venue, race_no, ymd)
                     out["path"].append("program_rebuild")
+                    # Ver326.1 (app 65c62b9): re-attach the OtherRaceInfo lines the rebuild drops.
+                    # Only for configs that pin a fixed app; ver326_base keeps the 4d19bcd8 behaviour.
+                    if self.reattach_meta and ml_keep:
+                        body = str(card or "").strip()
+                        card = "\n".join(ml_keep) + ("\n" + body if body else "")
+                        out["path"].append("meta_lines_reattached")
         except Exception as e:
             out["path"].append(f"program_error:{type(e).__name__}:{e}")
         out.update({"ready": True, "card_text": card, "kessha": kessha, "st_default": st_default,
@@ -587,6 +599,7 @@ def cmd_run(a) -> None:
     tmp = Path(a.tmp)
     tmp.mkdir(parents=True, exist_ok=True)
     builder = CardBuilder(a.app, a.db)  # history fill reads the master copy read-only path
+    builder.reattach_meta = bool(CONFIGS[a.config_id].get("reattach_meta"))
     ladder = [int(x) for x in a.trials_ladder.split(",")]
     li = 0
     venues = [v for v in (a.venues.split(",") if a.venues else VENUES) if v]
@@ -759,6 +772,7 @@ def cmd_selftest(a) -> None:
     tmp = Path(a.tmp)
     tmp.mkdir(parents=True, exist_ok=True)
     builder = CardBuilder(a.app, a.db)
+    builder.reattach_meta = bool(CONFIGS[a.config_id].get("reattach_meta"))
     date_s, venue, rno = a.date, a.venue, a.race_no
     ob = builder.api("/race_info/OtherRaceInfo", date_s.replace("-", ""), venue, rno)
     ob = (ob or {}).get("body") if isinstance(ob, dict) and "body" in ob else ob
