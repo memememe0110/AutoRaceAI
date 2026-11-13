@@ -3,7 +3,7 @@ name: QVer Lock8 Phase5 Tests
 on:
   push:
     branches:
-      - qver-lock8-heartbeat-fix
+      - qver-lock8-done-defer
     paths:
       - "app.py"
       - "engine.py"
@@ -27,7 +27,7 @@ jobs:
       - name: Checkout work branch
         uses: actions/checkout@v4
         with:
-          ref: qver-lock8-heartbeat-fix
+          ref: qver-lock8-done-defer
 
       - name: Set up Python
         uses: actions/setup-python@v5
