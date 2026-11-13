@@ -24,6 +24,10 @@ SEEDS = [
     "_v326_set_worker_config_snapshot", "_v326_set_worker_tx_active_event", "_v326_get_worker_tx_active_event",
     "_V326OwnershipLost", "_V326SafeStop", "_V326HeartbeatJoinTimeout",
     "_V326_HB_JOIN_TIMEOUT_SEC", "_V326_HB_CONNECT_TIMEOUT_SEC", "_V326_HB_WRITE_RETRIES",
+    "_v319_ymd_digits", "_v319_race_key_candidates",
+    "_v326_normalize_config_json", "_v326_config_json_fingerprint",
+    "_v326_prediction_fingerprint_codes", "_v326_find_matching_prediction_history",
+    "_v231_save_prediction_history",
 ]
 
 SAVE_TABLES = {
