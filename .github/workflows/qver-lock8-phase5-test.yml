@@ -1,0 +1,48 @@
+name: QVer Lock8 Phase5 Tests
+
+on:
+  push:
+    branches:
+      - qver-lock8-heartbeat-fix
+    paths:
+      - "app.py"
+      - "engine.py"
+      - "tests/test_queue_version_lock_phase5.py"
+      - ".github/workflows/qver-lock8-phase5-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qver-lock8-phase5-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  phase5:
+    name: Compile and Phase 5 regression tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout work branch
+        uses: actions/checkout@v4
+        with:
+          ref: qver-lock8-heartbeat-fix
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pandas openpyxl
+
+      - name: Compile changed Python files
+        run: |
+          python -m py_compile app.py engine.py tests/test_queue_version_lock_phase5.py
+
+      - name: Run Phase 5 regression tests
+        run: |
+          python tests/test_queue_version_lock_phase5.py

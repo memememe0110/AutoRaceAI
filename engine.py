@@ -7450,8 +7450,11 @@ def v34_init_feedback_tables(db_path=DB_PATH):
         """)
 
 
-def v34_save_prediction_snapshot(meta, df, finish_prob=None, db_path=DB_PATH):
-    v34_init_feedback_tables(db_path)
+def v34_save_prediction_snapshot(meta, df, finish_prob=None, db_path=DB_PATH, con=None, commit=True):
+    """予測スナップショット保存。TX 境界: con=None は成功時のみ commit・例外時 rollback。con 指定時は commit/rollback/表作成をしない（呼び出し側が管理）。"""
+    own = con is None
+    if own:
+        v34_init_feedback_tables(db_path)
     key = v34_race_key(meta)
     probs = {}
     if isinstance(finish_prob, pd.DataFrame) and not finish_prob.empty:
@@ -7461,7 +7464,9 @@ def v34_save_prediction_snapshot(meta, df, finish_prob=None, db_path=DB_PATH):
     now = datetime.now().isoformat(timespec="seconds")
     rank_col = "改善後順位" if "改善後順位" in df.columns else ("順位" if "順位" in df.columns else None)
     car_col = "車" if "車" in df.columns else "車番"
-    with sqlite3.connect(db_path) as con:
+    if own:
+        con = sqlite3.connect(db_path)
+    try:
         con.execute("DELETE FROM prediction_snapshots WHERE race_key=?", (key,))
         for _, r in df.iterrows():
             car = int(r[car_col]); win, top3 = probs.get(car, (None, None))
@@ -7469,7 +7474,21 @@ def v34_save_prediction_snapshot(meta, df, finish_prob=None, db_path=DB_PATH):
                 (race_key,car_no,player_name,predicted_rank,win_prob,top3_prob,created_at)
                 VALUES(?,?,?,?,?,?,?)""",
                 (key, car, str(r.get("選手名", "")), int(r[rank_col]) if rank_col else None, win, top3, now))
-        con.commit()
+        if own:
+            if commit:
+                con.commit()
+            else:
+                con.rollback()
+    except BaseException:
+        if own:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if own:
+            con.close()
     return key
 
 
@@ -8447,10 +8466,15 @@ def v40_apply_adaptive_weights(df, db_path=DB_PATH):
     return df
 
 
-def v40_save_prediction_features(meta, df, db_path=DB_PATH):
-    v40_init_learning_tables(db_path)
+def v40_save_prediction_features(meta, df, db_path=DB_PATH, con=None, commit=True):
+    """予測特徴量保存。TX 境界: con=None は成功時のみ commit・例外時 rollback。con 指定時は commit/rollback/表作成をしない（呼び出し側が管理）。"""
+    own = con is None
+    if own:
+        v40_init_learning_tables(db_path)
     key = v34_race_key(meta)
-    with sqlite3.connect(db_path) as con:
+    if own:
+        con = sqlite3.connect(db_path)
+    try:
         con.execute("DELETE FROM v40_prediction_feature_snapshots WHERE race_key=?", (key,))
         for _, r in df.iterrows():
             con.execute("""INSERT INTO v40_prediction_feature_snapshots VALUES(
@@ -8460,7 +8484,21 @@ def v40_save_prediction_features(meta, df, db_path=DB_PATH):
                 float(r.get("調整前総合点", 0)), float(r.get("改善後総合点", 0)),
                 int(r.get("調整前順位", 0)), int(r.get("改善後順位", 0))
             ))
-        con.commit()
+        if own:
+            if commit:
+                con.commit()
+            else:
+                con.rollback()
+    except BaseException:
+        if own:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if own:
+            con.close()
     return key
 
 
@@ -11438,9 +11476,12 @@ def _v67_combo_text(combo, unordered=False):
     return "-".join(map(str, vals))
 
 
-def v67_save_ticket_snapshot(meta, bets, trials, db_path=DB_PATH):
+def v67_save_ticket_snapshot(meta, bets, trials, db_path=DB_PATH, con=None, commit=True):
     """予測時点の全組み合わせ確率を保存する。結果登録後の先読みを防ぐため予測時のみ呼ぶ。"""
-    v67_init_ticket_feedback_tables(db_path)
+    # TX 境界: con=None は成功時のみ commit・例外時 rollback。con 指定時は commit/rollback/表作成をしない（呼び出し側が管理）。
+    own = con is None
+    if own:
+        v67_init_ticket_feedback_tables(db_path)
     race_key = v34_race_key(meta)
     total = max(int(trials or 0), 1)
     mapping = {
@@ -11450,7 +11491,9 @@ def v67_save_ticket_snapshot(meta, bets, trials, db_path=DB_PATH):
         "3連単": ("三連単", False),
     }
     now = datetime.now().isoformat(timespec="seconds")
-    with sqlite3.connect(db_path) as con:
+    if own:
+        con = sqlite3.connect(db_path)
+    try:
         con.execute("DELETE FROM v67_prediction_tickets WHERE race_key=?", (race_key,))
         for bet_type, (source_key, unordered) in mapping.items():
             counter = (bets or {}).get(source_key, {})
@@ -11471,7 +11514,21 @@ def v67_save_ticket_snapshot(meta, bets, trials, db_path=DB_PATH):
                     (race_key,bet_type,combination,probability,predicted_rank,cumulative_probability,simulation_count,created_at)
                     VALUES(?,?,?,?,?,?,?,?)
                 """, (race_key, bet_type, text, probability, rank, cumulative, int(count), now))
-        con.commit()
+        if own:
+            if commit:
+                con.commit()
+            else:
+                con.rollback()
+    except BaseException:
+        if own:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if own:
+            con.close()
     return race_key
 
 
