@@ -8771,7 +8771,6 @@ def v41_register_result(meta, results, laps=None, payouts=None, db_path=DB_PATH)
 
 
 def v41_registration_history(db_path=DB_PATH, limit=50):
-    v41_init_tables(db_path)
     with sqlite3.connect(str(db_path)) as con:
         return pd.read_sql_query("""SELECT batch_id AS ID, race_key AS レースID, registered_at AS 登録日時,
             CASE status WHEN 'active' THEN '登録中' ELSE '取消済' END AS 状態,
@@ -8781,7 +8780,6 @@ def v41_registration_history(db_path=DB_PATH, limit=50):
 
 def v41_registration_detail(race_key, db_path=DB_PATH):
     """登録済み結果を再表示するための詳細取得。"""
-    v41_init_tables(db_path)
     with sqlite3.connect(str(db_path)) as con:
         race = pd.read_sql_query("SELECT * FROM result_races WHERE race_key=?", con, params=(race_key,))
         entries = pd.read_sql_query("SELECT * FROM result_entries WHERE race_key=? ORDER BY CASE WHEN finish IS NULL THEN 999 ELSE finish END, car_no", con, params=(race_key,))
