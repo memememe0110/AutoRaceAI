@@ -18,11 +18,16 @@ SNAP = {
 
 SEEDS = [
     "_v326_ensure_import_queue", "_v326_enqueue_tasks", "_v326_pickup_next", "_v326_reset_running_to_pending",
-    "_v326_queue_heartbeat", "_v326_hb_timer_loop", "_v326_update_task_status", "_v326_owner_save_tx",
+    "_v326_queue_heartbeat", "_v326_hb_timer_loop", "_v326_queue_connect", "_v326_queue_write_retry",
+    "_V326_QUEUE_LOCK", "_v326_update_task_status_ex", "_v326_update_task_status", "_v326_owner_save_tx",
     "_v326_preensure_save_tables", "_v326_bulk_fix_unfixed_pending", "_v326_worker_config_snapshot",
     "_v326_set_worker_config_snapshot", "_v326_set_worker_tx_active_event", "_v326_get_worker_tx_active_event",
     "_V326OwnershipLost", "_V326SafeStop", "_V326HeartbeatJoinTimeout",
     "_V326_HB_JOIN_TIMEOUT_SEC", "_V326_HB_CONNECT_TIMEOUT_SEC", "_V326_HB_WRITE_RETRIES",
+    "_v319_ymd_digits", "_v319_race_key_candidates",
+    "_v326_normalize_config_json", "_v326_config_json_fingerprint",
+    "_v326_prediction_fingerprint_codes", "_v326_find_matching_prediction_history",
+    "_v231_save_prediction_history",
 ]
 
 SAVE_TABLES = {

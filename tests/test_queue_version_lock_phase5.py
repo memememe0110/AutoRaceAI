@@ -73,6 +73,7 @@ class Harness:
         self.tasks = list(tasks)
         self.picked = []
         self.status_updates = []
+        self.rejected_status_updates = []
         self.bg_updates = []
         self.hb_calls = []          # (time, task_id, owner)
         self.work_starts = []       # (time, task_id)
@@ -130,6 +131,15 @@ class Harness:
             h.status_updates.append((tid, status, message, owner_token))
             return True
 
+        def upd_ex(db, tid, status, message="", *, owner_token):
+            # status_updates はDB上で受理された更新だけを記録する。
+            # 旧Ownerの拒否された更新試行は別配列で追跡する。
+            if h.behavior == "ownership_lost" and tid == 1:
+                h.rejected_status_updates.append((tid, status, message, owner_token))
+                return False, "ownership_lost"
+            h.status_updates.append((tid, status, message, owner_token))
+            return True, "ok"
+
         def bg_update(db, job_id, **kw):
             h.bg_updates.append(kw)
             if kw.get("status") == "failed":
@@ -145,7 +155,7 @@ class Harness:
             "_v326_hb_timer_loop": loop, "_v326_pickup_next": pickup, "_v326_queue_heartbeat": hb,
             "_v319_import_one_race": work, "_v319_import_player_history_one_race": work,
             "_v326_validate_queue_config_row": mock.MagicMock(side_effect=ValueError("bad config")),
-            "_v326_update_task_status": upd, "_v278_bg_update": bg_update,
+            "_v326_update_task_status": upd, "_v326_update_task_status_ex": upd_ex, "_v278_bg_update": bg_update,
             "_v326_queue_summary": lambda *a, **k: {"pending": 1, "running": 0},
             "_v278_bg_cancel_requested": lambda *a, **k: False,
             "_v278_bg_pause_loop": lambda *a, **k: None,
@@ -333,7 +343,7 @@ def _env(app, eng):
 
 
 def p5_01(app, eng):
-    """1レース単位の保存TX：成功で 6 表＋done が揃う。途中失敗（v40）で全部無し・queue は running のまま。"""
+    """1レース単位の保存TX：成功で6表が揃いqueueはrunningを維持。途中失敗は全体ROLLBACK。"""
     e = _env(app, eng)
     try:
         e.enqueue([("川口", 1), ("川口", 2)])
@@ -342,7 +352,7 @@ def p5_01(app, eng):
         e.trigger("CREATE TRIGGER f40 BEFORE INSERT ON v40_prediction_feature_snapshots BEGIN SELECT RAISE(ABORT,'inj'); END")
         t2 = e.pickup("A"); r2, k2 = e.owner_save(t2["task_id"], "A", 2)
         c2 = e.counts(k2); s2 = e.row(t2["task_id"])["status"]
-        ok = (r1["ok"] and all(v > 0 for v in c1.values()) and s1 == "done"
+        ok = (r1["ok"] and all(v > 0 for v in c1.values()) and s1 == "running"
               and not r2["ok"] and all(v == 0 for v in c2.values()) and s2 == "running")
         return ok, {"success": [c1, s1], "v40_fail": [r2.get("reason"), c2, s2]}
     finally:
@@ -433,14 +443,14 @@ def p5_05(app, eng):
 
 
 def p5_06(app, eng):
-    """v266 だけ失敗：v266 は SAVEPOINT で巻き戻し、他 5 表と done は確定（best-effort の仕様）。"""
+    """v266 だけ失敗：v266 は SAVEPOINT で巻き戻し、他 5 表は確定しqueueはrunningを維持。"""
     e = _env(app, eng)
     try:
         e.enqueue([("川口", 1)]); t = e.pickup("A")
         e.trigger("CREATE TRIGGER f266 BEFORE INSERT ON v266_pred_time_snapshots BEGIN SELECT RAISE(ABORT,'inj'); END")
         r, k = e.owner_save(t["task_id"], "A", 1)
         c = e.counts(k); s = e.row(t["task_id"])["status"]
-        ok = r["ok"] and c["v266"] == 0 and all(c[x] > 0 for x in ("v34", "v40", "v67", "v231", "v222")) and s == "done"
+        ok = r["ok"] and c["v266"] == 0 and all(c[x] > 0 for x in ("v34", "v40", "v67", "v231", "v222")) and s == "running"
         return ok, {"result": r.get("ok"), "rows": c, "queue": s}
     finally:
         e.close()
@@ -577,7 +587,7 @@ def p5_25(app):
                 hb_interval=0.01, work_sleep=0.06).run()
     st = [(x[0], x[1]) for x in h.status_updates]
     logs = [line for line in h.logs if "[queue] ownership_lost task=" in line]
-    ok = h.picked == [1, 2] and (1, "error") in st and (2, "done") in st
+    ok = h.picked == [1, 2] and (1, "error") not in st and (2, "done") in st
     ok = ok and len(logs) == 1 and "count=1" in logs[0]
     h.cleanup()
     return ok, {"picked": h.picked, "task_status": st, "ownership_logs": logs}

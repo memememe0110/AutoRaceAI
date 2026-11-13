@@ -3,11 +3,13 @@ name: QVer Lock8 Phase5 Tests
 on:
   push:
     branches:
-      - qver-lock8-heartbeat-fix
+      - qver-lock8-done-defer
     paths:
       - "app.py"
       - "engine.py"
       - "tests/test_queue_version_lock_phase5.py"
+      - "tests/test_queue_done_defer.py"
+      - "tests/qver_realcode.py"
       - ".github/workflows/qver-lock8-phase5-test.yml"
   workflow_dispatch:
 
@@ -27,7 +29,7 @@ jobs:
       - name: Checkout work branch
         uses: actions/checkout@v4
         with:
-          ref: qver-lock8-heartbeat-fix
+          ref: qver-lock8-done-defer
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -41,8 +43,9 @@ jobs:
 
       - name: Compile changed Python files
         run: |
-          python -m py_compile app.py engine.py tests/test_queue_version_lock_phase5.py
+          python -m py_compile app.py engine.py tests/test_queue_version_lock_phase5.py tests/test_queue_done_defer.py tests/qver_realcode.py
 
       - name: Run Phase 5 regression tests
         run: |
+          python tests/test_queue_done_defer.py
           python tests/test_queue_version_lock_phase5.py
