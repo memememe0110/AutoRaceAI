@@ -73,6 +73,7 @@ class Harness:
         self.tasks = list(tasks)
         self.picked = []
         self.status_updates = []
+        self.rejected_status_updates = []
         self.bg_updates = []
         self.hb_calls = []          # (time, task_id, owner)
         self.work_starts = []       # (time, task_id)
@@ -131,9 +132,12 @@ class Harness:
             return True
 
         def upd_ex(db, tid, status, message="", *, owner_token):
-            h.status_updates.append((tid, status, message, owner_token))
+            # status_updates はDB上で受理された更新だけを記録する。
+            # 旧Ownerの拒否された更新試行は別配列で追跡する。
             if h.behavior == "ownership_lost" and tid == 1:
+                h.rejected_status_updates.append((tid, status, message, owner_token))
                 return False, "ownership_lost"
+            h.status_updates.append((tid, status, message, owner_token))
             return True, "ok"
 
         def bg_update(db, job_id, **kw):
