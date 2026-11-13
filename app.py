@@ -23896,8 +23896,12 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             _ownership_logged = [False]
 
             def _abort_cb(_lost=_ownership_lost, _safe=_safe_stop,
-                          _tid=task_id, _ot=_ot_local, _logged=_ownership_logged):
+                          _tid=task_id, _ot=_ot_local, _logged=_ownership_logged,
+                          _ctx=_hb_ctx):
                 nonlocal _ownership_lost_count
+                # join timeout は heartbeat 連続エラーとは別の停止理由として保持する。
+                if _ctx.get("join_timed_out"):
+                    raise _V326HeartbeatJoinTimeout(_tid, _ot)
                 # 両方セット時は Worker 全体を止める SafeStop を優先する。
                 if _safe.is_set():
                     raise _V326SafeStop(
