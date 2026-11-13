@@ -23779,6 +23779,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             message=f"今回{total}件｜pending={_qs0.get('pending',0)}（過去done={_qs0.get('done',0)}は分母に含めない）",
         )
         i = 0
+        _ownership_lost_count = 0
         _hb_zombie_state = {"task_id": None, "owner_token": None, "cause": None}
         while True:
             # 前レースの heartbeat が止まっていなければ次レースへ進まない
@@ -23892,14 +23893,28 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             _ot_local = str(_worker_owner_token or "")
             _hb_zombie = False
 
+            _ownership_logged = [False]
+
             def _abort_cb(_lost=_ownership_lost, _safe=_safe_stop,
-                          _tid=task_id, _ot=_ot_local):
+                          _tid=task_id, _ot=_ot_local, _logged=_ownership_logged):
+                nonlocal _ownership_lost_count
                 # 両方セット時は Worker 全体を止める SafeStop を優先する。
                 if _safe.is_set():
                     raise _V326SafeStop(
                         _tid, _ot, "heartbeat_error_streak"
                     )
                 if _lost.is_set():
+                    if not _logged[0]:
+                        _logged[0] = True
+                        _ownership_lost_count += 1
+                        try:
+                            print(
+                                f"[queue] ownership_lost task={_tid} "
+                                f"count={_ownership_lost_count}",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
                     raise _V326OwnershipLost()
 
             def _hb_shutdown(_stop=_hb_stop, _ctx=_hb_ctx, _safe=_safe_stop) -> bool:
@@ -24058,8 +24073,8 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         raise
                     finally:
                         _hb_shutdown()
-                    # 保存関数側が safe_stop を戻り値へ変換した場合も、
-                    # 次レースへ進む前に Worker 全体の停止を表面化させる。
+                    # 保存関数側が safe_stop を戻り値へ変換した場合も停止を表面化。
+                    # SafeStop / OwnershipLost 時は done 更新へ進まず、完了扱いを避ける。
                     _abort_cb()
                 # 状態更新の前に heartbeat を止める（履歴のみ経路を含む）。
                 # 止まらなければ done にせず error 扱い（Worker は finally 後に停止する）。
