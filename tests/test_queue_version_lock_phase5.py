@@ -108,7 +108,7 @@ class Harness:
             if h.behavior in ("safe_stop", "safe_stop_hang"):
                 return "ok" if n == 1 else "error"
             if h.behavior == "ownership_lost":
-                return "ok" if n == 1 else ("lost" if n == 2 else "ok")
+                return "lost" if len(h.hb_calls) == 2 else "ok"
             return "ok"
 
         def work(*a, **k):
