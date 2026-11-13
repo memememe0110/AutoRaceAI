@@ -14866,17 +14866,26 @@ def _v222_save_prediction_restore(
     db_path: str, race_key: str, raw_text: str, venue_override: str, view: dict,
     con=None, commit: bool = True,
 ) -> None:
+    """予測復元データ保存。
+
+    TX 境界（保存関数共通）:
+      - con=None（自前接続）: 成功時のみ commit、例外時は rollback して再送出。
+      - con 指定（外部接続）: commit/rollback/表作成は一切しない（呼び出し側が管理）。
+        表は呼び出し側が BEGIN 前に _v326_preensure_save_tables() で用意しておく。
+      commit 引数は互換用で、自前接続では commit=False でも途中結果を残さない（rollback）。
+    """
     race_key = str(race_key or "").strip()
     if not race_key or not isinstance(view, dict):
         return
-    try:
-        _v222_ensure_prediction_restore_table(db_path)
-    except Exception:
-        pass
+    own = con is None
+    if own:
+        try:
+            _v222_ensure_prediction_restore_table(db_path)
+        except Exception:
+            pass
     payload = zlib.compress(pickle.dumps(view, protocol=pickle.HIGHEST_PROTOCOL), level=6)
     now = _v228_now_jst_iso()
     label = _v222_race_label(view.get("meta") or {}, race_key)
-    own = con is None
     if own:
         con = sqlite3.connect(db_path)
     try:
@@ -14889,15 +14898,20 @@ def _v222_save_prediction_restore(
                 venue_override=excluded.venue_override, payload=excluded.payload,
                 updated_at=excluded.updated_at
         """, (race_key, label, str(raw_text or ""), str(venue_override or ""), sqlite3.Binary(payload), now, now))
-        if own and commit:
-            con.commit()
-    finally:
+        if own:
+            if commit:
+                con.commit()
+            else:
+                con.rollback()
+    except BaseException:
         if own:
             try:
-                if commit:
-                    con.commit()
+                con.rollback()
             except Exception:
                 pass
+        raise
+    finally:
+        if own:
             con.close()
 
 
@@ -15049,17 +15063,26 @@ def _v266_save_pred_time_snapshot(
     app_version: str,
     view: dict,
     source_kind: str = "saved_view",
+    con=None,
+    commit: bool = True,
 ) -> int:
-    """prediction_viewに保存されている値を、そのまま車番別スナップショットへ保存する。"""
+    """prediction_viewに保存されている値を、そのまま車番別スナップショットへ保存する。
+
+    TX 境界は _v222_save_prediction_restore と同じ（con 指定時は commit/rollback/表作成をしない）。
+    """
     if not history_id:
         return 0
     rows = _v266_extract_pred_time_rows_from_view(view)
     if not rows:
         return 0
-    _v266_ensure_pred_time_snapshot_table(db_path)
+    own = con is None
+    if own:
+        _v266_ensure_pred_time_snapshot_table(db_path)
     now = _v228_now_jst_iso()
     saved = 0
-    with sqlite3.connect(str(db_path)) as con:
+    if own:
+        con = sqlite3.connect(str(db_path))
+    try:
         for row in rows:
             con.execute("""
                 INSERT INTO v266_pred_time_snapshots
@@ -15078,7 +15101,22 @@ def _v266_save_pred_time_snapshot(
                 float(row["predicted_race_time"]), str(source_kind), now,
             ))
             saved += 1
-        con.commit()
+        if own:
+            if commit:
+                con.commit()
+            else:
+                con.rollback()
+                saved = 0
+    except BaseException:
+        if own:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if own:
+            con.close()
     return saved
 
 
@@ -15156,7 +15194,9 @@ def _v231_save_prediction_history(db_path: str, race_key: str, raw_text: str, ve
                 "schema": "capture_failed",
                 "error": f"{type(_state_exc305).__name__}: {_state_exc305}",
             }
-    _v231_ensure_prediction_history_table(db_path)
+    own = con is None
+    if own:
+        _v231_ensure_prediction_history_table(db_path)
     now = _v228_now_jst_iso()
     app_version = str(view.get("app_version") or _V231_APP_VERSION)
     simulation_mode = str(view.get("simulation_mode") or _V231_SIMULATION_MODE)
@@ -15173,7 +15213,6 @@ def _v231_save_prediction_history(db_path: str, race_key: str, raw_text: str, ve
         pass
     label = _v222_race_label(view.get("meta") or {}, race_key)
     payload = zlib.compress(pickle.dumps(view, protocol=pickle.HIGHEST_PROTOCOL), level=6)
-    own = con is None
     if own:
         con = sqlite3.connect(db_path)
     try:
@@ -15183,29 +15222,36 @@ def _v231_save_prediction_history(db_path: str, race_key: str, raw_text: str, ve
             VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (race_key,label,app_version,simulation_mode,settings_hash,now,int(trials or 0),int(seed or 0),str(raw_text or ""),str(venue_override or ""),sqlite3.Binary(payload)))
         history_id = int(cur.lastrowid or 0)
-        if own and commit:
-            con.commit()
-        # Ver266: best-effort（共有TX時は呼び出し側で SAVEPOINT してもよい）
+        if own:
+            if commit:
+                con.commit()
+            else:
+                con.rollback()
+                history_id = 0
+    except BaseException:
         if own:
             try:
-                _v266_save_pred_time_snapshot(
-                    db_path=db_path,
-                    history_id=history_id,
-                    race_key=race_key,
-                    app_version=app_version,
-                    view=view,
-                    source_kind="saved_view",
-                )
+                con.rollback()
             except Exception:
                 pass
+        raise
     finally:
         if own:
-            try:
-                if commit:
-                    con.commit()
-            except Exception:
-                pass
             con.close()
+    # Ver266: 自前接続のときだけ、確定後に best-effort で別TX保存（従来どおり）。
+    # 外部接続のときは呼び出し側が同一TX内で _v266_save_pred_time_snapshot(con=...) を呼ぶ。
+    if own and history_id:
+        try:
+            _v266_save_pred_time_snapshot(
+                db_path=db_path,
+                history_id=history_id,
+                race_key=race_key,
+                app_version=app_version,
+                view=view,
+                source_kind="saved_view",
+            )
+        except Exception:
+            pass
     return history_id
 
 def _v231_list_prediction_histories(db_path: str, limit: int = 120) -> list[dict]:
@@ -21108,6 +21154,16 @@ def _v319_clear_prediction(db_path: str, race_key: str) -> None:
 
 
 
+def _v326_preensure_save_tables(db_path: str) -> None:
+    """Worker 共有TXの BEGIN 前に、保存先の表を自前接続で用意する（冪等）。"""
+    engine.v34_init_feedback_tables(db_path)
+    engine.v40_init_learning_tables(db_path)
+    engine.v67_init_ticket_feedback_tables(db_path)
+    _v231_ensure_prediction_history_table(db_path)
+    _v222_ensure_prediction_restore_table(db_path)
+    _v266_ensure_pred_time_snapshot_table(db_path)
+
+
 def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719, raw_text: str = "", manual_excluded: list | None = None, abort_cb=None, task_id: int | None = None, owner_token: str | None = None, skip_deferred: bool = False) -> dict:
     """出走表（SP）があればそれを使い、なければ結果のレース前項目だけで予測する。"""
     # 取込経路の OOM 低減（本線手動予測の既定20kは UI 側。ここは上限キャップ）
@@ -21230,8 +21286,15 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
         except _V326SafeStop:
             return {"ok": False, "reason": "safe_stop", "race_key": key}
         history_id = 0
+        # 共有TXの中では別接続で表作成しない（書込ロック保持中に別接続が待たされるため）。
+        # 必要な表は BEGIN 前に自前接続で用意する。失敗したら保存に進まない。
         try:
-            with _v326_queue_connect(db_path, 60.0) as con:
+            _v326_preensure_save_tables(db_path)
+        except Exception as _pe_exc:
+            return {"ok": False, "reason": f"preensure:{type(_pe_exc).__name__}: {_pe_exc}", "race_key": key}
+        try:
+            import contextlib as _ctx326
+            with _ctx326.closing(_v326_queue_connect(db_path, 60.0)) as con:
                 con.execute("BEGIN IMMEDIATE")
                 try:
                     row = con.execute(
@@ -21298,15 +21361,14 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
 
                     _v222_save_prediction_restore(db_path, key, text, venue, view, con=con, commit=False)
 
-                    # v266 best-effort
+                    # v266 best-effort（同一TX・同一接続。失敗時はこの部分だけ巻き戻す）
                     try:
                         con.execute("SAVEPOINT v266_best_effort")
                         _v266_save_pred_time_snapshot(
                             db_path=db_path, history_id=history_id, race_key=key,
                             app_version=str(view.get("app_version") or ""), view=view,
-                            source_kind="saved_view",
+                            source_kind="saved_view", con=con, commit=False,
                         )
-                        # note: v266 opens own con today; still best-effort outside TX if so
                         con.execute("RELEASE v266_best_effort")
                     except Exception:
                         try:
