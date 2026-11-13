@@ -3767,15 +3767,16 @@ def _v326_hb_timer_loop(db_path, task_id, owner_token, stop_evt, lost_evt, safe_
             err_streak = 0
 
 
-def _v326_update_task_status(
+def _v326_update_task_status_ex(
     db_path: str, task_id: int, status: str, message: str = "",
     *,
     owner_token: str,
-) -> bool:
-    """Worker専用: running + owner_token 一致のときだけ状態更新。成功で True。"""
+) -> tuple[bool, str]:
+    """Worker専用。reasonは観測用で、制御上の成功は ok=True のみ。"""
     ot = str(owner_token or "").strip()
     if not ot:
-        return False
+        # 空tokenは所有権喪失と断定せず、呼び出し側設定不備として unknown。
+        return False, "unknown"
     now = _v228_now_jst_iso()
 
     def _run():
@@ -3790,14 +3791,57 @@ def _v326_update_task_status(
                 """,
                 (str(status), str(message or "")[:500], now, int(task_id), ot),
             )
+            rc = int(cur.rowcount or 0)
             con.commit()
-            return int(cur.rowcount or 0) == 1
+            return rc
 
+    # threading.Lock は非再入。ロック取得はこの共通実処理だけが行う。
     with _V326_QUEUE_LOCK:
         try:
-            return bool(_v326_queue_write_retry(_run))
+            rc = _v326_queue_write_retry(_run)
+        except sqlite3.Error:
+            return False, "db_error"
         except Exception:
-            return False
+            return False, "unknown"
+
+        if rc == 1:
+            return True, "ok"
+        if rc != 0:
+            return False, "unknown"
+
+        # rowcount=0 の分類は通知・ログ専用。別プロセスとの競合は残る。
+        try:
+            with _v326_queue_connect(db_path, 5.0) as con:
+                row = con.execute(
+                    """
+                    SELECT status, owner_token
+                      FROM v326_import_queue
+                     WHERE task_id = ?
+                     LIMIT 1
+                    """,
+                    (int(task_id),),
+                ).fetchone()
+        except Exception:
+            return False, "unknown"
+        if row is None:
+            return False, "state_not_running"
+        if str(row[1] or "").strip() != ot:
+            return False, "ownership_lost"
+        if str(row[0] or "") != "running":
+            return False, "state_not_running"
+        return False, "unknown"
+
+
+def _v326_update_task_status(
+    db_path: str, task_id: int, status: str, message: str = "",
+    *,
+    owner_token: str,
+) -> bool:
+    """既存呼び出し元互換のboolラッパー。"""
+    ok, _reason = _v326_update_task_status_ex(
+        db_path, task_id, status, message, owner_token=owner_token,
+    )
+    return bool(ok)
 
 
 def _v326_reset_running_to_pending(
@@ -21271,7 +21315,7 @@ def _v326_owner_save_tx(
 ) -> dict:
     """Worker 所有権付きの 1 レース保存 TX。
 
-    v34 / v231 / v222 / v266(SAVEPOINT) / v67 / v40 / queue done を 1 つの BEGIN IMMEDIATE で確定する。
+    v34 / v231 / v222 / v266(SAVEPOINT) / v67 / v40 を 1 つの BEGIN IMMEDIATE で確定する。
     所有権が無い・途中失敗・SAVEPOINT 巻き戻し失敗はすべて ROLLBACK して ok=False。
     """
     _tid = int(task_id)
@@ -21395,19 +21439,8 @@ def _v326_owner_save_tx(
                     con.execute("ROLLBACK")
                     return {"ok": False, "reason": f"p2:{type(exc_p2).__name__}: {exc_p2}", "race_key": key}
 
-                # done 同一TX
-                now_done = _v228_now_jst_iso()
-                cur_done = con.execute(
-                    """
-                    UPDATE v326_import_queue
-                       SET status='done', message='', updated_at=?
-                     WHERE task_id=? AND status='running' AND owner_token=?
-                    """,
-                    (now_done, _tid, _ot),
-                )
-                if int(cur_done.rowcount or 0) != 1:
-                    con.execute("ROLLBACK")
-                    return {"ok": False, "reason": "ownership_lost", "race_key": key}
+                # キューのdoneは公式取り込み後段の完了地点でWorkerが確定する。
+                # ここでは予測保存TXのみCOMMITし、running + owner_tokenの状態を維持する。
                 con.execute("COMMIT")
             except Exception:
                 try:
@@ -21415,7 +21448,7 @@ def _v326_owner_save_tx(
                 except Exception:
                     pass
                 raise
-        return {"ok": True, "race_key": key, "trials": int(trials), "history_id": history_id, "queue_done": True}
+        return {"ok": True, "race_key": key, "trials": int(trials), "history_id": history_id, "queue_done": False}
     except (_V326OwnershipLost, _V326SafeStop) as _ab:
         return {"ok": False, "reason": "ownership_lost" if isinstance(_ab, _V326OwnershipLost) else "safe_stop", "race_key": key}
     except Exception as exc:
@@ -23691,6 +23724,10 @@ def _v326_notify_import_cancelled(db_path: str, job_id: int, *, done: int = 0, s
 def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
     details = []
     ok = skip = err = 0
+    _status_reason_counts = {
+        "ok": 0, "ownership_lost": 0, "state_not_running": 0,
+        "db_error": 0, "unknown": 0,
+    }
     try:
         # 起動スレッドの globals に依存せず、req から版を確定（Ver326とVer330-A両存用）
         try:
@@ -23799,6 +23836,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 _qs = _v326_queue_summary(db_path, job_type)
                 blob = zlib.compress(pickle.dumps({
                     "ok": ok, "skip": skip, "error": err, "details": details,
+                    "queue_status_reasons": dict(_status_reason_counts),
                     "cancelled": True,
                     "queue": _qs,
                     "summary": (
@@ -24156,21 +24194,48 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     item["notify_message"] = one.get("notify_message")
                 st_one = str(item["status"] or "")
                 if st_one == "skip":
-                    skip += 1
                     if task_id:
-                        _v326_update_task_status(
-                            db_path, task_id, "skipped", item.get("message") or "登録済み"
-                        , owner_token=_worker_owner_token)
+                        status_ok, reason = _v326_update_task_status_ex(
+                            db_path, task_id, "skipped",
+                            item.get("message") or "登録済み",
+                            owner_token=_worker_owner_token,
+                        )
+                        _status_reason_counts[reason] = _status_reason_counts.get(reason, 0) + 1
+                        if status_ok:
+                            skip += 1
+                        elif reason != "ownership_lost":
+                            err += 1
+                            print(f"[queue] task={task_id} skipped update failed: {reason}", flush=True)
+                    else:
+                        skip += 1
                 elif st_one in ("error", "failed"):
-                    err += 1
                     if task_id:
-                        _v326_update_task_status(
-                            db_path, task_id, "error", item.get("message") or "error"
-                        , owner_token=_worker_owner_token)
+                        status_ok, reason = _v326_update_task_status_ex(
+                            db_path, task_id, "error",
+                            item.get("message") or "error",
+                            owner_token=_worker_owner_token,
+                        )
+                        _status_reason_counts[reason] = _status_reason_counts.get(reason, 0) + 1
+                        if status_ok or reason != "ownership_lost":
+                            err += 1
+                        if not status_ok:
+                            print(f"[queue] task={task_id} error update failed: {reason}", flush=True)
+                    else:
+                        err += 1
                 else:
-                    ok += 1
                     if task_id:
-                        _v326_update_task_status(db_path, task_id, "done", "", owner_token=_worker_owner_token)
+                        status_ok, reason = _v326_update_task_status_ex(
+                            db_path, task_id, "done", "",
+                            owner_token=_worker_owner_token,
+                        )
+                        _status_reason_counts[reason] = _status_reason_counts.get(reason, 0) + 1
+                        if status_ok:
+                            ok += 1
+                        elif reason != "ownership_lost":
+                            err += 1
+                            print(f"[queue] task={task_id} final done failed: {reason}", flush=True)
+                    else:
+                        ok += 1
             except _V326SafeStop as exc:
                 # SafeStop は Exception より先に捕捉し、通常エラーへ変換しない。
                 _hb_body_exc = exc
@@ -24188,14 +24253,21 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 item["status"] = "error"
                 item["phase"] = "exception"
                 item["message"] = _orig_msg
-                err += 1
                 try:
                     if task_id:
-                        _v326_update_task_status(
-                            db_path, task_id, "error", item["message"]
-                        , owner_token=_worker_owner_token)
+                        status_ok, reason = _v326_update_task_status_ex(
+                            db_path, task_id, "error", item["message"],
+                            owner_token=_worker_owner_token,
+                        )
+                        _status_reason_counts[reason] = _status_reason_counts.get(reason, 0) + 1
+                        if status_ok or reason != "ownership_lost":
+                            err += 1
+                        if not status_ok:
+                            print(f"[queue] task={task_id} exception error update failed: {reason}", flush=True)
+                    else:
+                        err += 1
                 except Exception:
-                    pass
+                    err += 1
             finally:
                 # 版設定エラー(continue)・中止(return)・予測エラー・例外・正常のすべてで停止。
                 # finally の中では raise しない（本体の例外・return・continue を上書きしないため）。
