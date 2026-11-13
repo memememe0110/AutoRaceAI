@@ -214,8 +214,18 @@ def t3(app_path):
     tree = ast.parse(src)
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_v319_bg_import_worker")
     seg = ast.get_source_segment(src, node)
-    cls_src = "\n".join(ast.get_source_segment(src, n) for n in tree.body
-                        if isinstance(n, ast.ClassDef) and n.name in ("_V326OwnershipLost", "_V326SafeStop"))
+    _helpers = ("_V326OwnershipLost", "_V326SafeStop", "_V326HeartbeatJoinTimeout", "_v326_hb_timer_loop",
+                "_v326_raise_hb_zombie", "_V326_TX_ACTIVE_TLS", "_v326_set_worker_tx_active_event",
+                "_v326_get_worker_tx_active_event", "_V326_HB_JOIN_TIMEOUT_SEC")
+
+    def _nm(n):
+        if isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+            return n.name
+        if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name):
+            return n.targets[0].id
+        return None
+    # heartbeat 修正後はループ・停止例外がモジュール関数になったので一緒に取り出す（無い版では無視）
+    cls_src = "\n".join(ast.get_source_segment(src, n) for n in tree.body if _nm(n) in _helpers)
     import zlib, pickle, json, urllib.request
     scenarios = {
         "normal": ("normal", "ok"),
@@ -240,7 +250,7 @@ def t3(app_path):
         def pickup(*a, **k):
             return tasks.pop(0) if tasks else None
 
-        def hb(db, tid, ot):
+        def hb(db, tid, ot, tx_active=None):
             hb_calls.append(time.time()); return "ok"
 
         work_calls = []

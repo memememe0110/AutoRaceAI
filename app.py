@@ -3600,6 +3600,36 @@ class _V326SafeStop(Exception):
     """Worker should stop without claiming ownership_lost."""
 
 
+class _V326HeartbeatJoinTimeout(Exception):
+    """heartbeat スレッドが join timeout 内に止まらなかった。Worker は次レースへ進まない。"""
+
+    def __init__(self, task_id=None, owner_token=None):
+        super().__init__(f"heartbeat join timeout: task={task_id}")
+        self.task_id = task_id
+        self.owner_token = owner_token
+
+
+# heartbeat の 1 回あたり上限（接続 timeout × retry）は join timeout より十分短くする。
+_V326_HB_CONNECT_TIMEOUT_SEC = 3.0
+_V326_HB_WRITE_RETRIES = 2
+_V326_HB_JOIN_TIMEOUT_SEC = 30.0
+
+# Worker スレッドごとの「保存TX中」Event（thread-local）。heartbeat はこれが set の間は書かない。
+_V326_TX_ACTIVE_TLS = threading.local()
+
+
+def _v326_set_worker_tx_active_event(evt) -> None:
+    """Worker スレッドに、そのレース用の TX active Event を結び付ける（None で解除）。"""
+    try:
+        _V326_TX_ACTIVE_TLS.evt = evt
+    except Exception:
+        pass
+
+
+def _v326_get_worker_tx_active_event():
+    return getattr(_V326_TX_ACTIVE_TLS, "evt", None)
+
+
 def _v326_parse_queue_ts(value):
     """updated_at -> aware UTC datetime, or None if unusable."""
     text = str(value or "").strip()
@@ -3625,21 +3655,30 @@ def _v326_is_stale_updated_at(value, *, stale_minutes: int = 30) -> bool:
     return (datetime.now(timezone.utc) - dt) > timedelta(minutes=mins)
 
 
-def _v326_queue_heartbeat(db_path: str, task_id: int, owner_token: str) -> str:
-    """'ok' | 'lost' | 'busy' | 'error'. Updates updated_at only for own running row."""
+def _v326_queue_heartbeat(db_path: str, task_id: int, owner_token: str, tx_active=None) -> str:
+    """'ok' | 'lost' | 'busy' | 'in_flight' | 'error'. 自分の running 行の updated_at だけ更新。
+
+    - in_flight: 同じ task の heartbeat が実行中、または保存TX中（tx_active が set）。正常な競合。
+    - busy: DB ロック競合。正常な競合。
+    - 1 回の上限は _V326_HB_CONNECT_TIMEOUT_SEC × _V326_HB_WRITE_RETRIES 程度（join timeout より短い）。
+    - in-flight 登録は finally で必ず解除する。
+    """
     ot = str(owner_token or "").strip()
     if not ot or not task_id:
         return "error"
     tid = int(task_id)
+    if tx_active is not None and tx_active.is_set():
+        return "in_flight"
     with _V326_HB_LOCK:
         if tid in _V326_HB_INFLIGHT:
-            return "ok"
+            return "in_flight"
         _V326_HB_INFLIGHT.add(tid)
     try:
         now = _v228_now_jst_iso()
 
         def _run():
-            with _v326_queue_connect(db_path, 10.0) as con:
+            con = _v326_queue_connect(db_path, float(_V326_HB_CONNECT_TIMEOUT_SEC))
+            try:
                 cur = con.execute(
                     """
                     UPDATE v326_import_queue
@@ -3652,9 +3691,11 @@ def _v326_queue_heartbeat(db_path: str, task_id: int, owner_token: str) -> str:
                 )
                 con.commit()
                 return int(cur.rowcount or 0)
+            finally:
+                con.close()
 
         try:
-            n = _v326_queue_write_retry(_run)
+            n = _v326_queue_write_retry(_run, retries=int(_V326_HB_WRITE_RETRIES))
         except Exception as e:
             msg = str(e).lower()
             if "locked" in msg or "busy" in msg:
@@ -3664,6 +3705,58 @@ def _v326_queue_heartbeat(db_path: str, task_id: int, owner_token: str) -> str:
     finally:
         with _V326_HB_LOCK:
             _V326_HB_INFLIGHT.discard(tid)
+
+
+def _v326_raise_hb_zombie(db_path, state: dict, item, owner_token) -> None:
+    """heartbeat が止まらなかったレースを task error にして、Worker を止める例外を送出する。
+
+    task が保存TXで既に done の場合（保存は原子的に確定済み）は、owner+running 条件で
+    更新できないため done のまま残る。Job は failed になる。
+    """
+    tid = state.get("task_id")
+    try:
+        if tid:
+            _v326_update_task_status(
+                db_path, int(tid), "error", "heartbeat join timeout", owner_token=owner_token
+            )
+    except Exception:
+        pass
+    if isinstance(item, dict):
+        item["status"] = "error"
+        msg = str(item.get("message") or "")
+        if "[heartbeat join timeout]" not in msg:
+            item["message"] = (msg + " [heartbeat join timeout]").strip()
+        item["phase"] = item.get("phase") or "heartbeat"
+    exc = _V326HeartbeatJoinTimeout(tid, state.get("owner_token"))
+    cause = state.get("cause")
+    if isinstance(cause, BaseException):
+        raise exc from cause
+    raise exc
+
+
+def _v326_hb_timer_loop(db_path, task_id, owner_token, stop_evt, lost_evt, safe_evt, tx_active_evt,
+                        interval_sec, err_limit):
+    """heartbeat タイマー本体。前レースの変数を参照しないよう、すべて引数で受け取る。"""
+    err_streak = 0
+    while not stop_evt.wait(float(interval_sec)):
+        if not task_id or not owner_token:
+            break
+        code = _v326_queue_heartbeat(db_path, int(task_id), owner_token, tx_active=tx_active_evt)
+        if code == "lost":
+            lost_evt.set()
+            stop_evt.set()
+            return
+        if code in ("busy", "in_flight"):
+            err_streak = 0
+            continue
+        if code == "error":
+            err_streak += 1
+            if err_streak >= int(err_limit):
+                safe_evt.set()
+                stop_evt.set()
+                return
+        else:
+            err_streak = 0
 
 
 def _v326_update_task_status(
@@ -21164,6 +21257,166 @@ def _v326_preensure_save_tables(db_path: str) -> None:
     _v266_ensure_pred_time_snapshot_table(db_path)
 
 
+def _v326_owner_save_tx(
+    db_path: str, *, task_id: int, owner_token: str, race_key, key: str, meta: dict, df, finish_prob, bets,
+    entries, text, venue, view: dict, trials: int, seed: int, check_abort, is_slim_recoverable,
+) -> dict:
+    """Worker 所有権付きの 1 レース保存 TX。
+
+    v34 / v231 / v222 / v266(SAVEPOINT) / v67 / v40 / queue done を 1 つの BEGIN IMMEDIATE で確定する。
+    所有権が無い・途中失敗・SAVEPOINT 巻き戻し失敗はすべて ROLLBACK して ok=False。
+    """
+    _tid = int(task_id)
+    _ot = str(owner_token or "").strip()
+    _check_abort = check_abort
+    _is_slim_recoverable = is_slim_recoverable
+    history_id = 0
+    # 共有TXの中では別接続で表作成しない（書込ロック保持中に別接続が待たされるため）。
+    # 必要な表は BEGIN 前に自前接続で用意する。失敗したら保存に進まない。
+    try:
+        _v326_preensure_save_tables(db_path)
+    except Exception as _pe_exc:
+        return {"ok": False, "reason": f"preensure:{type(_pe_exc).__name__}: {_pe_exc}", "race_key": key}
+    # 保存TX中は heartbeat を抑止（同じ DB の書込ロックを自分で待たないため）。
+    # BEGIN 失敗・COMMIT 失敗・ROLLBACK・return のどの経路でも finally で解除する。
+    _txa326 = _v326_get_worker_tx_active_event()
+    try:
+        import contextlib as _ctx326
+        if _txa326 is not None:
+            _txa326.set()
+        with _ctx326.closing(_v326_queue_connect(db_path, 60.0)) as con:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                row = con.execute(
+                    """
+                    SELECT 1 FROM v326_import_queue
+                     WHERE task_id=? AND status='running' AND owner_token=?
+                    """,
+                    (_tid, _ot),
+                ).fetchone()
+                if not row:
+                    con.execute("ROLLBACK")
+                    return {"ok": False, "reason": "ownership_lost", "race_key": key}
+                # 計算後・保存前
+                try:
+                    _check_abort()
+                except (_V326OwnershipLost, _V326SafeStop) as _ab:
+                    con.execute("ROLLBACK")
+                    return {"ok": False, "reason": "ownership_lost" if isinstance(_ab, _V326OwnershipLost) else "safe_stop", "race_key": key}
+
+                engine.v34_save_prediction_snapshot(meta, df, finish_prob, db_path, con=con, commit=False)
+                saved_key = str(engine.v34_race_key(meta) if hasattr(engine, "v34_race_key") else key)
+                key = str(race_key or "").strip() or saved_key
+                view["race_key"] = key
+
+                # history full with SAVEPOINT
+                con.execute("SAVEPOINT history_full")
+                try:
+                    history_id = int(
+                        _v231_save_prediction_history(
+                            db_path, key, text, venue, view, int(trials), int(seed),
+                            con=con, commit=False,
+                        ) or 0
+                    )
+                    if not history_id:
+                        raise RuntimeError("history_id=0")
+                    con.execute("RELEASE history_full")
+                except Exception as exc_full:
+                    try:
+                        con.execute("ROLLBACK TO history_full")
+                        con.execute("RELEASE history_full")
+                    except Exception as _sp_exc:
+                        # 部分巻き戻しが出来ない＝TX の中身が不明。全体を捨てて失敗扱い。
+                        try:
+                            con.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                        return {"ok": False, "race_key": key,
+                                "reason": f"savepoint_rollback_failed(history_full): {type(_sp_exc).__name__}: {_sp_exc}"
+                                          f" / original {type(exc_full).__name__}: {exc_full}"}
+                    if not _is_slim_recoverable(exc_full):
+                        con.execute("ROLLBACK")
+                        return {"ok": False, "reason": f"{type(exc_full).__name__}: {exc_full}", "race_key": key}
+                    slim = {
+                        "meta": meta, "race_key": key, "trials": int(trials), "seed": int(seed),
+                        "app_version": _v326_effective_save_version(), "prediction_time": view["prediction_time"],
+                        "df": df, "bets": bets, "entries": entries, "finish_prob": finish_prob,
+                    }
+                    try:
+                        history_id = int(
+                            _v231_save_prediction_history(
+                                db_path, key, text, venue, slim, int(trials), int(seed),
+                                con=con, commit=False,
+                            ) or 0
+                        )
+                    except Exception as exc_slim:
+                        con.execute("ROLLBACK")
+                        return {"ok": False, "reason": f"{type(exc_slim).__name__}: {exc_slim}", "race_key": key}
+                    if not history_id:
+                        con.execute("ROLLBACK")
+                        return {"ok": False, "reason": "予測履歴の保存に失敗", "race_key": key}
+
+                _v222_save_prediction_restore(db_path, key, text, venue, view, con=con, commit=False)
+
+                # v266 best-effort（同一TX・同一接続。失敗時はこの部分だけ巻き戻す）
+                try:
+                    con.execute("SAVEPOINT v266_best_effort")
+                    _v266_save_pred_time_snapshot(
+                        db_path=db_path, history_id=history_id, race_key=key,
+                        app_version=str(view.get("app_version") or ""), view=view,
+                        source_kind="saved_view", con=con, commit=False,
+                    )
+                    con.execute("RELEASE v266_best_effort")
+                except Exception as _v266_exc:
+                    try:
+                        con.execute("ROLLBACK TO v266_best_effort")
+                        con.execute("RELEASE v266_best_effort")
+                    except Exception as _sp_exc:
+                        try:
+                            con.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                        return {"ok": False, "race_key": key,
+                                "reason": f"savepoint_rollback_failed(v266): {type(_sp_exc).__name__}: {_sp_exc}"
+                                          f" / original {type(_v266_exc).__name__}: {_v266_exc}"}
+
+                try:
+                    engine.v67_save_ticket_snapshot(meta, bets, int(trials), db_path, con=con, commit=False)
+                    engine.v40_save_prediction_features(meta, df, db_path, con=con, commit=False)
+                except Exception as exc_p2:
+                    con.execute("ROLLBACK")
+                    return {"ok": False, "reason": f"p2:{type(exc_p2).__name__}: {exc_p2}", "race_key": key}
+
+                # done 同一TX
+                now_done = _v228_now_jst_iso()
+                cur_done = con.execute(
+                    """
+                    UPDATE v326_import_queue
+                       SET status='done', message='', updated_at=?
+                     WHERE task_id=? AND status='running' AND owner_token=?
+                    """,
+                    (now_done, _tid, _ot),
+                )
+                if int(cur_done.rowcount or 0) != 1:
+                    con.execute("ROLLBACK")
+                    return {"ok": False, "reason": "ownership_lost", "race_key": key}
+                con.execute("COMMIT")
+            except Exception:
+                try:
+                    con.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        return {"ok": True, "race_key": key, "trials": int(trials), "history_id": history_id, "queue_done": True}
+    except (_V326OwnershipLost, _V326SafeStop) as _ab:
+        return {"ok": False, "reason": "ownership_lost" if isinstance(_ab, _V326OwnershipLost) else "safe_stop", "race_key": key}
+    except Exception as exc:
+        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}", "race_key": key}
+    finally:
+        if _txa326 is not None:
+            _txa326.clear()
+
+
 def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719, raw_text: str = "", manual_excluded: list | None = None, abort_cb=None, task_id: int | None = None, owner_token: str | None = None, skip_deferred: bool = False) -> dict:
     """出走表（SP）があればそれを使い、なければ結果のレース前項目だけで予測する。"""
     # 取込経路の OOM 低減（本線手動予測の既定20kは UI 側。ここは上限キャップ）
@@ -21285,130 +21538,11 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
             return {"ok": False, "reason": "ownership_lost", "race_key": key}
         except _V326SafeStop:
             return {"ok": False, "reason": "safe_stop", "race_key": key}
-        history_id = 0
-        # 共有TXの中では別接続で表作成しない（書込ロック保持中に別接続が待たされるため）。
-        # 必要な表は BEGIN 前に自前接続で用意する。失敗したら保存に進まない。
-        try:
-            _v326_preensure_save_tables(db_path)
-        except Exception as _pe_exc:
-            return {"ok": False, "reason": f"preensure:{type(_pe_exc).__name__}: {_pe_exc}", "race_key": key}
-        try:
-            import contextlib as _ctx326
-            with _ctx326.closing(_v326_queue_connect(db_path, 60.0)) as con:
-                con.execute("BEGIN IMMEDIATE")
-                try:
-                    row = con.execute(
-                        """
-                        SELECT 1 FROM v326_import_queue
-                         WHERE task_id=? AND status='running' AND owner_token=?
-                        """,
-                        (_tid, _ot),
-                    ).fetchone()
-                    if not row:
-                        con.execute("ROLLBACK")
-                        return {"ok": False, "reason": "ownership_lost", "race_key": key}
-                    # 計算後・保存前
-                    try:
-                        _check_abort()
-                    except (_V326OwnershipLost, _V326SafeStop) as _ab:
-                        con.execute("ROLLBACK")
-                        return {"ok": False, "reason": "ownership_lost" if isinstance(_ab, _V326OwnershipLost) else "safe_stop", "race_key": key}
-
-                    engine.v34_save_prediction_snapshot(meta, df, finish_prob, db_path, con=con, commit=False)
-                    saved_key = str(engine.v34_race_key(meta) if hasattr(engine, "v34_race_key") else key)
-                    key = str(race_key or "").strip() or saved_key
-                    view["race_key"] = key
-
-                    # history full with SAVEPOINT
-                    con.execute("SAVEPOINT history_full")
-                    try:
-                        history_id = int(
-                            _v231_save_prediction_history(
-                                db_path, key, text, venue, view, int(trials), int(seed),
-                                con=con, commit=False,
-                            ) or 0
-                        )
-                        if not history_id:
-                            raise RuntimeError("history_id=0")
-                        con.execute("RELEASE history_full")
-                    except Exception as exc_full:
-                        try:
-                            con.execute("ROLLBACK TO history_full")
-                            con.execute("RELEASE history_full")
-                        except Exception:
-                            pass
-                        if not _is_slim_recoverable(exc_full):
-                            con.execute("ROLLBACK")
-                            return {"ok": False, "reason": f"{type(exc_full).__name__}: {exc_full}", "race_key": key}
-                        slim = {
-                            "meta": meta, "race_key": key, "trials": int(trials), "seed": int(seed),
-                            "app_version": _v326_effective_save_version(), "prediction_time": view["prediction_time"],
-                            "df": df, "bets": bets, "entries": entries, "finish_prob": finish_prob,
-                        }
-                        try:
-                            history_id = int(
-                                _v231_save_prediction_history(
-                                    db_path, key, text, venue, slim, int(trials), int(seed),
-                                    con=con, commit=False,
-                                ) or 0
-                            )
-                        except Exception as exc_slim:
-                            con.execute("ROLLBACK")
-                            return {"ok": False, "reason": f"{type(exc_slim).__name__}: {exc_slim}", "race_key": key}
-                        if not history_id:
-                            con.execute("ROLLBACK")
-                            return {"ok": False, "reason": "予測履歴の保存に失敗", "race_key": key}
-
-                    _v222_save_prediction_restore(db_path, key, text, venue, view, con=con, commit=False)
-
-                    # v266 best-effort（同一TX・同一接続。失敗時はこの部分だけ巻き戻す）
-                    try:
-                        con.execute("SAVEPOINT v266_best_effort")
-                        _v266_save_pred_time_snapshot(
-                            db_path=db_path, history_id=history_id, race_key=key,
-                            app_version=str(view.get("app_version") or ""), view=view,
-                            source_kind="saved_view", con=con, commit=False,
-                        )
-                        con.execute("RELEASE v266_best_effort")
-                    except Exception:
-                        try:
-                            con.execute("ROLLBACK TO v266_best_effort")
-                            con.execute("RELEASE v266_best_effort")
-                        except Exception:
-                            pass
-
-                    try:
-                        engine.v67_save_ticket_snapshot(meta, bets, int(trials), db_path, con=con, commit=False)
-                        engine.v40_save_prediction_features(meta, df, db_path, con=con, commit=False)
-                    except Exception as exc_p2:
-                        con.execute("ROLLBACK")
-                        return {"ok": False, "reason": f"p2:{type(exc_p2).__name__}: {exc_p2}", "race_key": key}
-
-                    # done 同一TX
-                    now_done = _v228_now_jst_iso()
-                    cur_done = con.execute(
-                        """
-                        UPDATE v326_import_queue
-                           SET status='done', message='', updated_at=?
-                         WHERE task_id=? AND status='running' AND owner_token=?
-                        """,
-                        (now_done, _tid, _ot),
-                    )
-                    if int(cur_done.rowcount or 0) != 1:
-                        con.execute("ROLLBACK")
-                        return {"ok": False, "reason": "ownership_lost", "race_key": key}
-                    con.execute("COMMIT")
-                except Exception:
-                    try:
-                        con.execute("ROLLBACK")
-                    except Exception:
-                        pass
-                    raise
-            return {"ok": True, "race_key": key, "trials": int(trials), "history_id": history_id, "queue_done": True}
-        except (_V326OwnershipLost, _V326SafeStop) as _ab:
-            return {"ok": False, "reason": "ownership_lost" if isinstance(_ab, _V326OwnershipLost) else "safe_stop", "race_key": key}
-        except Exception as exc:
-            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}", "race_key": key}
+        return _v326_owner_save_tx(
+            db_path, task_id=_tid, owner_token=_ot, race_key=race_key, key=key, meta=meta, df=df,
+            finish_prob=finish_prob, bets=bets, entries=entries, text=text, venue=venue, view=view,
+            trials=int(trials), seed=int(seed), check_abort=_check_abort, is_slim_recoverable=_is_slim_recoverable,
+        )
 
     # --- UI / 非所有権パス（従来） ---
     saved_key = ""
@@ -23637,7 +23771,12 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             message=f"今回{total}件｜pending={_qs0.get('pending',0)}（過去done={_qs0.get('done',0)}は分母に含めない）",
         )
         i = 0
+        _hb_zombie_state = {"task_id": None, "owner_token": None, "cause": None}
         while True:
+            # 前レースの heartbeat が止まっていなければ次レースへ進まない
+            if _hb_zombie_state.get("task_id") is not None:
+                _v326_raise_hb_zombie(db_path, _hb_zombie_state, None, _worker_owner_token)
+            _hb_body_exc = None
             _v278_bg_pause_loop(db_path, job_id)
             if _v278_bg_cancel_requested(db_path, job_id):
                 try:
@@ -23731,59 +23870,60 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 total_count=max(1, total),
             )
             # W07 A+B heartbeat + ownership abort
+            # Event / ctx / クロージャはすべてレースごとに新規生成する（前レースの状態を引き継がない）。
             _ownership_lost = threading.Event()
             _safe_stop = threading.Event()
             _hb_stop = threading.Event()
-            _hb_thread = None
+            _hb_tx_active = threading.Event()
+            _hb_ctx = {
+                "thread": None,
+                "shutdown_first_ts": None,
+                "shutdown_calls": 0,
+                "join_timed_out": False,
+            }
             _ot_local = str(_worker_owner_token or "")
+            _hb_zombie = False
 
-            def _abort_cb():
-                if _ownership_lost.is_set():
+            def _abort_cb(_lost=_ownership_lost, _safe=_safe_stop):
+                if _lost.is_set():
                     raise _V326OwnershipLost()
-                if _safe_stop.is_set():
+                if _safe.is_set():
                     raise _V326SafeStop()
 
-            def _hb_timer_loop():
-                err_streak = 0
-                while not _hb_stop.wait(float(globals().get("_V326_QUEUE_HEARTBEAT_SEC", 300))):
-                    if not task_id or not _ot_local:
-                        break
-                    code = _v326_queue_heartbeat(db_path, int(task_id), _ot_local)
-                    if code == "lost":
-                        _ownership_lost.set()
-                        _hb_stop.set()
-                        return
-                    if code == "busy":
-                        continue
-                    if code == "error":
-                        err_streak += 1
-                        if err_streak >= int(globals().get("_V326_HB_ERROR_STREAK_LIMIT", 3)):
-                            _safe_stop.set()
-                            _hb_stop.set()
-                            return
-                    else:
-                        err_streak = 0
+            def _hb_shutdown(_stop=_hb_stop, _ctx=_hb_ctx, _safe=_safe_stop) -> bool:
+                """heartbeat を停止・join（冪等・例外を投げない）。
 
-            _hb_holder = {"t": None}
-
-            def _hb_shutdown():
-                """heartbeat スレッドを停止・join（冪等）。全終了経路から呼ぶ。"""
+                戻り値: True = 停止済み（またはスレッド無し）、False = join timeout 後も生存。
+                期限は最初の呼び出しから _V326_HB_JOIN_TIMEOUT_SEC（2 回目以降は残り時間だけ待つ）。
+                """
                 try:
-                    _hb_stop.set()
-                    _t = _hb_holder.get("t")
-                    if _t is not None:
-                        _t.join(timeout=max(5.0, float(globals().get("_V326_QUEUE_HEARTBEAT_SEC", 300)) * 0.05 + 15.0))
-                        if _t.is_alive():
-                            _safe_stop.set()
+                    _stop.set()
+                    _ctx["shutdown_calls"] = int(_ctx.get("shutdown_calls") or 0) + 1
+                    _now = time_module.monotonic()
+                    if _ctx.get("shutdown_first_ts") is None:
+                        _ctx["shutdown_first_ts"] = _now
+                    _t = _ctx.get("thread")
+                    if _t is None:
+                        return True
+                    _limit = float(globals().get("_V326_HB_JOIN_TIMEOUT_SEC", 30.0))
+                    _left = max(0.0, _limit - (_now - float(_ctx["shutdown_first_ts"])))
+                    if _t.is_alive() and _left > 0:
+                        _t.join(timeout=_left)
+                    if _t.is_alive():
+                        _ctx["join_timed_out"] = True
+                        _safe.set()
+                        return False
+                    return True
                 except Exception:
-                    pass
+                    return False
 
-            def _on_step_wrapped(msg, vn=vn, n=n, i=i):
-                _abort_cb()
-                if task_id and _ot_local:
-                    code = _v326_queue_heartbeat(db_path, int(task_id), _ot_local)
+            def _on_step_wrapped(msg, vn=vn, n=n, i=i, _tid=task_id, _ot=_ot_local,
+                                 _lost=_ownership_lost, _abort=_abort_cb, _txa=_hb_tx_active):
+                _abort()
+                if _tid and _ot:
+                    code = _v326_queue_heartbeat(db_path, int(_tid), _ot, tx_active=_txa)
                     if code == "lost":
-                        _ownership_lost.set()
+                        _lost.set()
                         raise _V326OwnershipLost()
                 try:
                     _v278_bg_update(
@@ -23798,15 +23938,33 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                      "task_mode": str(task.get("task_mode") or "normal")}
             try:
                 # heartbeat 開始は try の内側（以降のどの終了経路でも finally で止まる）
+                _v326_set_worker_tx_active_event(_hb_tx_active)
                 if task_id and _ot_local:
+                    _hb_initial = "error"
                     try:
-                        _v326_queue_heartbeat(db_path, int(task_id), _ot_local)
+                        _hb_initial = _v326_queue_heartbeat(
+                            db_path, int(task_id), _ot_local, tx_active=_hb_tx_active
+                        )
                     except Exception:
-                        pass
+                        _hb_initial = "error"
+                    if _hb_initial == "lost":
+                        _ownership_lost.set()
+                    elif _hb_initial == "error":
+                        try:
+                            print(f"[heartbeat] initial error: task={task_id}", flush=True)
+                        except Exception:
+                            pass
                     _hb_thread = threading.Thread(
-                        target=_hb_timer_loop, name=f"qhb-{task_id}", daemon=False
+                        target=_v326_hb_timer_loop,
+                        args=(
+                            db_path, int(task_id), _ot_local,
+                            _hb_stop, _ownership_lost, _safe_stop, _hb_tx_active,
+                            float(globals().get("_V326_QUEUE_HEARTBEAT_SEC", 300)),
+                            int(globals().get("_V326_HB_ERROR_STREAK_LIMIT", 3)),
+                        ),
+                        name=f"qhb-{task_id}", daemon=False,
                     )
-                    _hb_holder["t"] = _hb_thread
+                    _hb_ctx["thread"] = _hb_thread
                     _hb_thread.start()
                 # 版固定: キュー行 config を thread-local に載せる
                 _cfg = task.get("config") if isinstance(task.get("config"), dict) else None
@@ -23888,8 +24046,14 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         one = {"status": "error", "message": "safe_stop", "phase": "safe_stop"}
                     finally:
                         _hb_shutdown()
-                # 状態更新の前に heartbeat を止める（履歴のみ経路を含む）
-                _hb_shutdown()
+                # 状態更新の前に heartbeat を止める（履歴のみ経路を含む）。
+                # 止まらなければ done にせず error 扱い（Worker は finally 後に停止する）。
+                if not _hb_shutdown() and str(one.get("status") or "") != "cancelled":
+                    one = {
+                        "status": "error",
+                        "message": (str(one.get("message") or "") + " [heartbeat join timeout]").strip(),
+                        "phase": "heartbeat",
+                    }
                 if str(one.get("status") or "") == "cancelled":
                     try:
                         _v326_set_worker_config_snapshot(None)
@@ -23973,10 +24137,15 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     if task_id:
                         _v326_update_task_status(db_path, task_id, "done", "", owner_token=_worker_owner_token)
             except Exception as exc:
-                _hb_shutdown()
+                # 元の例外を先に確保してから heartbeat を止める（停止失敗でも元例外を失わない）
+                _orig_msg = f"{type(exc).__name__}: {exc}"
+                _hb_body_exc = exc
+                if not _hb_shutdown():
+                    _hb_zombie = True
+                    _orig_msg = _orig_msg + " [heartbeat join timeout]"
                 item["status"] = "error"
                 item["phase"] = "exception"
-                item["message"] = f"{type(exc).__name__}: {exc}"
+                item["message"] = _orig_msg
                 err += 1
                 try:
                     if task_id:
@@ -23986,9 +24155,28 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 except Exception:
                     pass
             finally:
-                # 版設定エラー(continue)・中止(return)・予測エラー・例外・正常のすべてで停止
-                _hb_shutdown()
+                # 版設定エラー(continue)・中止(return)・予測エラー・例外・正常のすべてで停止。
+                # finally の中では raise しない（本体の例外・return・continue を上書きしないため）。
+                try:
+                    _stopped = _hb_shutdown()
+                except Exception:
+                    _stopped = False
+                _v326_set_worker_tx_active_event(None)
+                _t_left = _hb_ctx.get("thread")
+                if not _stopped and _t_left is not None and _t_left.is_alive():
+                    _safe_stop.set()
+                    _hb_zombie = True
+                    _hb_zombie_state["task_id"] = task_id
+                    _hb_zombie_state["owner_token"] = _ot_local
+                    _hb_zombie_state["cause"] = _hb_body_exc
+                    try:
+                        print(f"[heartbeat] zombie after race: task={task_id}", flush=True)
+                    except Exception:
+                        pass
             _ = details.append(item)
+            # 通常の流れでだけ表面化させる（continue/return の経路は次ループ先頭で検査）
+            if _hb_zombie_state.get("task_id") is not None:
+                _v326_raise_hb_zombie(db_path, _hb_zombie_state, item, _worker_owner_token)
             fail_hint = ""
             if str(item.get("status") or "") in ("error", "failed"):
                 fail_hint = f"｜失敗:{vn}{n}R"
@@ -24109,6 +24297,15 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             message=f"失敗: {exc}",
         )
     finally:
+        # Worker 終了時に thread-local を必ず解除（次の Job へ持ち越さない）
+        try:
+            _v326_set_worker_tx_active_event(None)
+        except Exception:
+            pass
+        try:
+            _v326_set_worker_config_snapshot(None)
+        except Exception:
+            pass
         try:
             with _V278_BG_LOCK:
                 _V278_BG_THREADS.pop(int(job_id), None)
