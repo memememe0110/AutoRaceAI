@@ -23901,7 +23901,8 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 nonlocal _ownership_lost_count
                 # join timeout は heartbeat 連続エラーとは別の停止理由として保持する。
                 if _ctx.get("join_timed_out"):
-                    raise _V326HeartbeatJoinTimeout(_tid, _ot)
+                    # join timeout は後段の zombie 処理で task を error 化してから送出する。
+                    return
                 # 両方セット時は Worker 全体を止める SafeStop を優先する。
                 if _safe.is_set():
                     raise _V326SafeStop(
