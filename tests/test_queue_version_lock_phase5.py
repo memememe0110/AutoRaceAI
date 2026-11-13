@@ -562,7 +562,10 @@ def p5_24(app):
                 join_timeout=0.03, hb_interval=0.01, work_sleep=0.04).run()
     failed = [x for x in h.bg_updates if x.get("status") == "failed"]
     st = [(x[0], x[1]) for x in h.status_updates]
-    ok = h.picked == [1] and bool(failed) and len(failed) == 1 and (1, "error") in st
+    safe_exc = h.g["_V326SafeStop"]
+    timeout_exc = h.g["_V326HeartbeatJoinTimeout"]
+    ok = (h.picked == [1] and bool(failed) and len(failed) == 1 and (1, "error") in st
+          and isinstance(h.failed_exc, safe_exc) and not isinstance(h.failed_exc, timeout_exc))
     h.cleanup()
     return ok, {"picked": h.picked, "task_status": st, "job_failed_updates": len(failed),
                 "failed_exception": type(h.failed_exc).__name__ if h.failed_exc else None}
