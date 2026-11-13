@@ -18,7 +18,8 @@ SNAP = {
 
 SEEDS = [
     "_v326_ensure_import_queue", "_v326_enqueue_tasks", "_v326_pickup_next", "_v326_reset_running_to_pending",
-    "_v326_queue_heartbeat", "_v326_hb_timer_loop", "_v326_update_task_status", "_v326_owner_save_tx",
+    "_v326_queue_heartbeat", "_v326_hb_timer_loop", "_v326_queue_connect", "_v326_queue_write_retry",
+    "_V326_QUEUE_LOCK", "_v326_update_task_status_ex", "_v326_update_task_status", "_v326_owner_save_tx",
     "_v326_preensure_save_tables", "_v326_bulk_fix_unfixed_pending", "_v326_worker_config_snapshot",
     "_v326_set_worker_config_snapshot", "_v326_set_worker_tx_active_event", "_v326_get_worker_tx_active_event",
     "_V326OwnershipLost", "_V326SafeStop", "_V326HeartbeatJoinTimeout",
