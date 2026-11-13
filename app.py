@@ -24166,6 +24166,13 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     ok += 1
                     if task_id:
                         _v326_update_task_status(db_path, task_id, "done", "", owner_token=_worker_owner_token)
+            except _V326SafeStop as exc:
+                # SafeStop は Exception より先に捕捉し、通常エラーへ変換しない。
+                _hb_body_exc = exc
+                raise
+            except _V326HeartbeatJoinTimeout as exc:
+                _hb_body_exc = exc
+                raise
             except Exception as exc:
                 # 元の例外を先に確保してから heartbeat を止める（停止失敗でも元例外を失わない）
                 _orig_msg = f"{type(exc).__name__}: {exc}"
@@ -24184,10 +24191,6 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         , owner_token=_worker_owner_token)
                 except Exception:
                     pass
-            except _V326SafeStop:
-                raise
-            except _V326HeartbeatJoinTimeout:
-                raise
             finally:
                 # 版設定エラー(continue)・中止(return)・予測エラー・例外・正常のすべてで停止。
                 # finally の中では raise しない（本体の例外・return・continue を上書きしないため）。
@@ -24210,6 +24213,9 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             _ = details.append(item)
             # 通常の流れでだけ表面化させる（continue/return の経路は次ループ先頭で検査）
             if _hb_zombie_state.get("task_id") is not None:
+                # SafeStop が先に発生している場合は join timeout で上書きしない。
+                if isinstance(_hb_body_exc, _V326SafeStop):
+                    raise _hb_body_exc
                 _v326_raise_hb_zombie(db_path, _hb_zombie_state, item, _worker_owner_token)
             fail_hint = ""
             if str(item.get("status") or "") in ("error", "failed"):
