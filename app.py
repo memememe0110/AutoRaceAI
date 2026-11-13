@@ -270,9 +270,14 @@ _V330A_UI_TOGGLE_KEY = "v330a_toggle"
 def _v330a_active() -> bool:
     """Ver330-A: 周6抑制のみを独立して有効化する。
 
-    - 比較検証モード / worker: globals()[_V330A_EXPERIMENT]
-    - 通常UI: セッションの v330a_toggle（デフォルトOFF）
+    優先: Workerキュー固定snapshot → globals → session toggle
     """
+    snap = _v326_worker_config_snapshot()
+    if isinstance(snap, dict) and snap:
+        if "v330a_enabled" in snap:
+            return bool(snap.get("v330a_enabled"))
+        sv = str(snap.get("save_version") or "").strip()
+        return sv == "Ver330-A"
     if bool(globals().get("_V330A_EXPERIMENT")):
         return True
     try:
@@ -389,6 +394,12 @@ def _v326_catch_gap_cap() -> float:
 
 
 def _v326_effective_save_version() -> str:
+    # Worker経路: キュー登録時の固定版を最優先（global/session 再判定しない）
+    snap = _v326_worker_config_snapshot()
+    if isinstance(snap, dict):
+        sv = str(snap.get("save_version") or "").strip()
+        if sv:
+            return sv
     if _v328_active():
         return str(globals().get("_V328_APP_VERSION") or "Ver328")
     if _v330a_active():
@@ -467,7 +478,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261112_q_shiftn"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261113_qver_lock8_w07"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -2606,6 +2617,9 @@ def _v278_bg_ensure_table(db_path: str) -> None:
                     con.execute("ALTER TABLE v278_background_jobs ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0")
                 if "odds_only" not in cols:
                     con.execute("ALTER TABLE v278_background_jobs ADD COLUMN odds_only INTEGER NOT NULL DEFAULT 0")
+                if "save_version" not in cols:
+                    # 実保存版。既存行は NULL のまま（自動補完しない）
+                    con.execute("ALTER TABLE v278_background_jobs ADD COLUMN save_version TEXT")
             except Exception:
                 pass
             con.commit()
@@ -2986,6 +3000,29 @@ def _v326_abort_any() -> bool:
 
 
 _V326_QUEUE_LOCK = threading.Lock()
+
+# 公式取込Worker: キュー行1件処理中だけの設定スナップショット（版固定）
+_V326_QUEUE_WORKER_LOCAL = threading.local()
+
+
+def _v326_worker_config_snapshot():
+    """Worker 1レース処理中の固定設定。無ければ None。"""
+    try:
+        return getattr(_V326_QUEUE_WORKER_LOCAL, "config_snapshot", None)
+    except Exception:
+        return None
+
+
+def _v326_set_worker_config_snapshot(cfg):
+    if cfg is None:
+        try:
+            if hasattr(_V326_QUEUE_WORKER_LOCAL, "config_snapshot"):
+                delattr(_V326_QUEUE_WORKER_LOCAL, "config_snapshot")
+        except Exception:
+            pass
+        return
+    _V326_QUEUE_WORKER_LOCAL.config_snapshot = cfg
+
 _V319_HISTORY_WRITE_LOCK = threading.Lock()  # 履歴保存と予測のSQLite競合緩和
 
 
@@ -3028,7 +3065,22 @@ def _v326_queue_write_retry(fn, *, retries: int = 5, delay: float = 0.08):
 
 
 def _v326_ensure_import_queue(db_path: str) -> None:
-    """v326_import_queue を冪等作成。Step 2 では task_mode を UNIQUE 制約に含める。"""
+    """v326_import_queue を冪等作成。
+
+    - task_mode を UNIQUE に含む（Step2再構築）
+    - 版固定列: save_version, seed, code_commit_sha, config_version, config_json, input_sha256
+    - 既存行の版列は NULL のまま（自動埋めしない）
+    """
+    _SNAP_COLS = (
+        ("save_version", "TEXT"),
+        ("seed", "INTEGER"),
+        ("code_commit_sha", "TEXT"),
+        ("config_version", "INTEGER"),
+        ("config_json", "TEXT"),
+        ("input_sha256", "TEXT"),
+        ("owner_token", "TEXT"),  # running 所有（任意）
+    )
+
     def _run():
         with _v326_queue_connect(db_path, 30.0) as con:
             con.execute(
@@ -3045,7 +3097,19 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                     message     TEXT    DEFAULT '',
                     created_at  TEXT    NOT NULL,
                     updated_at  TEXT    NOT NULL,
-                    UNIQUE (job_type, ymd, venue, race_no)
+                    fetch_odds  INTEGER NOT NULL DEFAULT 1,
+                    register_result INTEGER NOT NULL DEFAULT 1,
+                    skip_existing INTEGER NOT NULL DEFAULT 1,
+                    replace_existing INTEGER NOT NULL DEFAULT 0,
+                    predict_if_missing INTEGER NOT NULL DEFAULT 1,
+                    save_version TEXT,
+                    seed INTEGER,
+                    code_commit_sha TEXT,
+                    config_version INTEGER,
+                    config_json TEXT,
+                    input_sha256 TEXT,
+                    owner_token TEXT,
+                    UNIQUE (job_type, task_mode, ymd, venue, race_no)
                 )
                 """
             )
@@ -3056,7 +3120,7 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                 ("skip_existing", "INTEGER NOT NULL DEFAULT 1"),
                 ("replace_existing", "INTEGER NOT NULL DEFAULT 0"),
                 ("predict_if_missing", "INTEGER NOT NULL DEFAULT 1"),
-            ):
+            ) + _SNAP_COLS:
                 try:
                     con.execute(
                         f"ALTER TABLE v326_import_queue ADD COLUMN {_col} {_typ}"
@@ -3065,13 +3129,11 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                     pass
 
             # Step 2: 旧 UNIQUE(job_type, ymd, venue, race_no) を
-            # UNIQUE(job_type, task_mode, ymd, venue, race_no) に置換する。
-            # 既存行はすべて task_mode='normal' のまま保持し、task_id も維持する。
+            # UNIQUE(job_type, task_mode, ymd, venue, race_no) に置換。
             _need_rebuild = False
             try:
                 _idx_rows = con.execute("PRAGMA index_list(v326_import_queue)").fetchall()
                 for _idx in _idx_rows:
-                    # index_list: seq, name, unique, origin, partial
                     if int(_idx[2] or 0) != 1:
                         continue
                     _iname = str(_idx[1] or "")
@@ -3109,26 +3171,60 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                         skip_existing INTEGER NOT NULL DEFAULT 1,
                         replace_existing INTEGER NOT NULL DEFAULT 0,
                         predict_if_missing INTEGER NOT NULL DEFAULT 1,
+                        save_version TEXT,
+                        seed INTEGER,
+                        code_commit_sha TEXT,
+                        config_version INTEGER,
+                        config_json TEXT,
+                        input_sha256 TEXT,
+                        owner_token TEXT,
                         UNIQUE (job_type, task_mode, ymd, venue, race_no)
                     )
                     """
                 )
-                con.execute(
-                    """
-                    INSERT INTO v326_import_queue_step2_new
-                        (task_id, job_type, task_mode, ymd, venue, race_no, status, sort_order,
-                         message, created_at, updated_at, fetch_odds, register_result,
-                         skip_existing, replace_existing, predict_if_missing)
-                    SELECT task_id, job_type, COALESCE(task_mode, 'normal'), ymd, venue, race_no,
-                           status, sort_order, message, created_at, updated_at,
-                           COALESCE(fetch_odds, 1), COALESCE(register_result, 1),
-                           COALESCE(skip_existing, 1), COALESCE(replace_existing, 0),
-                           COALESCE(predict_if_missing, 1)
-                      FROM v326_import_queue
-                    """
+                # 動的 INSERT: 旧列があればコピー、無ければ NULL
+                _old_cols = {
+                    str(r[1]) for r in con.execute("PRAGMA table_info(v326_import_queue)").fetchall()
+                }
+                _new_order = [
+                    "task_id", "job_type", "task_mode", "ymd", "venue", "race_no",
+                    "status", "sort_order", "message", "created_at", "updated_at",
+                    "fetch_odds", "register_result", "skip_existing",
+                    "replace_existing", "predict_if_missing",
+                    "save_version", "seed", "code_commit_sha", "config_version",
+                    "config_json", "input_sha256", "owner_token",
+                ]
+                _select_exprs = []
+                for c in _new_order:
+                    if c in _old_cols:
+                        if c == "task_mode":
+                            _select_exprs.append("COALESCE(task_mode, 'normal')")
+                        elif c == "fetch_odds":
+                            _select_exprs.append("COALESCE(fetch_odds, 1)")
+                        elif c == "register_result":
+                            _select_exprs.append("COALESCE(register_result, 1)")
+                        elif c == "skip_existing":
+                            _select_exprs.append("COALESCE(skip_existing, 1)")
+                        elif c == "replace_existing":
+                            _select_exprs.append("COALESCE(replace_existing, 0)")
+                        elif c == "predict_if_missing":
+                            _select_exprs.append("COALESCE(predict_if_missing, 1)")
+                        else:
+                            _select_exprs.append(c)
+                    else:
+                        _select_exprs.append("NULL")
+                _sql = (
+                    "INSERT INTO v326_import_queue_step2_new ("
+                    + ", ".join(_new_order)
+                    + ") SELECT "
+                    + ", ".join(_select_exprs)
+                    + " FROM v326_import_queue"
                 )
+                con.execute(_sql)
                 con.execute("DROP TABLE v326_import_queue")
-                con.execute("ALTER TABLE v326_import_queue_step2_new RENAME TO v326_import_queue")
+                con.execute(
+                    "ALTER TABLE v326_import_queue_step2_new RENAME TO v326_import_queue"
+                )
 
             con.execute(
                 """
@@ -3137,8 +3233,115 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                 """
             )
             con.commit()
+
     with _V326_QUEUE_LOCK:
         _v326_queue_write_retry(_run)
+
+
+
+
+def _v326_try_code_commit_sha() -> str | None:
+    """登録時コード識別。失敗時は NULL（勝手に埋めない）。"""
+    try:
+        import subprocess
+        p = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if p.returncode == 0:
+            s = str(p.stdout or "").strip()
+            if len(s) >= 7:
+                return s[:40]
+    except Exception:
+        pass
+    return None
+
+
+def _v326_build_queue_config_snapshot() -> dict:
+    """キュー登録・再投入時の版固定スナップショット。
+
+    個別列 + config_json（実験フラグ集約）。v330a_enabled は列にしない。
+    """
+    try:
+        sv = str(_v326_effective_save_version() or "").strip() or "Ver326"
+    except Exception:
+        sv = str(globals().get("_V231_APP_VERSION") or "Ver326")
+    try:
+        v330 = bool(_v330a_active())
+    except Exception:
+        v330 = False
+    # seed: session 優先、0 は有効
+    seed = 20260719
+    try:
+        if "seed" in st.session_state and st.session_state.get("seed") is not None:
+            seed = int(st.session_state.get("seed"))
+    except Exception:
+        pass
+    cfg = {
+        "save_version": sv,
+        "v330a_enabled": bool(v330),
+        "v326_ca_enabled": bool(_v326_ca_active()) if "_v326_ca_active" in globals() else True,
+        "v327_enabled": bool(_v327_active()) if "_v327_active" in globals() else False,
+        "v328_enabled": bool(_v328_active()) if "_v328_active" in globals() else False,
+        "v331_lap1_tune_enabled": bool(_v331_lap1_tune_active()) if "_v331_lap1_tune_active" in globals() else False,
+        "v331_gap_mode": str(_v331_gap_mode()) if "_v331_gap_mode" in dir() or "_v331_gap_mode" in globals() else "C",
+        "config_version": 1,
+    }
+    try:
+        if "_v331_gap_mode" in globals() or callable(globals().get("_v331_gap_mode")):
+            cfg["v331_gap_mode"] = str(_v331_gap_mode())
+    except Exception:
+        pass
+    if cfg.get("save_version") != sv:
+        cfg["save_version"] = sv
+    import json as _json
+    blob = _json.dumps(cfg, ensure_ascii=False, sort_keys=True)
+    return {
+        "save_version": sv,
+        "seed": int(seed),
+        "code_commit_sha": _v326_try_code_commit_sha(),
+        "config_version": 1,
+        "config_json": blob,
+        "input_sha256": None,
+        "v330a_enabled": bool(v330),
+    }
+
+
+def _v326_validate_queue_config_row(row_dict: dict) -> dict:
+    """pickup 用。不正なら例外。"""
+    import json as _json
+    sv = str((row_dict or {}).get("save_version") or "").strip()
+    if not sv:
+        raise ValueError("版未設定。再キューしてください")
+    raw = (row_dict or {}).get("config_json")
+    cfg = {}
+    if raw:
+        try:
+            cfg = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except Exception as e:
+            raise ValueError(f"config_json 不正: {e}") from e
+    jsv = str(cfg.get("save_version") or "").strip()
+    if jsv and jsv != sv:
+        raise ValueError(
+            f"save_version 不一致: col={sv} json={jsv}"
+        )
+    cfg["save_version"] = sv
+    if "v330a_enabled" not in cfg:
+        cfg["v330a_enabled"] = sv == "Ver330-A"
+    seed = (row_dict or {}).get("seed")
+    try:
+        seed = int(seed) if seed is not None else 20260719
+    except Exception:
+        seed = 20260719
+    return {
+        "save_version": sv,
+        "seed": seed,
+        "code_commit_sha": (row_dict or {}).get("code_commit_sha"),
+        "config_version": int((row_dict or {}).get("config_version") or cfg.get("config_version") or 1),
+        "config_json": cfg,
+        "input_sha256": (row_dict or {}).get("input_sha256"),
+        "v330a_enabled": bool(cfg.get("v330a_enabled")),
+    }
 
 
 def _v326_enqueue_tasks(
@@ -3156,16 +3359,15 @@ def _v326_enqueue_tasks(
     replace: bool = False,
     predict_if_missing: bool = True,
 ) -> int:
-    """キュー投入（条件付き upsert）。戻り値=新規 or 再投入件数。
+    """キュー投入（条件付き upsert + 版スナップショット）。
 
-    - 行なし → INSERT pending
-    - done/failed 等 → pending に戻して再投入（Ver326後にVer330-Aも回せる）
-    - pending → オプション更新のみ
-    - processing → 触らない
+    戻り値=新規INSERT + 再投入の件数（後方互換）。
 
-    insert_first=True: 既存 pending の sort_order を +len(task_list) シフトし先頭挿入。
-    insert_first=False（既定）: pending 末尾へ追加。
-    予測履歴は版ごとに残る（版違い再予測時は clear しない）。
+    - 新規INSERT: 登録時の版を固定
+    - pending: オプションのみ更新（版は維持）
+    - done/failed等: 再投入時に現在版で再スナップショット
+    - processing/running: 触らない
+    insert_first の sort シフトは同一トランザクション内。
     """
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     task_mode = str(task_mode or "normal").strip().lower()
@@ -3187,44 +3389,33 @@ def _v326_enqueue_tasks(
     except Exception:
         pass
 
-    if insert_first:
-        _shift_by = max(1, len(task_list))  # 追加件数だけ既存を押し出す
-        with _V326_QUEUE_LOCK:
-            def _shift():
-                with _v326_queue_connect(db_path, 30.0) as con:
-                    con.execute(
-                        """
-                        UPDATE v326_import_queue
-                           SET sort_order = COALESCE(sort_order,0) + ?,
-                               updated_at = ?
-                         WHERE job_type = ? AND status = 'pending'
-                        """,
-                        (int(_shift_by), now, str(job_type)),
-                    )
-                    con.commit()
-                    return 1
-            try:
-                _v326_queue_write_retry(_shift)
-            except Exception:
-                pass
+    snap = _v326_build_queue_config_snapshot()
+    if str(snap.get("save_version") or "") != str(
+        (__import__("json").loads(snap["config_json"]).get("save_version") or "")
+    ):
+        raise RuntimeError("queue snapshot save_version mismatch")
 
     _fo = 1 if fetch_odds else 0
     _rr = 1 if register_result else 0
     _se = 1 if skip_existing else 0
     _rp = 1 if replace else 0
     _pm = 1 if predict_if_missing else 0
+    _shift_by = max(1, len(task_list)) if insert_first else 0
 
     def _run():
-        """条件付き upsert（UNIQUE: job_type, task_mode, ymd, venue, race_no）。
-
-        - 行なし → INSERT pending
-        - done/failed 等 → 同一 task_mode 行を pending に戻す（履歴再取込・版再予測）
-        - pending → オプション更新のみ
-        - processing → 触らない
-        IntegrityError 時も SELECT→reset にフォールバック（旧UNIQUE残骸対策）
-        """
         inserted = 0
         with _v326_queue_connect(db_path, 30.0) as con:
+            # 同一TX内で sort シフト
+            if insert_first and _shift_by:
+                con.execute(
+                    """
+                    UPDATE v326_import_queue
+                       SET sort_order = COALESCE(sort_order,0) + ?,
+                           updated_at = ?
+                     WHERE job_type = ? AND status = 'pending'
+                    """,
+                    (int(_shift_by), now, str(job_type)),
+                )
             if insert_first:
                 next_so = 0
             else:
@@ -3244,44 +3435,17 @@ def _v326_enqueue_tasks(
                         (str(job_type),),
                     ).fetchone()
                     next_so = int(row[0] if row and row[0] is not None else -1) + 1
-            for venue, rn in task_list:
-                rowcount = 0
-                try:
-                    cur = con.execute(
-                        """
-                        INSERT OR IGNORE INTO v326_import_queue
-                            (job_type, task_mode, ymd, venue, race_no, status, sort_order,
-                             message, created_at, updated_at,
-                             fetch_odds, register_result, skip_existing,
-                             replace_existing, predict_if_missing)
-                        VALUES (?, ?, ?, ?, ?, 'pending', ?, '', ?, ?,
-                                ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            str(job_type), task_mode, ymd, venue, rn, int(next_so), now, now,
-                            _fo, _rr, _se, _rp, _pm,
-                        ),
-                    )
-                    rowcount = int(cur.rowcount or 0)
-                except sqlite3.IntegrityError:
-                    # 旧UNIQUEや競合時: IGNORE 相当として既存行処理へ
-                    rowcount = 0
-                if rowcount > 0:
-                    inserted += 1
-                    next_so += 1
-                    continue
 
-                # 同一 UNIQUE キー（task_mode 込み）の既存行を優先
+            for venue, rn in task_list:
                 row = con.execute(
                     """
-                    SELECT status,
+                    SELECT task_id, status,
                            COALESCE(task_mode, 'normal'),
                            COALESCE(fetch_odds, 1),
                            COALESCE(register_result, 1),
                            COALESCE(skip_existing, 1),
                            COALESCE(replace_existing, 0),
-                           COALESCE(predict_if_missing, 1),
-                           task_id
+                           COALESCE(predict_if_missing, 1)
                       FROM v326_import_queue
                      WHERE job_type = ?
                        AND COALESCE(task_mode, 'normal') = ?
@@ -3290,68 +3454,72 @@ def _v326_enqueue_tasks(
                     """,
                     (str(job_type), task_mode, ymd, venue, rn),
                 ).fetchone()
+
                 if not row:
-                    # 旧UNIQUEのみ（task_mode なし）で他mode行が座っている場合
-                    row = con.execute(
-                        """
-                        SELECT status,
-                               COALESCE(task_mode, 'normal'),
-                               COALESCE(fetch_odds, 1),
-                               COALESCE(register_result, 1),
-                               COALESCE(skip_existing, 1),
-                               COALESCE(replace_existing, 0),
-                               COALESCE(predict_if_missing, 1),
-                               task_id
-                          FROM v326_import_queue
-                         WHERE job_type = ? AND ymd = ? AND venue = ? AND race_no = ?
-                         ORDER BY task_id DESC
-                         LIMIT 1
-                        """,
-                        (str(job_type), ymd, venue, rn),
-                    ).fetchone()
-                if not row:
-                    continue
-                st = str(row[0] or "").strip().lower()
-                tid = int(row[7] or 0)
-                if st == "processing":
-                    continue
-                if st in ("done", "failed", "error", "skipped", "cancelled", "ok"):
-                    con.execute(
-                        """
-                        UPDATE v326_import_queue
-                           SET status = 'pending',
-                               task_mode = ?,
-                               sort_order = ?,
-                               message = '',
-                               updated_at = ?,
-                               fetch_odds = ?,
-                               register_result = ?,
-                               skip_existing = ?,
-                               replace_existing = ?,
-                               predict_if_missing = ?
-                         WHERE task_id = ?
-                           AND status = ?
-                        """,
-                        (
-                            task_mode, int(next_so), now,
-                            _fo, _rr, _se, _rp, _pm,
-                            tid, st,
-                        ),
-                    )
-                    inserted += 1
-                    next_so += 1
+                    try:
+                        cur = con.execute(
+                            """
+                            INSERT INTO v326_import_queue
+                                (job_type, task_mode, ymd, venue, race_no, status, sort_order,
+                                 message, created_at, updated_at,
+                                 fetch_odds, register_result, skip_existing,
+                                 replace_existing, predict_if_missing,
+                                 save_version, seed, code_commit_sha,
+                                 config_version, config_json, input_sha256)
+                            VALUES (?, ?, ?, ?, ?, 'pending', ?, '', ?, ?,
+                                    ?, ?, ?, ?, ?,
+                                    ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                str(job_type), task_mode, ymd, venue, rn, int(next_so),
+                                now, now,
+                                _fo, _rr, _se, _rp, _pm,
+                                snap["save_version"], snap["seed"], snap["code_commit_sha"],
+                                snap["config_version"], snap["config_json"], snap["input_sha256"],
+                            ),
+                        )
+                        if int(cur.rowcount or 0) > 0:
+                            inserted += 1
+                            next_so += 1
+                    except sqlite3.IntegrityError:
+                        row = con.execute(
+                            """
+                            SELECT task_id, status,
+                                   COALESCE(task_mode, 'normal'),
+                                   COALESCE(fetch_odds, 1),
+                                   COALESCE(register_result, 1),
+                                   COALESCE(skip_existing, 1),
+                                   COALESCE(replace_existing, 0),
+                                   COALESCE(predict_if_missing, 1)
+                              FROM v326_import_queue
+                             WHERE job_type = ?
+                               AND COALESCE(task_mode, 'normal') = ?
+                               AND ymd = ? AND venue = ? AND race_no = ?
+                             LIMIT 1
+                            """,
+                            (str(job_type), task_mode, ymd, venue, rn),
+                        ).fetchone()
+                        if not row:
+                            continue
+                    else:
+                        continue
+
+                st = str(row[1] or "").strip().lower()
+                tid = int(row[0] or 0)
+                if st in ("processing", "running"):
                     continue
                 if st == "pending":
-                    old_mode = str(row[1] or "normal")
+                    old_mode = str(row[2] or "normal")
                     old_fo, old_rr, old_se, old_rp, old_pm = (
-                        int(row[2] or 1), int(row[3] or 1), int(row[4] or 1),
-                        int(row[5] or 0), int(row[6] or 1),
+                        int(row[3] or 1), int(row[4] or 1), int(row[5] or 1),
+                        int(row[6] or 0), int(row[7] or 1),
                     )
                     if (
                         old_mode != task_mode
                         or old_fo != _fo or old_rr != _rr
                         or old_se != _se or old_rp != _rp or old_pm != _pm
                     ):
+                        # 版列は SET に含めない
                         con.execute(
                             """
                             UPDATE v326_import_queue
@@ -3372,6 +3540,41 @@ def _v326_enqueue_tasks(
                             ),
                         )
                     continue
+                if st in ("done", "failed", "error", "skipped", "cancelled", "ok"):
+                    cur = con.execute(
+                        """
+                        UPDATE v326_import_queue
+                           SET status = 'pending',
+                               task_mode = ?,
+                               sort_order = ?,
+                               message = '',
+                               updated_at = ?,
+                               fetch_odds = ?,
+                               register_result = ?,
+                               skip_existing = ?,
+                               replace_existing = ?,
+                               predict_if_missing = ?,
+                               save_version = ?,
+                               seed = ?,
+                               code_commit_sha = ?,
+                               config_version = ?,
+                               config_json = ?,
+                               input_sha256 = ?
+                         WHERE task_id = ?
+                           AND status = ?
+                        """,
+                        (
+                            task_mode, int(next_so), now,
+                            _fo, _rr, _se, _rp, _pm,
+                            snap["save_version"], snap["seed"], snap["code_commit_sha"],
+                            snap["config_version"], snap["config_json"], snap["input_sha256"],
+                            tid, st,
+                        ),
+                    )
+                    if int(cur.rowcount or 0) > 0:
+                        inserted += 1
+                        next_so += 1
+                    continue
             con.commit()
         return inserted
 
@@ -3379,67 +3582,222 @@ def _v326_enqueue_tasks(
         return int(_v326_queue_write_retry(_run) or 0)
 
 
+
+
+# --- W07: queue heartbeat / ownership / stale (Python-side) ---
+_V326_QUEUE_HEARTBEAT_SEC = 300
+_V326_QUEUE_STALE_MINUTES = 30
+_V326_HB_LOCK = threading.Lock()
+_V326_HB_INFLIGHT: set = set()
+_V326_HB_ERROR_STREAK_LIMIT = 3
+
+
+class _V326OwnershipLost(Exception):
+    """queue ownership lost (rowcount=0 on running+token)."""
+
+
+class _V326SafeStop(Exception):
+    """Worker should stop without claiming ownership_lost."""
+
+
+def _v326_parse_queue_ts(value):
+    """updated_at -> aware UTC datetime, or None if unusable."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _v326_is_stale_updated_at(value, *, stale_minutes: int = 30) -> bool:
+    dt = _v326_parse_queue_ts(value)
+    if dt is None:
+        return False  # 不正形式は自動 stale にしない
+    try:
+        mins = max(1, int(stale_minutes))
+    except Exception:
+        mins = 30
+    return (datetime.now(timezone.utc) - dt) > timedelta(minutes=mins)
+
+
+def _v326_queue_heartbeat(db_path: str, task_id: int, owner_token: str) -> str:
+    """'ok' | 'lost' | 'busy' | 'error'. Updates updated_at only for own running row."""
+    ot = str(owner_token or "").strip()
+    if not ot or not task_id:
+        return "error"
+    tid = int(task_id)
+    with _V326_HB_LOCK:
+        if tid in _V326_HB_INFLIGHT:
+            return "ok"
+        _V326_HB_INFLIGHT.add(tid)
+    try:
+        now = _v228_now_jst_iso()
+
+        def _run():
+            with _v326_queue_connect(db_path, 10.0) as con:
+                cur = con.execute(
+                    """
+                    UPDATE v326_import_queue
+                       SET updated_at = ?
+                     WHERE task_id = ?
+                       AND status = 'running'
+                       AND owner_token = ?
+                    """,
+                    (now, tid, ot),
+                )
+                con.commit()
+                return int(cur.rowcount or 0)
+
+        try:
+            n = _v326_queue_write_retry(_run)
+        except Exception as e:
+            msg = str(e).lower()
+            if "locked" in msg or "busy" in msg:
+                return "busy"
+            return "error"
+        return "ok" if int(n or 0) == 1 else "lost"
+    finally:
+        with _V326_HB_LOCK:
+            _V326_HB_INFLIGHT.discard(tid)
+
+
 def _v326_update_task_status(
-    db_path: str, task_id: int, status: str, message: str = ""
-) -> None:
+    db_path: str, task_id: int, status: str, message: str = "",
+    *,
+    owner_token: str,
+) -> bool:
+    """Worker専用: running + owner_token 一致のときだけ状態更新。成功で True。"""
+    ot = str(owner_token or "").strip()
+    if not ot:
+        return False
     now = _v228_now_jst_iso()
 
     def _run():
         with _v326_queue_connect(db_path, 30.0) as con:
-            con.execute(
+            cur = con.execute(
                 """
                 UPDATE v326_import_queue
                    SET status = ?, message = ?, updated_at = ?
                  WHERE task_id = ?
+                   AND status = 'running'
+                   AND owner_token = ?
                 """,
-                (str(status), str(message or "")[:500], now, int(task_id)),
+                (str(status), str(message or "")[:500], now, int(task_id), ot),
             )
             con.commit()
+            return int(cur.rowcount or 0) == 1
 
     with _V326_QUEUE_LOCK:
-        _v326_queue_write_retry(_run)
+        try:
+            return bool(_v326_queue_write_retry(_run))
+        except Exception:
+            return False
 
 
 def _v326_reset_running_to_pending(
     db_path: str,
     job_type: str | None = None,
     reason: str = "中止要求により pending に戻しました",
+    *,
+    stale_minutes: int = 30,
+    owner_token: str | None = None,
 ) -> int:
+    """running → pending。版スナップショット列は変更しない。
+
+    自分の owner_token の行、または Python 側 stale 判定の行のみ。
+    SELECT 時の owner_token/updated_at を UPDATE WHERE で再照合（同一 TX）。
+    """
     now = _v228_now_jst_iso()
+    try:
+        stale_minutes = max(1, int(stale_minutes or _V326_QUEUE_STALE_MINUTES))
+    except Exception:
+        stale_minutes = 30
+    _ot = str(owner_token or "").strip()
+    reason_s = str(reason)[:500]
 
     def _run():
         with _v326_queue_connect(db_path, 30.0) as con:
-            if job_type:
-                cur = con.execute(
-                    """
-                    UPDATE v326_import_queue
-                       SET status = 'pending', message = ?, updated_at = ?
-                     WHERE status = 'running' AND job_type = ?
-                    """,
-                    (str(reason)[:500], now, str(job_type)),
-                )
-            else:
-                cur = con.execute(
-                    """
-                    UPDATE v326_import_queue
-                       SET status = 'pending', message = ?, updated_at = ?
-                     WHERE status = 'running'
-                    """,
-                    (str(reason)[:500], now),
-                )
-            con.commit()
-            return int(cur.rowcount or 0)
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                if job_type:
+                    rows = con.execute(
+                        """
+                        SELECT task_id, owner_token, updated_at
+                          FROM v326_import_queue
+                         WHERE status = 'running' AND job_type = ?
+                        """,
+                        (str(job_type),),
+                    ).fetchall()
+                else:
+                    rows = con.execute(
+                        """
+                        SELECT task_id, owner_token, updated_at
+                          FROM v326_import_queue
+                         WHERE status = 'running'
+                        """
+                    ).fetchall()
+                n = 0
+                for r in rows:
+                    tid = int(r[0])
+                    row_ot = r[1]
+                    row_ua = r[2]
+                    row_ot_s = str(row_ot or "").strip()
+                    take = False
+                    if _ot and row_ot_s == _ot:
+                        take = True
+                    elif not row_ot_s:
+                        # NULL/空は stale のときだけ（不正形式は触らない）
+                        take = _v326_is_stale_updated_at(row_ua, stale_minutes=stale_minutes)
+                    elif _v326_is_stale_updated_at(row_ua, stale_minutes=stale_minutes):
+                        # 他 token でも本当に stale なら孤児として戻す
+                        take = True
+                    if not take:
+                        continue
+                    cur = con.execute(
+                        """
+                        UPDATE v326_import_queue
+                           SET status = 'pending', message = ?, updated_at = ?,
+                               owner_token = NULL
+                         WHERE task_id = ?
+                           AND status = 'running'
+                           AND owner_token IS ?
+                           AND updated_at IS ?
+                        """,
+                        (reason_s, now, tid, row_ot, row_ua),
+                    )
+                    n += int(cur.rowcount or 0)
+                con.execute("COMMIT")
+                return n
+            except Exception:
+                try:
+                    con.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
 
     with _V326_QUEUE_LOCK:
         return int(_v326_queue_write_retry(_run) or 0)
 
 
-def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
-    """pending を sort_order→task_id 順で1件取り、running にする。"""
+
+def _v326_pickup_next(db_path: str, job_type: str, owner_token: str | None = None) -> dict | None:
+    """pending を1件 running にする（版固定済みのみ）。
+
+    戻り値:
+      None / {"kind":"empty"} … 処理可能 pending なし → Worker終了可
+      {"kind":"skipped_invalid", "task_id": ...} … 設定不正で error 化 → 次へ
+      {"kind":"task", ...} … 通常処理
+    """
     now = _v228_now_jst_iso()
 
     def _run():
         with _v326_queue_connect(db_path, 30.0) as con:
+            # 未固定 (save_version IS NULL) は対象外
             row = con.execute(
                 """
                 SELECT task_id, task_mode, ymd, venue, race_no,
@@ -3447,30 +3805,22 @@ def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
                        COALESCE(register_result, 1),
                        COALESCE(skip_existing, 1),
                        COALESCE(replace_existing, 0),
-                       COALESCE(predict_if_missing, 1)
+                       COALESCE(predict_if_missing, 1),
+                       save_version, seed, code_commit_sha,
+                       config_version, config_json, input_sha256
                   FROM v326_import_queue
                  WHERE job_type = ? AND status = 'pending'
+                   AND save_version IS NOT NULL
+                   AND TRIM(COALESCE(save_version, '')) != ''
                  ORDER BY sort_order ASC, task_id ASC
                  LIMIT 1
                 """,
                 (str(job_type),),
             ).fetchone()
             if not row:
-                return None
+                return {"kind": "empty"}
             task_id = int(row[0])
-            cur = con.execute(
-                """
-                UPDATE v326_import_queue
-                   SET status = 'running', updated_at = ?
-                 WHERE task_id = ? AND status = 'pending'
-                """,
-                (now, task_id),
-            )
-            con.commit()
-            if int(cur.rowcount or 0) <= 0:
-                return None
-            # Ver324: 0 は falsy なので `x or 1` すると意図が反転する。NULL のみ default。
-            return {
+            row_dict = {
                 "task_id": task_id,
                 "task_mode": str(row[1] or "normal"),
                 "ymd": str(row[2] or ""),
@@ -3481,10 +3831,60 @@ def _v326_pickup_next(db_path: str, job_type: str) -> dict | None:
                 "skip_existing": bool(int(row[7])) if row[7] is not None else True,
                 "replace": bool(int(row[8])) if row[8] is not None else False,
                 "predict_if_missing": bool(int(row[9])) if row[9] is not None else True,
+                "save_version": row[10],
+                "seed": row[11],
+                "code_commit_sha": row[12],
+                "config_version": row[13],
+                "config_json": row[14],
+                "input_sha256": row[15],
             }
+            try:
+                cfg = _v326_validate_queue_config_row(row_dict)
+            except Exception as exc:
+                con.execute(
+                    """
+                    UPDATE v326_import_queue
+                       SET status = 'error',
+                           message = ?,
+                           updated_at = ?
+                     WHERE task_id = ? AND status = 'pending'
+                    """,
+                    (f"版設定不正: {exc}"[:500], now, task_id),
+                )
+                con.commit()
+                return {"kind": "skipped_invalid", "task_id": task_id, "error": str(exc)}
+
+            _ot = str(owner_token or "").strip() or None
+            if _ot:
+                cur = con.execute(
+                    """
+                    UPDATE v326_import_queue
+                       SET status = 'running', updated_at = ?, owner_token = ?
+                     WHERE task_id = ? AND status = 'pending'
+                    """,
+                    (now, _ot, task_id),
+                )
+            else:
+                cur = con.execute(
+                    """
+                    UPDATE v326_import_queue
+                       SET status = 'running', updated_at = ?
+                     WHERE task_id = ? AND status = 'pending'
+                    """,
+                    (now, task_id),
+                )
+            con.commit()
+            if int(cur.rowcount or 0) <= 0:
+                return {"kind": "empty"}
+            out = dict(row_dict)
+            out["kind"] = "task"
+            out["config"] = cfg
+            out["owner_token"] = _ot
+            return out
 
     with _V326_QUEUE_LOCK:
         return _v326_queue_write_retry(_run)
+
 
 
 def _v326_queue_summary(db_path: str, job_type: str) -> dict:
@@ -5173,7 +5573,22 @@ def _v279_send_bg_prediction_complete_notification(result: dict) -> None:
 def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) -> None:
     _prev_v330a = bool(globals().get("_V330A_EXPERIMENT"))
     try:
-        # 予測タブの Ver330-A トグルを worker に反映（session なし）
+        # 開始時 snapshot を thread-local に固定（実行中の UI 変更を無視）
+        _cfg_snap = None
+        try:
+            _cfg_snap = (request_data or {}).get("config_snapshot")
+            if not isinstance(_cfg_snap, dict) or not _cfg_snap:
+                _cfg_snap = {
+                    "save_version": str((request_data or {}).get("save_version") or "").strip(),
+                    "v330a_enabled": bool((request_data or {}).get("v330a_enabled")),
+                    "seed": int((request_data or {}).get("seed") or 0),
+                    "config_json": (request_data or {}).get("config_json"),
+                    "code_commit_sha": (request_data or {}).get("code_commit_sha"),
+                    "config_version": (request_data or {}).get("config_version") or 1,
+                }
+            _v326_set_worker_config_snapshot(_cfg_snap)
+        except Exception:
+            _cfg_snap = None
         try:
             if "v330a_enabled" in (request_data or {}):
                 globals()["_V330A_EXPERIMENT"] = bool(request_data.get("v330a_enabled"))
@@ -5184,6 +5599,7 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
         try:
             _save_ver = str(
                 (request_data or {}).get("save_version")
+                or (_cfg_snap or {}).get("save_version")
                 or _v326_effective_save_version()
                 or globals().get("_V231_APP_VERSION")
                 or "Ver326"
@@ -5315,6 +5731,10 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
         )
     finally:
         try:
+            _v326_set_worker_config_snapshot(None)
+        except Exception:
+            pass
+        try:
             globals()["_V330A_EXPERIMENT"] = bool(_prev_v330a)
         except Exception:
             pass
@@ -5343,30 +5763,37 @@ def _v279_bg_prediction_start(
         if bool(rerun_from_restored) else "バックグラウンド予測を開始します。"
     )
     try:
-        _job_ver = str(_v326_effective_save_version()).strip()
+        _snap_pred = _v326_build_queue_config_snapshot()
     except Exception:
-        _job_ver = str(globals().get("_V231_APP_VERSION") or "Ver326")
+        _snap_pred = {}
+    try:
+        _sv = str((_snap_pred or {}).get("save_version") or _v326_effective_save_version()).strip()
+    except Exception:
+        _sv = str(globals().get("_V231_APP_VERSION") or "Ver326")
+    try:
+        _v330_on = bool((_snap_pred or {}).get("v330a_enabled", _v330a_active()))
+    except Exception:
+        _v330_on = False
+    _job_ver = _sv
+    try:
+        _v278_bg_ensure_table(db_path)
+    except Exception:
+        pass
     with sqlite3.connect(str(db_path),timeout=30.0) as con:
         con.execute("PRAGMA busy_timeout=30000")
         cur=con.execute("""
             INSERT INTO v278_background_jobs(
-                job_type,app_version,status,created_at,updated_at,limit_count,force_current,
+                job_type,app_version,save_version,status,created_at,updated_at,limit_count,force_current,
                 done_count,total_count,current_label,message
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """,(
-            job_type,_job_ver,"queued",now,now,1,0,0,4,"準備中",start_message
+            job_type, str(globals().get("_V231_APP_VERSION") or _job_ver), _sv,
+            "queued",now,now,1,0,0,4,"準備中",
+            f"{start_message} save={_sv}",
         ))
         con.commit(); job_id=int(cur.lastrowid or 0)
     _excluded301=[int(x) for x in (excluded or [])]
     _input_fp301=_v301_bg_input_fingerprint(str(raw_text),str(venue_override or ""),_excluded301)
-    try:
-        _sv = str(_v326_effective_save_version()).strip()
-    except Exception:
-        _sv = str(globals().get("_V231_APP_VERSION") or "Ver326")
-    try:
-        _v330_on = bool(_v330a_active())
-    except Exception:
-        _v330_on = False
     try:
         globals()["_V330A_EXPERIMENT"] = bool(_v330_on)
     except Exception:
@@ -5380,6 +5807,10 @@ def _v279_bg_prediction_start(
         "rerun_source_history_id":int(rerun_source_history_id or 0),
         "v330a_enabled": bool(_v330_on),
         "save_version": _sv,
+        "config_snapshot": dict(_snap_pred or {}),
+        "config_json": (_snap_pred or {}).get("config_json"),
+        "code_commit_sha": (_snap_pred or {}).get("code_commit_sha"),
+        "config_version": (_snap_pred or {}).get("config_version") or 1,
     }
     th=threading.Thread(
         target=_v279_bg_prediction_worker,args=(str(db_path),job_id,request_data),daemon=True,
@@ -13614,6 +14045,184 @@ def _v326_render_queue_reorder_fragment(db_path: str, job_type: str = "official_
 
 
 @_v146_fragment
+
+def _v326_list_unfixed_pending(db_path: str, job_type: str = "official_import", limit: int = 200) -> list[dict]:
+    """版未固定の pending 行を返す（Worker 対象外）。"""
+    try:
+        _v326_ensure_import_queue(db_path)
+    except Exception:
+        pass
+    out = []
+    try:
+        with _v326_queue_connect(db_path, 15.0) as con:
+            rows = con.execute(
+                """
+                SELECT task_id, ymd, venue, race_no, task_mode, sort_order, created_at
+                  FROM v326_import_queue
+                 WHERE job_type = ?
+                   AND status = 'pending'
+                   AND (save_version IS NULL OR TRIM(COALESCE(save_version, '')) = '')
+                 ORDER BY sort_order ASC, task_id ASC
+                 LIMIT ?
+                """,
+                (str(job_type), int(limit)),
+            ).fetchall()
+            for r in rows:
+                out.append({
+                    "task_id": int(r[0]),
+                    "ymd": str(r[1] or ""),
+                    "venue": str(r[2] or ""),
+                    "race_no": int(r[3] or 0),
+                    "task_mode": str(r[4] or "normal"),
+                    "sort_order": int(r[5] or 0),
+                    "created_at": str(r[6] or ""),
+                    "race_key": f"{r[1]}_{r[2]}_{int(r[3] or 0)}R",
+                })
+    except Exception:
+        return []
+    return out
+
+
+def _v326_count_unfixed_pending(db_path: str, job_type: str = "official_import") -> int:
+    try:
+        _v326_ensure_import_queue(db_path)
+    except Exception:
+        pass
+    try:
+        with _v326_queue_connect(db_path, 10.0) as con:
+            row = con.execute(
+                """
+                SELECT COUNT(*)
+                  FROM v326_import_queue
+                 WHERE job_type = ?
+                   AND status = 'pending'
+                   AND (save_version IS NULL OR TRIM(COALESCE(save_version, '')) = '')
+                """,
+                (str(job_type),),
+            ).fetchone()
+            return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+
+
+def _v326_bulk_fix_unfixed_pending(
+    db_path: str,
+    job_type: str = "official_import",
+    snap: dict | None = None,
+) -> dict:
+    """未固定 pending だけに現在スナップショットを書き込む。
+
+    - status='pending' かつ save_version 空の行のみ
+    - running/done は絶対に触らない
+    - 既に固定済みの行は上書きしない
+    """
+    if not isinstance(snap, dict) or not snap:
+        snap = _v326_build_queue_config_snapshot()
+    sv = str(snap.get("save_version") or "").strip()
+    if not sv:
+        return {"ok": False, "updated": 0, "reason": "save_version が空のため固定できません"}
+    import json as _json
+    try:
+        cfg_obj = _json.loads(snap["config_json"]) if isinstance(snap.get("config_json"), str) else (snap.get("config_json") or {})
+        if str(cfg_obj.get("save_version") or "").strip() != sv:
+            return {"ok": False, "updated": 0, "reason": "config_json.save_version 不一致"}
+    except Exception as e:
+        return {"ok": False, "updated": 0, "reason": f"config_json 不正: {e}"}
+
+    now = _v228_now_jst_iso()
+    expected = 0
+    updated = 0
+
+    def _run():
+        nonlocal expected, updated
+        with _v326_queue_connect(db_path, 30.0) as con:
+            # BEGIN IMMEDIATE 相当: 書き込み接続で先行ロック
+            try:
+                con.execute("BEGIN IMMEDIATE")
+            except Exception:
+                pass
+            row = con.execute(
+                """
+                SELECT COUNT(*)
+                  FROM v326_import_queue
+                 WHERE job_type = ?
+                   AND status = 'pending'
+                   AND (save_version IS NULL OR TRIM(COALESCE(save_version, '')) = '')
+                """,
+                (str(job_type),),
+            ).fetchone()
+            expected = int(row[0] or 0) if row else 0
+            if expected <= 0:
+                try:
+                    con.execute("COMMIT")
+                except Exception:
+                    pass
+                return 0
+            cur = con.execute(
+                """
+                UPDATE v326_import_queue
+                   SET save_version = ?,
+                       seed = ?,
+                       code_commit_sha = ?,
+                       config_version = ?,
+                       config_json = ?,
+                       input_sha256 = COALESCE(input_sha256, ?),
+                       message = CASE
+                           WHEN message IS NULL OR TRIM(message) = '' THEN ?
+                           ELSE message
+                       END,
+                       updated_at = ?
+                 WHERE job_type = ?
+                   AND status = 'pending'
+                   AND (save_version IS NULL OR TRIM(COALESCE(save_version, '')) = '')
+                """,
+                (
+                    sv,
+                    snap.get("seed"),
+                    snap.get("code_commit_sha"),
+                    int(snap.get("config_version") or 1),
+                    snap.get("config_json"),
+                    snap.get("input_sha256"),
+                    f"一括固定:{sv}",
+                    now,
+                    str(job_type),
+                ),
+            )
+            updated = int(cur.rowcount or 0)
+            # 検証
+            left = con.execute(
+                """
+                SELECT COUNT(*)
+                  FROM v326_import_queue
+                 WHERE job_type = ?
+                   AND status = 'pending'
+                   AND (save_version IS NULL OR TRIM(COALESCE(save_version, '')) = '')
+                """,
+                (str(job_type),),
+            ).fetchone()
+            left_n = int(left[0] or 0) if left else 0
+            try:
+                con.execute("COMMIT")
+            except Exception:
+                con.commit()
+            return left_n
+
+    try:
+        with _V326_QUEUE_LOCK:
+            left_n = int(_v326_queue_write_retry(_run) or 0)
+        return {
+            "ok": True,
+            "updated": int(updated),
+            "expected": int(expected),
+            "left_unfixed": int(left_n),
+            "save_version": sv,
+            "seed": snap.get("seed"),
+            "code_commit_sha": snap.get("code_commit_sha"),
+        }
+    except Exception as e:
+        return {"ok": False, "updated": 0, "reason": f"{type(e).__name__}: {e}"}
+
+
 def _v326_render_official_import_panel() -> None:
     """公式取込パネル。日付・開催場・チェック変更は枠内だけ再実行。"""
     # Ver330-A UIトグル（デフォルトOFF）。通常予測に周6抑制を載せる。
@@ -13824,11 +14433,17 @@ def _v326_render_official_import_panel() -> None:
     except Exception:
         _qs = {"total": 0, "pending": 0, "running": 0, "done": 0, "skipped": 0, "error": 0}
     st.markdown("#### 📋 取込キュー（プレイリスト）")
+    try:
+        _unfix_cap = _v326_count_unfixed_pending(str(engine.DB_PATH), "official_import")
+    except Exception:
+        _unfix_cap = 0
     st.caption(
         f"pending {_qs.get('pending',0)} / running {_qs.get('running',0)} / "
         f"done {_qs.get('done',0)} / skipped {_qs.get('skipped',0)} / error {_qs.get('error',0)}"
+        f" / 未固定 {_unfix_cap}"
         "　※キューの定義は UI、実行は worker（自動で1〜12を足しません）"
         "　※再シミュとは別セッションで同時実行できます"
+        "　※未固定pendingはWorker対象外（下で一括固定）"
     )
     _pend_n = int(_qs.get("pending") or 0)
     _run_n = int(_qs.get("running") or 0)
@@ -13900,6 +14515,76 @@ def _v326_render_official_import_panel() -> None:
         st.success(f"キューを全消去しました（{n} 件）")
         if n:
             st.rerun()
+    # --- 未固定 pending（版スナップショット無し → Worker 対象外） ---
+    try:
+        _unfix_n = _v326_count_unfixed_pending(str(engine.DB_PATH), "official_import")
+    except Exception:
+        _unfix_n = 0
+    if _unfix_n > 0:
+        with st.expander(
+            f"⚠ 未固定 pending が {_unfix_n} 件あります（Workerは処理しません）",
+            expanded=True,
+        ):
+            st.caption(
+                "旧キュー行など save_version が空の pending です。"
+                "一括固定で「いまの予測版・seed・設定」を書き込みます。"
+                "自動では固定しません。running/done は変更しません。"
+            )
+            try:
+                _snap_prev = _v326_build_queue_config_snapshot()
+            except Exception as _sx:
+                _snap_prev = {"save_version": "?", "seed": None, "error": str(_sx)}
+            _prev_md = (
+                "**適用予定**\n\n"
+                f"- save_version: `{_snap_prev.get('save_version')}`\n"
+                f"- seed: `{_snap_prev.get('seed')}`\n"
+                f"- code_commit_sha: `{_snap_prev.get('code_commit_sha') or 'NULL'}`\n"
+                f"- config_version: `{_snap_prev.get('config_version')}`"
+            )
+            st.markdown(_prev_md)
+            with st.expander("config_json プレビュー", expanded=False):
+                st.code(str(_snap_prev.get("config_json") or "")[:4000], language="json")
+            try:
+                _unfix_rows = _v326_list_unfixed_pending(
+                    str(engine.DB_PATH), "official_import", limit=100
+                )
+            except Exception:
+                _unfix_rows = []
+            if _unfix_rows:
+                _rk_list = [r.get("race_key") for r in _unfix_rows[:40]]
+                st.caption(
+                    "対象 race_key（最大40件表示）: "
+                    + ", ".join(str(x) for x in _rk_list)
+                    + (f" … 他 {_unfix_n - len(_rk_list)} 件" if _unfix_n > len(_rk_list) else "")
+                )
+            _confirm = st.checkbox(
+                f"上記 {_unfix_n} 件を、表示中の適用予定で一括固定する（確認）",
+                key="v326_unfixed_confirm",
+            )
+            if st.button(
+                "🔒 未固定 pending を一括固定",
+                type="primary",
+                disabled=not _confirm,
+                key="v326_unfixed_bulk_fix",
+            ):
+                if not _confirm:
+                    st.warning("確認チェックを入れてください。")
+                else:
+                    _fr = _v326_bulk_fix_unfixed_pending(
+                        str(engine.DB_PATH), "official_import", snap=_snap_prev
+                    )
+                    if _fr.get("ok"):
+                        st.success(
+                            f"一括固定完了: {_fr.get('updated')} 件 "
+                            f"（想定 {_fr.get('expected')} / 残未固定 {_fr.get('left_unfixed')}） "
+                            f"save_version={_fr.get('save_version')}"
+                        )
+                        st.rerun()
+                    else:
+                        st.error(_fr.get("reason") or "一括固定に失敗しました")
+    else:
+        st.caption("未固定 pending: 0 件")
+
     # B13-F: 並び替えは fragment（部分更新）。一覧・削除もここで完結。
     # 並び替え・全件表示・削除は fragment（部分更新・全画面再計算なし）
     _v326_render_queue_reorder_fragment(str(engine.DB_PATH), "official_import")
@@ -14177,15 +14862,24 @@ def _v222_race_label(meta: dict, race_key: str) -> str:
     return " ".join(parts) if parts else str(race_key or "保存済み予測")
 
 
-def _v222_save_prediction_restore(db_path: str, race_key: str, raw_text: str, venue_override: str, view: dict) -> None:
+def _v222_save_prediction_restore(
+    db_path: str, race_key: str, raw_text: str, venue_override: str, view: dict,
+    con=None, commit: bool = True,
+) -> None:
     race_key = str(race_key or "").strip()
     if not race_key or not isinstance(view, dict):
         return
-    _v222_ensure_prediction_restore_table(db_path)
+    try:
+        _v222_ensure_prediction_restore_table(db_path)
+    except Exception:
+        pass
     payload = zlib.compress(pickle.dumps(view, protocol=pickle.HIGHEST_PROTOCOL), level=6)
     now = _v228_now_jst_iso()
     label = _v222_race_label(view.get("meta") or {}, race_key)
-    with sqlite3.connect(db_path) as con:
+    own = con is None
+    if own:
+        con = sqlite3.connect(db_path)
+    try:
         con.execute("""
             INSERT INTO v222_prediction_restore
             (race_key,race_label,raw_text,venue_override,payload,created_at,updated_at)
@@ -14195,7 +14889,16 @@ def _v222_save_prediction_restore(db_path: str, race_key: str, raw_text: str, ve
                 venue_override=excluded.venue_override, payload=excluded.payload,
                 updated_at=excluded.updated_at
         """, (race_key, label, str(raw_text or ""), str(venue_override or ""), sqlite3.Binary(payload), now, now))
-        con.commit()
+        if own and commit:
+            con.commit()
+    finally:
+        if own:
+            try:
+                if commit:
+                    con.commit()
+            except Exception:
+                pass
+            con.close()
 
 
 def _v222_list_prediction_restores(db_path: str, limit: int = 60) -> list[dict]:
@@ -14434,7 +15137,7 @@ def _v266_backfill_pred_time_snapshots(db_path: str, limit: int = 500) -> dict:
     return out
 
 
-def _v231_save_prediction_history(db_path: str, race_key: str, raw_text: str, venue_override: str, view: dict, trials: int, seed: int) -> int:
+def _v231_save_prediction_history(db_path: str, race_key: str, raw_text: str, venue_override: str, view: dict, trials: int, seed: int, con=None, commit: bool = True) -> int:
     race_key = str(race_key or "").strip()
     if not race_key or not isinstance(view, dict):
         return 0
@@ -14458,30 +15161,51 @@ def _v231_save_prediction_history(db_path: str, race_key: str, raw_text: str, ve
     app_version = str(view.get("app_version") or _V231_APP_VERSION)
     simulation_mode = str(view.get("simulation_mode") or _V231_SIMULATION_MODE)
     settings_hash = str(view.get("settings_hash") or _v231_settings_hash(trials, seed, view.get("excluded") or []))
+    try:
+        _snap_q = _v326_worker_config_snapshot()
+        if isinstance(_snap_q, dict) and _snap_q:
+            _cfp = _v326_config_json_fingerprint(
+                _snap_q.get("config_json") or _snap_q.get("config")
+            )
+            if _cfp and "|qcfg:" not in str(settings_hash):
+                settings_hash = f"{settings_hash}|qcfg:{_cfp}"
+    except Exception:
+        pass
     label = _v222_race_label(view.get("meta") or {}, race_key)
     payload = zlib.compress(pickle.dumps(view, protocol=pickle.HIGHEST_PROTOCOL), level=6)
-    with sqlite3.connect(db_path) as con:
+    own = con is None
+    if own:
+        con = sqlite3.connect(db_path)
+    try:
         cur = con.execute("""
             INSERT INTO v231_prediction_history
             (race_key,race_label,app_version,simulation_mode,settings_hash,prediction_time,trials,seed,raw_text,venue_override,payload)
             VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (race_key,label,app_version,simulation_mode,settings_hash,now,int(trials or 0),int(seed or 0),str(raw_text or ""),str(venue_override or ""),sqlite3.Binary(payload)))
-        con.commit()
         history_id = int(cur.lastrowid or 0)
-
-    # Ver266: 履歴保存時点のdfから車番別予測競走Tを同時保存。
-    # 失敗しても本体予測履歴の保存は成功扱いにする。
-    try:
-        _v266_save_pred_time_snapshot(
-            db_path=db_path,
-            history_id=history_id,
-            race_key=race_key,
-            app_version=app_version,
-            view=view,
-            source_kind="saved_view",
-        )
-    except Exception:
-        pass
+        if own and commit:
+            con.commit()
+        # Ver266: best-effort（共有TX時は呼び出し側で SAVEPOINT してもよい）
+        if own:
+            try:
+                _v266_save_pred_time_snapshot(
+                    db_path=db_path,
+                    history_id=history_id,
+                    race_key=race_key,
+                    app_version=app_version,
+                    view=view,
+                    source_kind="saved_view",
+                )
+            except Exception:
+                pass
+    finally:
+        if own:
+            try:
+                if commit:
+                    con.commit()
+            except Exception:
+                pass
+            con.close()
     return history_id
 
 def _v231_list_prediction_histories(db_path: str, limit: int = 120) -> list[dict]:
@@ -19962,6 +20686,155 @@ def _v319_result_exists(db_path: str, ymd: str, venue: str, race_no: int) -> boo
         return False
 
 
+
+def _v326_normalize_config_json(cfg) -> str:
+    """config_json の表記ゆれを吸収した正規化文字列。"""
+    import json as _json
+    if cfg is None or cfg == "":
+        return ""
+    if isinstance(cfg, str):
+        try:
+            obj = _json.loads(cfg)
+        except Exception:
+            return str(cfg).strip()
+    else:
+        obj = cfg
+    try:
+        return _json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(cfg)
+
+
+def _v326_config_json_fingerprint(cfg) -> str | None:
+    import hashlib
+    norm = _v326_normalize_config_json(cfg)
+    if not norm:
+        return None
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def _v326_prediction_fingerprint_codes(
+    *,
+    race_key: str,
+    save_version: str,
+    seed: int,
+    input_sha256: str | None,
+    config_json=None,
+    code_commit_sha: str | None = None,
+) -> dict:
+    """二重実行判定用の照合キー（不足時は incomplete）。
+
+    必須: race_key, save_version, seed, config_json(正規化可能)
+    任意: input_sha256, code_commit_sha
+    """
+    sv = str(save_version or "").strip()
+    rk = str(race_key or "").strip()
+    try:
+        sd = int(seed)
+    except Exception:
+        sd = None
+    ih = str(input_sha256 or "").strip() or None
+    cs = str(code_commit_sha or "").strip() or None
+    cfg_fp = _v326_config_json_fingerprint(config_json)
+    complete = bool(rk and sv and sd is not None and cfg_fp)
+    return {
+        "race_key": rk,
+        "save_version": sv,
+        "seed": sd,
+        "input_sha256": ih,
+        "config_fp": cfg_fp,
+        "code_commit_sha": cs,
+        "complete": complete,
+    }
+
+
+def _v326_find_matching_prediction_history(
+    db_path: str,
+    *,
+    race_key: str,
+    save_version: str,
+    seed: int,
+    input_sha256: str | None = None,
+    config_json=None,
+    code_commit_sha: str | None = None,
+) -> dict | None:
+    """同一 fingerprint の予測履歴があれば要約を返す。不足時は同一と断定しない。"""
+    import hashlib
+    fp = _v326_prediction_fingerprint_codes(
+        race_key=race_key,
+        save_version=save_version,
+        seed=seed,
+        input_sha256=input_sha256,
+        config_json=config_json,
+        code_commit_sha=code_commit_sha,
+    )
+    if not fp["complete"]:
+        return None
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as con:
+            tables = {
+                r[0]
+                for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "v231_prediction_history" not in tables:
+                return None
+            keys = [str(fp["race_key"])]
+            m = re.match(
+                r"(\d{4})-?(\d{2})-?(\d{2})_(.+)_(\d+)R?",
+                str(fp["race_key"]),
+            )
+            if m:
+                ymd = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+                try:
+                    keys = _v319_race_key_candidates(ymd, m.group(4), m.group(5))
+                except Exception:
+                    keys = [str(fp["race_key"])]
+            ph = ",".join("?" * len(keys))
+            rows = con.execute(
+                f"""
+                SELECT history_id, race_key, app_version, trials, seed, raw_text, settings_hash
+                  FROM v231_prediction_history
+                 WHERE race_key IN ({ph})
+                   AND app_version = ?
+                   AND seed = ?
+                 ORDER BY history_id DESC
+                 LIMIT 30
+                """,
+                tuple(list(keys) + [fp["save_version"], int(fp["seed"])]),
+            ).fetchall()
+            if not rows:
+                return None
+            want_h = fp.get("input_sha256")
+            want_cfg = fp.get("config_fp")
+            for r in rows:
+                hid, rk, aver, trials, sd, raw, sh = r
+                sh = str(sh or "")
+                if "|qcfg:" not in sh:
+                    continue
+                got_cfg = sh.split("|qcfg:")[-1].strip()
+                if got_cfg != want_cfg:
+                    continue
+                if want_h:
+                    got = hashlib.sha256(
+                        str(raw or "").encode("utf-8", errors="replace")
+                    ).hexdigest()
+                    if got != want_h:
+                        continue
+                return {
+                    "history_id": int(hid or 0),
+                    "race_key": str(rk or ""),
+                    "app_version": str(aver or ""),
+                    "seed": int(sd or 0),
+                    "matched_input_hash": bool(want_h),
+                    "matched_config": True,
+                }
+            return None
+    except Exception:
+        return None
+
+
 def _v319_prediction_exists(db_path: str, race_key: str) -> bool:
     """保存済み予測一覧に出る履歴があるときだけ予測済みとみなす。"""
     try:
@@ -20235,7 +21108,7 @@ def _v319_clear_prediction(db_path: str, race_key: str) -> None:
 
 
 
-def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719, raw_text: str = "", manual_excluded: list | None = None) -> dict:
+def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials: int = 20000, seed: int = 20260719, raw_text: str = "", manual_excluded: list | None = None, abort_cb=None, task_id: int | None = None, owner_token: str | None = None, skip_deferred: bool = False) -> dict:
     """出走表（SP）があればそれを使い、なければ結果のレース前項目だけで予測する。"""
     # 取込経路の OOM 低減（本線手動予測の既定20kは UI 側。ここは上限キャップ）
     try:
@@ -20314,12 +21187,7 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
         meta["レース"] = meta.get("レース") or int(km.group(3))
     if venue:
         meta["開催場"] = meta.get("開催場") or venue
-    saved_key = ""
-    try:
-        saved_key = str(engine.v34_save_prediction_snapshot(meta, df, finish_prob, db_path) or "")
-    except Exception:
-        saved_key = ""
-    key = str(race_key or "").strip() or saved_key
+    key = str(race_key or "").strip()
     view = {
         "df": df, "bets": bets, "output": output, "entries": entries, "meta": meta,
         "finish_prob": finish_prob, "race_key": key,
@@ -20328,11 +21196,179 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
         "prediction_time": _v228_now_jst_iso(), "seed": int(seed),
         "settings_hash": _v231_settings_hash(int(trials), int(seed), []),
     }
+
+    def _check_abort():
+        if callable(abort_cb):
+            abort_cb()
+
+    def _is_slim_recoverable(exc: BaseException) -> bool:
+        # 接続・ロック・スキーマ等は slim 対象外
+        name = type(exc).__name__
+        msg = str(exc).lower()
+        if name in ("OperationalError", "DatabaseError", "ProgrammingError"):
+            if "locked" in msg or "busy" in msg or "readonly" in msg or "no such" in msg:
+                return False
+            if "disk" in msg or "full" in msg:
+                return False
+        if name in ("MemoryError",):
+            return True
+        # pickle/圧縮・巨大payload 系は slim 候補
+        if "pickle" in msg or "payload" in msg or "too large" in msg or "overflow" in msg:
+            return True
+        if name in ("TypeError", "ValueError", "AttributeError", "KeyError"):
+            return True
+        return False
+
+    # --- Worker 所有権付き: 同一TXで snapshot/history/restore/v67/v40/done ---
+    _ot = str(owner_token or "").strip()
+    _tid = int(task_id) if task_id is not None else None
+    if _tid is not None and _ot:
+        try:
+            _check_abort()
+        except _V326OwnershipLost:
+            return {"ok": False, "reason": "ownership_lost", "race_key": key}
+        except _V326SafeStop:
+            return {"ok": False, "reason": "safe_stop", "race_key": key}
+        history_id = 0
+        try:
+            with _v326_queue_connect(db_path, 60.0) as con:
+                con.execute("BEGIN IMMEDIATE")
+                try:
+                    row = con.execute(
+                        """
+                        SELECT 1 FROM v326_import_queue
+                         WHERE task_id=? AND status='running' AND owner_token=?
+                        """,
+                        (_tid, _ot),
+                    ).fetchone()
+                    if not row:
+                        con.execute("ROLLBACK")
+                        return {"ok": False, "reason": "ownership_lost", "race_key": key}
+                    # 計算後・保存前
+                    try:
+                        _check_abort()
+                    except (_V326OwnershipLost, _V326SafeStop) as _ab:
+                        con.execute("ROLLBACK")
+                        return {"ok": False, "reason": "ownership_lost" if isinstance(_ab, _V326OwnershipLost) else "safe_stop", "race_key": key}
+
+                    engine.v34_save_prediction_snapshot(meta, df, finish_prob, db_path, con=con, commit=False)
+                    saved_key = str(engine.v34_race_key(meta) if hasattr(engine, "v34_race_key") else key)
+                    key = str(race_key or "").strip() or saved_key
+                    view["race_key"] = key
+
+                    # history full with SAVEPOINT
+                    con.execute("SAVEPOINT history_full")
+                    try:
+                        history_id = int(
+                            _v231_save_prediction_history(
+                                db_path, key, text, venue, view, int(trials), int(seed),
+                                con=con, commit=False,
+                            ) or 0
+                        )
+                        if not history_id:
+                            raise RuntimeError("history_id=0")
+                        con.execute("RELEASE history_full")
+                    except Exception as exc_full:
+                        try:
+                            con.execute("ROLLBACK TO history_full")
+                            con.execute("RELEASE history_full")
+                        except Exception:
+                            pass
+                        if not _is_slim_recoverable(exc_full):
+                            con.execute("ROLLBACK")
+                            return {"ok": False, "reason": f"{type(exc_full).__name__}: {exc_full}", "race_key": key}
+                        slim = {
+                            "meta": meta, "race_key": key, "trials": int(trials), "seed": int(seed),
+                            "app_version": _v326_effective_save_version(), "prediction_time": view["prediction_time"],
+                            "df": df, "bets": bets, "entries": entries, "finish_prob": finish_prob,
+                        }
+                        try:
+                            history_id = int(
+                                _v231_save_prediction_history(
+                                    db_path, key, text, venue, slim, int(trials), int(seed),
+                                    con=con, commit=False,
+                                ) or 0
+                            )
+                        except Exception as exc_slim:
+                            con.execute("ROLLBACK")
+                            return {"ok": False, "reason": f"{type(exc_slim).__name__}: {exc_slim}", "race_key": key}
+                        if not history_id:
+                            con.execute("ROLLBACK")
+                            return {"ok": False, "reason": "予測履歴の保存に失敗", "race_key": key}
+
+                    _v222_save_prediction_restore(db_path, key, text, venue, view, con=con, commit=False)
+
+                    # v266 best-effort
+                    try:
+                        con.execute("SAVEPOINT v266_best_effort")
+                        _v266_save_pred_time_snapshot(
+                            db_path=db_path, history_id=history_id, race_key=key,
+                            app_version=str(view.get("app_version") or ""), view=view,
+                            source_kind="saved_view",
+                        )
+                        # note: v266 opens own con today; still best-effort outside TX if so
+                        con.execute("RELEASE v266_best_effort")
+                    except Exception:
+                        try:
+                            con.execute("ROLLBACK TO v266_best_effort")
+                            con.execute("RELEASE v266_best_effort")
+                        except Exception:
+                            pass
+
+                    try:
+                        engine.v67_save_ticket_snapshot(meta, bets, int(trials), db_path, con=con, commit=False)
+                        engine.v40_save_prediction_features(meta, df, db_path, con=con, commit=False)
+                    except Exception as exc_p2:
+                        con.execute("ROLLBACK")
+                        return {"ok": False, "reason": f"p2:{type(exc_p2).__name__}: {exc_p2}", "race_key": key}
+
+                    # done 同一TX
+                    now_done = _v228_now_jst_iso()
+                    cur_done = con.execute(
+                        """
+                        UPDATE v326_import_queue
+                           SET status='done', message='', updated_at=?
+                         WHERE task_id=? AND status='running' AND owner_token=?
+                        """,
+                        (now_done, _tid, _ot),
+                    )
+                    if int(cur_done.rowcount or 0) != 1:
+                        con.execute("ROLLBACK")
+                        return {"ok": False, "reason": "ownership_lost", "race_key": key}
+                    con.execute("COMMIT")
+                except Exception:
+                    try:
+                        con.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+            return {"ok": True, "race_key": key, "trials": int(trials), "history_id": history_id, "queue_done": True}
+        except (_V326OwnershipLost, _V326SafeStop) as _ab:
+            return {"ok": False, "reason": "ownership_lost" if isinstance(_ab, _V326OwnershipLost) else "safe_stop", "race_key": key}
+        except Exception as exc:
+            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}", "race_key": key}
+
+    # --- UI / 非所有権パス（従来） ---
+    saved_key = ""
+    try:
+        _check_abort()
+        saved_key = str(engine.v34_save_prediction_snapshot(meta, df, finish_prob, db_path) or "")
+    except _V326OwnershipLost:
+        return {"ok": False, "reason": "ownership_lost", "race_key": key}
+    except _V326SafeStop:
+        return {"ok": False, "reason": "safe_stop", "race_key": key}
+    except Exception:
+        saved_key = ""
+    key = str(race_key or "").strip() or saved_key
+    view["race_key"] = key
     history_id = 0
     save_err = ""
     try:
+        _check_abort()
         history_id = int(_v231_save_prediction_history(db_path, key, text, venue, view, int(trials), int(seed)) or 0)
         _v222_save_prediction_restore(db_path, key, text, venue, view)
+    except (_V326OwnershipLost, _V326SafeStop) as _ab:
+        return {"ok": False, "reason": "ownership_lost" if isinstance(_ab, _V326OwnershipLost) else "safe_stop", "race_key": key}
     except Exception as exc:
         save_err = f"{type(exc).__name__}: {exc}"
         try:
@@ -20341,14 +21377,18 @@ def _v319_run_prerace_prediction(db_path: str, race_key: str, venue: str, trials
                 "app_version": _v326_effective_save_version(), "prediction_time": view["prediction_time"],
                 "df": df, "bets": bets, "entries": entries, "finish_prob": finish_prob,
             }
-            history_id = int(_v231_save_prediction_history(db_path, key, text, venue, slim, int(trials), int(seed)) or 0)
-            save_err = ""
+            if _is_slim_recoverable(exc):
+                history_id = int(_v231_save_prediction_history(db_path, key, text, venue, slim, int(trials), int(seed)) or 0)
+                save_err = ""
+            else:
+                history_id = 0
         except Exception as exc2:
             save_err = f"{type(exc2).__name__}: {exc2}"
-    try:
-        _v217_deferred_prediction_db_save(meta, bets, int(trials), df)
-    except Exception:
-        pass
+    if not skip_deferred:
+        try:
+            _v217_deferred_prediction_db_save(meta, bets, int(trials), df)
+        except Exception:
+            pass
     if not history_id:
         return {"ok": False, "reason": save_err or "予測履歴の保存に失敗", "race_key": key}
     return {"ok": True, "race_key": key, "trials": int(trials), "history_id": history_id}
@@ -21368,6 +22408,91 @@ def _v319_bg_history_any_active(db_path: str) -> bool:
         return False
 
 
+
+def _v326_queue_bind_input_sha256(
+    db_path: str,
+    task_id: int,
+    card_text: str,
+) -> dict:
+    """Worker: card_text の SHA256 をキュー行に初回確定し、不一致を検出する。
+
+    - input_sha256 IS NULL のときだけ条件付き UPDATE
+    - 再 SELECT して最終値と比較
+    - 不一致でも予測続行可（reproducibility_not_guaranteed）
+    """
+    import hashlib
+    out = {
+        "ok": True,
+        "hash": "",
+        "stored": None,
+        "mismatch": False,
+        "codes": [],
+        "message": "",
+    }
+    try:
+        tid = int(task_id or 0)
+    except Exception:
+        tid = 0
+    payload = str(card_text or "")
+    h = hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+    out["hash"] = h
+    if tid <= 0:
+        out["message"] = "task_id なしのため input_sha256 未保存"
+        return out
+    try:
+        _v326_ensure_import_queue(db_path)
+    except Exception:
+        pass
+    now = _v228_now_jst_iso()
+
+    def _run():
+        with _v326_queue_connect(db_path, 30.0) as con:
+            con.execute(
+                """
+                UPDATE v326_import_queue
+                   SET input_sha256 = ?, updated_at = ?
+                 WHERE task_id = ?
+                   AND (input_sha256 IS NULL OR TRIM(COALESCE(input_sha256, '')) = '')
+                """,
+                (h, now, tid),
+            )
+            row = con.execute(
+                """
+                SELECT input_sha256 FROM v326_import_queue WHERE task_id = ? LIMIT 1
+                """,
+                (tid,),
+            ).fetchone()
+            con.commit()
+            return str(row[0] or "") if row else ""
+
+    try:
+        with _V326_QUEUE_LOCK:
+            stored = str(_v326_queue_write_retry(_run) or "")
+    except Exception as exc:
+        out["ok"] = False
+        out["message"] = f"input_sha256 保存失敗: {type(exc).__name__}: {exc}"
+        out["codes"] = ["input_hash_save_failed"]
+        return out
+
+    out["stored"] = stored or None
+    if stored and stored != h:
+        out["mismatch"] = True
+        out["codes"] = [
+            "input_hash_mismatch",
+            "reproducibility_not_guaranteed",
+        ]
+        out["message"] = (
+            "input_hash_mismatch / reproducibility_not_guaranteed "
+            f"(stored={stored[:16]}… now={h[:16]}…)"
+        )
+    elif not stored:
+        out["message"] = "input_sha256 再SELECT 空"
+        out["codes"] = ["input_hash_missing_after_save"]
+    else:
+        out["message"] = "input_sha256 ok"
+    return out
+
+
 def _v319_import_one_race(
     db_path: str, ymd: str, venue: str, race_no: int,
     skip_existing: bool, replace: bool, predict_if_missing: bool, trials: int, seed: int,
@@ -21375,6 +22500,10 @@ def _v319_import_one_race(
     fetch_odds: bool = True,
     register_result: bool = True,
     cancel_cb=None,
+    task_id: int | None = None,
+    owner_token: str | None = None,
+    abort_cb=None,
+    skip_deferred: bool = False,
 ) -> dict:
     """1レース単位の自動取得。
 
@@ -21551,6 +22680,22 @@ def _v319_import_one_race(
                     card_text = "\n".join(_meta_lines) + ("\n" + _body if _body else "")
         except Exception:
             pass
+        # --- input_sha256: 出走表テキスト確定後に初回保存・照合 ---
+        _input_hash_info = {}
+        try:
+            _input_hash_info = _v326_queue_bind_input_sha256(
+                db_path, int(task_id or 0), str(card_text or "")
+            )
+            if _input_hash_info.get("mismatch"):
+                hist_msg = str(hist_msg or "") + " / " + str(
+                    _input_hash_info.get("message") or "input_hash_mismatch"
+                )
+        except Exception as _ih_exc:
+            _input_hash_info = {
+                "ok": False,
+                "codes": ["input_hash_bind_error"],
+                "message": str(_ih_exc),
+            }
         # 公式 Program の latest10List を選手履歴へ先行保存（oddspark不要）
         try:
             _prog = _v319_autorace_program_body(ymd, venue, race_no)
@@ -21791,7 +22936,61 @@ def _v319_import_one_race(
 
     _gc_soft()
     # --- 3) 予測（未保存時）＋出走数不一致／版違いなら再予測 ---
-    pred_ok = _v319_prediction_exists(db_path, key_guess)
+    # 二重実行対策: 同一 fingerprint の履歴があれば予測をスキップして done 側へ
+    _fp_match = None
+    try:
+        _snap = _v326_worker_config_snapshot() if "_v326_worker_config_snapshot" in dir() else None
+        _sv_fp = ""
+        _seed_fp = int(seed)
+        _ih_fp = None
+        if isinstance(_snap, dict) and _snap:
+            _sv_fp = str(_snap.get("save_version") or "").strip()
+            try:
+                _seed_fp = int(_snap.get("seed") if _snap.get("seed") is not None else seed)
+            except Exception:
+                _seed_fp = int(seed)
+            _ih_fp = _snap.get("input_sha256")
+        if not _sv_fp:
+            try:
+                _sv_fp = str(_v326_effective_save_version()).strip()
+            except Exception:
+                _sv_fp = "Ver326"
+        # キュー行に保存済み input_sha256 を優先
+        try:
+            if int(task_id or 0) > 0:
+                with sqlite3.connect(str(db_path), timeout=10) as _cfp:
+                    _rfp = _cfp.execute(
+                        "SELECT input_sha256 FROM v326_import_queue WHERE task_id=? LIMIT 1",
+                        (int(task_id),),
+                    ).fetchone()
+                    if _rfp and _rfp[0]:
+                        _ih_fp = str(_rfp[0])
+        except Exception:
+            pass
+        _cfg_json_fp = None
+        _ccs_fp = None
+        if isinstance(_snap, dict) and _snap:
+            _cfg_json_fp = _snap.get("config_json")
+            _ccs_fp = _snap.get("code_commit_sha")
+        _fp_match = _v326_find_matching_prediction_history(
+            db_path,
+            race_key=key_guess,
+            save_version=_sv_fp,
+            seed=int(_seed_fp),
+            input_sha256=_ih_fp,
+            config_json=_cfg_json_fp,
+            code_commit_sha=_ccs_fp,
+        )
+    except Exception:
+        _fp_match = None
+    if _fp_match:
+        pred_ok = True
+        pred_msg = (
+            f" / 同一fingerprint履歴あり(id={_fp_match.get('history_id')})"
+            f"→予測スキップ"
+        )
+    else:
+        pred_ok = _v319_prediction_exists(db_path, key_guess)
     card_n = len(players or [])
     if not card_n and card_text:
         mm = re.search(r"(\d+)\s*車", str(card_text))
@@ -21817,7 +23016,8 @@ def _v319_import_one_race(
             pred_ok = False
             pred_msg = f" / 予測台数不明のため再予測({card_n}車)"
     # 現行版の予測が無い（他版のみ等）→ 未予測扱いで再予測
-    if pred_ok and not _v319_prediction_matches_current_version(db_path, key_guess):
+    # 同一fingerprint確定済みなら再予測しない
+    if pred_ok and not _fp_match and not _v319_prediction_matches_current_version(db_path, key_guess):
         _old_ver = _v319_latest_prediction_app_version(db_path, key_guess) or "?"
         try:
             _cur_ver = str(_v326_effective_save_version()).strip()
@@ -21839,7 +23039,7 @@ def _v319_import_one_race(
         try:
             if not str(card_text or "").strip():
                 card_text = _v319_build_prediction_text_from_sprace(sp_html, venue, race_no, ymd)
-            pred = _v319_run_prerace_prediction(db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text, manual_excluded=kessha_cars)
+            pred = _v319_run_prerace_prediction(db_path, key_guess, venue, trials=int(trials), seed=int(seed), raw_text=card_text, manual_excluded=kessha_cars, abort_cb=abort_cb, task_id=task_id, owner_token=owner_token, skip_deferred=bool(skip_deferred) or bool(owner_token))
             if not pred.get("ok"):
                 return {
                     "status": "error",
@@ -22175,6 +23375,8 @@ def _v319_import_one_race(
                         db_path, key_guess, venue,
                         trials=int(trials), seed=int(seed),
                         raw_text=card_text, manual_excluded=excl,
+                        abort_cb=abort_cb, task_id=task_id, owner_token=owner_token,
+                        skip_deferred=bool(skip_deferred) or bool(owner_token),
                     )
                     if pred.get("ok"):
                         pred_msg += " / 結果前に再予測"
@@ -22323,11 +23525,27 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
         ymd = str(req.get("ymd") or "")
         venues = list(req.get("venues") or [])
         job_type = "official_import"
+        import uuid as _uuid_mod
+        _worker_owner_token = f"w-{job_id}-{_uuid_mod.uuid4().hex[:12]}"
+        # Job 固定版（開始時に DB へ保存済み）。無ければ req。global 再判定しない。
+        _job_save_version = str((req or {}).get("save_version") or "").strip()
+        try:
+            with sqlite3.connect(str(db_path), timeout=10) as _cj:
+                _rj = _cj.execute(
+                    "SELECT save_version FROM v278_background_jobs WHERE job_id=? LIMIT 1",
+                    (int(job_id),),
+                ).fetchone()
+                if _rj and str(_rj[0] or "").strip():
+                    _job_save_version = str(_rj[0]).strip()
+        except Exception:
+            pass
         try:
             _v326_ensure_import_queue(db_path)
-            # 前回中止の孤児 running → pending（再開可能に）
+            # 前回中止の孤児 running → pending（自分の token or stale/NULL のみ）
             _v326_reset_running_to_pending(
-                db_path, job_type=job_type, reason="起動時に running を pending へ復帰"
+                db_path, job_type=job_type,
+                reason="起動時に running を pending へ復帰",
+                owner_token=_worker_owner_token,
             )
         except Exception:
             pass
@@ -22364,6 +23582,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     _v326_reset_running_to_pending(
                         db_path, job_type=job_type,
                         reason="中止要求により pending に戻しました",
+                        owner_token=_worker_owner_token,
                     )
                 except Exception:
                     pass
@@ -22405,11 +23624,27 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 return
             task = None
             try:
-                task = _v326_pickup_next(db_path, job_type)
+                task = _v326_pickup_next(
+                    db_path, job_type, owner_token=_worker_owner_token
+                )
             except Exception:
                 task = None
             if task is None:
                 break
+            _kind = str((task or {}).get("kind") or "")
+            if _kind in ("", "empty") and not task.get("task_id"):
+                break
+            if _kind == "empty":
+                break
+            if _kind == "skipped_invalid":
+                err += 1
+                details.append({
+                    "venue": "", "R": 0, "status": "error",
+                    "message": str(task.get("error") or "版設定不正"),
+                    "task_id": int(task.get("task_id") or 0),
+                })
+                continue
+            # kind=task または後方互換（kind 無し・task_id あり）
             i += 1
             vn = str(task.get("venue") or "")
             n = int(task.get("race_no") or 0)
@@ -22433,9 +23668,99 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 done_count=max(0, int(ok) + int(skip) + int(err)),
                 total_count=max(1, total),
             )
+            # W07 A+B heartbeat + ownership abort
+            _ownership_lost = threading.Event()
+            _safe_stop = threading.Event()
+            _hb_stop = threading.Event()
+            _hb_thread = None
+            _ot_local = str(_worker_owner_token or "")
+
+            def _abort_cb():
+                if _ownership_lost.is_set():
+                    raise _V326OwnershipLost()
+                if _safe_stop.is_set():
+                    raise _V326SafeStop()
+
+            def _hb_timer_loop():
+                err_streak = 0
+                while not _hb_stop.wait(float(globals().get("_V326_QUEUE_HEARTBEAT_SEC", 300))):
+                    if not task_id or not _ot_local:
+                        break
+                    code = _v326_queue_heartbeat(db_path, int(task_id), _ot_local)
+                    if code == "lost":
+                        _ownership_lost.set()
+                        _hb_stop.set()
+                        return
+                    if code == "busy":
+                        continue
+                    if code == "error":
+                        err_streak += 1
+                        if err_streak >= int(globals().get("_V326_HB_ERROR_STREAK_LIMIT", 3)):
+                            _safe_stop.set()
+                            _hb_stop.set()
+                            return
+                    else:
+                        err_streak = 0
+
+            if task_id and _ot_local:
+                try:
+                    _v326_queue_heartbeat(db_path, int(task_id), _ot_local)
+                except Exception:
+                    pass
+                _hb_thread = threading.Thread(
+                    target=_hb_timer_loop, name=f"qhb-{task_id}", daemon=False
+                )
+                _hb_thread.start()
+
+            def _on_step_wrapped(msg, vn=vn, n=n, i=i):
+                _abort_cb()
+                if task_id and _ot_local:
+                    code = _v326_queue_heartbeat(db_path, int(task_id), _ot_local)
+                    if code == "lost":
+                        _ownership_lost.set()
+                        raise _V326OwnershipLost()
+                try:
+                    _v278_bg_update(
+                        db_path, job_id,
+                        current_label=f"{vn} {n}R｜{msg}",
+                        message=f"登録{ok}/skip{skip}/err{err}｜今は{msg}",
+                        done_count=i - 1,
+                    )
+                except Exception:
+                    pass
             item = {"venue": vn, "R": n, "status": "", "message": "", "task_id": task_id,
                      "task_mode": str(task.get("task_mode") or "normal")}
             try:
+                # 版固定: キュー行 config を thread-local に載せる
+                _cfg = task.get("config") if isinstance(task.get("config"), dict) else None
+                if not _cfg:
+                    try:
+                        _cfg = _v326_validate_queue_config_row(task)
+                    except Exception as _cfg_exc:
+                        err += 1
+                        if task_id:
+                            _v326_update_task_status(
+                                db_path, task_id, "error", f"版設定不正: {_cfg_exc}"[:500]
+                            , owner_token=_worker_owner_token)
+                        details.append({
+                            "venue": vn, "R": n, "status": "error",
+                            "message": str(_cfg_exc), "task_id": task_id,
+                        })
+                        continue
+                _v326_set_worker_config_snapshot(_cfg)
+                # Job と queue の save_version 不一致は警告のみ（上書きしない）
+                try:
+                    _qsv = str((_cfg or {}).get("save_version") or task.get("save_version") or "").strip()
+                    if _job_save_version and _qsv and _job_save_version != _qsv:
+                        _v278_bg_update(
+                            db_path, job_id,
+                            message=(
+                                f"版不一致警告 job={_job_save_version} queue={_qsv} "
+                                f"{vn} {n}R（queue固定版で継続）"
+                            ),
+                        )
+                except Exception:
+                    pass
                 # task 行のオプション優先（追加時の意図を保持）。無ければ job の req。
                 _t_skip = task.get("skip_existing")
                 _t_repl = task.get("replace")
@@ -22443,6 +23768,13 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 _t_odds = task.get("fetch_odds")
                 _t_reg = task.get("register_result")
                 _task_mode = str(task.get("task_mode") or req.get("task_mode") or "normal").strip().lower()
+                _seed_use = _cfg.get("seed")
+                if _seed_use is None:
+                    _seed_use = int(req.get("seed") or 20260719)
+                try:
+                    _seed_use = int(_seed_use)
+                except Exception:
+                    _seed_use = 20260719
                 if _task_mode == "history_only":
                     one = _v319_import_player_history_one_race(
                         db_path, ymd_t, vn, n,
@@ -22456,24 +23788,41 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         ),
                     )
                 else:
-                    one = _v319_import_one_race(
-                        db_path, ymd_t, vn, n,
-                        skip_existing=bool(_t_skip if _t_skip is not None else req.get("skip_existing")),
-                        replace=bool(_t_repl if _t_repl is not None else req.get("replace")),
-                        predict_if_missing=bool(_t_pred if _t_pred is not None else req.get("predict_if_missing")),
-                        trials=int(req.get("trials") or 20000),
-                        seed=int(req.get("seed") or 20260719),
-                        fetch_odds=bool(_t_odds if _t_odds is not None else req.get("fetch_odds", True)),
-                        register_result=bool(_t_reg if _t_reg is not None else req.get("register_result", True)),
-                        cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
-                        on_step=lambda msg, vn=vn, n=n, i=i: _v278_bg_update(
-                            db_path, job_id,
-                            current_label=f"{vn} {n}R｜{msg}",
-                            message=f"登録{ok}/skip{skip}/err{err}｜今は{msg}",
-                            done_count=i - 1,
-                        ),
-                    )
+                    try:
+                        one = _v319_import_one_race(
+                            db_path, ymd_t, vn, n,
+                            skip_existing=bool(_t_skip if _t_skip is not None else req.get("skip_existing")),
+                            replace=bool(_t_repl if _t_repl is not None else req.get("replace")),
+                            predict_if_missing=bool(_t_pred if _t_pred is not None else req.get("predict_if_missing")),
+                            trials=int(req.get("trials") or 20000),
+                            seed=int(_seed_use),
+                            fetch_odds=bool(_t_odds if _t_odds is not None else req.get("fetch_odds", True)),
+                            register_result=bool(_t_reg if _t_reg is not None else req.get("register_result", True)),
+                            cancel_cb=lambda: _v278_bg_cancel_requested(db_path, job_id),
+                            on_step=_on_step_wrapped,
+                            task_id=int(task_id or 0) or None,
+                            owner_token=_ot_local or None,
+                            abort_cb=_abort_cb,
+                            skip_deferred=True,
+                        )
+                    except _V326OwnershipLost:
+                        one = {"status": "error", "message": "ownership_lost", "phase": "ownership"}
+                    except _V326SafeStop:
+                        one = {"status": "error", "message": "safe_stop", "phase": "safe_stop"}
+                    finally:
+                        try:
+                            _hb_stop.set()
+                            if _hb_thread is not None:
+                                _hb_thread.join(timeout=max(5.0, float(globals().get("_V326_QUEUE_HEARTBEAT_SEC", 300)) * 0.05 + 15.0))
+                                if _hb_thread.is_alive():
+                                    _safe_stop.set()
+                        except Exception:
+                            pass
                 if str(one.get("status") or "") == "cancelled":
+                    try:
+                        _v326_set_worker_config_snapshot(None)
+                    except Exception:
+                        pass
                     details.append({
                         "venue": vn, "R": n, "status": "cancelled",
                         "message": one.get("message") or "中止",
@@ -22487,12 +23836,12 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         if task_id:
                             _v326_update_task_status(
                                 db_path, task_id, "pending",
-                                "中止要求により pending に戻しました",
-                            )
+                                "中止要求により pending に戻しました", owner_token=_worker_owner_token)
                         _v326_reset_running_to_pending(
                             db_path, job_type=job_type,
                             reason="中止要求により pending に戻しました",
-                        )
+                        owner_token=_worker_owner_token,
+                    )
                     except Exception:
                         pass
                     _qs = _v326_queue_summary(db_path, job_type)
@@ -22525,6 +23874,10 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         pending=int(_qs.get("pending") or 0),
                     )
                     return
+                try:
+                    _v326_set_worker_config_snapshot(None)
+                except Exception:
+                    pass
                 item["status"] = one.get("status") or "ok"
                 item["message"] = one.get("message") or ""
                 item["phase"] = one.get("phase") or ""
@@ -22536,17 +23889,17 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     if task_id:
                         _v326_update_task_status(
                             db_path, task_id, "skipped", item.get("message") or "登録済み"
-                        )
+                        , owner_token=_worker_owner_token)
                 elif st_one in ("error", "failed"):
                     err += 1
                     if task_id:
                         _v326_update_task_status(
                             db_path, task_id, "error", item.get("message") or "error"
-                        )
+                        , owner_token=_worker_owner_token)
                 else:
                     ok += 1
                     if task_id:
-                        _v326_update_task_status(db_path, task_id, "done", "")
+                        _v326_update_task_status(db_path, task_id, "done", "", owner_token=_worker_owner_token)
             except Exception as exc:
                 item["status"] = "error"
                 item["phase"] = "exception"
@@ -22556,7 +23909,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     if task_id:
                         _v326_update_task_status(
                             db_path, task_id, "error", item["message"]
-                        )
+                        , owner_token=_worker_owner_token)
                 except Exception:
                     pass
             _ = details.append(item)
@@ -22764,20 +24117,7 @@ def _v319_bg_import_start(
     if pending_n <= 0 and not enqueue:
         return {"ok": False, "reason": "実行する pending がありません。先にキューへ追加してください。"}
     now = _v228_now_jst_iso()
-    with sqlite3.connect(str(db_path), timeout=30.0) as con:
-        con.execute("PRAGMA busy_timeout=30000")
-        cur = con.execute("""
-            INSERT INTO v278_background_jobs(
-                job_type,app_version,status,created_at,updated_at,limit_count,force_current,
-                done_count,total_count,current_label,message
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            "official_import", str(_V231_APP_VERSION), "queued", now, now, max(1, len(venues or [])), 0,
-            0, pending_n, "準備中",
-            f"キュー実行 pending={qs0.get('pending',0)} (追加{enqueued})",
-        ))
-        con.commit()
-        job_id = int(cur.lastrowid or 0)
+    # Job開始時に版を1回だけ確定（再開時に global/session から再判定しない）
     try:
         _sv = str(_v326_effective_save_version()).strip()
     except Exception:
@@ -22786,6 +24126,27 @@ def _v319_bg_import_start(
         _v330_on = bool(_v330a_active())
     except Exception:
         _v330_on = False
+    try:
+        _v278_bg_ensure_table(db_path)
+    except Exception:
+        pass
+    with sqlite3.connect(str(db_path), timeout=30.0) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        cur = con.execute("""
+            INSERT INTO v278_background_jobs(
+                job_type,app_version,save_version,status,created_at,updated_at,limit_count,force_current,
+                done_count,total_count,current_label,message
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            "official_import",
+            str(_V231_APP_VERSION),
+            str(_sv or "") or None,
+            "queued", now, now, max(1, len(venues or [])), 0,
+            0, pending_n, "準備中",
+            f"キュー実行 pending={qs0.get('pending',0)} (追加{enqueued}) save={_sv}",
+        ))
+        con.commit()
+        job_id = int(cur.lastrowid or 0)
     # UI描画で globals 同期済みでも worker 用に明示
     try:
         globals()["_V330A_EXPERIMENT"] = bool(_v330_on)
@@ -39460,6 +40821,33 @@ elif selected_main_page == "🏁 予測":
         else:
             st.caption("自動検出された欠車はありません。必要な車番だけ選択してください。")
 
+    # Ver330-A: 予測タブ表示（session を公式取込トグルと同期）
+    st.markdown("#### 予測バージョン")
+    if "v330a_toggle" not in st.session_state:
+        st.session_state["v330a_toggle"] = False
+    if "v330a_toggle_pred" not in st.session_state:
+        st.session_state["v330a_toggle_pred"] = bool(st.session_state.get("v330a_toggle", False))
+    _v330a_pred_on = st.checkbox(
+        "Ver330-A（周6抑制のみ）",
+        key="v330a_toggle_pred",
+        help="ON時: 周6抑制。開始時に版固定。実行中の変更は当実行に影響しません。",
+    )
+    # 双方向同期（次の rerun で公式取込側も一致）
+    try:
+        if bool(st.session_state.get("v330a_toggle")) != bool(_v330a_pred_on):
+            st.session_state["v330a_toggle"] = bool(_v330a_pred_on)
+    except Exception:
+        pass
+    try:
+        _pred_sv_ui = str(_v326_effective_save_version()).strip()
+    except Exception:
+        _pred_sv_ui = "Ver326"
+    st.caption(
+        f"現在の保存予定版: **{_pred_sv_ui}**"
+        + ("（Ver330-A ON）" if _v330a_pred_on else "（本線）")
+        + "｜「予測」開始時に snapshot 固定"
+    )
+
     # Ver279: 通常1R予測は、従来の前面実行に加えてバックグラウンド実行も選べる。
     # バックグラウンド側はStreamlit描画やsession_stateを触らず、計算・DB保存だけを行う。
     _v279_bg_job = _v279_bg_prediction_get_latest(engine.DB_PATH)
@@ -39579,7 +40967,7 @@ elif selected_main_page == "🏁 予測":
                 if _bgstart.get("ok"):
                     st.session_state["v301_bg_expected_job_id"]=int(_bgstart.get("job_id") or 0)
                     st.session_state["v279_bg_loaded_job_id"]=0
-                    st.success(f"バックグラウンド予測を開始しました（ジョブID: {_bgstart.get('job_id')}）。他の画面へ移動できます。")
+                    st.success(f"バックグラウンド予測を開始しました（ジョブID: {_bgstart.get('job_id')} / save={_v326_effective_save_version()}）。他の画面へ移動できます。")
                     st.rerun()
                 else:
                     st.warning(str(_bgstart.get("reason") or "バックグラウンド予測を開始できませんでした。"))
@@ -39593,6 +40981,26 @@ elif selected_main_page == "🏁 予測":
         if not detected_prediction_venue and not prediction_venue_override:
             st.warning("開催場を選択してください。")
             st.stop()
+        # 開始時 snapshot 固定（実行中のトグル変更を無視）
+        try:
+            _fg_snap = _v326_build_queue_config_snapshot()
+        except Exception as _fge:
+            _fg_snap = {
+                "save_version": str(_v326_effective_save_version()),
+                "seed": int(seed),
+                "v330a_enabled": bool(_v330a_active()),
+                "error": str(_fge),
+            }
+        st.session_state["_v330a_pred_run_snapshot"] = _fg_snap
+        try:
+            _v326_set_worker_config_snapshot(_fg_snap)
+        except Exception:
+            pass
+        st.info(
+            f"予測開始：save_version=**{_fg_snap.get('save_version')}** "
+            f"seed={_fg_snap.get('seed')} "
+            f"（この実行中はトグル変更を反映しません）"
+        )
         try:
             prediction_text = text
             if prediction_venue_override:
