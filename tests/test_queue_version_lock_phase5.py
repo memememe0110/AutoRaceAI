@@ -66,6 +66,8 @@ class Harness:
     def __init__(self, app_path, *, tasks, behavior="ok", hang=False, join_timeout=0.3, hb_interval=0.02,
                  work_sleep=0.1, run_in_thread=False):
         self.g = g = load(app_path)
+        self.logs = []
+        g["print"] = lambda *args, **kwargs: self.logs.append(" ".join(str(x) for x in args))
         g["_V326_QUEUE_HEARTBEAT_SEC"] = hb_interval
         g["_V326_HB_JOIN_TIMEOUT_SEC"] = join_timeout
         self.tasks = list(tasks)
@@ -571,13 +573,11 @@ def p5_25(app):
     h = Harness(app, tasks=[task(1), task(2)], behavior="ownership_lost",
                 hb_interval=0.01, work_sleep=0.06).run()
     st = [(x[0], x[1]) for x in h.status_updates]
-    logs = [line for line in h.g.get("_TEST_LOGS", [])]
-    # print は Harness の実行環境で捕捉していないため、worker counter の出力経路を静的にも確認する。
-    src = open(app, encoding="utf-8").read()
+    logs = [line for line in h.logs if "[queue] ownership_lost task=" in line]
     ok = h.picked == [1, 2] and (1, "error") in st and (2, "done") in st
-    ok = ok and "ownership_lost task=" in src and "_ownership_lost_count += 1" in src
+    ok = ok and len(logs) == 1 and "count=1" in logs[0]
     h.cleanup()
-    return ok, {"picked": h.picked, "task_status": st, "ownership_log_code": ok}
+    return ok, {"picked": h.picked, "task_status": st, "ownership_logs": logs}
 
 
 TESTS = [("P5-12", p5_12), ("P5-13", p5_13), ("P5-14", p5_14), ("P5-15", p5_15), ("P5-16", p5_16),
