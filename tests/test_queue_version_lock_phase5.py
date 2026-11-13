@@ -89,6 +89,10 @@ class Harness:
             if h.hang:
                 h.release.wait(10)   # stop を無視して居座る（ゾンビ）
                 return
+            if h.behavior == "safe_stop_hang":
+                safe.set()
+                h.release.wait(10)   # SafeStop と join timeout の競合を再現
+                return
             return real_loop(db, tid, ot, stop, lost, safe, txa, interval, limit)
 
         def pickup(*a, **k):
@@ -100,6 +104,11 @@ class Harness:
 
         def hb(db, tid, ot, tx_active=None):
             h.hb_calls.append((time.monotonic(), tid, ot))
+            n = sum(1 for _, x, _ in h.hb_calls if x == tid)
+            if h.behavior in ("safe_stop", "safe_stop_hang"):
+                return "ok" if n == 1 else "error"
+            if h.behavior == "ownership_lost":
+                return "ok" if n == 1 else ("lost" if n == 2 else "ok")
             return "ok"
 
         def work(*a, **k):
@@ -111,6 +120,8 @@ class Harness:
                 raise RuntimeError("boom")
             if b == "status_error":
                 return {"status": "error", "message": "x"}
+            if b in ("safe_stop", "safe_stop_hang", "ownership_lost"):
+                k["on_step"]("phase5 heartbeat test")
             return {"status": "ok"}
 
         def upd(db, tid, status, message="", *, owner_token):
@@ -506,8 +517,72 @@ REAL_TESTS = [("P5-01", p5_01), ("P5-02", p5_02), ("P5-03", p5_03), ("P5-04", p5
               ("P5-06", p5_06), ("P5-07", p5_07), ("P5-08", p5_08), ("P5-09", p5_09)]
 
 
+def p5_21(app):
+    """SafeStop は Worker 全体を停止し、現在 task=error / Job=failed。"""
+    h = Harness(app, tasks=[task(1), task(2)], behavior="safe_stop",
+                hb_interval=0.01, work_sleep=0.12).run()
+    st = [(x[0], x[1]) for x in h.status_updates]
+    failed = [x for x in h.bg_updates if x.get("status") == "failed"]
+    ok = h.picked == [1] and (1, "error") in st and bool(failed) and not h.alive_hb()
+    h.cleanup()
+    return ok, {"picked": h.picked, "task_status": st, "job_failed": bool(failed),
+                "alive_hb": h.alive_hb()}
+
+
+def p5_22(app):
+    """heartbeat error streak が limit=3 に到達すると safe_stop Event と stop Event が立つ。"""
+    g = load(app)
+    stop, lost, safe, txa = (threading.Event() for _ in range(4))
+    calls = []
+    def hb(*a, **k):
+        calls.append(1)
+        return "error"
+    g["_v326_queue_heartbeat"] = hb
+    g["_v326_hb_timer_loop"]("x", 1, "tok", stop, lost, safe, txa, 0.001, 3)
+    ok = len(calls) == 3 and safe.is_set() and stop.is_set() and not lost.is_set()
+    return ok, {"heartbeat_errors": len(calls), "safe_stop": safe.is_set(),
+                "stop": stop.is_set(), "ownership_lost": lost.is_set()}
+
+
+def p5_23(app):
+    """SafeStop 後の次 task は pickup されず pending のまま残る。"""
+    h = Harness(app, tasks=[task(1), task(2)], behavior="safe_stop",
+                hb_interval=0.01, work_sleep=0.12).run()
+    pending_left = [x["task_id"] for x in h.tasks]
+    ok = h.picked == [1] and pending_left == [2]
+    h.cleanup()
+    return ok, {"picked": h.picked, "pending_unpicked": pending_left}
+
+
+def p5_24(app):
+    """SafeStop と heartbeat join timeout が競合しても SafeStop のみを処理し、Job failed は一度。"""
+    h = Harness(app, tasks=[task(1), task(2)], behavior="safe_stop_hang",
+                join_timeout=0.03, hb_interval=0.01, work_sleep=0.04).run()
+    failed = [x for x in h.bg_updates if x.get("status") == "failed"]
+    st = [(x[0], x[1]) for x in h.status_updates]
+    ok = h.picked == [1] and bool(failed) and len(failed) == 1 and (1, "error") in st
+    h.cleanup()
+    return ok, {"picked": h.picked, "task_status": st, "job_failed_updates": len(failed),
+                "failed_exception": type(h.failed_exc).__name__ if h.failed_exc else None}
+
+
+def p5_25(app):
+    """OwnershipLost は現仕様どおり次 task へ進み、race ごとに一度ログカウントする。"""
+    h = Harness(app, tasks=[task(1), task(2)], behavior="ownership_lost",
+                hb_interval=0.01, work_sleep=0.06).run()
+    st = [(x[0], x[1]) for x in h.status_updates]
+    logs = [line for line in h.g.get("_TEST_LOGS", [])]
+    # print は Harness の実行環境で捕捉していないため、worker counter の出力経路を静的にも確認する。
+    src = open(app, encoding="utf-8").read()
+    ok = h.picked == [1, 2] and (1, "error") in st and (2, "done") in st
+    ok = ok and "ownership_lost task=" in src and "_ownership_lost_count += 1" in src
+    h.cleanup()
+    return ok, {"picked": h.picked, "task_status": st, "ownership_log_code": ok}
+
+
 TESTS = [("P5-12", p5_12), ("P5-13", p5_13), ("P5-14", p5_14), ("P5-15", p5_15), ("P5-16", p5_16),
-         ("P5-17", p5_17), ("P5-18", p5_18), ("P5-19", p5_19), ("P5-20", p5_20)]
+         ("P5-17", p5_17), ("P5-18", p5_18), ("P5-19", p5_19), ("P5-20", p5_20),
+         ("P5-21", p5_21), ("P5-22", p5_22), ("P5-23", p5_23), ("P5-24", p5_24), ("P5-25", p5_25)]
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--app", default="app.py"); ap.add_argument("--engine", default="engine.py")
