@@ -23764,15 +23764,19 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     else:
                         err_streak = 0
 
-            if task_id and _ot_local:
+            _hb_holder = {"t": None}
+
+            def _hb_shutdown():
+                """heartbeat スレッドを停止・join（冪等）。全終了経路から呼ぶ。"""
                 try:
-                    _v326_queue_heartbeat(db_path, int(task_id), _ot_local)
+                    _hb_stop.set()
+                    _t = _hb_holder.get("t")
+                    if _t is not None:
+                        _t.join(timeout=max(5.0, float(globals().get("_V326_QUEUE_HEARTBEAT_SEC", 300)) * 0.05 + 15.0))
+                        if _t.is_alive():
+                            _safe_stop.set()
                 except Exception:
                     pass
-                _hb_thread = threading.Thread(
-                    target=_hb_timer_loop, name=f"qhb-{task_id}", daemon=False
-                )
-                _hb_thread.start()
 
             def _on_step_wrapped(msg, vn=vn, n=n, i=i):
                 _abort_cb()
@@ -23793,6 +23797,17 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             item = {"venue": vn, "R": n, "status": "", "message": "", "task_id": task_id,
                      "task_mode": str(task.get("task_mode") or "normal")}
             try:
+                # heartbeat 開始は try の内側（以降のどの終了経路でも finally で止まる）
+                if task_id and _ot_local:
+                    try:
+                        _v326_queue_heartbeat(db_path, int(task_id), _ot_local)
+                    except Exception:
+                        pass
+                    _hb_thread = threading.Thread(
+                        target=_hb_timer_loop, name=f"qhb-{task_id}", daemon=False
+                    )
+                    _hb_holder["t"] = _hb_thread
+                    _hb_thread.start()
                 # 版固定: キュー行 config を thread-local に載せる
                 _cfg = task.get("config") if isinstance(task.get("config"), dict) else None
                 if not _cfg:
@@ -23872,14 +23887,9 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     except _V326SafeStop:
                         one = {"status": "error", "message": "safe_stop", "phase": "safe_stop"}
                     finally:
-                        try:
-                            _hb_stop.set()
-                            if _hb_thread is not None:
-                                _hb_thread.join(timeout=max(5.0, float(globals().get("_V326_QUEUE_HEARTBEAT_SEC", 300)) * 0.05 + 15.0))
-                                if _hb_thread.is_alive():
-                                    _safe_stop.set()
-                        except Exception:
-                            pass
+                        _hb_shutdown()
+                # 状態更新の前に heartbeat を止める（履歴のみ経路を含む）
+                _hb_shutdown()
                 if str(one.get("status") or "") == "cancelled":
                     try:
                         _v326_set_worker_config_snapshot(None)
@@ -23963,6 +23973,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     if task_id:
                         _v326_update_task_status(db_path, task_id, "done", "", owner_token=_worker_owner_token)
             except Exception as exc:
+                _hb_shutdown()
                 item["status"] = "error"
                 item["phase"] = "exception"
                 item["message"] = f"{type(exc).__name__}: {exc}"
@@ -23974,6 +23985,9 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         , owner_token=_worker_owner_token)
                 except Exception:
                     pass
+            finally:
+                # 版設定エラー(continue)・中止(return)・予測エラー・例外・正常のすべてで停止
+                _hb_shutdown()
             _ = details.append(item)
             fail_hint = ""
             if str(item.get("status") or "") in ("error", "failed"):
