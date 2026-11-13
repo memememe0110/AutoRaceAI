@@ -24169,6 +24169,10 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                         , owner_token=_worker_owner_token)
                 except Exception:
                     pass
+            except _V326SafeStop:
+                raise
+            except _V326HeartbeatJoinTimeout:
+                raise
             finally:
                 # 版設定エラー(continue)・中止(return)・予測エラー・例外・正常のすべてで停止。
                 # finally の中では raise しない（本体の例外・return・continue を上書きしないため）。
