@@ -3597,7 +3597,15 @@ class _V326OwnershipLost(Exception):
 
 
 class _V326SafeStop(Exception):
-    """Worker should stop without claiming ownership_lost."""
+    """Heartbeat の連続エラー等で Worker 全体を安全停止する。"""
+
+    def __init__(self, task_id=None, owner_token=None, reason=""):
+        self.task_id = int(task_id or 0)
+        self.owner_token = str(owner_token or "")
+        self.reason = str(reason or "")
+        super().__init__(
+            f"safe_stop: task_id={self.task_id} reason={self.reason or 'unspecified'}"
+        )
 
 
 class _V326HeartbeatJoinTimeout(Exception):
@@ -23884,11 +23892,15 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             _ot_local = str(_worker_owner_token or "")
             _hb_zombie = False
 
-            def _abort_cb(_lost=_ownership_lost, _safe=_safe_stop):
+            def _abort_cb(_lost=_ownership_lost, _safe=_safe_stop,
+                          _tid=task_id, _ot=_ot_local):
+                # 両方セット時は Worker 全体を止める SafeStop を優先する。
+                if _safe.is_set():
+                    raise _V326SafeStop(
+                        _tid, _ot, "heartbeat_error_streak"
+                    )
                 if _lost.is_set():
                     raise _V326OwnershipLost()
-                if _safe.is_set():
-                    raise _V326SafeStop()
 
             def _hb_shutdown(_stop=_hb_stop, _ctx=_hb_ctx, _safe=_safe_stop) -> bool:
                 """heartbeat を停止・join（冪等・例外を投げない）。
@@ -24043,9 +24055,12 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     except _V326OwnershipLost:
                         one = {"status": "error", "message": "ownership_lost", "phase": "ownership"}
                     except _V326SafeStop:
-                        one = {"status": "error", "message": "safe_stop", "phase": "safe_stop"}
+                        raise
                     finally:
                         _hb_shutdown()
+                    # 保存関数側が safe_stop を戻り値へ変換した場合も、
+                    # 次レースへ進む前に Worker 全体の停止を表面化させる。
+                    _abort_cb()
                 # 状態更新の前に heartbeat を止める（履歴のみ経路を含む）。
                 # 止まらなければ done にせず error 扱い（Worker は finally 後に停止する）。
                 if not _hb_shutdown() and str(one.get("status") or "") != "cancelled":
@@ -24288,6 +24303,34 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             message=f"自動取得完了｜完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}{gh_msg}{_recalc_suffix}",
             result_blob=blob,
         )
+    except _V326SafeStop as exc:
+        _safe_task_id = int(getattr(exc, "task_id", 0) or 0)
+        _safe_owner = str(getattr(exc, "owner_token", "") or "")
+        _status_saved = False
+        if _safe_task_id and _safe_owner:
+            try:
+                _status_saved = bool(_v326_update_task_status(
+                    db_path,
+                    _safe_task_id,
+                    "error",
+                    f"safe_stop: heartbeat連続エラー ({getattr(exc, 'reason', '')})"[:500],
+                    owner_token=_safe_owner,
+                ))
+            except Exception:
+                _status_saved = False
+        try:
+            _v278_bg_update(
+                db_path, job_id,
+                status="failed",
+                finished_at=_v228_now_jst_iso(),
+                error_text=f"safe_stop: {exc}",
+                message=(
+                    "Worker停止：heartbeat連続エラーによる安全停止"
+                    + ("" if _status_saved else "（対象タスクの状態更新は未確認）")
+                ),
+            )
+        except Exception:
+            pass
     except Exception as exc:
         _v278_bg_update(
             db_path, job_id,
