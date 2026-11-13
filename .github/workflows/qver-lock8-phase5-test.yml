@@ -7,7 +7,9 @@ on:
     paths:
       - "app.py"
       - "engine.py"
-      - "tests/test_queue_version_lock_phase5.py"\n      - "tests/test_queue_done_defer.py"\n      - "tests/qver_realcode.py"
+      - "tests/test_queue_version_lock_phase5.py"
+      - "tests/test_queue_done_defer.py"
+      - "tests/qver_realcode.py"
       - ".github/workflows/qver-lock8-phase5-test.yml"
   workflow_dispatch:
 
@@ -41,8 +43,9 @@ jobs:
 
       - name: Compile changed Python files
         run: |
-          python -m py_compile app.py engine.py tests/test_queue_version_lock_phase5.py
+          python -m py_compile app.py engine.py tests/test_queue_version_lock_phase5.py tests/test_queue_done_defer.py tests/qver_realcode.py
 
       - name: Run Phase 5 regression tests
         run: |
-          python tests/test_queue_done_defer.py\n          python tests/test_queue_version_lock_phase5.py
+          python tests/test_queue_done_defer.py
+          python tests/test_queue_version_lock_phase5.py
