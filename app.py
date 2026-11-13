@@ -24042,11 +24042,18 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                     try:
                         _cfg = _v326_validate_queue_config_row(task)
                     except Exception as _cfg_exc:
-                        err += 1
                         if task_id:
-                            _v326_update_task_status(
-                                db_path, task_id, "error", f"版設定不正: {_cfg_exc}"[:500]
-                            , owner_token=_worker_owner_token)
+                            _cfg_ok, _cfg_reason = _v326_update_task_status_ex(
+                                db_path, task_id, "error", f"版設定不正: {_cfg_exc}"[:500],
+                                owner_token=_worker_owner_token,
+                            )
+                            _status_reason_counts[_cfg_reason] = _status_reason_counts.get(_cfg_reason, 0) + 1
+                            if _cfg_ok or _cfg_reason != "ownership_lost":
+                                err += 1
+                            if not _cfg_ok:
+                                print(f"[queue] task={task_id} config error update failed: {_cfg_reason}", flush=True)
+                        else:
+                            err += 1
                         details.append({
                             "venue": vn, "R": n, "status": "error",
                             "message": str(_cfg_exc), "task_id": task_id,
@@ -24349,6 +24356,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
         blob = zlib.compress(pickle.dumps({
             "ok": ok, "skip": skip, "error": err, "details": details,
             "failed_keys": failed_keys,
+            "queue_status_reasons": dict(_status_reason_counts),
             "summary": f"自動取得が完了しました。完了：{ok}R / スキップ：{skip}R / 失敗：{err}R",
         }, protocol=4), 6)
         # 完了時: 先に通知、GitHubは軽量保存（リモート全取得なし）
@@ -24359,6 +24367,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             body = (
                 f"自動取得完了 {ymd}\n"
                 f"完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}\n"
+                f"queue_status={_status_reason_counts}\n"
                 f"GitHub軽量保存を開始します"
             )
             payload = {
@@ -24402,7 +24411,8 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             finished_at=_v228_now_jst_iso(),
             done_count=total,
             current_label="完了",
-            message=f"自動取得完了｜完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}{gh_msg}{_recalc_suffix}",
+            message=f"自動取得完了｜完了{ok} / スキップ{skip} / 失敗{err}{fail_summary}"
+                    f"｜queue_status={_status_reason_counts}{gh_msg}{_recalc_suffix}",
             result_blob=blob,
         )
     except _V326SafeStop as exc:
