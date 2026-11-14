@@ -4,20 +4,9 @@ run-name: "Result audit ${{ github.event_name }}"
 # Read-only audit of all registered result races from the latest immutable DB snapshot.
 # No DB files are uploaded; only CSV and summary JSON are retained.
 on:
-  schedule:
-    - cron: "0 22 * * *" # 07:00 JST every day
-  workflow_dispatch:
-    inputs:
-      db_branch:
-        description: "Source DB branch"
-        required: true
-        default: "autorace-db"
-        type: string
-      expected_generation:
-        description: "Optional generation guard (blank = latest)"
-        required: false
-        default: ""
-        type: string
+  push:
+    branches:
+      - tmp-run-result-audit-gen701
 
 permissions:
   contents: read
@@ -48,8 +37,8 @@ jobs:
       - name: Resolve inputs
         id: params
         env:
-          IN_BRANCH: ${{ inputs.db_branch }}
-          IN_EXPECTED_GENERATION: ${{ inputs.expected_generation }}
+          IN_BRANCH: "autorace-db"
+          IN_EXPECTED_GENERATION: "701"
         run: |
           set -euo pipefail
           branch="$IN_BRANCH"
