@@ -1,5 +1,5 @@
 from __future__ import annotations
-import io, math, re, sqlite3, hashlib, time, traceback
+import io, math, re, sqlite3, hashlib, time, traceback, os
 from collections import Counter
 from datetime import datetime, date
 from pathlib import Path
@@ -7846,6 +7846,17 @@ def v35_save_result_and_analyze(meta, results, laps=None, payouts=None, db_path=
                 if not _dup.empty and "車番" in _dup.columns:
                     _conflict = (_dup.groupby(_lap_key_cols)["車番"].nunique(dropna=True) > 1).any()
                     if _conflict:
+                        if os.environ.get("_V41_LAPS_DEBUG") == "1":
+                            _conflict_rows = (
+                                _dup.groupby(_lap_key_cols)
+                                .filter(lambda g: g["車番"].nunique(dropna=True) > 1)
+                            )
+                            _source_text = getattr(laps, "attrs", {}).get("_v41_source_text", "")
+                            print(f"[LAPS_CONFLICT] {key}")
+                            print(_conflict_rows.to_string(index=False))
+                            print(f"[LAPS_BLOCK_LEN] {len(_source_text)}")
+                            print(f"[LAPS_BLOCK_HEAD] {_source_text[:200]!r}")
+                            print(f"[LAPS_BLOCK_TAIL] {_source_text[-500:]!r}")
                         raise ValueError(
                             "result_lapsに同一周回・同一順位で異なる車番が存在します。"
                         )
@@ -9284,7 +9295,11 @@ def _v41_parse_compact_laps(text):
         cars = [int(x) for x in re.findall(r"[1-8]", mm.group(3))]
         for rank, car in enumerate(cars, 1):
             records.append({"周回": label, "周回番号": lap_no, "順位": rank, "車番": car})
-    return pd.DataFrame(records, columns=["周回", "周回番号", "順位", "車番"])
+    laps = pd.DataFrame(records, columns=["周回", "周回番号", "順位", "車番"])
+    # 診断時のみ、保存直前の競合検出で元テキスト末尾まで確認できるよう保持する。
+    if os.environ.get("_V41_LAPS_DEBUG") == "1":
+        laps.attrs["_v41_source_text"] = text
+    return laps
 
 
 def _v41_parse_compact_payouts(text):
