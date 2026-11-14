@@ -37,7 +37,7 @@ jobs:
       - name: Resolve inputs
         id: params
         env:
-          IN_BRANCH: "autorace-db"
+          IN_BRANCH: "8abb84575cf2937ce7407204ba22be07ae43bcd7"
           IN_EXPECTED_GENERATION: "701"
         run: |
           set -euo pipefail
