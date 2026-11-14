@@ -1,0 +1,228 @@
+name: Daily Result Registration Audit
+run-name: "Result audit ${{ github.event_name }}"
+
+# Read-only audit of all registered result races from the latest immutable DB snapshot.
+# No DB files are uploaded; only CSV and summary JSON are retained.
+on:
+  schedule:
+    - cron: "0 22 * * *" # 07:00 JST every day
+  workflow_dispatch:
+    inputs:
+      db_branch:
+        description: "Source DB branch"
+        required: true
+        default: "autorace-db"
+        type: string
+      expected_generation:
+        description: "Optional generation guard (blank = latest)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-result-registration-audit
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout query tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve inputs
+        id: params
+        env:
+          IN_BRANCH: ${{ inputs.db_branch }}
+          IN_EXPECTED_GENERATION: ${{ inputs.expected_generation }}
+        run: |
+          set -euo pipefail
+          branch="$IN_BRANCH"
+          branch="${branch:-autorace-db}"
+          expected="$IN_EXPECTED_GENERATION"
+          if [ -n "$expected" ]; then
+            case "$expected" in
+              *[!0-9]*) echo "expected_generation must be an integer" >&2; exit 1 ;;
+            esac
+          fi
+          echo "db_branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "expected_generation=$expected" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch and verify immutable DB
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python tools/prospective_collector.py fetch-db \
+            --repo "$REPO" \
+            --branch "${{ steps.params.outputs.db_branch }}" \
+            --out work/autorace_players.sqlite3 \
+            --info-out work/db_info.json
+          df -h /home/runner
+
+      - name: Run read-only result registration audit
+        env:
+          EXPECTED_GENERATION: ${{ steps.params.outputs.expected_generation }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          import sqlite3
+          from collections import Counter
+          from pathlib import Path
+
+          db = Path("work/autorace_players.sqlite3").resolve()
+          info_path = Path("work/db_info.json")
+          out = Path("work/result_audit")
+          out.mkdir(parents=True, exist_ok=True)
+          db_info = json.loads(info_path.read_text(encoding="utf-8"))
+          generation = db_info.get("manifest_generation")
+          saved_at = db_info.get("manifest_saved_at")
+          expected = os.environ.get("EXPECTED_GENERATION", "").strip()
+          if expected and str(generation) != expected:
+              raise SystemExit(
+                  f"generation mismatch: expected={expected}, actual={generation}"
+              )
+
+          required_tables = {
+              "result_races", "result_entries", "result_laps", "result_payouts"
+          }
+          with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+              if str(integrity).lower() != "ok":
+                  raise SystemExit(f"integrity_check failed: {integrity}")
+              tables = {
+                  row[0] for row in con.execute(
+                      "SELECT name FROM sqlite_master WHERE type='table'"
+                  )
+              }
+              missing = sorted(required_tables - tables)
+              if missing:
+                  raise SystemExit("Missing required tables: " + ", ".join(missing))
+
+              # Detect the optional race status column instead of silently assuming it exists.
+              race_columns = {
+                  row[1] for row in con.execute("PRAGMA table_info(result_races)")
+              }
+              has_status = "status" in race_columns
+              status_select = ", r.status" if has_status else ""
+              rows = con.execute(f"""
+                  SELECT
+                    r.race_key,
+                    (SELECT COUNT(*) FROM result_entries e
+                     WHERE e.race_key = r.race_key) AS n_entries,
+                    (SELECT COUNT(*) FROM result_laps l
+                     WHERE l.race_key = r.race_key) AS n_laps,
+                    (SELECT COUNT(*) FROM result_payouts p
+                     WHERE p.race_key = r.race_key){status_select}
+                  FROM result_races r
+                  ORDER BY r.race_key
+              """).fetchall()
+
+          # Keep status as a fifth field only when the DB actually has that column.
+          columns = ["race_key", "n_entries", "n_laps", "n_payouts"]
+          if has_status:
+              columns.append("status")
+
+          with (out / "result_audit_all_races.csv").open(
+              "w", newline="", encoding="utf-8-sig"
+          ) as f:
+              writer = csv.writer(f)
+              writer.writerow(columns)
+              writer.writerows(rows)
+
+          zero_rows = [
+              row for row in rows
+              if int(row[1] or 0) == 0
+              or int(row[2] or 0) == 0
+              or int(row[3] or 0) == 0
+          ]
+          # Put fully empty rows first, then partial-zero rows; tie-break by race_key.
+          zero_rows.sort(
+              key=lambda row: (
+                  int(row[1] or 0) + int(row[2] or 0) + int(row[3] or 0),
+                  str(row[0]),
+              )
+          )
+          with (out / "result_audit_zero_count_review.csv").open(
+              "w", newline="", encoding="utf-8-sig"
+          ) as f:
+              writer = csv.writer(f)
+              writer.writerow(columns)
+              writer.writerows(zero_rows)
+
+          summary = {
+              "db_source": db_info.get("db_source"),
+              "db_commit_sha": db_info.get("commit_sha"),
+              "db_commit_date": db_info.get("commit_date"),
+              "db_generation": generation,
+              "db_manifest_saved_at": saved_at,
+              "db_sha256": db_info.get("db_sha256"),
+              "db_integrity_check": integrity,
+              "race_count": len(rows),
+              "entries_zero_count": sum(int(r[1] or 0) == 0 for r in rows),
+              "laps_zero_count": sum(int(r[2] or 0) == 0 for r in rows),
+              "payouts_zero_count": sum(int(r[3] or 0) == 0 for r in rows),
+              "any_zero_count_review_rows": len(zero_rows),
+              "entries_count_distribution": dict(sorted(
+                  Counter(int(r[1] or 0) for r in rows).items()
+              )),
+              "laps_count_distribution": dict(sorted(
+                  Counter(int(r[2] or 0) for r in rows).items()
+              )),
+              "payouts_count_distribution": dict(sorted(
+                  Counter(int(r[3] or 0) for r in rows).items()
+              )),
+              "result_races_status_column_present": has_status,
+              "result_races_status_column_name": "status" if has_status else None,
+              "zero_count_status_classification": (
+                  "status_included_for_manual_review"
+                  if has_status else "not_performed_status_column_absent"
+              ),
+              "manual_status_classification_required": not has_status,
+              "expected_generation_guard": expected or None,
+              "database_modified": False,
+              "database_in_artifact": False,
+              "notes": [
+                  "All result_races rows are exported; no zero-only filtering is applied to the full CSV.",
+                  "Zero counts are review flags, not automatic proof of incomplete registration.",
+                  "No fixed lap or payout count threshold is assumed.",
+                  "When result_races.status is absent, zero-count rows require manual race-status classification.",
+                  "Zero-count review rows are sorted by total child-row count ascending, then race_key.",
+                  "SQLite was opened with mode=ro and PRAGMA query_only=ON."
+              ]
+          }
+          (out / "result_audit_summary.json").write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print(json.dumps(summary, ensure_ascii=False))
+          PY
+
+      - name: Upload audit CSV and summary only
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-registration-audit-${{ github.run_id }}
+          path: |
+            work/result_audit/*.csv
+            work/result_audit/*.json
+          if-no-files-found: error
+          retention-days: 30
