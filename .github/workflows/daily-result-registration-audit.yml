@@ -170,6 +170,73 @@ jobs:
               writer.writerow(columns)
               writer.writerows(zero_rows)
 
+          # Race-level audit for missing race_time / start_time in result_entries.
+          # Column presence is checked dynamically so older DB generations remain auditable.
+          with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              entry_columns = {
+                  row[1] for row in con.execute("PRAGMA table_info(result_entries)")
+              }
+              has_race_time = "race_time" in entry_columns
+              has_start_time = "start_time" in entry_columns
+              race_time_expr = (
+                  "SUM(CASE WHEN race_time IS NOT NULL THEN 1 ELSE 0 END)"
+                  if has_race_time else "NULL"
+              )
+              start_time_expr = (
+                  "SUM(CASE WHEN start_time IS NOT NULL THEN 1 ELSE 0 END)"
+                  if has_start_time else "NULL"
+              )
+              time_rows = con.execute(f"""
+                  SELECT race_key, COUNT(*) AS total_rows,
+                         {race_time_expr} AS rows_with_race_time,
+                         {start_time_expr} AS rows_with_start_time
+                  FROM result_entries
+                  GROUP BY race_key
+                  ORDER BY race_key
+              """).fetchall()
+
+          with (out / "result_time_null_by_race.csv").open(
+              "w", newline="", encoding="utf-8-sig"
+          ) as f:
+              writer = csv.writer(f)
+              writer.writerow([
+                  "race_key", "total_rows", "rows_with_race_time",
+                  "rows_with_start_time"
+              ])
+              writer.writerows(time_rows)
+
+          time_race_count = len(time_rows)
+          time_total_rows = sum(int(r[1] or 0) for r in time_rows)
+          time_rows_with_race_time = sum(int(r[2] or 0) for r in time_rows)
+          time_rows_with_start_time = sum(int(r[3] or 0) for r in time_rows)
+          time_audit = {
+              "result_entries_race_time_column_present": has_race_time,
+              "result_entries_start_time_column_present": has_start_time,
+              "race_count": time_race_count,
+              "races_with_any_race_time": (
+                  sum(int(r[2] or 0) > 0 for r in time_rows) if has_race_time else None
+              ),
+              "races_without_race_time": (
+                  sum(int(r[2] or 0) == 0 for r in time_rows) if has_race_time else None
+              ),
+              "races_with_any_start_time": (
+                  sum(int(r[3] or 0) > 0 for r in time_rows) if has_start_time else None
+              ),
+              "races_without_start_time": (
+                  sum(int(r[3] or 0) == 0 for r in time_rows) if has_start_time else None
+              ),
+              "total_entry_rows": time_total_rows,
+              "rows_with_race_time": time_rows_with_race_time if has_race_time else None,
+              "rows_without_race_time": (
+                  time_total_rows - time_rows_with_race_time if has_race_time else None
+              ),
+              "rows_with_start_time": time_rows_with_start_time if has_start_time else None,
+              "rows_without_start_time": (
+                  time_total_rows - time_rows_with_start_time if has_start_time else None
+              ),
+          }
+
           summary = {
               "db_source": db_info.get("db_source"),
               "db_commit_sha": db_info.get("commit_sha"),
@@ -179,6 +246,7 @@ jobs:
               "db_sha256": db_info.get("db_sha256"),
               "db_integrity_check": integrity,
               "race_count": len(rows),
+              "result_time_null_audit": time_audit,
               "entries_zero_count": sum(int(r[1] or 0) == 0 for r in rows),
               "laps_zero_count": sum(int(r[2] or 0) == 0 for r in rows),
               "payouts_zero_count": sum(int(r[3] or 0) == 0 for r in rows),
