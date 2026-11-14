@@ -181,11 +181,11 @@ jobs:
               has_start_time = "start_time" in entry_columns
               race_time_expr = (
                   "SUM(CASE WHEN race_time IS NOT NULL THEN 1 ELSE 0 END)"
-                  if has_race_time else "0"
+                  if has_race_time else "NULL"
               )
               start_time_expr = (
                   "SUM(CASE WHEN start_time IS NOT NULL THEN 1 ELSE 0 END)"
-                  if has_start_time else "0"
+                  if has_start_time else "NULL"
               )
               time_rows = con.execute(f"""
                   SELECT race_key, COUNT(*) AS total_rows,
@@ -214,15 +214,27 @@ jobs:
               "result_entries_race_time_column_present": has_race_time,
               "result_entries_start_time_column_present": has_start_time,
               "race_count": time_race_count,
-              "races_with_any_race_time": sum(int(r[2] or 0) > 0 for r in time_rows),
-              "races_without_race_time": sum(int(r[2] or 0) == 0 for r in time_rows),
-              "races_with_any_start_time": sum(int(r[3] or 0) > 0 for r in time_rows),
-              "races_without_start_time": sum(int(r[3] or 0) == 0 for r in time_rows),
+              "races_with_any_race_time": (
+                  sum(int(r[2] or 0) > 0 for r in time_rows) if has_race_time else None
+              ),
+              "races_without_race_time": (
+                  sum(int(r[2] or 0) == 0 for r in time_rows) if has_race_time else None
+              ),
+              "races_with_any_start_time": (
+                  sum(int(r[3] or 0) > 0 for r in time_rows) if has_start_time else None
+              ),
+              "races_without_start_time": (
+                  sum(int(r[3] or 0) == 0 for r in time_rows) if has_start_time else None
+              ),
               "total_entry_rows": time_total_rows,
-              "rows_with_race_time": time_rows_with_race_time,
-              "rows_without_race_time": time_total_rows - time_rows_with_race_time,
-              "rows_with_start_time": time_rows_with_start_time,
-              "rows_without_start_time": time_total_rows - time_rows_with_start_time,
+              "rows_with_race_time": time_rows_with_race_time if has_race_time else None,
+              "rows_without_race_time": (
+                  time_total_rows - time_rows_with_race_time if has_race_time else None
+              ),
+              "rows_with_start_time": time_rows_with_start_time if has_start_time else None,
+              "rows_without_start_time": (
+                  time_total_rows - time_rows_with_start_time if has_start_time else None
+              ),
           }
 
           summary = {
