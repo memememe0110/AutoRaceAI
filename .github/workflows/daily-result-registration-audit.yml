@@ -32,7 +32,7 @@ env:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - name: Checkout query tools
         uses: actions/checkout@v4
@@ -119,9 +119,13 @@ jobs:
               if missing:
                   raise SystemExit("Missing required tables: " + ", ".join(missing))
 
-              # Counts are not converted into pass/fail thresholds because
-              # scratches, cancellations and exceptional races need review.
-              rows = con.execute("""
+              # Detect the optional race status column instead of silently assuming it exists.
+              race_columns = {
+                  row[1] for row in con.execute("PRAGMA table_info(result_races)")
+              }
+              has_status = "status" in race_columns
+              status_select = ", r.status" if has_status else ""
+              rows = con.execute(f"""
                   SELECT
                     r.race_key,
                     (SELECT COUNT(*) FROM result_entries e
@@ -129,12 +133,16 @@ jobs:
                     (SELECT COUNT(*) FROM result_laps l
                      WHERE l.race_key = r.race_key) AS n_laps,
                     (SELECT COUNT(*) FROM result_payouts p
-                     WHERE p.race_key = r.race_key) AS n_payouts
+                     WHERE p.race_key = r.race_key){status_select}
                   FROM result_races r
                   ORDER BY r.race_key
               """).fetchall()
 
+          # Keep status as a fifth field only when the DB actually has that column.
           columns = ["race_key", "n_entries", "n_laps", "n_payouts"]
+          if has_status:
+              columns.append("status")
+
           with (out / "result_audit_all_races.csv").open(
               "w", newline="", encoding="utf-8-sig"
           ) as f:
@@ -148,6 +156,13 @@ jobs:
               or int(row[2] or 0) == 0
               or int(row[3] or 0) == 0
           ]
+          # Put fully empty rows first, then partial-zero rows; tie-break by race_key.
+          zero_rows.sort(
+              key=lambda row: (
+                  int(row[1] or 0) + int(row[2] or 0) + int(row[3] or 0),
+                  str(row[0]),
+              )
+          )
           with (out / "result_audit_zero_count_review.csv").open(
               "w", newline="", encoding="utf-8-sig"
           ) as f:
@@ -177,6 +192,13 @@ jobs:
               "payouts_count_distribution": dict(sorted(
                   Counter(int(r[3] or 0) for r in rows).items()
               )),
+              "result_races_status_column_present": has_status,
+              "result_races_status_column_name": "status" if has_status else None,
+              "zero_count_status_classification": (
+                  "status_included_for_manual_review"
+                  if has_status else "not_performed_status_column_absent"
+              ),
+              "manual_status_classification_required": not has_status,
               "expected_generation_guard": expected or None,
               "database_modified": False,
               "database_in_artifact": False,
@@ -184,6 +206,8 @@ jobs:
                   "All result_races rows are exported; no zero-only filtering is applied to the full CSV.",
                   "Zero counts are review flags, not automatic proof of incomplete registration.",
                   "No fixed lap or payout count threshold is assumed.",
+                  "When result_races.status is absent, zero-count rows require manual race-status classification.",
+                  "Zero-count review rows are sorted by total child-row count ascending, then race_key.",
                   "SQLite was opened with mode=ro and PRAGMA query_only=ON."
               ]
           }
