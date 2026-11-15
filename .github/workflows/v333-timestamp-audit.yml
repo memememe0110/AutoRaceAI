@@ -57,6 +57,9 @@ jobs:
               ("v231_prediction_history", "updated_at"),
               ("player_lap_history", "created_at"),
               ("v41_registration_batches", "registered_at"),
+              # Actual timestamp columns referenced by the application code.
+              ("result_races", "registered_at"),
+              ("v231_prediction_history", "prediction_time"),
           ]
 
           def classify(value):
@@ -141,6 +144,38 @@ jobs:
                       "context": context,
                   })
               source_report.append({"file": filename, "registered_at_hit_count": len(hits), "hits": records})
+
+          # Compare the known Kawaguchi registration timestamp against the stored
+          # result_races and registration-batch values, if that race row exists.
+          known_time = {"race_date": ["2026-11-14", "20261114"], "venue": "川口", "race_no": ["1", "01"]}
+          anchor = {"criteria": known_time, "matches": []}
+          with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              cols = {r[1] for r in con.execute('PRAGMA table_info("result_races")')}
+              required = {"race_key", "race_date", "venue", "race_no", "registered_at"}
+              if required.issubset(cols):
+                  q = """
+                      SELECT race_key, race_date, venue, race_no, registered_at
+                        FROM result_races
+                       WHERE CAST(race_date AS TEXT) IN (?,?)
+                         AND venue=?
+                         AND CAST(race_no AS TEXT) IN (?,?)
+                       ORDER BY race_key
+                  """
+                  rows = con.execute(q, (*known_time["race_date"], known_time["venue"], *known_time["race_no"])).fetchall()
+                  for row in rows:
+                      item = dict(zip(["race_key", "race_date", "venue", "race_no", "registered_at"], row))
+                      batch_cols = {r[1] for r in con.execute('PRAGMA table_info("v41_registration_batches")')}
+                      if "race_key" in batch_cols and "registered_at" in batch_cols:
+                          batch = con.execute(
+                              "SELECT registered_at FROM v41_registration_batches WHERE race_key=? ORDER BY batch_id DESC LIMIT 1",
+                              (item["race_key"],)
+                          ).fetchone()
+                          item["v41_registered_at"] = batch[0] if batch else None
+                      anchor["matches"].append(item)
+              else:
+                  anchor["status"] = "required_result_races_columns_missing"
+          report["known_kawaguchi_anchor"] = anchor
 
           report["registered_at_code_scan"] = {
               "files_scanned": ["app.py", "engine.py"],
