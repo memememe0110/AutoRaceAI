@@ -1,0 +1,91 @@
+name: Temporary Lap Count Distribution Audit
+run-name: "Lap count distribution audit 2026-11-16"
+on:
+  push:
+    branches:
+      - tmp-lap-count-audit-1116
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch immutable DB snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python tools/prospective_collector.py fetch-db --repo "$REPO" --branch autorace-db --out work/autorace_players.sqlite3 --info-out work/db_info.json
+      - name: Read-only result race lap and distance distribution
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, sqlite3
+          from collections import Counter
+          from pathlib import Path
+          db = Path("work/autorace_players.sqlite3").resolve()
+          con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+          con.execute("PRAGMA query_only=ON")
+          tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+          if not {"result_races", "races"} <= tables:
+              raise SystemExit("required tables missing: result_races / races")
+          rr_cols = [r[1] for r in con.execute("PRAGMA table_info(result_races)")]
+          races_cols = [r[1] for r in con.execute("PRAGMA table_info(races)")]
+          rr_names = [d[0] for d in con.execute("SELECT * FROM result_races LIMIT 0").description]
+          rr_idx = {n:i for i,n in enumerate(rr_names)}
+          def digits(v): return re.sub(r"[^0-9]", "", str(v or ""))
+          def norm_key(date, venue, race_no):
+              d, rn = digits(date), digits(race_no)
+              return f"{d[-8:]}_{str(venue).strip()}_{int(rn)}R" if len(d)>=8 and venue and rn else None
+          select = ["race_date","venue","race_no"] + [c for c in ("distance_m","total_laps","race_id") if c in races_cols]
+          order = " ORDER BY race_id DESC" if "race_id" in races_cols else ""
+          meta = {}
+          for row in con.execute("SELECT "+",".join(select)+" FROM races"+order):
+              d = dict(zip(select,row)); k = norm_key(d.get("race_date"),d.get("venue"),d.get("race_no"))
+              if k and k not in meta: meta[k] = d
+          direct_lap = next((c for c in ("total_laps","laps","lap_count","周回数") if c in rr_idx),None)
+          direct_dist = next((c for c in ("distance_m","distance","距離") if c in rr_idx),None)
+          lap_counts, dist_counts = Counter(), Counter()
+          matched, unmatched = 0, []
+          for row in con.execute("SELECT * FROM result_races"):
+              rec = {n:row[i] for n,i in rr_idx.items()}
+              rk = str(rec.get("race_key") or "")
+              p = rk.split("_")
+              key = f"{p[0]}_{'_'.join(p[1:-1])}_{int(digits(p[-1]))}R" if len(p)>=3 and digits(p[-1]) else None
+              m = meta.get(key,{})
+              laps = rec.get(direct_lap) if direct_lap else None
+              dist = rec.get(direct_dist) if direct_dist else None
+              if laps in (None,""): laps = m.get("total_laps")
+              if dist in (None,""): dist = m.get("distance_m")
+              if m: matched += 1
+              if laps in (None,"") or dist in (None,""): unmatched.append(rk)
+              if laps not in (None,""): lap_counts[str(laps)] += 1
+              if dist not in (None,""): dist_counts[str(dist)] += 1
+          total, known = con.execute("SELECT COUNT(*) FROM result_races").fetchone()[0], sum(lap_counts.values())
+          summary = {
+            "db_info": json.loads(Path("work/db_info.json").read_text(encoding="utf-8")),
+            "result_races_rows": total, "result_races_columns": rr_cols, "races_columns": races_cols,
+            "matched_to_race_metadata": matched, "unmatched_or_missing_metadata_sample": unmatched[:30],
+            "known_lap_count_rows": known, "lap_count_distribution": dict(lap_counts),
+            "known_distance_rows": sum(dist_counts.values()), "distance_distribution_m": dict(dist_counts),
+            "eight_lap_count": lap_counts.get("8",0),
+            "eight_lap_share_of_known": lap_counts.get("8",0)/known if known else None,
+            "database_modified": False
+          }
+          Path("work/lap_count_distribution.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
+          print(json.dumps(summary,ensure_ascii=False))
+          con.close()
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lap-count-distribution-20261116
+          path: work/lap_count_distribution.json
+          if-no-files-found: error
+          retention-days: 30
