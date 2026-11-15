@@ -31,6 +31,15 @@ jobs:
             echo "=== COMMIT ==="
             git rev-parse HEAD
             echo
+            echo "=== 0. v223 writer exact context (app.py 15440-15480) ==="
+            sed -n '15440,15480p' app.py
+            echo
+            echo "=== 0b. Job timestamp context (app.py 2705-2720) ==="
+            sed -n '2705,2720p' app.py
+            echo
+            echo "=== 0c. Job timestamp context (app.py 2850-2870) ==="
+            sed -n '2850,2870p' app.py
+            echo
             echo "=== 1. COALESCE lines mentioning timestamp columns ==="
             grep -rnE "COALESCE" app.py engine.py tools/ 2>/dev/null | grep -iE "registered_at|updated_at|prediction_time|created_at" || true
             echo
