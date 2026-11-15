@@ -149,6 +149,12 @@ jobs:
                   f"WHERE l.race_key = r.race_key "
                   f"AND l.{goal_label_column} != 'ゴール線') AS n_non_goal_laps"
               )
+              lap_no_count_sql = (
+                  f"(SELECT COUNT(DISTINCT l.lap_no) FROM result_laps l "
+                  f"WHERE l.race_key = r.race_key "
+                  f"AND l.{goal_label_column} != 'ゴール線') AS n_lap_numbers"
+                  if has_lap_no else "NULL AS n_lap_numbers"
+              )
               # Count lap_no groups whose row count differs from the entry count.
               # This catches imbalances that a simple total-row modulo can miss.
               lap_no_bad_count_sql = (
@@ -175,9 +181,7 @@ jobs:
                      WHERE p.race_key = r.race_key) AS n_payouts{status_select},
                     {goal_line_count_sql},
                     {non_goal_lap_count_sql},
-                    (SELECT COUNT(DISTINCT l.lap_no) FROM result_laps l
-                     WHERE l.race_key = r.race_key
-                     AND l.{goal_label_column} != 'ゴール線') AS n_lap_numbers,
+                    {lap_no_count_sql},
                     {lap_no_bad_count_sql}
                   FROM result_races r
                   ORDER BY r.race_key
