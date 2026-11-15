@@ -17512,21 +17512,47 @@ def _v319_autorace_result_to_text(body: dict, venue: str, race_no: int, ymd: str
     # 周回（grandNoteList）
     gn = body.get("grandNoteList") or []
     if gn:
+        def _valid_lap_car(value):
+            car = str(value or "").strip()
+            return car in ("1", "2", "3", "4", "5", "6", "7", "8")
+
+        valid_lap_nos = []
+        for item in gn:
+            if not isinstance(item, dict):
+                continue
+            try:
+                lap_no = int(item.get("lapNo"))
+            except (TypeError, ValueError):
+                continue
+            ranks = item.get("rankList") or []
+            if any(
+                isinstance(r, dict) and _valid_lap_car(r.get("carNo"))
+                for r in ranks
+            ):
+                valid_lap_nos.append(lap_no)
+        max_lap = max(valid_lap_nos, default=None)
+
         lines.append("グランドノート")
         lines.append("周回・順位\t1\t2\t3\t4\t5\t6\t7\t8")
         for item in gn:
             if not isinstance(item, dict):
                 continue
-            lap = item.get("lapNo")
+            try:
+                lap_no = int(item.get("lapNo"))
+            except (TypeError, ValueError):
+                continue
             ranks = item.get("rankList") or []
             cars = []
             for r in sorted(ranks, key=lambda x: int(x.get("rank") or 99) if isinstance(x, dict) else 99):
-                if isinstance(r, dict) and r.get("carNo") is not None:
-                    cars.append(str(r.get("carNo")))
-            if cars:
-                label = "ゴール線" if int(lap or 0) >= 7 else f"{lap}周"
-                lines.append(f"{label}\t" + "\t".join(cars))
-
+                if not isinstance(r, dict):
+                    continue
+                car = str(r.get("carNo") or "").strip()
+                if _valid_lap_car(car):
+                    cars.append(car)
+            if not cars:
+                continue
+            label = "ゴール線" if max_lap is not None and lap_no == max_lap else f"{lap_no}周目"
+            lines.append(f"{label}\t" + "\t".join(cars))
     # 払戻
     lines.append("払戻金")
     ri = body.get("refundInfo") or {}
