@@ -84,34 +84,61 @@ jobs:
               players = con.execute(f"""
                 WITH targets(race_key) AS (VALUES {target_sql}),
                 target_players AS (
-                  SELECT DISTINCT
-                         REPLACE(REPLACE(TRIM(e.player_name),' ',''),'　','') AS name_key,
-                         TRIM(e.player_name) AS player_name
+                  SELECT REPLACE(REPLACE(TRIM(e.player_name),' ',''),'　','') AS name_key,
+                         MIN(TRIM(e.player_name)) AS player_name
                     FROM result_entries e JOIN targets t ON t.race_key=e.race_key
                    WHERE TRIM(COALESCE(e.player_name,''))<>''
+                   GROUP BY REPLACE(REPLACE(TRIM(e.player_name),' ',''),'　','')
+                ),
+                lap_by_race AS (
+                  SELECT REPLACE(REPLACE(TRIM(player_name),' ',''),'　','') AS name_key,
+                         race_key, COUNT(*) AS history_rows,
+                         MAX(CASE WHEN lap_label='1周目' AND position IS NOT NULL THEN 1 ELSE 0 END) AS has_first,
+                         MAX(CASE WHEN lap_label IN ('ゴール線','ゴール') AND position IS NOT NULL THEN 1 ELSE 0 END) AS has_goal
+                    FROM player_lap_history
+                   GROUP BY REPLACE(REPLACE(TRIM(player_name),' ',''),'　',''), race_key
+                ),
+                history_summary AS (
+                  SELECT name_key, SUM(history_rows) AS history_rows,
+                         COUNT(*) AS history_races,
+                         SUM(CASE WHEN has_first=1 AND has_goal=1 THEN 1 ELSE 0 END) AS eligible_lap_races,
+                         MIN(race_key) AS oldest_race_key, MAX(race_key) AS newest_race_key
+                    FROM lap_by_race GROUP BY name_key
                 )
                 SELECT p.player_name,
-                       COUNT(h.rowid) AS history_rows,
-                       COUNT(DISTINCT h.race_key) AS history_races,
-                       MIN(h.race_key) AS oldest_race_key,
-                       MAX(h.race_key) AS newest_race_key
+                       COALESCE(h.history_rows,0) AS history_rows,
+                       COALESCE(h.history_races,0) AS history_races,
+                       COALESCE(h.eligible_lap_races,0) AS eligible_lap_races,
+                       h.oldest_race_key, h.newest_race_key
                   FROM target_players p
-                  LEFT JOIN player_lap_history h
-                    ON REPLACE(REPLACE(TRIM(h.player_name),' ',''),'　','')=p.name_key
-                 GROUP BY p.name_key, p.player_name
-                 ORDER BY history_races ASC, history_rows ASC, p.player_name
+                  LEFT JOIN history_summary h ON h.name_key=p.name_key
+                 ORDER BY eligible_lap_races ASC, history_races ASC, history_rows ASC, p.player_name
               """, params).fetchall()
+              result_laps_total = con.execute("SELECT COUNT(*) FROM result_laps").fetchone()[0]
+              unsynced_lap_rows = con.execute("""
+                SELECT COUNT(*)
+                  FROM result_laps rl
+                  JOIN result_entries re ON re.race_key=rl.race_key AND re.car_no=rl.car_no
+                  LEFT JOIN player_lap_history plh
+                    ON plh.race_key=rl.race_key AND plh.car_no=rl.car_no
+                   AND plh.lap_label=rl.lap_label
+                 WHERE plh.race_key IS NULL
+                   AND COALESCE(TRIM(re.player_name),'')<>''
+              """).fetchone()[0]
               global_summary = {
                 "integrity_check": integrity,
                 "player_lap_history_rows": total_rows,
                 "distinct_players": distinct_players,
                 "distinct_races": distinct_races,
+                "result_laps_total_rows": result_laps_total,
+                "unsynced_result_lap_rows_estimate": unsynced_lap_rows,
                 "target_race_count": len(targets),
                 "target_player_count": len(players),
                 "target_races_with_entries": sum(1 for r in race_rows if r[1] > 0),
                 "target_players_with_zero_history": sum(1 for r in players if r[2] == 0),
-                "target_players_with_1_to_7_history_races": sum(1 for r in players if 1 <= r[2] <= 7),
-                "target_players_with_8plus_history_races": sum(1 for r in players if r[2] >= 8),
+                "target_players_with_zero_eligible_lap_history": sum(1 for r in players if r[3] == 0),
+                "target_players_with_1_to_7_eligible_lap_races": sum(1 for r in players if 1 <= r[3] <= 7),
+                "target_players_with_8plus_eligible_lap_races": sum(1 for r in players if r[3] >= 8),
                 "database_modified": False
               }
           def write_csv(name, header, rows):
@@ -120,14 +147,14 @@ jobs:
           write_csv("target_races.csv",
                     ["race_key","entry_cars","named_players","result_lap_rows","linked_history_rows"], race_rows)
           write_csv("target_players_history.csv",
-                    ["player_name","history_rows","history_races","oldest_race_key","newest_race_key"], players)
+                    ["player_name","history_rows","history_races","eligible_lap_races","oldest_race_key","newest_race_key"], players)
           (out / "player_lap_history_schema.json").write_text(
               json.dumps({"schema": schema, "summary": global_summary}, ensure_ascii=False, indent=2),
               encoding="utf-8")
           info = json.loads(Path("work/db_info.json").read_text(encoding="utf-8"))
           report = {"db_info": info, "summary": global_summary, "schema": schema,
                     "target_races": [dict(zip(["race_key","entry_cars","named_players","result_lap_rows","linked_history_rows"], r)) for r in race_rows],
-                    "target_players": [dict(zip(["player_name","history_rows","history_races","oldest_race_key","newest_race_key"], r)) for r in players]}
+                    "target_players": [dict(zip(["player_name","history_rows","history_races","eligible_lap_races","oldest_race_key","newest_race_key"], r)) for r in players]}
           (out / "lap_learning_audit_summary.json").write_text(
               json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
           print(json.dumps(global_summary, ensure_ascii=False))
