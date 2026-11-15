@@ -42328,7 +42328,7 @@ if selected_main_page == "✅ 結果登録・解析":
         result_options = {
             0: "選択してください",
             **{
-                i + 1: f"{row.get('race_date','')}｜{row.get('venue','')} {row.get('race_no','')}R｜保存 {str(row.get('updated_at') or '')[:19]}"
+                i + 1: f"{row.get('race_date','')}｜{row.get('venue','')} {row.get('race_no','')}R｜保存 {_v228_format_saved_time(row.get('updated_at'))}"
                 for i, row in enumerate(saved_results)
             },
         }
@@ -42601,7 +42601,7 @@ if selected_main_page == "✅ 結果登録・解析":
             pass
         replace_registered = False
         if result_exists:
-            st.warning(f"このレースは登録済みです：{existing_result_key}（{existing_registered_at or '登録日時不明'}）")
+            st.warning(f"このレースは登録済みです：{existing_result_key}（{_v228_format_saved_time(existing_registered_at) or '登録日時不明'}）")
             replace_registered = st.checkbox(
                 "登録済み内容を、不成立・全返還へ置き換える",
                 key=f"replace_no_contest_{existing_result_key}",
@@ -42669,7 +42669,7 @@ if selected_main_page == "✅ 結果登録・解析":
 
         replace_registered = False
         if result_exists:
-            st.warning(f"このレースは登録済みです：{existing_result_key}（{existing_registered_at or '登録日時不明'}）")
+            st.warning(f"このレースは登録済みです：{existing_result_key}（{_v228_format_saved_time(existing_registered_at) or '登録日時不明'}）")
             replace_registered = st.checkbox(
                 "登録済みの結果を、今回の内容で置き換える",
                 key=f"replace_result_{existing_result_key}",
@@ -43080,7 +43080,7 @@ if selected_main_page == "🗃️ 登録情報確認":
     )
     if isinstance(_pts324, pd.DataFrame) and not _pts324.empty:
         _labels324 = [
-            f"{r.race_key}｜登録 {r.registered_at}（batch {r.batch_id}）"
+            f"{r.race_key}｜登録 {_v228_format_saved_time(r.registered_at)}（batch {r.batch_id}）"
             for r in _pts324.itertuples()
         ]
         _pick324 = st.selectbox(
@@ -44072,7 +44072,10 @@ if selected_main_page == "🗃️ 登録情報確認":
     if reg_history.empty:
         st.caption("v4.1で登録した結果はまだありません。")
     else:
-        st.dataframe(reg_history, use_container_width=True, hide_index=True)
+        reg_history_display = reg_history.copy()
+        if "登録日時" in reg_history_display.columns:
+            reg_history_display["登録日時"] = reg_history_display["登録日時"].map(_v228_format_saved_time)
+        st.dataframe(reg_history_display, use_container_width=True, hide_index=True)
         active_rows = reg_history[reg_history["状態"] == "登録中"] if "状態" in reg_history.columns else reg_history
         if not active_rows.empty:
             labels = active_rows["レースID"].astype(str).tolist()
