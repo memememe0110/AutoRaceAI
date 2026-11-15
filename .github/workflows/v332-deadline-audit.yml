@@ -1,0 +1,179 @@
+name: Audit v332 deadline comparisons (read-only)
+run-name: "v332 deadline comparison audit"
+
+on:
+  push:
+    branches:
+      - tmp-v332-time-audit
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v332-deadline-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout audit workflow
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          path: audit-src
+          persist-credentials: false
+
+      - name: Checkout prospective collection store (read-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch prospective-collect \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" results
+          test -s results/prospective/prospective_collect.sqlite3
+
+      - name: Evaluate deadline comparisons using parse_iso semantics
+        run: |
+          set -euo pipefail
+          mkdir -p audit-output
+          DB="$PWD/results/prospective/prospective_collect.sqlite3" OUT="$PWD/audit-output" python3 - <<'PY'
+          import csv, json, os, sqlite3
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          JST = ZoneInfo("Asia/Tokyo")
+
+          # Same interpretation used by evaluate_brier.parse_iso:
+          # ISO strings with an offset retain that offset; naive ISO strings are JST.
+          def parse_iso(value):
+              if value is None:
+                  return None
+              s = str(value).strip()
+              if not s:
+                  return None
+              try:
+                  dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=JST)
+                  return dt
+              except (TypeError, ValueError, OverflowError):
+                  return None
+
+          db = Path(os.environ["DB"]).resolve()
+          out = Path(os.environ["OUT"])
+          con = sqlite3.connect("file:" + db.as_posix() + "?mode=ro", uri=True)
+          con.row_factory = sqlite3.Row
+          con.execute("PRAGMA query_only=ON")
+
+          alpha_cols = {r["name"] for r in con.execute("PRAGMA table_info(v332_prospective_alpha_log)")}
+          commit_cols = {r["name"] for r in con.execute("PRAGMA table_info(v332_commit_log)")}
+          required_alpha = {"id", "config_id", "race_key", "status", "telvote_time", "sim_finished_at"}
+          required_commit = {"alpha_log_id", "committed_at"}
+          if required_alpha - alpha_cols:
+              raise SystemExit("Missing alpha columns: " + ", ".join(sorted(required_alpha - alpha_cols)))
+          if required_commit - commit_cols:
+              raise SystemExit("Missing commit columns: " + ", ".join(sorted(required_commit - commit_cols)))
+
+          rows = [dict(r) for r in con.execute("""
+              SELECT a.id, a.config_id, a.race_key, a.source, a.status,
+                     a.telvote_time, a.sim_finished_at, c.committed_at
+              FROM v332_prospective_alpha_log a
+              LEFT JOIN v332_commit_log c ON c.alpha_log_id = a.id
+              ORDER BY a.id, c.rowid
+          """)]
+
+          # Detect join multiplicity before aggregating; expected one row per alpha record.
+          alpha_total = con.execute("SELECT COUNT(*) FROM v332_prospective_alpha_log").fetchone()[0]
+          commit_total = con.execute("SELECT COUNT(*) FROM v332_commit_log").fetchone()[0]
+          unique_alpha_ids = len({r["id"] for r in rows})
+          joined_rows = len(rows)
+
+          def blank_counts():
+              return {
+                  "total": 0, "parse_ok": 0,
+                  "fin_before_dl": 0, "com_before_dl": 0, "both_ok": 0,
+                  "parse_fail_telvote": 0, "parse_fail_sim_finished": 0,
+                  "parse_fail_committed": 0, "status_late": 0,
+                  "missing_commit": 0
+              }
+
+          groups = {}
+          for r in rows:
+              key = r["config_id"] if r["config_id"] is not None else "(NULL)"
+              g = groups.setdefault(str(key), blank_counts())
+              g["total"] += 1
+              if r["status"] == "late":
+                  g["status_late"] += 1
+
+              dl = parse_iso(r["telvote_time"])
+              fin = parse_iso(r["sim_finished_at"])
+              com = parse_iso(r["committed_at"])
+
+              if dl is None: g["parse_fail_telvote"] += 1
+              if fin is None: g["parse_fail_sim_finished"] += 1
+              if com is None:
+                  g["parse_fail_committed"] += 1
+                  g["missing_commit"] += 1
+              if dl is not None and fin is not None and com is not None:
+                  g["parse_ok"] += 1
+                  fin_ok = fin < dl
+                  com_ok = com < dl
+                  if fin_ok: g["fin_before_dl"] += 1
+                  if com_ok: g["com_before_dl"] += 1
+                  if fin_ok and com_ok: g["both_ok"] += 1
+
+          overall = blank_counts()
+          for g in groups.values():
+              for k in overall:
+                  overall[k] += g[k]
+
+          report = {
+              "database": "prospective/prospective_collect.sqlite3",
+              "database_mode": "read-only (SQLite mode=ro + PRAGMA query_only=ON)",
+              "parse_iso_semantics": "ISO offset retained; naive ISO interpreted as Asia/Tokyo",
+              "alpha_log_rows": alpha_total,
+              "commit_log_rows": commit_total,
+              "joined_rows": joined_rows,
+              "unique_alpha_ids_in_join": unique_alpha_ids,
+              "join_multiplicity_or_missing_warning": joined_rows != alpha_total or unique_alpha_ids != alpha_total,
+              "overall": overall,
+              "by_config_id": groups,
+          }
+          con.close()
+
+          (out / "deadline-audit.json").write_text(
+              json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+          )
+          with (out / "deadline-audit.csv").open("w", newline="", encoding="utf-8-sig") as f:
+              w = csv.writer(f)
+              w.writerow(["config_id", *overall.keys()])
+              w.writerow(["(ALL)", *[overall[k] for k in overall]])
+              for config_id, g in sorted(groups.items()):
+                  w.writerow([config_id, *[g[k] for k in overall]])
+
+          print("=== DEADLINE COMPARISON OVERALL ===")
+          print(json.dumps(overall, ensure_ascii=False, indent=2))
+          print("=== DEADLINE COMPARISON BY CONFIG ===")
+          print(json.dumps(groups, ensure_ascii=False, indent=2))
+          print("=== JOIN COUNTS ===")
+          print(json.dumps({
+              "alpha_log_rows": alpha_total,
+              "commit_log_rows": commit_total,
+              "joined_rows": joined_rows,
+              "unique_alpha_ids_in_join": unique_alpha_ids,
+              "join_multiplicity_or_missing_warning": report["join_multiplicity_or_missing_warning"]
+          }, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload deadline audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v332-deadline-audit-${{ github.run_id }}
+          path: audit-output/
+          if-no-files-found: error
+          retention-days: 14
