@@ -95,6 +95,24 @@ jobs:
               else:
                   report["payout_count"] = None
 
+                  payout_rows = con.execute(
+                      "SELECT bet_type, combination, payout_yen, popularity "
+                      "FROM result_payouts WHERE race_key=? ORDER BY bet_type, combination",
+                      (race_key,)
+                  ).fetchall()
+                  report["payout_rows"] = payout_rows
+                  report["payout_nonnull_counts"] = {
+                      "bet_type": sum(r[0] is not None for r in payout_rows),
+                      "combination": sum(r[1] is not None for r in payout_rows),
+                      "payout_yen": sum(r[2] is not None for r in payout_rows),
+                      "popularity": sum(r[3] is not None for r in payout_rows),
+                  }
+                  write_csv("payout_rows.csv",
+                            ["bet_type", "combination", "payout_yen", "popularity"],
+                            payout_rows)
+              else:
+                  report["payout_count"] = None
+
               if "result_laps" in tables:
                   rows = con.execute(
                       "SELECT lap_label, COUNT(*) FROM result_laps "
@@ -129,6 +147,10 @@ jobs:
                   if {"race_key", "registered_at"}.issubset(cols):
                       report["target_registered_at"] = con.execute(
                           "SELECT registered_at FROM result_races WHERE race_key=?",
+                          (race_key,)
+                      ).fetchall()
+                      report["registered_at_type_value"] = con.execute(
+                          "SELECT typeof(registered_at), registered_at FROM result_races WHERE race_key=?",
                           (race_key,)
                       ).fetchall()
                       # Read-only sample of recent timestamps for timezone-distribution review.
