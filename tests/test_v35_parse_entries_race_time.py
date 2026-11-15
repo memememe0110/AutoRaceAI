@@ -66,7 +66,7 @@ class TestV35ParseEntriesRaceTime(unittest.TestCase):
         parsed = engine._v35_parse_entries(text)
         first = parsed.iloc[0]
         self.assertTrue(math.isnan(first["競走T"]))
-        self.assertAlmostEqual(first["ST"], 0.11)
+        self.assertTrue(math.isnan(first["ST"]))
 
     def test_four_six_entry_fixtures_parse_race_time_and_st(self):
         fixtures = [
@@ -101,7 +101,7 @@ class TestV35ParseEntriesRaceTime(unittest.TestCase):
             engine.v35_save_result_and_analyze(meta, parsed, db_path=db_path)
             with sqlite3.connect(db_path) as con:
                 saved = con.execute(
-                    "SELECT car_no, race_time, st FROM result_entries ORDER BY finish"
+                    "SELECT car_no, race_time, start_time FROM result_entries ORDER BY finish"
                 ).fetchall()
             self.assertEqual(len(saved), 6)
             self.assertAlmostEqual(saved[0][1], 3.455)
