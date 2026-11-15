@@ -71,3 +71,24 @@ def test_parser_accepts_legacy_and_new_lap_labels():
     parsed = parser(text)
     assert set(parsed["周回番号"].tolist()) == {5, 6}
     assert set(parsed["周回"].tolist()) == {"6周", "5周目"}
+
+
+
+def test_empty_none_and_zero_car_numbers_are_excluded_before_max_lap():
+    body = {
+        "raceResult": [],
+        "refundInfo": {},
+        "grandNoteList": [
+            {"lapNo": 9, "rankList": [{"rank": 1, "carNo": "0"}]},
+            {"lapNo": 8, "rankList": [{"rank": 1, "carNo": None}]},
+            {"lapNo": 7, "rankList": [
+                {"rank": 1, "carNo": "4"},
+                {"rank": 2, "carNo": "6"},
+                {"rank": 3, "carNo": "7"},
+            ]},
+        ],
+    }
+    text = converter(body, "fixture", 1, "20261115")
+    lap_lines = get_lap_lines(text)
+    assert len(lap_lines) == 1
+    assert lap_lines[0] == "ゴール線\\t4\\t6\\t7"
