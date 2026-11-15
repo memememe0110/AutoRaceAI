@@ -1,0 +1,107 @@
+name: Brier Trial (17R, temporary revision)
+
+# 試運転用。40R本評価時にこの4修正を正式採用するかは別判断。
+on:
+  push:
+    branches:
+      - tmp-brier-trial
+    paths:
+      - .github/workflows/brier-trial.yml
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout trial code
+        uses: actions/checkout@v4
+        with:
+          ref: \${{ github.sha }}
+          path: trial
+          fetch-depth: 1
+
+      - name: Checkout prospective store (read-only source)
+        uses: actions/checkout@v4
+        with:
+          ref: prospective-collect
+          path: cardstore
+          fetch-depth: 1
+
+      - name: Verify input DB and schema
+        working-directory: trial
+        run: |
+          set -euo pipefail
+          DB="../cardstore/prospective/prospective_collect.sqlite3"
+          test -s "$DB"
+
+          python - "$DB" <<'PY'
+          import sqlite3, sys
+
+          db = sys.argv[1]
+          con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+
+          required = {
+              "v332_prospective_alpha_log",
+              "v332_commit_log",
+              "v332_prospective_results",
+          }
+          found = {
+              r[0] for r in con.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table'"
+              )
+          }
+          missing = sorted(required - found)
+
+          print("DB_TABLES:", sorted(required & found))
+          if missing:
+              raise SystemExit(f"Missing tables: {missing}")
+
+          print("DB_READ_ONLY_SCHEMA_CHECK: PASS")
+          con.close()
+          PY
+
+      - name: Run 17R Brier trial
+        working-directory: trial
+        run: |
+          set -euo pipefail
+          mkdir -p output
+
+          python - <<'PY'
+          import sys
+          import json
+
+          sys.path.insert(0, "tools")
+          import evaluate_brier as eb
+
+          result = eb.evaluate(
+              "../cardstore/prospective/prospective_collect.sqlite3",
+              "ver326_1_base",
+              "2026-11-14",
+              "2026-11-15",
+              n_boot=0,
+          )
+
+          with open("output/brier_trial.json", "w", encoding="utf-8") as f:
+              json.dump(
+                  result,
+                  f,
+                  ensure_ascii=False,
+                  indent=2,
+                  default=str,
+              )
+
+          print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+          PY
+
+      - name: Upload trial results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brier-trial-17r-\${{ github.run_id }}
+          path: trial/output/
+          if-no-files-found: warn
+          retention-days: 30
