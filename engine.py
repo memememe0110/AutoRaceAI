@@ -13446,10 +13446,10 @@ def _v35_parse_entries(text):
         race_t = np.nan
         popularity = np.nan
         if i < len(lines):
-            rm = re.search(r"([0-9]\.[0-9]{3})\s*\((\d+)\)", lines[i])
+            rm = re.search(r"([0-9]\.[0-9]{3})\s*\((\d+|-)\)", lines[i])
             if rm:
                 race_t = float(rm.group(1))
-                popularity = int(rm.group(2))
+                popularity = int(rm.group(2)) if rm.group(2).isdigit() else np.nan
                 i += 1
 
         st_time = np.nan
