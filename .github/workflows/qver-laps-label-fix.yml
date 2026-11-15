@@ -31,7 +31,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install test dependency
-        run: python -m pip install --disable-pip-version-check pandas
+        run: python -m pip install --disable-pip-version-check pandas pytest
 
       - name: Download captured API diagnostic and create fixtures
         env:
@@ -73,7 +73,7 @@ jobs:
               gn = body.get("grandNoteList") or []
               if gn:
                   lines.append("グランドノート")
-                  lines.append("周回・順位\\t1\\t2\\t3\\t4\\t5\\t6\\t7\\t8")
+                  lines.append("周回・順位\t1\t2\t3\t4\t5\t6\t7\t8")
                   for item in gn:
                       if not isinstance(item, dict):
                           continue
@@ -85,7 +85,7 @@ jobs:
                               cars.append(str(r.get("carNo")))
                       if cars:
                           label = "ゴール線" if int(lap or 0) >= 7 else f"{lap}周"
-                          lines.append(f"{label}\\t" + "\\t".join(cars))
+                          lines.append(f"{label}\t" + "\t".join(cars))
           '''
           new = '''    # 周回（grandNoteList）
               gn = body.get("grandNoteList") or []
@@ -111,7 +111,7 @@ jobs:
                   max_lap = max(valid_lap_nos, default=None)
 
                   lines.append("グランドノート")
-                  lines.append("周回・順位\\t1\\t2\\t3\\t4\\t5\\t6\\t7\\t8")
+                  lines.append("周回・順位\t1\t2\t3\t4\t5\t6\t7\t8")
                   for item in gn:
                       if not isinstance(item, dict):
                           continue
@@ -130,7 +130,7 @@ jobs:
                       if not cars:
                           continue
                       label = "ゴール線" if max_lap is not None and lap_no == max_lap else f"{lap_no}周目"
-                      lines.append(f"{label}\\t" + "\\t".join(cars))
+                      lines.append(f"{label}\t" + "\t".join(cars))
           '''
           if app.count(old) != 1:
               raise SystemExit(f"Expected exactly one converter block, found {app.count(old)}")
@@ -177,8 +177,8 @@ jobs:
           def get_lap_lines(text):
               return [
                   line for line in text.splitlines()
-                  if line.startswith("ゴール線\\t")
-                  or (line.split("\\t", 1)[0].endswith("周目") if "\\t" in line else False)
+                  if line.startswith("ゴール線\t")
+                  or (line.split("\t", 1)[0].endswith("周目") if "\t" in line else False)
               ]
 
           def test_four_captured_api_cases_have_one_finish_line_and_no_empty_cars():
@@ -195,11 +195,11 @@ jobs:
                   )
                   lap_lines = get_lap_lines(text)
                   assert len(lap_lines) == expected_counts[case["name"]], case["name"]
-                  assert sum(line.startswith("ゴール線\\t") for line in lap_lines) == 1, case["name"]
-                  assert all(line.split("\\t")[1:] for line in lap_lines), case["name"]
+                  assert sum(line.startswith("ゴール線\t") for line in lap_lines) == 1, case["name"]
+                  assert all(line.split("\t")[1:] for line in lap_lines), case["name"]
                   assert all(
                       car in {"1", "2", "3", "4", "5", "6", "7", "8"}
-                      for line in lap_lines for car in line.split("\\t")[1:]
+                      for line in lap_lines for car in line.split("\t")[1:]
                   ), case["name"]
                   parsed = parser(text)
                   assert not parsed.empty, case["name"]
@@ -213,12 +213,12 @@ jobs:
                   "浜松", 12, "20261102"
               )
               lap_lines = get_lap_lines(text)
-              assert lap_lines[0].startswith("ゴール線\\t4\\t6\\t7")
+              assert lap_lines[0].startswith("ゴール線\t4\t6\t7")
               assert len(lap_lines) == 7
               assert not any(line.startswith("8周") or line.startswith("9周") for line in lap_lines)
 
           def test_parser_accepts_legacy_and_new_lap_labels():
-              text = "グランドノート\\n6周\\t1\\t2\\t3\\n5周目\\t3\\t2\\t1\\n払戻金"
+              text = "グランドノート\n6周\t1\t2\t3\n5周目\t3\t2\t1\n払戻金"
               parsed = parser(text)
               assert set(parsed["周回番号"].tolist()) == {5, 6}
               assert set(parsed["周回"].tolist()) == {"6周", "5周目"}
