@@ -102,7 +102,7 @@ jobs:
               tables = {r[0] for r in con.execute(
                   "SELECT name FROM sqlite_master WHERE type='table'")}
               schemas = {}
-              for table in ("result_races", "v15_race_inputs", "result_laps", "v15_player_history_imports"):
+              for table in ("result_races", "v15_race_inputs", "result_laps", "player_lap_history", "v15_player_history_imports"):
                   if table in tables:
                       schemas[table] = table_columns(con, table)
                   else:
@@ -218,6 +218,49 @@ jobs:
                                   f'ORDER BY "{lap_label_col}" LIMIT 30')
                           ]
     
+          # Parallel check using player_lap_history, which has race_key directly.
+          player_lap_rows = []
+          player_lap_summary = {"table_present": "player_lap_history" in tables}
+          if "player_lap_history" in tables:
+              with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+                  con.execute("PRAGMA query_only=ON")
+                  plcols = table_columns(con, "player_lap_history")
+                  plkey = choose(plcols, ["race_key"])
+                  plno = choose(plcols, ["lap_no"])
+                  plcar = choose(plcols, ["car_no"])
+                  if plkey and plno:
+                      sql = (
+                          f'SELECT "{plkey}", MAX(CASE WHEN "{plno}" BETWEEN 1 AND 8 '
+                          f'THEN "{plno}" END), COUNT(DISTINCT CASE WHEN "{plno}" BETWEEN 1 AND 8 '
+                          f'THEN "{plno}" END), COUNT(DISTINCT "{plcar}") '
+                          f'FROM player_lap_history GROUP BY "{plkey}" ORDER BY "{plkey}"'
+                      ) if plcar else (
+                          f'SELECT "{plkey}", MAX(CASE WHEN "{plno}" BETWEEN 1 AND 8 '
+                          f'THEN "{plno}" END), COUNT(DISTINCT CASE WHEN "{plno}" BETWEEN 1 AND 8 '
+                          f'THEN "{plno}" END), NULL FROM player_lap_history '
+                          f'GROUP BY "{plkey}" ORDER BY "{plkey}"'
+                      )
+                      for race_key, max_lap, distinct_laps, cars in con.execute(sql):
+                          if max_lap is not None:
+                              player_lap_rows.append([
+                                  race_key, max_lap, distinct_laps, cars,
+                                  "complete" if distinct_laps == max_lap else "missing_lap_rows"
+                              ])
+                      player_counts = Counter(
+                          "unknown" if r[1] is None else
+                          "6_lap" if r[1] == 6 else
+                          "8_lap" if r[1] == 8 else f"other_{r[1]}_lap"
+                          for r in player_lap_rows
+                      )
+                      player_lap_summary = {
+                          "table_present": True,
+                          "rows": con.execute("SELECT COUNT(*) FROM player_lap_history").fetchone()[0],
+                          "distinct_races_with_lap_no_1_to_8": len(player_lap_rows),
+                          "lap_counts": dict(sorted(player_counts.items())),
+                          "complete_races": sum(1 for r in player_lap_rows if r[4] == "complete"),
+                          "incomplete_races": sum(1 for r in player_lap_rows if r[4] != "complete"),
+                      }
+
           # Independent race-level distribution from imported player histories.
           history_race_rows = []
           history_summary = {"table_present": "v15_player_history_imports" in tables}
@@ -394,7 +437,7 @@ jobs:
           total = len(all_keys)
           summary = {
               "integrity_check": integrity,
-              "tables_present": {t: t in tables for t in ("result_races", "v15_race_inputs", "result_laps", "v15_player_history_imports")},
+              "tables_present": {t: t in tables for t in ("result_races", "v15_race_inputs", "result_laps", "player_lap_history", "v15_player_history_imports")},
               "result_races_columns": rr_cols,
               "v15_race_inputs_columns": v15_cols,
               "result_races_key_column": rr_key,
@@ -420,6 +463,7 @@ jobs:
               "result_laps_summary": lap_table_summary,
               "result_laps_race_distribution": result_lap_summary,
               "player_history_race_distribution": history_summary,
+              "player_lap_history_distribution": player_lap_summary,
               "classification_rule": "Precedence: recognized result_races distance, explicit v15_race_inputs.laps, recognized v15 distance, then a unique lap count in raw_text. Conflicts/unknowns are not guessed."
           }
 
@@ -442,6 +486,9 @@ jobs:
           write_csv(out / "player_history_per_race.csv",
                     ["race_key", "player_history_rows", "laps_values", "distance_values", "source", "lap_count"],
                     history_race_rows)
+          write_csv(out / "player_lap_history_per_race.csv",
+                    ["race_key", "max_lap_no", "distinct_lap_nos", "distinct_cars", "coverage"],
+                    player_lap_rows)
           print(json.dumps(summary, ensure_ascii=False, indent=2))
           PY
 
