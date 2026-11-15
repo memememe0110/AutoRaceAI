@@ -39,11 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work
-          python tools/prospective_collector.py fetch-db \\
-            --repo "$REPO" \\
-            --branch "autorace-db" \\
-            --out work/autorace_players.sqlite3 \\
-            --info-out work/db_info.json
+          python tools/prospective_collector.py fetch-db --repo "$REPO" --branch "autorace-db" --out work/autorace_players.sqlite3 --info-out work/db_info.json
 
       - name: Analyze race lap distribution (SELECT only)
         run: |
@@ -128,13 +124,17 @@ jobs:
                       f"found columns={v15_cols}")
 
               distance_by_key = {}
+              result_keys = set()
               result_rows = 0
-              if "result_races" in tables and rr_key and rr_distance:
-                  sql = (f'SELECT "{rr_key}", "{rr_distance}" '
+              if "result_races" in tables and rr_key:
+                  distance_expr = f'"{rr_distance}"' if rr_distance else "NULL"
+                  sql = (f'SELECT "{rr_key}", {distance_expr} '
                          f'FROM result_races WHERE "{rr_key}" IS NOT NULL')
                   for key, distance in con.execute(sql):
                       result_rows += 1
                       k = str(key).strip()
+                      if k:
+                          result_keys.add(k)
                       if k and distance is not None and str(distance).strip():
                           distance_by_key.setdefault(k, set()).add(norm(distance))
 
@@ -152,7 +152,7 @@ jobs:
                       else:
                           raw_by_key[k].add("NO_LAP_MATCH")
 
-          all_keys = sorted(set(distance_by_key) | set(raw_by_key))
+          all_keys = sorted(result_keys | set(distance_by_key) | set(raw_by_key))
           details = []
           source_counts = Counter()
           lap_counts = Counter()
