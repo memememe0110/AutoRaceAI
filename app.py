@@ -15722,7 +15722,7 @@ def _v233_list_saved_results(db_path: str, limit: int = 200) -> list[dict]:
                        COALESCE(v.updated_at, r.registered_at) AS updated_at
                 FROM result_races r
                 LEFT JOIN v223_result_view_restore v ON v.race_key = r.race_key
-                ORDER BY COALESCE(v.updated_at, r.registered_at) DESC, r.race_key DESC
+                ORDER BY julianday(COALESCE(v.updated_at, r.registered_at)) DESC, r.race_key DESC
                 LIMIT ?
                 """,
                 (int(limit),),
