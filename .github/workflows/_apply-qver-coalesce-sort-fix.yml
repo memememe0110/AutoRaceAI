@@ -17,7 +17,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: qver-coalesce-sort-fix
-          fetch-depth: 0
+          fetch-depth: 1
+          sparse-checkout: |
+            app.py
+            .github/workflows/_apply-qver-coalesce-sort-fix.yml
+          sparse-checkout-cone-mode: false
 
       - name: Apply the isolated SQL change and tests
         shell: bash
