@@ -69,25 +69,9 @@ jobs:
 
           app_path = Path("app.py")
           app = app_path.read_text(encoding="utf-8")
-          old = '''    # 周回（grandNoteList）
-              gn = body.get("grandNoteList") or []
-              if gn:
-                  lines.append("グランドノート")
-                  lines.append("周回・順位\t1\t2\t3\t4\t5\t6\t7\t8")
-                  for item in gn:
-                      if not isinstance(item, dict):
-                          continue
-                      lap = item.get("lapNo")
-                      ranks = item.get("rankList") or []
-                      cars = []
-                      for r in sorted(ranks, key=lambda x: int(x.get("rank") or 99) if isinstance(x, dict) else 99):
-                          if isinstance(r, dict) and r.get("carNo") is not None:
-                              cars.append(str(r.get("carNo")))
-                      if cars:
-                          label = "ゴール線" if int(lap or 0) >= 7 else f"{lap}周"
-                          lines.append(f"{label}\t" + "\t".join(cars))
-          '''
-          new = '''    # 周回（grandNoteList）
+          start = app.index("    # 周回（grandNoteList）")
+          end = app.index("    # 払戻", start)
+          new_block = '''    # 周回（grandNoteList）
               gn = body.get("grandNoteList") or []
               if gn:
                   def _valid_lap_car(value):
@@ -111,7 +95,7 @@ jobs:
                   max_lap = max(valid_lap_nos, default=None)
 
                   lines.append("グランドノート")
-                  lines.append("周回・順位\t1\t2\t3\t4\t5\t6\t7\t8")
+                  lines.append("周回・順位\\\\t1\\\\t2\\\\t3\\\\t4\\\\t5\\\\t6\\\\t7\\\\t8")
                   for item in gn:
                       if not isinstance(item, dict):
                           continue
@@ -130,11 +114,9 @@ jobs:
                       if not cars:
                           continue
                       label = "ゴール線" if max_lap is not None and lap_no == max_lap else f"{lap_no}周目"
-                      lines.append(f"{label}\t" + "\t".join(cars))
+                      lines.append(f"{label}\\\\t" + "\\\\t".join(cars))
           '''
-          if app.count(old) != 1:
-              raise SystemExit(f"Expected exactly one converter block, found {app.count(old)}")
-          app_path.write_text(app.replace(old, new, 1), encoding="utf-8")
+          app_path.write_text(app[:start] + new_block + app[end:], encoding="utf-8")
 
           engine_path = Path("engine.py")
           engine = engine_path.read_text(encoding="utf-8")
