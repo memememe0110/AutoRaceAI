@@ -313,7 +313,7 @@ jobs:
               "entries_zero_count": sum(int(r[1] or 0) == 0 for r in rows),
               "laps_zero_count": sum(int(r[2] or 0) == 0 for r in rows),
               "goal_lines_zero_count": sum(int(r[goal_line_index] or 0) == 0 for r in rows),
-              "payouts_zero_count": sum(int(r[4] or 0) == 0 for r in rows),
+              "payouts_zero_count": sum(int(r[3] or 0) == 0 for r in rows),
               "any_zero_count_review_rows": len(zero_rows),
               "entries_count_distribution": dict(sorted(
                   Counter(int(r[1] or 0) for r in rows).items()
@@ -325,7 +325,7 @@ jobs:
                   Counter(int(r[goal_line_index] or 0) for r in rows).items()
               )),
               "payouts_count_distribution": dict(sorted(
-                  Counter(int(r[4] or 0) for r in rows).items()
+                  Counter(int(r[3] or 0) for r in rows).items()
               )),
               "result_races_status_column_present": has_status,
               "result_races_status_column_name": "status" if has_status else None,
