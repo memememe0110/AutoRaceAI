@@ -174,48 +174,50 @@ jobs:
                       else:
                           raw_by_key[k].add("NO_LAP_MATCH")
 
-          # Inventory all tables with race/lap/distance-like columns to find any
-          # populated source missed by the two expected tables.
-          inventory_rows = []
-          for table in sorted(tables):
-              cols = table_columns(con, table)
-              relevant = [c for c in cols if any(
-                  token in c.lower() for token in
-                  ("race_key", "distance", "lap", "周", "raw_text", "race_name"))]
-              if relevant:
-                  safe_table = table.replace('"', '""')
-                  count = con.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
-                  inventory_rows.append([table, count, "|".join(relevant), "|".join(cols)])
-
-          lap_table_summary = {}
-          if "result_laps" in tables:
-              lap_cols = schemas.get("result_laps", [])
-              lap_key = choose(lap_cols, ["race_key"])
-              lap_no_col = choose(lap_cols, ["lap_no"])
-              lap_label_col = choose(lap_cols, ["lap_label"])
-              if lap_key:
-                  lap_total = con.execute("SELECT COUNT(*) FROM result_laps").fetchone()[0]
-                  lap_races = con.execute(
-                      f'SELECT COUNT(DISTINCT "{lap_key}") FROM result_laps').fetchone()[0]
-                  lap_table_summary = {
-                      "rows": lap_total,
-                      "distinct_races": lap_races,
-                      "lap_no_column": lap_no_col,
-                      "lap_label_column": lap_label_col,
-                  }
-                  if lap_no_col:
-                      lap_table_summary["lap_no_distribution"] = [
-                          list(r) for r in con.execute(
-                              f'SELECT "{lap_no_col}", COUNT(*) FROM result_laps '
-                              f'GROUP BY "{lap_no_col}" ORDER BY "{lap_no_col}"')
-                      ]
-                  if lap_label_col:
-                      lap_table_summary["lap_label_examples"] = [
-                          list(r) for r in con.execute(
-                              f'SELECT DISTINCT "{lap_label_col}" FROM result_laps '
-                              f'ORDER BY "{lap_label_col}" LIMIT 30')
-                      ]
-
+          with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              # Inventory all tables with race/lap/distance-like columns to find any
+              # populated source missed by the two expected tables.
+              inventory_rows = []
+              for table in sorted(tables):
+                  cols = table_columns(con, table)
+                  relevant = [c for c in cols if any(
+                      token in c.lower() for token in
+                      ("race_key", "distance", "lap", "周", "raw_text", "race_name"))]
+                  if relevant:
+                      safe_table = table.replace('"', '""')
+                      count = con.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
+                      inventory_rows.append([table, count, "|".join(relevant), "|".join(cols)])
+    
+              lap_table_summary = {}
+              if "result_laps" in tables:
+                  lap_cols = schemas.get("result_laps", [])
+                  lap_key = choose(lap_cols, ["race_key"])
+                  lap_no_col = choose(lap_cols, ["lap_no"])
+                  lap_label_col = choose(lap_cols, ["lap_label"])
+                  if lap_key:
+                      lap_total = con.execute("SELECT COUNT(*) FROM result_laps").fetchone()[0]
+                      lap_races = con.execute(
+                          f'SELECT COUNT(DISTINCT "{lap_key}") FROM result_laps').fetchone()[0]
+                      lap_table_summary = {
+                          "rows": lap_total,
+                          "distinct_races": lap_races,
+                          "lap_no_column": lap_no_col,
+                          "lap_label_column": lap_label_col,
+                      }
+                      if lap_no_col:
+                          lap_table_summary["lap_no_distribution"] = [
+                              list(r) for r in con.execute(
+                                  f'SELECT "{lap_no_col}", COUNT(*) FROM result_laps '
+                                  f'GROUP BY "{lap_no_col}" ORDER BY "{lap_no_col}"')
+                          ]
+                      if lap_label_col:
+                          lap_table_summary["lap_label_examples"] = [
+                              list(r) for r in con.execute(
+                                  f'SELECT DISTINCT "{lap_label_col}" FROM result_laps '
+                                  f'ORDER BY "{lap_label_col}" LIMIT 30')
+                          ]
+    
           all_keys = sorted(result_keys | set(distance_by_key) | set(v15_laps_by_key) | set(v15_distance_by_key) | set(raw_by_key))
           details = []
           source_counts = Counter()
