@@ -1,0 +1,26 @@
+name: Verify lap label fix PR
+
+on:
+  push:
+    branches:
+      - qver-laps-label-fix
+    paths:
+      - ".github/workflows/qver-laps-label-fix-verify.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: qver-laps-label-fix
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --disable-pip-version-check pandas pytest
+      - run: |
+          python -m pytest -q tests/test_v35_parse_laps_label_fix.py
+          python -m py_compile app.py engine.py
