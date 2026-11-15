@@ -5,6 +5,9 @@ run-name: "Prospective collect ${{ inputs.date || 'scheduled' }}"
 # app.py is pinned by SHA (APP_COMMIT); the collector itself comes from this workflow's commit.
 
 on:
+  push:
+    branches:
+      - tmp-pilot-1116
   workflow_dispatch:
     inputs:
       date:
@@ -59,6 +62,7 @@ jobs:
         id: p
         env:
           IN_DATE: ${{ inputs.date }}
+          EV: ${{ github.event_name }}
           IN_CONFIG: ${{ inputs.config_id }}
           IN_VENUES: ${{ inputs.venues }}
           IN_LADDER: ${{ inputs.trials_ladder }}
@@ -67,10 +71,17 @@ jobs:
           set -euo pipefail
           D="${IN_DATE:-$(TZ=Asia/Tokyo date +%F)}"
           echo "date=$D" >> "$GITHUB_OUTPUT"
-          echo "config=${IN_CONFIG}" >> "$GITHUB_OUTPUT"
+          if [ "$EV" = "push" ]; then
+            C="ver326_1_base"
+            M="260"
+          else
+            C="${IN_CONFIG}"
+            M="${IN_MAX:-340}"
+          fi
+          echo "config=$C" >> "$GITHUB_OUTPUT"
           echo "venues=${IN_VENUES}" >> "$GITHUB_OUTPUT"
           echo "ladder=${IN_LADDER:-20000,10000,5000}" >> "$GITHUB_OUTPUT"
-          echo "max=${IN_MAX:-340}" >> "$GITHUB_OUTPUT"
+          echo "max=$M" >> "$GITHUB_OUTPUT"
 
       - name: Checkout collector (this workflow's commit)
         uses: actions/checkout@v4
