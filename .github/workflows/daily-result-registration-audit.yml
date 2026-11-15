@@ -400,6 +400,213 @@ jobs:
           print(json.dumps(summary, ensure_ascii=False))
           PY
 
+      - name: Run read-only NULL audit
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import json
+          import sqlite3
+          from datetime import datetime
+          from pathlib import Path
+
+          db = Path("work/autorace_players.sqlite3").resolve()
+          out = Path("work/result_audit")
+          out.mkdir(parents=True, exist_ok=True)
+          cutoff = datetime.fromisoformat("2026-11-15T00:00:00")
+
+          expected = {
+              "result_races": [
+                  "race_key", "race_date", "venue", "race_no", "registered_at",
+              ],
+              "result_entries": ["race_key", "race_time", "start_time"],
+              "races": ["race_key"],
+          }
+
+          with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              tables = {
+                  r[0] for r in con.execute(
+                      "SELECT name FROM sqlite_master WHERE type='table'"
+                  )
+              }
+              schemas = {}
+              column_rows = []
+              absent = []
+              for table, names in expected.items():
+                  present_table = table in tables
+                  info = (
+                      con.execute(f'PRAGMA table_info("{table}")').fetchall()
+                      if present_table else []
+                  )
+                  schema = {r[1]: r[2] for r in info}
+                  schemas[table] = schema
+                  for name in names:
+                      exists = name in schema
+                      if not exists:
+                          absent.append(f"{table}.{name}")
+                      column_rows.append([
+                          table, name, schema.get(name), int(exists),
+                          "present" if exists else "column_absent",
+                      ])
+
+              with (out / "null_audit_columns.csv").open(
+                  "w", newline="", encoding="utf-8-sig"
+              ) as f:
+                  w = csv.writer(f)
+                  w.writerow([
+                      "table_name", "column_name", "declared_type",
+                      "present", "status",
+                  ])
+                  w.writerows(column_rows)
+
+              rr = schemas["result_races"]
+              re = schemas["result_entries"]
+              rs = schemas["races"]
+              if "result_races" not in tables or "race_key" not in rr:
+                  race_rows = []
+                  entries_by_race = {}
+                  join_keys = None
+              else:
+                  select_cols = [
+                      name if name in rr else f"NULL AS {name}"
+                      for name in (
+                          "race_key", "race_date", "venue", "race_no",
+                          "registered_at",
+                      )
+                  ]
+                  race_rows = con.execute(
+                      "SELECT " + ", ".join(select_cols) +
+                      " FROM result_races ORDER BY race_key"
+                  ).fetchall()
+
+                  entries_by_race = {}
+                  if "result_entries" in tables and "race_key" in re:
+                      race_time_expr = (
+                          "SUM(CASE WHEN race_time IS NULL THEN 1 ELSE 0 END)"
+                          if "race_time" in re else "NULL"
+                      )
+                      start_time_expr = (
+                          "SUM(CASE WHEN start_time IS NULL THEN 1 ELSE 0 END)"
+                          if "start_time" in re else "NULL"
+                      )
+                      rows = con.execute(f"""
+                          SELECT race_key, COUNT(*) AS total_count,
+                                 {race_time_expr} AS race_time_null_count,
+                                 {start_time_expr} AS start_time_null_count
+                          FROM result_entries
+                          GROUP BY race_key
+                      """).fetchall()
+                      entries_by_race = {
+                          r[0]: (r[1], r[2], r[3]) for r in rows
+                      }
+
+                  join_keys = None
+                  if "races" in tables and "race_key" in rs:
+                      join_keys = {
+                          r[0] for r in con.execute(
+                              "SELECT race_key FROM races"
+                          )
+                      }
+
+          def classify_race_time(null_count, registered_at):
+              if null_count is None:
+                  return "unknown"
+              if null_count == 0:
+                  return "not_applicable"
+              if not registered_at:
+                  return "unknown"
+              try:
+                  parsed = datetime.fromisoformat(str(registered_at))
+              except (TypeError, ValueError):
+                  return "unknown"
+              # Runtime timezone is unverified. Only naive ISO timestamps
+              # strictly before the conservative cutoff can be pre-fix.
+              if parsed.tzinfo is not None:
+                  return "unknown"
+              if parsed < cutoff:
+                  return "parser_bug"
+              return "unknown"
+
+          by_race = []
+          for race in race_rows:
+              race_key, race_date, venue, race_no, registered_at = race
+              counts = entries_by_race.get(race_key)
+              if counts is None:
+                  race_time_null_count = None
+                  start_time_null_count = None
+              else:
+                  _, race_time_null_count, start_time_null_count = counts
+
+              likely_cause = classify_race_time(
+                  race_time_null_count, registered_at
+              )
+              if join_keys is None:
+                  other_missing = "unknown"
+              elif race_key in join_keys:
+                  other_missing = "joined"
+              else:
+                  other_missing = "no_join_row"
+
+              by_race.append([
+                  race_key, race_date, venue, race_no, registered_at,
+                  race_time_null_count, start_time_null_count,
+                  likely_cause, other_missing, "unknown",
+              ])
+
+          with (out / "null_audit_by_race.csv").open(
+              "w", newline="", encoding="utf-8-sig"
+          ) as f:
+              w = csv.writer(f)
+              w.writerow([
+                  "race_key", "race_date", "venue", "race_no",
+                  "registered_at", "race_time_null_count",
+                  "start_time_null_count", "likely_cause",
+                  "other_race_info_missing", "weather_missing",
+              ])
+              w.writerows(by_race)
+
+          parser_bug_races = sum(row[7] == "parser_bug" for row in by_race)
+          race_time_null_races = sum(
+              row[5] is not None and row[5] > 0 for row in by_race
+          )
+          other_no_join = sum(row[8] == "no_join_row" for row in by_race)
+          summary = {
+              "race_count": len(by_race),
+              "column_absent": absent,
+              "column_absent_count": len(absent),
+              "race_time_null_race_count": race_time_null_races,
+              "parser_bug_race_count": parser_bug_races,
+              "other_race_info_no_join_row_count": other_no_join,
+              "other_race_info_missing_definition":
+                  "結合先不在（API未提供とは限らない）",
+              "weather_missing_judgment":
+                  "not_implemented_no_evidence_column",
+              "registered_at_timezone":
+                  "naive ISO; runtime timezone unverified",
+              "parser_bug_rule":
+                  "race_time_null_count > 0 AND registered_at < "
+                  "2026-11-15T00:00:00; naive ISO only",
+              "start_time_null_count":
+                  "reported for information only; not used for likely_cause",
+              "database_modified": False,
+              "database_in_artifact": False,
+              "notes": [
+                  "race_time/start_time are REAL; empty-string counts are not applicable.",
+                  "start_time NULL is reported but does not independently determine likely_cause.",
+                  "Timezone-ambiguous registered_at values remain unknown.",
+                  "other_race_info_missing means no matching races.race_key row, not API unavailability.",
+                  "weather_missing remains unknown because no evidence column is available.",
+                  "SQLite opened with mode=ro and PRAGMA query_only=ON.",
+              ],
+          }
+          (out / "null_audit_summary.json").write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          print(json.dumps(summary, ensure_ascii=False))
+          PY
+
       - name: Upload audit CSV and summary only
         uses: actions/upload-artifact@v4
         with:
