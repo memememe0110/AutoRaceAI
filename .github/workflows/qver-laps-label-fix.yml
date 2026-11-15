@@ -115,7 +115,7 @@ jobs:
                           continue
                       label = "ゴール線" if max_lap is not None and lap_no == max_lap else f"{lap_no}周目"
                       lines.append(f"{label}\\\\t" + "\\\\t".join(cars))
-          '''
+          '''''
           app_path.write_text(app[:start] + new_block + app[end:], encoding="utf-8")
 
           engine_path = Path("engine.py")
