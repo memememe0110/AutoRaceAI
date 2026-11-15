@@ -116,11 +116,17 @@ jobs:
               rr_key = choose(rr_cols, ["race_key"])
               rr_distance = choose(rr_cols, ["distance", "race_distance", "kyori", "距離"])
               v15_key = choose(v15_cols, ["race_key"])
+              v15_laps_col = choose(v15_cols, ["laps", "lap_count", "total_laps", "周回数"])
+              v15_distance = choose(v15_cols, ["distance", "race_distance", "kyori", "距離"])
               v15_raw = choose(v15_cols, ["raw_text"])
 
-              if not v15_key or not v15_raw:
+              if not v15_key:
                   raise SystemExit(
-                      "v15_race_inputs requires race_key and raw_text; "
+                      "v15_race_inputs requires race_key; "
+                      f"found columns={v15_cols}")
+              if not any((v15_laps_col, v15_distance, v15_raw)):
+                  raise SystemExit(
+                      "v15_race_inputs has no laps, distance, or raw_text source; "
                       f"found columns={v15_cols}")
 
               distance_by_key = {}
@@ -138,21 +144,37 @@ jobs:
                       if k and distance is not None and str(distance).strip():
                           distance_by_key.setdefault(k, set()).add(norm(distance))
 
+              v15_laps_by_key = defaultdict(set)
+              v15_distance_by_key = defaultdict(set)
               raw_by_key = defaultdict(set)
-              raw_rows = 0
-              sql = (f'SELECT "{v15_key}", "{v15_raw}" FROM v15_race_inputs '
-                     f'WHERE "{v15_key}" IS NOT NULL AND "{v15_raw}" IS NOT NULL')
-              for key, raw in con.execute(sql):
-                  raw_rows += 1
+              v15_rows = 0
+              select_laps = f'"{v15_laps_col}"' if v15_laps_col else "NULL"
+              select_distance = f'"{v15_distance}"' if v15_distance else "NULL"
+              select_raw = f'"{v15_raw}"' if v15_raw else "NULL"
+              sql = (f'SELECT "{v15_key}", {select_laps}, {select_distance}, {select_raw} '
+                     f'FROM v15_race_inputs WHERE "{v15_key}" IS NOT NULL')
+              for key, explicit_laps, distance, raw in con.execute(sql):
+                  v15_rows += 1
                   k = str(key).strip()
-                  if k:
+                  if not k:
+                      continue
+                  if explicit_laps is not None and str(explicit_laps).strip():
+                      value = norm(explicit_laps)
+                      match = re.search(r"\d{1,2}", value)
+                      if match:
+                          v15_laps_by_key[k].add(int(match.group(0)))
+                      else:
+                          v15_laps_by_key[k].add("UNPARSEABLE")
+                  if distance is not None and str(distance).strip():
+                      v15_distance_by_key[k].add(norm(distance))
+                  if raw is not None and str(raw).strip():
                       lap, values = lap_from_raw(raw)
                       if values:
                           raw_by_key[k].update(values)
                       else:
                           raw_by_key[k].add("NO_LAP_MATCH")
 
-          all_keys = sorted(result_keys | set(distance_by_key) | set(raw_by_key))
+          all_keys = sorted(result_keys | set(distance_by_key) | set(v15_laps_by_key) | set(v15_distance_by_key) | set(raw_by_key))
           details = []
           source_counts = Counter()
           lap_counts = Counter()
@@ -161,6 +183,12 @@ jobs:
               distances = sorted(distance_by_key.get(key, set()))
               distance_laps = sorted({x for x in
                   (lap_from_distance(d) for d in distances) if x is not None})
+              explicit_values = v15_laps_by_key.get(key, set())
+              explicit_laps = sorted(x for x in explicit_values if isinstance(x, int))
+              explicit_conflict = len(explicit_laps) > 1
+              v15_distances = sorted(v15_distance_by_key.get(key, set()))
+              v15_distance_laps = sorted({x for x in
+                  (lap_from_distance(d) for d in v15_distances) if x is not None})
               raw_values = raw_by_key.get(key, set())
               raw_laps = sorted(x for x in raw_values if isinstance(x, int))
               raw_conflict = len(raw_laps) > 1
@@ -170,6 +198,14 @@ jobs:
                   laps, source = distance_laps[0], "result_races.distance"
               elif len(distance_laps) > 1:
                   laps, source = None, "distance_conflict"
+              elif explicit_laps and not explicit_conflict:
+                  laps, source = explicit_laps[0], "v15_race_inputs.laps"
+              elif explicit_conflict:
+                  laps, source = None, "v15_laps_conflict"
+              elif len(v15_distance_laps) == 1:
+                  laps, source = v15_distance_laps[0], "v15_race_inputs.distance"
+              elif len(v15_distance_laps) > 1:
+                  laps, source = None, "v15_distance_conflict"
               elif raw_laps and not raw_conflict:
                   laps, source = raw_laps[0], "v15_race_inputs.raw_text"
               elif raw_conflict:
@@ -177,7 +213,8 @@ jobs:
               else:
                   laps, source = None, "unknown"
 
-              if distance_laps and raw_laps and set(distance_laps).isdisjoint(raw_laps):
+              combined_fallback_laps = set(explicit_laps) | set(v15_distance_laps) | set(raw_laps)
+              if distance_laps and combined_fallback_laps and set(distance_laps).isdisjoint(combined_fallback_laps):
                   mismatch_keys.append(key)
 
               if laps is None:
@@ -192,7 +229,8 @@ jobs:
               source_counts[source] += 1
               lap_counts[category] += 1
               details.append([
-                  key, "|".join(distances), "|".join(map(str, raw_laps)),
+                  key, "|".join(distances), "|".join(map(str, explicit_laps)),
+                  "|".join(v15_distances), "|".join(map(str, raw_laps)),
                   source, laps if laps is not None else "", category,
                   int(raw_conflict), int(raw_has_no_match),
               ])
@@ -208,9 +246,11 @@ jobs:
               "result_races_key_column": rr_key,
               "result_races_distance_column": rr_distance,
               "v15_race_key_column": v15_key,
+              "v15_laps_column": v15_laps_col,
+              "v15_distance_column": v15_distance,
               "v15_raw_text_column": v15_raw,
               "result_races_rows_scanned": result_rows,
-              "v15_raw_text_rows_scanned": raw_rows,
+              "v15_race_input_rows_scanned": v15_rows,
               "distinct_race_keys": total,
               "lap_counts": dict(sorted(lap_counts.items())),
               "source_counts": dict(sorted(source_counts.items())),
@@ -222,11 +262,12 @@ jobs:
               "distance_vs_raw_text_mismatch_count": len(mismatch_keys),
               "distance_vs_raw_text_mismatch_examples": mismatch_keys[:50],
               "distance_mapping": {"4100": 6, "5000": 8},
-              "classification_rule": "Use recognized result_races distance first; otherwise use a unique lap count parsed from v15_race_inputs.raw_text. Conflicts/unknowns are not guessed."
+              "classification_rule": "Precedence: recognized result_races distance, explicit v15_race_inputs.laps, recognized v15 distance, then a unique lap count in raw_text. Conflicts/unknowns are not guessed."
           }
 
           write_csv(out / "race_lap_distribution.csv",
-                    ["race_key", "result_distance_values", "raw_text_lap_values",
+                    ["race_key", "result_distance_values", "v15_laps_values",
+                     "v15_distance_values", "raw_text_lap_values",
                      "classification_source", "lap_count", "category",
                      "raw_text_conflict", "raw_text_no_match"],
                     details)
