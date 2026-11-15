@@ -1,0 +1,248 @@
+name: QVER Lap Distribution (Read Only)
+run-name: "QVER lap distribution ${{ github.ref_name }}"
+
+on:
+  push:
+    branches:
+      - tmp-qver-lap-distribution
+    paths:
+      - .github/workflows/qver-lap-distribution.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qver-lap-distribution
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout query tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fetch and verify immutable DB
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python tools/prospective_collector.py fetch-db \\
+            --repo "$REPO" \\
+            --branch "autorace-db" \\
+            --out work/autorace_players.sqlite3 \\
+            --info-out work/db_info.json
+
+      - name: Analyze race lap distribution (SELECT only)
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import json
+          import re
+          import sqlite3
+          import unicodedata
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          db = Path("work/autorace_players.sqlite3").resolve()
+          out = Path("work/lap_distribution")
+          out.mkdir(parents=True, exist_ok=True)
+
+          def norm(value):
+              return unicodedata.normalize("NFKC", str(value or "")).strip()
+
+          def table_columns(con, table):
+              return [str(r[1]) for r in con.execute(f'PRAGMA table_info("{table}")')]
+
+          def choose(columns, candidates):
+              lower = {c.lower(): c for c in columns}
+              for name in candidates:
+                  if name.lower() in lower:
+                      return lower[name.lower()]
+              return None
+
+          def lap_from_raw(raw):
+              values = sorted({int(x) for x in re.findall(r"(\d{1,2})\s*周", norm(raw))})
+              if len(values) == 1:
+                  return values[0], values
+              if len(values) > 1:
+                  return None, values
+              return None, []
+
+          def lap_from_distance(value):
+              s = norm(value).replace(",", "")
+              nums = re.findall(r"\d{3,5}", s)
+              if not nums:
+                  return None
+              # Agreed mapping for this audit: 4,100m -> 6 laps; 5,000m -> 8 laps.
+              distance = int(nums[0])
+              return {4100: 6, 5000: 8}.get(distance)
+
+          def write_csv(path, header, rows):
+              with path.open("w", newline="", encoding="utf-8-sig") as f:
+                  w = csv.writer(f)
+                  w.writerow(header)
+                  w.writerows(rows)
+
+          with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+              if str(integrity).lower() != "ok":
+                  raise SystemExit(f"integrity_check failed: {integrity}")
+
+              tables = {r[0] for r in con.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table'")}
+              schemas = {}
+              for table in ("result_races", "v15_race_inputs"):
+                  if table in tables:
+                      schemas[table] = table_columns(con, table)
+                  else:
+                      schemas[table] = []
+
+              if not schemas["v15_race_inputs"]:
+                  raise SystemExit("v15_race_inputs table missing or has no columns")
+
+              rr_cols = schemas["result_races"]
+              v15_cols = schemas["v15_race_inputs"]
+              rr_key = choose(rr_cols, ["race_key"])
+              rr_distance = choose(rr_cols, ["distance", "race_distance", "kyori", "距離"])
+              v15_key = choose(v15_cols, ["race_key"])
+              v15_raw = choose(v15_cols, ["raw_text"])
+
+              if not v15_key or not v15_raw:
+                  raise SystemExit(
+                      "v15_race_inputs requires race_key and raw_text; "
+                      f"found columns={v15_cols}")
+
+              distance_by_key = {}
+              result_rows = 0
+              if "result_races" in tables and rr_key and rr_distance:
+                  sql = (f'SELECT "{rr_key}", "{rr_distance}" '
+                         f'FROM result_races WHERE "{rr_key}" IS NOT NULL')
+                  for key, distance in con.execute(sql):
+                      result_rows += 1
+                      k = str(key).strip()
+                      if k and distance is not None and str(distance).strip():
+                          distance_by_key.setdefault(k, set()).add(norm(distance))
+
+              raw_by_key = defaultdict(set)
+              raw_rows = 0
+              sql = (f'SELECT "{v15_key}", "{v15_raw}" FROM v15_race_inputs '
+                     f'WHERE "{v15_key}" IS NOT NULL AND "{v15_raw}" IS NOT NULL')
+              for key, raw in con.execute(sql):
+                  raw_rows += 1
+                  k = str(key).strip()
+                  if k:
+                      lap, values = lap_from_raw(raw)
+                      if values:
+                          raw_by_key[k].update(values)
+                      else:
+                          raw_by_key[k].add("NO_LAP_MATCH")
+
+          all_keys = sorted(set(distance_by_key) | set(raw_by_key))
+          details = []
+          source_counts = Counter()
+          lap_counts = Counter()
+          mismatch_keys = []
+          for key in all_keys:
+              distances = sorted(distance_by_key.get(key, set()))
+              distance_laps = sorted({x for x in
+                  (lap_from_distance(d) for d in distances) if x is not None})
+              raw_values = raw_by_key.get(key, set())
+              raw_laps = sorted(x for x in raw_values if isinstance(x, int))
+              raw_conflict = len(raw_laps) > 1
+              raw_has_no_match = "NO_LAP_MATCH" in raw_values
+
+              if len(distance_laps) == 1:
+                  laps, source = distance_laps[0], "result_races.distance"
+              elif len(distance_laps) > 1:
+                  laps, source = None, "distance_conflict"
+              elif raw_laps and not raw_conflict:
+                  laps, source = raw_laps[0], "v15_race_inputs.raw_text"
+              elif raw_conflict:
+                  laps, source = None, "raw_text_conflict"
+              else:
+                  laps, source = None, "unknown"
+
+              if distance_laps and raw_laps and set(distance_laps).isdisjoint(raw_laps):
+                  mismatch_keys.append(key)
+
+              if laps is None:
+                  category = "unknown"
+              elif laps == 6:
+                  category = "6_lap"
+              elif laps == 8:
+                  category = "8_lap"
+              else:
+                  category = f"other_{laps}_lap"
+
+              source_counts[source] += 1
+              lap_counts[category] += 1
+              details.append([
+                  key, "|".join(distances), "|".join(map(str, raw_laps)),
+                  source, laps if laps is not None else "", category,
+                  int(raw_conflict), int(raw_has_no_match),
+              ])
+
+          known = sum(v for k, v in lap_counts.items() if k != "unknown")
+          six_eight = lap_counts["6_lap"] + lap_counts["8_lap"]
+          total = len(all_keys)
+          summary = {
+              "integrity_check": integrity,
+              "tables_present": {t: t in tables for t in ("result_races", "v15_race_inputs")},
+              "result_races_columns": rr_cols,
+              "v15_race_inputs_columns": v15_cols,
+              "result_races_key_column": rr_key,
+              "result_races_distance_column": rr_distance,
+              "v15_race_key_column": v15_key,
+              "v15_raw_text_column": v15_raw,
+              "result_races_rows_scanned": result_rows,
+              "v15_raw_text_rows_scanned": raw_rows,
+              "distinct_race_keys": total,
+              "lap_counts": dict(sorted(lap_counts.items())),
+              "source_counts": dict(sorted(source_counts.items())),
+              "known_lap_count": known,
+              "unknown_lap_count": lap_counts["unknown"],
+              "eight_lap_share_of_known_percent": round(100 * lap_counts["8_lap"] / known, 3) if known else None,
+              "eight_lap_share_of_six_or_eight_percent": round(100 * lap_counts["8_lap"] / six_eight, 3) if six_eight else None,
+              "eight_lap_share_of_all_keys_percent": round(100 * lap_counts["8_lap"] / total, 3) if total else None,
+              "distance_vs_raw_text_mismatch_count": len(mismatch_keys),
+              "distance_vs_raw_text_mismatch_examples": mismatch_keys[:50],
+              "distance_mapping": {"4100": 6, "5000": 8},
+              "classification_rule": "Use recognized result_races distance first; otherwise use a unique lap count parsed from v15_race_inputs.raw_text. Conflicts/unknowns are not guessed."
+          }
+
+          write_csv(out / "race_lap_distribution.csv",
+                    ["race_key", "result_distance_values", "raw_text_lap_values",
+                     "classification_source", "lap_count", "category",
+                     "raw_text_conflict", "raw_text_no_match"],
+                    details)
+          (out / "summary.json").write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+          write_csv(out / "table_schemas.csv", ["table", "column"],
+                    [[t, c] for t, cols in schemas.items() for c in cols])
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload read-only results
+        uses: actions/upload-artifact@v4
+        with:
+          name: qver-lap-distribution-${{ github.run_id }}
+          path: |
+            work/lap_distribution/
+            work/db_info.json
+          if-no-files-found: error
+          retention-days: 7
