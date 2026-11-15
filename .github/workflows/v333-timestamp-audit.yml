@@ -22,7 +22,7 @@ jobs:
       - name: Checkout audit source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: \${{ github.sha }}
           fetch-depth: 1
 
       - name: Set up Python
@@ -32,16 +32,12 @@ jobs:
 
       - name: Fetch immutable DB snapshot
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
+          GH_TOKEN: \${{ github.token }}
+          REPO: \${{ github.repository }}
         run: |
           set -euo pipefail
           mkdir -p work
-          python tools/prospective_collector.py fetch-db \\
-            --repo "$REPO" \\
-            --branch "autorace-db" \\
-            --out work/autorace_players.sqlite3 \\
-            --info-out work/db_info.json
+          python tools/prospective_collector.py fetch-db --repo "$REPO" --branch "autorace-db" --out work/autorace_players.sqlite3 --info-out work/db_info.json
 
       - name: Audit timestamp storage and registered_at code references
         run: |
@@ -56,7 +52,6 @@ jobs:
           db = Path("work/autorace_players.sqlite3").resolve()
           out = Path("work/timestamp_audit")
           out.mkdir(parents=True, exist_ok=True)
-
           targets = [
               ("result_races", "created_at"),
               ("v231_prediction_history", "updated_at"),
@@ -72,60 +67,46 @@ jobs:
               s = value.strip()
               if re.search(r"Z$", s, re.I):
                   return "iso_z"
-              if re.search(r"[+-]\\d{2}:\\d{2}$", s):
+              if re.search(r"[+-]\d{2}:\d{2}$", s):
                   return "iso_offset"
-              if re.match(r"^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}", s):
+              if re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}", s):
                   return "iso_naive"
               return "other_text"
 
-          report = {"database_modified": False, "db_source_info": json.loads(
-              Path("work/db_info.json").read_text(encoding="utf-8")
-          ), "columns": []}
-
+          report = {
+              "database_modified": False,
+              "db_source_info": json.loads(Path("work/db_info.json").read_text(encoding="utf-8")),
+              "columns": [],
+          }
           with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
               con.execute("PRAGMA query_only=ON")
               integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
               if str(integrity).lower() != "ok":
                   raise SystemExit(f"integrity_check failed: {integrity}")
               report["integrity_check"] = integrity
-
-              tables = {r[0] for r in con.execute(
-                  "SELECT name FROM sqlite_master WHERE type='table'"
-              )}
+              tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
               for table, column in targets:
                   item = {"table": table, "column": column}
                   if table not in tables:
-                      item.update({"status": "table_missing"})
+                      item["status"] = "table_missing"
                       report["columns"].append(item)
                       continue
                   cols = {r[1] for r in con.execute(f'PRAGMA table_info("{table}")')}
                   if column not in cols:
-                      item.update({"status": "column_missing"})
+                      item["status"] = "column_missing"
                       report["columns"].append(item)
                       continue
-
                   qtable = '"' + table.replace('"', '""') + '"'
                   qcol = '"' + column.replace('"', '""') + '"'
                   total = con.execute(f"SELECT COUNT(*) FROM {qtable}").fetchone()[0]
-                  nulls = con.execute(
-                      f"SELECT COUNT(*) FROM {qtable} WHERE {qcol} IS NULL"
-                  ).fetchone()[0]
-                  types = Counter()
-                  patterns = Counter()
-                  samples = []
-                  # Full-column scan is read-only and bounded to four scalar columns.
-                  cur = con.execute(
-                      f"SELECT typeof({qcol}), {qcol} FROM {qtable} WHERE {qcol} IS NOT NULL"
-                  )
+                  nulls = con.execute(f"SELECT COUNT(*) FROM {qtable} WHERE {qcol} IS NULL").fetchone()[0]
+                  types, patterns, samples = Counter(), Counter(), []
+                  cur = con.execute(f"SELECT typeof({qcol}), {qcol} FROM {qtable} WHERE {qcol} IS NOT NULL")
                   for storage_type, value in cur:
                       types[str(storage_type)] += 1
                       patterns[classify(value)] += 1
                       if len(samples) < 3:
-                          samples.append({
-                              "typeof": storage_type,
-                              "value": value,
-                              "pattern": classify(value),
-                          })
+                          samples.append({"typeof": storage_type, "value": value, "pattern": classify(value)})
                   item.update({
                       "status": "ok",
                       "row_count": total,
@@ -134,15 +115,10 @@ jobs:
                       "typeof_counts": dict(types),
                       "value_format_counts": dict(patterns),
                       "first_3_non_null_samples": samples,
-                      "interpretation_limit": (
-                          "Naive ISO strings do not encode their timezone; UTC vs JST "
-                          "cannot be proven from string shape alone."
-                      ),
+                      "interpretation_limit": "Naive ISO strings do not encode their timezone; UTC vs JST cannot be proven from string shape alone.",
                   })
                   report["columns"].append(item)
 
-          # Grep-equivalent source scan: preserve all registered_at hits and nearby
-          # SQL context so multiline ORDER BY / WHERE / comparison expressions show.
           source_report = []
           for filename in ("app.py", "engine.py"):
               path = Path(filename)
@@ -154,23 +130,17 @@ jobs:
               records = []
               for i in hits:
                   lo, hi = max(0, i - 4), min(len(lines), i + 5)
-                  context = "\\n".join(
-                      f"{j+1}: {lines[j]}" for j in range(lo, hi)
-                  )
+                  context = "\n".join(f"{j+1}: {lines[j]}" for j in range(lo, hi))
                   low = context.lower()
                   records.append({
                       "line": i + 1,
                       "text": lines[i].strip(),
-                      "near_order_by": bool(re.search(r"order\\s+by", low)),
+                      "near_order_by": bool(re.search(r"order\s+by", low)),
                       "near_where": bool(re.search(r"where", low)),
                       "near_comparison": bool(re.search(r"(<=|>=|(?<![<>=])<(?![=>])|(?<![<>=])>(?![=>]))", context)),
                       "context": context,
                   })
-              source_report.append({
-                  "file": filename,
-                  "registered_at_hit_count": len(hits),
-                  "hits": records,
-              })
+              source_report.append({"file": filename, "registered_at_hit_count": len(hits), "hits": records})
 
           report["registered_at_code_scan"] = {
               "files_scanned": ["app.py", "engine.py"],
@@ -178,10 +148,8 @@ jobs:
               "matches": source_report,
               "note": "Multiline SQL is reviewed using adjacent context; no source files were modified.",
           }
-
           (out / "timestamp_storage_audit.json").write_text(
-              json.dumps(report, ensure_ascii=False, indent=2, default=str),
-              encoding="utf-8"
+              json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
           )
           print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
           PY
@@ -189,7 +157,7 @@ jobs:
       - name: Upload read-only audit report
         uses: actions/upload-artifact@v4
         with:
-          name: v333-timestamp-audit-${{ github.run_id }}
+          name: v333-timestamp-audit-\${{ github.run_id }}
           path: |
             work/timestamp_audit/timestamp_storage_audit.json
             work/db_info.json
