@@ -1,0 +1,140 @@
+name: Temporary Lap Learning Impact Audit
+run-name: "Lap learning audit ${{ github.run_id }}"
+
+on:
+  push:
+    branches:
+      - tmp-lap-learning-audit
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch immutable DB snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python tools/prospective_collector.py fetch-db --repo "$REPO" --branch autorace-db --out work/autorace_players.sqlite3 --info-out work/db_info.json
+      - name: Read-only lap learning audit
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, sqlite3
+          from pathlib import Path
+
+          db = Path("work/autorace_players.sqlite3").resolve()
+          out = Path("work/lap_learning_audit")
+          out.mkdir(parents=True, exist_ok=True)
+          targets = [
+              "20260723_伊勢崎_8R",
+              "20260803_川口_6R",
+              "20260805_飯塚_1R",
+              "20260928_伊勢崎_8R",
+              "20261004_飯塚_9R",
+              "20261006_伊勢崎_6R",
+              "20261007_川口_6R",
+              "20261008_飯塚_12R",
+              "20261009_山陽_5R",
+              "20261009_飯塚_4R",
+              "20261012_飯塚_12R",
+              "20261025_伊勢崎_12R",
+          ]
+          with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+              tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+              required = {"player_lap_history", "result_laps", "result_entries"}
+              missing = sorted(required - tables)
+              if missing:
+                  raise SystemExit("Missing tables: " + ", ".join(missing))
+              schema = [dict(cid=r[0], name=r[1], type=r[2], notnull=r[3], default=r[4], pk=r[5])
+                        for r in con.execute("PRAGMA table_info(player_lap_history)")]
+              total_rows = con.execute("SELECT COUNT(*) FROM player_lap_history").fetchone()[0]
+              distinct_players = con.execute("SELECT COUNT(DISTINCT player_name) FROM player_lap_history").fetchone()[0]
+              distinct_races = con.execute("SELECT COUNT(DISTINCT race_key) FROM player_lap_history").fetchone()[0]
+              target_sql = ",".join(["(?)"] * len(targets))
+              params = tuple(targets)
+              race_rows = con.execute(f"""
+                WITH targets(race_key) AS (VALUES {target_sql})
+                SELECT t.race_key,
+                       COUNT(DISTINCT e.car_no) AS entry_cars,
+                       COUNT(DISTINCT CASE WHEN TRIM(COALESCE(e.player_name,''))<>'' THEN e.player_name END) AS named_players,
+                       COUNT(DISTINCT l.rowid) AS result_lap_rows,
+                       COUNT(DISTINCT h.rowid) AS linked_history_rows
+                  FROM targets t
+                  LEFT JOIN result_entries e ON e.race_key=t.race_key
+                  LEFT JOIN result_laps l ON l.race_key=t.race_key
+                  LEFT JOIN player_lap_history h ON h.race_key=t.race_key
+                 GROUP BY t.race_key ORDER BY t.race_key
+              """, params).fetchall()
+              players = con.execute(f"""
+                WITH targets(race_key) AS (VALUES {target_sql}),
+                target_players AS (
+                  SELECT DISTINCT
+                         REPLACE(REPLACE(TRIM(e.player_name),' ',''),'　','') AS name_key,
+                         TRIM(e.player_name) AS player_name
+                    FROM result_entries e JOIN targets t ON t.race_key=e.race_key
+                   WHERE TRIM(COALESCE(e.player_name,''))<>''
+                )
+                SELECT p.player_name,
+                       COUNT(h.rowid) AS history_rows,
+                       COUNT(DISTINCT h.race_key) AS history_races,
+                       MIN(h.race_key) AS oldest_race_key,
+                       MAX(h.race_key) AS newest_race_key
+                  FROM target_players p
+                  LEFT JOIN player_lap_history h
+                    ON REPLACE(REPLACE(TRIM(h.player_name),' ',''),'　','')=p.name_key
+                 GROUP BY p.name_key, p.player_name
+                 ORDER BY history_races ASC, history_rows ASC, p.player_name
+              """, params).fetchall()
+              global_summary = {
+                "integrity_check": integrity,
+                "player_lap_history_rows": total_rows,
+                "distinct_players": distinct_players,
+                "distinct_races": distinct_races,
+                "target_race_count": len(targets),
+                "target_player_count": len(players),
+                "target_races_with_entries": sum(1 for r in race_rows if r[1] > 0),
+                "target_players_with_zero_history": sum(1 for r in players if r[2] == 0),
+                "target_players_with_1_to_7_history_races": sum(1 for r in players if 1 <= r[2] <= 7),
+                "target_players_with_8plus_history_races": sum(1 for r in players if r[2] >= 8),
+                "database_modified": False
+              }
+          def write_csv(name, header, rows):
+              with (out / name).open("w", newline="", encoding="utf-8-sig") as f:
+                  w = csv.writer(f); w.writerow(header); w.writerows(rows)
+          write_csv("target_races.csv",
+                    ["race_key","entry_cars","named_players","result_lap_rows","linked_history_rows"], race_rows)
+          write_csv("target_players_history.csv",
+                    ["player_name","history_rows","history_races","oldest_race_key","newest_race_key"], players)
+          (out / "player_lap_history_schema.json").write_text(
+              json.dumps({"schema": schema, "summary": global_summary}, ensure_ascii=False, indent=2),
+              encoding="utf-8")
+          info = json.loads(Path("work/db_info.json").read_text(encoding="utf-8"))
+          report = {"db_info": info, "summary": global_summary, "schema": schema,
+                    "target_races": [dict(zip(["race_key","entry_cars","named_players","result_lap_rows","linked_history_rows"], r)) for r in race_rows],
+                    "target_players": [dict(zip(["player_name","history_rows","history_races","oldest_race_key","newest_race_key"], r)) for r in players]}
+          (out / "lap_learning_audit_summary.json").write_text(
+              json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(json.dumps(global_summary, ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lap-learning-audit-${{ github.run_id }}
+          path: work/lap_learning_audit/*
+          if-no-files-found: error
+          retention-days: 30
