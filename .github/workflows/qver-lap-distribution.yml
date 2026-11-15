@@ -102,7 +102,7 @@ jobs:
               tables = {r[0] for r in con.execute(
                   "SELECT name FROM sqlite_master WHERE type='table'")}
               schemas = {}
-              for table in ("result_races", "v15_race_inputs"):
+              for table in ("result_races", "v15_race_inputs", "result_laps"):
                   if table in tables:
                       schemas[table] = table_columns(con, table)
                   else:
@@ -174,6 +174,48 @@ jobs:
                       else:
                           raw_by_key[k].add("NO_LAP_MATCH")
 
+          # Inventory all tables with race/lap/distance-like columns to find any
+          # populated source missed by the two expected tables.
+          inventory_rows = []
+          for table in sorted(tables):
+              cols = table_columns(con, table)
+              relevant = [c for c in cols if any(
+                  token in c.lower() for token in
+                  ("race_key", "distance", "lap", "周", "raw_text", "race_name"))]
+              if relevant:
+                  safe_table = table.replace('"', '""')
+                  count = con.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
+                  inventory_rows.append([table, count, "|".join(relevant), "|".join(cols)])
+
+          lap_table_summary = {}
+          if "result_laps" in tables:
+              lap_cols = schemas.get("result_laps", [])
+              lap_key = choose(lap_cols, ["race_key"])
+              lap_no_col = choose(lap_cols, ["lap_no"])
+              lap_label_col = choose(lap_cols, ["lap_label"])
+              if lap_key:
+                  lap_total = con.execute("SELECT COUNT(*) FROM result_laps").fetchone()[0]
+                  lap_races = con.execute(
+                      f'SELECT COUNT(DISTINCT "{lap_key}") FROM result_laps').fetchone()[0]
+                  lap_table_summary = {
+                      "rows": lap_total,
+                      "distinct_races": lap_races,
+                      "lap_no_column": lap_no_col,
+                      "lap_label_column": lap_label_col,
+                  }
+                  if lap_no_col:
+                      lap_table_summary["lap_no_distribution"] = [
+                          list(r) for r in con.execute(
+                              f'SELECT "{lap_no_col}", COUNT(*) FROM result_laps '
+                              f'GROUP BY "{lap_no_col}" ORDER BY "{lap_no_col}"')
+                      ]
+                  if lap_label_col:
+                      lap_table_summary["lap_label_examples"] = [
+                          list(r) for r in con.execute(
+                              f'SELECT DISTINCT "{lap_label_col}" FROM result_laps '
+                              f'ORDER BY "{lap_label_col}" LIMIT 30')
+                      ]
+
           all_keys = sorted(result_keys | set(distance_by_key) | set(v15_laps_by_key) | set(v15_distance_by_key) | set(raw_by_key))
           details = []
           source_counts = Counter()
@@ -240,7 +282,7 @@ jobs:
           total = len(all_keys)
           summary = {
               "integrity_check": integrity,
-              "tables_present": {t: t in tables for t in ("result_races", "v15_race_inputs")},
+              "tables_present": {t: t in tables for t in ("result_races", "v15_race_inputs", "result_laps")},
               "result_races_columns": rr_cols,
               "v15_race_inputs_columns": v15_cols,
               "result_races_key_column": rr_key,
@@ -262,6 +304,8 @@ jobs:
               "distance_vs_raw_text_mismatch_count": len(mismatch_keys),
               "distance_vs_raw_text_mismatch_examples": mismatch_keys[:50],
               "distance_mapping": {"4100": 6, "5000": 8},
+              "table_inventory": inventory_rows,
+              "result_laps_summary": lap_table_summary,
               "classification_rule": "Precedence: recognized result_races distance, explicit v15_race_inputs.laps, recognized v15 distance, then a unique lap count in raw_text. Conflicts/unknowns are not guessed."
           }
 
@@ -275,6 +319,9 @@ jobs:
               json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
           write_csv(out / "table_schemas.csv", ["table", "column"],
                     [[t, c] for t, cols in schemas.items() for c in cols])
+          write_csv(out / "table_inventory.csv",
+                    ["table", "row_count", "relevant_columns", "all_columns"],
+                    inventory_rows)
           print(json.dumps(summary, ensure_ascii=False, indent=2))
           PY
 
