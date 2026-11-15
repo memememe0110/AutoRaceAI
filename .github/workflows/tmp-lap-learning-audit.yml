@@ -21,6 +21,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install engine audit dependencies
+        run: |
+          python -m pip install --disable-pip-version-check numpy pandas openpyxl
       - name: Fetch immutable DB snapshot
         env:
           GH_TOKEN: ${{ github.token }}
@@ -158,6 +161,123 @@ jobs:
           (out / "lap_learning_audit_summary.json").write_text(
               json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
           print(json.dumps(global_summary, ensure_ascii=False))
+          PY
+      - name: Isolated v62 rebuild and Ver60 sample comparison
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, shutil, sqlite3, sys
+          from pathlib import Path
+          import pandas as pd
+
+          root = Path.cwd()
+          source = (root / "work/autorace_players.sqlite3").resolve()
+          isolated = (root / "work/autorace_players_isolated.sqlite3").resolve()
+          shutil.copy2(source, isolated)
+          original_sha_before = hashlib.sha256(source.read_bytes()).hexdigest()
+
+          targets = [
+              "20260723_伊勢崎_8R", "20260803_川口_6R", "20260805_飯塚_1R",
+              "20260928_伊勢崎_8R", "20261004_飯塚_9R", "20261006_伊勢崎_6R",
+              "20261007_川口_6R", "20261008_飯塚_12R", "20261009_山陽_5R",
+              "20261009_飯塚_4R", "20261012_飯塚_12R", "20261025_伊勢崎_12R",
+          ]
+          with sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True) as con:
+              sql = ",".join(["(?)"] * len(targets))
+              rows = con.execute(f"""
+                WITH targets(race_key) AS (VALUES {sql})
+                SELECT REPLACE(REPLACE(TRIM(e.player_name),' ',''),'　','') AS name_key,
+                       MIN(TRIM(e.player_name)) AS player_name
+                  FROM result_entries e JOIN targets t ON t.race_key=e.race_key
+                 WHERE TRIM(COALESCE(e.player_name,''))<>''
+                 GROUP BY REPLACE(REPLACE(TRIM(e.player_name),' ',''),'　','')
+                 ORDER BY name_key
+              """, tuple(targets)).fetchall()
+              names = [r[1] for r in rows]
+              before_rows = con.execute("SELECT COUNT(*) FROM player_lap_history").fetchone()[0]
+
+          sys.path.insert(0, str(root))
+          import engine
+          meta = {"開催日": "2026-11-16", "レース": "12R", "走路温度": 30}
+          engine.v61_set_learning_boundary(meta)
+          frame = pd.DataFrame({"選手名": names})
+          before = engine.v60_apply_lap_and_heat_learning(
+              frame, entries=None, meta=meta, db_path=str(isolated)
+          )
+          before_map = before.set_index("選手名").to_dict(orient="index")
+          before_counts = pd.to_numeric(before["展開履歴件数"], errors="coerce").fillna(0)
+          before_distribution = {
+              "zero": int((before_counts == 0).sum()),
+              "one_to_seven": int(((before_counts >= 1) & (before_counts <= 7)).sum()),
+              "eight_plus": int((before_counts >= 8).sum()),
+          }
+          sample_names = before.assign(_n=before_counts).sort_values(
+              ["_n", "選手名"], ascending=[True, True]
+          )["選手名"].head(2).tolist()
+
+          rebuild_stats = engine.v62_rebuild_grand_note_learning(str(isolated))
+          engine.v61_set_learning_boundary(meta)
+          after = engine.v60_apply_lap_and_heat_learning(
+              frame, entries=None, meta=meta, db_path=str(isolated)
+          )
+          after_map = after.set_index("選手名").to_dict(orient="index")
+          after_counts = pd.to_numeric(after["展開履歴件数"], errors="coerce").fillna(0)
+          after_distribution = {
+              "zero": int((after_counts == 0).sum()),
+              "one_to_seven": int(((after_counts >= 1) & (after_counts <= 7)).sum()),
+              "eight_plus": int((after_counts >= 8).sum()),
+          }
+          with sqlite3.connect(f"file:{isolated.as_posix()}?mode=ro", uri=True) as con:
+              after_rows = con.execute("SELECT COUNT(*) FROM player_lap_history").fetchone()[0]
+              remaining_unsynced = con.execute("""
+                SELECT COUNT(*) FROM result_laps rl
+                JOIN result_entries re ON re.race_key=rl.race_key AND re.car_no=rl.car_no
+                LEFT JOIN player_lap_history plh
+                  ON plh.race_key=rl.race_key AND plh.car_no=rl.car_no
+                 AND plh.lap_label=rl.lap_label
+                WHERE plh.race_key IS NULL AND COALESCE(TRIM(re.player_name),'')<>''
+              """).fetchone()[0]
+          original_sha_after = hashlib.sha256(source.read_bytes()).hexdigest()
+
+          fields = ["展開履歴件数","初周主導指数","位置維持指数","捌き指数",
+                    "追込み指数","終盤指数_実測","失速リスク","展開学習補正","Ver60総合補正"]
+          samples = []
+          for name in sample_names:
+              b = before_map.get(name, {})
+              a = after_map.get(name, {})
+              samples.append({
+                  "player_name": name,
+                  "before": {k: (None if pd.isna(b.get(k)) else float(b.get(k))) for k in fields},
+                  "after": {k: (None if pd.isna(a.get(k)) else float(a.get(k))) for k in fields},
+                  "delta": {
+                      k: (None if pd.isna(b.get(k)) or pd.isna(a.get(k))
+                          else float(a.get(k)) - float(b.get(k)))
+                      for k in fields
+                  }
+              })
+          report = {
+              "database_generation": 704,
+              "source_db_sha256_before": original_sha_before,
+              "source_db_sha256_after": original_sha_after,
+              "source_db_unchanged": original_sha_before == original_sha_after,
+              "target_player_count": len(names),
+              "player_lap_history_rows_before": before_rows,
+              "player_lap_history_rows_after": after_rows,
+              "player_lap_history_rows_delta": after_rows - before_rows,
+              "v62_rebuild_stats": rebuild_stats,
+              "remaining_unsynced_lap_rows_estimate": remaining_unsynced,
+              "ver60_history_count_distribution_before": before_distribution,
+              "ver60_history_count_distribution_after": after_distribution,
+              "sample_players": samples,
+              "isolated_copy_only": True
+          }
+          out = root / "work/lap_learning_audit"
+          (out / "isolated_v62_ver60_comparison.json").write_text(
+              json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print(json.dumps(report, ensure_ascii=False))
+          if original_sha_before != original_sha_after:
+              raise SystemExit("Source DB changed unexpectedly")
           PY
       - uses: actions/upload-artifact@v4
         with:
