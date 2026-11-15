@@ -72,102 +72,84 @@ jobs:
               tables = {r[0] for r in con.execute(
                   "SELECT name FROM sqlite_master WHERE type='table'"
               )}
-              schema_rows = []
               schemas = {}
+              schema_rows = []
               for table in ("result_payouts", "result_laps", "result_races", "result_entries"):
                   if table not in tables:
                       schemas[table] = []
                       report.setdefault("missing_tables", []).append(table)
                       continue
-                  rows = con.execute(f'PRAGMA table_info("{table}")').fetchall()
-                  schemas[table] = [r[1] for r in rows]
-                  schema_rows.extend([[table, *r] for r in rows])
+                  info = con.execute(f'PRAGMA table_info("{table}")').fetchall()
+                  schemas[table] = [r[1] for r in info]
+                  schema_rows.extend([[table, *r] for r in info]
+              report["schemas"] = schemas
               write_csv("schema.csv",
                         ["table_name", "cid", "name", "type", "notnull", "default", "pk"],
                         schema_rows)
-              report["schemas"] = schemas
 
-              if "result_payouts" in tables:
-                  report["payout_count"] = con.execute(
-                      "SELECT COUNT(*) FROM result_payouts WHERE race_key=?",
+              if "result_races" in tables and {"race_key", "registered_at"}.issubset(schemas["result_races"]):
+                  race_rows = con.execute(
+                      "SELECT race_key, typeof(registered_at), registered_at "
+                      "FROM result_races WHERE race_key=?",
                       (race_key,)
-                  ).fetchone()[0]
+                  ).fetchall()
+                  report["result_races_rows"] = race_rows
+                  report["result_races_count"] = len(race_rows)
+                  write_csv("result_races.csv",
+                            ["race_key", "registered_at_type", "registered_at"], race_rows)
+              else:
+                  report["result_races_rows"] = []
+                  report["result_races_count"] = None
+
+              if "result_laps" in tables:
+                  lap_rows = con.execute(
+                      "SELECT lap_label, COUNT(*) FROM result_laps "
+                      "WHERE race_key=? GROUP BY lap_label ORDER BY lap_label",
+                      (race_key,)
+                  ).fetchall()
+                  report["result_lap_label_counts"] = lap_rows
+                  report["result_laps_count"] = sum(r[1] for r in lap_rows)
+                  write_csv("result_laps.csv", ["lap_label", "count"], lap_rows)
+              else:
+                  report["result_lap_label_counts"] = None
+                  report["result_laps_count"] = None
+
+              if "result_entries" in tables and {"race_key", "race_time", "start_time"}.issubset(schemas["result_entries"]):
+                  entry_row = con.execute(
+                      "SELECT COUNT(*), SUM(race_time IS NOT NULL), "
+                      "SUM(start_time IS NOT NULL) "
+                      "FROM result_entries WHERE race_key=?",
+                      (race_key,)
+                  ).fetchone()
+                  report["result_entries_count"] = entry_row[0]
+                  report["race_time_nonnull"] = entry_row[1]
+                  report["start_time_nonnull"] = entry_row[2]
+              else:
+                  report["result_entries_count"] = None
+                  report["race_time_nonnull"] = None
+                  report["start_time_nonnull"] = None
+
+              if "result_payouts" in tables and {"race_key", "bet_type", "combination", "payout_yen", "popularity"}.issubset(schemas["result_payouts"]):
                   payout_rows = con.execute(
                       "SELECT bet_type, combination, payout_yen, popularity "
                       "FROM result_payouts WHERE race_key=? ORDER BY bet_type, combination",
                       (race_key,)
                   ).fetchall()
-                  report["payout_rows"] = payout_rows
+                  report["result_payouts_count"] = len(payout_rows)
                   report["payout_nonnull_counts"] = {
                       "bet_type": sum(r[0] is not None for r in payout_rows),
                       "combination": sum(r[1] is not None for r in payout_rows),
                       "payout_yen": sum(r[2] is not None for r in payout_rows),
                       "popularity": sum(r[3] is not None for r in payout_rows),
                   }
-                  write_csv("payout_rows.csv",
+                  report["payout_rows"] = payout_rows
+                  write_csv("result_payouts.csv",
                             ["bet_type", "combination", "payout_yen", "popularity"],
                             payout_rows)
               else:
-                  report["payout_count"] = None
+                  report["result_payouts_count"] = None
+                  report["payout_nonnull_counts"] = None
                   report["payout_rows"] = []
-
-              if "result_laps" in tables:
-                  rows = con.execute(
-                      "SELECT lap_label, COUNT(*) FROM result_laps "
-                      "WHERE race_key=? GROUP BY lap_label ORDER BY lap_label",
-                      (race_key,)
-                  ).fetchall()
-                  report["lap_counts"] = rows
-                  write_csv("lap_counts.csv", ["lap_label", "count"], rows)
-              else:
-                  report["lap_counts"] = None
-
-              if "result_entries" in tables:
-                  cols = set(schemas["result_entries"])
-                  required = {"race_key", "race_time", "start_time"}
-                  if required.issubset(cols):
-                      row = con.execute(
-                          "SELECT COUNT(*), SUM(race_time IS NOT NULL), "
-                          "SUM(start_time IS NOT NULL) FROM result_entries WHERE race_key=?",
-                          (race_key,)
-                      ).fetchone()
-                      report["entry_counts"] = row
-                  else:
-                      report["entry_counts"] = {
-                          "error": "required columns absent",
-                          "columns": sorted(cols)
-                      }
-              else:
-                  report["entry_counts"] = None
-
-              if "result_races" in tables:
-                  cols = set(schemas["result_races"])
-                  if {"race_key", "registered_at"}.issubset(cols):
-                      report["target_registered_at"] = con.execute(
-                          "SELECT registered_at FROM result_races WHERE race_key=?",
-                          (race_key,)
-                      ).fetchall()
-                      report["registered_at_type_value"] = con.execute(
-                          "SELECT typeof(registered_at), registered_at FROM result_races WHERE race_key=?",
-                          (race_key,)
-                      ).fetchall()
-                      sample = con.execute(
-                          "SELECT registered_at FROM result_races "
-                          "WHERE registered_at IS NOT NULL "
-                          "ORDER BY rowid DESC LIMIT 1000"
-                      ).fetchall()
-                      hours = {}
-                      for (value,) in sample:
-                          value_text = str(value or "")
-                          if len(value_text) >= 13:
-                              hour = value_text[11:13]
-                              hours[hour] = hours.get(hour, 0) + 1
-                      report["registered_at_recent_1000_hour_histogram"] = dict(sorted(hours.items()))
-                  else:
-                      report["target_registered_at"] = {
-                          "error": "race_key/registered_at columns absent",
-                          "columns": sorted(cols)
-                      }
 
           (out / "summary.json").write_text(
               json.dumps(report, ensure_ascii=False, indent=2, default=str),
