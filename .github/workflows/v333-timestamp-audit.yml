@@ -60,6 +60,8 @@ jobs:
               # Actual timestamp columns referenced by the application code.
               ("result_races", "registered_at"),
               ("v231_prediction_history", "prediction_time"),
+              # updated_at used by COALESCE(v.updated_at, r.registered_at).
+              ("v223_result_view_restore", "updated_at"),
           ]
 
           def classify(value):
