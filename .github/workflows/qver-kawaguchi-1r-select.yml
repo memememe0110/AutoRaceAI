@@ -81,7 +81,7 @@ jobs:
                       continue
                   rows = con.execute(f'PRAGMA table_info("{table}")').fetchall()
                   schemas[table] = [r[1] for r in rows]
-                  schema_rows.extend([[table, *r] for r in rows)
+                  schema_rows.extend([[table, *r] for r in rows])
               write_csv("schema.csv",
                         ["table_name", "cid", "name", "type", "notnull", "default", "pk"],
                         schema_rows)
