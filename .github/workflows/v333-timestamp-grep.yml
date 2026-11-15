@@ -1,0 +1,63 @@
+name: V333 Timestamp Code Grep Audit
+
+on:
+  push:
+    branches:
+      - tmp-v333-timestamp-audit
+    paths:
+      - ".github/workflows/v333-timestamp-grep.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  grep-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout audit branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Run exhaustive timestamp grep
+        shell: bash
+        run: |
+          set -u
+          mkdir -p timestamp_grep_audit
+          OUT="$PWD/timestamp_grep_audit"
+
+          {
+            echo "=== COMMIT ==="
+            git rev-parse HEAD
+            echo
+            echo "=== 1. COALESCE lines mentioning timestamp columns ==="
+            grep -rnE "COALESCE" app.py engine.py tools/ 2>/dev/null | grep -iE "registered_at|updated_at|prediction_time|created_at" || true
+            echo
+            echo "=== 2. All v223_result_view_restore references ==="
+            grep -rn "v223_result_view_restore" app.py engine.py tools/ 2>/dev/null || true
+            echo
+            echo "=== 3. ORDER BY timestamp columns ==="
+            grep -rnE "ORDER BY.*(registered_at|updated_at|prediction_time)" app.py engine.py tools/ 2>/dev/null || true
+            echo
+            echo "=== 4. WHERE timestamp range comparisons ==="
+            grep -rnE "WHERE.*(registered_at|updated_at|prediction_time).*[<>]" app.py engine.py tools/ 2>/dev/null || true
+            echo
+            echo "=== 5. All SQL-ish timestamp column references (context inventory) ==="
+            grep -rnE "(registered_at|updated_at|prediction_time)" app.py engine.py tools/ 2>/dev/null || true
+          } | tee "$OUT/timestamp_grep_results.txt"
+
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "app_py_lines=$(wc -l < app.py)"
+            echo "engine_py_lines=$(wc -l < engine.py)"
+            echo "tools_py_files=$(find tools -type f -name '*.py' 2>/dev/null | wc -l)"
+          } > "$OUT/summary.txt"
+
+      - name: Upload grep results
+        uses: actions/upload-artifact@v4
+        with:
+          name: v333-timestamp-grep-audit
+          path: timestamp_grep_audit/
+          if-no-files-found: error
+          retention-days: 14
