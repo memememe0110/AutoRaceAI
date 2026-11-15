@@ -78,7 +78,7 @@ jobs:
           SELECT typeof(a.telvote_time) AS telvote_type,
                  typeof(a.sim_finished_at) AS sim_finished_type,
                  typeof(c.committed_at) AS committed_type,
-                 typeof(a.fetched_at) AS fetched_type,
+                 typeof(a.input_fetched_at) AS input_fetched_type,
                  COUNT(*) AS n
           FROM v332_prospective_alpha_log a
           LEFT JOIN v332_commit_log c ON c.alpha_log_id = a.id
@@ -90,7 +90,7 @@ jobs:
           # Query 2: latest 10 records, including commit timestamp where present.
           q2 = """
           SELECT a.id, a.race_key, a.config_id, a.source, a.status,
-                 a.telvote_time, a.sim_finished_at, c.committed_at, a.fetched_at
+                 a.telvote_time, a.sim_finished_at, c.committed_at, a.input_fetched_at
           FROM v332_prospective_alpha_log a
           LEFT JOIN v332_commit_log c ON c.alpha_log_id = a.id
           ORDER BY a.id DESC
