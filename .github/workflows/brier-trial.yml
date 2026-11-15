@@ -20,7 +20,7 @@ jobs:
       - name: Checkout trial code
         uses: actions/checkout@v4
         with:
-          ref: \${{ github.sha }}
+          ref: ${{ github.sha }}
           path: trial
           fetch-depth: 1
 
@@ -101,7 +101,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: brier-trial-17r-\${{ github.run_id }}
+          name: brier-trial-17r-${{ github.run_id }}
           path: trial/output/
           if-no-files-found: warn
           retention-days: 30
