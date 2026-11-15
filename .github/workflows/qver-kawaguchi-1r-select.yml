@@ -1,0 +1,168 @@
+name: QVER Kawaguchi 1R Read-only SELECT
+run-name: "QVER SELECT 20261114_川口_1R"
+
+on:
+  push:
+    branches:
+      - tmp-qver-kawaguchi-1r-select
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qver-kawaguchi-1r-select
+  cancel-in-progress: false
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout query tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fetch immutable DB
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python tools/prospective_collector.py fetch-db \
+            --repo "$REPO" \
+            --branch "autorace-db" \
+            --out work/autorace_players.sqlite3 \
+            --info-out work/db_info.json
+
+      - name: Run read-only PRAGMA and SELECT checks
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import json
+          import sqlite3
+          from pathlib import Path
+
+          db = Path("work/autorace_players.sqlite3").resolve()
+          out = Path("work/qver_select")
+          out.mkdir(parents=True, exist_ok=True)
+          race_key = "20261114_川口_1R"
+
+          def write_csv(name, header, rows):
+              with (out / name).open("w", newline="", encoding="utf-8-sig") as f:
+                  w = csv.writer(f)
+                  w.writerow(header)
+                  w.writerows(rows)
+
+          report = {"race_key": race_key, "queries_are_read_only": True}
+          with sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True) as con:
+              con.execute("PRAGMA query_only=ON")
+              report["integrity_check"] = con.execute("PRAGMA integrity_check").fetchone()[0]
+              if report["integrity_check"] != "ok":
+                  raise SystemExit("SQLite integrity_check failed")
+
+              tables = {r[0] for r in con.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table'"
+              )}
+              schema_rows = []
+              schemas = {}
+              for table in ("result_payouts", "result_laps", "result_races", "result_entries"):
+                  if table not in tables:
+                      schemas[table] = []
+                      report.setdefault("missing_tables", []).append(table)
+                      continue
+                  rows = con.execute(f'PRAGMA table_info("{table}")').fetchall()
+                  schemas[table] = [r[1] for r in rows]
+                  schema_rows.extend([[table, *r] for r in rows])
+              write_csv("schema.csv",
+                        ["table_name", "cid", "name", "type", "notnull", "default", "pk"],
+                        schema_rows)
+              report["schemas"] = schemas
+
+              if "result_payouts" in tables:
+                  report["payout_count"] = con.execute(
+                      "SELECT COUNT(*) FROM result_payouts WHERE race_key=?",
+                      (race_key,)
+                  ).fetchone()[0]
+              else:
+                  report["payout_count"] = None
+
+              if "result_laps" in tables:
+                  rows = con.execute(
+                      "SELECT lap_label, COUNT(*) FROM result_laps "
+                      "WHERE race_key=? GROUP BY lap_label ORDER BY lap_label",
+                      (race_key,)
+                  ).fetchall()
+                  report["lap_counts"] = rows
+                  write_csv("lap_counts.csv", ["lap_label", "count"], rows)
+              else:
+                  report["lap_counts"] = None
+
+              if "result_entries" in tables:
+                  cols = set(schemas["result_entries"])
+                  required = {"race_key", "race_time", "start_time"}
+                  if required.issubset(cols):
+                      row = con.execute(
+                          "SELECT COUNT(*), SUM(race_time IS NOT NULL), "
+                          "SUM(start_time IS NOT NULL) FROM result_entries WHERE race_key=?",
+                          (race_key,)
+                      ).fetchone()
+                      report["entry_counts"] = row
+                  else:
+                      report["entry_counts"] = {
+                          "error": "required columns absent",
+                          "columns": sorted(cols)
+                      }
+              else:
+                  report["entry_counts"] = None
+
+              if "result_races" in tables:
+                  cols = set(schemas["result_races"])
+                  if {"race_key", "registered_at"}.issubset(cols):
+                      report["target_registered_at"] = con.execute(
+                          "SELECT registered_at FROM result_races WHERE race_key=?",
+                          (race_key,)
+                      ).fetchall()
+                      # Read-only sample of recent timestamps for timezone-distribution review.
+                      sample = con.execute(
+                          "SELECT registered_at FROM result_races "
+                          "WHERE registered_at IS NOT NULL "
+                          "ORDER BY rowid DESC LIMIT 1000"
+                      ).fetchall()
+                      hours = {}
+                      for (value,) in sample:
+                          text = str(value or "")
+                          if len(text) >= 13:
+                              hour = text[11:13]
+                              hours[hour] = hours.get(hour, 0) + 1
+                      report["registered_at_recent_1000_hour_histogram"] = dict(sorted(hours.items()))
+                  else:
+                      report["target_registered_at"] = {
+                          "error": "race_key/registered_at columns absent",
+                          "columns": sorted(cols)
+                      }
+
+          (out / "summary.json").write_text(
+              json.dumps(report, ensure_ascii=False, indent=2, default=str),
+              encoding="utf-8"
+          )
+          print(json.dumps(report, ensure_ascii=False, default=str))
+          PY
+
+      - name: Upload SELECT results
+        uses: actions/upload-artifact@v4
+        with:
+          name: qver-kawaguchi-1r-select-${{ github.run_id }}
+          path: |
+            work/qver_select/
+            work/db_info.json
+          if-no-files-found: error
+          retention-days: 7
