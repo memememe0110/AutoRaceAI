@@ -77,5 +77,22 @@ jobs:
                           "FROM result_races GROUP BY 1"
                       ).fetchall(), ensure_ascii=False
                   ))
+          if "result_races" in tables:
+              rr_cols = {r[1] for r in con.execute("PRAGMA table_info(result_races)")}
+              for col in ("race_date", "venue", "race_no"):
+                  if col not in rr_cols:
+                      print("RESULT_RACES_NULL_AUDIT_COLUMN_ABSENT", col)
+                      continue
+                  qcol = '"' + col.replace('"', '""') + '"'
+                  total, nulls, blanks = con.execute(
+                      f"SELECT COUNT(*), "
+                      f"SUM(CASE WHEN {qcol} IS NULL THEN 1 ELSE 0 END), "
+                      f"SUM(CASE WHEN typeof({qcol})='text' AND trim({qcol})='' "
+                      f"THEN 1 ELSE 0 END) FROM result_races"
+                  ).fetchone()
+                  print("RESULT_RACES_NULL_RATE", json.dumps({
+                      "column": col, "total": total,
+                      "null_count": nulls or 0, "empty_count": blanks or 0
+                  }, ensure_ascii=False))
           con.close()
           PY
