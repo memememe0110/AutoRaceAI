@@ -7752,7 +7752,7 @@ def _v35_parse_laps(text):
     records = []
     for raw in block.splitlines():
         line = re.sub(r"[\t\u3000]+", " ", raw).strip()
-        m = re.match(r"^(ゴール線|([1-9])周目)\s+((?:[1-8]\s*){3,8})$", line)
+        m = re.match(r"^(ゴール線|([1-9])周(?:目)?)\s+((?:[1-8]\s*){3,8})$", line)
         if not m:
             continue
         label = m.group(1)

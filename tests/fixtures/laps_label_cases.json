@@ -1,0 +1,1122 @@
+[
+  {
+    "name": "hamamatsu_10r",
+    "grandNoteList": [
+      {
+        "lapNo": 9,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "1"
+          },
+          {
+            "rank": 4,
+            "carNo": "7"
+          },
+          {
+            "rank": 5,
+            "carNo": "8"
+          },
+          {
+            "rank": 6,
+            "carNo": "4"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 8,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "1"
+          },
+          {
+            "rank": 5,
+            "carNo": "8"
+          },
+          {
+            "rank": 6,
+            "carNo": "4"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 7,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "1"
+          },
+          {
+            "rank": 5,
+            "carNo": "8"
+          },
+          {
+            "rank": 6,
+            "carNo": "4"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 6,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "1"
+          },
+          {
+            "rank": 5,
+            "carNo": "8"
+          },
+          {
+            "rank": 6,
+            "carNo": "4"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 5,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "7"
+          },
+          {
+            "rank": 3,
+            "carNo": "6"
+          },
+          {
+            "rank": 4,
+            "carNo": "1"
+          },
+          {
+            "rank": 5,
+            "carNo": "8"
+          },
+          {
+            "rank": 6,
+            "carNo": "4"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 4,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "7"
+          },
+          {
+            "rank": 3,
+            "carNo": "8"
+          },
+          {
+            "rank": 4,
+            "carNo": "1"
+          },
+          {
+            "rank": 5,
+            "carNo": "6"
+          },
+          {
+            "rank": 6,
+            "carNo": "4"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 3,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "7"
+          },
+          {
+            "rank": 3,
+            "carNo": "8"
+          },
+          {
+            "rank": 4,
+            "carNo": "6"
+          },
+          {
+            "rank": 5,
+            "carNo": "1"
+          },
+          {
+            "rank": 6,
+            "carNo": "4"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 2,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "8"
+          },
+          {
+            "rank": 3,
+            "carNo": "6"
+          },
+          {
+            "rank": 4,
+            "carNo": "7"
+          },
+          {
+            "rank": 5,
+            "carNo": "1"
+          },
+          {
+            "rank": 6,
+            "carNo": "4"
+          },
+          {
+            "rank": 7,
+            "carNo": "5"
+          },
+          {
+            "rank": 8,
+            "carNo": "2"
+          }
+        ]
+      },
+      {
+        "lapNo": 1,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "8"
+          },
+          {
+            "rank": 4,
+            "carNo": "7"
+          },
+          {
+            "rank": 5,
+            "carNo": "4"
+          },
+          {
+            "rank": 6,
+            "carNo": "1"
+          },
+          {
+            "rank": 7,
+            "carNo": "5"
+          },
+          {
+            "rank": 8,
+            "carNo": "2"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "hamamatsu_12r_void",
+    "grandNoteList": [
+      {
+        "lapNo": 9,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": ""
+          }
+        ]
+      },
+      {
+        "lapNo": 8,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": ""
+          }
+        ]
+      },
+      {
+        "lapNo": 7,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "4"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "5"
+          },
+          {
+            "rank": 5,
+            "carNo": "3"
+          },
+          {
+            "rank": 6,
+            "carNo": "8"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "1"
+          }
+        ]
+      },
+      {
+        "lapNo": 6,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "4"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "5"
+          },
+          {
+            "rank": 5,
+            "carNo": "3"
+          },
+          {
+            "rank": 6,
+            "carNo": "8"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "1"
+          }
+        ]
+      },
+      {
+        "lapNo": 5,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "4"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "5"
+          },
+          {
+            "rank": 5,
+            "carNo": "8"
+          },
+          {
+            "rank": 6,
+            "carNo": "3"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "1"
+          }
+        ]
+      },
+      {
+        "lapNo": 4,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "4"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "8"
+          },
+          {
+            "rank": 5,
+            "carNo": "5"
+          },
+          {
+            "rank": 6,
+            "carNo": "3"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "1"
+          }
+        ]
+      },
+      {
+        "lapNo": 3,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "4"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "8"
+          },
+          {
+            "rank": 5,
+            "carNo": "5"
+          },
+          {
+            "rank": 6,
+            "carNo": "3"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          },
+          {
+            "rank": 8,
+            "carNo": "1"
+          }
+        ]
+      },
+      {
+        "lapNo": 2,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "4"
+          },
+          {
+            "rank": 2,
+            "carNo": "6"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "8"
+          },
+          {
+            "rank": 5,
+            "carNo": "5"
+          },
+          {
+            "rank": 6,
+            "carNo": "2"
+          },
+          {
+            "rank": 7,
+            "carNo": "3"
+          },
+          {
+            "rank": 8,
+            "carNo": "1"
+          }
+        ]
+      },
+      {
+        "lapNo": 1,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "2"
+          },
+          {
+            "rank": 2,
+            "carNo": "4"
+          },
+          {
+            "rank": 3,
+            "carNo": "6"
+          },
+          {
+            "rank": 4,
+            "carNo": "8"
+          },
+          {
+            "rank": 5,
+            "carNo": "7"
+          },
+          {
+            "rank": 6,
+            "carNo": "5"
+          },
+          {
+            "rank": 7,
+            "carNo": "1"
+          },
+          {
+            "rank": 8,
+            "carNo": "3"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "kawaguchi_1r",
+    "grandNoteList": [
+      {
+        "lapNo": 7,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "7"
+          },
+          {
+            "rank": 2,
+            "carNo": "3"
+          },
+          {
+            "rank": 3,
+            "carNo": "4"
+          },
+          {
+            "rank": 4,
+            "carNo": "6"
+          },
+          {
+            "rank": 5,
+            "carNo": "5"
+          },
+          {
+            "rank": 6,
+            "carNo": "1"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          }
+        ]
+      },
+      {
+        "lapNo": 6,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "7"
+          },
+          {
+            "rank": 3,
+            "carNo": "4"
+          },
+          {
+            "rank": 4,
+            "carNo": "6"
+          },
+          {
+            "rank": 5,
+            "carNo": "5"
+          },
+          {
+            "rank": 6,
+            "carNo": "1"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          }
+        ]
+      },
+      {
+        "lapNo": 5,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "4"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "6"
+          },
+          {
+            "rank": 5,
+            "carNo": "5"
+          },
+          {
+            "rank": 6,
+            "carNo": "1"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          }
+        ]
+      },
+      {
+        "lapNo": 4,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "4"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "6"
+          },
+          {
+            "rank": 5,
+            "carNo": "5"
+          },
+          {
+            "rank": 6,
+            "carNo": "1"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          }
+        ]
+      },
+      {
+        "lapNo": 3,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "3"
+          },
+          {
+            "rank": 2,
+            "carNo": "4"
+          },
+          {
+            "rank": 3,
+            "carNo": "7"
+          },
+          {
+            "rank": 4,
+            "carNo": "1"
+          },
+          {
+            "rank": 5,
+            "carNo": "6"
+          },
+          {
+            "rank": 6,
+            "carNo": "5"
+          },
+          {
+            "rank": 7,
+            "carNo": "2"
+          }
+        ]
+      },
+      {
+        "lapNo": 2,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "1"
+          },
+          {
+            "rank": 2,
+            "carNo": "3"
+          },
+          {
+            "rank": 3,
+            "carNo": "4"
+          },
+          {
+            "rank": 4,
+            "carNo": "5"
+          },
+          {
+            "rank": 5,
+            "carNo": "7"
+          },
+          {
+            "rank": 6,
+            "carNo": "2"
+          },
+          {
+            "rank": 7,
+            "carNo": "6"
+          }
+        ]
+      },
+      {
+        "lapNo": 1,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "1"
+          },
+          {
+            "rank": 2,
+            "carNo": "2"
+          },
+          {
+            "rank": 3,
+            "carNo": "3"
+          },
+          {
+            "rank": 4,
+            "carNo": "4"
+          },
+          {
+            "rank": 5,
+            "carNo": "5"
+          },
+          {
+            "rank": 6,
+            "carNo": "7"
+          },
+          {
+            "rank": 7,
+            "carNo": "6"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "sanyo_8r",
+    "grandNoteList": [
+      {
+        "lapNo": 7,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "8"
+          },
+          {
+            "rank": 2,
+            "carNo": "1"
+          },
+          {
+            "rank": 3,
+            "carNo": "2"
+          },
+          {
+            "rank": 4,
+            "carNo": "4"
+          },
+          {
+            "rank": 5,
+            "carNo": "6"
+          },
+          {
+            "rank": 6,
+            "carNo": "7"
+          },
+          {
+            "rank": 7,
+            "carNo": "3"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 6,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "8"
+          },
+          {
+            "rank": 2,
+            "carNo": "1"
+          },
+          {
+            "rank": 3,
+            "carNo": "2"
+          },
+          {
+            "rank": 4,
+            "carNo": "4"
+          },
+          {
+            "rank": 5,
+            "carNo": "6"
+          },
+          {
+            "rank": 6,
+            "carNo": "7"
+          },
+          {
+            "rank": 7,
+            "carNo": "3"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 5,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "1"
+          },
+          {
+            "rank": 2,
+            "carNo": "8"
+          },
+          {
+            "rank": 3,
+            "carNo": "2"
+          },
+          {
+            "rank": 4,
+            "carNo": "4"
+          },
+          {
+            "rank": 5,
+            "carNo": "6"
+          },
+          {
+            "rank": 6,
+            "carNo": "7"
+          },
+          {
+            "rank": 7,
+            "carNo": "3"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 4,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "1"
+          },
+          {
+            "rank": 2,
+            "carNo": "2"
+          },
+          {
+            "rank": 3,
+            "carNo": "4"
+          },
+          {
+            "rank": 4,
+            "carNo": "8"
+          },
+          {
+            "rank": 5,
+            "carNo": "6"
+          },
+          {
+            "rank": 6,
+            "carNo": "7"
+          },
+          {
+            "rank": 7,
+            "carNo": "3"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 3,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "1"
+          },
+          {
+            "rank": 2,
+            "carNo": "2"
+          },
+          {
+            "rank": 3,
+            "carNo": "4"
+          },
+          {
+            "rank": 4,
+            "carNo": "6"
+          },
+          {
+            "rank": 5,
+            "carNo": "8"
+          },
+          {
+            "rank": 6,
+            "carNo": "3"
+          },
+          {
+            "rank": 7,
+            "carNo": "7"
+          },
+          {
+            "rank": 8,
+            "carNo": "5"
+          }
+        ]
+      },
+      {
+        "lapNo": 2,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "1"
+          },
+          {
+            "rank": 2,
+            "carNo": "2"
+          },
+          {
+            "rank": 3,
+            "carNo": "3"
+          },
+          {
+            "rank": 4,
+            "carNo": "4"
+          },
+          {
+            "rank": 5,
+            "carNo": "6"
+          },
+          {
+            "rank": 6,
+            "carNo": "5"
+          },
+          {
+            "rank": 7,
+            "carNo": "8"
+          },
+          {
+            "rank": 8,
+            "carNo": "7"
+          }
+        ]
+      },
+      {
+        "lapNo": 1,
+        "rankList": [
+          {
+            "rank": 1,
+            "carNo": "1"
+          },
+          {
+            "rank": 2,
+            "carNo": "2"
+          },
+          {
+            "rank": 3,
+            "carNo": "3"
+          },
+          {
+            "rank": 4,
+            "carNo": "4"
+          },
+          {
+            "rank": 5,
+            "carNo": "5"
+          },
+          {
+            "rank": 6,
+            "carNo": "6"
+          },
+          {
+            "rank": 7,
+            "carNo": "7"
+          },
+          {
+            "rank": 8,
+            "carNo": "8"
+          }
+        ]
+      }
+    ]
+  }
+]
