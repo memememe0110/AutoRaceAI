@@ -144,7 +144,7 @@ jobs:
               )
               has_status = "status" in race_columns
               status_select = ", r.status" if has_status else ""
-              rows = con.execute(f"""
+              raw_rows = con.execute(f"""
                   SELECT
                     r.race_key,
                     (SELECT COUNT(*) FROM result_entries e
@@ -159,9 +159,37 @@ jobs:
               """).fetchall()
 
           # Keep status as a sixth field only when the DB actually has that column.
-          columns = ["race_key", "n_entries", "n_laps", "n_goal_lines", "n_payouts"]
+          base_columns = ["race_key", "n_entries", "n_laps", "n_goal_lines", "n_payouts"]
           if has_status:
-              columns.append("status")
+              base_columns.append("status")
+
+          def classify_goal_lines(n_laps, n_goal_lines):
+              if n_goal_lines == 0 and n_laps == 0:
+                  return 0, "empty_laps_or_void_check_status"
+              if n_goal_lines == 1 and n_laps == 1:
+                  return 1, "goal_line_only_incomplete"
+              if n_goal_lines >= 2:
+                  return 1, "duplicate_goal_lines"
+              if n_goal_lines == 0 and n_laps > 0:
+                  return 1, "missing_goal_line"
+              if n_goal_lines == 1 and 7 <= n_laps <= 9:
+                  return 0, "complete_goal_line_and_laps"
+              return 1, "unusual_lap_count_review"
+
+          goal_class_counts = Counter()
+          rows = []
+          goal_review_rows = []
+          for raw_row in raw_rows:
+              incomplete_flag, incomplete_reason = classify_goal_lines(
+                  int(raw_row[2] or 0), int(raw_row[3] or 0)
+              )
+              goal_class_counts[incomplete_reason] += 1
+              row = tuple(raw_row) + (incomplete_flag, incomplete_reason)
+              rows.append(row)
+              if incomplete_flag:
+                  goal_review_rows.append(row)
+
+          columns = base_columns + ["incomplete_flag", "incomplete_reason"]
 
           with (out / "result_audit_all_races.csv").open(
               "w", newline="", encoding="utf-8-sig"
@@ -190,31 +218,8 @@ jobs:
               writer.writerow(columns)
               writer.writerows(zero_rows)
 
-          # Goal-line completeness classification. n_laps includes the goal-line row.
-          goal_review_rows = []
-          goal_class_counts = Counter()
-          for row in rows:
-              n_laps = int(row[2] or 0)
-              n_goal_lines = int(row[3] or 0)
-              if n_goal_lines == 0 and n_laps == 0:
-                  classification, incomplete = "empty_laps_or_void_check_status", False
-              elif n_goal_lines == 1 and n_laps == 1:
-                  classification, incomplete = "goal_line_only_incomplete", True
-              elif n_goal_lines >= 2:
-                  classification, incomplete = "duplicate_goal_lines", True
-              elif n_goal_lines == 0 and n_laps > 0:
-                  classification, incomplete = "missing_goal_line", True
-              elif n_goal_lines == 1 and 7 <= n_laps <= 9:
-                  classification, incomplete = "complete_goal_line_and_laps", False
-              else:
-                  classification, incomplete = "unusual_lap_count_review", True
-              goal_class_counts[classification] += 1
-              if incomplete:
-                  goal_review_rows.append(
-                      list(row) + [1, classification]
-                  )
-
-          goal_columns = columns + ["incomplete_flag", "incomplete_reason"]
+          # The all-races CSV already includes the goal-line flag and reason.
+          goal_columns = columns
           with (out / "result_audit_goal_line_review.csv").open(
               "w", newline="", encoding="utf-8-sig"
           ) as f:
