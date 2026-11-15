@@ -166,3 +166,5 @@ jobs:
             work/db_info.json
           if-no-files-found: error
           retention-days: 7
+
+# Immediate re-check after the user's lightweight save on 2026-11-16 (JST).
