@@ -123,6 +123,25 @@ jobs:
               race_columns = {
                   row[1] for row in con.execute("PRAGMA table_info(result_races)")
               }
+              lap_columns = {
+                  row[1] for row in con.execute("PRAGMA table_info(result_laps)")
+              }
+              print("RESULT_LAPS_COLUMNS:", sorted(lap_columns))
+              if "lap_label" in lap_columns:
+                  goal_label_column = "lap_label"
+              elif "周回" in lap_columns:
+                  goal_label_column = "周回"
+              else:
+                  raise SystemExit(
+                      "result_laps has no supported goal-line label column "
+                      "(expected lap_label or 周回)"
+                  )
+              # Column names are selected only from the explicit whitelist above.
+              goal_line_count_sql = (
+                  f"(SELECT COUNT(*) FROM result_laps l "
+                  f"WHERE l.race_key = r.race_key "
+                  f"AND l.{goal_label_column} = 'ゴール線') AS n_goal_lines"
+              )
               has_status = "status" in race_columns
               status_select = ", r.status" if has_status else ""
               rows = con.execute(f"""
@@ -132,14 +151,15 @@ jobs:
                      WHERE e.race_key = r.race_key) AS n_entries,
                     (SELECT COUNT(*) FROM result_laps l
                      WHERE l.race_key = r.race_key) AS n_laps,
+                    {goal_line_count_sql},
                     (SELECT COUNT(*) FROM result_payouts p
-                     WHERE p.race_key = r.race_key){status_select}
+                     WHERE p.race_key = r.race_key) AS n_payouts{status_select}
                   FROM result_races r
                   ORDER BY r.race_key
               """).fetchall()
 
-          # Keep status as a fifth field only when the DB actually has that column.
-          columns = ["race_key", "n_entries", "n_laps", "n_payouts"]
+          # Keep status as a sixth field only when the DB actually has that column.
+          columns = ["race_key", "n_entries", "n_laps", "n_goal_lines", "n_payouts"]
           if has_status:
               columns.append("status")
 
@@ -154,12 +174,12 @@ jobs:
               row for row in rows
               if int(row[1] or 0) == 0
               or int(row[2] or 0) == 0
-              or int(row[3] or 0) == 0
+              or int(row[4] or 0) == 0
           ]
           # Put fully empty rows first, then partial-zero rows; tie-break by race_key.
           zero_rows.sort(
               key=lambda row: (
-                  int(row[1] or 0) + int(row[2] or 0) + int(row[3] or 0),
+                  int(row[1] or 0) + int(row[2] or 0) + int(row[4] or 0),
                   str(row[0]),
               )
           )
@@ -169,6 +189,38 @@ jobs:
               writer = csv.writer(f)
               writer.writerow(columns)
               writer.writerows(zero_rows)
+
+          # Goal-line completeness classification. n_laps includes the goal-line row.
+          goal_review_rows = []
+          goal_class_counts = Counter()
+          for row in rows:
+              n_laps = int(row[2] or 0)
+              n_goal_lines = int(row[3] or 0)
+              if n_goal_lines == 0 and n_laps == 0:
+                  classification, incomplete = "empty_laps_or_void_check_status", False
+              elif n_goal_lines == 1 and n_laps == 1:
+                  classification, incomplete = "goal_line_only_incomplete", True
+              elif n_goal_lines >= 2:
+                  classification, incomplete = "duplicate_goal_lines", True
+              elif n_goal_lines == 0 and n_laps > 0:
+                  classification, incomplete = "missing_goal_line", True
+              elif n_goal_lines == 1 and 7 <= n_laps <= 9:
+                  classification, incomplete = "complete_goal_line_and_laps", False
+              else:
+                  classification, incomplete = "unusual_lap_count_review", True
+              goal_class_counts[classification] += 1
+              if incomplete:
+                  goal_review_rows.append(
+                      list(row) + [1, classification]
+                  )
+
+          goal_columns = columns + ["incomplete_flag", "incomplete_reason"]
+          with (out / "result_audit_goal_line_review.csv").open(
+              "w", newline="", encoding="utf-8-sig"
+          ) as f:
+              writer = csv.writer(f)
+              writer.writerow(goal_columns)
+              writer.writerows(goal_review_rows)
 
           # Race-level audit for missing race_time / start_time in result_entries.
           # Column presence is checked dynamically so older DB generations remain auditable.
@@ -246,10 +298,14 @@ jobs:
               "db_sha256": db_info.get("db_sha256"),
               "db_integrity_check": integrity,
               "race_count": len(rows),
+              "result_laps_label_column": goal_label_column,
+              "goal_line_classification_counts": dict(sorted(goal_class_counts.items())),
+              "goal_line_incomplete_review_rows": len(goal_review_rows),
               "result_time_null_audit": time_audit,
               "entries_zero_count": sum(int(r[1] or 0) == 0 for r in rows),
               "laps_zero_count": sum(int(r[2] or 0) == 0 for r in rows),
-              "payouts_zero_count": sum(int(r[3] or 0) == 0 for r in rows),
+              "goal_lines_zero_count": sum(int(r[3] or 0) == 0 for r in rows),
+              "payouts_zero_count": sum(int(r[4] or 0) == 0 for r in rows),
               "any_zero_count_review_rows": len(zero_rows),
               "entries_count_distribution": dict(sorted(
                   Counter(int(r[1] or 0) for r in rows).items()
@@ -257,8 +313,11 @@ jobs:
               "laps_count_distribution": dict(sorted(
                   Counter(int(r[2] or 0) for r in rows).items()
               )),
-              "payouts_count_distribution": dict(sorted(
+              "goal_lines_count_distribution": dict(sorted(
                   Counter(int(r[3] or 0) for r in rows).items()
+              )),
+              "payouts_count_distribution": dict(sorted(
+                  Counter(int(r[4] or 0) for r in rows).items()
               )),
               "result_races_status_column_present": has_status,
               "result_races_status_column_name": "status" if has_status else None,
@@ -273,7 +332,11 @@ jobs:
               "notes": [
                   "All result_races rows are exported; no zero-only filtering is applied to the full CSV.",
                   "Zero counts are review flags, not automatic proof of incomplete registration.",
-                  "No fixed lap or payout count threshold is assumed.",
+                  "Goal-line classification uses the detected result_laps label column and counts exact ゴール線 labels.",
+                  "n_laps includes goal-line rows; 1 goal-line row with 1 total lap row is flagged incomplete.",
+                  "Zero laps and zero goal lines are not automatically marked incomplete because void/cancelled races require status review.",
+                  "Two or more goal-line rows, missing goal-line rows with lap data, and unusual counts are flagged for review.",
+                  "No fixed payout count threshold is assumed.",
                   "When result_races.status is absent, zero-count rows require manual race-status classification.",
                   "Zero-count review rows are sorted by total child-row count ascending, then race_key.",
                   "SQLite was opened with mode=ro and PRAGMA query_only=ON."
