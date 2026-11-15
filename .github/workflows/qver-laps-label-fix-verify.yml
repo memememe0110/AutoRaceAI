@@ -24,3 +24,5 @@ jobs:
       - run: |
           python -m pytest -q tests/test_v35_parse_laps_label_fix.py
           python -m py_compile app.py engine.py
+
+# Re-run verification after test expectation correction
