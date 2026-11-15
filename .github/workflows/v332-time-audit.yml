@@ -1,0 +1,150 @@
+name: Audit v332 prospective timestamps (read-only)
+run-name: "v332 timestamp audit"
+
+on:
+  push:
+    branches:
+      - tmp-v332-time-audit
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v332-time-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout audit workflow
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          path: audit-src
+          persist-credentials: false
+
+      - name: Checkout prospective collection store (read-only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch prospective-collect \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" results
+          test -s results/prospective/prospective_collect.sqlite3
+          ls -lh results/prospective/prospective_collect.sqlite3
+
+      - name: Audit timestamp storage and status distribution
+        run: |
+          set -euo pipefail
+          mkdir -p audit-output
+          DB="$PWD/results/prospective/prospective_collect.sqlite3" OUT="$PWD/audit-output" python3 - <<'PY'
+          import csv, json, os, sqlite3
+          from pathlib import Path
+
+          db = Path(os.environ["DB"]).resolve()
+          out = Path(os.environ["OUT"])
+          uri = "file:" + db.as_posix() + "?mode=ro"
+          con = sqlite3.connect(uri, uri=True)
+          con.row_factory = sqlite3.Row
+          con.execute("PRAGMA query_only=ON")
+
+          table = "v332_prospective_alpha_log"
+          exists = con.execute(
+              "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+          ).fetchone()
+          if not exists:
+              raise SystemExit(f"Required table missing: {table}")
+
+          columns = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
+          required = {"id", "telvote_time", "sim_finished_at", "status"}
+          missing = sorted(required - columns)
+          if missing:
+              raise SystemExit("Required columns missing: " + ", ".join(missing))
+
+          has_committed = con.execute(
+              "SELECT 1 FROM sqlite_master WHERE type='table' AND name='v332_commit_log'"
+          ).fetchone()
+          if not has_committed:
+              raise SystemExit("Required table missing: v332_commit_log")
+          commit_cols = {r["name"] for r in con.execute("PRAGMA table_info(v332_commit_log)")}
+          if not {"alpha_log_id", "committed_at"} <= commit_cols:
+              raise SystemExit("Required columns missing in v332_commit_log")
+
+          # Query 1: SQLite storage classes, grouped by all four timestamp columns.
+          q1 = """
+          SELECT typeof(a.telvote_time) AS telvote_type,
+                 typeof(a.sim_finished_at) AS sim_finished_type,
+                 typeof(c.committed_at) AS committed_type,
+                 typeof(a.fetched_at) AS fetched_type,
+                 COUNT(*) AS n
+          FROM v332_prospective_alpha_log a
+          LEFT JOIN v332_commit_log c ON c.alpha_log_id = a.id
+          GROUP BY 1,2,3,4
+          ORDER BY n DESC, 1,2,3,4
+          """
+          type_rows = [dict(r) for r in con.execute(q1)]
+
+          # Query 2: latest 10 records, including commit timestamp where present.
+          q2 = """
+          SELECT a.id, a.race_key, a.config_id, a.source, a.status,
+                 a.telvote_time, a.sim_finished_at, c.committed_at, a.fetched_at
+          FROM v332_prospective_alpha_log a
+          LEFT JOIN v332_commit_log c ON c.alpha_log_id = a.id
+          ORDER BY a.id DESC
+          LIMIT 10
+          """
+          sample_rows = [dict(r) for r in con.execute(q2)]
+
+          # Query 3: status distribution.
+          q3 = """
+          SELECT status, COUNT(*) AS n
+          FROM v332_prospective_alpha_log
+          GROUP BY status
+          ORDER BY n DESC, status
+          """
+          status_rows = [dict(r) for r in con.execute(q3)]
+
+          report = {
+              "database": "prospective/prospective_collect.sqlite3",
+              "database_mode": "read-only (SQLite mode=ro + PRAGMA query_only=ON)",
+              "alpha_log_rows": con.execute("SELECT COUNT(*) FROM v332_prospective_alpha_log").fetchone()[0],
+              "commit_log_rows": con.execute("SELECT COUNT(*) FROM v332_commit_log").fetchone()[0],
+              "timestamp_storage_types": type_rows,
+              "latest_10_samples": sample_rows,
+              "status_distribution": status_rows,
+          }
+          con.close()
+
+          (out / "audit.json").write_text(
+              json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+          )
+          with (out / "audit.csv").open("w", newline="", encoding="utf-8-sig") as f:
+              w = csv.writer(f)
+              w.writerow(["section", "data"])
+              for row in type_rows:
+                  w.writerow(["timestamp_storage_types", json.dumps(row, ensure_ascii=False)])
+              for row in sample_rows:
+                  w.writerow(["latest_10_samples", json.dumps(row, ensure_ascii=False)])
+              for row in status_rows:
+                  w.writerow(["status_distribution", json.dumps(row, ensure_ascii=False)])
+
+          print("=== TIMESTAMP STORAGE TYPES ===")
+          print(json.dumps(type_rows, ensure_ascii=False, indent=2))
+          print("=== LATEST 10 SAMPLES ===")
+          print(json.dumps(sample_rows, ensure_ascii=False, indent=2))
+          print("=== STATUS DISTRIBUTION ===")
+          print(json.dumps(status_rows, ensure_ascii=False, indent=2))
+          print("=== READ-ONLY AUDIT COMPLETE ===")
+          PY
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v332-time-audit-${{ github.run_id }}
+          path: audit-output/
+          if-no-files-found: error
+          retention-days: 14
