@@ -248,7 +248,7 @@ def evaluate(store, config_id, d_from=None, d_to=None, include_divergence=False,
 def to_md(o):
     f = lambda v: "—" if v is None else f"{v:.4f}"
     L = [f"# Lap1 pairwise Brier（{o['config_id']}）", "",
-         f"- 作成：{o['generated_at']}／記録ファイル：\`{o['store']}\`／期間：{o['from'] or '—'}〜{o['to'] or '—'}",
+         f"- 作成：{o['generated_at']}／記録ファイル：`{o['store']}`／期間：{o['from'] or '—'}〜{o['to'] or '—'}",
          f"- 候補 {o['candidates']} R、評価 {o['evaluated']} R、除外 {len(o['excluded'])} R"
          + ("（欠車・再試走を含めた集計）" if o["include_divergence"] else ""),
          f"- BS_macro = **{f(o['bs_macro'])}**（無情報 0.25 との差 {f(o['delta_vs_uninformative_mean'])}、"
