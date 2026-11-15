@@ -143,6 +143,25 @@ jobs:
                   f"WHERE l.race_key = r.race_key "
                   f"AND l.{goal_label_column} = 'ゴール線') AS n_goal_lines"
               )
+              has_lap_no = "lap_no" in lap_columns
+              non_goal_lap_count_sql = (
+                  f"(SELECT COUNT(*) FROM result_laps l "
+                  f"WHERE l.race_key = r.race_key "
+                  f"AND l.{goal_label_column} != 'ゴール線') AS n_non_goal_laps"
+              )
+              # Count lap_no groups whose row count differs from the entry count.
+              # This catches imbalances that a simple total-row modulo can miss.
+              lap_no_bad_count_sql = (
+                  "(SELECT COUNT(*) FROM ("
+                  " SELECT l.lap_no FROM result_laps l "
+                  " WHERE l.race_key = r.race_key "
+                  f" AND l.{goal_label_column} != 'ゴール線' "
+                  " GROUP BY l.lap_no "
+                  " HAVING COUNT(*) != (SELECT COUNT(*) FROM result_entries e "
+                  " WHERE e.race_key = r.race_key)"
+                  ")) AS lap_no_bad_count"
+                  if has_lap_no else "NULL AS lap_no_bad_count"
+              )
               has_status = "status" in race_columns
               status_select = ", r.status" if has_status else ""
               raw_rows = con.execute(f"""
@@ -154,37 +173,54 @@ jobs:
                      WHERE l.race_key = r.race_key) AS n_laps,
                     (SELECT COUNT(*) FROM result_payouts p
                      WHERE p.race_key = r.race_key) AS n_payouts{status_select},
-                    {goal_line_count_sql}
+                    {goal_line_count_sql},
+                    {non_goal_lap_count_sql},
+                    (SELECT COUNT(DISTINCT l.lap_no) FROM result_laps l
+                     WHERE l.race_key = r.race_key
+                     AND l.{goal_label_column} != 'ゴール線') AS n_lap_numbers,
+                    {lap_no_bad_count_sql}
                   FROM result_races r
                   ORDER BY r.race_key
               """).fetchall()
 
-          # Preserve original columns; append all new audit columns after them.
+          # Preserve original columns; append all audit columns after them.
           base_columns = ["race_key", "n_entries", "n_laps", "n_payouts"]
           if has_status:
               base_columns.append("status")
-          goal_line_index = 5 if has_status else 4
-          base_columns.append("n_goal_lines")
+          goal_line_index = 4 + int(has_status)
+          base_columns.extend([
+              "n_goal_lines", "n_non_goal_laps", "n_lap_numbers",
+              "lap_no_bad_count"
+          ])
 
-          def classify_goal_lines(n_laps, n_goal_lines):
-              if n_goal_lines == 0 and n_laps == 0:
-                  return 0, "empty_laps_or_void_check_status"
-              if n_goal_lines == 1 and n_laps == 1:
-                  return 1, "goal_line_only_incomplete"
-              if n_goal_lines >= 2:
-                  return 1, "duplicate_goal_lines"
-              if n_goal_lines == 0 and n_laps > 0:
-                  return 1, "missing_goal_line"
-              if n_goal_lines == 1 and 7 <= n_laps <= 9:
-                  return 0, "complete_goal_line_and_laps"
-              return 1, "unusual_lap_count_review"
+          def classify_goal_lines(n_entries, n_laps, n_goal_lines,
+                                  lap_no_bad_count):
+              if n_entries == 0:
+                  return 0, "entries_empty"
+              if n_laps == 0:
+                  return 1, "laps_empty"
+              if n_goal_lines == 0:
+                  return 1, "goal_line_shortage"
+              if n_goal_lines < n_entries:
+                  return 1, "goal_line_shortage"
+              if n_goal_lines > n_entries:
+                  return 1, "goal_line_excess"
+              # Goal-line rows are expanded one row per racer. Remaining lap
+              # rows should also form complete per-lap groups of n_entries.
+              if (n_laps % n_entries != 0) or (lap_no_bad_count or 0) > 0:
+                  return 1, "lap_shortage"
+              return 0, "normal_candidate"
 
           goal_class_counts = Counter()
           rows = []
           goal_review_rows = []
           for raw_row in raw_rows:
+              n_entries = int(raw_row[1] or 0)
+              n_laps = int(raw_row[2] or 0)
+              n_goal_lines = int(raw_row[goal_line_index] or 0)
+              lap_no_bad_count = int(raw_row[goal_line_index + 3] or 0)
               incomplete_flag, incomplete_reason = classify_goal_lines(
-                  int(raw_row[2] or 0), int(raw_row[goal_line_index] or 0)
+                  n_entries, n_laps, n_goal_lines, lap_no_bad_count
               )
               goal_class_counts[incomplete_reason] += 1
               row = tuple(raw_row) + (incomplete_flag, incomplete_reason)
@@ -324,6 +360,9 @@ jobs:
               "goal_line_count_distribution": dict(sorted(
                   Counter(int(r[goal_line_index] or 0) for r in rows).items()
               )),
+              "lap_no_bad_count_distribution": dict(sorted(
+                  Counter(int(r[goal_line_index + 3] or 0) for r in rows).items()
+              )),
               "payouts_count_distribution": dict(sorted(
                   Counter(int(r[3] or 0) for r in rows).items()
               )),
@@ -340,10 +379,11 @@ jobs:
               "notes": [
                   "All result_races rows are exported; no zero-only filtering is applied to the full CSV.",
                   "Zero counts are review flags, not automatic proof of incomplete registration.",
-                  "Goal-line classification uses the detected result_laps label column and counts exact ゴール線 labels.",
-                  "n_laps includes goal-line rows; 1 goal-line row with 1 total lap row is flagged incomplete.",
-                  "Zero laps and zero goal lines are not automatically marked incomplete because void/cancelled races require status review.",
-                  "Two or more goal-line rows, missing goal-line rows with lap data, and unusual counts are flagged for review.",
+                  "Goal-line rows are expanded one row per racer; n_goal_lines is compared with n_entries.",
+                  "normal_candidate requires n_goal_lines == n_entries, n_laps divisible by n_entries, and every non-goal lap_no group to contain n_entries rows.",
+                  "lap_no_bad_count detects per-lap row imbalances that a total-row modulo check alone could miss.",
+                  "entries_empty and laps_empty are separate; laps_empty with entries present requires investigation and is not assumed to be a void race.",
+                  "goal_line_shortage and goal_line_excess compare goal-line row count with entry count.",
                   "No fixed payout count threshold is assumed.",
                   "When result_races.status is absent, zero-count rows require manual race-status classification.",
                   "Zero-count review rows are sorted by total child-row count ascending, then race_key.",
