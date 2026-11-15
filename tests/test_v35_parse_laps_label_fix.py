@@ -91,4 +91,4 @@ def test_empty_none_and_zero_car_numbers_are_excluded_before_max_lap():
     text = converter(body, "fixture", 1, "20261115")
     lap_lines = get_lap_lines(text)
     assert len(lap_lines) == 1
-    assert lap_lines[0] == "ゴール線\\t4\\t6\\t7"
+    assert lap_lines[0] == "ゴール線\t4\t6\t7"
