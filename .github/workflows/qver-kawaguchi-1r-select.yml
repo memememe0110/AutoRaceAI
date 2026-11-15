@@ -81,7 +81,7 @@ jobs:
                       continue
                   rows = con.execute(f'PRAGMA table_info("{table}")').fetchall()
                   schemas[table] = [r[1] for r in rows]
-                  schema_rows.extend([[table, *r] for r in rows])
+                  schema_rows.extend([[table, *r] for r in rows)
               write_csv("schema.csv",
                         ["table_name", "cid", "name", "type", "notnull", "default", "pk"],
                         schema_rows)
@@ -92,9 +92,6 @@ jobs:
                       "SELECT COUNT(*) FROM result_payouts WHERE race_key=?",
                       (race_key,)
                   ).fetchone()[0]
-              else:
-                  report["payout_count"] = None
-
                   payout_rows = con.execute(
                       "SELECT bet_type, combination, payout_yen, popularity "
                       "FROM result_payouts WHERE race_key=? ORDER BY bet_type, combination",
@@ -112,6 +109,7 @@ jobs:
                             payout_rows)
               else:
                   report["payout_count"] = None
+                  report["payout_rows"] = []
 
               if "result_laps" in tables:
                   rows = con.execute(
@@ -153,7 +151,6 @@ jobs:
                           "SELECT typeof(registered_at), registered_at FROM result_races WHERE race_key=?",
                           (race_key,)
                       ).fetchall()
-                      # Read-only sample of recent timestamps for timezone-distribution review.
                       sample = con.execute(
                           "SELECT registered_at FROM result_races "
                           "WHERE registered_at IS NOT NULL "
@@ -161,9 +158,9 @@ jobs:
                       ).fetchall()
                       hours = {}
                       for (value,) in sample:
-                          text = str(value or "")
-                          if len(text) >= 13:
-                              hour = text[11:13]
+                          value_text = str(value or "")
+                          if len(value_text) >= 13:
+                              hour = value_text[11:13]
                               hours[hour] = hours.get(hour, 0) + 1
                       report["registered_at_recent_1000_hour_histogram"] = dict(sorted(hours.items()))
                   else:
@@ -189,4 +186,4 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-# Immediate re-check after the user's lightweight save on 2026-11-16 (JST).
+# Read-only re-check pinned to generation 705.
