@@ -239,6 +239,98 @@ jobs:
           con.close()
           PY
 
+
+      - name: Extract prediction-path AST (read-only)
+        working-directory: trial
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast, re
+          from pathlib import Path
+
+          src = Path("app.py").read_text(encoding="utf-8")
+          tree = ast.parse(src)
+          lines = src.splitlines()
+          defs = {}
+          parents = {}
+          for node in tree.body:
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                  defs[node.name] = node
+          for parent in ast.walk(tree):
+              for child in ast.iter_child_nodes(parent):
+                  parents[child] = parent
+
+          def segment(node):
+              return ast.get_source_segment(src, node) or ""
+
+          def calls_in(node):
+              return sorted({n.func.id if isinstance(n.func, ast.Name)
+                             else n.func.attr if isinstance(n.func, ast.Attribute) else ""
+                             for n in ast.walk(node) if isinstance(n, ast.Call)} - {""})
+
+          def owner_function(node):
+              cur = node
+              while cur in parents:
+                  cur = parents[cur]
+                  if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                      return cur
+              return None
+
+          out = []
+          out.append(f"APP_SHA256_INPUT_BYTES={len(src.encode('utf-8'))}")
+          out.append(f"TOP_LEVEL_FUNCTIONS={len(defs)}")
+
+          target = defs.get("_v319_run_prerace_prediction")
+          if target is None:
+              out.append("TARGET_FUNCTION_NOT_FOUND")
+          else:
+              out.append("\n===== TARGET _v319_run_prerace_prediction =====")
+              out.append(f"LINES={target.lineno}-{target.end_lineno}")
+              out.append(segment(target))
+              calls = calls_in(target)
+              out.append("\nTARGET_CALLS=" + ", ".join(calls))
+              # Include directly called local helpers that look relevant to parsing/dataframe/simulation.
+              relevant = [n for n in calls if n in defs and re.search(
+                  r"parse|entry|sim|predict|array|card|race", n, re.I)]
+              for name in relevant:
+                  node = defs[name]
+                  out.append(f"\n===== DIRECT HELPER {name} LINES={node.lineno}-{node.end_lineno} =====")
+                  out.append(segment(node))
+
+          out.append("\n===== COMPARE ENV BRANCHES =====")
+          compare_nodes = []
+          for node in ast.walk(tree):
+              if isinstance(node, (ast.If, ast.IfExp)):
+                  test = ast.unparse(node.test)
+                  if "AUTORACE_COMPARE" in test or "AUTORACE_VER330A_COMPARE" in test:
+                      compare_nodes.append(node)
+          for node in sorted(compare_nodes, key=lambda n:n.lineno):
+              out.append(f"\n--- IF LINES={node.lineno}-{node.end_lineno} TEST={ast.unparse(node.test)} ---")
+              out.append(segment(node))
+
+          out.append("\n===== PARSER / SIMULATION CALL SITES =====")
+          seen = set()
+          for node in ast.walk(tree):
+              if not isinstance(node, ast.Call):
+                  continue
+              fn = node.func
+              name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
+              if re.search(r"parse_entries|detect_nonstarters|prepare_simulation_arrays|simulate", name, re.I):
+                  owner = owner_function(node)
+                  key = (name, node.lineno, owner.name if owner else "<module>")
+                  if key in seen: continue
+                  seen.add(key)
+                  out.append(f"CALL {name} LINE={node.lineno} OWNER={owner.name if owner else '<module>'} OWNER_LINES={owner.lineno if owner else '?'}-{owner.end_lineno if owner else '?'}")
+                  if owner and owner.name not in ("_v319_run_prerace_prediction",):
+                      # Emit only concise surrounding source context for non-target call sites.
+                      lo=max(owner.lineno, node.lineno-7); hi=min(owner.end_lineno, node.lineno+7)
+                      out.extend(f"{i}: {lines[i-1]}" for i in range(lo,hi+1))
+
+          Path("output").mkdir(exist_ok=True)
+          Path("output/app_prediction_ast_audit.txt").write_text("\n".join(out), encoding="utf-8")
+          print("\n".join(out))
+          PY
+
       - name: Run 17R Brier trial
         working-directory: trial
         run: |
