@@ -1,4 +1,4 @@
-name: Brier Trial (17R, temporary revision)
+name: Brier Trial (29R, temporary revision)
 
 # 試運転用。40R本評価時にこの4修正を正式採用するかは別判断。
 on:
@@ -607,7 +607,7 @@ jobs:
               raise SystemExit("COMPARE_MODE_FAILED: " + str(result.get("error")))
           PY
 
-      - name: Run 17R Brier trial
+      - name: Run 29R Brier trial
         working-directory: trial
         run: |
           set -euo pipefail
@@ -624,7 +624,7 @@ jobs:
               "../cardstore/prospective/prospective_collect.sqlite3",
               "ver326_1_base",
               "2026-11-14",
-              "2026-11-15",
+              "2026-11-16",
               n_boot=0,
           )
 
@@ -644,7 +644,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: brier-trial-17r-${{ github.run_id }}
+          name: brier-trial-29r-${{ github.run_id }}
           path: trial/output/
           if-no-files-found: warn
           retention-days: 30
