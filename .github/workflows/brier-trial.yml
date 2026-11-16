@@ -529,6 +529,7 @@ jobs:
           AUTORACE_COMPARE_RACE_KEY: "20261115_川口_1R"
           AUTORACE_COMPARE_TRIALS: "8000"
           AUTORACE_COMPARE_SEED: "12345"
+          AUTORACE_330_VALIDATION_MODE: "1"
         run: |
           set -euo pipefail
           python -m pip install --disable-pip-version-check -q -r requirements.txt playwright
