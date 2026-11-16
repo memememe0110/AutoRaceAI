@@ -13493,36 +13493,10 @@ def _v330a_compare_mode_run() -> None:
         df, bets, output, entries, meta = engine.ver16_run_prediction(
             prediction_text, trials=trials, seed=seed, manual_excluded=None
         )
-        _compare_parsed_cars = sorted(
-            int(x) for x in pd.to_numeric(df["車"], errors="coerce").dropna().unique()
-        ) if isinstance(df, pd.DataFrame) and "車" in df.columns else []
-        print("COMPARE_INPUT_AUDIT=" + json.dumps({
-            "race_key": race_key,
-            "prediction_text_len": len(prediction_text or ""),
-            "parsed_car_count": len(_compare_parsed_cars),
-            "parsed_cars": _compare_parsed_cars,
-            "dataframe_columns": list(df.columns) if isinstance(df, pd.DataFrame) else [],
-            "manual_excluded": None,
-        }, ensure_ascii=False, sort_keys=True))
         # ここでのみ6周Simを実行。保存・学習更新・履歴登録・GitHub同期は呼ばない。
         _sim_df, _sim_bets, audit = _v230_six_lap_simulation(
             df, bets, entries, meta, int(trials), int(seed)
         )
-        _compare_counts = dict((audit or {}).get("ver330a_validation_lap_order_counts") or {})
-        _compare_count_sets = {}
-        for _lap, _counts in _compare_counts.items():
-            _keys = list((_counts or {}).keys()) if isinstance(_counts, dict) else []
-            _sets = sorted({tuple(sorted(int(v) for v in str(k).split("-") if v.strip()))
-                            for k in _keys})
-            _compare_count_sets[str(_lap)] = {
-                "key_count": len(_keys),
-                "distinct_car_sets": [list(x) for x in _sets],
-            }
-        print("COMPARE_SIM_AUDIT=" + json.dumps({
-            "race_key": race_key,
-            "sim_trials": int((audit or {}).get("v284_transition_audit", {}).get("trials") or 0),
-            "lap_count_sets": _compare_count_sets,
-        }, ensure_ascii=False, sort_keys=True))
         fp = dict((audit or {}).get("ver330a_state_fingerprint") or {})
         result.update({
             "ok": True,
@@ -13532,14 +13506,6 @@ def _v330a_compare_mode_run() -> None:
             "sim_trials": int((audit or {}).get("v284_transition_audit", {}).get("trials") or 0),
             "lap_order_counts": dict((audit or {}).get("ver330a_validation_lap_order_counts") or {}),
             "validation_full_trials": bool((audit or {}).get("ver330a_validation_full_trials")),
-            "prediction_text_len": len(prediction_text or ""),
-            "parsed_cars": _compare_parsed_cars,
-            "parsed_car_count": len(_compare_parsed_cars),
-            "sim_df_columns": list(_sim_df.columns) if isinstance(_sim_df, pd.DataFrame) else [],
-            "sim_cars": sorted(int(x) for x in pd.to_numeric(
-                _sim_df["車"] if "車" in _sim_df.columns else _sim_df["車番"],
-                errors="coerce"
-            ).dropna().unique()) if isinstance(_sim_df, pd.DataFrame) and ("車" in _sim_df.columns or "車番" in _sim_df.columns) else [],
             "ver331_gap_diag": dict((audit or {}).get("ver331_gap_diag") or {}),
         })
     except Exception as exc:
