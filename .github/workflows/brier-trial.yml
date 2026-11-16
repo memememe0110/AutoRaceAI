@@ -193,6 +193,52 @@ jobs:
           con.close()
           PY
 
+      - name: Recheck parser and duplicate provenance (read-only)
+        working-directory: trial
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -q numpy pandas openpyxl
+          python - <<'PY'
+          import sqlite3, json, sys
+          from pathlib import Path
+
+          db = "../cardstore/prospective/prospective_collect.sqlite3"
+          con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+          con.execute("PRAGMA query_only=ON")
+          con.row_factory = sqlite3.Row
+
+          cols = [r["name"] for r in con.execute(
+              "PRAGMA table_info(v332_prospective_alpha_log)"
+          )]
+          wanted = ["id", "created_at", "status", "race_key", "config_id"]
+          selected = [c for c in wanted if c in cols]
+          print("ALPHA_LOG_COLUMNS:", cols)
+          sql = "SELECT " + ", ".join('"' + c + '"' for c in selected) + """
+            FROM v332_prospective_alpha_log
+            WHERE race_key=? AND config_id=?
+            ORDER BY id
+          """
+          rows = [dict(r) for r in con.execute(
+              sql, ("20261115_川口_1R", "ver326_1_base")
+          )]
+          print("TARGET_DUPLICATE_ROW_COUNT:", len(rows))
+          print("TARGET_DUPLICATE_ROWS:", json.dumps(rows, ensure_ascii=False))
+
+          raw_row = con.execute("""
+              SELECT raw_text FROM v332_prospective_alpha_log
+              WHERE race_key=? AND config_id=?
+              ORDER BY id DESC LIMIT 1
+          """, ("20261115_川口_1R", "ver326_1_base")).fetchone()
+          raw_text = raw_row["raw_text"] if raw_row else ""
+          sys.path.insert(0, str(Path.cwd()))
+          import engine
+          parsed = engine.v15_parse_entries(raw_text)
+          print("CURRENT_ENGINE_V15_PARSE_CARS:",
+                sorted(int(x) for x in parsed["車番"].tolist()))
+          print("CURRENT_ENGINE_V15_PARSE_COUNT:", len(parsed))
+          con.close()
+          PY
+
       - name: Run 17R Brier trial
         working-directory: trial
         run: |
