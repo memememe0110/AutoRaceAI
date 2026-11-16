@@ -560,9 +560,18 @@ jobs:
               "INSERT INTO v222_prediction_restore(race_key,raw_text,venue_override) VALUES(?,?,?)",
               ("20261115_川口_1R", row[0], "川口"),
           )
+          con.execute("""
+              CREATE TABLE IF NOT EXISTS v15_player_history_imports (
+                  player_name TEXT, race_date TEXT, race_no INTEGER, venue TEXT,
+                  rank INTEGER, starters INTEGER, surface TEXT, handicap REAL,
+                  track_temp REAL, humidity REAL, race_type TEXT,
+                  trial_time REAL, race_time REAL, st REAL, raw_line TEXT
+              )
+          """)
           con.commit()
           con.close()
           print("COMPARE_SNAPSHOT_READY: race_key=20261115_川口_1R raw_text_len=" + str(len(row[0])))
+          print("COMPARE_SNAPSHOT_SUPPORT: empty v15_player_history_imports table for isolated car-count test")
           PY
           (streamlit run app.py --server.headless=true --server.port=8501 > output/streamlit_compare.log 2>&1 & echo $! > output/streamlit.pid)
           python - <<'PY'
