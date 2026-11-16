@@ -13532,6 +13532,14 @@ def _v330a_compare_mode_run() -> None:
             "sim_trials": int((audit or {}).get("v284_transition_audit", {}).get("trials") or 0),
             "lap_order_counts": dict((audit or {}).get("ver330a_validation_lap_order_counts") or {}),
             "validation_full_trials": bool((audit or {}).get("ver330a_validation_full_trials")),
+            "prediction_text_len": len(prediction_text or ""),
+            "parsed_cars": _compare_parsed_cars,
+            "parsed_car_count": len(_compare_parsed_cars),
+            "sim_df_columns": list(_sim_df.columns) if isinstance(_sim_df, pd.DataFrame) else [],
+            "sim_cars": sorted(int(x) for x in pd.to_numeric(
+                _sim_df["車"] if "車" in _sim_df.columns else _sim_df["車番"],
+                errors="coerce"
+            ).dropna().unique()) if isinstance(_sim_df, pd.DataFrame) and ("車" in _sim_df.columns or "車番" in _sim_df.columns) else [],
             "ver331_gap_diag": dict((audit or {}).get("ver331_gap_diag") or {}),
         })
     except Exception as exc:
