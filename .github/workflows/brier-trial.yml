@@ -128,6 +128,71 @@ jobs:
           con.close()
           PY
 
+      - name: Audit Kawaguchi 1R raw input provenance (read-only)
+        working-directory: trial
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          import sqlite3, json, re
+          from pathlib import Path
+
+          db = "../cardstore/prospective/prospective_collect.sqlite3"
+          con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+          con.execute("PRAGMA query_only=ON")
+          con.row_factory = sqlite3.Row
+          row = con.execute("""
+              SELECT raw_text, input_builder_manifest_json, car_set_json,
+                     lap_order_counts_json
+              FROM v332_prospective_alpha_log
+              WHERE race_key='20261115_川口_1R'
+                AND config_id='ver326_1_base'
+          """).fetchone()
+          if row is None:
+              raise SystemExit("TARGET_ROW_NOT_FOUND")
+
+          raw_text = row["raw_text"] or ""
+          manifest_raw = row["input_builder_manifest_json"] or ""
+          manifest = json.loads(manifest_raw) if manifest_raw else None
+          car_set = json.loads(row["car_set_json"] or "null")
+          counts = json.loads(row["lap_order_counts_json"] or "{}")
+          lap1 = counts.get("1") or {}
+          keys = list(lap1.keys())
+
+          lines = raw_text.splitlines()
+          target = None
+          for i, line in enumerate(lines):
+              if re.match(r"^\\s*3(?:[\\t 　]+)\\S", line):
+                  target = i
+                  break
+          if target is None:
+              m = re.search(r"(?<!\\d)3(?=[\\t 　])", raw_text)
+              pos = m.start() if m else -1
+          else:
+              pos = sum(len(x) + 1 for x in lines[:target])
+          snippet = raw_text[max(0, pos-100):pos+300] if pos >= 0 else "CAR_3_BLOCK_NOT_FOUND"
+
+          print("RAW_TEXT_CAR3_SNIPPET:", json.dumps(snippet, ensure_ascii=False))
+          print("INPUT_BUILDER_MANIFEST_JSON:", json.dumps(manifest, ensure_ascii=False, sort_keys=True))
+          print("CAR_SET_JSON:", json.dumps(car_set, ensure_ascii=False))
+          print("COUNTS_LAP1_KEYS_FIRST5:", json.dumps(keys[:5], ensure_ascii=False))
+          print("COUNTS_LAP1_KEY_COUNT:", len(keys))
+
+          audit = {
+              "race_key": "20261115_川口_1R",
+              "config_id": "ver326_1_base",
+              "raw_text": raw_text,
+              "input_builder_manifest_json_raw": manifest_raw,
+              "input_builder_manifest": manifest,
+              "car_set_json": car_set,
+              "lap_order_counts_json_lap1": lap1,
+              "lap1_keys_first5": keys[:5],
+          }
+          Path("output/kawaguchi1r_input_audit.json").write_text(
+              json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
+          con.close()
+          PY
+
       - name: Run 17R Brier trial
         working-directory: trial
         run: |
