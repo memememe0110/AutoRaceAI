@@ -13491,7 +13491,7 @@ def _v330a_compare_mode_run() -> None:
         # 331測定では330Aを混ぜない（初期gapのみの効果を見る）
         globals()["_V331_LAP1_TUNE"] = bool(_v331_on)
         df, bets, output, entries, meta = engine.ver16_run_prediction(
-            prediction_text, trials=trials, seed=seed, manual_excluded=[]
+            prediction_text, trials=trials, seed=seed, manual_excluded=None
         )
         # ここでのみ6周Simを実行。保存・学習更新・履歴登録・GitHub同期は呼ばない。
         _sim_df, _sim_bets, audit = _v230_six_lap_simulation(
