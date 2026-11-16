@@ -453,6 +453,72 @@ jobs:
                       emit_node("MODULE_COMPARE",node)
           PY
 
+      - name: Audit restored v222 prediction text detector (read-only)
+        working-directory: trial
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast, re, sqlite3
+          from pathlib import Path
+
+          db = "../cardstore/prospective/prospective_collect.sqlite3"
+          con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+          con.execute("PRAGMA query_only=ON")
+          con.row_factory = sqlite3.Row
+
+          tables = {
+              r["name"] for r in con.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table'"
+              )
+          }
+          if "v222_prediction_restore" not in tables:
+              print("RESTORE_ROW_FOUND: False")
+              print("RESTORE_DETECTOR_KESSHA: NOT_RUN_TABLE_MISSING")
+              print("RESTORE_TEXT_LEN: 0")
+              con.close()
+              raise SystemExit(0)
+
+          row = con.execute("""
+              SELECT raw_text
+              FROM v222_prediction_restore
+              WHERE race_key=?
+          """, ("20261115_川口_1R",)).fetchone()
+
+          found = row is not None
+          prediction_text = (row["raw_text"] or "") if found else ""
+          print("RESTORE_ROW_FOUND:", found)
+          print("RESTORE_TEXT_LEN:", len(prediction_text))
+
+          if not found:
+              print("RESTORE_DETECTOR_KESSHA: NOT_RUN_ROW_MISSING")
+              con.close()
+              raise SystemExit(0)
+
+          src = Path("app.py").read_text(encoding="utf-8")
+          tree = ast.parse(src)
+          fn = next(
+              (node for node in tree.body
+               if isinstance(node, ast.FunctionDef)
+               and node.name == "_v319_detect_kessha_from_card_text"),
+              None,
+          )
+          if fn is None:
+              print("RESTORE_DETECTOR_KESSHA: ERROR_DETECTOR_NOT_FOUND")
+              con.close()
+              raise SystemExit(0)
+
+          ns = {"re": re}
+          exec(compile(ast.Module(body=[fn], type_ignores=[]),
+                       "app_detector_extract", "exec"), ns)
+          try:
+              detected = ns["_v319_detect_kessha_from_card_text"](prediction_text)
+              print("RESTORE_DETECTOR_KESSHA:", detected)
+          except Exception as exc:
+              print("RESTORE_DETECTOR_KESSHA: ERROR", type(exc).__name__, str(exc))
+
+          con.close()
+          PY
+
       - name: Run 17R Brier trial
         working-directory: trial
         run: |
