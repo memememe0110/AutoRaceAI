@@ -64,6 +64,70 @@ jobs:
           con.close()
           PY
 
+      - name: Audit Kawaguchi 1R car-set provenance
+        working-directory: trial
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sqlite3, json, re
+
+          db = "../cardstore/prospective/prospective_collect.sqlite3"
+          con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+          con.execute("PRAGMA query_only=ON")
+          con.row_factory = sqlite3.Row
+
+          row = con.execute("""
+              SELECT car_set_json, lap_order_counts_json
+              FROM v332_prospective_alpha_log
+              WHERE race_key='20261115_川口_1R'
+                AND config_id='ver326_1_base'
+          """).fetchone()
+
+          if row is None:
+              print("ALPHA_ROW: NOT_FOUND")
+          else:
+              print("CAR_SET_JSON:", row["car_set_json"])
+              counts = json.loads(row["lap_order_counts_json"] or "{}")
+              lap1_counts = counts.get("1") or {}
+              keys = list(lap1_counts.keys())
+              print("COUNTS_LAP1_KEYS:", keys[:20])
+              print("COUNTS_LAP1_COUNT:", len(keys))
+              car_sets = {
+                  frozenset(int(x) for x in str(k).split("-"))
+                  for k in keys
+              }
+              print("DISTINCT_CAR_SETS_IN_COUNTS:",
+                    [sorted(s) for s in sorted(car_sets, key=lambda x: (len(x), sorted(x)))])
+          
+          cols = [r["name"] for r in con.execute(
+              "PRAGMA table_info(v332_prospective_results)"
+          )]
+          print("RESULTS_COLUMNS:", cols)
+          relevant = [
+              c for c in cols
+              if re.search(r"absent|accident|欠車|事故|car|車番|entry|result", c, re.I)
+          ]
+          print("RESULTS_RELEVANT_COLUMNS:", relevant)
+
+          result_rows = con.execute("""
+              SELECT * FROM v332_prospective_results
+              WHERE race_key='20261115_川口_1R'
+          """).fetchall()
+          print("RESULT_ROW_COUNT:", len(result_rows))
+          for i, rr in enumerate(result_rows):
+              d = dict(rr)
+              print(f"RESULT_ROW_{i}_KEYS:", list(d.keys()))
+              print(f"RESULT_ROW_{i}_RELEVANT:", {
+                  k: d.get(k) for k in relevant
+              })
+              print(f"RESULT_ROW_{i}_JSON_FIELDS:", {
+                  k: v for k, v in d.items()
+                  if isinstance(v, str) and v.strip().startswith(("{", "["))
+              })
+
+          con.close()
+          PY
+
       - name: Run 17R Brier trial
         working-directory: trial
         run: |
