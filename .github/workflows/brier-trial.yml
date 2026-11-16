@@ -519,6 +519,84 @@ jobs:
           con.close()
           PY
 
+      - name: Isolated compare-mode Kawaguchi 1R regression test
+        working-directory: trial
+        env:
+          AUTORACE_VER330A_COMPARE: "1"
+          AUTORACE_COMPARE_OUT: ${{ github.workspace }}/trial/output/kawaguchi1r_compare.json
+          AUTORACE_COMPARE_MODE: "Ver326"
+          AUTORACE_COMPARE_DB: ${{ github.workspace }}/trial/output/compare_snapshot.sqlite3
+          AUTORACE_COMPARE_RACE_KEY: "20261115_川口_1R"
+          AUTORACE_COMPARE_TRIALS: "8000"
+          AUTORACE_COMPARE_SEED: "12345"
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -q -r requirements.txt playwright
+          python -m playwright install --with-deps chromium
+          mkdir -p output
+          python - <<'PY'
+          import json, shutil, sqlite3
+          from pathlib import Path
+          source = Path("../cardstore/prospective/prospective_collect.sqlite3")
+          target = Path("output/compare_snapshot.sqlite3")
+          shutil.copy2(source, target)
+          con = sqlite3.connect(target)
+          row = con.execute("""
+              SELECT raw_text FROM v332_prospective_alpha_log
+              WHERE race_key=? AND config_id=?
+              ORDER BY id DESC LIMIT 1
+          """, ("20261115_川口_1R", "ver326_1_base")).fetchone()
+          if not row or not row[0]:
+              raise SystemExit("TARGET_RAW_TEXT_NOT_FOUND")
+          con.execute("DROP TABLE IF EXISTS v222_prediction_restore")
+          con.execute("""
+              CREATE TABLE v222_prediction_restore (
+                  race_key TEXT PRIMARY KEY,
+                  raw_text TEXT,
+                  venue_override TEXT
+              )
+          """)
+          con.execute(
+              "INSERT INTO v222_prediction_restore(race_key,raw_text,venue_override) VALUES(?,?,?)",
+              ("20261115_川口_1R", row[0], "川口"),
+          )
+          con.commit()
+          con.close()
+          print("COMPARE_SNAPSHOT_READY: race_key=20261115_川口_1R raw_text_len=" + str(len(row[0])))
+          PY
+          (streamlit run app.py --server.headless=true --server.port=8501 > output/streamlit_compare.log 2>&1 & echo $! > output/streamlit.pid)
+          python - <<'PY'
+          import json, time, urllib.request
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          out = Path("output/kawaguchi1r_compare.json")
+          ready = False
+          for _ in range(90):
+              try:
+                  urllib.request.urlopen("http://127.0.0.1:8501/_stcore/health", timeout=2).read()
+                  ready = True
+                  break
+              except Exception:
+                  time.sleep(1)
+          if not ready:
+              raise SystemExit("STREAMLIT_SERVER_NOT_READY")
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              page = browser.new_page()
+              page.goto("http://127.0.0.1:8501", wait_until="domcontentloaded", timeout=60000)
+              for _ in range(180):
+                  if out.exists() and out.stat().st_size:
+                      break
+                  time.sleep(1)
+              browser.close()
+          if not out.exists():
+              raise SystemExit("COMPARE_OUTPUT_NOT_CREATED")
+          result = json.loads(out.read_text(encoding="utf-8"))
+          print("KAWAGUCHI1R_COMPARE_RESULT:", json.dumps(result, ensure_ascii=False, sort_keys=True))
+          if not result.get("ok"):
+              raise SystemExit("COMPARE_MODE_FAILED: " + str(result.get("error")))
+          PY
+
       - name: Run 17R Brier trial
         working-directory: trial
         run: |
