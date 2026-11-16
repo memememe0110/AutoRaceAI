@@ -380,6 +380,79 @@ jobs:
           print("ENGINE_V15_APP_DETECTOR_OVERRIDE_COUNT:", len(parsed_app_excl))
           PY
 
+
+      - name: Trace compare-mode owner and simulation call graph (read-only)
+        working-directory: trial
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast, re
+          from pathlib import Path
+
+          src = Path("app.py").read_text(encoding="utf-8")
+          tree = ast.parse(src)
+          lines = src.splitlines()
+          parents = {}
+          defs = {}
+          for node in tree.body:
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                  defs[node.name] = node
+          for parent in ast.walk(tree):
+              for child in ast.iter_child_nodes(parent):
+                  parents[child] = parent
+
+          def owner(node):
+              cur=node
+              while cur in parents:
+                  cur=parents[cur]
+                  if isinstance(cur,(ast.FunctionDef,ast.AsyncFunctionDef)):
+                      return cur
+              return None
+
+          def calls(node):
+              return sorted({n.func.id if isinstance(n.func,ast.Name)
+                             else n.func.attr if isinstance(n.func,ast.Attribute) else ""
+                             for n in ast.walk(node) if isinstance(n,ast.Call)}- {""})
+
+          def emit_node(label,node):
+              print(f"\n===== {label} LINES={node.lineno}-{node.end_lineno} =====")
+              print(ast.get_source_segment(src,node) or "")
+
+          print("===== COMPARE ENV IF OWNERS =====")
+          for node in ast.walk(tree):
+              if isinstance(node,ast.If):
+                  test=ast.unparse(node.test)
+                  if "AUTORACE_COMPARE" in test or "AUTORACE_VER330A_COMPARE" in test:
+                      own=owner(node)
+                      print(f"IF line={node.lineno}-{node.end_lineno} owner={own.name if own else '<module>'} owner_lines={own.lineno if own else '?'}-{own.end_lineno if own else '?'} test={test}")
+                      emit_node("COMPARE_IF",node)
+
+          print("\n===== COMPARE / VALIDATION FUNCTIONS =====")
+          for name,node in sorted(defs.items(),key=lambda x:x[1].lineno):
+              if re.search(r"compare|validation",name,re.I):
+                  cs=calls(node)
+                  if any(re.search(r"prerace|run_prediction|simulate|lap_order|counts|prepare",x,re.I) for x in cs) or re.search(r"compare",name,re.I):
+                      print(f"FUNC {name} LINES={node.lineno}-{node.end_lineno} CALLS={cs}")
+                      if re.search(r"compare|validation",name,re.I):
+                          emit_node(name,node)
+
+          print("\n===== FUNCTIONS TOUCHING LAP COUNTS / OUTPUT =====")
+          for name,node in sorted(defs.items(),key=lambda x:x[1].lineno):
+              seg=ast.get_source_segment(src,node) or ""
+              if any(k in seg for k in ("lap_order_counts","AUTORACE_COMPARE_OUT","_v319_run_prerace_prediction","ver16_run_prediction")):
+                  print(f"FUNC {name} LINES={node.lineno}-{node.end_lineno} CALLS={calls(node)}")
+                  # Only print functions that write compare output or invoke prediction/simulation.
+                  if any(k in seg for k in ("AUTORACE_COMPARE_OUT","_v319_run_prerace_prediction","ver16_run_prediction")):
+                      emit_node(name,node)
+
+          print("\n===== MODULE-LEVEL COMPARE INVOCATIONS =====")
+          for node in tree.body:
+              if isinstance(node,ast.Expr) or isinstance(node,ast.If):
+                  seg=ast.get_source_segment(src,node) or ""
+                  if "AUTORACE_VER330A_COMPARE" in seg or "AUTORACE_COMPARE_OUT" in seg:
+                      emit_node("MODULE_COMPARE",node)
+          PY
+
       - name: Run 17R Brier trial
         working-directory: trial
         run: |
