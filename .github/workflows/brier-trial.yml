@@ -331,6 +331,55 @@ jobs:
           print("\n".join(out))
           PY
 
+
+      - name: Test exact app nonstarter detector against saved raw text (read-only)
+        working-directory: trial
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast, re, sqlite3, sys
+          from pathlib import Path
+
+          db = "../cardstore/prospective/prospective_collect.sqlite3"
+          con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+          con.execute("PRAGMA query_only=ON")
+          row = con.execute("""
+              SELECT raw_text FROM v332_prospective_alpha_log
+              WHERE race_key=? AND config_id=?
+              ORDER BY id DESC LIMIT 1
+          """, ("20261115_川口_1R", "ver326_1_base")).fetchone()
+          if row is None:
+              raise SystemExit("TARGET_RAW_TEXT_NOT_FOUND")
+          raw = row[0] or ""
+          con.close()
+
+          src = Path("app.py").read_text(encoding="utf-8")
+          tree = ast.parse(src)
+          fn = None
+          for node in tree.body:
+              if isinstance(node, ast.FunctionDef) and node.name == "_v319_detect_kessha_from_card_text":
+                  fn = node
+          if fn is None:
+              raise SystemExit("APP_DETECTOR_NOT_FOUND")
+          mod = ast.Module(body=[fn], type_ignores=[])
+          ns = {"re": re}
+          exec(compile(mod, "app_detector_extract", "exec"), ns)
+          detected = ns["_v319_detect_kessha_from_card_text"](raw)
+
+          sys.path.insert(0, str(Path.cwd()))
+          import engine
+          parsed_auto = engine.v15_parse_entries(raw)
+          parsed_empty_override = engine.v15_parse_entries(raw, manual_excluded=[])
+          parsed_app_excl = engine.v15_parse_entries(raw, manual_excluded=detected)
+
+          print("APP_DETECTOR_KESSHA:", detected)
+          print("ENGINE_V15_NO_OVERRIDE_CARS:", sorted(int(x) for x in parsed_auto["車番"].tolist()))
+          print("ENGINE_V15_EMPTY_OVERRIDE_CARS:", sorted(int(x) for x in parsed_empty_override["車番"].tolist()))
+          print("ENGINE_V15_APP_DETECTOR_OVERRIDE_CARS:", sorted(int(x) for x in parsed_app_excl["車番"].tolist()))
+          print("ENGINE_V15_EMPTY_OVERRIDE_COUNT:", len(parsed_empty_override))
+          print("ENGINE_V15_APP_DETECTOR_OVERRIDE_COUNT:", len(parsed_app_excl))
+          PY
+
       - name: Run 17R Brier trial
         working-directory: trial
         run: |
