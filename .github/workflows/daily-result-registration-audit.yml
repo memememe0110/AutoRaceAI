@@ -168,8 +168,14 @@ jobs:
                   ")) AS lap_no_bad_count"
                   if has_lap_no else "NULL AS lap_no_bad_count"
               )
-              has_status = "status" in race_columns
-              status_select = ", r.status" if has_status else ""
+              # result_racesの実スキーマはrace_status。旧DBのstatusも互換対応する。
+              status_column = (
+                  "status" if "status" in race_columns
+                  else "race_status" if "race_status" in race_columns
+                  else None
+              )
+              has_status = status_column is not None
+              status_select = f", r.{status_column}" if status_column else ""
               raw_rows = con.execute(f"""
                   SELECT
                     r.race_key,
@@ -190,7 +196,7 @@ jobs:
           # Preserve original columns; append all audit columns after them.
           base_columns = ["race_key", "n_entries", "n_laps", "n_payouts"]
           if has_status:
-              base_columns.append("status")
+              base_columns.append(status_column)
           goal_line_index = 4 + int(has_status)
           base_columns.extend([
               "n_goal_lines", "n_non_goal_laps", "n_lap_numbers",
@@ -371,7 +377,7 @@ jobs:
                   Counter(int(r[3] or 0) for r in rows).items()
               )),
               "result_races_status_column_present": has_status,
-              "result_races_status_column_name": "status" if has_status else None,
+              "result_races_status_column_name": status_column,
               "zero_count_status_classification": (
                   "status_included_for_manual_review"
                   if has_status else "not_performed_status_column_absent"
