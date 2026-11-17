@@ -17,11 +17,12 @@ sys.modules[spec.name] = verify
 spec.loader.exec_module(verify)
 
 FIELDS = [
-    'race_key','car_count','actual_pattern','unique_pattern_count','pattern_rank',
+    'race_key','mode','app_sha256','db_sha256','car_count','actual_pattern','unique_pattern_count','pattern_rank',
     'pattern_count','pattern_prob','uniform_ratio','top1_prob','relative_lift',
     'observed_trials','rank_cutoff_25pct','rank_pass','uniform_pass','top1_pass',
     'relative_lift_pass','sim_trials_reported','ok','error'
 ]
+ALLOWED_MODES = ('Ver326', 'Ver330-A')
 
 
 def _file_sha256(path: Path):
@@ -31,6 +32,17 @@ def _file_sha256(path: Path):
         for block in iter(lambda:f.read(1024*1024),b''):
             h.update(block)
     return h.hexdigest()
+
+
+def _race_set_sha256(keys) -> str:
+    import hashlib
+    return hashlib.sha256('\n'.join(keys).encode()).hexdigest()
+
+
+def _require_same(progress: dict, key: str, value, label: str) -> None:
+    old = progress.get(key)
+    if old and value and str(old) != str(value):
+        raise SystemExit(f'{label} mismatch: progress={old} current={value}')
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
@@ -146,8 +158,13 @@ def main():
     ap.add_argument('--max-races',type=int,default=50)
     ap.add_argument('--trials',type=int,default=20000)
     ap.add_argument('--seed',type=int,default=12345)
+    ap.add_argument('--mode', default='Ver326', choices=ALLOWED_MODES)
+    ap.add_argument('--app-sha', default='', help='Pinned application commit SHA')
+    ap.add_argument('--db-tag', default='', help='Pinned DB release tag')
     ap.add_argument('--timeout',type=float,default=1800)
     a=ap.parse_args()
+    if a.mode not in ALLOWED_MODES:
+        raise SystemExit(f'mode must be one of {ALLOWED_MODES}')
     if a.trials != 20000 or a.seed != 12345:
         raise SystemExit('Pre-registered settings are fixed: trials=20000, seed=12345')
     db=Path(a.db).resolve(); app=Path(a.app).resolve(); db_root=Path(a.db_root).resolve()
@@ -163,18 +180,32 @@ def main():
     # 全予測履歴のうちLap1結果がないレース数は対象外開催を含むため、
     # Ver326/Ver328の共通集合に限定して「全返還1RだけがLap1なし」を検証する。
     common, contamination = load_target_set(db)
+    db_sha = _file_sha256(db)
+    app_sha = str(a.app_sha or '').strip()
+    db_tag = str(a.db_tag or '').strip()
+    race_set_sha = _race_set_sha256(common)
+    _require_same(progress, 'mode', a.mode, 'mode')
+    _require_same(progress, 'app_sha256', app_sha, 'app SHA')
+    _require_same(progress, 'db_sha256', db_sha, 'DB SHA')
+    _require_same(progress, 'db_tag', db_tag, 'DB tag')
+    _require_same(progress, 'race_set_sha256', race_set_sha, 'race set')
+    _require_same(progress, 'trials', a.trials, 'trials')
+    _require_same(progress, 'seed', a.seed, 'seed')
 
     started=str(progress.get('started_at') or now_iso())
     batch_started_at=now_iso()
     remaining=[k for k in common if k not in done]
     progress.update({
-        'run_id':a.run_id,'phase':'Ver326 Lap1','status':'running',
+        'run_id':a.run_id,'phase':f'{a.mode} Lap1','status':'running','mode':a.mode,
         'total':verify.EXPECTED_LAP1_COUNT,'done_count':len(done),'failed_count':sum(1 for r in rows if str(r.get('ok','')).lower() not in ('true','1')),
         'current_race':'','started_at':started,'updated_at':now_iso(),
         'batch_started_at':batch_started_at,
         'last_error':'',
         'trials':a.trials,'seed':a.seed,'batch_limit':a.max_races,
-        'db_sha256':_file_sha256(db),
+        'app_sha256':app_sha,'db_sha256':db_sha,'db_tag':db_tag,
+        'race_set_sha256':race_set_sha,
+        'python':sys.version.split()[0],
+        'pythonhashseed':'0',
         'target_check':contamination,
     })
     progress_path.write_text(json.dumps(progress,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -189,7 +220,7 @@ def main():
         git_checkpoint(db_root,a.branch,progress_path,csv_path,f'Ver330-A validation {a.run_id}: {len(done)}/{len(common)} start {race_key}')
         out_json=result_dir/'runs'/f'{len(done)+1:03d}.json'
         try:
-            data=verify.run_one_race(app,db,race_key,'Ver326',a.trials,a.seed,out_json,a.timeout)
+            data=verify.run_one_race(app,db,race_key,a.mode,a.trials,a.seed,out_json,a.timeout)
             if not data.get('validation_full_trials'):
                 raise RuntimeError('validation_full_trials is false')
             if int(data.get('sim_trials') or 0) != a.trials:
@@ -199,9 +230,9 @@ def main():
             if not actual:
                 raise RuntimeError('actual Lap1 order missing')
             metrics=verify.pattern_metrics(data.get('lap_order_counts',{}).get('1',{}),actual,a.trials)
-            row={**metrics,'race_key':race_key,'sim_trials_reported':int(data.get('sim_trials') or 0),'ok':True,'error':''}
+            row={**metrics,'race_key':race_key,'mode':a.mode,'app_sha256':app_sha,'db_sha256':db_sha,'sim_trials_reported':int(data.get('sim_trials') or 0),'ok':True,'error':''}
         except Exception as exc:
-            row={'race_key':race_key,'ok':False,'error':f'{type(exc).__name__}: {exc}'}
+            row={'race_key':race_key,'mode':a.mode,'app_sha256':app_sha,'db_sha256':db_sha,'ok':False,'error':f'{type(exc).__name__}: {exc}'}
             # Persist failure diagnostics and stop this workflow run. Rerun resumes and retries this race.
             rows=[r for r in rows if str(r.get('race_key')) != race_key]+[row]
             write_rows(csv_path,rows)
