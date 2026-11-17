@@ -46,14 +46,14 @@
 
 ## 完了
 
-| 分類 | タスク | 結果 |
-|------|--------|------|
-| 予測 | 実周回数対応 | [PR #27](https://github.com/memememe0110/AutoRaceAI/pull/27) mainマージ済み。6/7/8周に応じて展開。6周対照一致。検証モード20,000試行完走 |
-| 運用 | 前向き収集のAPP_COMMIT固定 | [PR #25](https://github.com/memememe0110/AutoRaceAI/pull/25) mainマージ済み |
-| データ | 選手履歴の強制再取得 | [PR #26](https://github.com/memememe0110/AutoRaceAI/pull/26) mainマージ済み。通常の公式取込経路。history_onlyは#37 |
-| データ | ハンデパーサ修正 | [PR #24](https://github.com/memememe0110/AutoRaceAI/pull/24) mainマージ済み。欠損を0mにしない |
-| 予測 | キュー版固定 | 登録時に予測版・seed・configを固定 |
-| 予測 | 8周の原因特定 | `_v230_six_lap_simulation` が1-6固定。`simulate()` は別経路 |
+| 分類 | Issue | タスク | 結果 |
+|------|-------|--------|------|
+| 予測 | [#30](https://github.com/memememe0110/AutoRaceAI/issues/30) | 実周回数対応 | [PR #27](https://github.com/memememe0110/AutoRaceAI/pull/27) mainマージ済み。6/7/8周に応じて展開。6周対照一致。検証モード20,000試行完走 |
+| 運用 | [#34](https://github.com/memememe0110/AutoRaceAI/issues/34) | 前向き収集のAPP_COMMIT固定 | [PR #25](https://github.com/memememe0110/AutoRaceAI/pull/25) mainマージ済み |
+| データ | - | 選手履歴の強制再取得 | [PR #26](https://github.com/memememe0110/AutoRaceAI/pull/26) mainマージ済み。通常の公式取込経路。history_onlyは#37 |
+| データ | - | ハンデパーサ修正 | [PR #24](https://github.com/memememe0110/AutoRaceAI/pull/24) mainマージ済み。欠損を0mにしない |
+| 予測 | - | キュー版固定 | 登録時に予測版・seed・configを固定 |
+| 予測 | - | 8周の原因特定 | `_v230_six_lap_simulation` が1-6固定。`simulate()` は別経路 |
 
 ## Ver331 Lap1 の制約
 
