@@ -10,14 +10,24 @@
 |------|------|------|
 | 選手履歴の強制再取得 | テスト補強済み・未マージ | [PR #26](https://github.com/memememe0110/AutoRaceAI/pull/26) |
 | 前向き収集の APP_COMMIT 固定 | 未マージ | [PR #25](https://github.com/memememe0110/AutoRaceAI/pull/25) |
-| 8周レースの周回数延長 | 調査済み・実装待ち | `fix/lap-count-audit` |
+| 8周レースの周回数延長 | 調査済み・実装待ち。実周回数対応、終盤補正、出力比較まで必要 | `fix/lap-count-audit` |
+| worker 実行中の UI rerun による global 上書き | 原因調査未完了。特に `_V330A_EXPERIMENT` の上書きと worker 終了時の復元漏れ | 調査継続 |
+| 実DBの全レース件数・登録完全性監査 | 過去のDB世代だけでは最新状態を確定できていない。全レース件数と部分登録を確認 | 読み取り専用監査 |
 
 ## 次にやること
 
-- 予測・結果の欠損監査（実DBの件数突き合わせ。予測の存在、result_races / entries / laps / payouts、予測周回数と実周回数）
-- 山陽10R（2026-11-14）のハンデ再収集。PR #24 反映後、ログで `hand_source_missing` / `hand_parse_failed` を確認してから
-- 既存の全員0mスナップショットの再生成
-- 必要なら `history_only` 経路へ `force_history_refresh` を伝播
+- **予測・結果の欠損監査**（実DBの件数突き合わせ。予測の存在、`result_races` / `result_entries` / `result_laps` / `result_payouts`、予測周回数と実周回数。画面表示上の欠損もDB実体と切り分ける）
+- **全レース件数監査の完了**（2026-01-01以降を対象に、開催レース数と登録件数を照合。部分登録・未登録レースを抽出。以前の世代693/701/705等の監査結果を最新DBの確定値として扱わない）
+- **worker/global の競合調査**（`_v319_bg_import_worker` 実行中の Streamlit UI rerun がプロセス global `_V330A_EXPERIMENT` を上書きしないか、worker 終了時の finally 復元が欠けていないか確認）
+- 山陽10R（2026-11-14）のハンデ再収集。PR #24 反映後、ログで `handicap_source_missing` / `handicap_parse_failed` を確認してから。実データで 0m, 10m, 10m... が復元されることを確認
+- 既存の全員0mスナップショットの再生成。再生成後、ハンデ分析の基準データを更新
+- 結果登録時の `result_entries` の `race_time` / `start_time` 欠損と、`OtherRaceInfo` の結合・欠損判定を監査
+- 周回ラベル変換・パースの不一致を監査（公式の「N周」「N周目」表記、ゴール線を含む周回の対応）
+- 登録済み判定が「レース行の存在」だけで完了扱いになっていないか、関連テーブルの全数チェックで確認
+- 701件の `parser_bug` 分類は、登録時刻のタイムゾーンと締切前後を照合して確定。根拠不足なら未確定のままにする
+- 天候欠損は unknown として扱い、欠損を晴れ等へ補完していないことを監査
+- 必要なら `history_only` 経路へ `force_history_refresh` を伝播（現状の PR #26 の対象は通常の公式取込経路）
+- 必要性を再確認したうえで、旧DB世代693のコピー上で Worker / qver_lock8 の再現検証を実施（本番DB・mainを変更しない）
 
 ## 8周の調査結果
 
@@ -25,6 +35,7 @@
 - 周回隊列の `_v230_six_lap_simulation` は `for lap in range(1, 7)`。`meta["周回数"]` を見ない。
 - ループを伸ばすだけだと 7・8周は隊列更新されるが、終盤ルール（late_release、Ver330-A抑制）は 5・6周固定のまま。
 - 推奨: 実周回数まで延長し、7・8周は6周と同じ終盤ルール。6周レースの出力は変えない。
+- 実装時はペア事前計算、late_release キャッシュ、監査辞書、周回別出力・比較・fingerprint も実周回数に対応させる。6周レースの既存出力が同一であることを回帰テストする。
 
 ## 完了
 
@@ -36,3 +47,4 @@
 
 - main 以外は修正ブランチを作って push してよい。
 - 予測に関わる修正は通常予測停止中なので進めてよい。
+- PR #25 / #26 は未マージ。マージは明示承認後。
