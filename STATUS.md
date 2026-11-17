@@ -23,7 +23,7 @@
 
 | 進捗 | 分類 | Issue | タスク | 現状 | 次 |
 |------|------|-------|--------|------|----|
-| 進行中 | 予測 | [#28](https://github.com/memememe0110/AutoRaceAI/issues/28) | Ver331 Lap1精度改善 | 測定前提が未整合。225/377は暫定。補正は未投入。`_V331_LAP1_TUNE=False` | race_key集合・seed・trials・DB SHA・保存版・集計方法を突合してから基準測定 |
+| 進行中 | 予測 | [#28](https://github.com/memememe0110/AutoRaceAI/issues/28) | Ver331 Lap1精度改善 | 測定モードとSHA固定は [PR #38](https://github.com/memememe0110/AutoRaceAI/pull/38) でmain済み。Ver326の2R×2回は分布一致。377R基準は実行中 | 基準測定完了後に不一致を解消。補正は未投入 |
 | 進行中 | 予測 | [#29](https://github.com/memememe0110/AutoRaceAI/issues/29) | Ver330-A / Ver326 の実保存版切替調査 | `v231_prediction_history` / `v187_mixed_plan_runs` の実保存版と切替時刻が未確認 | SQLで実保存版と切替時刻を出す。証拠なしに原因を確定しない |
 | 進行中 | 運用 | [#32](https://github.com/memememe0110/AutoRaceAI/issues/32) | worker中のUI rerunによるglobal上書き | `_V330A_EXPERIMENT` の上書きと、worker終了時の復元漏れが未解決 | worker実行中の上書き有無と finally 復元を確認 |
 | 進行中 | データ | [#33](https://github.com/memememe0110/AutoRaceAI/issues/33) | 実DBの登録完全性監査 | #35の細部監査を統合済み。#17は周回履歴の将来予測影響で別目的 | 2026-01-01以降の開催件数と登録件数を照合。部分登録を抽出 |
