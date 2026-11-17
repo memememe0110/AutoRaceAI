@@ -179,9 +179,7 @@ def test_fill_failure_keeps_existing_history(tmp_path, monkeypatch):
     assert any("取得失敗" in str(d) or "取得開始" in str(d) for d in out.get("details") or [])
 
 
-def _run_import(monkeypatch, *, force: bool, replace: bool, counts: int = 15):
-    calls = {"fill": 0, "fill_force": None, "v70": 0, "register": 0}
-
+def _base_import_mocks(monkeypatch, calls, *, parse_ok=True):
     def fill(*a, **k):
         calls["fill"] += 1
         calls["fill_force"] = bool(k.get("force_refresh"))
@@ -197,17 +195,9 @@ def _run_import(monkeypatch, *, force: bool, replace: bool, counts: int = 15):
         }],
     )
     monkeypatch.setattr(app, "_v319_parse_sprace_players", lambda *a, **k: [])
-    monkeypatch.setattr(app, "_v319_build_prediction_text_from_sprace", lambda *a, **k: "1車")
-    monkeypatch.setattr(app, "_v319_detect_kessha_from_players", lambda *a, **k: [])
-    monkeypatch.setattr(app, "_v319_detect_kessha_from_card_text", lambda *a, **k: [])
-    monkeypatch.setattr(app, "_v319_autorace_other_race_info", lambda *a, **k: {})
-    monkeypatch.setattr(app, "_v319_http_get", lambda *a, **k: "")
-    monkeypatch.setattr(app, "_v319_autorace_api_post", lambda *a, **k: {})
-    monkeypatch.setattr(app, "_v326_queue_bind_input_sha256", lambda *a, **k: {"ok": True})
-    monkeypatch.setattr(app, "_v319_autorace_program_body", lambda *a, **k: {})
     monkeypatch.setattr(app, "_v319_is_void_or_cancelled_result", lambda *a, **k: {"void": False})
     monkeypatch.setattr(app, "_v319_card_fill_note", lambda *a, **k: "")
-    monkeypatch.setattr(app, "_v319_player_history_counts_batch", lambda *a, **k: {"山田": counts})
+    monkeypatch.setattr(app, "_v319_player_history_counts_batch", lambda *a, **k: {"山田": 15})
     monkeypatch.setattr(app, "_v319_fill_player_histories", fill)
     monkeypatch.setattr(app, "_v319_result_exists", lambda *a, **k: True)
     monkeypatch.setattr(app, "_v319_prediction_exists", lambda *a, **k: True)
@@ -216,20 +206,46 @@ def _run_import(monkeypatch, *, force: bool, replace: bool, counts: int = 15):
     monkeypatch.setattr(app, "_v326_find_matching_prediction_history", lambda *a, **k: None)
     monkeypatch.setattr(app, "_v319_apply_odds_and_plan", lambda *a, **k: {"odds": 3, "plan_hash": "p"})
     monkeypatch.setattr(app, "_v319_fetch_oddspark_result", lambda *a, **k: "1R\n確定\n着順\n払戻金\n")
+    monkeypatch.setattr(app, "_v319_build_prediction_text_from_sprace", lambda *a, **k: "1車")
+    monkeypatch.setattr(app, "_v319_detect_kessha_from_players", lambda *a, **k: [])
+    monkeypatch.setattr(app, "_v319_detect_kessha_from_card_text", lambda *a, **k: [])
+    monkeypatch.setattr(app, "_v319_autorace_other_race_info", lambda *a, **k: {})
+    monkeypatch.setattr(app, "_v319_http_get", lambda *a, **k: "")
+    monkeypatch.setattr(app, "_v319_autorace_api_post", lambda *a, **k: {})
+    monkeypatch.setattr(app, "_v326_queue_bind_input_sha256", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(app, "_v319_autorace_program_body", lambda *a, **k: {})
+    monkeypatch.setattr(app, "_v319_upsert_payouts_from_text", lambda *a, **k: None)
 
-    def reg(*a, **k):
-        calls["register"] += 1
-        if k.get("replace") or (len(a) >= 4 and a[3]):
-            calls["v70"] += 1
-        return {"key": "20261114_山陽_10R"}
+    def v70(*a, **k):
+        calls["v70"] += 1
+        calls["v70_args"] = a
+        return ("20261114_山陽_10R", None, {}, {}, {"replaced": True})
 
-    monkeypatch.setattr(app, "_v319_register_fetched_result", reg)
-    monkeypatch.setattr(
-        app.engine,
-        "v70_replace_registered_result",
-        lambda *a, **k: calls.__setitem__("v70", calls["v70"] + 1) or ("k", None, {}, {}, {"replaced": True}),
-    )
+    def v41(*a, **k):
+        calls["v41"] += 1
+        return ("20261114_山陽_10R", None, {}, {}, {})
 
+    monkeypatch.setattr(app.engine, "v70_replace_registered_result", v70)
+    monkeypatch.setattr(app.engine, "v41_register_result", v41)
+    if parse_ok:
+        import pandas as pd
+        meta = {"開催場": "山陽", "レース": 10, "開催日": "2026-11-14"}
+        rows = pd.DataFrame([{"着順": 1, "車番": 1, "選手名": "山田", "競走T": 3.5, "ST": 0.15}])
+        laps = pd.DataFrame([{"周回": "1周目", "順位": 1, "車番": 1}])
+        pays = pd.DataFrame()
+        monkeypatch.setattr(app.engine, "v35_parse_result_text", lambda *a, **k: (meta, rows, laps, pays))
+        monkeypatch.setattr(app.engine, "v67_analyze_ticket_result", lambda *a, **k: None)
+
+
+def _run_import(monkeypatch, *, force: bool, replace: bool, use_real_register: bool = False):
+    calls = {"fill": 0, "fill_force": None, "v70": 0, "v41": 0, "v70_args": None}
+    _base_import_mocks(monkeypatch, calls, parse_ok=use_real_register)
+    if not use_real_register:
+        def reg(*a, **k):
+            calls["register"] = calls.get("register", 0) + 1
+            calls["register_replace"] = bool(k.get("replace"))
+            return {"key": "20261114_山陽_10R"}
+        monkeypatch.setattr(app, "_v319_register_fetched_result", reg)
     out = app._v319_import_one_race(
         ":memory:",
         "20261114",
@@ -251,22 +267,28 @@ def test_off_sufficiency_skips(monkeypatch):
     out, calls = _run_import(monkeypatch, force=False, replace=False)
     assert calls["fill"] == 0
     assert "充足スキップ" in str(out.get("message") or "")
+    assert calls["v70"] == 0
 
 
 def test_on_fetches_history(monkeypatch):
     out, calls = _run_import(monkeypatch, force=True, replace=False)
     assert calls["fill"] == 1
     assert calls["fill_force"] is True
-    assert calls["v70"] == 0
+    assert "充足スキップ" not in str(out.get("message") or "")
 
 
 def test_on_does_not_force_result_replace(monkeypatch):
     out, calls = _run_import(monkeypatch, force=True, replace=False)
     assert calls["fill"] == 1
     assert calls["v70"] == 0
+    assert calls.get("register", 0) == 0
+    assert out.get("phase") == "completed_result_exists"
 
 
-def test_replace_on_does_not_force_history(monkeypatch):
-    out, calls = _run_import(monkeypatch, force=False, replace=True)
+def test_replace_on_calls_v70_not_history(monkeypatch):
+    out, calls = _run_import(monkeypatch, force=False, replace=True, use_real_register=True)
     assert calls["fill"] == 0
-    assert calls["v70"] >= 1 or calls["register"] >= 1
+    assert calls["v70"] == 1
+    assert calls["v41"] == 0
+    assert calls["v70_args"] is not None
+    assert out.get("status") in {"ok", "skip"}
