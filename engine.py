@@ -7344,14 +7344,22 @@ def v15_save_player_history(df, db_path=DB_PATH):
 # ============================================================
 # v3.0: 6周詳細シミュレーション表示補助
 # ============================================================
-def v30_representative_lap_projection(df):
-    """詳細シミュレーション用指標から、代表的な6周の隊列推移を作る。
+def v30_representative_lap_projection(df, total_laps=6):
+    """詳細シミュレーション用指標から、実周回数分の代表隊列推移を作る。
 
     確率計算そのものは simulate_detailed() が担当する。この関数は画面表示用で、
     スタート隊列から最終予測順位へ、隣接追い抜きだけで移る代表経路を返す。
+    total_laps が不正・未指定の場合は従来互換の6周とする。
     """
     if df is None or len(df) == 0:
         return pd.DataFrame()
+    try:
+        _lap_match = re.search(r"\d+", str(total_laps))
+        total_laps = int(_lap_match.group()) if _lap_match else 6
+        if total_laps not in (6, 7, 8):
+            total_laps = 6
+    except Exception:
+        total_laps = 6
     work = df.copy().reset_index(drop=True)
     cars = pd.to_numeric(work.get("車"), errors="coerce").fillna(999).astype(int).to_numpy()
     names = work.get("選手名", pd.Series([""] * len(work))).astype(str).to_numpy()
@@ -7368,8 +7376,8 @@ def v30_representative_lap_projection(df):
     target = list(np.argsort(final_rank, kind="stable"))
     snapshots = [order.copy()]
 
-    # 2～6周目。1周に一度、隣接車だけを入れ替えて徐々に最終隊列へ近づける。
-    for lap in range(2, 7):
+    # 2周目から実周回数まで、1周に一度、隣接車だけを入れ替える。
+    for lap in range(2, total_laps + 1):
         desired_pos = {idx: pos for pos, idx in enumerate(target)}
         candidates = []
         for pos in range(1, len(order)):
