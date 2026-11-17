@@ -13271,7 +13271,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["Ver268ハンデ学習件数"]=int(handicap_bias_v268.get("samples",0) or 0)
     top=sorted(ints.items(),key=lambda kv:kv[1],reverse=True)[:5]
     modal_laps=[]
-    for lap in range(1,7):
+    for lap in range(1,total_laps+1):
         counter=lap_order_counts.get(lap) or {}
         if counter:
             order_mode,n=max(counter.items(),key=lambda kv:kv[1])
