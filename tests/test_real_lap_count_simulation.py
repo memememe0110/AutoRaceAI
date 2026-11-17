@@ -28,6 +28,8 @@ def test_simulation_lap_count_controls_all_lap_outputs_and_transitions():
     assert 'for _lap276 in range(1, total_laps + 1):' in fn
     assert 'for _lap276 in range(5, total_laps + 1):' in fn
     assert 'actual_lap_orders[:total_laps]' in fn
+    assert '_late_release_audit_payload' in fn
+    assert '[_late_release_audit_payload] * len(out)' in fn
     assert 'int(lap) >= 6' in fn
     assert 'for lap in range(1,7):' not in fn
     helper_start = source.index('def _v272_late_chase_release')
