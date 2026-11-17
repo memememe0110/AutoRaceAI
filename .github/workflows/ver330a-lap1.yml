@@ -19,6 +19,24 @@ on:
         required: true
         default: '1'
         type: string
+      mode:
+        description: 'Measurement mode'
+        required: true
+        default: 'Ver326'
+        type: choice
+        options:
+          - Ver326
+          - Ver330-A
+      app_ref:
+        description: 'App commit SHA or ref. Empty uses progress pin, else main.'
+        required: false
+        default: ''
+        type: string
+      db_tag:
+        description: 'DB release tag. Empty uses progress pin, else latest db-*.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: write
@@ -33,28 +51,66 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout application source
+      - name: Checkout validation results
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.repository.default_branch }}
-          path: appsrc
+          ref: ${{ inputs.results_branch }}
+          path: validation-output
           fetch-depth: 1
 
-      - name: Resolve latest db-* Release tag
-        id: db_tag
+      - name: Resolve pinned app and DB
+        id: pins
         env:
+          APP_REF: ${{ inputs.app_ref }}
+          DB_TAG: ${{ inputs.db_tag }}
+          RUN_ID: ${{ inputs.run_id }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          TAG="$(gh release list --repo "$REPO" --limit 100 \
-                 --json tagName,publishedAt \
-                 --jq '[.[] | select(.tagName | startswith("db-"))] | sort_by(.publishedAt) | reverse | .[0].tagName')"
-          if [ -z "$TAG" ]; then
-            echo "::error::No db-* release found"; exit 1
+          PROG="validation-output/validation/ver330a_lap1/${RUN_ID}/progress.json"
+          APP="$APP_REF"
+          TAG="$DB_TAG"
+          if [ -f "$PROG" ]; then
+            APP="$(python - "$PROG" "$APP" <<'PY'
+          import json, sys
+          prog, fallback = sys.argv[1], sys.argv[2]
+          data = json.load(open(prog, encoding='utf-8'))
+          print(data.get('app_sha256') or fallback)
+          PY
+          )"
+            TAG="$(python - "$PROG" "$TAG" <<'PY'
+          import json, sys
+          prog, fallback = sys.argv[1], sys.argv[2]
+          data = json.load(open(prog, encoding='utf-8'))
+          print(data.get('db_tag') or fallback)
+          PY
+          )"
           fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Resolved latest DB release: ${TAG}"
+          if [ -z "$APP" ]; then APP="${{ github.event.repository.default_branch }}"; fi
+          if [ -z "$TAG" ]; then
+            TAG="$(gh release list --repo "$REPO" --limit 100 \
+              --json tagName,publishedAt \
+              --jq '[.[] | select(.tagName | startswith("db-"))] | sort_by(.publishedAt) | reverse | .[0].tagName')"
+          fi
+          if [ -z "$TAG" ]; then echo "::error::No db tag"; exit 1; fi
+          echo "app_ref=$APP" >> "$GITHUB_OUTPUT"
+          echo "db_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Pinned app=$APP db=$TAG"
+
+      - name: Checkout application source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pins.outputs.app_ref }}
+          path: appsrc
+          fetch-depth: 1
+
+      - name: Record application SHA
+        id: appsha
+        run: |
+          SHA="$(git -C appsrc rev-parse HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "App SHA $SHA"
 
       - name: Show disk before download
         run: df -h /home/runner
@@ -63,7 +119,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          TAG: ${{ steps.db_tag.outputs.tag }}
+          TAG: ${{ steps.pins.outputs.db_tag }}
         run: |
           set -euo pipefail
           mkdir -p validation_workdir
@@ -110,18 +166,14 @@ jobs:
           python -m pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Checkout dedicated validation results branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.results_branch }}
-          path: validation-output
-          fetch-depth: 1
-
       - name: Run next batch (up to ${{ inputs.max_races }} races)
         env:
           RUN_ID: ${{ inputs.run_id }}
           RESULTS_BRANCH: ${{ inputs.results_branch }}
           MAX_RACES: ${{ inputs.max_races }}
+          MODE: ${{ inputs.mode }}
+          APP_SHA: ${{ steps.appsha.outputs.sha }}
+          DB_TAG: ${{ steps.pins.outputs.db_tag }}
         run: |
           python appsrc/run_ver330a_actions.py \
             --db validation_workdir/autorace_players.sqlite3 \
@@ -131,6 +183,9 @@ jobs:
             --run-id "$RUN_ID" \
             --branch "$RESULTS_BRANCH" \
             --max-races "$MAX_RACES" \
+            --mode "$MODE" \
+            --app-sha "$APP_SHA" \
+            --db-tag "$DB_TAG" \
             --trials 20000 \
             --seed 12345 \
             --timeout 1800
