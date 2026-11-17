@@ -21,7 +21,7 @@
 | 進行中 | 予測 | [#29](https://github.com/memememe0110/AutoRaceAI/issues/29) | Ver330-A / Ver326 の実保存版切替調査 | `v231_prediction_history` / `v187_mixed_plan_runs` の実保存版と切替時刻が未確認 | SQLで実保存版と切替時刻を出す。証拠なしに原因を確定しない |
 | レビュー待ち | 予測 | [#30](https://github.com/memememe0110/AutoRaceAI/issues/30) | 8周シミュレーション対応 | [PR #27](https://github.com/memememe0110/AutoRaceAI/pull/27) 未マージ。検証モード20,000試行は完走。6周対照も一致。マージ判断待ち | マージ判断。30m以上の終盤再加速は合成入力で別途確認 |
 | 進行中 | 運用 | [#32](https://github.com/memememe0110/AutoRaceAI/issues/32) | worker中のUI rerunによるglobal上書き | `_V330A_EXPERIMENT` の上書きと、worker終了時の復元漏れが未解決 | worker実行中の上書き有無と finally 復元を確認 |
-| 進行中 | データ | [#33](https://github.com/memememe0110/AutoRaceAI/issues/33) | 実DBの登録完全性監査 | 過去世代の監査だけでは最新DBを確定できない。[#17](https://github.com/memememe0110/AutoRaceAI/issues/17)は周回履歴の将来予測影響で別目的 | 2026-01-01以降の開催件数と登録件数を照合。部分登録を抽出 |
+| 進行中 | データ | [#33](https://github.com/memememe0110/AutoRaceAI/issues/33) | 実DBの登録完全性監査 | #35の細部監査を統合済み。#17は周回履歴の将来予測影響で別目的 | 2026-01-01以降の開催件数と登録件数を照合。部分登録を抽出 |
 
 ## 高
 
@@ -35,7 +35,6 @@
 | 進捗 | 分類 | Issue | タスク | 現状 | 次 |
 |------|------|-------|--------|------|----|
 | レビュー待ち | データ | [#26](https://github.com/memememe0110/AutoRaceAI/pull/26) | 選手履歴の強制再取得 | PR #26 通常の公式取込経路のみ。未マージ | レビュー後マージ。history_onlyは [#37](https://github.com/memememe0110/AutoRaceAI/issues/37) |
-| 未着手 | データ | [#35](https://github.com/memememe0110/AutoRaceAI/issues/35) | 結果・周回・払戻の整合性監査 | #33の細部監査。統合侯補 | #33に統合するか、細部タスクとして残すかを決める |
 | 未着手 | データ | [#36](https://github.com/memememe0110/AutoRaceAI/issues/36) | 旧ハンデ0mデータの再生成 | PR #24はmain済み。PR #25未マージ。再収集前 | 新コード確認後に再収集。0,10,10,10,10,10,10,10 を確認 |
 | 未着手 | 運用 | [#37](https://github.com/memememe0110/AutoRaceAI/issues/37) | history_only への強制履歴更新 | PR #26の対象外 | 必要かを判断してから別PR |
 | 未着手 | データ | [#17](https://github.com/memememe0110/AutoRaceAI/issues/17) | 欠損周回履歴の将来予測影響 | #33とは別目的。対象12Rの履歴影響 | 隔離DBで影響を定量化 |
