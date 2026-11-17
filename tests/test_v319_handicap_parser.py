@@ -123,6 +123,21 @@ def test_prediction_text_builder_never_zero_fills_missing_handicap():
         raise AssertionError("builder must reject missing handicap")
 
 
+def test_program_rebuild_keeps_handicap_when_st_is_absent():
+    ns = _load_app_functions()
+    body = {"playerList": [{
+        "carNo": 2, "playerCode": "1002", "playerName": "テスト選手2",
+        "placeName": "山陽", "handicap": 10, "trialRunTime": "3.40",
+        "startTime": None, "absent": None,
+    }]}
+    html = ns["_v319_synthesize_sprace_html_from_program"](
+        body, "山陽", 10, "20261117"
+    )
+    rows = ns["_v319_parse_sprace_car_rows"](html)
+    assert rows[0]["hand"] == "10"
+    assert rows[0]["st"] == ""
+
+
 def test_program_rebuild_rejects_missing_active_handicap():
     ns = _load_app_functions()
     body = {"playerList": [{
