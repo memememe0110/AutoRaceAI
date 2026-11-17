@@ -121,6 +121,7 @@ def test_prediction_text_builder_never_zero_fills_missing_handicap():
         assert "後段で解析できません" in str(exc)
     else:
         raise AssertionError("builder must reject missing handicap")
+    assert ns["_V319_LAST_CARD_FILL"]["hand_parse_failed"] == 1
 
 
 def test_program_rebuild_keeps_handicap_when_st_is_absent():
