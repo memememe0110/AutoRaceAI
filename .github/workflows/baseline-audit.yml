@@ -1,0 +1,68 @@
+name: Historical Lap1 Baseline Audit
+run-name: "Historical baseline audit - ${{ github.run_number }}"
+
+on:
+  push:
+    branches: [tmp-baseline-audit]
+    paths:
+      - '.github/workflows/baseline-audit.yml'
+      - 'tools/baseline_audit.py'
+      - 'tools/rebuild_pinned_db.py'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: historical-lap1-baseline-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download pinned DB generation 705
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python tools/rebuild_pinned_db.py --repo "$GITHUB_REPOSITORY" --branch autorace-db \
+            --db-name autorace_players.sqlite3 --expected-commit 20c67a8450ea72d219c19601319faf558a2f93c1 \
+            --out data/autorace_players.sqlite3 --info-out output/db_info.json
+          cat output/db_info.json
+      - name: Download exact 29R Brier artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p input output
+          gh run download 43917416699 --repo "$GITHUB_REPOSITORY" \
+            --name brier-trial-29r-43917416699 --dir input
+          test -s input/brier_trial.json
+          test -s input/compare_snapshot.sqlite3
+      - name: Schema audit first
+        run: |
+          set -euo pipefail
+          python tools/baseline_audit.py --db data/autorace_players.sqlite3 \
+            --snapshot input/compare_snapshot.sqlite3 --out output --schema-only
+          cat output/schema_audit.json
+      - name: Historical baseline and frozen 29R analysis
+        run: |
+          set -euo pipefail
+          python tools/baseline_audit.py --db data/autorace_players.sqlite3 \
+            --snapshot input/compare_snapshot.sqlite3 --out output
+          cp input/brier_trial.json output/brier_trial.json
+      - name: Upload audit outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: historical-lap1-baseline-${{ github.run_id }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
