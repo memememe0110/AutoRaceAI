@@ -1,0 +1,32 @@
+name: Lap Snapshot Save Version Tests
+
+on:
+  pull_request:
+    paths:
+      - "app.py"
+      - "tests/test_lap_snapshot_version.py"
+      - ".github/workflows/lap-snapshot-version-pytest.yml"
+  push:
+    branches:
+      - fix/lap-snapshot-effective-version
+    paths:
+      - "app.py"
+      - "tests/test_lap_snapshot_version.py"
+      - ".github/workflows/lap-snapshot-version-pytest.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lap-snapshot-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile
+        run: python -m py_compile app.py tests/test_lap_snapshot_version.py
+      - name: Test effective save version propagation
+        run: python -m unittest discover -s tests -p "test_lap_snapshot_version.py" -v
