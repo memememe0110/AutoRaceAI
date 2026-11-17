@@ -12214,8 +12214,14 @@ def _v285_same_scenario_transition_calibration(db_path: str, venue: str, cutoff_
     return result
 
 
-def _v331_diag_init() -> dict:
+def _v331_diag_init(total_laps: int = 6) -> dict:
     """Ver331 gap診断の集計器。検証モード専用。RNG・予測値には一切関与しない。"""
+    try:
+        _laps = int(total_laps)
+    except Exception:
+        _laps = 6
+    if _laps not in (6, 7, 8):
+        _laps = 6
     return {
         "trials": 0,
         "g0": {"g0_sum": 0.0, "g0_base_sum": 0.0, "g0_noise_sum": 0.0,
@@ -12223,9 +12229,9 @@ def _v331_diag_init() -> dict:
                "g0_ka_pairs_nonzero": 0, "g0_kb_pairs_nonzero": 0,
                "g0_pairs_total": 0},
         "strength_by_start_rank": {},   # rank(1始まり) -> [strength合計, 件数]
-        "gap_end_sum": {lap: 0.0 for lap in range(1, 7)},
-        "pass_attempts": {lap: 0 for lap in range(1, 7)},
-        "pass_successes": {lap: 0 for lap in range(1, 7)},
+        "gap_end_sum": {lap: 0.0 for lap in range(1, _laps + 1)},
+        "pass_attempts": {lap: 0 for lap in range(1, _laps + 1)},
+        "pass_successes": {lap: 0 for lap in range(1, _laps + 1)},
         "lap1_spearman": {"sum": 0.0, "n": 0},            # 実lap1順 vs sim lap1順 (spearman_actual)
         "lap1_spearman_strength": {"sum": 0.0, "n": 0},   # strength順 vs sim lap1順 (spearman_strength)
         "lap1_strongest_pos": [0.0, 0],   # trial内strength最大車のlap1順位(1始まり)合計/件数
@@ -12618,6 +12624,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 )
             except Exception as _e276:
                 _late_release_cache276[(_c276,_lap276)]=(1.0,{"eligible":False,"reason":"cache_error","reasons":[],"_error":f"{type(_e276).__name__}: {_e276}"})
+    _v330a_suppress_counts = {lap: 0 for lap in range(6, total_laps + 1)}
     rng=np.random.default_rng(int(seed)+230)
     _v242_sim_started=time_module.perf_counter()
     requested_trials=max(1000,min(int(trials),20000))
@@ -12662,7 +12669,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
               "trial0_hash": None} for lap in range(1, total_laps + 1)
     }
     # Ver331診断集計器（検証モードのみ。通常実行は None）。
-    _gd330a = _v331_diag_init() if _v330a_full_validation else None
+    _gd330a = _v331_diag_init(total_laps) if _v330a_full_validation else None
     # 追い抜き成功後の勢い。壁を抜いた車が次の車にも迫る展開を試行ごとに保持する。
     chain_events={c:0 for c in cars}
     # 初期の物理位置。10mを約0.17秒差へ換算し、同ハンデは内枠優先。
@@ -13000,6 +13007,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                         _scale_v328 = float(globals().get("_V328_LAP6_P_SCALE") or 0.40)
                         if i >= 4 and _gap3_v328 > _thresh_v328:
                             p = float(np.clip(p * _scale_v328, 0.035, 0.88))
+                            _v330a_suppress_counts[int(lap)] = _v330a_suppress_counts.get(int(lap), 0) + 1
                     except Exception:
                         pass
                 # Ver289:
@@ -13420,6 +13428,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             if _v330a_full_validation else {}
         ),
         "ver330a_validation_full_trials": bool(_v330a_full_validation),
+        "ver330a_suppress_counts": {str(k): int(v) for k, v in _v330a_suppress_counts.items()},
         "ver331_lap1_audit": (
             {
                 "trial0_initial": _v331_trial0_initial,

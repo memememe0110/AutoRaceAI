@@ -32,6 +32,12 @@ def test_simulation_lap_count_controls_all_lap_outputs_and_transitions():
     assert '[_late_release_audit_payload] * len(out)' in fn
     assert 'int(lap) >= 6' in fn
     assert 'for lap in range(1,7):' not in fn
+    assert '_v331_diag_init(total_laps)' in fn
+    diag_start = source.index('def _v331_diag_init')
+    diag_end = source.index('\n\ndef ', diag_start + 5)
+    diag = source[diag_start:diag_end]
+    assert 'if _laps not in (6, 7, 8):' in diag
+    assert 'range(1, _laps + 1)' in diag
     helper_start = source.index('def _v272_late_chase_release')
     helper_end = source.index('\n\ndef ', helper_start + 5)
     helper = source[helper_start:helper_end]
