@@ -304,6 +304,9 @@ def _v331_lap1_tune_active() -> bool:
         return True
     if env == "0":
         return False
+    snap = _v326_worker_config_snapshot()
+    if isinstance(snap, dict) and "v331_lap1_tune_enabled" in snap:
+        return bool(snap.get("v331_lap1_tune_enabled"))
     if bool(globals().get("_V331_LAP1_TUNE")):
         return True
     try:
@@ -354,7 +357,10 @@ def _v331_kb() -> float:
 
 
 def _v327_active() -> bool:
-    """Ver327 late_release実験が有効か。workerではglobal、通常予測ではsessionを参照。"""
+    """Ver327 late_release実験。Workerではqueue snapshotを最優先する。"""
+    snap = _v326_worker_config_snapshot()
+    if isinstance(snap, dict) and "v327_enabled" in snap:
+        return bool(snap.get("v327_enabled"))
     if bool(globals().get("_V327_LATE_RELEASE_EXPERIMENT")) or bool(
         globals().get("_V327_LATE_RELEASE_WORKER_ACTIVE")
     ):
@@ -369,6 +375,9 @@ def _v328_active() -> bool:
     """Ver328 中盤底上げ+6周抑制実験。本線・Ver327とは独立。比較検証モードでは強制OFF。"""
     if str(os.environ.get("AUTORACE_VER330A_COMPARE") or "") == "1":
         return False
+    snap = _v326_worker_config_snapshot()
+    if isinstance(snap, dict) and "v328_enabled" in snap:
+        return bool(snap.get("v328_enabled"))
     if bool(globals().get("_V328_EXPERIMENT")) or bool(globals().get("_V328_WORKER_ACTIVE")):
         return True
     try:
@@ -378,6 +387,9 @@ def _v328_active() -> bool:
 
 
 def _v326_ca_active() -> bool:
+    snap = _v326_worker_config_snapshot()
+    if isinstance(snap, dict) and "v326_ca_enabled" in snap:
+        return bool(snap.get("v326_ca_enabled"))
     if bool(globals().get("_V326_ENABLE_CA")) or bool(globals().get("_V326_CA_WORKER_ACTIVE")):
         return True
     try:
@@ -3343,6 +3355,16 @@ def _v326_validate_queue_config_row(row_dict: dict) -> dict:
     cfg["save_version"] = sv
     if "v330a_enabled" not in cfg:
         cfg["v330a_enabled"] = sv == "Ver330-A"
+    # 旧キュー行は保存版から実験フラグを復元し、UI globalを継承しない。
+    if "v326_ca_enabled" not in cfg:
+        cfg["v326_ca_enabled"] = sv in {"Ver326", "Ver327", "Ver328", "Ver330-A", "Ver331"}
+    if "v327_enabled" not in cfg:
+        cfg["v327_enabled"] = sv == "Ver327"
+    if "v328_enabled" not in cfg:
+        cfg["v328_enabled"] = sv == "Ver328"
+    # 旧キュー行にLap1フラグが無い場合はOFF固定（UI globalを継承しない）。
+    if "v331_lap1_tune_enabled" not in cfg:
+        cfg["v331_lap1_tune_enabled"] = False
     seed = (row_dict or {}).get("seed")
     try:
         seed = int(seed) if seed is not None else 20260719
@@ -5741,7 +5763,6 @@ def _v279_send_bg_prediction_complete_notification(result: dict) -> None:
 
 
 def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) -> None:
-    _prev_v330a = bool(globals().get("_V330A_EXPERIMENT"))
     try:
         # 開始時 snapshot を thread-local に固定（実行中の UI 変更を無視）
         _cfg_snap = None
@@ -5759,13 +5780,6 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             _v326_set_worker_config_snapshot(_cfg_snap)
         except Exception:
             _cfg_snap = None
-        try:
-            if "v330a_enabled" in (request_data or {}):
-                globals()["_V330A_EXPERIMENT"] = bool(request_data.get("v330a_enabled"))
-            elif str((request_data or {}).get("save_version") or "").strip() == "Ver330-A":
-                globals()["_V330A_EXPERIMENT"] = True
-        except Exception:
-            pass
         try:
             _save_ver = str(
                 (request_data or {}).get("save_version")
@@ -5904,10 +5918,6 @@ def _v279_bg_prediction_worker(db_path: str, job_id: int, request_data: dict) ->
             _v326_set_worker_config_snapshot(None)
         except Exception:
             pass
-        try:
-            globals()["_V330A_EXPERIMENT"] = bool(_prev_v330a)
-        except Exception:
-            pass
         _v276_foreground_prediction_event.clear()
         try:
             with _V279_BG_PRED_LOCK:
@@ -5964,10 +5974,6 @@ def _v279_bg_prediction_start(
         con.commit(); job_id=int(cur.lastrowid or 0)
     _excluded301=[int(x) for x in (excluded or [])]
     _input_fp301=_v301_bg_input_fingerprint(str(raw_text),str(venue_override or ""),_excluded301)
-    try:
-        globals()["_V330A_EXPERIMENT"] = bool(_v330_on)
-    except Exception:
-        pass
     request_data={
         "raw_text":str(raw_text),"venue_override":str(venue_override or ""),"trials":int(trials),
         "seed":int(seed),"excluded":_excluded301,
@@ -11832,8 +11838,18 @@ def _v287_compute_race_contribution(payload: bytes) -> list[tuple]:
     ]
 
 
-_V287_IMPORT_STATE_RESET: dict = {}
-_V287_AUTO_IMPORT_STATE: dict = {}
+_V287_IMPORT_STATE_LOCAL = threading.local()
+
+
+def _v287_set_import_state_reset(state: dict | None) -> None:
+    """取込処理の基準状態をスレッド単位で保持する。"""
+    _V287_IMPORT_STATE_LOCAL.reset = dict(state or {})
+
+
+def _v287_get_import_state_reset() -> dict:
+    """現在スレッドの取込基準状態。別Workerの値は参照しない。"""
+    state = getattr(_V287_IMPORT_STATE_LOCAL, "reset", None)
+    return state if isinstance(state, dict) else {}
 
 
 def _v287_calibration_state(db_path: str) -> dict:
@@ -11878,7 +11894,7 @@ def _v287_calibration_state(db_path: str) -> dict:
 def _v287_calibration_needs_full(db_path: str) -> bool:
     """取込時に状態が動いていたら全件再集計が必要。動いていなければ増分で足りる。"""
     st_now = _v287_calibration_state(db_path)
-    st_old = _V287_IMPORT_STATE_RESET if isinstance(_V287_IMPORT_STATE_RESET, dict) else {}
+    st_old = _v287_get_import_state_reset()
     if not st_old:
         return True
     for k, dflt in (("history_id", 0), ("scenario_laps", 0), ("pairs", -1)):
@@ -12075,7 +12091,6 @@ def _v287_recalculate_global_transition_calibration(db_path: str, force_full: bo
         _st_new = {}
         try:
             _st_new = _v287_save_calibration_state(db_path, _v287_max_hist)
-            _V287_AUTO_IMPORT_STATE.update(_st_new)
         except Exception:
             _st_new = {}
         out.update({
@@ -14826,8 +14841,7 @@ def _v326_render_official_import_panel() -> None:
             all_rep = {"ok": 0, "skip": 0, "error": 0, "details": []}
             with st.spinner(f"{ymd} {','.join(venues)} を取得しています…"):
                 _v319_prev_state = _v287_calibration_state(engine.DB_PATH)
-                _V287_IMPORT_STATE_RESET.clear()
-                _V287_IMPORT_STATE_RESET.update(_v319_prev_state)
+                _v287_set_import_state_reset(_v319_prev_state)
                 for vn in venues:
                     _rnos = [int(fetch_race_no)] if int(fetch_race_no or 0) >= 1 else None
                     rep = _v319_import_official_results(
@@ -23847,19 +23861,8 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
         "db_error": 0, "unknown": 0,
     }
     try:
-        # 起動スレッドの globals に依存せず、req から版を確定（Ver326とVer330-A両存用）
-        try:
-            if "v330a_enabled" in (req or {}):
-                globals()["_V330A_EXPERIMENT"] = bool(req.get("v330a_enabled"))
-            elif str((req or {}).get("save_version") or "").strip() == "Ver330-A":
-                globals()["_V330A_EXPERIMENT"] = True
-            else:
-                # 明示が無ければ OFF（本線 Ver326）
-                globals()["_V330A_EXPERIMENT"] = False
-            # 通常取込では Ver331 Lap1補正を絶対に漏らさない
-            globals()["_V331_LAP1_TUNE"] = False
-        except Exception:
-            pass
+        # 版・実験フラグは各raceのWorker thread-local snapshotで解決する。
+        # ここでmodule globalを書き換えると、別Worker/UIへ設定が漏れる。
         try:
             _v278_bg_update(
                 db_path, job_id,
@@ -23877,10 +23880,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
             _v319_ensure_perf_indexes(db_path)
         except Exception:
             pass
-        _V287_IMPORT_STATE_RESET.clear()
-        _V287_IMPORT_STATE_RESET.update(_v287_calibration_state(db_path))
-        _V287_AUTO_IMPORT_STATE.clear()
-        _V287_AUTO_IMPORT_STATE.update(_V287_IMPORT_STATE_RESET)
+        _v287_set_import_state_reset(_v287_calibration_state(db_path))
         ymd = str(req.get("ymd") or "")
         venues = list(req.get("venues") or [])
         job_type = "official_import"
@@ -24177,6 +24177,10 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                             "message": str(_cfg_exc), "task_id": task_id,
                         })
                         continue
+                # 公式取込は既存仕様どおりVer331 Lap1補正をOFFに固定する。
+                # Queue snapshotをコピーして変更し、DBのtask設定自体は変更しない。
+                _cfg = dict(_cfg)
+                _cfg["v331_lap1_tune_enabled"] = False
                 _v326_set_worker_config_snapshot(_cfg)
                 # Job と queue の save_version 不一致は警告のみ（上書きしない）
                 try:
@@ -24750,10 +24754,7 @@ def _v319_bg_history_worker(db_path: str, job_id: int, req: dict) -> None:
             _v319_ensure_perf_indexes(db_path)
         except Exception:
             pass
-        _V287_IMPORT_STATE_RESET.clear()
-        _V287_IMPORT_STATE_RESET.update(_v287_calibration_state(db_path))
-        _V287_AUTO_IMPORT_STATE.clear()
-        _V287_AUTO_IMPORT_STATE.update(_V287_IMPORT_STATE_RESET)
+        _v287_set_import_state_reset(_v287_calibration_state(db_path))
         ymd = str(req.get("ymd") or "")
         venues = list(req.get("venues") or [])
         min_rows = int(req.get("min_rows") or 30)

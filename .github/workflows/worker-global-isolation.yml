@@ -1,0 +1,38 @@
+name: Worker Global Isolation Tests
+
+on:
+  pull_request:
+    paths:
+      - "app.py"
+      - "tests/test_worker_global_isolation.py"
+      - ".github/workflows/worker-global-isolation.yml"
+  push:
+    branches:
+      - fix/worker-global-isolation
+    paths:
+      - "app.py"
+      - "tests/test_worker_global_isolation.py"
+      - ".github/workflows/worker-global-isolation.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  worker-global-isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install regression test dependencies
+        run: python -m pip install numpy pandas openpyxl
+      - name: Compile
+        run: python -m py_compile app.py engine.py tests/test_worker_global_isolation.py tests/test_queue_version_lock_phase5.py tests/test_queue_done_defer.py
+      - name: Test worker-local state isolation
+        run: python -m unittest discover -s tests -p "test_worker_global_isolation.py" -v
+      - name: Run queue ownership and concurrency regressions
+        run: |
+          python tests/test_queue_done_defer.py
+          python tests/test_queue_version_lock_phase5.py
