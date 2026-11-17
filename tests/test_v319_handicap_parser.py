@@ -90,9 +90,11 @@ def test_missing_handicap_is_allowed_only_for_absent_row():
     ns = _load_app_functions()
     html = "<table><tr>" + _row(8, "", kessha=True) + "</tr></table>"
     rows = ns["_v319_parse_sprace_car_rows"](html)
+    active_html = "<table><tr>" + _row(1, "0m") + "</tr></table>"
+    active = ns["_v319_parse_sprace_car_rows"](active_html)
     assert rows[0]["hand"] is None
     assert rows[0]["kessha"] is True
-    ns["_v319_validate_card_players"](rows, "山陽", 10)
+    ns["_v319_validate_card_players"](active + rows, "山陽", 10)
 
 
 def test_missing_handicap_for_active_starter_fails_validation():
