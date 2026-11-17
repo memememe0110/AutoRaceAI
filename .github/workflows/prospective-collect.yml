@@ -46,7 +46,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  APP_COMMIT: 65c62b966a7ebd848d5194a4ac1e65e616228af9
+  APP_COMMIT: 386d605c299fc9f2c27d724c9a28d1d22be53763
   RESULTS_BRANCH: prospective-collect
   STORE_REL: prospective/prospective_collect.sqlite3
 
