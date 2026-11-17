@@ -13234,7 +13234,8 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["Ver271中盤補正対象"]=out[car_col].map(
         lambda x: "3-4周目" if (pd.notna(x) and float(handicap.get(int(x),0) or 0)>=30.0) else "対象外"
     )
-    out["Ver273_周回別再加速監査"] = {str(k): dict(v) for k, v in late_release_audit_v273.items()}
+    _late_release_audit_payload = {str(k): dict(v) for k, v in late_release_audit_v273.items()}
+    out["Ver273_周回別再加速監査"] = [_late_release_audit_payload] * len(out)
     out["Ver273_5周目再加速対象数"]=int(late_release_audit_v273[5]["eligible"])
     out["Ver273_5周目再加速発動数"]=int(late_release_audit_v273[5]["triggered"])
     out["Ver273_6周目再加速対象数"]=int(late_release_audit_v273[6]["eligible"])
