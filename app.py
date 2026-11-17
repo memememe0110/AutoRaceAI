@@ -1855,8 +1855,18 @@ def _v252_save_lap_prediction(db_path: str | None, meta: dict, modal_laps: list[
     status.update({"race_date":race_date,"venue":venue,"race_no":race_no})
     if not race_date or not venue or not race_no:
         status["reason"]=f"レースキー不足: date={race_date or '-'} venue={venue or '-'} R={race_no or '-'}"; return status
-    # 再構成は従来どおりVer253の検証材料、通常予測は現在の実行版として保存する。
-    app_version=(str(app_version_override or '').strip() or ('Ver253' if _V253_RECONSTRUCTION_MODE else str(globals().get('_V231_APP_VERSION') or 'Ver265')))
+    # 再構成は従来どおりVer253。通常予測はWorker snapshotを含む実効保存版を使う。
+    if str(app_version_override or '').strip():
+        app_version = str(app_version_override).strip()
+    elif _V253_RECONSTRUCTION_MODE:
+        app_version = "Ver253"
+    else:
+        try:
+            app_version = str(_v326_effective_save_version() or "").strip()
+        except Exception:
+            app_version = ""
+        if not app_version:
+            app_version = str(globals().get('_V231_APP_VERSION') or 'Ver265').strip()
     bt=(2 if _V253_RECONSTRUCTION_MODE else (1 if is_backtest else 0))
     status.update({"app_version":app_version,"is_backtest":bt})
     try:
