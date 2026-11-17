@@ -478,7 +478,7 @@ _V231_SIMULATION_MODE = SIMULATION_MODE
 _V314_AUTOSAVE_EVERY_N = 40  # Ver236/237相当: 40Rごとに軽量保存+GC
 _V314_GH_AUTOSAVE_EVERY_N = 40  # GitHub軽量自動保存は40Rごと。DBチャンク間隔と揃える
 _V314_RESIM_TRIALS_CAP = 8000  # BG再シム trials 上限（本線予測20kは維持）
-_V326_BUILD_TAG = "20261113_qver_lock8_w07"  # デプロイ確認用。取込メッセージに出る
+_V326_BUILD_TAG = "20261117_force_hist_refresh"  # デプロイ確認用。取込メッセージに出る
 
 
 # Ver319: 起動時の事故監査は重いので既定スキップ（必要時のみ手動）。
@@ -3102,6 +3102,7 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                     skip_existing INTEGER NOT NULL DEFAULT 1,
                     replace_existing INTEGER NOT NULL DEFAULT 0,
                     predict_if_missing INTEGER NOT NULL DEFAULT 1,
+                    force_history_refresh INTEGER NOT NULL DEFAULT 0,
                     save_version TEXT,
                     seed INTEGER,
                     code_commit_sha TEXT,
@@ -3120,6 +3121,7 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                 ("skip_existing", "INTEGER NOT NULL DEFAULT 1"),
                 ("replace_existing", "INTEGER NOT NULL DEFAULT 0"),
                 ("predict_if_missing", "INTEGER NOT NULL DEFAULT 1"),
+                ("force_history_refresh", "INTEGER NOT NULL DEFAULT 0"),
             ) + _SNAP_COLS:
                 try:
                     con.execute(
@@ -3171,6 +3173,7 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                         skip_existing INTEGER NOT NULL DEFAULT 1,
                         replace_existing INTEGER NOT NULL DEFAULT 0,
                         predict_if_missing INTEGER NOT NULL DEFAULT 1,
+                        force_history_refresh INTEGER NOT NULL DEFAULT 0,
                         save_version TEXT,
                         seed INTEGER,
                         code_commit_sha TEXT,
@@ -3190,7 +3193,7 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                     "task_id", "job_type", "task_mode", "ymd", "venue", "race_no",
                     "status", "sort_order", "message", "created_at", "updated_at",
                     "fetch_odds", "register_result", "skip_existing",
-                    "replace_existing", "predict_if_missing",
+                    "replace_existing", "predict_if_missing", "force_history_refresh",
                     "save_version", "seed", "code_commit_sha", "config_version",
                     "config_json", "input_sha256", "owner_token",
                 ]
@@ -3207,6 +3210,8 @@ def _v326_ensure_import_queue(db_path: str) -> None:
                             _select_exprs.append("COALESCE(skip_existing, 1)")
                         elif c == "replace_existing":
                             _select_exprs.append("COALESCE(replace_existing, 0)")
+                        elif c == "force_history_refresh":
+                            _select_exprs.append("COALESCE(force_history_refresh, 0)")
                         elif c == "predict_if_missing":
                             _select_exprs.append("COALESCE(predict_if_missing, 1)")
                         else:
@@ -3358,6 +3363,7 @@ def _v326_enqueue_tasks(
     skip_existing: bool = True,
     replace: bool = False,
     predict_if_missing: bool = True,
+    force_history_refresh: bool = False,
 ) -> int:
     """キュー投入（条件付き upsert + 版スナップショット）。
 
@@ -3400,6 +3406,7 @@ def _v326_enqueue_tasks(
     _se = 1 if skip_existing else 0
     _rp = 1 if replace else 0
     _pm = 1 if predict_if_missing else 0
+    _fh = 1 if force_history_refresh else 0
     _shift_by = max(1, len(task_list)) if insert_first else 0
 
     def _run():
@@ -3445,7 +3452,8 @@ def _v326_enqueue_tasks(
                            COALESCE(register_result, 1),
                            COALESCE(skip_existing, 1),
                            COALESCE(replace_existing, 0),
-                           COALESCE(predict_if_missing, 1)
+                           COALESCE(predict_if_missing, 1),
+                           COALESCE(force_history_refresh, 0)
                       FROM v326_import_queue
                      WHERE job_type = ?
                        AND COALESCE(task_mode, 'normal') = ?
@@ -3463,17 +3471,17 @@ def _v326_enqueue_tasks(
                                 (job_type, task_mode, ymd, venue, race_no, status, sort_order,
                                  message, created_at, updated_at,
                                  fetch_odds, register_result, skip_existing,
-                                 replace_existing, predict_if_missing,
+                                 replace_existing, predict_if_missing, force_history_refresh,
                                  save_version, seed, code_commit_sha,
                                  config_version, config_json, input_sha256)
                             VALUES (?, ?, ?, ?, ?, 'pending', ?, '', ?, ?,
-                                    ?, ?, ?, ?, ?,
+                                    ?, ?, ?, ?, ?, ?,
                                     ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 str(job_type), task_mode, ymd, venue, rn, int(next_so),
                                 now, now,
-                                _fo, _rr, _se, _rp, _pm,
+                                _fo, _rr, _se, _rp, _pm, _fh,
                                 snap["save_version"], snap["seed"], snap["code_commit_sha"],
                                 snap["config_version"], snap["config_json"], snap["input_sha256"],
                             ),
@@ -3490,7 +3498,8 @@ def _v326_enqueue_tasks(
                                    COALESCE(register_result, 1),
                                    COALESCE(skip_existing, 1),
                                    COALESCE(replace_existing, 0),
-                                   COALESCE(predict_if_missing, 1)
+                                   COALESCE(predict_if_missing, 1),
+                                   COALESCE(force_history_refresh, 0)
                               FROM v326_import_queue
                              WHERE job_type = ?
                                AND COALESCE(task_mode, 'normal') = ?
@@ -3510,14 +3519,15 @@ def _v326_enqueue_tasks(
                     continue
                 if st == "pending":
                     old_mode = str(row[2] or "normal")
-                    old_fo, old_rr, old_se, old_rp, old_pm = (
+                    old_fo, old_rr, old_se, old_rp, old_pm, old_fh = (
                         int(row[3] or 1), int(row[4] or 1), int(row[5] or 1),
-                        int(row[6] or 0), int(row[7] or 1),
+                        int(row[6] or 0), int(row[7] or 1), int(row[8] or 0),
                     )
                     if (
                         old_mode != task_mode
                         or old_fo != _fo or old_rr != _rr
                         or old_se != _se or old_rp != _rp or old_pm != _pm
+                        or old_fh != _fh
                     ):
                         # 版列は SET に含めない
                         con.execute(
@@ -3529,13 +3539,14 @@ def _v326_enqueue_tasks(
                                    register_result = ?,
                                    skip_existing = ?,
                                    replace_existing = ?,
-                                   predict_if_missing = ?
+                                   predict_if_missing = ?,
+                                   force_history_refresh = ?
                              WHERE task_id = ?
                                AND status = 'pending'
                             """,
                             (
                                 task_mode, now,
-                                _fo, _rr, _se, _rp, _pm,
+                                _fo, _rr, _se, _rp, _pm, _fh,
                                 tid,
                             ),
                         )
@@ -3554,6 +3565,7 @@ def _v326_enqueue_tasks(
                                skip_existing = ?,
                                replace_existing = ?,
                                predict_if_missing = ?,
+                               force_history_refresh = ?,
                                save_version = ?,
                                seed = ?,
                                code_commit_sha = ?,
@@ -3565,7 +3577,7 @@ def _v326_enqueue_tasks(
                         """,
                         (
                             task_mode, int(next_so), now,
-                            _fo, _rr, _se, _rp, _pm,
+                            _fo, _rr, _se, _rp, _pm, _fh,
                             snap["save_version"], snap["seed"], snap["code_commit_sha"],
                             snap["config_version"], snap["config_json"], snap["input_sha256"],
                             tid, st,
@@ -3951,6 +3963,7 @@ def _v326_pickup_next(db_path: str, job_type: str, owner_token: str | None = Non
                        COALESCE(skip_existing, 1),
                        COALESCE(replace_existing, 0),
                        COALESCE(predict_if_missing, 1),
+                       COALESCE(force_history_refresh, 0),
                        save_version, seed, code_commit_sha,
                        config_version, config_json, input_sha256
                   FROM v326_import_queue
@@ -3976,12 +3989,13 @@ def _v326_pickup_next(db_path: str, job_type: str, owner_token: str | None = Non
                 "skip_existing": bool(int(row[7])) if row[7] is not None else True,
                 "replace": bool(int(row[8])) if row[8] is not None else False,
                 "predict_if_missing": bool(int(row[9])) if row[9] is not None else True,
-                "save_version": row[10],
-                "seed": row[11],
-                "code_commit_sha": row[12],
-                "config_version": row[13],
-                "config_json": row[14],
-                "input_sha256": row[15],
+                "force_history_refresh": bool(int(row[10])) if row[10] is not None else False,
+                "save_version": row[11],
+                "seed": row[12],
+                "code_commit_sha": row[13],
+                "config_version": row[14],
+                "config_json": row[15],
+                "input_sha256": row[16],
             }
             try:
                 cfg = _v326_validate_queue_config_row(row_dict)
@@ -4069,7 +4083,8 @@ def _v326_list_queue_tasks(
                        COALESCE(register_result,1) AS register_result,
                        COALESCE(skip_existing,1) AS skip_existing,
                        COALESCE(replace_existing,0) AS replace_existing,
-                       COALESCE(predict_if_missing,1) AS predict_if_missing
+                       COALESCE(predict_if_missing,1) AS predict_if_missing,
+                       COALESCE(force_history_refresh,0) AS force_history_refresh
                   FROM v326_import_queue
                  WHERE job_type = ?
                  ORDER BY
@@ -14398,8 +14413,24 @@ def _v326_render_official_import_panel() -> None:
         key="v319_op_fetch_race_no_v326",
         help="0=開催全レース（結果登録含む） / 1〜12=その1レースだけ",
     )
-    skip_existing = st.checkbox("登録済みは飛ばす", value=True, key="v319_op_skip_existing")
-    replace_existing = st.checkbox("登録済みを置き換える", value=False, key="v319_op_replace_existing")
+    skip_existing = st.checkbox(
+        "登録済み結果は飛ばす",
+        value=True,
+        key="v319_op_skip_existing",
+        help="結果が既にあるレースの結果再登録をスキップします（払戻補完などは行う場合があります）。",
+    )
+    replace_existing = st.checkbox(
+        "結果を再登録する",
+        value=False,
+        key="v319_op_replace_existing",
+        help="既存の着順・周回・払戻などを削除して結果を再登録します。選手履歴の充足スキップは解除しません。",
+    )
+    force_history_refresh = st.checkbox(
+        "選手履歴を強制再取得する",
+        value=False,
+        key="v319_op_force_history_refresh",
+        help="履歴が15件以上あっても充足スキップせず、公式から選手履歴を再取得します。結果の再登録とは独立です。",
+    )
     predict_missing = st.checkbox(
         "未予測／他バージョン予測なら再予測",
         value=True,
@@ -14425,6 +14456,7 @@ def _v326_render_official_import_panel() -> None:
         skip_existing=bool(skip_existing and not replace_existing),
         replace=bool(replace_existing),
         predict_if_missing=bool(predict_missing),
+        force_history_refresh=bool(force_history_refresh),
         trials=int(st.session_state.get("trials") or 20000),
         seed=int(st.session_state.get("seed") or 20260719),
         race_nos=_rnos,
@@ -14783,6 +14815,7 @@ def _v326_render_official_import_panel() -> None:
                         race_nos=_rnos,
                         fetch_odds=bool(fetch_odds_opt),
                         register_result=bool(register_result_opt),
+                        force_history_refresh=bool(force_history_refresh),
                     )
                     all_rep["ok"] += int(rep.get("ok") or 0)
                     all_rep["skip"] += int(rep.get("skip") or 0)
@@ -20123,6 +20156,7 @@ def _v319_fill_player_histories(
     _exclusive: bool = False,
     cancel_cb=None,
     on_step=None,
+    force_refresh: bool = False,
 ) -> dict:
     """選手履歴を公式PC版 PlayerDetail から取得して保存。
 
@@ -20279,18 +20313,18 @@ def _v319_fill_player_histories(
             already_skipped_d = str(_V319_HIST_SKIPPED.get(cache_key) or "")
             try:
                 # === 最速パス：同一取込ジョブ内・同じ開催日は DB SELECT すら打たない ===
-                if already_skipped_d and before_d_job and already_skipped_d == before_d_job:
+                if (not force_refresh) and already_skipped_d and before_d_job and already_skipped_d == before_d_job:
                     skipped += 1
                     _ = details.append(f"{name}:ジョブ内キャッシュ即スキップ")
                     continue
                 # before_d 無しでも「充足確認済み」マークがあれば即スキップ
-                if already_skipped_d and not before_d_job:
+                if (not force_refresh) and already_skipped_d and not before_d_job:
                     skipped += 1
                     _ = details.append(f"{name}:ジョブ内キャッシュ即スキップ")
                     continue
 
                 # Ver324: DB永続スキップ（再起動後も同対象日は HTTP しない）
-                if pcd and before_d_job:
+                if (not force_refresh) and pcd and before_d_job:
                     _persist = _v319_persistent_skip_lookup(
                         db_path, pcd, before_d_job, con=con
                     )
@@ -20339,7 +20373,7 @@ def _v319_fill_player_histories(
                         str(_V319_HIST_SKIPPED.get(cache_key) or "") == before_d
                     ):
                         _skip_ok = True
-                if _skip_ok:
+                if _skip_ok and not force_refresh:
                     skipped += 1
                     _V319_HIST_SKIPPED[cache_key] = before_d or latest_d or "1"
                     _ = details.append(
@@ -22396,6 +22430,7 @@ def _v319_import_official_results(
     race_nos: list | None = None,
     fetch_odds: bool = True,
     register_result: bool = True,
+    force_history_refresh: bool = False,
 ) -> dict:
     ymd = re.sub(r"[^0-9]", "", str(ymd or ""))
     place = _V319_OP_PLACE.get(str(venue))
@@ -22422,6 +22457,7 @@ def _v319_import_official_results(
                 trials=int(trials), seed=int(seed),
                 fetch_odds=bool(fetch_odds),
                 register_result=bool(register_result),
+                force_history_refresh=bool(force_history_refresh),
             )
             item["status"] = one.get("status") or "ok"
             item["message"] = one.get("message") or ""
@@ -22788,6 +22824,7 @@ def _v319_import_one_race(
     owner_token: str | None = None,
     abort_cb=None,
     skip_deferred: bool = False,
+    force_history_refresh: bool = False,
 ) -> dict:
     """1レース単位の自動取得。
 
@@ -23105,15 +23142,22 @@ def _v319_import_one_race(
                 _fast_hist = all(int(_cnt0.get(nm) or 0) >= 15 for nm in _names_chk0)
         except Exception:
             _fast_hist = False
-        if _fast_hist:
+        if _fast_hist and not force_history_refresh:
             filled = {"added": 0, "skipped": len(players or []), "errors": 0, "details": ["充足スキップ(公式近10走済)"]}
         else:
+            if force_history_refresh and _fast_hist:
+                try:
+                    if on_step:
+                        on_step("選手履歴 強制再取得（充足スキップ解除）")
+                except Exception:
+                    pass
             # 公式のみでは近5〜10走が上限。30件要求は oddspark 前提なので緩和する
             filled = _v319_fill_player_histories(
                 db_path, players, min_rows=5,
                 before_ymd=ymd, before_venue=venue, before_race=race_no,
                 cancel_cb=cancel_cb,
                 on_step=on_step,
+                force_refresh=bool(force_history_refresh),
             )
         if filled.get("cancelled"):
             return {
@@ -24126,6 +24170,7 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                 _t_pred = task.get("predict_if_missing")
                 _t_odds = task.get("fetch_odds")
                 _t_reg = task.get("register_result")
+                _t_fh = task.get("force_history_refresh")
                 _task_mode = str(task.get("task_mode") or req.get("task_mode") or "normal").strip().lower()
                 _seed_use = _cfg.get("seed")
                 if _seed_use is None:
@@ -24163,6 +24208,9 @@ def _v319_bg_import_worker(db_path: str, job_id: int, req: dict) -> None:
                             owner_token=_ot_local or None,
                             abort_cb=_abort_cb,
                             skip_deferred=True,
+                            force_history_refresh=bool(
+                                _t_fh if _t_fh is not None else req.get("force_history_refresh", False)
+                            ),
                         )
                     except _V326OwnershipLost:
                         one = {"status": "error", "message": "ownership_lost", "phase": "ownership"}
@@ -24523,6 +24571,7 @@ def _v319_bg_import_start(
     race_nos: list | None = None,
     fetch_odds: bool = True,
     register_result: bool = True,
+    force_history_refresh: bool = False,
     *,
     enqueue: bool = True,
     run_worker: bool = True,
@@ -24568,6 +24617,7 @@ def _v319_bg_import_start(
                 skip_existing=bool(skip_existing),
                 replace=bool(replace),
                 predict_if_missing=bool(predict_if_missing),
+                force_history_refresh=bool(force_history_refresh),
             ) or 0)
         except Exception as exc:
             return {"ok": False, "reason": f"キュー追加失敗: {type(exc).__name__}: {exc}"}
@@ -24631,6 +24681,7 @@ def _v319_bg_import_start(
         "ymd": ymd, "venues": list(venues or []),
         "skip_existing": bool(skip_existing), "replace": bool(replace),
         "predict_if_missing": bool(predict_if_missing),
+        "force_history_refresh": bool(force_history_refresh),
         "trials": int(trials), "seed": int(seed), "max_races": 12,
         "race_nos": _rnos,
         "fetch_odds": bool(fetch_odds),
