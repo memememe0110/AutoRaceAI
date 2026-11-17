@@ -17904,7 +17904,7 @@ def _v319_synthesize_sprace_html_from_program(
         f"<html><body><div>{date_s} {venue} {int(race_no)}R 予選 3100m 良走路</div>",
         "<table>",
     ]
-    n_trial_def = n_hand_def = n_dev_def = n_cars = 0
+    n_trial_def = n_hand_source_missing = n_dev_def = n_cars = 0
     for p in body.get("playerList") or []:
         if not isinstance(p, dict):
             continue
@@ -17924,7 +17924,7 @@ def _v319_synthesize_sprace_html_from_program(
         hand_s = _v319_normalize_handicap(hand_raw)
         if hand_s is None:
             if hand_raw is None or str(hand_raw).strip() in ("", "-", "None", "nan"):
-                n_hand_def += 1
+                n_hand_source_missing += 1
                 if not is_kessha:
                     _V319_LAST_CARD_FILL["hand_source_missing"] = int(
                         _V319_LAST_CARD_FILL.get("hand_source_missing") or 0
@@ -18028,7 +18028,7 @@ def _v319_synthesize_sprace_html_from_program(
         {
             "source": "autorace",
             "trial_default": int(n_trial_def),
-            "hand_source_missing": int(_V319_LAST_CARD_FILL.get("hand_source_missing") or 0) + int(n_hand_def),
+            "hand_source_missing": int(_V319_LAST_CARD_FILL.get("hand_source_missing") or 0) + int(n_hand_source_missing),
             "hand_parse_failed": int(_V319_LAST_CARD_FILL.get("hand_parse_failed") or 0),
             "dev_default": int(n_dev_def),
             "cars": int(n_cars),
@@ -18519,6 +18519,9 @@ def _v319_build_prediction_text_from_sprace(
         hand_raw = p.get("hand")
         hand = _v319_normalize_handicap(hand_raw)
         if hand is None:
+            _V319_LAST_CARD_FILL["hand_parse_failed"] = int(
+                _V319_LAST_CARD_FILL.get("hand_parse_failed") or 0
+            ) + 1
             raise ValueError(
                 f"出走表のハンデを後段で解析できません: "
                 f"{p.get('car')}号 {name} hand={hand_raw!r}。"
