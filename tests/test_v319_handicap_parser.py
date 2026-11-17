@@ -23,6 +23,7 @@ def _load_app_functions():
         "_v319_validate_card_players",
         "_v319_build_prediction_text_from_sprace",
         "_v319_synthesize_sprace_html_from_program",
+        "_v319_program_players_from_body",
     }
     nodes = [
         node for node in tree.body
@@ -122,6 +123,18 @@ def test_prediction_text_builder_never_zero_fills_missing_handicap():
     else:
         raise AssertionError("builder must reject missing handicap")
     assert ns["_V319_LAST_CARD_FILL"]["hand_parse_failed"] == 1
+
+
+def test_program_player_mapping_preserves_missing_as_none():
+    ns = _load_app_functions()
+    players = ns["_v319_program_players_from_body"](
+        {"playerList": [{
+            "carNo": 8, "playerCode": "1008", "playerName": "テスト選手8",
+            "placeName": "山陽", "handicap": None, "absent": "1",
+        }]},
+        "山陽",
+    )
+    assert players[0]["hand"] is None
 
 
 def test_program_rebuild_keeps_handicap_when_st_is_absent():
