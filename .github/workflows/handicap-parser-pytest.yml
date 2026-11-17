@@ -1,0 +1,32 @@
+name: Handicap parser pytest
+
+on:
+  push:
+    branches:
+      - fix/handicap-parse-no-zero
+    paths:
+      - "app.py"
+      - "tests/**"
+      - ".github/workflows/handicap-parser-pytest.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout dedicated branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/handicap-parse-no-zero
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test runner
+        run: python -m pip install --upgrade pip pytest
+      - name: Run handicap parser regression tests
+        run: python -m pytest -q tests/test_v319_handicap_parser.py
