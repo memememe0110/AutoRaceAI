@@ -16446,11 +16446,7 @@ def _v319_program_players_from_body(body: dict, venue: str = "") -> list[dict]:
         age = p.get("age")
         grad = p.get("graduationCode")
         age_s = f"{age}歳/{grad}期" if age is not None and grad else ""
-        hand = p.get("handicap")
-        try:
-            hand_s = str(int(float(hand))) if hand is not None and str(hand).strip() not in ("", "-") else "0"
-        except Exception:
-            hand_s = "0"
+        hand_s = _v319_normalize_handicap(p.get("handicap"))
         trial = str(p.get("trialRunTime") or p.get("trialTime") or "").strip()
         # raceDev: "097" → 0.097
         dev_raw = str(p.get("raceDev") or "").strip()
@@ -17843,11 +17839,25 @@ def _v319_norm_player_name(name: str) -> str:
     return re.sub(r"[\s　]+", "", str(name or ""))
 
 
+def _v319_normalize_handicap(value):
+    """ハンデを非負整数文字列へ正規化。欠損・不正値は None（0扱いしない）。"""
+    if value is None or str(value).strip() in ("", "-", "None", "nan"):
+        return None
+    try:
+        number = float(value)
+        if not (number >= 0 and number < float("inf") and number.is_integer()):
+            return None
+        return str(int(number))
+    except Exception:
+        return None
+
+
 # 出走表の欠損補完ログ（予測は続行しつつ、取込メッセージで気づけるようにする）
 _V319_LAST_CARD_FILL: dict = {
     "source": "",
     "trial_default": 0,
-    "hand_default": 0,
+    "hand_source_missing": 0,
+    "hand_parse_failed": 0,
     "dev_default": 0,
     "cars": 0,
 }
@@ -17858,7 +17868,8 @@ def _v319_reset_card_fill() -> None:
         {
             "source": "",
             "trial_default": 0,
-            "hand_default": 0,
+            "hand_source_missing": 0,
+            "hand_parse_failed": 0,
             "dev_default": 0,
             "cars": 0,
         }
@@ -17871,8 +17882,10 @@ def _v319_card_fill_note() -> str:
     bits = []
     if int(d.get("trial_default") or 0) > 0:
         bits.append(f"試走T既定{int(d['trial_default'])}台")
-    if int(d.get("hand_default") or 0) > 0:
-        bits.append(f"ハンデ既定{int(d['hand_default'])}台")
+    if int(d.get("hand_source_missing") or 0) > 0:
+        bits.append(f"ハンデ取得元欠損{int(d['hand_source_missing'])}台")
+    if int(d.get("hand_parse_failed") or 0) > 0:
+        bits.append(f"ハンデ後段パース失敗{int(d['hand_parse_failed'])}台")
     if int(d.get("dev_default") or 0) > 0:
         bits.append(f"偏差既定{int(d['dev_default'])}台")
     if not bits:
@@ -17905,16 +17918,25 @@ def _v319_synthesize_sprace_html_from_program(
         age = p.get("age")
         grad = p.get("graduationCode")
         age_s = f"{age}歳/{grad}期" if age is not None and grad else ""
-        hand = p.get("handicap")
-        try:
-            if hand is None or str(hand).strip() in ("", "-", "None"):
-                hand_s = "0"
+        absent = p.get("absent")
+        is_kessha = absent not in (None, "", 0, "0", False)
+        hand_raw = p.get("handicap")
+        hand_s = _v319_normalize_handicap(hand_raw)
+        if hand_s is None:
+            if hand_raw is None or str(hand_raw).strip() in ("", "-", "None", "nan"):
                 n_hand_def += 1
+                if not is_kessha:
+                    _V319_LAST_CARD_FILL["hand_source_missing"] = int(
+                        _V319_LAST_CARD_FILL.get("hand_source_missing") or 0
+                    ) + 1
+                    raise ValueError(
+                        f"出走表のハンデが取得元で欠損しています: {car}号 {name or ''}。"
+                        "通常出走車にハンデ欠損があるため予測を停止しました。"
+                    )
             else:
-                hand_s = str(int(float(hand)))
-        except Exception:
-            hand_s = "0"
-            n_hand_def += 1
+                raise ValueError(
+                    f"出走表のハンデが不正です: {car}号 {name or ''} handicap={hand_raw!r}"
+                )
         # Program API は trialRunTime / trialTime の両系統があり得る。
         # parser 側と同じ優先順位で拾い、別キーに入っている試走Tを
         # 「欠損」と誤判定しない。
@@ -17958,10 +17980,9 @@ def _v319_synthesize_sprace_html_from_program(
         rate2 = str(p.get("rate2") or "")
         rate3 = str(p.get("rate3") or "")
         bike = str(p.get("bikeName") or "")
-        absent = p.get("absent")
         kessha_span = (
             '<span class="alert">欠車</span>'
-            if absent not in (None, "", 0, "0", False)
+            if is_kessha
             else ""
         )
         # parse_sprace_car_rows / parse_sprace_players の正規表現に合わせる
@@ -17985,7 +18006,7 @@ def _v319_synthesize_sprace_html_from_program(
         parts.append(
             f'<td class="stcNameFull" param="{car}" '
             f'href="/autorace/SpPlayerDetail.do?playerCd={pcd}">'
-            f"<strong>{name}</strong>({lg}) {age_s} {hand_s}m{_st_part} {kessha_span}</td>"
+            f"<strong>{name}</strong>({lg}) {age_s} {hand_s + 'm' if hand_s is not None else ''}{_st_part} {kessha_span}</td>"
         )
         # parse_sprace_car_rows は name td 以降を tds[0]=短縮名, tds[1]=試走T/偏差 と読む
         short = re.sub(r"[\s　]+", "", name)[:3]
@@ -18007,7 +18028,8 @@ def _v319_synthesize_sprace_html_from_program(
         {
             "source": "autorace",
             "trial_default": int(n_trial_def),
-            "hand_default": int(n_hand_def),
+            "hand_source_missing": int(_V319_LAST_CARD_FILL.get("hand_source_missing") or 0) + int(n_hand_def),
+            "hand_parse_failed": int(_V319_LAST_CARD_FILL.get("hand_parse_failed") or 0),
             "dev_default": int(n_dev_def),
             "cars": int(n_cars),
         }
@@ -18246,10 +18268,13 @@ def _v319_parse_sprace_car_rows(html: str) -> list[dict]:
         am = re.search(r"(\d+歳/\d+期)", name_td)
         if am:
             age = am.group(1)
-        hand, st = "0", ""
-        hm = re.search(r"(\d+)m/ST([\d.]+)", name_td)
+        hand, st = None, ""
+        hm = re.search(r"(?<![\d.])(\d+)\s*m\b", name_td, re.I)
+        sm = re.search(r"(?:/|\s)ST\s*([\d.]+)", name_td, re.I)
         if hm:
-            hand, st = hm.group(1), hm.group(2)
+            hand = hm.group(1)
+        if sm:
+            st = sm.group(1)
         # 同じTR内の後続セル
         tr_end = html.find("</tr>", m.end())
         rest = html[m.end(): tr_end if tr_end > m.end() else m.end() + 4000]
@@ -18332,15 +18357,16 @@ def _v319_validate_card_players(players: list, venue: str = "", race_no: int = 0
         trial = str(p.get("trial") or "").strip()
         if not re.match(r"^\d+\.\d+$", trial):
             problems.append(f"{car_i}号{name}:試走T空{trial!r}（公式未公開の可能性大→再取得）")
-        hand = p.get("hand")
-        try:
-            if hand is None or str(hand).strip() in ("", "-", "None"):
-                # ハンデ0は合法。空のみ問題
+        hand = _v319_normalize_handicap(p.get("hand"))
+        if hand is None:
+            _V319_LAST_CARD_FILL["hand_parse_failed"] = int(
+                _V319_LAST_CARD_FILL.get("hand_parse_failed") or 0
+            ) + 1
+            raw_hand = p.get("hand")
+            if raw_hand is None or str(raw_hand).strip() in ("", "-", "None", "nan"):
                 problems.append(f"{car_i}号{name}:ハンデ欠損")
             else:
-                _ = int(float(hand))
-        except Exception:
-            problems.append(f"{car_i}号{name}:ハンデ不正{hand!r}")
+                problems.append(f"{car_i}号{name}:ハンデ不正{raw_hand!r}")
     if not cars:
         raise ValueError(f"{venue} {race_no}R：有効な出走車がありません。")
     if problems:
@@ -18491,16 +18517,13 @@ def _v319_build_prediction_text_from_sprace(
         if p.get("age"):
             _ = lines.append(p["age"])
         hand_raw = p.get("hand")
-        hand_filled = False
-        try:
-            if hand_raw is None or str(hand_raw).strip() in ("", "-", "None"):
-                hand = "0"
-                hand_filled = True
-            else:
-                hand = str(int(float(hand_raw)))
-        except Exception:
-            hand = "0"
-            hand_filled = True
+        hand = _v319_normalize_handicap(hand_raw)
+        if hand is None:
+            raise ValueError(
+                f"出走表のハンデを後段で解析できません: "
+                f"{p.get('car')}号 {name} hand={hand_raw!r}。"
+                "通常出走車にハンデ欠損・不正があるため予測を停止しました。"
+            )
         st = str(p.get("st") or "").strip()
         trial = str(p.get("trial") or "").strip()
         trial_filled = False
@@ -18544,11 +18567,6 @@ def _v319_build_prediction_text_from_sprace(
             _V319_LAST_CARD_FILL["trial_default"] = int(
                 _V319_LAST_CARD_FILL.get("trial_default") or 0
             ) + 1
-        if hand_filled:
-            _V319_LAST_CARD_FILL["hand_default"] = int(
-                _V319_LAST_CARD_FILL.get("hand_default") or 0
-            ) + 1
-
         # 公式と同じ形。当日STが無いときは捏造せず ST を省略する
         st_s = str(st or "").strip()
         has_st = st_s not in ("", "-", "None", "nan")
