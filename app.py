@@ -11451,8 +11451,8 @@ def _v272_late_chase_release(lap_no, handicap_m, chase_gate, trial_time, field_t
     score = 0
     reasons = []
 
-    if lap_i not in (5, 6):
-        diag = {"eligible": False, "reason": "lap_not_5_6", "score": 0, "threshold": None, "factor": 1.0}
+    if lap_i < 5:
+        diag = {"eligible": False, "reason": "lap_before_5", "score": 0, "threshold": None, "factor": 1.0}
         return (1.0, diag) if return_diag else 1.0
 
     if h < 30.0:
@@ -12348,6 +12348,15 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         except Exception: pass
     cars=work["_car"].astype(int).tolist()
     if len(cars)<3: return df,bets,{"enabled":False,"reason":"3車未満"}
+    # 実レースの周回数。未設定・不正値は従来どおり6周として扱う。
+    try:
+        _lap_raw = (meta or {}).get("周回数", 6)
+        _lap_match = re.search(r"\d+", str(_lap_raw))
+        total_laps = int(_lap_match.group()) if _lap_match else 6
+        if total_laps not in (6, 7, 8):
+            total_laps = 6
+    except Exception:
+        total_laps = 6
     names=[]; handicap={}; stmean={}; trial={}; strength={}; breakthrough={}
     # 既存三連単分布の1着周辺確率を基礎能力にする。
     tri=(bets or {}).get("三連単",{}) or {}
@@ -12495,16 +12504,13 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     handicap_adjust_v268={}
     chase_gate_v270={}
     chase_reason_v270={}
-    late_release_audit_v273={
-        5: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
-            "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
-            "score_below_required":0,"score_zero_guard":0,"v282_borderline_guard":0,
-            "residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0,
-            "errors":0,"last_error":""},
-        6: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
-            "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
-            "score_below_required":0,"score_zero_guard":0,"residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0,
-            "errors":0,"last_error":""},
+    late_release_audit_v273 = {
+        lap: {"lap_seen":0,"pair_checks":0,"chaser_seen":0,"rear30_seen":0,
+              "function_called":0,"eligible":0,"triggered":0,"factor_sum":0.0,
+              "score_below_required":0,"score_zero_guard":0,"v282_borderline_guard":0,
+              "residual_samples_lt5":0,"gate_lt_080":0,"trial_missing":0,
+              "errors":0,"last_error":""}
+        for lap in range(5, total_laps + 1)
     }
     try:
         _trial_vals_v270 = [
@@ -12579,7 +12585,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             _direct276=max(-0.5,min(0.5,_adv276))*min(1.0,_conf276)*0.85
             _hgap276=max(0,handicap[_chaser276]-handicap[_front276])
             _hwall276=min(0.12,0.0022*_hgap276)
-            for _lap276 in range(1,7):
+            for _lap276 in range(1, total_laps + 1):
                 _tp276=_transition_by_car276.get(_chaser276,{})
                 _la276=(_tp276.get("lap_attack") or [0.0]*7)
                 _lap_attack276=_la276[_lap276] if _lap276 < len(_la276) else 0.0
@@ -12603,7 +12609,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 )[0]
             except Exception:
                 _mid_factor_cache276[(_c276,_lap276)]=1.0
-        for _lap276 in (5,6):
+        for _lap276 in range(5, total_laps + 1):
             try:
                 _late_release_cache276[(_c276,_lap276)]=_v272_late_chase_release(
                     _lap276, handicap.get(_c276,0), chase_gate_v270.get(_c276,0.75),
@@ -12635,7 +12641,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         _v330a_full_validation = True
     sim_trials = (requested_trials if _v330a_full_validation else max(1400, min(requested_trials, base_budget)))
     counts={}; wall_events={c:0 for c in cars}; pass_events={c:0 for c in cars}; start_front={c:0 for c in cars}
-    lap_order_counts={lap:{} for lap in range(1,7)}
+    lap_order_counts={lap:{} for lap in range(1,total_laps+1)}
     finish_position_counts={c:{pos:0 for pos in range(1,len(cars)+1)} for c in cars}
     final_order_counts={}
     scenario_counts={}
@@ -12646,14 +12652,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                            "wall_attempts":0,"wall_successes":0,"wall_sum":0.0,
                            "momentum_attempts":0,"momentum_successes":0,
                            "slowdown_attempts":0,"slowdown_successes":0,
-                           "top3_entries":0,"top3_exits":0} for lap in range(1,7)}
+                           "top3_entries":0,"top3_exits":0} for lap in range(1,total_laps+1)}
     transition_pair_audit={}
     top3_order_audit={}
     # Ver330-A検証用: 各周の状態を試行順にrolling hash化。予測・保存には使用しない。
     _v330a_state_fp = {
         lap: {"hash": hashlib.sha256(), "gap_sum": 0.0, "momentum_sum": 0.0,
               "slowdown_sum": 0.0, "pass_count": 0,
-              "trial0_hash": None} for lap in range(1, 7)
+              "trial0_hash": None} for lap in range(1, total_laps + 1)
     }
     # Ver331診断集計器（検証モードのみ。通常実行は None）。
     _gd330a = _v331_diag_init() if _v330a_full_validation else None
@@ -12815,7 +12821,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
         # Ver289: Ver287補正は「TOP3に絡む力」へ限定。
         # TOP3内の1↔2↔3着順交換には掛けず、286系の順序形成を残す。
         v289_zone_audit={"boundary":0,"outside":0,"inside_top3":0,"applied":0}
-        for lap in range(1,7):
+        for lap in range(1,total_laps+1):
             _prev_top3_audit=set(order[:3])
             # Ver285: ここまでに実際に枝分かれしたrouteから暫定展開型を判定。
             # 未来の結果や実測展開型は使用しない。2周未満は補正なし。
@@ -12927,7 +12933,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 logit += rng.normal(0,_branch_noise)
                 try:
                     _lap_dbg273=int(lap)
-                    if _lap_dbg273 in (5,6):
+                    if _lap_dbg273 >= 5:
                         late_release_audit_v273[_lap_dbg273]["pair_checks"]+=1
                         late_release_audit_v273[_lap_dbg273]["chaser_seen"]+=1
                         if float(handicap.get(chaser,0) or 0)>=30.0:
@@ -12947,7 +12953,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 try:
                     try:
                         _lap_call273=int(lap)
-                        if _lap_call273 in (5,6):
+                        if _lap_call273 >= 5:
                             late_release_audit_v273[_lap_call273]["function_called"]+=1
                     except Exception:
                         pass
@@ -12958,7 +12964,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                         raise RuntimeError(str(_late_diag274.get('_error')))
                     try:
                         _lap_diag274=int(lap)
-                        if _lap_diag274 in (5,6):
+                        if _lap_diag274 >= 5:
                             if bool(_late_diag274.get('eligible')):
                                 late_release_audit_v273[_lap_diag274]['eligible']+=1
                             if str(_late_diag274.get('reason') or '')=='triggered':
@@ -12980,14 +12986,14 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 except Exception as _e_late275:
                     try:
                         _lap_err275=int(lap)
-                        if _lap_err275 in (5,6):
+                        if _lap_err275 >= 5:
                             late_release_audit_v273[_lap_err275]["errors"]+=1
                             late_release_audit_v273[_lap_err275]["last_error"]=f"{type(_e_late275).__name__}: {_e_late275}"
                     except Exception:
                         pass
                 # Ver328 / Ver330-A: 6周目・5位以下で3位と大差がある場合の無意味追い抜きを抑制。
                 # Ver330-Aではこの周6抑制だけを残し、周1〜4 +0.08は一切適用しない。
-                if (_v328_active() or _v330a_active()) and int(lap) == 6:
+                if (_v328_active() or _v330a_active()) and int(lap) >= 6:
                     try:
                         _gap3_v328 = float(gaps[min(3, len(gaps) - 1)]) if gaps else 0.0
                         _thresh_v328 = float(globals().get("_V328_LAP6_GAP_THRESH") or 0.80)
@@ -13228,6 +13234,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     out["Ver271中盤補正対象"]=out[car_col].map(
         lambda x: "3-4周目" if (pd.notna(x) and float(handicap.get(int(x),0) or 0)>=30.0) else "対象外"
     )
+    out["Ver273_周回別再加速監査"] = {str(k): dict(v) for k, v in late_release_audit_v273.items()}
     out["Ver273_5周目再加速対象数"]=int(late_release_audit_v273[5]["eligible"])
     out["Ver273_5周目再加速発動数"]=int(late_release_audit_v273[5]["triggered"])
     out["Ver273_6周目再加速対象数"]=int(late_release_audit_v273[6]["eligible"])
@@ -13271,7 +13278,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
             _ = modal_laps.append({"lap":lap,"order":"-".join(map(str,order_mode)),"support":n/max(1,sim_trials)*100})
     lap_comparison=[]
     if actual_lap_orders:
-        for idx,(label,actual) in enumerate(actual_lap_orders[:6],start=1):
+        for idx,(label,actual) in enumerate(actual_lap_orders[:total_laps],start=1):
             pred=tuple(int(x) for x in modal_laps[idx-1]["order"].split('-')) if idx<=len(modal_laps) else tuple()
             pos_acc=(sum(1 for a,b in zip(pred,actual) if a==b)/max(1,len(actual))) if pred else 0.0
             _ = lap_comparison.append({"lap":idx,"label":label,"actual":"-".join(map(str,actual)),"predicted":"-".join(map(str,pred)),"position_accuracy":pos_acc*100,"pairwise_accuracy":_v251_pairwise_accuracy(pred,actual)*100})
@@ -13279,7 +13286,7 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
     scenario_distribution={k:float(v)/max(1,sim_trials)*100 for k,v in sorted(scenario_counts.items(),key=lambda kv:kv[1],reverse=True)}
     top_routes=[]
     actual_scenario='不明'; closest_similarity=0.0; closest_route=''
-    actual_orders_only=[tuple(x[1]) for x in actual_lap_orders[:6]] if actual_lap_orders else []
+    actual_orders_only=[tuple(x[1]) for x in actual_lap_orders[:total_laps]] if actual_lap_orders else []
     if actual_orders_only:
         actual_scenario=_v263_scenario_type_from_laps(actual_orders_only)
     for route,n in sorted(route_counts.items(),key=lambda kv:kv[1],reverse=True)[:12]:
@@ -13403,12 +13410,12 @@ def _v230_six_lap_simulation(df: pd.DataFrame, bets: dict, entries: pd.DataFrame
                 "momentum_sum": round(float(_v330a_state_fp[lap]["momentum_sum"]), 8),
                 "slowdown_sum": round(float(_v330a_state_fp[lap]["slowdown_sum"]), 8),
                 "pass_count": int(_v330a_state_fp[lap]["pass_count"]),
-            } for lap in range(1, 7)}
+            } for lap in range(1, total_laps + 1)}
             if _v330a_full_validation else {}
         ),
         "ver331_gap_diag": (_v331_diag_finalize(_gd330a) if _v330a_full_validation else {}),
         "ver330a_validation_lap_order_counts": (
-            {str(lap): {"-".join(map(str,k)): int(v) for k,v in lap_order_counts[lap].items()} for lap in range(1, 7)}
+            {str(lap): {"-".join(map(str,k)): int(v) for k,v in lap_order_counts[lap].items()} for lap in range(1, total_laps + 1)}
             if _v330a_full_validation else {}
         ),
         "ver330a_validation_full_trials": bool(_v330a_full_validation),
@@ -42049,8 +42056,11 @@ elif selected_main_page == "🏁 予測":
 
             st.markdown('<div id="prediction-summary"></div>', unsafe_allow_html=True)
             v73_section_nav()
-            st.subheader("6周の代表展開")
-            lap_df = engine.v30_representative_lap_projection(df)
+            _lap_display_match = re.search(r"\d+", str(meta.get("周回数", 6)))
+            _lap_display_count = int(_lap_display_match.group()) if _lap_display_match else 6
+            _lap_display_count = _lap_display_count if _lap_display_count in (6, 7, 8) else 6
+            st.subheader(f"{_lap_display_count}周の代表展開")
+            lap_df = engine.v30_representative_lap_projection(df, total_laps=_lap_display_count)
             st.dataframe(lap_df, use_container_width=True, hide_index=True)
             st.caption("確率計算は全試行で、スタート・中盤・最終周のイベントを生成しています。この表は指標から作った代表的な1展開です。")
             st.caption(f"予測保存キー: {race_key}（結果登録時の比較・重み調整に使用）")
