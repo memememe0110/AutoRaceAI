@@ -10,8 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qver_lock8_review_test import load_engine, load_app_subset, _mk_df  # noqa: E402
 
 SNAP = {
-    "save_version": "Ver326", "seed": 20260719, "code_commit_sha": "test", "config_version": 1,
-    "config_json": json.dumps({"save_version": "Ver326", "config_version": 1, "v330a_enabled": False,
+    "save_version": "Ver326", "seed": 20260719, "code_commit_sha": "test", "db_sha256": "db-test", "config_version": 2,
+    "config_json": json.dumps({"save_version": "Ver326", "config_version": 2, "code_commit_sha": "test", "db_sha256": "db-test", "v330a_enabled": False,
                                "v331_lap1_tune_enabled": False, "v331_gap_mode": "C"}, sort_keys=True),
     "input_sha256": None, "v330a_enabled": False,
 }
