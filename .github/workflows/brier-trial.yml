@@ -1,5 +1,6 @@
 name: Brier Trial (29R, temporary revision)
 
+# Post-PR47 repeat: rerun the identical 29R Brier evaluation after input-SHA fail-closed merge.
 # 試運転用。40R本評価時にこの4修正を正式採用するかは別判断。
 on:
   push:
