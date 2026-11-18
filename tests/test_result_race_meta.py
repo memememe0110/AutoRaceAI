@@ -37,7 +37,7 @@ def test_result_race_meta_and_nullable_prize():
             """SELECT race_name,race_type,distance_m,total_laps,start_time_text,time_band,weather,prize_yen
                FROM result_races WHERE race_key=?""", ("20261118_川口_5R",)
         ).fetchone()
-        assert row == expected_preserved
+        assert row == EXPECTED
 
 
 def test_old_result_races_schema_is_migrated_without_losing_existing_row():
@@ -82,4 +82,4 @@ def test_null_reregistration_preserves_existing_meta():
                FROM result_races WHERE race_key=?""",
             ("20261118_川口_5R",),
         ).fetchone()
-    assert row == EXPECTED
+    assert row == expected_preserved
