@@ -1,0 +1,81 @@
+name: Prediction Version Integrity Audit
+
+on:
+  pull_request:
+    paths:
+      - "tools/audit_prediction_version_integrity.py"
+      - "tests/test_prediction_version_audit.py"
+      - ".github/workflows/prediction-version-integrity-audit.yml"
+  workflow_dispatch:
+    inputs:
+      expected_generation:
+        description: "Immutable autorace-db generation to audit"
+        required: true
+        default: "705"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prediction-version-audit
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+  EXPECTED_GENERATION: ${{ inputs.expected_generation || '705' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile
+        run: python -m py_compile tools/audit_prediction_version_integrity.py tests/test_prediction_version_audit.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p "test_prediction_version_audit.py" -v
+
+  audit:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch immutable DB snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python tools/prospective_collector.py fetch-db \
+            --repo "$REPO" \
+            --branch autorace-db \
+            --out work/autorace_players.sqlite3 \
+            --info-out work/db_info.json
+      - name: Install saved-view pickle dependencies
+        run: python -m pip install numpy pandas
+      - name: Run read-only version integrity audit
+        run: |
+          set -euo pipefail
+          python tools/audit_prediction_version_integrity.py \
+            --db work/autorace_players.sqlite3 \
+            --db-info work/db_info.json \
+            --expected-generation "$EXPECTED_GENERATION" \
+            --outdir work/prediction_version_audit
+      - name: Upload audit CSV and summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: prediction-version-audit-${{ github.run_id }}
+          path: work/prediction_version_audit/
+          if-no-files-found: error
+          retention-days: 30
