@@ -26,7 +26,7 @@
 | 進行中 | 予測 | [#28](https://github.com/memememe0110/AutoRaceAI/issues/28) | Ver331 Lap1精度改善 | 測定モードとSHA固定は [PR #38](https://github.com/memememe0110/AutoRaceAI/pull/38) でmain済み。Ver326の2R×2回は分布一致。377R基準は実行中 | 基準測定完了後に不一致を解消。補正は未投入 |
 | 進行中 | 予測 | [#29](https://github.com/memememe0110/AutoRaceAI/issues/29) | Ver330-A / Ver326 の実保存版切替調査 | [PR #40](https://github.com/memememe0110/AutoRaceAI/pull/40) mainマージ済み。generation 705でhistory/payload 0不一致、queue 128行0不一致。1,437レース/540複数版。restore孤立55、pred-time snapshot孤立50,230行、lap版のみ318組、結果履歴なし189R | 孤立データが旧世代の保持仕様か欠損か分類。削除・上書きはしない |
 | 完了 | 運用 | [#32](https://github.com/memememe0110/AutoRaceAI/issues/32) | Worker global上書き競合 | [PR #39](https://github.com/memememe0110/AutoRaceAI/pull/39) mainマージ済み。Worker設定/校正基準をthread-local化。Ver326/327/328/330-Aの実験フラグもsnapshot優先。専用テストとqueue所有権/並行回帰PASS | 完了 |
-| 進行中 | データ | [#33](https://github.com/memememe0110/AutoRaceAI/issues/33) | 実DBの登録完全性監査 | 第1段階のresult_racesメタデータ保存は [PR #46](https://github.com/memememe0110/AutoRaceAI/pull/46) で実装中。NULL再登録時の既存meta保持テストを一時ブランチ `tmp-result-race-meta-regression` に追加。push-triggered CI Run #1 実行中。PASS確認後にテスト本体のみPRブランチへ反映する。旧DBへの不足列追加・賞金NULL・合成DB移行は確認済み | 一時ブランチの回帰テストCI PASS→テスト本体のみPR #46へ反映→CI/レビュー→マージ。その後result_entriesを別PRで実装 |
+| 進行中 | データ | [#33](https://github.com/memememe0110/AutoRaceAI/issues/33) | 実DBの登録完全性監査 | 第1段階のresult_racesメタデータ保存は [PR #46](https://github.com/memememe0110/AutoRaceAI/pull/46) で実装中。NULL再登録時の既存meta保持テストを一時ブランチへ追加。初回登録に合成賞金123456円を設定し、再登録でNULLにしても8項目すべて保持する検証へ強化。Run #1はSUCCESS、強化版Run #2は実行中。PASS後にテスト本体のみPRブランチへ反映。旧DBへの不足列追加・賞金NULL・合成DB移行は確認済み | 強化版の一時ブランチ回帰テストCI PASS→テスト本体のみPR #46へ反映→レビュー→マージ。その後result_entriesを別PRで実装 |
 
 ## 高
 
