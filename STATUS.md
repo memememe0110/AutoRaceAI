@@ -26,7 +26,7 @@
 | 進行中 | 予測 | [#28](https://github.com/memememe0110/AutoRaceAI/issues/28) | Ver331 Lap1精度改善 | 測定モードとSHA固定は [PR #38](https://github.com/memememe0110/AutoRaceAI/pull/38) でmain済み。Ver326の2R×2回は分布一致。377R基準は実行中 | 基準測定完了後に不一致を解消。補正は未投入 |
 | 進行中 | 予測 | [#29](https://github.com/memememe0110/AutoRaceAI/issues/29) | Ver330-A / Ver326 の実保存版切替調査 | [PR #40](https://github.com/memememe0110/AutoRaceAI/pull/40) mainマージ済み。generation 705でhistory/payload 0不一致、queue 128行0不一致。1,437レース/540複数版。restore孤立55、pred-time snapshot孤立50,230行、lap版のみ318組、結果履歴なし189R | 孤立データが旧世代の保持仕様か欠損か分類。削除・上書きはしない |
 | 完了 | 運用 | [#32](https://github.com/memememe0110/AutoRaceAI/issues/32) | Worker global上書き競合 | [PR #39](https://github.com/memememe0110/AutoRaceAI/pull/39) mainマージ済み。Worker設定/校正基準をthread-local化。Ver326/327/328/330-Aの実験フラグもsnapshot優先。専用テストとqueue所有権/並行回帰PASS | 完了 |
-| 進行中 | データ | [#33](https://github.com/memememe0110/AutoRaceAI/issues/33) | 実DBの登録完全性監査 | 第1段階のresult_racesメタデータ保存は [PR #46](https://github.com/memememe0110/AutoRaceAI/pull/46) で実装中。NULL再登録時の既存meta保持テストを一時ブランチへ追加。初回登録に合成賞金123456円を設定し、再登録でNULLにしても8項目すべて保持する検証へ強化。Run #1 SUCCESS。強化版Run #2はテスト期待値の誤置換でFAILしたが修正済み。Run #3 SUCCESS。賞金123456円を含む8項目を初回保存し、全項目NULLで再登録しても既存値が保持されることを確認。PASSしたテストをPR #46へ反映（head `41ef764`）。差分レビュー・必要CI確認後にマージ判断。旧DB移行・賞金NULLも確認済み | 一時ブランチ回帰テストCI Run #3 SUCCESS→テスト本体をPR #46へ反映済み。差分レビュー・CI確認→マージ。その後result_entriesを別PRで実装 |
+| 進行中 | データ | [#33](https://github.com/memememe0110/AutoRaceAI/issues/33) | 実DBの登録完全性監査 | 第1段階のresult_racesメタデータ保存は [PR #46](https://github.com/memememe0110/AutoRaceAI/pull/46) でmainへマージ済み（merge commit `21957f7`）。旧DB不足列追加・賞金NULL・NULL再登録時の8項目保持を検証。賞金123456円を初回保存し、全項目NULLで再登録しても既存値が保持される回帰テストは一時Run #3 SUCCESS、PR headでもpytest check SUCCESS。Issue #33は継続 | 次はresult_entries（所属・人気・事故情報）を別PRで実装。その後result_laps/result_payouts/監査Workflowへ進む |
 
 ## 高
 
@@ -60,7 +60,7 @@
 
 | 分類 | Issue / PR | 状態 | 確認結果・次 |
 |------|------------|------|--------------|
-| データ | [PR #46](https://github.com/memememe0110/AutoRaceAI/pull/46) / [Issue #33](https://github.com/memememe0110/AutoRaceAI/issues/33) | 進行中・レビュー前 | head `ab70afb`。result_racesのメタデータ永続化、旧DB不足列追加、NULL賞金を実装。NULL再登録時の既存meta保持を直接検証する回帰テストとCIが残る。対象外のentries/laps/payoutsや予測ロジックは混ぜない |
+| データ | [PR #46](https://github.com/memememe0110/AutoRaceAI/pull/46) / [Issue #33](https://github.com/memememe0110/AutoRaceAI/issues/33) | PR完了・Issue継続 | merge commit `21957f7`。result_racesメタデータ保存、旧DB不足列追加、NULL賞金、NULL再登録時の8項目保持テストをmainへ反映。Run #3とPR headのpytest checkはSUCCESS。#28測定環境は変更なし | Issue #33の次段階としてresult_entriesを別PR化 |
 | 運用 | [PR #47](https://github.com/memememe0110/AutoRaceAI/pull/47) | 完了 | input SHA必須化をmainへマージ（merge commit `122a8bc`）。29R Brier再測定Run #14はSUCCESS、28/29R評価、BS_macro=0.3235148327。除外1Rはcar_set不一致。今回の再測定では既知基準値から変化なし。Issue #28のLap1基準測定完了とは別 |
 
 ## Ver331 Lap1 の制約
