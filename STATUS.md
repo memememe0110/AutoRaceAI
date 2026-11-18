@@ -32,7 +32,7 @@
 
 | 進捗 | 分類 | Issue | タスク | 現状 | 次 |
 |------|------|-------|--------|------|----|
-| 未着手 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | 同一レースのseed・試行回数・DB世代・保存版の突合が未完了 | 突合条件を固定して差分を出す |
+| 進行中 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | 2026-11-19着手。v231_prediction_historyの同一race_key重複を読み取り専用で全件分類する設計をIssueへ記録。実DBスキーマを先に取得し、seed/trials/input SHA/config/DB世代/保存版の実列・取得元を確定する | 実DBのgeneration/commit/DB SHAとPRAGMA table_infoを取得し、列対応表を確定。#28は隔離、#29のデータ変更なし |
 
 ## 中
 
