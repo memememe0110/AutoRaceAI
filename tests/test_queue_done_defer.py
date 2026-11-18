@@ -155,8 +155,9 @@ def _history_count(e, race_key):
 
 def _matcher(e, key, seed, config_json, input_sha256=None):
     return e.ns["_v326_find_matching_prediction_history"](
-        e.db, race_key=key, save_version=SNAP["save_version"], seed=seed,
+        e.db, race_key=key, save_version=SNAP["save_version"], trials=20, seed=seed,
         input_sha256=input_sha256, config_json=config_json,
+        code_commit_sha=SNAP["code_commit_sha"], db_sha256=SNAP["db_sha256"],
     )
 
 
@@ -168,8 +169,9 @@ def p5_29():
         key, saved_id, seed = _save_history(e, raw, cfg)
         before = _history_count(e, key)
         fp = e.ns["_v326_prediction_fingerprint_codes"](
-            race_key=key, save_version=SNAP["save_version"], seed=seed,
+            race_key=key, save_version=SNAP["save_version"], trials=20, seed=seed,
             input_sha256=hashlib.sha256(raw.encode("utf-8")).hexdigest(), config_json=cfg,
+            code_commit_sha=SNAP["code_commit_sha"], db_sha256=SNAP["db_sha256"],
         )
         found = _matcher(e, key, seed, cfg, fp["input_sha256"])
         after = _history_count(e, key)
@@ -194,14 +196,16 @@ def p5_29b():
         key, old_id, seed = _save_history(e, "P5-29b original input", cfg_a)
         before = _history_count(e, key)
         fp_a = e.ns["_v326_prediction_fingerprint_codes"](
-            race_key=key, save_version=SNAP["save_version"], seed=seed,
+            race_key=key, save_version=SNAP["save_version"], trials=20, seed=seed,
             input_sha256=None, config_json=cfg_a,
+            code_commit_sha=SNAP["code_commit_sha"], db_sha256=SNAP["db_sha256"],
         )
         reused = _matcher(e, key, seed, cfg_a, None)
         after_reuse = _history_count(e, key)
         fp_b = e.ns["_v326_prediction_fingerprint_codes"](
-            race_key=key, save_version=SNAP["save_version"], seed=seed,
+            race_key=key, save_version=SNAP["save_version"], trials=20, seed=seed,
             input_sha256=None, config_json=cfg_b,
+            code_commit_sha=SNAP["code_commit_sha"], db_sha256=SNAP["db_sha256"],
         )
         mismatch = _matcher(e, key, seed, cfg_b, None)
         before_insert = _history_count(e, key)
@@ -240,8 +244,9 @@ def p5_30():
         before = _history_count(e, key)
         wrong_sha = hashlib.sha256(raw_new.encode("utf-8")).hexdigest()
         fp = e.ns["_v326_prediction_fingerprint_codes"](
-            race_key=key, save_version=SNAP["save_version"], seed=seed,
+            race_key=key, save_version=SNAP["save_version"], trials=20, seed=seed,
             input_sha256=wrong_sha, config_json=cfg,
+            code_commit_sha=SNAP["code_commit_sha"], db_sha256=SNAP["db_sha256"],
         )
         found = _matcher(e, key, seed, cfg, wrong_sha)
         after = _history_count(e, key)

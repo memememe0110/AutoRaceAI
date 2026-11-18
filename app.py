@@ -3304,6 +3304,18 @@ def _v326_build_queue_config_snapshot() -> dict:
             seed = int(st.session_state.get("seed"))
     except Exception:
         pass
+    db_sha256 = None
+    try:
+        ident = _v284_current_db_identity()
+        if isinstance(ident, dict) and ident.get("ok") and ident.get("sha256"):
+            db_sha256 = str(ident.get("sha256"))
+    except Exception:
+        pass
+    code_commit_sha = None
+    try:
+        code_commit_sha = _v326_try_code_commit_sha()
+    except Exception:
+        pass
     cfg = {
         "save_version": sv,
         "v330a_enabled": bool(v330),
@@ -3312,7 +3324,9 @@ def _v326_build_queue_config_snapshot() -> dict:
         "v328_enabled": bool(_v328_active()) if "_v328_active" in globals() else False,
         "v331_lap1_tune_enabled": bool(_v331_lap1_tune_active()) if "_v331_lap1_tune_active" in globals() else False,
         "v331_gap_mode": str(_v331_gap_mode()) if "_v331_gap_mode" in dir() or "_v331_gap_mode" in globals() else "C",
-        "config_version": 1,
+        "code_commit_sha": code_commit_sha,
+        "db_sha256": db_sha256,
+        "config_version": 2,
     }
     try:
         if "_v331_gap_mode" in globals() or callable(globals().get("_v331_gap_mode")):
@@ -3326,8 +3340,9 @@ def _v326_build_queue_config_snapshot() -> dict:
     return {
         "save_version": sv,
         "seed": int(seed),
-        "code_commit_sha": _v326_try_code_commit_sha(),
-        "config_version": 1,
+        "code_commit_sha": code_commit_sha,
+        "db_sha256": db_sha256,
+        "config_version": 2,
         "config_json": blob,
         "input_sha256": None,
         "v330a_enabled": bool(v330),
@@ -3377,6 +3392,8 @@ def _v326_validate_queue_config_row(row_dict: dict) -> dict:
         "config_version": int((row_dict or {}).get("config_version") or cfg.get("config_version") or 1),
         "config_json": cfg,
         "input_sha256": (row_dict or {}).get("input_sha256"),
+        "code_commit_sha": (row_dict or {}).get("code_commit_sha") or cfg.get("code_commit_sha"),
+        "db_sha256": cfg.get("db_sha256"),
         "v330a_enabled": bool(cfg.get("v330a_enabled")),
     }
 
@@ -21030,124 +21047,91 @@ def _v326_prediction_fingerprint_codes(
     *,
     race_key: str,
     save_version: str,
+    trials: int,
     seed: int,
     input_sha256: str | None,
     config_json=None,
     code_commit_sha: str | None = None,
+    db_sha256: str | None = None,
 ) -> dict:
-    """二重実行判定用の照合キー（不足時は incomplete）。
-
-    必須: race_key, save_version, seed, config_json(正規化可能)
-    任意: input_sha256, code_commit_sha
-    """
+    """再利用判定用fingerprint。不足メタデータ時はincomplete。"""
     sv = str(save_version or "").strip()
     rk = str(race_key or "").strip()
+    try:
+        tr = int(trials)
+    except Exception:
+        tr = None
     try:
         sd = int(seed)
     except Exception:
         sd = None
     ih = str(input_sha256 or "").strip() or None
     cs = str(code_commit_sha or "").strip() or None
+    ds = str(db_sha256 or "").strip() or None
     cfg_fp = _v326_config_json_fingerprint(config_json)
-    complete = bool(rk and sv and sd is not None and cfg_fp)
+    complete = bool(rk and sv and tr is not None and tr > 0 and sd is not None and cfg_fp and cs and ds)
     return {
-        "race_key": rk,
-        "save_version": sv,
-        "seed": sd,
-        "input_sha256": ih,
-        "config_fp": cfg_fp,
-        "code_commit_sha": cs,
-        "complete": complete,
+        "race_key": rk, "save_version": sv, "trials": tr, "seed": sd,
+        "input_sha256": ih, "config_fp": cfg_fp, "code_commit_sha": cs,
+        "db_sha256": ds, "complete": complete,
     }
-
-
 def _v326_find_matching_prediction_history(
     db_path: str,
     *,
     race_key: str,
     save_version: str,
+    trials: int,
     seed: int,
     input_sha256: str | None = None,
     config_json=None,
     code_commit_sha: str | None = None,
+    db_sha256: str | None = None,
 ) -> dict | None:
-    """同一 fingerprint の予測履歴があれば要約を返す。不足時は同一と断定しない。"""
+    """完全なfingerprintが一致した履歴だけを再利用する。"""
     import hashlib
     fp = _v326_prediction_fingerprint_codes(
-        race_key=race_key,
-        save_version=save_version,
-        seed=seed,
-        input_sha256=input_sha256,
-        config_json=config_json,
-        code_commit_sha=code_commit_sha,
+        race_key=race_key, save_version=save_version, trials=trials, seed=seed,
+        input_sha256=input_sha256, config_json=config_json,
+        code_commit_sha=code_commit_sha, db_sha256=db_sha256,
     )
     if not fp["complete"]:
         return None
     try:
         with sqlite3.connect(str(db_path), timeout=10) as con:
-            tables = {
-                r[0]
-                for r in con.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             if "v231_prediction_history" not in tables:
                 return None
             keys = [str(fp["race_key"])]
-            m = re.match(
-                r"(\d{4})-?(\d{2})-?(\d{2})_(.+)_(\d+)R?",
-                str(fp["race_key"]),
-            )
-            if m:
-                ymd = f"{m.group(1)}{m.group(2)}{m.group(3)}"
-                try:
-                    keys = _v319_race_key_candidates(ymd, m.group(4), m.group(5))
-                except Exception:
-                    keys = [str(fp["race_key"])]
             ph = ",".join("?" * len(keys))
             rows = con.execute(
-                f"""
-                SELECT history_id, race_key, app_version, trials, seed, raw_text, settings_hash
-                  FROM v231_prediction_history
-                 WHERE race_key IN ({ph})
-                   AND app_version = ?
-                   AND seed = ?
-                 ORDER BY history_id DESC
-                 LIMIT 30
-                """,
+                f"""SELECT history_id, race_key, app_version, trials, seed, raw_text, settings_hash
+                    FROM v231_prediction_history
+                   WHERE race_key IN ({ph}) AND app_version=? AND seed=?
+                   ORDER BY history_id DESC LIMIT 30""",
                 tuple(list(keys) + [fp["save_version"], int(fp["seed"])]),
             ).fetchall()
-            if not rows:
-                return None
-            want_h = fp.get("input_sha256")
-            want_cfg = fp.get("config_fp")
-            for r in rows:
-                hid, rk, aver, trials, sd, raw, sh = r
+            for row in rows:
+                hid, rk, aver, row_trials, sd, raw, sh = row
                 sh = str(sh or "")
                 if "|qcfg:" not in sh:
                     continue
-                got_cfg = sh.split("|qcfg:")[-1].strip()
-                if got_cfg != want_cfg:
+                if sh.split("|qcfg:")[-1].strip() != fp["config_fp"]:
                     continue
-                if want_h:
-                    got = hashlib.sha256(
-                        str(raw or "").encode("utf-8", errors="replace")
-                    ).hexdigest()
-                    if got != want_h:
+                if int(row_trials or 0) != int(fp["trials"]):
+                    continue
+                if input_sha256:
+                    got = hashlib.sha256(str(raw or "").encode("utf-8", errors="replace")).hexdigest()
+                    if got != fp["input_sha256"]:
                         continue
                 return {
-                    "history_id": int(hid or 0),
-                    "race_key": str(rk or ""),
-                    "app_version": str(aver or ""),
-                    "seed": int(sd or 0),
-                    "matched_input_hash": bool(want_h),
-                    "matched_config": True,
+                    "history_id": int(hid or 0), "race_key": str(rk or ""),
+                    "app_version": str(aver or ""), "seed": int(sd or 0),
+                    "matched_input_hash": bool(input_sha256), "matched_config": True,
+                    "matched_trials": True, "matched_code_db": True,
                 }
             return None
     except Exception:
         return None
-
-
 def _v319_prediction_exists(db_path: str, race_key: str) -> bool:
     """保存済み予測一覧に出る履歴があるときだけ予測済みとみなす。"""
     try:
@@ -23345,10 +23329,12 @@ def _v319_import_one_race(
             db_path,
             race_key=key_guess,
             save_version=_sv_fp,
+            trials=int(trials),
             seed=int(_seed_fp),
             input_sha256=_ih_fp,
             config_json=_cfg_json_fp,
             code_commit_sha=_ccs_fp,
+            db_sha256=(str(_snap.get("db_sha256") or "") if isinstance(_snap, dict) else ""),
         )
     except Exception:
         _fp_match = None
