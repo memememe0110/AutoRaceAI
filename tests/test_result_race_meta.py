@@ -37,7 +37,7 @@ def test_result_race_meta_and_nullable_prize():
             """SELECT race_name,race_type,distance_m,total_laps,start_time_text,time_band,weather,prize_yen
                FROM result_races WHERE race_key=?""", ("20261118_川口_5R",)
         ).fetchone()
-        assert row == EXPECTED
+        assert row == expected_preserved
 
 
 def test_old_result_races_schema_is_migrated_without_losing_existing_row():
@@ -60,9 +60,11 @@ def test_null_reregistration_preserves_existing_meta():
     with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as f:
         db = f.name
 
-    engine.v35_save_result_and_analyze(META, ROWS, db_path=db)
+    initial_meta = {**META, "1着賞金": 123456}
+    expected_preserved = (*EXPECTED[:-1], 123456)
+    engine.v35_save_result_and_analyze(initial_meta, ROWS, db_path=db)
     null_meta = {
-        **META,
+        **initial_meta,
         "レース名": None,
         "レース種別": None,
         "距離": None,
