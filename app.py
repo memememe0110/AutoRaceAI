@@ -21069,7 +21069,7 @@ def _v326_prediction_fingerprint_codes(
     cs = str(code_commit_sha or "").strip() or None
     ds = str(db_sha256 or "").strip() or None
     cfg_fp = _v326_config_json_fingerprint(config_json)
-    complete = bool(rk and sv and tr is not None and tr > 0 and sd is not None and cfg_fp and cs and ds)
+    complete = bool(rk and sv and tr is not None and tr > 0 and sd is not None and ih and cfg_fp and cs and ds)
     return {
         "race_key": rk, "save_version": sv, "trials": tr, "seed": sd,
         "input_sha256": ih, "config_fp": cfg_fp, "code_commit_sha": cs,
@@ -21089,9 +21089,20 @@ def _v326_find_matching_prediction_history(
 ) -> dict | None:
     """完全なfingerprintが一致した履歴だけを再利用する。"""
     import hashlib
+    ih = str(input_sha256 or "").strip() or None
+    if ih is None:
+        print(
+            "[prediction-history-reuse] skipped "
+            "reason=input_sha_missing "
+            f"race_key={str(race_key or '').strip()} "
+            f"save_version={str(save_version or '').strip()} "
+            f"trials={trials} seed={seed}",
+            flush=True,
+        )
+        return None
     fp = _v326_prediction_fingerprint_codes(
         race_key=race_key, save_version=save_version, trials=trials, seed=seed,
-        input_sha256=input_sha256, config_json=config_json,
+        input_sha256=ih, config_json=config_json,
         code_commit_sha=code_commit_sha, db_sha256=db_sha256,
     )
     if not fp["complete"]:
@@ -21119,10 +21130,11 @@ def _v326_find_matching_prediction_history(
                     continue
                 if int(row_trials or 0) != int(fp["trials"]):
                     continue
-                if input_sha256:
-                    got = hashlib.sha256(str(raw or "").encode("utf-8", errors="replace")).hexdigest()
-                    if got != fp["input_sha256"]:
-                        continue
+                got = hashlib.sha256(
+                    str(raw or "").encode("utf-8", errors="replace")
+                ).hexdigest()
+                if got != fp["input_sha256"]:
+                    continue
                 return {
                     "history_id": int(hid or 0), "race_key": str(rk or ""),
                     "app_version": str(aver or ""), "seed": int(sd or 0),

@@ -189,10 +189,11 @@ def p5_29():
 def p5_29b():
     e = Env("app.py", "engine.py")
     try:
-        cfg_a = SNAP["config_json"]
+        normalize = e.ns["_v326_normalize_config_json"]
+        cfg_a = normalize(SNAP["config_json"])
         cfg_obj_b = json.loads(cfg_a)
         cfg_obj_b["p5_29b_case"] = "different-config"
-        cfg_b = json.dumps(cfg_obj_b, ensure_ascii=False, sort_keys=True)
+        cfg_b = normalize(cfg_obj_b)
         key, old_id, seed = _save_history(e, "P5-29b original input", cfg_a)
         before = _history_count(e, key)
         fp_a = e.ns["_v326_prediction_fingerprint_codes"](
@@ -212,14 +213,16 @@ def p5_29b():
         _, new_id, _ = _save_history(e, "P5-29b changed config input", cfg_b)
         after_insert = _history_count(e, key)
         ok = (
-            bool(reused) and reused["history_id"] == old_id
+            reused is None
+            and fp_a["complete"] is False
+            and fp_b["complete"] is False
             and after_reuse == before == 1
             and mismatch is None
             and new_id > old_id
             and after_insert == before_insert + 1 == 2
         )
         return ok, {
-            "reuse_history_id": reused.get("history_id") if reused else None,
+            "reuse_rejected": reused is None,
             "old_history_id": old_id,
             "mismatch_result": mismatch,
             "new_history_id": new_id,
