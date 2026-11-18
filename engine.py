@@ -7442,7 +7442,9 @@ def v34_init_feedback_tables(db_path=DB_PATH):
         CREATE TABLE IF NOT EXISTS result_races (
             race_key TEXT PRIMARY KEY, race_date TEXT, venue TEXT, race_no TEXT,
             surface TEXT, track_temp REAL, air_temp REAL, humidity REAL,
-            registered_at TEXT
+            registered_at TEXT,
+            race_name TEXT, race_type TEXT, distance_m INTEGER, total_laps INTEGER,
+            start_time_text TEXT, time_band TEXT, weather TEXT, prize_yen INTEGER
         );
         CREATE TABLE IF NOT EXISTS result_entries (
             race_key TEXT NOT NULL, car_no INTEGER NOT NULL, player_name TEXT,
@@ -7456,6 +7458,16 @@ def v34_init_feedback_tables(db_path=DB_PATH):
             analyzed_at TEXT
         );
         """)
+        # Add nullable metadata columns to older DB generations only.
+        existing = {row[1] for row in con.execute("PRAGMA table_info(result_races)").fetchall()}
+        for name, definition in {
+            "race_name": "TEXT", "race_type": "TEXT", "distance_m": "INTEGER",
+            "total_laps": "INTEGER", "start_time_text": "TEXT", "time_band": "TEXT",
+            "weather": "TEXT", "prize_yen": "INTEGER",
+        }.items():
+            if name not in existing:
+                con.execute(f'ALTER TABLE result_races ADD COLUMN "{name}" {definition}')
+        con.commit()
 
 
 def v34_save_prediction_snapshot(meta, df, finish_prob=None, db_path=DB_PATH, con=None, commit=True):
@@ -7546,14 +7558,25 @@ def v34_save_result_and_analyze(meta, results, db_path=DB_PATH):
         # 列名を明示する。Ver76以降で result_races に学習可否列が増えても、
         # 既存の9項目登録が列数不一致で壊れないようにする。
         con.execute("""INSERT INTO result_races
-          (race_key,race_date,venue,race_no,surface,track_temp,air_temp,humidity,registered_at)
-          VALUES(?,?,?,?,?,?,?,?,?)
+          (race_key,race_date,venue,race_no,surface,track_temp,air_temp,humidity,registered_at,
+           race_name,race_type,distance_m,total_laps,start_time_text,time_band,weather,prize_yen)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
           ON CONFLICT(race_key) DO UPDATE SET
           race_date=excluded.race_date,venue=excluded.venue,race_no=excluded.race_no,
           surface=excluded.surface,track_temp=excluded.track_temp,
-          air_temp=excluded.air_temp,humidity=excluded.humidity,registered_at=excluded.registered_at""",
+          air_temp=excluded.air_temp,humidity=excluded.humidity,registered_at=excluded.registered_at,
+          race_name=COALESCE(excluded.race_name,result_races.race_name),
+          race_type=COALESCE(excluded.race_type,result_races.race_type),
+          distance_m=COALESCE(excluded.distance_m,result_races.distance_m),
+          total_laps=COALESCE(excluded.total_laps,result_races.total_laps),
+          start_time_text=COALESCE(excluded.start_time_text,result_races.start_time_text),
+          time_band=COALESCE(excluded.time_band,result_races.time_band),
+          weather=COALESCE(excluded.weather,result_races.weather),
+          prize_yen=COALESCE(excluded.prize_yen,result_races.prize_yen)""",
           (key,meta.get("開催日"),meta.get("開催場"),str(meta.get("レース") or ""),meta.get("走路状態"),
-           meta.get("走路温度"),meta.get("気温"),meta.get("湿度"),now))
+           meta.get("走路温度"),meta.get("気温"),meta.get("湿度"),now,
+           meta.get("レース名"),meta.get("レース種別"),meta.get("距離"),meta.get("周回数"),
+           meta.get("発走時刻"),meta.get("時間帯"),meta.get("天候"),meta.get("1着賞金")))
         con.execute("DELETE FROM result_entries WHERE race_key=?", (key,))
         if _has_rows:
             for _,r in results.iterrows():
