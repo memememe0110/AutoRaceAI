@@ -113,6 +113,29 @@ jobs:
 
           print(json.dumps(info, ensure_ascii=False, indent=2))
           PY
+      - name: Diagnose prediction history schema
+        run: |
+          python - <<'PY'
+          import sqlite3
+
+          db = "work/autorace_players.sqlite3"
+          con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+          try:
+              con.execute("PRAGMA query_only=ON")
+              print("PREDICTION_HISTORY_PRAGMA_TABLE_INFO:")
+              for row in con.execute(
+                  "PRAGMA table_info(v231_prediction_history)"
+              ):
+                  print(row)
+              print("PREDICTION_HISTORY_CREATE_SQL:")
+              row = con.execute(
+                  "SELECT sql FROM sqlite_master "
+                  "WHERE type='table' AND name='v231_prediction_history'"
+              ).fetchone()
+              print(row[0] if row else "CREATE_SQL_NOT_FOUND")
+          finally:
+              con.close()
+          PY
       - name: Run read-only duplicate audit
         run: |
           set -euo pipefail
