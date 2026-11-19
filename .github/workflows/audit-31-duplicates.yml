@@ -57,7 +57,7 @@ jobs:
               raise SystemExit(result.returncode)
 
           match = re.search(
-              r"^Ran (\\d+) tests?\\b", result.stdout, re.MULTILINE
+              r"^Ran (\d+) tests?\b", result.stdout, re.MULTILINE
           )
           if not match or int(match.group(1)) < 5:
               raise SystemExit(
