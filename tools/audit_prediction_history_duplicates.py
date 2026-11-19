@@ -97,7 +97,10 @@ def audit_database(db_path: Path, db_info_path: Path, expected_generation: str, 
         cols = {row[1] for row in con.execute("PRAGMA table_info(v231_prediction_history)")}
         missing = REQUIRED_COLUMNS - cols
         if missing:
-            raise SystemExit(f"REQUIRED_COLUMNS_MISSING: {sorted(missing)}")
+            raise SystemExit(
+                "REQUIRED_COLUMNS_MISSING: "
+                f"missing={sorted(missing)} actual_columns={sorted(cols)}"
+            )
 
         optional = [c for c in ("settings_hash",) if c in cols]
         required = REQUIRED_COLUMNS
