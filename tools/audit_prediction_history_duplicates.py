@@ -100,8 +100,8 @@ def audit_database(db_path: Path, db_info_path: Path, expected_generation: str, 
             raise SystemExit(f"REQUIRED_COLUMNS_MISSING: {sorted(missing)}")
 
         optional = [c for c in ("settings_hash",) if c in cols]
-        required = sorted(REQUIRED_COLUMNS)
-        selected = required + optional
+        required = REQUIRED_COLUMNS
+        selected = sorted(required) + optional
         selected_sql = ", ".join('"' + name + '"' for name in selected)
         rows = [
             dict(row)
