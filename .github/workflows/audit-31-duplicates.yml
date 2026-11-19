@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/audit-31-duplicates.yml"
       - "tools/audit_prediction_history_duplicates.py"
+      - "tests/__init__.py"
       - "tests/test_prediction_history_duplicates.py"
 
 permissions:
