@@ -32,7 +32,7 @@
 
 | 進捗 | 分類 | Issue | タスク | 現状 | 次 |
 |------|------|-------|--------|------|----|
-| 進行中 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | Run #6でgeneration 705の実DBスキーマ確定。12列、history_id INTEGER PRIMARY KEY AUTOINCREMENT（PRAGMA pk=1）、prediction_time/raw_text/settings_hash NOT NULL、seed/trials INTEGER NULL許容。旧id参照で監査停止。Run #6 test 6件PASS、DB取得・integrity PASS | history_idへ置換、settings_hashを必須化。12列fixtureを実DB制約に一致させ、raw_text空文字のunknownケースで回帰テスト。push前差分レビュー待ち。#28隔離、#29のデータ変更なし |
+| 進行中 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | Run #6でgeneration 705の実DBスキーマ確定。12列、history_id INTEGER PRIMARY KEY AUTOINCREMENT（PRAGMA pk=1）、prediction_time/raw_text/settings_hash NOT NULL、seed/trials INTEGER NULL許容。旧id参照で監査停止。Run #6 test 6件PASS、DB取得・integrity PASS | history_idへ置換、settings_hashを必須化。push前レビューでconfig_unknown復元（空/空白hash）、列存在ガード除去、raw_text空文字2行のinput_unknown、12列NOT NULL fixture/payload BLOB、seed NULL条件のテスト追加を確認中。focused logic check 3/3 PASS、既存6＋追加テストの完全実行は未実施。push前差分レビュー待ち。#28隔離、#29のデータ変更なし |
 
 ## 中
 
