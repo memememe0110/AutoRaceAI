@@ -1,6 +1,6 @@
 # AutoRaceAI 進捗ボード
 
-更新: 2026-11-19
+更新: 2026-11-21
 
 通常予測は停止中。main への直接 push はしない。修正はブランチ + PR。
 
@@ -32,7 +32,7 @@
 
 | 進捗 | 分類 | Issue | タスク | 現状 | 次 |
 |------|------|-------|--------|------|----|
-| 進行中 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | Run #6でgeneration 705の実DBスキーマ確定。12列、history_id INTEGER PRIMARY KEY AUTOINCREMENT（PRAGMA pk=1）、prediction_time/raw_text/settings_hash NOT NULL、seed/trials INTEGER NULL許容。旧id参照で監査停止。Run #6 test 6件PASS、DB取得・integrity PASS | 作業コピーでhistory_id/settings_hash必須化、config_unknown復元、raw_present先判定、NULL seed/trials分類を反映。実DB12列・NOT NULL・payload BLOB fixture＋追加3件を含む9件をpytest/unittest双方でPASS（pytest 9 passed in 0.09s）。GitHubブランチへのcommit/pushなし。3ファイル完全差分レビューと最終GO待ち。Run #7未実行。#28隔離、#29のデータ変更なし |
+| 進行中 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | 実DB generation 705の重複監査をRun #8で完了。3228行/540重複race/2331重複行。分類は execution_conditions_diff 371、same_seed_same_trials_and_input_sha 48、same_seed_same_trials_input_diff 121。実DB12列・NOT NULL制約を確認。DB SHA不変、integrity_check=ok、Artifact生成済み | 重複48組の内容・保存経路を精査し、意図した再実行か二重保存か分類する。より広い保存/復元整合性監査は継続。Run #8: test 9件PASS / TEST_COUNT_GATE_PASS: 9、audit SUCCESS。#28隔離、#29のデータ変更なし |
 
 ## 中
 
@@ -62,6 +62,8 @@
 |------|------------|------|--------------|
 | データ | [PR #46](https://github.com/memememe0110/AutoRaceAI/pull/46) / [Issue #33](https://github.com/memememe0110/AutoRaceAI/issues/33) | PR完了・Issue継続 | merge commit `21957f7`。result_racesメタデータ保存、旧DB不足列追加、NULL賞金、NULL再登録時の8項目保持テストをmainへ反映。Run #3とPR headのpytest checkはSUCCESS。#28測定環境は変更なし | Issue #33の次段階としてresult_entriesを別PR化 |
 | 運用 | [PR #47](https://github.com/memememe0110/AutoRaceAI/pull/47) | 完了 | input SHA必須化をmainへマージ（merge commit `122a8bc`）。29R Brier再測定Run #14はSUCCESS、28/29R評価、BS_macro=0.3235148327。除外1Rはcar_set不一致。今回の再測定では既知基準値から変化なし。Issue #28のLap1基準測定完了とは別 |
+
+| データ | [Issue #31](https://github.com/memememe0110/AutoRaceAI/issues/31) | Run #8 完了 | レビュー済み2ファイルを `tmp-audit-31-duplicates` に反映。Run #7は先行した1ファイルだけの中間コミットでtest失敗、Run #8は両ファイル揃ったhead `8c509077584a4343da854e41a9801a3cf053f4fa` でtest/auditともSUCCESS。9 tests / TEST_COUNT_GATE_PASS: 9。generation 705、DB SHA `57a6f7d4e8db23e9560e66ffbc2130f3cf1156164b3d760513c3da33f7535e67`、integrity ok。3228 history rows、540 duplicate races、2331 duplicate rows。classification_group_counts: exact-input 48 / input-diff 121 / execution-conditions-diff 371。raw_text欠損0。`duplicates.csv` / `summary.json` Artifact ID `14642433960`。DB変更検出なし（SHA不変） | 48件の同一条件・同一入力候補を精査。Issue #31は継続 |
 
 ## Ver331 Lap1 の制約
 
