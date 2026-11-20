@@ -15,9 +15,9 @@ from urllib.parse import quote
 
 
 REQUIRED_COLUMNS = {
-    "id", "race_key", "app_version", "trials", "seed", "raw_text", "prediction_time"
+    "history_id", "race_key", "app_version", "trials", "seed",
+    "raw_text", "prediction_time", "settings_hash",
 }
-OPTIONAL_COLUMNS = ("settings_hash",)
 
 
 def sha256_file(path: Path) -> str:
@@ -36,14 +36,19 @@ def row_input_sha(raw_text) -> str | None:
 
 
 def classify_group(rows: list[dict]) -> str:
+    if any(row["seed"] is None or row["trials"] is None for row in rows):
+        return "unknown_seed_or_trials"
     seeds = {str(row["seed"]) for row in rows}
     trials = {str(row["trials"]) for row in rows}
     if len(seeds) != 1 or len(trials) != 1:
         return "execution_conditions_diff"
+    raw_present = [bool(str(row["raw_text"] or "").strip()) for row in rows]
     hashes = [row["input_sha256"] for row in rows]
-    if any(value is None for value in hashes):
+    input_unknown = not all(raw_present)
+    input_same = all(raw_present) and len(set(hashes)) == 1
+    if input_unknown:
         return "same_seed_same_trials_input_unknown"
-    if len(set(hashes)) == 1:
+    if input_same:
         return "same_seed_same_trials_and_input_sha"
     return "same_seed_same_trials_input_diff"
 
@@ -102,14 +107,12 @@ def audit_database(db_path: Path, db_info_path: Path, expected_generation: str, 
                 f"missing={sorted(missing)} actual_columns={sorted(cols)}"
             )
 
-        optional = [c for c in ("settings_hash",) if c in cols]
-        required = REQUIRED_COLUMNS
-        selected = sorted(required) + optional
+        selected = sorted(REQUIRED_COLUMNS)
         selected_sql = ", ".join('"' + name + '"' for name in selected)
         rows = [
             dict(row)
             for row in con.execute(
-                f"SELECT {selected_sql} FROM v231_prediction_history ORDER BY race_key, id"
+                f"SELECT {selected_sql} FROM v231_prediction_history ORDER BY race_key, history_id"
             )
         ]
         schema_columns = sorted(cols)
@@ -129,10 +132,16 @@ def audit_database(db_path: Path, db_info_path: Path, expected_generation: str, 
         class_counts[classification] += 1
         row_count_distribution[str(len(group))] += 1
         gap = prediction_time_gap_seconds(group)
+        settings_hash_values = [row["settings_hash"] for row in group]
+        config_unknown = not settings_hash_values or any(
+            value is None or not str(value).strip()
+            for value in settings_hash_values
+        )
+        config_diff = len(set(settings_hash_values)) > 1
         for row in group:
             csv_rows.append({
                 "race_key": race_key,
-                "row_id": row["id"],
+                "history_id": row["history_id"],
                 "app_version": row["app_version"],
                 "seed": row["seed"],
                 "trials": row["trials"],
@@ -140,14 +149,17 @@ def audit_database(db_path: Path, db_info_path: Path, expected_generation: str, 
                 "prediction_time_gap_seconds": gap,
                 "input_sha256": row["input_sha256"] or "",
                 "classification": classification,
-                "settings_hash": row.get("settings_hash", ""),
+                "settings_hash": row["settings_hash"],
+                "config_unknown": config_unknown,
+                "config_diff": config_diff,
             })
 
     outdir.mkdir(parents=True, exist_ok=True)
     csv_path = outdir / "duplicates.csv"
     fieldnames = [
-        "race_key", "row_id", "app_version", "seed", "trials", "prediction_time",
+        "race_key", "history_id", "app_version", "seed", "trials", "prediction_time",
         "prediction_time_gap_seconds", "input_sha256", "classification", "settings_hash",
+        "config_unknown", "config_diff",
     ]
     with csv_path.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
@@ -175,6 +187,7 @@ def audit_database(db_path: Path, db_info_path: Path, expected_generation: str, 
             "same_seed_same_trials_input_diff": "seed/trialsは同一だが入力カードが異なる再実行。prediction_time_gap等で意図を確認。",
             "same_seed_same_trials_input_unknown": "raw_text欠損等で入力同一性を判定できない。",
             "execution_conditions_diff": "seedまたはtrialsが異なる再実行。条件差のある実行として扱い、直ちに破損とはしない。",
+            "unknown_seed_or_trials": "seedまたはtrialsがNULLのため実行条件を判定できない。",
         },
     }
     (outdir / "summary.json").write_text(
