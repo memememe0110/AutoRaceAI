@@ -35,11 +35,13 @@
 | 進行中 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | Run #8で実DB generation 705の重複監査完了。3228行/540重複race/2331重複行。実DB12列・NOT NULL制約確認、DB SHA不変、integrity_check=ok。Artifact ID 14642433960 | 48組188行を時系列再分析。Ver326/20,000の同一settings_hash・seed・trials・input SHAの完全一致fingerprintが37組で複数回保存（35組×3回、2組×2回、計109行）。10/15〜10/16の複数波で、隣接間隔最短11,036秒/中央値31,500秒。60秒未満・1時間未満0。Ver327は10/22〜23、Ver328は10/26に版別波。大規模9組559行も96完全fingerprint群中80群で反復（543行）。Ver326/327/328の版別バッチ波と重複が混在。短周期ポーリングは否定的だが、Ver326同一条件の複数回実行経路は未特定。Ver326ソースsnapshot（10/21 commit b13a319f）では_v231_save_prediction_historyは毎回INSERTし、重複検索なし。_v326_find_matching_prediction_history / fingerprint helperも未存在。保存呼出元は通常foreground、単発BG worker、_v262_batch_rerun_saved_histories、_v319_run_prerace_prediction等。batchはforce_current=Trueで現行版も再実行可能。_v319_run_prerace_predictionには履歴INSERT後の復元保存失敗時にslim payloadで再INSERTし得るfallbackあり。ただし観測間隔最短11,036秒のため同一処理内二重保存だけでは説明困難。重要な制約：10/15 app.py snapshot（e377076/c0a0356）は_V231_APP_VERSION=Ver324で、10/15〜16のDB Ver326行と不一致。10/21 Ver326 snapshotを10/15の実稼働版と断定できない。batch rerunが最優先候補：_v278_bg_startはforce_current=Trueで現行版保存済みraceも対象にでき、_v278_bg_workerはprocessed_race_keysで同一job内の重複だけを防ぐ（別jobには除外集合を引き継がない）。複数jobが同一raceを再保存でき、観測された数時間〜数日間隔と構造上整合。ただしjob単位の証拠なし。既存duplicates.csvにpayload/job detailなし、version-integrity auditもjob_type/status/app_version/save_version集計のみ。次は対象期間のv278_background_jobs個別行（job_id/force_current/created_at/result_blob）とprocessed_race_keys、history payloadのbackground_prediction/batch_rerun/walk_forward_v269/_v301_bg_job_idを37群と照合。10/15〜16の実稼働版不一致も未解決。batch rerun最有力・原因未確定。DB読み取り専用、コード/Workflow/保存関数変更なし。Run #8: 9 tests PASS / audit SUCCESS。#28隔離、#29変更なし |
 
 ### 追加確認（2026-11-22）
-- Run #8（44764670690）のartifact一覧を再確認。artifactは1件（ID `14642433960`、サイズ61,384 bytes）のみで、既取得ZIPの中身も `duplicates.csv` と `summary.json` の2ファイル。DB本体・個別job行・history payloadは含まれない。
-- mainの `.github/workflows/prediction-version-integrity-audit.yml` を確認。workflow_dispatchは存在し、generation指定でDBを読み取り専用取得する設計。ただし現行 `tools/audit_prediction_version_integrity.py` は `background_job_version_pairs.csv` をjob_type/status/app_version/save_version単位で集計するだけで、job_id・force_current・時刻・result_blob・処理race_keyを出力しない。
-- 利用可能なGitHub連携アクションにworkflow_dispatch専用操作はなく、GET専用fetchから起動することもできない。未実行のRunや未取得データを取得済みとは扱わない。
-- よって対象jobの個別照合は現時点で実施不能。必要なのは、個別job行・result_blob内の `processed_race_keys`・history payload経路マーカーを読み取り専用で出力する監査Workflow/スクリプト。これはWorkflow/コード変更を伴うため、現段階では未着手・未承認として保留する。
-- 結論は引き続き「batch rerunが最有力候補、原因未確定」。保存関数の不具合とは断定しない。DB読み取り専用、保存関数変更なし、#28/#29変更なし。
+- Run #8（44764670690）のartifactは `duplicates.csv` と `summary.json` の2ファイルで、個別job行/history payloadは含まれない。
+- **補足訂正：既存のPrediction Version Integrity Audit成果物が別に存在した。** Run `44117299639`（generation 705、artifact ID `14344016653`）を取得し、`prediction_version_table_inventory.csv` / summaryのtable_inventoryを確認。これはDB上の `PRAGMA table_info` から列名を抽出した既存出力。
+- `v278_background_jobs` の実DB列名は `app_version,cancel_requested,created_at,current_label,done_count,error_text,finished_at,force_current,job_id,job_type,limit_count,message,odds_only,pause_requested,result_blob,save_version,started_at,status,total_count,updated_at` の20列。**race_key / task_id / batch_id / run_id は存在しない。** したがって `j.race_key=h.race_key` の直接JOIN案は不可。result_blob内の `processed_race_keys` を抽出してhistoryのrace_keyと照合する方式が必要。
+- 既存artifactは列名のみを保存し、PRAGMAのtype/notnull/dflt_value/pkは出力していない。完全なPRAGMA行は未取得。
+- 現行audit scriptは背景jobをjob_type/status/app_version/save_version単位で集計するだけで、個別job行・result_blobを出力しない。個別照合には読み取り専用の追加出力が必要。workflow_dispatch専用アクションは利用可能ツールにないため、Workflow起動は行っていない。
+- 48グループは母集団、37グループはそのうちVer326内のsettings_hash/seed/trials/input SHA/app_versionが完全一致して複数回保存された重点対象。残り11グループはこの厳密条件に該当しない。
+- 判定は「batch rerunが最有力候補、原因未確定」。DB読み取り専用、保存関数変更なし、#28/#29変更なし。
 
 ## 中
 
