@@ -32,7 +32,7 @@
 
 | 進捗 | 分類 | Issue | タスク | 現状 | 次 |
 |------|------|-------|--------|------|----|
-| 進行中 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | 実DB generation 705の重複監査をRun #8で完了。3228行/540重複race/2331重複行。分類は execution_conditions_diff 371、same_seed_same_trials_and_input_sha 48、same_seed_same_trials_input_diff 121。実DB12列・NOT NULL制約を確認。DB SHA不変、integrity_check=ok、Artifact生成済み | 48組をduplicates.csvから再集計。gap min 588,993秒/median 589,212秒/max 939,549秒で60秒未満0。48/48が複数app_version（28組 Ver326+327、20組 Ver326+327+328）かつ複数settings_hash。59〜65行の大規模9組は全てexecution_conditions_diff、seedは各1種類だがtrials=8,000/20,000混在、Ver326/327/328混在。短時間ポーリング重複の証拠なし。次は48組の履歴時系列と大規模9組の実行経路を分けて精査。保存/復元整合性監査は継続。Run #8: test 9件PASS / TEST_COUNT_GATE_PASS: 9、audit SUCCESS。#28隔離、#29のデータ変更なし |
+| 進行中 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | Run #8で実DB generation 705の重複監査完了。3228行/540重複race/2331重複行。実DB12列・NOT NULL制約確認、DB SHA不変、integrity_check=ok。Artifact ID 14642433960 | 48組188行を時系列再分析。Ver326/20,000の同一settings_hash・seed・trials・input SHAの完全一致fingerprintが37組で複数回保存（35組×3回、2組×2回、計109行）。10/15〜10/16の複数波で、隣接間隔最短11,036秒/中央値31,500秒。60秒未満・1時間未満0。Ver327は10/22〜23、Ver328は10/26に版別波。大規模9組559行も96完全fingerprint群中80群で反復（543行）。Ver326/327/328の版別バッチ波と重複が混在。短周期ポーリングは否定的だが、Ver326同一条件の複数回実行経路は未特定。次は当時のapp.py/engine.pyスナップショットと実行履歴から起動経路を照合。DB読み取り専用、保存関数修正なし。Run #8: 9 tests PASS / audit SUCCESS。#28隔離、#29変更なし |
 
 ## 中
 
