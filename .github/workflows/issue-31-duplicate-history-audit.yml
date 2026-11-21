@@ -1,0 +1,77 @@
+name: Issue 31 Duplicate History Repeat Audit
+
+on:
+  push:
+    branches:
+      - tmp-audit-31-repeats
+    paths:
+      - "tools/audit_duplicate_history_repeats.py"
+      - "tests/test_duplicate_history_repeats.py"
+      - ".github/workflows/issue-31-duplicate-history-audit.yml"
+  workflow_dispatch:
+    inputs:
+      expected_generation:
+        description: "Immutable autorace-db generation"
+        required: true
+        default: "705"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-31-duplicate-history-audit
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+  EXPECTED_GENERATION: ${{ inputs.expected_generation || '705' }}
+  DB_COMMIT_SHA: 20c67a8450ea72d219c19601319faf558a2f93c1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m py_compile tools/audit_duplicate_history_repeats.py tests/test_duplicate_history_repeats.py
+      - run: python -m unittest discover -s tests -t . -p "test_duplicate_history_repeats.py" -v
+
+  audit:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch immutable DB snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python tools/prospective_collector.py fetch-db \
+            --repo "$REPO" --branch "$DB_COMMIT_SHA" \
+            --out work/autorace_players.sqlite3 --info-out work/db_info.json
+      - name: Run read-only repeat audit
+        run: |
+          set -euo pipefail
+          python tools/audit_duplicate_history_repeats.py \
+            --db work/autorace_players.sqlite3 --db-info work/db_info.json \
+            --expected-generation "$EXPECTED_GENERATION" \
+            --expected-commit "$DB_COMMIT_SHA" \
+            --outdir work/issue31_repeat_audit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issue-31-repeat-audit-${{ github.run_id }}
+          path: work/issue31_repeat_audit/
+          if-no-files-found: error
+          retention-days: 30
