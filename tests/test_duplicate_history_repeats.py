@@ -7,7 +7,8 @@ from pathlib import Path
 
 from tools.audit_duplicate_history_repeats import (
     classify,
-    is_strict_ver326_group,
+    filter_ver326_rows,
+    is_strict_group,
     job_time_values_are_offset_aware,
     parse_aware,
     safe_decompress,
@@ -65,10 +66,37 @@ class RepeatAuditLogicTests(unittest.TestCase):
             self.row(1, "2026-10-15T09:00:00+09:00"),
             self.row(2, "2026-10-15T14:30:00+09:00"),
         ]
-        self.assertTrue(is_strict_ver326_group(rows))
-        self.assertFalse(is_strict_ver326_group([dict(rows[0], settings_hash=""), rows[1]]))
-        self.assertFalse(is_strict_ver326_group([dict(rows[0], trials=10000), rows[1]]))
-        self.assertFalse(is_strict_ver326_group([dict(rows[0], app_version="Ver327"), rows[1]]))
+        self.assertTrue(is_strict_group(filter_ver326_rows(rows)))
+
+        # A mixed-version group remains strict when two Ver326 rows qualify.
+        mixed = rows + [
+            self.row(3, "2026-10-15T19:30:00+09:00", app_version="Ver327")
+        ]
+        self.assertTrue(is_strict_group(filter_ver326_rows(mixed)))
+
+        # One Ver326 row is insufficient, even if another version is present.
+        one_ver326 = [
+            rows[0],
+            self.row(3, "2026-10-15T19:30:00+09:00", app_version="Ver327")
+        ]
+        self.assertFalse(is_strict_group(filter_ver326_rows(one_ver326)))
+
+        self.assertFalse(is_strict_group(filter_ver326_rows([
+            dict(rows[0], settings_hash=""), rows[1]
+        ])))
+        self.assertFalse(is_strict_group(filter_ver326_rows([
+            dict(rows[0], trials=10000), rows[1]
+        ])))
+
+    def test_strict_csv_excludes_non_ver326_rows(self):
+        rows = [
+            self.row(1, "2026-10-15T09:00:00+09:00"),
+            self.row(2, "2026-10-15T14:30:00+09:00"),
+            self.row(3, "2026-10-15T19:30:00+09:00", app_version="Ver327"),
+        ]
+        strict_rows = filter_ver326_rows(rows)
+        self.assertEqual([r["history_id"] for r in strict_rows], [1, 2])
+        self.assertTrue(all(r["app_version"] == "Ver326" for r in strict_rows))
 
     def test_classify_same_input_and_conditions(self):
         rows = [self.row(1, "2026-10-15T09:00:00+09:00"), self.row(2, "2026-10-15T10:00:00+09:00")]
