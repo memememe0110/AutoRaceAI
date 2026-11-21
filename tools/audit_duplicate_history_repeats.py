@@ -107,24 +107,28 @@ def job_time_values_are_offset_aware(values):
     return all(not str(v).strip() or parse_aware(v) is not None for v in values if v is not None)
 
 
-def is_strict_ver326_group(rows):
-    if not rows or any(str(r["app_version"]) != "Ver326" for r in rows):
+def filter_ver326_rows(rows):
+    return [r for r in rows if str(r["app_version"]) == "Ver326"]
+
+
+def is_strict_group(ver326_rows):
+    if len(ver326_rows) < 2:
         return False
-    settings = {str(r["settings_hash"] or "").strip() for r in rows}
+    settings = {str(r["settings_hash"] or "").strip() for r in ver326_rows}
     if len(settings) != 1 or not next(iter(settings)):
         return False
-    if any(r["seed"] is None or r["trials"] is None for r in rows):
+    if any(r["seed"] is None or r["trials"] is None for r in ver326_rows):
         return False
-    if len({str(r["seed"]) for r in rows}) != 1:
+    if len({str(r["seed"]) for r in ver326_rows}) != 1:
         return False
-    if len({str(r["trials"]) for r in rows}) != 1:
+    if len({str(r["trials"]) for r in ver326_rows}) != 1:
         return False
     try:
-        if int(rows[0]["trials"]) != 20000:
+        if int(ver326_rows[0]["trials"]) != 20000:
             return False
     except (TypeError, ValueError):
         return False
-    hashes = {r["raw_text_sha256"] for r in rows}
+    hashes = {r["raw_text_sha256"] for r in ver326_rows}
     return len(hashes) == 1 and bool(next(iter(hashes)))
 
 
@@ -193,7 +197,11 @@ def audit(db_path, db_info_path, expected_generation, expected_commit, outdir):
 
         duplicate_groups = {k: v for k, v in groups.items() if len(v) > 1}
         broad = {k: v for k, v in duplicate_groups.items() if classify(v) == TARGET_CLASS}
-        strict = {k: v for k, v in broad.items() if is_strict_ver326_group(v)}
+        strict = {}
+        for race_key, rows in broad.items():
+            ver326_rows = filter_ver326_rows(rows)
+            if is_strict_group(ver326_rows):
+                strict[race_key] = ver326_rows
         broad_rows = sum(map(len, broad.values()))
         strict_rows_count = sum(map(len, strict.values()))
         if len(broad) != 48 or broad_rows != 188:
@@ -222,14 +230,22 @@ def audit(db_path, db_info_path, expected_generation, expected_commit, outdir):
             ordered = stable_sort_rows(race_rows)
             is_strict = race_key in strict
             prev_ts = first_ts = None
+            prev_ts_v326 = None
             for r in ordered:
                 ts = parse_aware(r["prediction_time"])
+                is_ver326 = str(r["app_version"]) == "Ver326"
                 gap_prev = ts - prev_ts if prev_ts is not None else None
                 gap_first = ts - first_ts if first_ts is not None else None
                 if first_ts is None:
                     first_ts = ts
-                if prev_ts is not None and is_strict:
-                    strict_gap_values.append(gap_prev)
+
+                gap_prev_v326 = None
+                if is_strict and is_ver326:
+                    if prev_ts_v326 is not None:
+                        gap_prev_v326 = ts - prev_ts_v326
+                        strict_gap_values.append(gap_prev_v326)
+                    prev_ts_v326 = ts
+
                 prev_ts = ts
                 pm = payload_meta[r["history_id"]]
                 x = {"race_key": race_key, "history_id": r["history_id"],
@@ -240,8 +256,10 @@ def audit(db_path, db_info_path, expected_generation, expected_commit, outdir):
                      "payload_size": pm["payload_size"], "payload_sha256": pm["payload_sha256"],
                      "gap_from_prev_seconds": gap_prev, "gap_from_first_seconds": gap_first}
                 all_rows.append(x)
-                if is_strict:
-                    strict_csv_rows.append(x)
+                if is_strict and is_ver326:
+                    x_strict = dict(x)
+                    x_strict["gap_from_prev_seconds"] = gap_prev_v326
+                    strict_csv_rows.append(x_strict)
                     date_counts[str(r["prediction_time"])[:10]] += 1
         fields = list(all_rows[0])
         write_csv(out / "duplicates_48.csv", fields, all_rows)
@@ -276,7 +294,8 @@ def audit(db_path, db_info_path, expected_generation, expected_commit, outdir):
                                       "correlation_type": "time_window_candidate_not_proven",
                                       "correlation_is_proven": False})
                         found = True
-                        if x["strict_37_flag"]:
+                        if (x["strict_37_flag"]
+                                and str(x["app_version"]) == "Ver326"):
                             job_types[j.get("job_type") or "(none)"] += 1
                             save_versions[j.get("save_version") or "(blank)"] += 1
                 if not found:
