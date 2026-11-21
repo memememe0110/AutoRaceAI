@@ -32,7 +32,7 @@
 
 | 進捗 | 分類 | Issue | タスク | 現状 | 次 |
 |------|------|-------|--------|------|----|
-| 進行中 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | 実DB generation 705の重複監査をRun #8で完了。3228行/540重複race/2331重複行。分類は execution_conditions_diff 371、same_seed_same_trials_and_input_sha 48、same_seed_same_trials_input_diff 121。実DB12列・NOT NULL制約を確認。DB SHA不変、integrity_check=ok、Artifact生成済み | 重複48組の内容・保存経路を精査し、意図した再実行か二重保存か分類する。より広い保存/復元整合性監査は継続。Run #8: test 9件PASS / TEST_COUNT_GATE_PASS: 9、audit SUCCESS。#28隔離、#29のデータ変更なし |
+| 進行中 | 予測 | [#31](https://github.com/memememe0110/AutoRaceAI/issues/31) | 予測データの再現性・保存整合性 | 実DB generation 705の重複監査をRun #8で完了。3228行/540重複race/2331重複行。分類は execution_conditions_diff 371、same_seed_same_trials_and_input_sha 48、same_seed_same_trials_input_diff 121。実DB12列・NOT NULL制約を確認。DB SHA不変、integrity_check=ok、Artifact生成済み | 48組をduplicates.csvから再集計。gap min 588,993秒/median 589,212秒/max 939,549秒で60秒未満0。48/48が複数app_version（28組 Ver326+327、20組 Ver326+327+328）かつ複数settings_hash。59〜65行の大規模9組は全てexecution_conditions_diff、seedは各1種類だがtrials=8,000/20,000混在、Ver326/327/328混在。短時間ポーリング重複の証拠なし。次は48組の履歴時系列と大規模9組の実行経路を分けて精査。保存/復元整合性監査は継続。Run #8: test 9件PASS / TEST_COUNT_GATE_PASS: 9、audit SUCCESS。#28隔離、#29のデータ変更なし |
 
 ## 中
 
