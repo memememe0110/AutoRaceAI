@@ -1,0 +1,105 @@
+import hashlib
+import pickle
+import tempfile
+import unittest
+import zlib
+from pathlib import Path
+
+from tools.audit_duplicate_history_repeats import (
+    classify,
+    is_strict_ver326_group,
+    job_time_values_are_offset_aware,
+    parse_aware,
+    safe_decompress,
+    safe_pickle_scan,
+    sha256_file,
+    stable_sort_rows,
+)
+
+
+class RepeatAuditLogicTests(unittest.TestCase):
+    def row(self, history_id, prediction_time, **overrides):
+        r = {
+            "history_id": history_id,
+            "prediction_time": prediction_time,
+            "app_version": "Ver326",
+            "settings_hash": "settings-a",
+            "seed": 12345,
+            "trials": 20000,
+            "raw_text_sha256": "a" * 64,
+        }
+        r.update(overrides)
+        return r
+
+    def test_three_row_adjacent_and_first_gaps(self):
+        ts = [parse_aware(x) for x in (
+            "2026-10-15T09:00:00+09:00",
+            "2026-10-15T14:30:00+09:00",
+            "2026-10-15T19:30:00+09:00",
+        )]
+        self.assertEqual([ts[1] - ts[0], ts[2] - ts[1]], [19800, 18000])
+        self.assertEqual([ts[1] - ts[0], ts[2] - ts[0]], [19800, 37800])
+
+    def test_two_row_gap(self):
+        a = parse_aware("2026-10-15T09:00:00+09:00")
+        b = parse_aware("2026-10-15T14:30:00+09:00")
+        self.assertEqual(b - a, 19800)
+
+    def test_naive_datetime_rejected(self):
+        self.assertIsNone(parse_aware("2026-10-15T09:00:00"))
+
+    def test_job_time_naive_skips_only_time_matching(self):
+        self.assertTrue(job_time_values_are_offset_aware([None, "", "2026-10-15T09:00:00+09:00"]))
+        self.assertFalse(job_time_values_are_offset_aware(["2026-10-15T09:00:00"]))
+
+    def test_stable_sort_uses_utc_then_history_id(self):
+        rows = [
+            self.row(9, "2026-10-15T00:00:00+00:00"),
+            self.row(3, "2026-10-15T09:00:00+09:00"),
+            self.row(4, "2026-10-15T01:00:00+00:00"),
+        ]
+        self.assertEqual([r["history_id"] for r in stable_sort_rows(rows)], [3, 9, 4])
+
+    def test_strict_ver326_criteria(self):
+        rows = [
+            self.row(1, "2026-10-15T09:00:00+09:00"),
+            self.row(2, "2026-10-15T14:30:00+09:00"),
+        ]
+        self.assertTrue(is_strict_ver326_group(rows))
+        self.assertFalse(is_strict_ver326_group([dict(rows[0], settings_hash=""), rows[1]]))
+        self.assertFalse(is_strict_ver326_group([dict(rows[0], trials=10000), rows[1]]))
+        self.assertFalse(is_strict_ver326_group([dict(rows[0], app_version="Ver327"), rows[1]]))
+
+    def test_classify_same_input_and_conditions(self):
+        rows = [self.row(1, "2026-10-15T09:00:00+09:00"), self.row(2, "2026-10-15T10:00:00+09:00")]
+        self.assertEqual(classify(rows), "same_seed_same_trials_and_input_sha")
+        self.assertEqual(classify([rows[0], dict(rows[1], raw_text_sha256="b" * 64)]),
+                         "same_seed_same_trials_input_diff")
+        self.assertEqual(classify([rows[0], dict(rows[1], seed=999)]), "execution_conditions_diff")
+
+    def test_safe_zlib_and_trailing_data(self):
+        raw = pickle.dumps({"a": "b"}, protocol=4)
+        self.assertEqual(safe_decompress(zlib.compress(raw))[1], "ok")
+        self.assertEqual(safe_decompress(zlib.compress(raw) + b"x")[1], "invalid_or_trailing_data")
+
+    def test_pickle_scan_no_partial_results(self):
+        raw = pickle.dumps({"small": "value"}, protocol=4)
+        keys, strings, status = safe_pickle_scan(raw)
+        self.assertEqual(status, "ok")
+        self.assertEqual(keys, [])
+        self.assertIn("small", strings)
+        keys, strings, status = safe_pickle_scan(raw[:-2])
+        self.assertTrue(status.startswith("genops_failed:"))
+        self.assertIsNone(keys)
+        self.assertIsNone(strings)
+
+    def test_sha256_file_streaming_result(self):
+        data = b"audit-stream-test" * 1000
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "sample.bin"
+            p.write_bytes(data)
+            self.assertEqual(sha256_file(p), hashlib.sha256(data).hexdigest())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
