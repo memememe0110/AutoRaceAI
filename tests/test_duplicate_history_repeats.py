@@ -141,7 +141,7 @@ class RepeatAuditLogicTests(unittest.TestCase):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (368, "batch_rerun", "completed", 35, 35, 0, 0,
                   "created", "started", "finished", "updated", "x" * 600,
-                  b"\\x01\\x02\\x03"))
+                  b"\x01\x02\x03"))
 
             result = collect_batch_jobs_368_370(con, Path(td))
             row = result["rows"][0]
