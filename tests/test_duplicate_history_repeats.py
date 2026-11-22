@@ -16,6 +16,7 @@ from tools.audit_duplicate_history_repeats import (
     safe_decompress,
     safe_pickle_scan,
     safe_pickle_target_contexts,
+    pickle_target_scalar,
     sha256_file,
     stable_sort_rows,
 )
@@ -123,6 +124,18 @@ class RepeatAuditLogicTests(unittest.TestCase):
         self.assertTrue(status.startswith("genops_failed:"))
         self.assertIsNone(keys)
         self.assertIsNone(strings)
+
+    def test_pickle_target_scalar_reads_only_primitive_adjacent_values(self):
+        raw = pickle.dumps({
+            "batch_rerun": True,
+            "rerun_source_history_id": 12345,
+        }, protocol=4)
+        contexts, status = safe_pickle_target_contexts(raw)
+        self.assertEqual(status, "ok")
+        self.assertEqual(pickle_target_scalar(contexts, "batch_rerun"), (True, "ok"))
+        self.assertEqual(pickle_target_scalar(contexts, "rerun_source_history_id"), (12345, "ok"))
+        self.assertEqual(pickle_target_scalar(contexts, "not_present"),
+                         (None, "target_not_found"))
 
     def test_pickle_target_contexts_are_static_and_extract_adjacent_scalars(self):
         from tools.audit_duplicate_history_repeats import safe_pickle_target_contexts

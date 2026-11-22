@@ -114,6 +114,28 @@ def safe_pickle_target_contexts(decompressed, targets=("batch_rerun", "rerun_sou
     return contexts, "ok"
 
 
+def pickle_target_scalar(contexts, target):
+    """Read only a primitive scalar immediately following a target string opcode."""
+    integer_ops = {"BININT", "BININT1", "BININT2", "INT", "LONG", "LONG1", "LONG4"}
+    for context in contexts or []:
+        if context.get("target") != target:
+            continue
+        for item in context.get("following", []):
+            op, arg = item.get("op"), item.get("arg")
+            if op == "MEMOIZE" or op in ("BINPUT", "LONG_BINPUT", "PUT"):
+                continue
+            if op in integer_ops and isinstance(arg, int) and not isinstance(arg, bool):
+                return arg, "ok"
+            if op == "NEWTRUE":
+                return True, "ok"
+            if op == "NEWFALSE":
+                return False, "ok"
+            if op == "NONE":
+                return None, "ok"
+            return None, f"unsupported_scalar_opcode:{op}"
+    return None, "target_not_found"
+
+
 def write_csv(path, fields, rows):
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -442,6 +464,68 @@ def audit(db_path, db_info_path, expected_generation, expected_commit, outdir):
             json.dumps(pickle_rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (out / "pickle_opcode_contexts.json").write_text(
             json.dumps(pickle_context_rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        # Resolve source-history lineage from primitive pickle opcodes only.
+        hist_by_id = {int(r["history_id"]): r for r in hist}
+        strict_by_id = {int(r["history_id"]): r for rs in strict.values() for r in rs}
+        contexts_by_id = {int(r["history_id"]): r["contexts"] for r in pickle_context_rows}
+        lineage_rows = []
+        for child_id, child in sorted(strict_by_id.items()):
+            contexts = contexts_by_id.get(child_id, [])
+            source_id, source_status = pickle_target_scalar(contexts, "rerun_source_history_id")
+            batch_flag, batch_status = pickle_target_scalar(contexts, "batch_rerun")
+            parent = hist_by_id.get(source_id) if isinstance(source_id, int) else None
+            lineage_rows.append({
+                "race_key": child["race_key"],
+                "history_id": child_id,
+                "prediction_time": child["prediction_time"],
+                "batch_rerun": batch_flag,
+                "batch_rerun_status": batch_status,
+                "rerun_source_history_id": source_id,
+                "source_id_status": source_status,
+                "source_row_found": parent is not None,
+                "source_race_key": parent.get("race_key") if parent else None,
+                "source_app_version": parent.get("app_version") if parent else None,
+                "source_prediction_time": parent.get("prediction_time") if parent else None,
+                "source_settings_hash": parent.get("settings_hash") if parent else None,
+                "source_seed": parent.get("seed") if parent else None,
+                "source_trials": parent.get("trials") if parent else None,
+                "source_raw_text_sha256": parent.get("raw_text_sha256") if parent else None,
+                "same_race": bool(parent and parent.get("race_key") == child.get("race_key")),
+                "same_settings_hash": bool(parent and parent.get("settings_hash") == child.get("settings_hash")),
+                "same_seed": bool(parent and str(parent.get("seed")) == str(child.get("seed"))),
+                "same_trials": bool(parent and str(parent.get("trials")) == str(child.get("trials"))),
+                "same_raw_text_sha256": bool(parent and parent.get("raw_text_sha256") == child.get("raw_text_sha256")),
+                "pickle_loads_called": False,
+            })
+        write_csv(out / "rerun_lineage_109.csv",
+                  ["race_key", "history_id", "prediction_time", "batch_rerun", "batch_rerun_status",
+                   "rerun_source_history_id", "source_id_status", "source_row_found", "source_race_key",
+                   "source_app_version", "source_prediction_time", "source_settings_hash", "source_seed",
+                   "source_trials", "source_raw_text_sha256", "same_race", "same_settings_hash",
+                   "same_seed", "same_trials", "same_raw_text_sha256", "pickle_loads_called"],
+                  lineage_rows)
+        source_ids = [r["rerun_source_history_id"] for r in lineage_rows
+                      if isinstance(r["rerun_source_history_id"], int)]
+        lineage_summary = {
+            "strict_child_rows": len(lineage_rows),
+            "batch_rerun_true_rows": sum(r["batch_rerun"] is True for r in lineage_rows),
+            "source_id_extracted_rows": sum(r["source_id_status"] == "ok" for r in lineage_rows),
+            "source_rows_found": sum(r["source_row_found"] for r in lineage_rows),
+            "same_race_links": sum(r["same_race"] for r in lineage_rows),
+            "same_settings_hash_links": sum(r["same_settings_hash"] for r in lineage_rows),
+            "same_seed_links": sum(r["same_seed"] for r in lineage_rows),
+            "same_trials_links": sum(r["same_trials"] for r in lineage_rows),
+            "same_raw_text_sha256_links": sum(r["same_raw_text_sha256"] for r in lineage_rows),
+            "unique_source_ids": len(set(source_ids)),
+            "source_ids_inside_strict_109": sum(r["rerun_source_history_id"] in strict_by_id
+                                                for r in lineage_rows
+                                                if isinstance(r["rerun_source_history_id"], int)),
+            "external_source_ids": len(set(source_ids) - set(strict_by_id)),
+            "pickle_loads_called": False,
+        }
+        (out / "rerun_lineage_summary.json").write_text(
+            json.dumps(lineage_summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
         gap_bands = Counter()
         for rs in strict.values():
