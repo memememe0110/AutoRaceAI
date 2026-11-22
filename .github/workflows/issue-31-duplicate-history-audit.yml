@@ -1,4 +1,5 @@
 name: Issue 31 Duplicate History Repeat Audit
+# Re-run audit after batch job metadata output was added.
 
 on:
   push:
