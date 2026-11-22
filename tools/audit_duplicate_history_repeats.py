@@ -132,6 +132,74 @@ def is_strict_group(ver326_rows):
     return len(hashes) == 1 and bool(next(iter(hashes)))
 
 
+
+def collect_batch_jobs_368_370(con, out):
+    requested = [368, 369, 370]
+    available = {r[1] for r in con.execute(
+        "PRAGMA table_info(v278_background_jobs)"
+    )}
+    required = {"job_id"}
+    if not required <= available:
+        raise SystemExit("BACKGROUND_JOB_ID_COLUMN_MISSING")
+
+    optional = [
+        "job_type", "status", "total_count", "done_count",
+        "cancel_requested", "pause_requested",
+        "created_at", "started_at", "finished_at", "updated_at",
+        "error_text",
+    ]
+    select_cols = ["job_id"]
+    for col in optional:
+        select_cols.append(
+            f'"{col}"' if col in available else f'NULL AS "{col}"'
+        )
+    if "result_blob" in available:
+        select_cols.append("LENGTH(result_blob) AS result_blob_length")
+    else:
+        select_cols.append("NULL AS result_blob_length")
+
+    placeholders = ",".join("?" for _ in requested)
+    sql = (
+        f"SELECT {','.join(select_cols)} "
+        "FROM v278_background_jobs "
+        f"WHERE job_id IN ({placeholders}) ORDER BY job_id"
+    )
+    rows = [dict(r) for r in con.execute(sql, requested)]
+
+    csv_fields = [
+        "job_id", "job_type", "status", "total_count", "done_count",
+        "cancel_requested", "pause_requested",
+        "created_at", "started_at", "finished_at", "updated_at",
+        "result_blob_length", "error_text", "error_text_length",
+    ]
+    json_rows, csv_rows = [], []
+    for row in rows:
+        raw_err = row.get("error_text")
+        error_text = "" if raw_err is None else str(raw_err)
+        item = dict(row)
+        item["error_text"] = error_text[:500]
+        item["error_text_length"] = None if raw_err is None else len(error_text)
+        item["error_text_truncated"] = len(error_text) > 500
+        json_rows.append(item)
+
+        csv_item = dict(item)
+        csv_item.pop("error_text_truncated", None)
+        csv_rows.append(csv_item)
+
+    write_csv(out / "batch_jobs_368_370.csv", csv_fields, csv_rows)
+    result = {
+        "job_ids_requested": requested,
+        "found": [r["job_id"] for r in rows],
+        "status": "found" if rows else "no_rows_found",
+        "rows": json_rows,
+        "result_blob_content_fetched": False,
+    }
+    (out / "batch_jobs_368_370.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2) + "\\n",
+        encoding="utf-8",
+    )
+    return result
+
 def audit(db_path, db_info_path, expected_generation, expected_commit, outdir):
     db_path, out = Path(db_path).resolve(), Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
@@ -152,6 +220,9 @@ def audit(db_path, db_info_path, expected_generation, expected_commit, outdir):
         integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
         if str(integrity).lower() != "ok":
             raise SystemExit(f"INTEGRITY_CHECK_FAILED:{integrity}")
+
+        # Independent early audit, before the 48/188 and 37/109 population assertions.
+        job_meta = collect_batch_jobs_368_370(con, out)
 
         # Inspect all four SQLite storage types and representative values first.
         job_cols = {r[1] for r in con.execute("PRAGMA table_info(v278_background_jobs)")}
