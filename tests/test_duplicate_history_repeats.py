@@ -130,6 +130,7 @@ class RepeatAuditLogicTests(unittest.TestCase):
             con.execute("""
                 CREATE TABLE v278_background_jobs (
                     job_id INTEGER, job_type TEXT, status TEXT,
+                    app_version TEXT, force_current INTEGER, limit_count INTEGER,
                     total_count INTEGER, done_count INTEGER,
                     cancel_requested INTEGER, pause_requested INTEGER,
                     created_at TEXT, started_at TEXT, finished_at TEXT,
@@ -138,8 +139,8 @@ class RepeatAuditLogicTests(unittest.TestCase):
             """)
             con.execute("""
                 INSERT INTO v278_background_jobs
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (368, "batch_rerun", "completed", 35, 35, 0, 0,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (368, "batch_rerun", "completed", "Ver326", 1, 120, 35, 35, 0, 0,
                   "created", "started", "finished", "updated", "x" * 600,
                   b"\x01\x02\x03"))
 
@@ -147,6 +148,9 @@ class RepeatAuditLogicTests(unittest.TestCase):
             row = result["rows"][0]
             self.assertEqual(result["status"], "found")
             self.assertEqual(result["found"], [368])
+            self.assertEqual(row["app_version"], "Ver326")
+            self.assertEqual(row["force_current"], 1)
+            self.assertEqual(row["limit_count"], 120)
             self.assertEqual(row["result_blob_length"], 3)
             self.assertEqual(row["error_text_length"], 600)
             self.assertTrue(row["error_text_truncated"])

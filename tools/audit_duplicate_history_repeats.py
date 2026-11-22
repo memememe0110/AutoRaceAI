@@ -143,8 +143,8 @@ def collect_batch_jobs_368_370(con, out):
         raise SystemExit("BACKGROUND_JOB_ID_COLUMN_MISSING")
 
     optional = [
-        "job_type", "status", "total_count", "done_count",
-        "cancel_requested", "pause_requested",
+        "job_type", "status", "app_version", "force_current", "limit_count",
+        "total_count", "done_count", "cancel_requested", "pause_requested",
         "created_at", "started_at", "finished_at", "updated_at",
         "error_text",
     ]
@@ -167,8 +167,8 @@ def collect_batch_jobs_368_370(con, out):
     rows = [dict(r) for r in con.execute(sql, requested)]
 
     csv_fields = [
-        "job_id", "job_type", "status", "total_count", "done_count",
-        "cancel_requested", "pause_requested",
+        "job_id", "job_type", "status", "app_version", "force_current", "limit_count",
+        "total_count", "done_count", "cancel_requested", "pause_requested",
         "created_at", "started_at", "finished_at", "updated_at",
         "result_blob_length", "error_text", "error_text_length",
     ]
