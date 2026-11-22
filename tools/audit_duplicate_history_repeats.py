@@ -195,7 +195,7 @@ def collect_batch_jobs_368_370(con, out):
         "result_blob_content_fetched": False,
     }
     (out / "batch_jobs_368_370.json").write_text(
-        json.dumps(result, ensure_ascii=False, indent=2) + "\\n",
+        json.dumps(result, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     return result
