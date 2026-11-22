@@ -78,6 +78,41 @@ def safe_pickle_scan(decompressed):
     # genops alone cannot prove which string literals are dictionary keys.
     return [], sorted(strings), "ok"
 
+def safe_pickle_target_contexts(decompressed, targets=("batch_rerun", "rerun_source_history_id")):
+    """Return static opcode neighborhoods for selected string literals; never unpickle."""
+    string_ops = {"SHORT_BINUNICODE", "BINUNICODE", "UNICODE", "BINUNICODE8"}
+    try:
+        ops = list(pickletools.genops(decompressed))
+    except Exception as e:
+        return None, f"genops_failed:{type(e).__name__}"
+
+    def safe_arg(op, arg):
+        if arg is None or isinstance(arg, (bool, int, float)):
+            return arg
+        if isinstance(arg, str):
+            return arg[:160]
+        if isinstance(arg, bytes):
+            return {"type": "bytes", "length": len(arg)}
+        return {"type": type(arg).__name__}
+
+    contexts = []
+    for i, (op, arg, pos) in enumerate(ops):
+        if op.name in string_ops and arg in targets:
+            following = []
+            for next_op, next_arg, next_pos in ops[i + 1:i + 17]:
+                following.append({
+                    "op": next_op.name,
+                    "arg": safe_arg(next_op, next_arg),
+                    "position": next_pos,
+                })
+            contexts.append({
+                "target": arg,
+                "opcode": op.name,
+                "position": pos,
+                "following": following,
+            })
+    return contexts, "ok"
+
 
 def write_csv(path, fields, rows):
     with path.open("w", newline="", encoding="utf-8-sig") as f:
@@ -379,6 +414,7 @@ def audit(db_path, db_info_path, expected_generation, expected_commit, outdir):
                    "correlation_type", "correlation_is_proven", "skip_reason"], joins)
 
         pickle_rows = []
+        pickle_context_rows = []
         for race_key, race_rows in broad.items():
             for r in race_rows:
                 blob_row = con.execute("SELECT payload FROM v231_prediction_history WHERE history_id=?",
@@ -387,15 +423,25 @@ def audit(db_path, db_info_path, expected_generation, expected_commit, outdir):
                 raw, decomp_status = safe_decompress(blob)
                 if decomp_status == "ok":
                     keys, strings, parse_status = safe_pickle_scan(raw)
+                    opcode_contexts, context_status = safe_pickle_target_contexts(raw)
                 else:
                     keys, strings, parse_status = None, None, decomp_status
+                    opcode_contexts, context_status = None, decomp_status
                 pm = payload_meta[r["history_id"]]
                 pickle_rows.append({"history_id": r["history_id"], "race_key": race_key,
                                     "payload_size": pm["payload_size"], "payload_sha256": pm["payload_sha256"],
                                     "dict_keys": keys, "string_candidates": strings,
                                     "parse_status": parse_status, "pickle_loads_called": False})
+                if opcode_contexts:
+                    pickle_context_rows.append({
+                        "history_id": r["history_id"], "race_key": race_key,
+                        "context_status": context_status, "contexts": opcode_contexts,
+                        "pickle_loads_called": False,
+                    })
         (out / "pickletools_keys.json").write_text(
             json.dumps(pickle_rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (out / "pickle_opcode_contexts.json").write_text(
+            json.dumps(pickle_context_rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
         gap_bands = Counter()
         for rs in strict.values():

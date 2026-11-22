@@ -15,6 +15,7 @@ from tools.audit_duplicate_history_repeats import (
     parse_aware,
     safe_decompress,
     safe_pickle_scan,
+    safe_pickle_target_contexts,
     sha256_file,
     stable_sort_rows,
 )
@@ -122,6 +123,27 @@ class RepeatAuditLogicTests(unittest.TestCase):
         self.assertTrue(status.startswith("genops_failed:"))
         self.assertIsNone(keys)
         self.assertIsNone(strings)
+
+    def test_pickle_target_contexts_are_static_and_extract_adjacent_scalars(self):
+        from tools.audit_duplicate_history_repeats import safe_pickle_target_contexts
+        raw = pickle.dumps({
+            "batch_rerun": True,
+            "rerun_source_history_id": 12345,
+        }, protocol=4)
+        contexts, status = safe_pickle_target_contexts(raw)
+        self.assertEqual(status, "ok")
+        by_target = {x["target"]: x for x in contexts}
+        self.assertIn("batch_rerun", by_target)
+        self.assertIn("rerun_source_history_id", by_target)
+        self.assertTrue(any(x["op"] in ("NEWTRUE", "BININT1", "BININT2", "BININT")
+                            for x in by_target["batch_rerun"]["following"]))
+        self.assertTrue(any(x["op"] in ("BININT1", "BININT2", "BININT")
+                            and x["arg"] == 12345
+                            for x in by_target["rerun_source_history_id"]["following"]))
+        self.assertFalse(any(x["op"] == "REDUCE" for c in contexts for x in c["following"]))
+        contexts, status = safe_pickle_target_contexts(raw[:-2])
+        self.assertTrue(status.startswith("genops_failed:"))
+        self.assertIsNone(contexts)
 
     def test_batch_job_metadata_found_blob_length_and_error_truncation(self):
         with tempfile.TemporaryDirectory() as td:
