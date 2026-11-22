@@ -1,0 +1,335 @@
+[
+  {
+    "race_key": "20260726_飯塚_1R",
+    "source_history_id": 5856,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "283a93182cb4ed5aee924d1ca0b2642019b7ae8d4375e3fafc7934777ba49618"
+  },
+  {
+    "race_key": "20260726_飯塚_2R",
+    "source_history_id": 5857,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "71ab431317dc650b5a94979bc5219c2df984f4afc771648397ae84ae7e094a6b"
+  },
+  {
+    "race_key": "20260726_飯塚_3R",
+    "source_history_id": 5858,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "fe8fdff32e9b76dba7ddf1d5cdc87bcc634499d23eb566d4a2c6e8848ad518cb"
+  },
+  {
+    "race_key": "20260726_飯塚_6R",
+    "source_history_id": 5859,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "f3b01feb388b607692ce1a92a1336c0d00f80df57bf55967bb474e4d18c4c46e"
+  },
+  {
+    "race_key": "20260726_飯塚_7R",
+    "source_history_id": 5860,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "20ae45d8854777fb820a689ee726c55b92790cf4f965bd98c0ded85f7a87ad86"
+  },
+  {
+    "race_key": "20260801_川口_1R",
+    "source_history_id": 5864,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "b4d3a7bc5d149f75c9b69fefc65806dda5ebf26724f44ef8ff34a76496cd8a76"
+  },
+  {
+    "race_key": "20260801_川口_2R",
+    "source_history_id": 5865,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "5c72a1f83dc3ee10c0c3f51e366bb552964c71f3fb54f5f54ce0f4973130f3ff"
+  },
+  {
+    "race_key": "20260801_川口_3R",
+    "source_history_id": 5866,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "2ad88574f4e74dc0eedab0edff4d5de7daed19d82d3ac8b70a6420744c0dfe65"
+  },
+  {
+    "race_key": "20260801_川口_4R",
+    "source_history_id": 5867,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "d3d43d449b57407b95420abf62d95e5ba45401c4eac66ba2ba07fa5c29ac7562"
+  },
+  {
+    "race_key": "20260801_川口_5R",
+    "source_history_id": 5868,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "706e65eddce9eaaf28f13bf3468ad316ab48deb33fd9aee4e6a1fb436f9bfa04"
+  },
+  {
+    "race_key": "20260801_川口_6R",
+    "source_history_id": 5869,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "d68f03aad427160d2fdd3f3d646d1a4314003f3283180428052263110ffeb2eb"
+  },
+  {
+    "race_key": "20260801_川口_7R",
+    "source_history_id": 5870,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "a8c9b0ea3dd3b86e11e91f4d6f8c42324f94ddde63ddc8af31a8a870f58fca9f"
+  },
+  {
+    "race_key": "20260801_川口_8R",
+    "source_history_id": 5871,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "ca25e397d1664feb5317898ef5083f66d3910952b57f04bd77bf78dbf7066bcb"
+  },
+  {
+    "race_key": "20260802_川口_1R",
+    "source_history_id": 5872,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "4506ecc21a103d8b52ba6b39fdfe056f797301d1b1c4c9803c94a6599129216e"
+  },
+  {
+    "race_key": "20260802_川口_2R",
+    "source_history_id": 5873,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "5ef7b512d4e280fac259083cdb3bed7bb7d921ed10ff8ab797ecd7e8fbeacb35"
+  },
+  {
+    "race_key": "20260802_川口_4R",
+    "source_history_id": 5874,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "1b7127efb3e557102da01265cde5a9415a699a7fca66116dbdd79f169bb22815"
+  },
+  {
+    "race_key": "20260802_川口_5R",
+    "source_history_id": 5875,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "2f2519bdf545fa29f92c2efff0ec4accb22bd4cb8edf1343168ed32ac13f17f9"
+  },
+  {
+    "race_key": "20260802_川口_6R",
+    "source_history_id": 5876,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "309b2b3e9245acc267a67887347711a39c186a6c21f2e1f4000e3d2a54686795"
+  },
+  {
+    "race_key": "20260802_川口_8R",
+    "source_history_id": 5877,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "1d1fd5ab64752813c7c3a6f26e64582f8b57047e573bab8886b592755d3db66f"
+  },
+  {
+    "race_key": "20260802_浜松_2R",
+    "source_history_id": 5878,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "c76907703977d5f91c35b7739392d8dc2a6f5d643fc0ccd85322a701368a81b3"
+  },
+  {
+    "race_key": "20260802_浜松_3R",
+    "source_history_id": 5879,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "50d99621061e3bd2a62b507c8d5ab2d3a7cdd4c97966864c08df4cd1571ffe10"
+  },
+  {
+    "race_key": "20260802_浜松_4R",
+    "source_history_id": 5880,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "eb0b3bcffee44c3ff29eb6e2c7d74a9f34925879e328d3addccb864cce39d122"
+  },
+  {
+    "race_key": "20260802_浜松_5R",
+    "source_history_id": 5881,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "0ca85f70f024f1a7ad2b4eb70c309ae8c332bd68557851d0fe18c2dcddcccb87"
+  },
+  {
+    "race_key": "20260802_浜松_6R",
+    "source_history_id": 5882,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "cbbaab6f9093f4e73c981f66bc8d13a6902cd16bc34faa5634a7bd231c694f66"
+  },
+  {
+    "race_key": "20260802_浜松_7R",
+    "source_history_id": 5883,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "d6a9f0304505c0482956ec58b2d168f5bfce726a37c4e548d3d1e287fa534a56"
+  },
+  {
+    "race_key": "20260802_浜松_8R",
+    "source_history_id": 5884,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "269d7a89f0c7185486be0ffb7bf67e3fa59428880f3b33cc5e70395c7ef323c9"
+  },
+  {
+    "race_key": "20260802_浜松_9R",
+    "source_history_id": 5885,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "0a0eadcf56e556357db5e05c04ea6d881c059b55d811d5ec69122f856d0ba00b"
+  },
+  {
+    "race_key": "20260802_浜松_10R",
+    "source_history_id": 5886,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "e2976c98778de4187d7dd337c386bdbe723f1a3cb68db22f4e29be1b4ec11529"
+  },
+  {
+    "race_key": "20260802_浜松_11R",
+    "source_history_id": 5887,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "737548434e6f78be5adfbece6be6efa24d611a39695e4bf3291ede028c58fc18"
+  },
+  {
+    "race_key": "20260802_浜松_12R",
+    "source_history_id": 5888,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "0b777a1cf1e115099591e6f3e7875d73dc13f0a98ff5e33576073e58c0750ab7"
+  },
+  {
+    "race_key": "20260803_川口_1R",
+    "source_history_id": 5889,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "469a04a618a38a7d44ee7d78d1e2658d54695b4f42aae977b06610094c3a992a"
+  },
+  {
+    "race_key": "20260803_川口_2R",
+    "source_history_id": 5890,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "e7d8afb92d2babc7fdd9b90c2bc0eb89acfa730a3abc233c04edba6ffe56c9dc"
+  },
+  {
+    "race_key": "20260803_川口_3R",
+    "source_history_id": 5891,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "ffc116591adcee44db5cea1eb93a1062d9b2ac727bcee97ef4d46750962875c6"
+  },
+  {
+    "race_key": "20260803_川口_4R",
+    "source_history_id": 5892,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "54e62797650f5eeaa3821f1b2577901c4d767d8c58c08ecad631577c5cfacdae"
+  },
+  {
+    "race_key": "20260803_川口_5R",
+    "source_history_id": 5893,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "d9ea0bc3128125e86baa4fe0324e82e6c2918145467dd6b10b95a0cd13a381c7"
+  },
+  {
+    "race_key": "20260803_川口_6R",
+    "source_history_id": 5894,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "08a84199f5a24ff256ee056fa6cf5d78f0f41baae0ceaf7bb31958e0900058a1"
+  },
+  {
+    "race_key": "20260803_川口_7R",
+    "source_history_id": 5895,
+    "child_app_version": "Ver326",
+    "child_settings_hash": "6a6084b95aa3262e",
+    "child_seed": "20260719",
+    "child_trials": "20000",
+    "child_raw_text_sha256": "8997c35042cc01ce951bdfdb804d0257412124de07fc40bf15cfc7cebc333df9"
+  }
+]

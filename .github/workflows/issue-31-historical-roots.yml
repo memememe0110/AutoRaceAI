@@ -1,0 +1,53 @@
+name: Issue 31 Historical External Root Audit
+on:
+  push:
+    branches: [tmp-audit-31-repeats]
+    paths:
+      - "tools/audit_issue31_historical_roots.py"
+      - "tools/issue31_external_roots.json"
+      - "tests/test_issue31_historical_roots.py"
+      - ".github/workflows/issue-31-historical-roots.yml"
+permissions:
+  contents: read
+concurrency:
+  group: issue-31-historical-root-audit
+  cancel-in-progress: false
+env:
+  REPO: ${{ github.repository }}
+  DB_COMMIT_SHA: 1591b29cce19cfcba38bd32238c1e8c3100246f0
+  EXPECTED_GENERATION: "489"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: python -m py_compile tools/audit_issue31_historical_roots.py tests/test_issue31_historical_roots.py
+      - run: python -m unittest discover -s tests -t . -p "test_issue31_historical_roots.py" -v
+  audit:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: ${{ github.sha }}, fetch-depth: 1}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Fetch immutable historical DB snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python tools/prospective_collector.py fetch-db --repo "$REPO" --branch "$DB_COMMIT_SHA" --out work/historical.sqlite3 --info-out work/db_info.json
+      - name: Run read-only root lookup
+        run: |
+          set -euo pipefail
+          python tools/audit_issue31_historical_roots.py --db work/historical.sqlite3 --db-info work/db_info.json --expected-generation "$EXPECTED_GENERATION" --expected-commit "$DB_COMMIT_SHA" --reference-json tools/issue31_external_roots.json --outdir work/historical_root_audit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issue-31-historical-roots-${{ github.run_id }}
+          path: work/historical_root_audit/
+          if-no-files-found: error
+          retention-days: 30
