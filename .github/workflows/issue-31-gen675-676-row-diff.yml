@@ -1,0 +1,78 @@
+name: Issue 31 Gen675-676 Full History Row Diff
+on:
+  push:
+    branches:
+      - tmp-audit-31-repeats
+    paths:
+      - ".github/workflows/issue-31-gen675-676-row-diff.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-31-gen675-676-full-row-diff
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m py_compile tools/audit_issue31_history_row_diff.py tests/test_issue31_history_row_diff.py
+      - run: python -m unittest discover -s tests -t . -p "test_issue31_history_row_diff.py" -v
+
+  diff:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch immutable Gen675 and Gen676 DB snapshots
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/gen675 work/gen676
+          python tools/prospective_collector.py fetch-db --repo "$REPO" --branch "590d5e4c45f6c6d53e89b928ef68a19b89c68011" --out work/gen675/db.sqlite3 --info-out work/gen675/db_info.json
+          python tools/prospective_collector.py fetch-db --repo "$REPO" --branch "c9e300b210da0d6d262b16d0c5527f8626f13d7e" --out work/gen676/db.sqlite3 --info-out work/gen676/db_info.json
+          for GEN in 675 676; do
+            if [ "$GEN" = "675" ]; then SHA="590d5e4c45f6c6d53e89b928ef68a19b89c68011"; else SHA="c9e300b210da0d6d262b16d0c5527f8626f13d7e"; fi
+            INFO="work/gen${GEN}/db_info.json"
+            MANIFEST_SHA="$(gh api "repos/${REPO}/contents/autorace_players.sqlite3.chunks.json?ref=${SHA}" --jq .sha)"
+            python - "$INFO" "$MANIFEST_SHA" <<'PY'
+          import json, sys
+          from pathlib import Path
+          p=Path(sys.argv[1]); d=json.loads(p.read_text(encoding="utf-8"))
+          d["manifest_blob_sha"]=sys.argv[2]
+          p.write_text(json.dumps(d,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+          PY
+          done
+      - name: Compare every history row read-only
+        run: |
+          set -euo pipefail
+          python tools/audit_issue31_history_row_diff.py \
+            --db-a work/gen675/db.sqlite3 --info-a work/gen675/db_info.json \
+            --gen-a 675 --commit-a 590d5e4c45f6c6d53e89b928ef68a19b89c68011 \
+            --db-b work/gen676/db.sqlite3 --info-b work/gen676/db_info.json \
+            --gen-b 676 --commit-b c9e300b210da0d6d262b16d0c5527f8626f13d7e \
+            --roots-json tools/issue31_external_roots.json --outdir work/history_row_diff
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issue-31-gen675-676-history-row-diff-${{ github.run_id }}
+          path: work/history_row_diff/
+          if-no-files-found: error
+          retention-days: 30
