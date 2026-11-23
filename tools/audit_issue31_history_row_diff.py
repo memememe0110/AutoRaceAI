@@ -54,6 +54,31 @@ def load_snapshot(path, info_path, expected_gen, expected_commit):
         con.close()
     return info, cols, rows, integrity
 
+def extra_db_inventory(path):
+    con=open_readonly(path)
+    try:
+        tables={str(r[0]) for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        out={"tables":{}}
+        for table in ("v252_lap_prediction_snapshots","v319_prediction_history_archive","v319_lap_snapshots_archive"):
+            if table not in tables:
+                out["tables"][table]={"exists":False,"count":0}
+                continue
+            n=int(con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            cols=[r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
+            item={"exists":True,"count":n,"columns":cols}
+            if "app_version" in cols:
+                item["by_app_version"]=[{"app_version":str(r[0] or "(NULL)"),"count":int(r[1])}
+                    for r in con.execute(f'SELECT COALESCE(app_version,"(NULL)"),COUNT(*) FROM "{table}" GROUP BY 1 ORDER BY 2 DESC,1')]
+            out["tables"][table]=item
+        if "v231_prediction_history" in tables:
+            out["history_version_settings"]=[
+                {"app_version":str(r[0] or "(NULL)"),"settings_hash":str(r[1] or "(NULL)"),"count":int(r[2])}
+                for r in con.execute("""SELECT COALESCE(app_version,'(NULL)'),COALESCE(settings_hash,'(NULL)'),COUNT(*)
+                    FROM v231_prediction_history GROUP BY 1,2 ORDER BY 1,2""")]
+        return out
+    finally:
+        con.close()
+
 def normalized_row(row):
     return {k: cell_value(k, v) for k, v in row.items()}
 
@@ -74,6 +99,8 @@ def audit(db_a, info_a, gen_a, commit_a, db_b, info_b, gen_b, commit_b, roots_js
     if ca != cb:
         raise SystemExit("SCHEMA_MISMATCH")
     roots = {int(x["source_history_id"]): x for x in json.loads(Path(roots_json).read_text(encoding="utf-8"))}
+    extra_a=extra_db_inventory(db_a)
+    extra_b=extra_db_inventory(db_b)
     ids_a, ids_b = set(a), set(b)
     deleted_ids = sorted(ids_a - ids_b)
     added_ids = sorted(ids_b - ids_a)
@@ -146,6 +173,8 @@ def audit(db_a, info_a, gen_a, commit_a, db_b, info_b, gen_b, commit_b, roots_js
         "deleted_prediction_time_bounds":time_bounds(deleted),
         "retained_prediction_time_bounds":time_bounds([a[x] for x in common_ids]),
         "deleted_by_race_date":grouped(deleted,"race_key",lambda x: str(x)[:8] if x else "(NULL)"),
+        "gen_a_extra_db_inventory":extra_a,
+        "gen_b_extra_db_inventory":extra_b,
         "database_open_mode":"ro","query_only":True,"pickle_loads_called":False,
         "large_text_and_blob_content_exported":False
     }
