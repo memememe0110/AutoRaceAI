@@ -25,19 +25,54 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Inspect snapshots in chronological order until first missing root
+      - name: Resolve DB generation commits
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           mkdir -p work/intermediate
-          : > work/intermediate/boundary.txt
-          while read -r GEN SHA; do
-            echo "=== generation ${GEN} ${SHA} ==="
-            DB="work/intermediate/gen${GEN}.sqlite3"
-            INFO="work/intermediate/gen${GEN}_db_info.json"
-            OUT="work/intermediate/gen${GEN}_root_audit"
+          for PAGE in 1 2 3 4 5; do
+            gh api "repos/${REPO}/commits?sha=autorace-db&per_page=100&page=${PAGE}" > "work/intermediate/commits_${PAGE}.json"
+          done
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+          rows=[]
+          for n in range(1,6):
+              rows.extend(json.loads(Path(f"work/intermediate/commits_{n}.json").read_text()))
+          found={}
+          for c in rows:
+              msg=c.get("commit",{}).get("message","")
+              m=re.search(r"DB世代\s*(\d+).*atomic",msg)
+              if not m: continue
+              g=int(m.group(1))
+              found.setdefault(g,{"sha":c["sha"],"commit_date":c["commit"]["committer"]["date"],"message":msg.splitlines()[0]})
+          missing=[g for g in range(497,706) if g not in found]
+          if missing:
+              raise SystemExit(f"Missing generation commits: {missing}")
+          Path("work/intermediate/commit_map.json").write_text(
+              json.dumps({str(g):found[g] for g in range(497,706)},ensure_ascii=False,indent=2)+"\n",
+              encoding="utf-8")
+          print(f"Resolved {len(found)} DB generations; required 497..705 all present.")
+          PY
+      - name: Binary-search the first missing source-root generation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          LOW=496
+          HIGH=705
+          printf 'generation,commit_sha,commit_date,saved_at,db_sha256,manifest_blob_sha,source_rows_found,source_rows_missing\n' > work/intermediate/binary_search_steps.csv
+          while [ "$((HIGH - LOW))" -gt 1 ]; do
+            MID=$(((LOW + HIGH) / 2))
+            SHA="$(python -c 'import json,sys; print(json.load(open("work/intermediate/commit_map.json"))[sys.argv[1]]["sha"])' "$MID")"
+            COMMIT_DATE="$(python -c 'import json,sys; print(json.load(open("work/intermediate/commit_map.json"))[sys.argv[1]]["commit_date"])' "$MID")"
+            echo "=== audit generation ${MID} ${SHA} ==="
+            DB="work/intermediate/gen${MID}.sqlite3"
+            INFO="work/intermediate/gen${MID}_db_info.json"
+            OUT="work/intermediate/gen${MID}_root_audit"
             python tools/prospective_collector.py fetch-db \
               --repo "$REPO" --branch "$SHA" --out "$DB" --info-out "$INFO"
             MANIFEST_SHA="$(gh api "repos/${REPO}/contents/autorace_players.sqlite3.chunks.json?ref=${SHA}" --jq .sha)"
@@ -51,29 +86,33 @@ jobs:
           PY
             python tools/audit_issue31_historical_roots.py \
               --db "$DB" --db-info "$INFO" \
-              --expected-generation "$GEN" --expected-commit "$SHA" \
+              --expected-generation "$MID" --expected-commit "$SHA" \
               --reference-json tools/issue31_external_roots.json --outdir "$OUT"
             FOUND="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_rows_found"])' "$OUT/external_roots_summary.json")"
             MISSING="$((37 - FOUND))"
-            printf 'generation=%s commit=%s source_rows_found=%s source_rows_missing=%s\n' "$GEN" "$SHA" "$FOUND" "$MISSING" | tee -a work/intermediate/boundary.txt
-            rm -f "$DB"
-            if [ "$FOUND" -lt 37 ]; then
-              echo "FIRST_GENERATION_WITH_MISSING_ROOTS=$GEN" | tee -a work/intermediate/boundary.txt
-              break
+            SAVED_AT="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["manifest_saved_at"])' "$INFO")"
+            DB_SHA="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["db_sha256"])' "$INFO")"
+            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$MID" "$SHA" "$COMMIT_DATE" "$SAVED_AT" "$DB_SHA" "$MANIFEST_SHA" "$FOUND" "$MISSING" | tee -a work/intermediate/binary_search_steps.csv
+            rm -f "$DB" "${DB}-wal" "${DB}-shm"
+            if [ "$FOUND" -eq 37 ]; then
+              LOW="$MID"
+              echo "ALL_37_PRESENT: LOW=${LOW} HIGH=${HIGH}"
+            else
+              HIGH="$MID"
+              echo "ROOTS_MISSING: LOW=${LOW} HIGH=${HIGH}"
             fi
-            echo "ALL_37_ROOTS_PRESENT_THROUGH=$GEN" | tee -a work/intermediate/boundary.txt
-          done <<'EOF'
-          491 adfab799ba2c01cb0183d3dcd03eb4c5f0e0f1cd
-          492 6c45163fa840399f00e2d3903b8d84f49e18c11e
-          493 d21a792f5074b171429502bf4b17cacdbc95995a
-          494 09bf2fb47463d35f95ccf6412bcee228a08fda2c
-          495 188b336c05b320b3a6f2af7aa1b3f52ac8b19b87
-          496 1f398fd69af9f0af25abb98c9b1a35b062ebdaa7
-          EOF
-          echo "Boundary audit complete."
+          done
+          {
+            echo "last_present_generation=${LOW}"
+            echo "first_missing_generation=${HIGH}"
+            echo "assumption=monotonic_non_reappearance"
+            echo "known_endpoint_gen496_present=37/37"
+            echo "known_endpoint_gen705_missing=37/37"
+          } | tee work/intermediate/boundary.txt
+          echo "Candidate boundary: Gen${LOW} present; Gen${HIGH} first missing (binary-search assumption)."
       - uses: actions/upload-artifact@v4
         with:
-          name: issue-31-intermediate-snapshot-boundary-${{ github.run_id }}
+          name: issue-31-intermediate-snapshot-binary-search-${{ github.run_id }}
           path: work/intermediate/
           if-no-files-found: error
           retention-days: 30
