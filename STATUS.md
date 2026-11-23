@@ -209,3 +209,23 @@ Jobメタデータ:
 4. Job368〜370とrace_keyの直接対応を示す永続データがないか、workerログ・結果blobの静的調査を継続する。pickle payloadの実行・デシリアライズは禁止。
 5. `force_current=1` は重複生成の有力候補として保持するが、Gen675までrootが残存した事実から、root消失の直接原因とは分けて扱う。
 6. 直接原因が特定できた後、ユーザー承認を得てIssue #31と正式な `docs/status/STATUS.md` へ反映する。現時点で正式ボードは未変更。
+
+
+#### GitHub Release上のGen675完全一致DBバックアップを確認（2026-11-23）
+
+GitHub Releases一覧でRelease `db-20261106-001313` を発見。Release本文は `Built from 590d5e4c45f6c6d53e89b928ef68a19b89c68011 (immutable)` と記載し、Gen675 DBを保存したコミットSHAと完全一致する。
+
+- Release: https://github.com/memememe0110/AutoRaceAI/releases/tag/db-20261106-001313
+- Asset: `autorace_players.sqlite3`
+- Asset size: 988,090,368 bytes
+- Asset SHA-256: `d5e7c141ae0e66708a53b2e8ac4d7035d019aeaf98cba596bc83d9d2d128d7ac`
+- Gen675監査記録のDB SHA-256: 同じく `d5e7c141ae0e66708a53b2e8ac4d7035d019aeaf98cba596bc83d9d2d128d7ac`
+- Release published: 2026-11-06T00:13:14Z
+
+**確定:** Release assetはGen675 DBとSHA-256が一致するため、Gen675の完全DBスナップショットそのもの（バイト単位で同一）である。Gen675では37件の元履歴が37/37存在し、Gen675→Gen676の差分で削除されたVer322〜324の履歴1,365行・周回スナップショット8,196行もGen675側に存在することが既存のread-only監査で確認済み。したがって、旧Ver整理前の完全DBバックアップはGitHub Release上に現存する。
+
+**区別:** これはアーカイブ処理が出力する `autorace_players_old_versions_backup.sqlite3` そのものではなく、旧Ver整理前のメインDB全体 `autorace_players.sqlite3`。別SQLiteアーカイブファイルの現存は依然未確認。ただし、37 rootと削除対象行を検証するための復元元データは確保できている。
+
+**次の安全な手順:** Release assetを取得し、read-onlyでSHA-256再検証、`integrity_check`、37 root ID、Ver322〜324の履歴1,365行と周回snapshot 8,196行を照合する。必要ならGen675 DBから削除対象だけを別の新規DB/CSVへ抽出する。Gen676や本番DBへの上書き・復元は行わない。
+
+GitHub code searchでは `autorace_players_old_versions_backup.sqlite3` および `old_versions_backup sqlite3` は検索結果なし。これはGitHubリポジトリ検索上で見つからなかったという意味に限り、Streamlit runtimeやローカル保存先に存在しない証拠ではない。
