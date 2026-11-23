@@ -1,0 +1,45 @@
+name: Issue 31 Verify Gen675 Release Backup
+on:
+  push:
+    branches:
+      - tmp-audit-31-repeats
+    paths:
+      - ".github/workflows/issue-31-verify-gen675-release.yml"
+      - "tools/verify_issue31_gen675_release.py"
+      - "tools/issue31_external_roots.json"
+permissions:
+  contents: read
+concurrency:
+  group: issue-31-verify-gen675-release
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Download immutable release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          gh release download db-20261106-001313 --repo "${GITHUB_REPOSITORY}" --pattern autorace_players.sqlite3 --dir work
+          test -s work/autorace_players.sqlite3
+          sha256sum work/autorace_players.sqlite3
+      - name: Verify hash, integrity, roots and export deleted versions
+        run: |
+          set -euo pipefail
+          python tools/verify_issue31_gen675_release.py --db work/autorace_players.sqlite3 --roots tools/issue31_external_roots.json --outdir work/gen675_recovered
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issue-31-gen675-verified-old-version-data-${{ github.run_id }}
+          path: work/gen675_recovered/
+          if-no-files-found: error
+          retention-days: 30
