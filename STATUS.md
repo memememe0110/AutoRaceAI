@@ -254,3 +254,26 @@ Workflow artifact: [issue-31-gen675-verified-old-version-data-45144072912](https
 - `summary.json`
 
 これは別ファイルへの抽出であり、Gen675元DB・Gen676 DB・本番DBのいずれも変更していない。復元・上書きは実施していない。
+
+
+#### Gen675→Gen676 cleanupの使い捨てSQLite再現完了（2026-11-23）
+
+- Workflow Run: [#45146199262](https://github.com/memememe0110/AutoRaceAI/actions/runs/45146199262)、SUCCESS（test/reproduce両ジョブ成功）
+- 実行commit: `2864c721aba4b7da97850fb6992a3e9c725aacd4`
+- Gen675 Release DBを取得し、SHA-256 `d5e7c141ae0e66708a53b2e8ac4d7035d019aeaf98cba596bc83d9d2d128d7ac` を再確認。
+- Gen676 DBもcommit `c9e300b210da0d6d262b16d0c5527f8626f13d7e` から取得。SHA-256 `72b99a0a92be5255c1f87b03823c4a2f41ba8e6514a5b1f1be1eb88c305cdeda`、integrity_check=ok。
+- Gen675/Gen676両DBはread-only、query_only=ONで検査。pickle.loads/load未使用。
+- Stage 1: Gen675のVer322/323/324履歴1,365行とLap snapshot 8,196行をアーカイブ表へ退避し、メイン表から削除。退避件数はそれぞれ1,365/8,196。
+- Stage 1後のメイン表は履歴2,704行、Lap snapshot 10,626行。
+- Stage 2: アーカイブ表を別SQLite `old_versions_archive_reproduction.sqlite3` へexportし、メインDB側のアーカイブ表をDROP、VACUUM。
+- Stage 2後のメインDB対象2テーブルはGen676と行単位digestが両方一致:
+  - `v231_prediction_history`: 2,704行、SHA-256 `65aa7bcfe54c47be371628293aea1c30e9605cac11a7d5f40e137248e078750b`
+  - `v252_lap_prediction_snapshots`: 10,626行、SHA-256 `ca30e3e4661702f3fb4794acf2986d0f03756bf8c98a6a71ab7d7126119bac1f`
+- 別SQLiteへのexport結果: 履歴1,365行、Lap snapshot 8,196行。root履歴37/37を保持。
+- main DB / archive DBのintegrity_checkはいずれもok。
+- ログ上 `production_db_touched=false`、`gen675_gen676_modified=false`。
+- Artifact: [issue-31-gen675-cleanup-reproduction-45146199262](https://github.com/memememe0110/AutoRaceAI/actions/runs/45146199262/artifacts/14803977379)、ID `14803977379`、サイズ56,816,154 bytes、30日保持。
+
+**判定:** Gen675→Gen676で観測した対象テーブルの削除後状態は、旧Verアーカイブ→本体DELETE→別SQLite export→archive表DROP→VACUUMの手順で、使い捨てDB上に再現できた。対象2テーブルはGen676と行単位ハッシュ一致。これはデータ状態の再現成功であり、2026-11-09に実際にこのUI操作が行われたことや、当時のアーカイブファイルが現存することを証明するものではない。
+
+**変更範囲:** 監査スクリプト・テスト・Workflowのみ。予測ロジック、save/restore本番コード、app version、本番DB、Gen675/Gen676は変更なし。正式な `docs/status/STATUS.md` とIssue #31も未変更。
