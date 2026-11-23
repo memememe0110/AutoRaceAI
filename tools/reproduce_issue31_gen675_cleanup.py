@@ -108,17 +108,20 @@ def main():
                 stage2 = td / "stage2.sqlite3"
                 shutil.copy2(stage1, stage2)
                 main_db = sqlite3.connect(stage2)
-                archive_db = sqlite3.connect(out / "old_versions_archive_reproduction.sqlite3")
+                archive_path = out / "old_versions_archive_reproduction.sqlite3"
+                main_db.execute("ATTACH DATABASE ? AS archive", (str(archive_path),))
+                archive_db = None
                 try:
                     for src_table, dst_table in (
                         ("v319_prediction_history_archive","v231_prediction_history"),
                         ("v319_lap_snapshots_archive","v252_lap_prediction_snapshots")
                     ):
-                        archive_db.execute(f'CREATE TABLE "{dst_table}" AS SELECT * FROM main."{src_table}"')
-                        main_db.execute(f'DROP TABLE "{src_table}"')
-                    archive_db.commit()
+                        main_db.execute(f'CREATE TABLE archive."{dst_table}" AS SELECT * FROM main."{src_table}"')
+                        main_db.execute(f'DROP TABLE main."{src_table}"')
                     main_db.commit()
+                    main_db.execute("DETACH DATABASE archive")
                     main_db.execute("VACUUM")
+                    archive_db = sqlite3.connect(archive_path)
                     stage2_main = {t: digest_rows(main_db,t) for t in TABLES}
                     stage2_archive = {t: digest_rows(archive_db,t) for t in TABLES}
                     if stage2_archive[TABLES[0]]["count"] != EXPECTED[TABLES[0]] or stage2_archive[TABLES[1]]["count"] != EXPECTED[TABLES[1]]:
@@ -153,7 +156,8 @@ def main():
                     (out/"reproduction_summary.json").write_text(json.dumps(result,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
                     print(json.dumps(result,ensure_ascii=False,indent=2))
                 finally:
-                    main_db.close(); archive_db.close()
+                    main_db.close()
+                    if archive_db is not None: archive_db.close()
             finally:
                 try: w.close()
                 except Exception: pass
