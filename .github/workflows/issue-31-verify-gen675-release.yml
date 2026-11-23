@@ -1,4 +1,4 @@
-name: Issue 31 Verify Gen675 Release Backup
+name: Issue 31 Verify Gen675 Release Backup and Reproduce Cleanup
 on:
   push:
     branches:
@@ -6,6 +6,8 @@ on:
     paths:
       - ".github/workflows/issue-31-verify-gen675-release.yml"
       - "tools/verify_issue31_gen675_release.py"
+      - "tools/reproduce_issue31_gen675_cleanup.py"
+      - "tests/test_reproduce_issue31_gen675_cleanup.py"
       - "tools/issue31_external_roots.json"
 permissions:
   contents: read
@@ -13,9 +15,9 @@ concurrency:
   group: issue-31-verify-gen675-release
   cancel-in-progress: false
 jobs:
-  verify:
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,22 +26,52 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Download immutable release asset
+      - name: Compile and test audit code
+        run: |
+          set -euo pipefail
+          python -m py_compile tools/verify_issue31_gen675_release.py tools/reproduce_issue31_gen675_cleanup.py tests/test_reproduce_issue31_gen675_cleanup.py
+          python -m unittest discover -s tests -t . -p "test_reproduce_issue31_gen675_cleanup.py" -v
+  reproduce:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Download immutable Gen675 release database
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p work
-          gh release download db-20261106-001313 --repo "${GITHUB_REPOSITORY}" --pattern autorace_players.sqlite3 --dir work
-          test -s work/autorace_players.sqlite3
-          sha256sum work/autorace_players.sqlite3
-      - name: Verify hash, integrity, roots and export deleted versions
+          mkdir -p work/gen675 work/gen676 work/reproduction
+          gh release download db-20261106-001313 --repo "${GITHUB_REPOSITORY}" --pattern autorace_players.sqlite3 --dir work/gen675
+          mv work/gen675/autorace_players.sqlite3 work/gen675/db.sqlite3
+          sha256sum work/gen675/db.sqlite3
+      - name: Fetch immutable Gen676 database
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          python tools/verify_issue31_gen675_release.py --db work/autorace_players.sqlite3 --roots tools/issue31_external_roots.json --outdir work/gen675_recovered
+          python tools/prospective_collector.py fetch-db --repo "$REPO" --branch "c9e300b210da0d6d262b16d0c5527f8626f13d7e" --out work/gen676/db.sqlite3 --info-out work/gen676/db_info.json
+      - name: Independently verify Gen675 and export baseline rows
+        run: |
+          set -euo pipefail
+          python tools/verify_issue31_gen675_release.py --db work/gen675/db.sqlite3 --roots tools/issue31_external_roots.json --outdir work/gen675_recovered
+      - name: Reproduce old-version archive, deletion, export and drop on disposable copy
+        run: |
+          set -euo pipefail
+          python tools/reproduce_issue31_gen675_cleanup.py --gen675 work/gen675/db.sqlite3 --gen676 work/gen676/db.sqlite3 --roots tools/issue31_external_roots.json --outdir work/reproduction
       - uses: actions/upload-artifact@v4
         with:
-          name: issue-31-gen675-verified-old-version-data-${{ github.run_id }}
-          path: work/gen675_recovered/
+          name: issue-31-gen675-cleanup-reproduction-${{ github.run_id }}
+          path: |
+            work/gen675_recovered/
+            work/reproduction/
           if-no-files-found: error
           retention-days: 30
