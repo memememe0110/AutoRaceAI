@@ -5,6 +5,8 @@ on:
       - tmp-audit-31-repeats
     paths:
       - ".github/workflows/issue-31-gen675-676-row-diff.yml"
+      - "tools/audit_issue31_history_row_diff.py"
+      - "tests/test_issue31_history_row_diff.py"
 
 permissions:
   contents: read
