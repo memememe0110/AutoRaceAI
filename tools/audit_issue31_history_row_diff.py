@@ -112,6 +112,16 @@ def audit(db_a, info_a, gen_a, commit_a, db_b, info_b, gen_b, commit_b, roots_js
               grouped(deleted,"race_key",lambda x: str(x)[:8] if x else "(NULL)"), ["value","count"])
 
     deleted_root_ids = sorted(set(deleted_ids) & set(roots))
+    def date_only(x):
+        return str(x)[:10] if x else "(NULL)"
+    def time_bounds(rows):
+        vals=sorted(str(r.get("prediction_time")) for r in rows if r.get("prediction_time"))
+        return {"min": vals[0] if vals else None, "max": vals[-1] if vals else None}
+    root_details=[]
+    for hid in deleted_root_ids:
+        row=next(r for r in deleted if int(r["history_id"])==hid)
+        root_details.append({k:row.get(k) for k in ("history_id","race_key","app_version","prediction_time",
+            "settings_hash","simulation_mode","seed","trials","venue_override","raw_text")})
     summary = {
         "gen_a": {"generation":ia.get("manifest_generation"),"commit_sha":ia.get("commit_sha"),
                   "saved_at":ia.get("manifest_saved_at"),"db_sha256":ia.get("db_sha256"),
@@ -125,8 +135,16 @@ def audit(db_a, info_a, gen_a, commit_a, db_b, info_b, gen_b, commit_b, roots_js
         "deleted_history_id_max":max(deleted_ids) if deleted_ids else None,
         "external_roots_expected":len(roots),"external_roots_deleted":len(deleted_root_ids),
         "deleted_external_root_ids":deleted_root_ids,
+        "deleted_external_root_details":root_details,
         "deleted_external_root_race_keys":[roots[x].get("race_key") for x in deleted_root_ids],
         "deleted_by_app_version":grouped(deleted,"app_version"),
+        "retained_by_app_version":grouped([normalized_row(a[x]) for x in common_ids],"app_version"),
+        "deleted_by_settings_hash":grouped(deleted,"settings_hash"),
+        "deleted_by_simulation_mode":grouped(deleted,"simulation_mode"),
+        "deleted_by_venue_override":grouped(deleted,"venue_override"),
+        "deleted_by_prediction_date":grouped(deleted,"prediction_time",lambda x: date_only(x)),
+        "deleted_prediction_time_bounds":time_bounds(deleted),
+        "retained_prediction_time_bounds":time_bounds([a[x] for x in common_ids]),
         "deleted_by_race_date":grouped(deleted,"race_key",lambda x: str(x)[:8] if x else "(NULL)"),
         "database_open_mode":"ro","query_only":True,"pickle_loads_called":False,
         "large_text_and_blob_content_exported":False
