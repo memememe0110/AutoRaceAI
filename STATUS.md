@@ -15,7 +15,9 @@
 
 よって109件すべてについて、参照先となる再実行元履歴の実在を、世代705または過去世代のDBで確認できた。37件の参照元は世代489・490の時点では存在し、世代705では不在である。
 
-**未確定:** 元履歴37件が消えた正確な時点・操作・原因。Job 368〜370と個別レース履歴の直接対応。時間窓の一致は相関であり、直接JOINではない。
+**更新（2026-11-23）:** Gen675/676の全行差分で、Ver322〜324の履歴1,365行と周回スナップショット8,196行だけが消え、Ver325〜328は全件残存・同一内容だった。Gen676直前のapp.pyには、このバージョン選択に基づき旧Verをアーカイブ表へ移して本体からDELETEし、別SQLiteへ書き出した後にアーカイブ表をDROP+VACUUMする機能が存在した。データ差分はこの機能と非常によく一致するため、**最有力原因は旧Verアーカイブ・本体削除機能の実行**へ更新する。ただし、実際のUI操作・選択keep_versions・出力されたバックアップファイルの保存状態は記録がなく、操作実行そのものは未証明。
+
+**未確定:** 実際に押されたUI操作とkeep_versions、アーカイブ別ファイルの現存・保管場所。Job 368〜370と個別レース履歴の直接対応。時間窓の一致は相関であり、直接JOINではない。
 
 ## 2. 過去DB世代の監査結果
 
@@ -98,6 +100,48 @@ Run: [#45112544906](https://github.com/memememe0110/AutoRaceAI/actions/runs/4511
 
 この差分は、Gen676保存時に少なくとも2つの履歴系テーブルが大幅に縮小したことを示す。**最有力仮説は、Gen676の手動DB保存時に、すでに履歴が間引かれた／古いDB状態が保存されたこと、または保存前に対象テーブルの整理・置換が行われたこと。** ただし、手動保存処理自体が削除を実行したのか、保存元DBがすでに削除済みだったのかは未証明。DB branchのGen676 commitはmanifest/chunkの変更のみで、アプリケーションコードの変更ではない。
 
+#### Gen675/676の全行差分と削除パターン（2026-11-23）
+
+Run [#45121675771](https://github.com/memememe0110/AutoRaceAI/actions/runs/45121675771) で全行差分を実施。追加分類・アーカイブ表棚卸しはRun [#45123549751](https://github.com/memememe0110/AutoRaceAI/actions/runs/45123549751) で再実行。両Runともテスト・DB取得・read-only照合・artifact保存がSUCCESS。最終artifact `14794503868`。
+
+- Gen675: 4,069行、Gen676: 2,704行。
+- 削除1,365行、追加0行、両方に残った2,704行は全列ハッシュ一致（changed_retained=0）。
+- 削除されたhistory_idは5409〜8263。37 root ID（5856〜5895の対象37件）は37/37すべて削除行に含まれる。
+- 削除1,365行はVer322=447、Ver323=447、Ver324=471のみ。Gen676に残る2,704行はVer325=14、Ver326=1,650、Ver327=460、Ver328=580。
+- 削除行のsimulation_modeは全1,365行が `6周内蔵型壁展開`。
+- 削除行のprediction_timeは2026-09-30 23:15:59〜2026-10-20 21:31:58 JST。残存行は2026-10-04 22:11:12〜2026-11-03 21:50:52 JST。時間帯が重なるため、単純な日時カットオフでは説明できない。
+- settings_hash内訳: Ver322は445行 `abbee8aed54a2db6` + 2種類各1行、Ver323は445行 `13a3b266ac35fdad` + 2種類各1行、Ver324は471行 `ed185f5c873307fd`。
+- 37 rootは全件Ver323、settings_hash=`13a3b266ac35fdad`、simulation_mode=`6周内蔵型壁展開`、seed=20260719、trials=20000、venue_override空欄。prediction_timeは10/2 12:35:29〜12:58:39 JST。
+
+周回スナップショットのapp_version別件数も同じパターン:
+| app_version | Gen675 | Gen676 | 差 |
+|---|---:|---:|---:|
+| Ver322 | 2,682 | 0 | −2,682 |
+| Ver323 | 2,682 | 0 | −2,682 |
+| Ver324 | 2,832 | 0 | −2,832 |
+| Ver325 | 84 | 84 | 0 |
+| Ver326 | 6,180 | 6,180 | 0 |
+| Ver327 | 2,076 | 2,076 | 0 |
+| Ver328 | 2,286 | 2,286 | 0 |
+| 合計 | 18,822 | 10,626 | −8,196 |
+
+Gen675・Gen676とも `v319_prediction_history_archive` と `v319_lap_snapshots_archive` は存在せず、両DBともread-only、query_only=ON、integrity_check=ok。archive表は世代スナップショットには残っていない。
+
+#### Gen676直前のアプリコードに存在した旧Ver整理機能
+
+Gen676保存時刻は2026-11-09 18:50:22 JST。直前のapp.py更新はcommit `ea9be46d094ae2c6b4a139919ecc34a5819de40f`（11/9 12:49 JST）。この時点のコードでは `APP_VERSION=Ver326`、`_V231_APP_VERSION=Ver326`。
+
+GitHub上の当該app.pyで以下を確認した（ソースコードの存在確認であり、実際の操作実行ログではない）。
+
+1. `_v319_archive_old_version_predictions()`（app.py 36393〜36471行）は、UIで選択された `keep_versions` 以外の `v231_prediction_history` 行を `v319_prediction_history_archive` にINSERTした後、本体からDELETEする。同じ条件で `v252_lap_prediction_snapshots` も `v319_lap_snapshots_archive` へ退避して本体からDELETEする。
+2. UI（37611〜37632行）は「DBに残す予測バージョン」のmultiselectを表示し、選択外のVerを退避する。デフォルト保護リストにはVer322/323/324も含まれるため、Gen676の結果をこの機能で作ったなら、操作時にVer322/323/324をkeepから外した必要がある。
+3. `_v319_export_and_drop_archives()`（36305〜36362行）はアーカイブ表を `<DB名>_old_versions_backup.sqlite3` に書き出し、メインDBからarchive表をDROPしてVACUUMする。
+4. 「現在のDBをGitHubへ保存（軽量）」UI（37650〜37654行）は `push_db_to_github(...,_lightweight=True)` を呼ぶ。push関数（36491行以降）のlightweight分岐は現在DBのchunk uploadだけで、リモート統合や予測履歴DELETEを行わない。
+
+**最有力仮説:** UIでVer322/323/324をkeep対象から外して旧Ver予測をアーカイブし、アーカイブを別SQLiteへ書き出して本体からDROP+VACUUM、その後に手動軽量保存した。この操作順なら、Gen676で観測した「Ver322〜324だけのhistory 1,365行減」「同じ3バージョンだけのlap snapshot 8,196行減」「他Verは完全維持」「軽量保存というcommit message」を一貫して説明できる。
+
+**未証明:** UIの実操作ログ、選択されたkeep_versions、アーカイブ処理の戻り値（archived/deleted件数）、`_old_versions_backup.sqlite3` の実在・保管場所。Gen676にarchive表がないことは、export/drop後の状態と整合するが、バックアップファイルが保存・保全された証明ではない。したがって、コード上の削除経路とDB差分は強く一致するが、操作実行の断定はしない。
+
 #### Job 368〜370との時間照合
 
 - Job 368: 10/15 12:30:27〜21:04:47 JST。Gen491は21:39:30保存（終了35分後）で37/37存在。
@@ -161,7 +205,7 @@ Jobメタデータ:
 
 1. 必要ならGen677を追加でroot照合し、Gen676以降での再出現がないことを確認する（Gen678・705は既に0/37）。
 2. Gen497〜675の未検査世代について、manifestの `v231_prediction_history` / `v252_lap_prediction_snapshots` 件数と `latest` を時系列走査し、Gen676以前に別の大きな巻き戻し・再構築がないかを確認する。これはDB本体の全件照合とは区別する。
-3. Gen676の手動保存に対応する実行記録・保存元DB・保存前処理（履歴テーブルの整理、DBコピー、VACUUM/再構築等）の証拠を調べる。原因は証拠が見つかるまで断定しない。
+3. 旧Ver整理機能の操作記録・選択keep_versions・`_old_versions_backup.sqlite3` の現存場所を確認する。特に、アーカイブ出力ファイルがStreamlit実行環境またはユーザー保管先に残っているかを調べ、復元可能性を評価する。
 4. Job368〜370とrace_keyの直接対応を示す永続データがないか、workerログ・結果blobの静的調査を継続する。pickle payloadの実行・デシリアライズは禁止。
 5. `force_current=1` は重複生成の有力候補として保持するが、Gen675までrootが残存した事実から、root消失の直接原因とは分けて扱う。
 6. 直接原因が特定できた後、ユーザー承認を得てIssue #31と正式な `docs/status/STATUS.md` へ反映する。現時点で正式ボードは未変更。
