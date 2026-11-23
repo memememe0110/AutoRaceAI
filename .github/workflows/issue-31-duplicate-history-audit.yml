@@ -1,5 +1,5 @@
 name: Issue 31 Duplicate History Repeat Audit
-# Re-run audit after batch job metadata output was added.
+# Read-only lineage and historical-root audit for Issue 31.
 
 on:
   push:
@@ -41,8 +41,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m py_compile tools/audit_duplicate_history_repeats.py tests/test_duplicate_history_repeats.py
+      - run: python -m py_compile tools/audit_duplicate_history_repeats.py tools/audit_issue31_historical_roots.py tests/test_duplicate_history_repeats.py tests/test_issue31_historical_roots.py
       - run: python -m unittest discover -s tests -t . -p "test_duplicate_history_repeats.py" -v
+      - run: python -m unittest discover -s tests -t . -p "test_issue31_historical_roots.py" -v
 
   audit:
     needs: test
@@ -62,16 +63,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work
-          python tools/prospective_collector.py fetch-db \
-            --repo "$REPO" --branch "$DB_COMMIT_SHA" \
+          python tools/prospective_collector.py fetch-db \\
+            --repo "$REPO" --branch "$DB_COMMIT_SHA" \\
             --out work/autorace_players.sqlite3 --info-out work/db_info.json
       - name: Run read-only repeat audit
         run: |
           set -euo pipefail
-          python tools/audit_duplicate_history_repeats.py \
-            --db work/autorace_players.sqlite3 --db-info work/db_info.json \
-            --expected-generation "$EXPECTED_GENERATION" \
-            --expected-commit "$DB_COMMIT_SHA" \
+          python tools/audit_duplicate_history_repeats.py \\
+            --db work/autorace_players.sqlite3 --db-info work/db_info.json \\
+            --expected-generation "$EXPECTED_GENERATION" \\
+            --expected-commit "$DB_COMMIT_SHA" \\
             --outdir work/issue31_repeat_audit
       - uses: actions/upload-artifact@v4
         with:
@@ -92,27 +93,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Fetch immutable historical DB snapshot (generation 489)
+      - name: Fetch immutable historical DB snapshot (generation 490)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p work
-          python tools/prospective_collector.py fetch-db \
-            --repo "$REPO" --branch "1591b29cce19cfcba38bd32238c1e8c3100246f0" \
+          python tools/prospective_collector.py fetch-db \\
+            --repo "$REPO" --branch "dafc1b1fda3ba69c809f8234b54b206c58dcfad7" \\
             --out work/historical.sqlite3 --info-out work/historical_db_info.json
       - name: Run read-only external-root lookup
         run: |
           set -euo pipefail
-          python tools/audit_issue31_historical_roots.py \
-            --db work/historical.sqlite3 --db-info work/historical_db_info.json \
-            --expected-generation "489" \
-            --expected-commit "1591b29cce19cfcba38bd32238c1e8c3100246f0" \
-            --reference-json tools/issue31_external_roots.json \
+          python tools/audit_issue31_historical_roots.py \\
+            --db work/historical.sqlite3 --db-info work/historical_db_info.json \\
+            --expected-generation "490" \\
+            --expected-commit "dafc1b1fda3ba69c809f8234b54b206c58dcfad7" \\
+            --reference-json tools/issue31_external_roots.json \\
             --outdir work/historical_root_audit
       - uses: actions/upload-artifact@v4
         with:
-          name: issue-31-historical-roots-${{ github.run_id }}
+          name: issue-31-historical-roots-gen490-${{ github.run_id }}
           path: work/historical_root_audit/
           if-no-files-found: error
           retention-days: 30
