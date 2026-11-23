@@ -102,7 +102,7 @@ def main():
                     raise SystemExit("STAGE1_HISTORY_ARCHIVE_COUNT_MISMATCH")
                 if archive_counts["v319_lap_snapshots_archive"] != EXPECTED[TABLES[1]]:
                     raise SystemExit("STAGE1_LAP_ARCHIVE_COUNT_MISMATCH")
-                stage1.close()
+                w.close()
 
                 # Stage 2: export archive tables to a separate SQLite, drop from main, VACUUM.
                 stage2 = td / "stage2.sqlite3"
