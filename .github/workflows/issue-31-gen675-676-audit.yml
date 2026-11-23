@@ -1,0 +1,76 @@
+name: Issue 31 Gen675-676 Root Presence Check
+on:
+  push:
+    branches:
+      - tmp-audit-31-repeats
+    paths:
+      - ".github/workflows/issue-31-gen675-676-audit.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-31-gen675-676-root-check
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - generation: 675
+            commit: 590d5e4c45f6c6d53e89b928ef68a19b89c68011
+          - generation: 676
+            commit: c9e300b210da0d6d262b16d0c5527f8626f13d7e
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch immutable DB snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DB_COMMIT_SHA: ${{ matrix.commit }}
+          GEN: ${{ matrix.generation }}
+        run: |
+          set -euo pipefail
+          mkdir -p "work/gen${GEN}"
+          python tools/prospective_collector.py fetch-db \
+            --repo "$REPO" --branch "$DB_COMMIT_SHA" \
+            --out "work/gen${GEN}/autorace_players.sqlite3" \
+            --info-out "work/gen${GEN}/db_info.json"
+          MANIFEST_SHA="$(gh api "repos/${REPO}/contents/autorace_players.sqlite3.chunks.json?ref=${DB_COMMIT_SHA}" --jq .sha)"
+          python - "work/gen${GEN}/db_info.json" "$MANIFEST_SHA" <<'PY'
+          import json, sys
+          from pathlib import Path
+          p=Path(sys.argv[1])
+          d=json.loads(p.read_text(encoding="utf-8"))
+          d["manifest_blob_sha"]=sys.argv[2]
+          p.write_text(json.dumps(d,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+          PY
+      - name: Audit all 37 historical source roots read-only
+        env:
+          GEN: ${{ matrix.generation }}
+          DB_COMMIT_SHA: ${{ matrix.commit }}
+        run: |
+          set -euo pipefail
+          python tools/audit_issue31_historical_roots.py \
+            --db "work/gen${GEN}/autorace_players.sqlite3" \
+            --db-info "work/gen${GEN}/db_info.json" \
+            --expected-generation "$GEN" --expected-commit "$DB_COMMIT_SHA" \
+            --reference-json tools/issue31_external_roots.json \
+            --outdir "work/gen${GEN}/root_audit"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issue-31-gen${{ matrix.generation }}-root-audit-${{ github.run_id }}
+          path: work/gen${{ matrix.generation }}/
+          if-no-files-found: error
+          retention-days: 30
