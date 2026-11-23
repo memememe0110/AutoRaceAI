@@ -229,3 +229,28 @@ GitHub Releases一覧でRelease `db-20261106-001313` を発見。Release本文�
 **次の安全な手順:** Release assetを取得し、read-onlyでSHA-256再検証、`integrity_check`、37 root ID、Ver322〜324の履歴1,365行と周回snapshot 8,196行を照合する。必要ならGen675 DBから削除対象だけを別の新規DB/CSVへ抽出する。Gen676や本番DBへの上書き・復元は行わない。
 
 GitHub code searchでは `autorace_players_old_versions_backup.sqlite3` および `old_versions_backup sqlite3` は検索結果なし。これはGitHubリポジトリ検索上で見つからなかったという意味に限り、Streamlit runtimeやローカル保存先に存在しない証拠ではない。
+
+
+#### Gen675 Release assetの独立取得・read-only再照合完了（2026-11-23）
+
+Release asset `db-20261106-001313/autorace_players.sqlite3` をGitHub Actions runnerで実際にダウンロードし、Gen675監査時の値と独立に再照合した。
+
+- Workflow Run: [#45144072912](https://github.com/memememe0110/AutoRaceAI/actions/runs/45144072912)、SUCCESS
+- 実ダウンロード後SHA-256: `d5e7c141ae0e66708a53b2e8ac4d7035d019aeaf98cba596bc83d9d2d128d7ac`（期待値と一致）
+- 実ファイルサイズ: 988,090,368 bytes
+- SQLite `integrity_check=ok`
+- SQLite接続: `mode=ro`、`PRAGMA query_only=ON`
+- `pickle.loads` / `pickle.load` 未使用
+- Ver322〜324の `v231_prediction_history`: 1,365行を再確認（Ver322=447、Ver323=447、Ver324=471）
+- Ver322〜324の `v252_lap_prediction_snapshots`: 8,196行を再確認（Ver322=2,682、Ver323=2,682、Ver324=2,832）
+- 37 root ID: 37/37存在し、各行の `race_key`、`seed`、`trials`、`raw_text` SHA-256を参照元定義と照合して37/37一致
+
+**結論:** Release assetはGen675完全DBであることを、今回の独立ダウンロード・SHA再計算・SQLite integrity・row counts・37 root内容照合で再確認した。Gen675→Gen676で削除された対象データは、Gen675 DBから別CSVへ安全に抽出済み。
+
+Workflow artifact: [issue-31-gen675-verified-old-version-data-45144072912](https://github.com/memememe0110/AutoRaceAI/actions/runs/45144072912)（artifact ID `14803252269`、30日保持、2026-12-23 09:06 UTC期限）。内容:
+- `recovered_v231_history_Ver322-324.csv`（1,365行、raw_text/payload等の大容量内容は除外）
+- `recovered_v252_lap_snapshots_Ver322-324.csv`（8,196行）
+- `root37_verification.json`
+- `summary.json`
+
+これは別ファイルへの抽出であり、Gen675元DB・Gen676 DB・本番DBのいずれも変更していない。復元・上書きは実施していない。
