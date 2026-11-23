@@ -72,7 +72,7 @@ def main():
                 raise SystemExit(f"EXTRACT_COUNT_MISMATCH:{t}:{selected[t]}")
         root_found = src.execute(
             'SELECT COUNT(*) FROM v231_prediction_history WHERE history_id IN (' +
-            ",".join("?" for _ in root_ids) + ")", tuple(sorted(root_ids)
+            ",".join("?" for _ in root_ids) + ")", tuple(sorted(root_ids))
         ).fetchone()[0]
         if root_found != 37:
             raise SystemExit("ROOTS_NOT_ALL_PRESENT_IN_GEN675")
