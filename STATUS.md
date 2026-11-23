@@ -277,3 +277,23 @@ Workflow artifact: [issue-31-gen675-verified-old-version-data-45144072912](https
 **判定:** Gen675→Gen676で観測した対象テーブルの削除後状態は、旧Verアーカイブ→本体DELETE→別SQLite export→archive表DROP→VACUUMの手順で、使い捨てDB上に再現できた。対象2テーブルはGen676と行単位ハッシュ一致。これはデータ状態の再現成功であり、2026-11-09に実際にこのUI操作が行われたことや、当時のアーカイブファイルが現存することを証明するものではない。
 
 **変更範囲:** 監査スクリプト・テスト・Workflowのみ。予測ロジック、save/restore本番コード、app version、本番DB、Gen675/Gen676は変更なし。正式な `docs/status/STATUS.md` とIssue #31も未変更。
+
+
+#### 専用旧Verアーカイブの保存先・実行記録に関する読み取り調査（2026-11-23）
+
+調査対象はGitHubリポジトリ、Gen676 commit tree、GitHub Releases、GitHub Actionsの実行履歴・関連Artifact。外部のStreamlit Cloud runtime、ユーザー端末、ローカルファイルシステムにはアクセスしていない。
+
+**確認結果:**
+
+- Gen676 commit `c9e300b210da0d6d262b16d0c5527f8626f13d7e` のrecursive treeに、`*_old_versions_backup.sqlite3`、`old_versions_backup` に該当する専用アーカイブファイルは見つからなかった。DB本体・chunk・manifestは存在する。
+- GitHub Releases一覧で確認できたReleaseは `db-20261106-001313` のみ。AssetはGen675完全DB `autorace_players.sqlite3` であり、専用の旧VerアーカイブSQLiteではない。
+- Gen676保存日（2026-11-09 UTC）に作成されたGitHub Actions workflow runは、repository APIのcreated日付指定検索で0件。
+- 近接するRun #42478283739（11/8）のArtifactは `axis-a-20260726_飯塚_2R-6`（1,599 bytes）、Run #42852514980（11/10）のArtifactは `ver330a-lap1-lap1_v331_p1-13`（2,258,293 bytes）。どちらも旧VerアーカイブSQLiteを示す名前・用途ではない。
+- Gen676直前のapp.py commit `ea9be46d094ae2c6b4a139919ecc34a5819de40f` の後、DB保存時刻（11/9 18:50:22 JST）より後の11/9 20:12 JSTにapp.pyのみを変更するcommit `386efbb5f7178cecb8cb3f46f4586b34bd66a3ca` が存在する（10 additions / 8 deletions）。これはコード更新履歴であり、旧Ver整理UIの実行記録ではない。
+- GitHub code searchでは `old_versions_backup.sqlite3`、`_v319_export_and_drop_archives`、`archive_old_version_predictions` の一致は見つからなかった。コード検索は現行default branchを対象とするため、過去のローカルruntimeファイルの不存在証明にはならない。
+
+**判定:** GitHubリポジトリ、Release、今回確認したActions実行・Artifactの範囲では、専用アーカイブSQLiteおよびGen676当日の旧Ver整理操作ログは**未発見**。Gen675の完全DBバックアップはReleaseに現存するが、専用アーカイブファイルとは別物である。
+
+**未調査・アクセス不能:** Streamlit Cloudのruntime filesystem、runtime logs、ユーザー端末/ダウンロード先、外部ストレージ、ブラウザ操作履歴。したがって「保存されなかった」「操作されなかった」とは結論しない。操作ユーザー・keep_versions選択値も未確認のまま。
+
+**変更範囲:** 本調査はGitHub上の読み取りのみ。現時点ではSTATUS.mdを含むリポジトリファイル、Issue、正式な進捗ボード、本番コード、DBを変更していない。
