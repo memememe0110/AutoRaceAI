@@ -1,0 +1,79 @@
+name: Issue 31 Intermediate DB Snapshot Boundary Audit
+on:
+  push:
+    branches:
+      - tmp-audit-31-repeats
+    paths:
+      - ".github/workflows/issue-31-intermediate-snapshot-audit.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-31-intermediate-snapshot-boundary
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Inspect snapshots in chronological order until first missing root
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/intermediate
+          : > work/intermediate/boundary.txt
+          while read -r GEN SHA; do
+            echo "=== generation ${GEN} ${SHA} ==="
+            DB="work/intermediate/gen${GEN}.sqlite3"
+            INFO="work/intermediate/gen${GEN}_db_info.json"
+            OUT="work/intermediate/gen${GEN}_root_audit"
+            python tools/prospective_collector.py fetch-db \
+              --repo "$REPO" --branch "$SHA" --out "$DB" --info-out "$INFO"
+            MANIFEST_SHA="$(gh api "repos/${REPO}/contents/autorace_players.sqlite3.chunks.json?ref=${SHA}" --jq .sha)"
+            python - "$INFO" "$MANIFEST_SHA" <<'PY'
+          import json, sys
+          from pathlib import Path
+          p=Path(sys.argv[1])
+          d=json.loads(p.read_text(encoding="utf-8"))
+          d["manifest_blob_sha"]=sys.argv[2]
+          p.write_text(json.dumps(d,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+          PY
+            python tools/audit_issue31_historical_roots.py \
+              --db "$DB" --db-info "$INFO" \
+              --expected-generation "$GEN" --expected-commit "$SHA" \
+              --reference-json tools/issue31_external_roots.json --outdir "$OUT"
+            FOUND="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_rows_found"])' "$OUT/external_roots_summary.json")"
+            MISSING="$((37 - FOUND))"
+            printf 'generation=%s commit=%s source_rows_found=%s source_rows_missing=%s\n' "$GEN" "$SHA" "$FOUND" "$MISSING" | tee -a work/intermediate/boundary.txt
+            rm -f "$DB"
+            if [ "$FOUND" -lt 37 ]; then
+              echo "FIRST_GENERATION_WITH_MISSING_ROOTS=$GEN" | tee -a work/intermediate/boundary.txt
+              break
+            fi
+            echo "ALL_37_ROOTS_PRESENT_THROUGH=$GEN" | tee -a work/intermediate/boundary.txt
+          done <<'EOF'
+          491 adfab799ba2c01cb0183d3dcd03eb4c5f0e0f1cd
+          492 6c45163fa840399f00e2d3903b8d84f49e18c11e
+          493 d21a792f5074b171429502bf4b17cacdbc95995a
+          494 09bf2fb47463d35f95ccf6412bcee228a08fda2c
+          495 188b336c05b320b3a6f2af7aa1b3f52ac8b19b87
+          496 1f398fd69af9f0af25abb98c9b1a35b062ebdaa7
+          EOF
+          echo "Boundary audit complete."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issue-31-intermediate-snapshot-boundary-${{ github.run_id }}
+          path: work/intermediate/
+          if-no-files-found: error
+          retention-days: 30
