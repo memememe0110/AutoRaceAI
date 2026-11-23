@@ -63,16 +63,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work
-          python tools/prospective_collector.py fetch-db \\
-            --repo "$REPO" --branch "$DB_COMMIT_SHA" \\
+          python tools/prospective_collector.py fetch-db \
+            --repo "$REPO" --branch "$DB_COMMIT_SHA" \
             --out work/autorace_players.sqlite3 --info-out work/db_info.json
       - name: Run read-only repeat audit
         run: |
           set -euo pipefail
-          python tools/audit_duplicate_history_repeats.py \\
-            --db work/autorace_players.sqlite3 --db-info work/db_info.json \\
-            --expected-generation "$EXPECTED_GENERATION" \\
-            --expected-commit "$DB_COMMIT_SHA" \\
+          python tools/audit_duplicate_history_repeats.py \
+            --db work/autorace_players.sqlite3 --db-info work/db_info.json \
+            --expected-generation "$EXPECTED_GENERATION" \
+            --expected-commit "$DB_COMMIT_SHA" \
             --outdir work/issue31_repeat_audit
       - uses: actions/upload-artifact@v4
         with:
@@ -99,17 +99,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work
-          python tools/prospective_collector.py fetch-db \\
-            --repo "$REPO" --branch "dafc1b1fda3ba69c809f8234b54b206c58dcfad7" \\
+          python tools/prospective_collector.py fetch-db \
+            --repo "$REPO" --branch "dafc1b1fda3ba69c809f8234b54b206c58dcfad7" \
             --out work/historical.sqlite3 --info-out work/historical_db_info.json
       - name: Run read-only external-root lookup
         run: |
           set -euo pipefail
-          python tools/audit_issue31_historical_roots.py \\
-            --db work/historical.sqlite3 --db-info work/historical_db_info.json \\
-            --expected-generation "490" \\
-            --expected-commit "dafc1b1fda3ba69c809f8234b54b206c58dcfad7" \\
-            --reference-json tools/issue31_external_roots.json \\
+          python tools/audit_issue31_historical_roots.py \
+            --db work/historical.sqlite3 --db-info work/historical_db_info.json \
+            --expected-generation "490" \
+            --expected-commit "dafc1b1fda3ba69c809f8234b54b206c58dcfad7" \
+            --reference-json tools/issue31_external_roots.json \
             --outdir work/historical_root_audit
       - uses: actions/upload-artifact@v4
         with:
