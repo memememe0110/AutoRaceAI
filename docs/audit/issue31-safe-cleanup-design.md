@@ -181,7 +181,8 @@ source_db_identityは次の値をキー順固定・空白なしUTF-8 JSONへ正�
 - schema_version、journal_mode
 - schema_fingerprint（receipt管理表を含む全sqlite_schema定義）
 このidentityにはsize、mtime、main DB SHA、WAL SHAを混ぜない。これらはsnapshot_capture_evidenceとして別途保存し、取得前後一致を必須とする。
-- source_snapshot_sha256はBackup API snapshot file全体のSHA-256。
+- source_snapshot_sha256はBackup API snapshot file全体のSHA-256であり、監査証跡として不変保存する。
+- receipt管理表のPREPARED行・状態更新はsnapshot取得後に行うため、DB file全体のSHA-256はその更新で変化し得る。したがって削除直前の論理一致判定にfile SHAを直接使わず、source_db_identity、schema_fingerprint、source_projection_digest、対象digestの一致で判定する。source_snapshot_sha256は承認時snapshotの固定証拠として保持し、再計算値で上書きしない。
 - source_projection_digestはreceipt管理表を除く全ユーザーテーブルのschema定義と全行を、table名・PK順・column順で型付き正規化して集約したSHA-256。receipt管理表以外を除外してはならない。
 - 削除直前はsource_db_identity、schema_fingerprint、source_projection_digest、対象2表のPK/row digest、37 root digestを承認時と照合し、1つでも異なればDELETE禁止。
 - receipt管理表は事前作成しschema_fingerprintに含める。可変receipt行のみsource_projection_digestから除外する。他の除外table/columnは認めない。
@@ -228,8 +229,8 @@ operation_idはPRIMARY KEY。receipt_digestは上記全列を固定順で正規�
 
 #### R3-2. receipt・外部ログ順序
 1. archive/restore PASS、承認有効、nonce未使用を確認後、DB内receiptをPREPAREDとして別transactionでINSERT/commitする。receipt_digestを再計算し一致確認する。
-2. main DB外append-only ledgerへDELETE_INTENTを追記しfsyncする。内容はoperation_id、plan_digest、source_db_identity、source_projection_digest、archive SHA、restore receipt SHA、承認証跡digest、nonce_digest、時刻。
-3. nonce ledgerへCONSUMEDを追記しfsyncする。いずれか失敗ならDELETE transactionを開始しない。receiptはPREPAREDのまま保持し、同一operation_idを再実行しない。
+2. nonce ledgerへCONSUMEDを追記しfsyncする。失敗ならDELETE transactionを開始しない。receiptはPREPAREDのまま保持し、同一operation_idを再実行しない。
+3. main DB外append-only ledgerへDELETE_INTENTを追記しfsyncする。内容はoperation_id、plan_digest、source_db_identity、source_projection_digest、archive SHA、restore receipt SHA、承認証跡digest、nonce_digest、時刻。失敗時はDELETE transactionを開始しない。CONSUMED nonceは取消済み相当として永久に再利用しない。
 4. R4の書き込みtransaction内で再照合後、2表DELETEと件数照合を行う。receiptをCOMMIT_PENDINGへ更新しreceipt_digestを再計算する。このUPDATEはDELETEと同一transaction内でCOMMIT直前に行う。
 5. SQLite COMMIT成功後、別の短いtransactionでreceiptをDELETE_COMMITTEDへ更新しcommitする。その後、外部ledgerへDELETE_COMMITTEDを追記しfsyncする。後段receipt更新または外部ログ追記が失敗した場合はCOMMIT_UNKNOWNとし、DELETE再実行禁止。
 
@@ -240,11 +241,12 @@ operation_idはPRIMARY KEY。receipt_digestは上記全列を固定順で正規�
 |---|---|---|---|---|
 | COMMIT_PENDING | 両表の全候補PKが不存在 | 承認時digestと一致 | DELETE_INTENTあり、完了記録なし | commit成立と確定。DELETE_COMMITTEDへ復旧記録 |
 | DELETE_COMMITTED | 両表の全候補PKが不存在 | 承認時digestと一致 | DELETE_INTENTあり。DELETE_COMMITTED完了記録は存在しても未記録でもよい | commit成立済み。完了記録がなければreceipt/ledgerだけ補完 |
-| PREPARED | 両表の全候補PKが全件存在し、全row digest一致 | 承認時digestと一致 | DELETE_INTENTあり、完了記録なし | NOT_COMMITTED確定。operation終端化、新operation_idでのみ再preview |
+| PREPARED | 両表の全候補PKが全件存在し、全row digest一致 | 承認時digestと一致 | ledger読取可能、DELETE_INTENTあり、完了記録なし | NOT_COMMITTED確定。operation終端化、新operation_idでのみ再preview |
+| PREPARED | 両表の全候補PKが全件存在し、全row digest一致 | 承認時digestと一致 | ledger読取可能、DELETE_INTENTなし | DELETE transaction未開始と確定。NOT_COMMITTEDで終端化し、新operation_idでのみ再preview |
 | 上記以外 | 一部だけ存在、digest不一致、receipt欠落/破損 | 不一致または判定不能 | 欠落・破損・不一致 | MANUAL_RECOVERY_REQUIRED。人手判断まで停止 |
 
 - commit後の外部ledger追記失敗時、receiptはCOMMIT_PENDINGまたはDELETE_COMMITTED、候補PKは全件不存在となる。表の全条件を満たす場合だけcommit成立と判定し、DELETEせずreceipt/ledger完了記録だけを補完する。
-- PREPAREDかつ全対象行が元digestで存在する場合はNOT_COMMITTED。同じoperation_idでDELETEを再試行しない。新operation_idでpreview・承認・archive・restoreを最初から行う。
+- PREPAREDかつ全対象行が元digestで存在し、外部ledgerが正常に読める場合は、DELETE_INTENTの有無にかかわらずNOT_COMMITTED。同じoperation_idでDELETEを再試行しない。nonceがISSUEDならCANCELLEDを追記しfsync、CONSUMEDなら使用済み状態を維持する。新operation_idでpreview・承認・archive・restoreを最初から行う。ledgerが読めない場合はMANUAL_RECOVERY_REQUIRED。
 - receipt/PK状態の矛盾、一部だけ消失、外部ledger欠落/破損時は自動判定せずMANUAL_RECOVERY_REQUIRED。
 - recovery初動はread-only照合のみ。DB更新は判定確定後の専用recovery操作に限定し、その操作にDELETE SQLを含めない。
 
