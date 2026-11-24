@@ -133,3 +133,31 @@
 
 結論：Gen675→Gen676の37件消失について、消失境界・技術的再現・回収可能性の確認は完了。実際の操作イベントの証明と再発防止策の実装・検証は未完了。
 
+
+## Issue #31 設計一次レビュー結果（2026-11-24）
+
+**状態：主要監査完了・再発防止未完了。設計一次レビューは「要修正」、設計承認未了。**
+
+監査ブランチ `tmp-audit-31-repeats` の3文書に一次レビュー指摘を追補する。今回の更新は設計文書と進捗記録のみであり、実装・本番反映は行わない。
+
+### 必須修正 R1〜R6
+- R1 SQLite識別/WAL: Backup API等による一貫snapshot、DB identity/schema/対象PK・row digest保存、削除直前再照合。WAL/同時更新/不一致時は削除禁止。
+- R2 承認真正性: 認証済み操作者の明示承認、operation_id/plan_digest/一回限りnonce、有効期限・取消・再利用防止、対象・DB・計画変更時の承認失効。
+- R3 外部ログ/commit: DELETE前の外部永続ログ、COMMIT_UNKNOWN、再起動後read-only照合、結果確定まで再DELETE禁止。
+- R4 競合/原子性: 書き込みトランザクション内でPK集合・row digest・保護対象を再照合。2テーブルを同一トランザクションで処理し、不一致・片側失敗はrollback。
+- R5 37 root: 通常整理から除外する本体保護対象。archive保存とは別要件。混入時は拒否。将来の削除は別設計と明示的追加承認が必要。
+- R6 VACUUM: 削除安全性の証明から分離。失敗はPOST_DELETE_MAINTENANCE_FAILEDとして記録し、削除済みデータのarchive/restore/ログを保持。
+
+### テスト計画
+- T01〜T20を維持。T16をVACUUM失敗とデータ削除結果の分離テストに修正。
+- T21 commit直後停止、T22外部ログ書込失敗、T23 WAL同時更新、T24 nonce再利用、T25 NULL/BLOB/数値/文字列digest、T26 schema/index/constraint変更、T27 operation_id並行実行、T28 37 root保護を追加。
+
+### 成果物・Git状態
+- 設計文書: `docs/audit/issue31-current-archive-spec.md`、`docs/audit/issue31-safe-cleanup-design.md`、`docs/audit/issue31-cleanup-test-plan.md`。
+- 監査ブランチ: `tmp-audit-31-repeats`。今回の修正commit SHAは作成後に確定して追記する。
+- 正式進捗正本ブランチ: `docs/status`。今回の更新commit SHAは作成後に確定して追記する。
+- 次の作業: 3文書の再レビュー。R1〜R6とT21〜T28に未解決が1つでもあれば設計承認・実装開始に進まない。
+
+### 変更禁止・未実施
+- app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更していない。
+- 実装・本番反映は未実施。実装開始には再レビュー完了後の明示承認が必要。
