@@ -87,3 +87,47 @@
 - main 以外は修正ブランチを作って push してよい。
 - 予測に関わる修正は通常予測停止中なので進めてよい。
 - 別の人が取る場合は、対象Issueにコメントしてからブランチを切る。同じIssueを二人で同時に触かない。
+
+## Issue #31 正式監査到達点（2026-11-24）
+
+**正式判定：主要監査完了・再発防止未完了**
+
+### Gen675→Gen676の37件消失
+
+- Gen675では対象37件が37/37存在し、Gen676では0/37。消失境界はGen675→Gen676。
+- 対象はVer322〜324。世代間差分は `v231_prediction_history` が1,365行減、`v252_lap_prediction_snapshots` が8,196行減。
+  - 履歴: Ver322 447行、Ver323 447行、Ver324 471行。
+  - Lap snapshot: Ver322 2,682行、Ver323 2,682行、Ver324 2,832行。
+- 旧Ver整理処理を隔離SQLiteで再現し、Gen676相当の状態を行単位ハッシュまで照合。技術的再現は確立したが、本番での実操作を証明したものではない。
+- Gen675由来の回収Artifactによる回収・検証は確認済み。元DBの直接変更・上書きはしていない。
+- これはVer326の同一fingerprint反復保存109件（37 race_key、force_current=1を含む再実行調査）とは別事象。両者の因果関係は主張しない。
+
+### 未証明事項
+
+- 実際の操作イベントと実行操作者
+- UIで指定された `keep_versions`
+- 専用アーカイブファイルが作成・保持されていたか
+
+したがって、旧Ver整理処理による技術的再現は成立したが、2026-11-09前後の本番操作イベントは未証明。
+
+### 再発防止設計の成果物
+
+監査ブランチ `tmp-audit-31-repeats` に次の3文書を作成・push済み。
+
+1. [現行アーカイブ処理仕様](https://github.com/memememe0110/AutoRaceAI/blob/tmp-audit-31-repeats/docs/audit/issue31-current-archive-spec.md)
+2. [安全な整理処理の設計](https://github.com/memememe0110/AutoRaceAI/blob/tmp-audit-31-repeats/docs/audit/issue31-safe-cleanup-design.md)
+3. [クリーンアップ試験計画](https://github.com/memememe0110/AutoRaceAI/blob/tmp-audit-31-repeats/docs/audit/issue31-cleanup-test-plan.md)
+
+設計文書commit: `334c29a1af52ba1f7e17efe1cc786ec34316395e`  
+監査ブランチ現HEAD: `076c24776f09d055f9c203d3cb14b8a9f71a1f22`
+
+**状態：設計段階。実装・本番反映は未実施。** `app.py`、本番DB、予測ロジック、`APP_VERSION` は変更していない。設計レビュー完了前に実装・本番反映へ進まない。
+
+### 次の作業
+
+1. 3設計文書のレビューと指摘反映。
+2. レビュー承認後、別途明示承認を得て隔離環境で実装・試験を検討。
+3. 実操作イベント・操作者・`keep_versions`・専用アーカイブの証拠は、別途取得できた場合のみ確定する。
+
+結論：Gen675→Gen676の37件消失について、消失境界・技術的再現・回収可能性の確認は完了。実際の操作イベントの証明と再発防止策の実装・検証は未完了。
+
