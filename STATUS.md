@@ -356,3 +356,20 @@ Workflow artifact: [issue-31-gen675-verified-old-version-data-45144072912](https
 2. operation_id receiptの改ざん耐性、source DB identityの定義、SQLite attached DB/atomicity境界をレビューする。
 3. 承認後に限り、使い捨てSQLiteでテストを実装・実行する。
 4. 本番コード変更や本番DB操作は、別途設計承認と明示承認を得るまで行わない。
+
+## 正式進捗正本・Issue #31 反映記録（2026-11-24）
+
+正式進捗正本とIssue #31への反映を完了。
+
+- 正式進捗ブランチ: `docs/status`
+- 正式進捗ファイル: `STATUS.md`（GitHub表示: `docs/status/STATUS.md`）
+- 正式進捗commit: `3ac7e4f0bf8f8f2d3448876f1531522bec765dab`
+- 正式進捗ファイル: https://github.com/memememe0110/AutoRaceAI/blob/docs/status/STATUS.md
+- Issue #31 comment: https://github.com/memememe0110/AutoRaceAI/issues/31#issuecomment-7133071531
+- 監査設計文書commit: `334c29a1af52ba1f7e17efe1cc786ec34316395e`
+- 監査ブランチ最終HEAD（本追記前）: `076c24776f09d055f9c203d3cb14b8a9f71a1f22`
+
+Issue #31の正式判定は「主要監査完了・再発防止未完了」。37件のGen675→Gen676消失、旧Ver整理処理による行単位ハッシュ再現、Gen675由来Artifactによる回収・検証、109件重複保存との別事象性、実操作イベント等の未証明事項を正本とIssueへ反映した。
+
+設計レビュー前の実装・本番反映は禁止。今回も `app.py`、本番DB、予測ロジック、`APP_VERSION` は変更していない。
+
