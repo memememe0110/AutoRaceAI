@@ -297,3 +297,62 @@ Workflow artifact: [issue-31-gen675-verified-old-version-data-45144072912](https
 **未調査・アクセス不能:** Streamlit Cloudのruntime filesystem、runtime logs、ユーザー端末/ダウンロード先、外部ストレージ、ブラウザ操作履歴。したがって「保存されなかった」「操作されなかった」とは結論しない。操作ユーザー・keep_versions選択値も未確認のまま。
 
 **変更範囲:** 本調査はGitHub上の読み取りのみ。現時点ではSTATUS.mdを含むリポジトリファイル、Issue、正式な進捗ボード、本番コード、DBを変更していない。
+
+
+## 7. 旧Ver整理の安全化設計ドラフト作成（2026-11-24）
+
+### 作業開始時点
+- 対象ブランチ: `tmp-audit-31-repeats`
+- 作業開始時HEAD: `1fa13ac9d7d4d21e164e8931453563f76935ec9f`
+- 対象ソースコミット: `ea9be46d094ae2c6b4a139919ecc34a5819de40f`
+- 対象ソース: `app.py`（blob SHA `ce637255569886f4c59a493f09964819ec7d2f00`）
+- 実コードblobを取得し、対象関数・UIの行番号と例外処理を再確認した。行番号は当該コミットのapp.pyに対する1始まり。
+
+### ドラフト作成完了
+以下の3文書を監査ブランチへ追加した。
+1. `docs/audit/issue31-current-archive-spec.md`
+2. `docs/audit/issue31-safe-cleanup-design.md`
+3. `docs/audit/issue31-cleanup-test-plan.md`
+
+設計文書commit:
+- SHA: `334c29a1af52ba1f7e17efe1cc786ec34316395e`
+- 変更ファイル: 上記3文書のみ
+- commit message: `Add Issue #31 archive safety design docs`
+
+### 実コード再照合で確定した事項
+- `_v319_archive_old_version_predictions()`: `app.py:36393-36471`
+- `_v319_export_and_drop_archives()`: `app.py:36305-36362`
+- UI: `app.py:37611-37654`
+- archive処理はhistoryをarchiveへINSERTする際にhistory_id重複を除外するが、archive INSERT件数とDELETE件数の一致検証はない。
+- snapshot archive INSERTにはhistoryと同じ主キー重複除外条件がない。
+- archive関数は36463行でcommitし、VACUUM失敗は握りつぶしてreportをokにし得る。
+- export関数は既存の出力先SQLiteをunlinkしてから作成する。出力件数・主キー・行ハッシュ・SHA-256・integrity_check・別DB復元検証は実装されていない。
+- export関数はarchive表をATTACH先へCTASコピーし、メインDB側archive表をDROPしてcommitする。DETACH失敗は握りつぶし、VACUUM失敗はreportへ記録するがokを維持し得る。
+- SQLite接続のwith contextはcommit前の未commitトランザクションをrollback対象にする。一方、既存archiveファイルのunlinkはSQLite transaction外であり、DB rollbackでは復元されない。commit後のDROPを戻す補償処理もない。
+- Gen675→Gen676の対象差分は、これらの処理が作る状態と整合する。ただし、当時のUI操作・keep_versions・archive出力の実在は未証明。
+
+### 未確定事項
+- 2026-11-09の操作者、実際のUI操作順、keep_versionsの値。
+- 当時のarchive処理reportと実行時例外の有無。
+- `_old_versions_backup.sqlite3` の作成・保存・現存。
+- 実運用時に処理がどの段階まで完了したか。
+
+### 安全化設計の中核
+- S0〜S7の状態遷移を定義。
+- operation_idとplan_digestで対象集合・DB identity・承認を固定。
+- 件数、主キー集合、全行ハッシュ、archive SHA-256、integrity_check、別DB復元を全てPASS必須とする。
+- 検証済みoperation_idに結び付いたreceiptをDELETE API内部で再検証する。
+- 検証PASS前にDELETE SQLへ到達できない単一入口設計とする。
+- 失敗・中断・部分成功・重複実行・リトライ・承認後変更をテスト計画に含める。
+
+### 変更範囲
+- 変更したのは上記3つの監査・設計文書と、このルートSTATUS.mdのみ。
+- 本番コード、本番DB、`app.py`、予測ロジック、買い目、EV、回収率計算、`APP_VERSION` は変更していない。
+- Issue #31、正式な `docs/status/STATUS.md`、既存Artifactは変更・削除していない。
+- 実装・PR・本番反映は未実施。設計レビュー待ち。
+
+### 次の作業
+1. 最優先で「archive検証PASS前のDELETE経路が構造的に存在しない」ことを設計レビューする。
+2. operation_id receiptの改ざん耐性、source DB identityの定義、SQLite attached DB/atomicity境界をレビューする。
+3. 承認後に限り、使い捨てSQLiteでテストを実装・実行する。
+4. 本番コード変更や本番DB操作は、別途設計承認と明示承認を得るまで行わない。
