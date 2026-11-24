@@ -428,3 +428,41 @@ Issue #31の正式判定は「主要監査完了・再発防止未完了」。37
 - app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは未変更。
 - 実装、テスト実装、PR作成、本番反映は未実施。
 - 次回レビューまで実装・PR・本番反映を禁止する。
+
+## Issue #31 設計再レビュー自己確認・Git記録（2026-11-24）
+
+**自己レビュー結果：文書上の仕様固定条件を満たした。独立再レビュー待ち。設計承認・実装承認は未了。**
+
+### 監査ブランチ反映
+- R1〜R4: SQLite snapshot/WAL/source_db_identity、OIDC/MFA/nonce、DB内receipt/COMMIT_UNKNOWN復旧、BEGIN IMMEDIATE排他順を規範仕様として固定。
+- T16: VACUUM失敗の独立状態へ一本化。重複差し替え節なし。
+- T21〜T25: commit停止・WAL競合・nonce・canonical typed digestのfixtureと期待値を具体化。
+- R5/R6とT22/T26〜T28: 前回の文面・判定を維持。
+- T01〜T28: 共通証跡schemaとDELETE SQL trace、状態遷移、対象digest、receipt、外部ledger、最終DB状態、削除可否を必須化。
+- current-archive-spec.mdは現行実装の監査事実に限定し、将来仕様との境界を追記。
+
+### 自己レビュー確認
+- R1〜R4に「案」「要検討」「例示」「例えば」「例：」の未確定表現なし。
+- R5/R6本文は前回文書と一致。
+- T16はテスト表に1行のみ。
+- T22、T26〜T28の既存テスト行は前回文書と一致。
+- T21〜T25のfixture・期待値、T01〜T28共通証跡を確認。
+- 3文書をGitHubから再取得して確認済み。
+
+### 残る未実施事項
+- SQLite/WAL実機競合試験、OIDC/MFA連携試験、fsync耐久試験、COMMIT_UNKNOWN強制停止試験は未実施。
+- 独立再レビューと設計承認は未了。
+- 上記は実証・承認上の未完了事項であり、文書内のR1〜R4の未確定表現ではない。
+
+### commit記録
+- R1〜R4/T21〜T28初回具体化: a9eae1d775e5a351842211ebdb25305738c52811
+- SQLite snapshot/receipt復旧追補: 8c7ab403716cc6f7cb17fc3de24687987d115578
+- canonical digest仕様: 2baa0c2d79346927b1e0642cf2ec7324c46b609c
+- snapshot lock順序: 226dd2ba248f5bd9c873d06b2894b049bd22f574
+- receipt recovery・source digest補完: 50649df711259cb3abade8f9dcf5a2226e29ac7d
+- T22維持・T24分離: dfb5cf9b34033193b6eee2695cd6e4a6adc960a3
+- T21〜T25 fixture具体化: 0b340b387306cb353ac5629c4428071980c9c3c9
+- 本追記時点の監査ブランチHEAD: 0b340b387306cb353ac5629c4428071980c9c3c9
+
+### 禁止・変更なし
+app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更していない。実装・テスト実装・PR・本番反映は未実施。独立再レビューが完了するまで、これらを開始しない。
