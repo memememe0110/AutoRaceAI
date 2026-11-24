@@ -157,10 +157,10 @@ operation_idは作成後に別の対象集合へ再利用しない。同じopera
 ### R1. SQLite識別・固定スナップショット取得（規範仕様）
 
 #### R1-1. 接続と取得順
-1. 対象DBをrealpathで絶対パス化する。読み取り専用URI mode=roで接続し、immutable=1は指定しない。query_only=ON、busy_timeout=5000msを設定する。
-2. 同じ接続でBEGINし、最初にschema_version、journal_mode、sqlite_schemaを読む。これを読み取りtransactionのsnapshot境界とする。Backup API完了と取得前後metadata採取までtransactionを維持する。
+1. 対象DBをrealpathで絶対パス化する。最初に専用coordinator接続をread-writeで開き、busy_timeout=5000msを設定してBEGIN IMMEDIATEを取得する。この接続ではデータ変更を一切行わず、snapshot取得中の外部writerを排除する。取得できなければpreviewを開始しない。
+2. coordinator lock取得後、別の読み取り専用URI mode=ro接続を開く。immutable=1は指定せず、query_only=ONを設定してBEGINし、schema_version、journal_mode、sqlite_schemaを読む。読み取りtransactionはBackup API完了とmetadata採取まで維持する。
 3. Backup API開始直前にmain DBと存在するWALのdevice、inode、size、mtime_ns、SHA-256を採取する。WAL不存在も明示記録する。
-4. 同じ読み取り接続からSQLite Backup APIで新規一意パスの一時SQLiteへ全DBをコピーする。排他的作成とし既存ファイルをunlink/上書きしない。Backup APIの非成功、busy/locked timeout、read error、中断は失敗とする。
+4. 読み取り専用接続をsource、専用一時SQLite接続をdestinationとしてSQLite Backup APIで全DBをコピーする。sourceとdestinationは別connectionとする。Backup APIは複数stepで進行し得るため、coordinatorのBEGIN IMMEDIATEを全step完了まで保持してsource更新を防ぐ。排他的な新規一意pathを使い、既存fileをunlink/上書きしない。Backup APIの非成功、busy/locked timeout、read error、中断は失敗とする。
 5. Backup完了後、出力接続でjournal_mode=DELETE、synchronous=FULLを設定しcommit・closeする。snapshot本体と親directoryをfsyncする。読み取り元transactionを維持したままmain/WAL metadataとSHA-256を再採取する。
 6. 取得前後のmain/WAL device、inode、size、mtime_ns、SHA-256、journal_mode、schema_versionのいずれかが変化した場合、snapshotを破棄し、そのoperation_idを終端化する。再取得は新しいpreviewと新しいoperation_idで行う。
 7. 検証順を固定する。①snapshot file SHA-256/size、②integrity_check、③schema fingerprintと対象table定義、④対象2表PK集合digest、⑤対象2表全行digest、⑥37 root digest、⑦source_db_identityとplan_digest。全PASS後にPREVIEWEDを永続化する。
@@ -168,7 +168,7 @@ operation_idは作成後に別の対象集合へ再利用しない。同じopera
 
 #### R1-2. WAL・checkpoint・transaction
 - WAL modeではBackup APIが読み取りtransactionから見える確定状態をコピーする。main DBファイル単体コピーは禁止。
-- preview取得中に手動checkpointを実行しない。外部checkpointが発生した場合は取得前後metadata差異として検出しoperationを破棄する。
+- preview取得中はcoordinator接続のBEGIN IMMEDIATEを維持し、外部writerを排除する。手動checkpointは実行しない。WAL checkpointは別処理として動作し得るため、外部checkpointが発生した場合は取得前後metadata差異として検出しoperationを破棄する。
 - 削除時はR4のBEGIN IMMEDIATEでwriterを確保する。削除直前比較snapshotは別read-only接続からBackup APIで取得し、writer transaction保持中の対象DBと比較する。比較中にsource metadataが変われば削除禁止。
 - WAL欠落、読取不能、journal_modeと関連file状態の矛盾、checkpoint状態を判別できない場合はfail closed。WALの手動削除・無視・強制checkpointは禁止。
 
@@ -238,7 +238,7 @@ operation_idはPRIMARY KEY。receipt_digestは上記全列を固定順で正規�
 | DB receipt | 対象2表 | 保護対象/schema | 外部ledger | 判定 |
 |---|---|---|---|---|
 | COMMIT_PENDING | 両表の全候補PKが不存在 | 承認時digestと一致 | DELETE_INTENTあり、完了記録なし | commit成立と確定。DELETE_COMMITTEDへ復旧記録 |
-| DELETE_COMMITTED | 両表の全候補PKが不存在 | 承認時digestと一致 | DELETE_COMMITTEDあり | commit成立済み |
+| DELETE_COMMITTED | 両表の全候補PKが不存在 | 承認時digestと一致 | DELETE_INTENTあり。DELETE_COMMITTED完了記録は存在しても未記録でもよい | commit成立済み。完了記録がなければreceipt/ledgerだけ補完 |
 | PREPARED | 両表の全候補PKが全件存在し、全row digest一致 | 承認時digestと一致 | DELETE_INTENTあり、完了記録なし | NOT_COMMITTED確定。operation終端化、新operation_idでのみ再preview |
 | 上記以外 | 一部だけ存在、digest不一致、receipt欠落/破損 | 不一致または判定不能 | 欠落・破損・不一致 | MANUAL_RECOVERY_REQUIRED。人手判断まで停止 |
 
