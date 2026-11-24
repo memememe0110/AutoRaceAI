@@ -402,3 +402,29 @@ Issue #31の正式判定は「主要監査完了・再発防止未完了」。37
 - Issue #31コメント: https://github.com/memememe0110/AutoRaceAI/issues/31#issuecomment-7133364016
 - 変更ファイルは監査設計3文書とルートSTATUSのみ。本番コード・DB・予測ロジック・APP_VERSION・既存Artifactは変更なし。
 - 次の作業: 3文書の再レビュー。一次判定「要修正」を維持し、R1〜R6/T21〜T28の全項目解決まで承認しない。
+
+## Issue #31 設計再レビュー追補（2026-11-24）
+
+**正式状態：主要監査完了・再発防止未完了。設計レビュー要修正。設計承認・実装承認は未了。**
+
+今回、監査ブランチの3文書を再取得し、前回の再レビュー指摘を反映した。更新対象は設計文書と進捗記録のみ。
+
+### 今回具体化した仕様
+- R1/T23: 読み取り専用接続、BEGINで固定した読み取りsnapshot、同一接続のSQLite Backup API、取得前後main/WAL metadata、fsync、snapshot SHA→schema→PK/row digestの検証順、source_db_identity構成、削除直前projection/digest一致条件を規範化。
+- R2/T24: OIDC主体識別、MFA必須、256-bit nonce、10分期限、取消/使用済み/期限切れの追記専用永続ledger、HMAC承認証跡、operation_id/plan_digest/DB identity/nonce結合を規範化。
+- R3/T21: DB内receipt表、PREPARED/COMMIT_PENDING/DELETE_COMMITTED等の状態、外部DELETE_INTENT fsync、COMMIT_UNKNOWN復旧判定表、commit後ログ失敗時の非DELETE復旧を必須化。
+- R4: BEGIN IMMEDIATE、busy_timeout=5000ms、ロック→再照合→37 root確認→2表DELETE→receipt更新→commitの順序、rollback/拒否/同一ID再試行禁止を固定。
+- T16: VACUUM失敗の独立状態へ一本化し、重複差し替え節を削除。
+- T01〜T28: 共通証跡schemaを定義。T21〜T25にfixtureと期待結果を追加。
+- R5/R6、T22、T26〜T28: 前回判定を維持し、意味変更なし。
+
+### 自己レビュー結果
+- R1〜R4とT16・T21〜T25の前回未確定表現を規範仕様へ置換。
+- 3文書の役割を整理。current-archive-spec.mdは現行コードの監査事実のみを保持し、安全化後の仕様はsafe-cleanup-design.mdとcleanup-test-plan.mdを参照する。
+- R5/R6とT22/T26〜T28は変更せず、重複記述だけ整理。
+- 今回は文書上の自己レビューであり、SQLite実機試験・OIDC/MFA試験・fsync耐久試験・強制停止試験は未実施。設計承認・安全性実証とは扱わない。次工程は独立再レビュー。実装は禁止。
+
+### 変更禁止・未実施
+- app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは未変更。
+- 実装、テスト実装、PR作成、本番反映は未実施。
+- 次回レビューまで実装・PR・本番反映を禁止する。

@@ -24,11 +24,36 @@
 | T13 | archiveファイルSHA不一致 | S4後、S5またはS6前にarchiveファイルを差し替える/1byte変更 | SHA再検査で不一致。receiptを無効化 | 禁止 | 期待/実測SHA、ファイルstat、検知時刻 |
 | T14 | archive欠落・片テーブル欠落 | archive DBから片方の対象テーブルを削除、またはarchive fileを削除 | S4/S5でテーブル欠落として失敗 | 禁止 | schema一覧、期待/実測table一覧、file path |
 | T15 | 既存archive保護 | 同名archiveが既に存在し、別operationを開始 | 既存ファイルをunlink/上書きせず、新規一意パスを使う | 禁止（新規archiveの全検証前） | 既存SHA、new path、作成ログ |
-| T16 | VACUUM失敗 | DELETE commitとS7データ検証完了後にVACUUMのみ失敗 | データ状態はDELETE_COMMITTED/POST_DELETE_VERIFIEDを保持し、保守状態のみPOST_DELETE_MAINTENANCE_FAILED。archive/restore/外部ログを保全し、再試行でDELETEしない | 新規DELETE禁止。保守処理のみ再試行可 | DELETE commit receipt、S7検証、vacuum_error、archive SHA、保全先、状態遷移 |
+| T16 | VACUUM失敗 | DELETE commitとS7データ検証完了後にVACUUMのみ失敗 | データ状態DELETE_COMMITTED/POST_DELETE_VERIFIEDを維持し、保守状態のみPOST_DELETE_MAINTENANCE_FAILED。archive/restore済みDB/外部ledgerを保全。再試行はVACUUMのみ | 新規DELETE禁止。保守処理のみ再試行可 | 共通証跡、DELETE receipt、S7検証、vacuum_error、archive SHA、保全先 |
 | T17 | 削除後検証失敗 | S6の削除commit後に残存件数/保護ID検査を意図的に失敗させる | SUCCESSにしない。archiveとrestore済みDBを保持し、復旧判断を要求 | 追加削除は禁止 | 削除commit receipt、post-check差分、archive SHA、復旧記録 |
 | T18 | 未検証IDからDELETE | PREVIEWED/APPROVED/ARCHIVE_CREATED状態のoperation_idでDELETE APIを呼ぶ | API内部の状態・receipt gateで拒否 | 禁止 | 拒否されたoperation_id、状態、呼出元、gate判定 |
 | T19 | 検証receipt改ざん | restore PASS記録、plan digest、archive SHA、状態値を改ざん | receipt署名/digest不一致で拒否 | 禁止 | receipt原本/実測、署名検証結果、拒否ログ |
 | T20 | 削除直前の同時更新 | S5 PASS後、削除直前に対象行を追加・更新・削除 | 最終再スキャンでpreviewとの差異を検出し承認失効 | 禁止 | preview/current PK digest・row digest比較、DB identity |
+
+
+## T01〜T28 共通証跡スキーマ（必須）
+
+全テストで同じJSONL event schemaを使い、main DB外のappend-only test evidenceへ記録する。必須key:
+- test_id、run_id、operation_id、event_id、event_seq、timestamp_utc
+- state_before、state_after、actor_id_digest、process_id、worker_id、connection_id
+- source_db_identity、source_snapshot_sha256、source_projection_digest、schema_fingerprint
+- target_table、target_count、target_pk_digest、target_row_digest、protected_root_count、protected_root_digest
+- archive_path_digest、archive_sha256、restore_receipt_sha256
+- receipt_state、receipt_digest、external_ledger_event、external_ledger_fsync_result
+- sql_trace（正規化SQL、対象表、時刻、transaction ID、実行回数、rowcount。値・秘密情報は記録しない）
+- sqlite_error_code、exception_type、error_message_digest、rollback_result
+- final_db_integrity、final_target_pk_digest、final_target_row_digest、final_protected_root_digest
+- delete_allowed、delete_sql_count、expected_delete_count、actual_delete_count、final_verdict
+
+証跡はoperation_id/test_idの複合キーで追跡する。各ケース終了時に最終DBをread-onlyで開き、integrity_check、対象PK/row digest、37 root digestを採取する。DELETE禁止ケースはdelete_sql_count=0。T01のみ全gate PASS後に各対象表DELETE SQLを1回ずつ許可する。証跡欠落・破損・連番飛びはテストFAIL。
+
+## T21〜T28追加合格基準
+- T21 recoveryはreceipt、候補PK/row digest、root digest、外部ledgerが全条件一致した場合だけ結果確定。同一operation_idのDELETE trace追加なし。
+- T22は外部DELETE_INTENTとnonce CONSUMEDのfsync完了前にDELETE SQL/DELETE transaction開始が0回。
+- T23はWAL snapshot境界、取得前後metadata、BEGIN IMMEDIATE後の再照合を個別検証。
+- T24は10分期限、MFA claim、取消・使用済みledger永続性を境界時刻で検証。
+- T25は型fixtureごとのcanonical byte列と期待SHAをgolden valueとして固定。
+- T26〜T28は既存期待結果を維持する。
 
 ## 合格基準
 
@@ -36,7 +61,7 @@
 - T02〜T20は、S6の条件を満たさない限り本体DELETEが一度も発行されないことをSQL traceまたはDELETE入口の呼出し監査で確認する。
 - T11では2テーブルを単一トランザクションとして扱い、片方だけの確定を認めない。
 - T16/T17では、DELETE commit済みか否かを正確に分離し、VACUUMや事後検査の失敗を削除成功の証明に流用しない。
-- すべてのケースで、失敗状態・例外・operation_id・source identity・対象digest・archive情報が残る。
+- 全T01〜T28で共通証跡schemaの必須keyを記録し、証跡欠落・不整合はテストFAILとする。
 - 失敗ログが残っていても、archiveや復元先のデータ完全性が確認できない場合は復元可能と判定しない。
 - テスト実行後、本番DB・既存Artifact・Issue #31・正式な `docs/status/STATUS.md` に変更がないことを確認する。
 
@@ -48,19 +73,18 @@
 - 例外を意図的に握りつぶす実装を検知するため、状態遷移とreturn statusの両方を検証する。
 - 既存のGen675/Gen676監査Artifactは読み取り専用で参照し、変更・削除しない。
 
-## 一次レビュー追加テスト T21〜T28（2026-11-24）
+## 再レビュー追補テスト T21〜T28（2026-11-24）
 
-| ID | ケース | 入力・注入条件 | 期待結果 | 本体削除可否 | 必須証跡 |
+| ID | ケース | fixture・注入条件 | 期待結果 | 本体削除可否 | 個別証跡 |
 |---|---|---|---|---|---|
-| T21 | DELETE commit直後のプロセス停止 | SQLite commit直後、外部完了ログ更新前にプロセスを強制停止 | 再起動後COMMIT_UNKNOWNとしてread-only照合。receipt・PK/row digest・外部ログから確定するまで停止 | 確定まで再DELETE禁止 | commit前後ログ、DB内receipt、再起動照合結果、状態遷移 |
-| T22 | 外部監査ログ書き込み失敗 | DELETE開始意図の外部永続ログ書込み/flush/fsyncを失敗させる | DELETE開始前にfail closed。DB本体無変更 | 禁止 | ログ書込例外、永続化確認結果、DELETE SQL trace |
-| T23 | WALを伴う同時更新 | WAL modeで別接続から対象行を更新/追加し、preview snapshot後に競合させる | snapshotと現在DBの差異またはロック競合を検知。承認失効し停止 | 禁止 | journal_mode、snapshot identity、WAL状態、PK/row digest差分、lock結果 |
-| T24 | 承認nonce再利用 | 同じapproval_nonceを同一/別operation_idで2回使用、期限切れ・取消済みnonceも再送 | UNIQUE/使用済み台帳で拒否。再承認を要求 | 禁止 | nonce digest、認証主体、使用履歴、拒否理由 |
-| T25 | 行digest型保持 | NULL、BLOB、整数/実数、文字列、境界値を含む行をarchive/restore | 型タグ・長さ・バイト列を含む正規化でsource/archive/restoreのPK・row digestが完全一致 | 一致確認まで禁止 | 列型、NULL区別、BLOB bytes、canonicalization仕様、各digest |
+| T21 | commit直後停止・外部完了ログ失敗 | 一時DBにhistory候補3行、lap候補2行、保護root37行、receipt表を作成。全gate PASS後DELETE transactionをcommitし、DELETE_COMMITTED receipt更新・外部完了ledger追記直前でkill。別ケースでCOMMIT前kill/rollback | commit後停止はreceipt=COMMIT_PENDING、両表候補PK=0、root37/37一致、ledger=DELETE_INTENTのみとなりread-only recoveryでcommit成立を確定。commit前停止はreceipt=PREPARED、候補3/3・2/2が元digestで存在しNOT_COMMITTED。いずれも同一IDでDELETE再実行なし | recovery中禁止。同一ID永久禁止 | receipt状態、PK/row digest、external ledger、kill位置、DELETE trace各表1回、recovery判定 |
+| T22 | 外部監査ログ書き込み失敗 | DELETE_INTENT追記・flush・fsyncを個別失敗注入。nonce ledger CONSUMEDのfsync失敗も別試験 | DELETE transactionを開始せず、業務表無変更、receipt PREPARED。DELETE SQL trace=0 | 禁止 | ログ例外、fsync結果、nonce台帳、transaction開始trace、DELETE trace |
+| T23 | WAL snapshot・同時更新・checkpoint | journal_mode=WAL一時DBにhistory3行/lap2行/root37行。preview後に別接続で候補1行更新、1行追加、1行削除を個別注入。別試験でsnapshot中writer更新/checkpoint | preview中metadata変化はsnapshot破棄。preview後の変更はBEGIN IMMEDIATE後のprojection/PK/row digest不一致で拒否。writer lock中の別writerはbusy timeout/lock拒否。全ケースDELETE SQL=0 | 禁止 | identity、main/WAL stat+SHA、journal_mode、snapshot SHA、projection digest、PK/row差分、checkpoint/lock結果、DELETE trace |
+| T24 | nonce期限・取消・再利用 | OIDC issuer/subject/session/auth_time/amr=MFA fixture、256-bit nonce。10分期限直前/直後、取消後、CONSUMED後、同一/別operation_id再送、plan_digest変更を注入 | 10分以内かつ未使用/未取消/認証有効のみ承認可能。期限切れ・取消・CONSUMED・別ID再送・計画変更は拒否。ledger状態は再起動後も維持 | 不正承認では禁止 | OIDC claim検証、nonce_digest、発行/期限/取消/消費時刻、ledger連番/fsync、拒否理由 |
+| T25 | 型保持canonical row digest | NULL、空文字、BLOB 00 FF、TEXT、INTEGER 1、REAL 1.0、REAL -0.0、日本語UTF-8、境界長fixtureをarchive/restore | storage classをタグ化。NULL=N、INTEGER=I+signed64 big-endian、REAL=R+IEEE754 binary64 big-endian、TEXT=T+UTF-8 length+bytes、BLOB=B+length+raw bytes。列順・長さprefixで連結。NULL/空文字、BLOB/TEXT、INTEGER/REAL、+0.0/-0.0は別digest。source/archive/restoreでPK/row digest完全一致 | 完全一致まで禁止 | typeof、tag、length、hex bytes、canonical byte SHA、PK/row digest、archive/restore比較 |
 | T26 | schema/index/constraint変更 | preview後に列定義、PK、index、UNIQUE/CHECK/FK制約を変更またはarchive側から欠落 | schema fingerprint不一致を検知しarchive/restore gateまたは削除直前gateで拒否 | 禁止 | schema SQL、index/constraint一覧、期待/実測fingerprint |
 | T27 | 同一operation_id並行実行 | 同一IDで複数worker/processから同時にpreview/approve/archive/deleteを開始 | 一意制約と排他lockにより一方だけが進行。他方は競合拒否。二重DELETEなし | 1 operationにつき最大1回、全gate後のみ | operation record、lock owner、競合ログ、DELETE SQL trace |
 | T28 | 37 root保護条件 | Gen675由来37 rootの一部/全部をcandidateへ混入、保護行を変更/欠落させる | 通常整理をfail closed。archiveに存在しても本体保護条件を免除しない | 禁止 | root ID集合digest、保護状態、candidate混入件数、拒否ログ |
-
 ## 追加テストの合格基準
 
 - T21〜T28はすべて失敗時にDELETEを禁止し、T21はcommit結果が確定するまで再DELETEを一切許可しない。
@@ -70,11 +94,3 @@
 - T26ではテーブル列だけでなくPK、index、UNIQUE/CHECK/FK等のschema fingerprint対象を検証する。
 - T27ではプロセスを跨ぐ排他を確認し、メモリ内lockだけに依存しない。
 - T28では37 rootが1件でも候補に混入した場合に拒否し、archive保存の有無で例外を認めない。
-
-## T16差し替え（VACUUMの独立状態）
-
-| ID | ケース | 入力・注入条件 | 期待結果 | 本体削除可否 | 必須証跡 |
-|---|---|---|---|---|---|
-| T16 | VACUUM失敗 | DELETE commitとS7データ検証が完了した後、VACUUMのみ失敗させる | データ状態はDELETE_COMMITTED/POST_DELETE_VERIFIEDとして保持し、保守状態のみPOST_DELETE_MAINTENANCE_FAILED。archive/restore/外部ログを保持し、VACUUM再試行でDELETEを再実行しない | 新規DELETE禁止。保守処理のみ再試行可 | DELETE commit receipt、S7検証、vacuum_error、archive SHA、保全先、状態遷移 |
-
-- T16は削除処理の成否を判定するテストではなく、削除後保守処理の失敗分離を検証する。

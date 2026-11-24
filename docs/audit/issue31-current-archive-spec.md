@@ -125,3 +125,14 @@
 - SQLite WALを含む一貫snapshot、承認nonce、COMMIT_UNKNOWN、削除直前ロック、37 rootの本体保護、VACUUM分離は現行実装に存在すると確認したものではなく、今後の設計要件である。
 - 2026-11-09の実操作イベント、操作者、keep_versions、専用archiveの存在は引き続き未証明。
 - 本追補は設計レビュー対応のみ。app.py、本番DB、予測ロジック、APP_VERSION、Artifactは変更していない。
+
+## 5. 安全化設計との境界（2026-11-24再レビュー追補）
+
+本書の第1〜4節は対象ソースcommitに存在した旧実装の監査事実であり、今後の安全化仕様ではない。旧実装にBackup API snapshot、認証済み承認、nonce台帳、DB内operation receipt、外部fsync ledger、BEGIN IMMEDIATE後の最終digest照合、共通SQL traceは存在しない。これらが実装済みであると読み替えてはならない。
+
+将来実装の規範仕様は次を唯一の参照先とする。
+- SQLite snapshot、source_db_identity、WAL、承認、receipt、COMMIT_UNKNOWN、BEGIN IMMEDIATEの固定順序: issue31-safe-cleanup-design.md のR1〜R4。
+- T01〜T28のfixture、共通証跡、期待結果: issue31-cleanup-test-plan.md。
+- 本書は現行実装の事実記録を保持し、将来仕様を旧実装の挙動として記述しない。
+
+今回の追補で現行コード、本番DB、予測ロジック、APP_VERSION、Artifactを変更していない。文書更新は安全性の実証・設計承認・実装承認を意味しない。

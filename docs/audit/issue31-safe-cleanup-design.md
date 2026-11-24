@@ -153,32 +153,121 @@ operation_idは作成後に別の対象集合へ再利用しない。同じopera
 
 **レビュー判定：要修正。設計承認未了。以下は既存本文に優先する規範要件であり、実装済みを意味しない。**
 
-### R1. SQLite識別・WAL・一貫スナップショット
-- プレビューはSQLite Backup API等で整合した読み取りスナップショットを別ファイルへ取得してから行う。WAL利用時にメインDBファイル単体をコピーしてスナップショットとみなしてはならない。読み取り接続で確定したトランザクション境界を明示し、必要なWAL内容を含む一貫状態を取得する。
-- スナップショットに対し、DBファイルSHA-256、サイズ、生成時刻、SQLiteバージョン、journal_mode、schema fingerprint、対象テーブル定義、PK集合digest、全対象行digest、保護対象digestを記録する。DB identityはパスやファイルサイズだけで定義しない。
-- plan_digestは上記identity、schema、keep/delete versions、対象テーブル、PK/row digest、保護対象条件、archive仕様を正規化して算出する。
-- 削除直前は書き込みトランザクション内で現在DBのschema・対象PK集合・行digest・保護対象を再照合する。プレビューsnapshotとの差異、WAL checkpoint/接続状態の不整合、identity不一致、読み取り不能、競合更新のいずれかがあればfail closedし、承認・archive/restore receiptを失効させてDELETE禁止とする。
-- WALを含む現在状態を安全に同定できない環境では削除機能自体を無効化する。WALファイルを手作業で削除・無視してはならない。
 
-### R2. 承認の真正性
-- 承認は認証済みセッションの操作者が、対象一覧・件数・保持/削除Ver・DB identity・archive先・plan_digestを表示した専用確認画面で明示的に実行する。単なるログイン、画面表示、チェックボックス初期値は承認ではない。
-- 承認レコードはoperation_id、plan_digest、認証主体ID、認証セッション/認証強度の証跡、承認時刻、期限、暗号学的乱数approval_nonceを一体で固定し、改ざん検出可能な署名/HMAC等で保護する。
-- approval_nonceは一回限りでUNIQUE管理し、使用済み・取消済み・期限切れnonceの再利用を拒否する。期限は設計値として実装前に明示し、期限切れなら再プレビュー・再承認を要求する。
-- 承認取消はDELETE開始前まで可能。取消後は承認状態を復活させず、新しい承認nonceを要求する。
-- operation_id、plan_digest、source DB identity、schema、PK/row digest、keep/delete versions、archive destinationのいずれかが変われば承認は即時失効し、同一operation_idでの差し替えを禁止する。
+### R1. SQLite識別・固定スナップショット取得（規範仕様）
 
-### R3. 外部監査ログとDB commitの不確定窓
-- DELETEトランザクション開始前に、メインDBとは独立した永続ログへoperation_id、plan_digest、source identity、archive SHA、restore PASS receipt、承認情報、DELETE開始意図を追記し、flush/fsync等の永続化確認を得る。外部ログに書けない場合はDELETE開始禁止。
-- 外部ログとSQLite commitは原子的に同時確定できないため、DELETE開始記録後からcommit結果確定までの状態としてCOMMIT_UNKNOWNを定義する。
-- commit応答喪失・プロセス停止時は、再起動後に本体DBを読み取り専用で開き、operation receipt、対象PKの存在/不存在、対象行digest、保護対象、外部ログを照合する。推測で成功・失敗を決めない。
-- COMMIT_UNKNOWN中は再DELETE、VACUUM、archive破棄、operation_id再利用を禁止する。整合が確定した場合のみCOMMITTEDまたはNOT_COMMITTEDへ遷移し、矛盾・ログ欠落時はMANUAL_RECOVERY_REQUIREDで停止する。
-- DELETE後のcommit結果を証明するため、同一DBトランザクション内にoperation_idと削除結果digestを記録する内部receipt行を設ける案を必須検討とする。ただし外部ログとの不一致は別途照合し、DB内receiptだけで外部ログ永続性を代替しない。
+#### R1-1. 接続と取得順
+1. 対象DBをrealpathで絶対パス化する。読み取り専用URI mode=roで接続し、immutable=1は指定しない。query_only=ON、busy_timeout=5000msを設定する。
+2. 同じ接続でBEGINし、最初にschema_version、journal_mode、sqlite_schemaを読む。これを読み取りtransactionのsnapshot境界とする。Backup API完了と取得前後metadata採取までtransactionを維持する。
+3. Backup API開始直前にmain DBと存在するWALのdevice、inode、size、mtime_ns、SHA-256を採取する。WAL不存在も明示記録する。
+4. 同じ読み取り接続からSQLite Backup APIで新規一意パスの一時SQLiteへ全DBをコピーする。排他的作成とし既存ファイルをunlink/上書きしない。Backup APIの非成功、busy/locked timeout、read error、中断は失敗とする。
+5. Backup完了後、出力接続でjournal_mode=DELETE、synchronous=FULLを設定しcommit・closeする。snapshot本体と親directoryをfsyncする。読み取り元transactionを維持したままmain/WAL metadataとSHA-256を再採取する。
+6. 取得前後のmain/WAL device、inode、size、mtime_ns、SHA-256、journal_mode、schema_versionのいずれかが変化した場合、snapshotを破棄し、そのoperation_idを終端化する。再取得は新しいpreviewと新しいoperation_idで行う。
+7. 検証順を固定する。①snapshot file SHA-256/size、②integrity_check、③schema fingerprintと対象table定義、④対象2表PK集合digest、⑤対象2表全行digest、⑥37 root digest、⑦source_db_identityとplan_digest。全PASS後にPREVIEWEDを永続化する。
+8. PK/row digestはsnapshot DBから読み取り専用で計算し、元DBの別接続から値を混在させない。
 
-### R4. 削除直前の競合防止と原子性
-- DELETE処理は対象DBに対する書き込みトランザクションを開始してから、source identity/schema、対象2表のPK集合・全行digest、保護対象37 rootの不存在/保護状態を再照合する。SQLiteでは競合を早期検知できるトランザクション開始方式（例: BEGIN IMMEDIATE）を採用するか、同等の排他保証を設計書で具体化する。
-- 再照合から2テーブルDELETE・削除件数照合・operation receipt書込みまでを同一トランザクション内で実施する。再照合後に別接続が対象行を変更できる競合窓を残さない。
-- どちらか一方のDELETE件数不一致、SQL例外、receipt書込み失敗、制約違反があれば全体rollback。部分commitは認めない。
-- トランザクション開始不能、busy/locked timeout、WAL状態不明、schema変更、PK/row digest不一致の場合はDELETEせず、承認・検証を失効させて再プレビューへ戻す。
+#### R1-2. WAL・checkpoint・transaction
+- WAL modeではBackup APIが読み取りtransactionから見える確定状態をコピーする。main DBファイル単体コピーは禁止。
+- preview取得中に手動checkpointを実行しない。外部checkpointが発生した場合は取得前後metadata差異として検出しoperationを破棄する。
+- 削除時はR4のBEGIN IMMEDIATEでwriterを確保する。削除直前比較snapshotは別read-only接続からBackup APIで取得し、writer transaction保持中の対象DBと比較する。比較中にsource metadataが変われば削除禁止。
+- WAL欠落、読取不能、journal_modeと関連file状態の矛盾、checkpoint状態を判別できない場合はfail closed。WALの手動削除・無視・強制checkpointは禁止。
+
+#### R1-3. source_db_identityとsnapshot digest
+source_db_identityは次の値をキー順固定・空白なしUTF-8 JSONへ正規化しSHA-256を取る。
+- canonical_db_path（realpath）
+- filesystem_device、filesystem_inode（main DB）
+- sqlite_application_id、sqlite_user_version、sqlite_page_size、sqlite_encoding
+- schema_version、journal_mode
+- schema_fingerprint（receipt管理表を含む全sqlite_schema定義）
+このidentityにはsize、mtime、main DB SHA、WAL SHAを混ぜない。これらはsnapshot_capture_evidenceとして別途保存し、取得前後一致を必須とする。
+- source_snapshot_sha256はBackup API snapshot file全体のSHA-256。
+- source_projection_digestはreceipt管理表を除く全ユーザーテーブルのschema定義と全行を、table名・PK順・column順で型付き正規化して集約したSHA-256。receipt管理表以外を除外してはならない。
+- 削除直前はsource_db_identity、schema_fingerprint、source_projection_digest、対象2表のPK/row digest、37 root digestを承認時と照合し、1つでも異なればDELETE禁止。
+- receipt管理表は事前作成しschema_fingerprintに含める。可変receipt行のみsource_projection_digestから除外する。他の除外table/columnは認めない。
+
+### R2. 承認真正性・nonce（規範仕様）
+
+#### R2-1. 操作者認証
+- 承認主体は許可リスト登録済みOpenID Connect Identity Providerが発行する署名検証済みID tokenのissuer（iss）とsubject（sub）の組で識別する。表示名・メール・ブラウザ入力文字列だけでは識別しない。
+- tokenの署名、issuer、audience、期限、発行時刻、auth_timeを検証する。承認時はMFA必須とし、amrにMFAを示す値がなければ拒否する。認証基盤が利用できない場合は承認/DELETE機能を無効化する。
+- issuer、subject、session_id、auth_time、acr、amr、ID token SHA-256、承認時刻を保存する。生token・秘密鍵・cookieは保存しない。
+
+#### R2-2. nonce・期限・台帳
+- approval_nonceはOS CSPRNGで生成する256-bit乱数のbase64url表現。有効期限は発行から10分に固定し、延長・再利用・同一nonce復活は禁止。
+- nonce台帳はmain DB外の追記専用ledgerとする。プロセス間排他lock下で追記し、各event後にfsync、初回作成時は親directoryもfsyncする。途中行・破損・読取不能・連番欠落時は承認/DELETEを停止する。
+- nonce_digestを一意キーとしISSUED、CONSUMED、CANCELLED、EXPIREDを記録する。ISSUEDは発行時、CANCELLEDは取消時、CONSUMEDはDELETE_INTENT記録直前に永続化する。期限到達後はEXPIREDを記録する。
+- 取消は認証済み操作者が専用操作を行い、CANCELLEDをfsyncした時点で成立。取消後は同じnonce/operation_idを再承認に使わない。新しいpreview、operation_id、nonceが必要。
+- CONSUMED/CANCELLED/EXPIRED nonceは同一・別operation_idを問わず永久に再利用禁止。ledgerに存在するnonce_digestは必ず拒否。
+
+#### R2-3. 承認レコード
+- 承認レコードはoperation_id、plan_digest、source_db_identity、source_snapshot_sha256、source_projection_digest、archive destination、approval_nonce_digest、issuer、subject、session_id、auth_time、承認時刻、有効期限を一体固定する。
+- 正規化レコードをmain DB外の秘密管理領域の鍵によるHMAC-SHA-256で署名する。鍵読取不能、署名不一致、鍵ID不明は拒否。
+- operation_idはUUIDv4相当CSPRNGで一度だけ発行し永続台帳でUNIQUE。nonceもUNIQUE。operation_id、plan_digest、source_db_identity、nonce_digestを同じ承認recordに結合する。
+- 承認後に対象一覧、件数、keep/delete versions、DB identity、schema、source projection、対象digest、archive destination/SHA、restore receiptのいずれかが変われば承認失効。変更後の計画へ同じoperation_idを流用しない。
+
+### R3. 外部ログ・DB内receipt・COMMIT_UNKNOWN（規範仕様）
+
+#### R3-1. DB内receipt必須schema
+対象DBに専用receipt管理表を事前作成する。必須列:
+- operation_id TEXT PRIMARY KEY
+- plan_digest TEXT NOT NULL
+- source_db_identity TEXT NOT NULL
+- source_projection_digest TEXT NOT NULL
+- target_pk_digest_history TEXT NOT NULL
+- target_row_digest_history TEXT NOT NULL
+- target_pk_digest_lap TEXT NOT NULL
+- target_row_digest_lap TEXT NOT NULL
+- archive_sha256 TEXT NOT NULL
+- restore_receipt_sha256 TEXT NOT NULL
+- state TEXT NOT NULL（PREPARED / COMMIT_PENDING / DELETE_COMMITTED / NOT_COMMITTED / MANUAL_RECOVERY_REQUIRED）
+- created_at_utc TEXT NOT NULL
+- updated_at_utc TEXT NOT NULL
+- receipt_digest TEXT NOT NULL
+operation_idはPRIMARY KEY。receipt_digestは上記全列を固定順で正規化したSHA-256。receipt表schemaはschema_fingerprintに含め、可変receipt行だけsource_projection_digestから除外する。
+
+#### R3-2. receipt・外部ログ順序
+1. archive/restore PASS、承認有効、nonce未使用を確認後、DB内receiptをPREPAREDとして別transactionでINSERT/commitする。receipt_digestを再計算し一致確認する。
+2. main DB外append-only ledgerへDELETE_INTENTを追記しfsyncする。内容はoperation_id、plan_digest、source_db_identity、source_projection_digest、archive SHA、restore receipt SHA、承認証跡digest、nonce_digest、時刻。
+3. nonce ledgerへCONSUMEDを追記しfsyncする。いずれか失敗ならDELETE transactionを開始しない。receiptはPREPAREDのまま保持し、同一operation_idを再実行しない。
+4. R4の書き込みtransaction内で再照合後、2表DELETEと件数照合を行う。receiptをCOMMIT_PENDINGへ更新しreceipt_digestを再計算する。このUPDATEはDELETEと同一transaction内でCOMMIT直前に行う。
+5. SQLite COMMIT成功後、別の短いtransactionでreceiptをDELETE_COMMITTEDへ更新しcommitする。その後、外部ledgerへDELETE_COMMITTEDを追記しfsyncする。後段receipt更新または外部ログ追記が失敗した場合はCOMMIT_UNKNOWNとし、DELETE再実行禁止。
+
+#### R3-3. COMMIT_UNKNOWN復旧判定表
+再起動後の初動は対象DBをmode=ro、query_only=ONで開き、receipt、対象PK、対象row digest、保護root digest、schema、外部ledgerを読むだけとする。判定確定までDELETE、VACUUM、archive削除、operation_id再利用を禁止する。
+
+| DB receipt | 対象2表 | 保護対象/schema | 外部ledger | 判定 |
+|---|---|---|---|---|
+| COMMIT_PENDING | 両表の全候補PKが不存在 | 承認時digestと一致 | DELETE_INTENTあり、完了記録なし | commit成立と確定。DELETE_COMMITTEDへ復旧記録 |
+| DELETE_COMMITTED | 両表の全候補PKが不存在 | 承認時digestと一致 | DELETE_COMMITTEDあり | commit成立済み |
+| PREPARED | 両表の全候補PKが全件存在し、全row digest一致 | 承認時digestと一致 | DELETE_INTENTあり、完了記録なし | NOT_COMMITTED確定。operation終端化、新operation_idでのみ再preview |
+| 上記以外 | 一部だけ存在、digest不一致、receipt欠落/破損 | 不一致または判定不能 | 欠落・破損・不一致 | MANUAL_RECOVERY_REQUIRED。人手判断まで停止 |
+
+- commit後の外部ledger追記失敗時、receiptはCOMMIT_PENDINGまたはDELETE_COMMITTED、候補PKは全件不存在となる。表の全条件を満たす場合だけcommit成立と判定し、DELETEせずreceipt/ledger完了記録だけを補完する。
+- PREPAREDかつ全対象行が元digestで存在する場合はNOT_COMMITTED。同じoperation_idでDELETEを再試行しない。新operation_idでpreview・承認・archive・restoreを最初から行う。
+- receipt/PK状態の矛盾、一部だけ消失、外部ledger欠落/破損時は自動判定せずMANUAL_RECOVERY_REQUIRED。
+- recovery初動はread-only照合のみ。DB更新は判定確定後の専用recovery操作に限定し、その操作にDELETE SQLを含めない。
+
+### R4. 排他方式・削除transaction順（規範仕様）
+
+#### R4-1. 採用方式
+SQLite排他方式はBEGIN IMMEDIATEに固定する。BEGIN、EXCLUSIVE、メモリ内lockへの切替は認めない。busy_timeout=5000msとし、5秒以内にwriter lockを取得できなければ拒否する。プロセス間補助lockは同一operation二重開始防止にのみ使い、DB排他の代替にしない。
+
+#### R4-2. 固定処理順
+1. 承認、nonce、archive SHA、restore receipt、外部DELETE_INTENT fsyncを確認。
+2. 対象DBへ書き込み接続しbusy_timeout=5000msを設定、BEGIN IMMEDIATE。取得失敗ならDELETEせずoperationをLOCK_REJECTEDとして終端化。
+3. lock保持中にsource_db_identity、schema_fingerprint、source_projection_digest、2表の対象PK/row digest、37 rootの存在・件数・PK/row digestを再計算。
+4. 別read-only接続でBackup API比較snapshotを取得し、取得前後のmain/WAL metadata不変を確認。identity、schema、projection、snapshot上の対象digestが承認時と完全一致しなければDELETE禁止。receiptはPREPAREDのまま、承認・archive/restore receiptを失効。
+5. 37 rootが全件本体に存在し、承認時PK/row digestと一致し、通常candidate混入0件を確認。1件でも欠落・変更・混入ならDELETE禁止。
+6. historyとlap snapshotの2表を同一BEGIN IMMEDIATE transaction内でDELETE。各表の削除件数は承認済みcandidate_countと完全一致させる。
+7. 2表DELETE成功後、DB receiptをCOMMIT_PENDINGへ更新しreceipt_digestを再計算。receipt更新/digest照合失敗なら両表DELETEをROLLBACK。
+8. DELETE SQL trace、削除件数、receipt更新をtransaction内で検査しCOMMITを1回だけ実行。commit応答喪失・停止・接続断はCOMMIT_UNKNOWN。
+9. commit前の例外、件数不一致、schema/digest不一致、root不一致、busy/locked timeoutはROLLBACK。同一operation_idのDELETE再試行は禁止し、新previewとoperation_idを要求。
+
+#### R4-3. 再試行・拒否条件
+- BEGIN IMMEDIATEのbusy/locked timeoutは自動再試行しない。operationを拒否し、待ち時間とSQLite error codeを記録。
+- snapshot/schema/identity/PK/row/root digest不一致は承認を自動更新しない。承認・receiptを失効し新operation_idを要求。
+- 片側DELETE失敗、件数不一致、receipt更新失敗、constraint違反はtransaction全体をROLLBACK。
+- COMMIT_UNKNOWN、MANUAL_RECOVERY_REQUIRED、DELETE_COMMITTED、NOT_COMMITTED、LOCK_REJECTEDでは同一operation_idのDELETE入口を永久に再開しない。
 
 ### R5. 37 rootの保護ポリシー
 - Gen675由来の37 rootは通常の旧Ver整理から除外する恒久保護対象として定義する。候補から除外するだけでなく、DELETE直前の独立した拒否条件として照合する。
