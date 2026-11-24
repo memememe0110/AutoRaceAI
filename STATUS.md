@@ -393,3 +393,12 @@ Issue #31の正式判定は「主要監査完了・再発防止未完了」。37
 - 実装・テスト実装・本番反映: 未実施。
 - 次の作業: 3文書の再レビュー。R1〜R6とT21〜T28に未解決が1つでもあれば承認しない。
 - 禁止範囲: app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更しない。
+
+
+## 修正反映Git記録（2026-11-24）
+
+- 設計文書・補助STATUSの修正commit: `1d3210b22958c83db7acf8f8778924ad6171093c`
+- 正式進捗正本の修正commit: `53b00494839aba9fe7fa952fc3d9d2ed322b7ff3`
+- Issue #31コメント: https://github.com/memememe0110/AutoRaceAI/issues/31#issuecomment-7133364016
+- 変更ファイルは監査設計3文書とルートSTATUSのみ。本番コード・DB・予測ロジック・APP_VERSION・既存Artifactは変更なし。
+- 次の作業: 3文書の再レビュー。一次判定「要修正」を維持し、R1〜R6/T21〜T28の全項目解決まで承認しない。
