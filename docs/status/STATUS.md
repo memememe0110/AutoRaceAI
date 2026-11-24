@@ -202,3 +202,7 @@ SQLite/WAL実機競合、OIDC/MFA連携、fsync耐久、COMMIT_UNKNOWN強制停�
 - Issue #31: 「再レビュー要修正」と未実施検証をコメントする
 
 app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更していない。
+
+### 正式進捗commit SHA追記（2026-11-24）
+- Issue #31設計再レビュー状態の正式進捗更新commit: 46299e927736be1826443e4a20f8ca4331c1617d
+- 上記commit SHAを記録した追記commit: 作成後にIssue #31コメントで最終HEADを報告する。
