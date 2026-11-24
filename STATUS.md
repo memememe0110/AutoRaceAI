@@ -373,3 +373,23 @@ Issue #31の正式判定は「主要監査完了・再発防止未完了」。37
 
 設計レビュー前の実装・本番反映は禁止。今回も `app.py`、本番DB、予測ロジック、`APP_VERSION` は変更していない。
 
+
+## Issue #31 設計一次レビュー（2026-11-24）
+
+**正式判定：設計の方向性は妥当だが、設計承認未了（要修正）。実装・本番反映は禁止。**
+
+一次レビューでR1〜R6を必須修正とし、監査ブランチ `tmp-audit-31-repeats` の設計文書に追補する。
+
+- R1: SQLite Backup API等による一貫snapshot、WALを含むDB identity/schema/PK・row digest、削除直前再照合。WAL・同時更新・不一致時はfail closed。
+- R2: 認証済み操作者の明示承認。operation_id/plan_digest/一回限りnonce、有効期限・取消・再利用防止、対象/DB/計画変更時の失効。
+- R3: DELETE前の外部永続ログ、COMMIT_UNKNOWN、再起動後read-only照合、結果確定まで再DELETE禁止。
+- R4: 書き込みトランザクション開始後にPK/row digest/保護対象を再照合し、2表を同一トランザクションで削除。不一致・片側失敗は全体rollback。
+- R5: Gen675由来37 rootを通常整理の本体保護対象とし、archive保存要件と分離。混入時は拒否。将来の削除は別設計・別の明示的追加承認が必要。
+- R6: VACUUMを削除安全性の証明から分離。失敗はPOST_DELETE_MAINTENANCE_FAILEDとして独立記録し、archive/restore/ログを保全。
+- テストT01〜T20を維持し、T21〜T28を追加。T16をVACUUM独立状態に差し替え。
+
+### 修正後の状態
+- 設計文書3点: 一次レビュー指摘を反映。設計承認は未了。
+- 実装・テスト実装・本番反映: 未実施。
+- 次の作業: 3文書の再レビュー。R1〜R6とT21〜T28に未解決が1つでもあれば承認しない。
+- 禁止範囲: app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更しない。

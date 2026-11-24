@@ -24,7 +24,7 @@
 | T13 | archiveファイルSHA不一致 | S4後、S5またはS6前にarchiveファイルを差し替える/1byte変更 | SHA再検査で不一致。receiptを無効化 | 禁止 | 期待/実測SHA、ファイルstat、検知時刻 |
 | T14 | archive欠落・片テーブル欠落 | archive DBから片方の対象テーブルを削除、またはarchive fileを削除 | S4/S5でテーブル欠落として失敗 | 禁止 | schema一覧、期待/実測table一覧、file path |
 | T15 | 既存archive保護 | 同名archiveが既に存在し、別operationを開始 | 既存ファイルをunlink/上書きせず、新規一意パスを使う | 禁止（新規archiveの全検証前） | 既存SHA、new path、作成ログ |
-| T16 | VACUUM失敗 | 削除commit後のVACUUMだけを失敗させる | データ削除の成否とVACUUM成否を分離。VACUUM失敗を隠して全体成功にしない | S6前は禁止。S6後のVACUUM失敗は削除結果を偽装せず、S7未完了/要対応 | DELETE commit結果、vacuum_error、DB integrity、操作状態 |
+| T16 | VACUUM失敗 | DELETE commitとS7データ検証完了後にVACUUMのみ失敗 | データ状態はDELETE_COMMITTED/POST_DELETE_VERIFIEDを保持し、保守状態のみPOST_DELETE_MAINTENANCE_FAILED。archive/restore/外部ログを保全し、再試行でDELETEしない | 新規DELETE禁止。保守処理のみ再試行可 | DELETE commit receipt、S7検証、vacuum_error、archive SHA、保全先、状態遷移 |
 | T17 | 削除後検証失敗 | S6の削除commit後に残存件数/保護ID検査を意図的に失敗させる | SUCCESSにしない。archiveとrestore済みDBを保持し、復旧判断を要求 | 追加削除は禁止 | 削除commit receipt、post-check差分、archive SHA、復旧記録 |
 | T18 | 未検証IDからDELETE | PREVIEWED/APPROVED/ARCHIVE_CREATED状態のoperation_idでDELETE APIを呼ぶ | API内部の状態・receipt gateで拒否 | 禁止 | 拒否されたoperation_id、状態、呼出元、gate判定 |
 | T19 | 検証receipt改ざん | restore PASS記録、plan digest、archive SHA、状態値を改ざん | receipt署名/digest不一致で拒否 | 禁止 | receipt原本/実測、署名検証結果、拒否ログ |
@@ -47,3 +47,34 @@
 - テストのDELETE SQL traceを記録し、S4/S5 PASS前にDELETE文が発行されていないことを検証する。
 - 例外を意図的に握りつぶす実装を検知するため、状態遷移とreturn statusの両方を検証する。
 - 既存のGen675/Gen676監査Artifactは読み取り専用で参照し、変更・削除しない。
+
+## 一次レビュー追加テスト T21〜T28（2026-11-24）
+
+| ID | ケース | 入力・注入条件 | 期待結果 | 本体削除可否 | 必須証跡 |
+|---|---|---|---|---|---|
+| T21 | DELETE commit直後のプロセス停止 | SQLite commit直後、外部完了ログ更新前にプロセスを強制停止 | 再起動後COMMIT_UNKNOWNとしてread-only照合。receipt・PK/row digest・外部ログから確定するまで停止 | 確定まで再DELETE禁止 | commit前後ログ、DB内receipt、再起動照合結果、状態遷移 |
+| T22 | 外部監査ログ書き込み失敗 | DELETE開始意図の外部永続ログ書込み/flush/fsyncを失敗させる | DELETE開始前にfail closed。DB本体無変更 | 禁止 | ログ書込例外、永続化確認結果、DELETE SQL trace |
+| T23 | WALを伴う同時更新 | WAL modeで別接続から対象行を更新/追加し、preview snapshot後に競合させる | snapshotと現在DBの差異またはロック競合を検知。承認失効し停止 | 禁止 | journal_mode、snapshot identity、WAL状態、PK/row digest差分、lock結果 |
+| T24 | 承認nonce再利用 | 同じapproval_nonceを同一/別operation_idで2回使用、期限切れ・取消済みnonceも再送 | UNIQUE/使用済み台帳で拒否。再承認を要求 | 禁止 | nonce digest、認証主体、使用履歴、拒否理由 |
+| T25 | 行digest型保持 | NULL、BLOB、整数/実数、文字列、境界値を含む行をarchive/restore | 型タグ・長さ・バイト列を含む正規化でsource/archive/restoreのPK・row digestが完全一致 | 一致確認まで禁止 | 列型、NULL区別、BLOB bytes、canonicalization仕様、各digest |
+| T26 | schema/index/constraint変更 | preview後に列定義、PK、index、UNIQUE/CHECK/FK制約を変更またはarchive側から欠落 | schema fingerprint不一致を検知しarchive/restore gateまたは削除直前gateで拒否 | 禁止 | schema SQL、index/constraint一覧、期待/実測fingerprint |
+| T27 | 同一operation_id並行実行 | 同一IDで複数worker/processから同時にpreview/approve/archive/deleteを開始 | 一意制約と排他lockにより一方だけが進行。他方は競合拒否。二重DELETEなし | 1 operationにつき最大1回、全gate後のみ | operation record、lock owner、競合ログ、DELETE SQL trace |
+| T28 | 37 root保護条件 | Gen675由来37 rootの一部/全部をcandidateへ混入、保護行を変更/欠落させる | 通常整理をfail closed。archiveに存在しても本体保護条件を免除しない | 禁止 | root ID集合digest、保護状態、candidate混入件数、拒否ログ |
+
+## 追加テストの合格基準
+
+- T21〜T28はすべて失敗時にDELETEを禁止し、T21はcommit結果が確定するまで再DELETEを一切許可しない。
+- T22では外部ログの永続化確認がない状態でDELETE SQLが0回であることをtraceで確認する。
+- T23ではWALを含む一貫snapshotと削除直前の書き込みトランザクション内再照合を検証する。
+- T25ではNULLと空文字、BLOBと文字列、整数と実数を混同しないcanonical serializationを仕様化してからテストする。
+- T26ではテーブル列だけでなくPK、index、UNIQUE/CHECK/FK等のschema fingerprint対象を検証する。
+- T27ではプロセスを跨ぐ排他を確認し、メモリ内lockだけに依存しない。
+- T28では37 rootが1件でも候補に混入した場合に拒否し、archive保存の有無で例外を認めない。
+
+## T16差し替え（VACUUMの独立状態）
+
+| ID | ケース | 入力・注入条件 | 期待結果 | 本体削除可否 | 必須証跡 |
+|---|---|---|---|---|---|
+| T16 | VACUUM失敗 | DELETE commitとS7データ検証が完了した後、VACUUMのみ失敗させる | データ状態はDELETE_COMMITTED/POST_DELETE_VERIFIEDとして保持し、保守状態のみPOST_DELETE_MAINTENANCE_FAILED。archive/restore/外部ログを保持し、VACUUM再試行でDELETEを再実行しない | 新規DELETE禁止。保守処理のみ再試行可 | DELETE commit receipt、S7検証、vacuum_error、archive SHA、保全先、状態遷移 |
+
+- T16は削除処理の成否を判定するテストではなく、削除後保守処理の失敗分離を検証する。
