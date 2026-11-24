@@ -171,3 +171,34 @@
 - Issue #31コメント: https://github.com/memememe0110/AutoRaceAI/issues/31#issuecomment-7133364016
 - 次の作業: R1〜R6およびT21〜T28を含む3文書の再レビュー。未解決があれば設計承認・実装開始は禁止。
 - 実装・本番反映は未実施。app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは未変更。
+
+## Issue #31 設計再レビュー自己確認・次工程（2026-11-24）
+
+**正式判定：主要監査完了・再発防止未完了。設計レビュー要修正。設計承認・実装承認は未了。**
+
+監査ブランチ tmp-audit-31-repeats の3文書を再取得・修正し、文書上の自己レビューを実施した。
+
+### 修正内容
+- R1〜R4: SQLite Backup APIによる固定snapshotとWAL/metadata、source_db_identity、OIDC/MFA/nonce、DB内receiptとCOMMIT_UNKNOWN復旧表、BEGIN IMMEDIATE排他と処理順を規範仕様化。
+- T16: POST_DELETE_MAINTENANCE_FAILEDへの一本化。重複差し替え節を削除。
+- T21〜T25: 具体的fixture・期待値を追加。
+- T01〜T28: 共通証跡schemaを追加。
+- R5/R6、T22、T26〜T28: 前回判定を維持。T22/T26〜T28のテスト行は変更なし。
+- current-archive-spec.mdは旧実装の監査事実と将来仕様を分離。
+
+### 自己レビュー
+3文書をGitHubから再取得。R1〜R4の未確定語句なし、T16重複なし、R5/R6・T22・T26〜T28の維持、T21〜T25 fixture、共通証跡schemaを確認した。
+
+### 未実施・承認ゲート
+SQLite/WAL実機競合、OIDC/MFA連携、fsync耐久、COMMIT_UNKNOWN強制停止の試験は未実施。独立再レビューと設計承認も未了。したがって正式状態は「設計レビュー要修正」を維持し、実装・テスト実装・PR・本番反映は禁止する。
+
+### Git記録
+- 監査ブランチ: tmp-audit-31-repeats
+- 監査ブランチ最終HEAD: 9131f427377f8cbd05d7b7856c872d35aa6a640b
+- R1〜R4/T21〜T28初回具体化: a9eae1d775e5a351842211ebdb25305738c52811
+- 追加仕様commit: 8c7ab403716cc6f7cb17fc3de24687987d115578 / 2baa0c2d79346927b1e0642cf2ec7324c46b609c / 226dd2ba248f5bd9c873d06b2894b049bd22f574 / 50649df711259cb3abade8f9dcf5a2226e29ac7d / dfb5cf9b34033193b6eee2695cd6e4a6adc960a3 / 0b340b387306cb353ac5629c4428071980c9c3c9
+- root STATUS自己レビュー・commit記録: 監査ブランチ最終HEADに含む
+- 正式進捗更新commit: 作成後、追記commitで記録する
+- Issue #31: 「再レビュー要修正」と未実施検証をコメントする
+
+app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更していない。
