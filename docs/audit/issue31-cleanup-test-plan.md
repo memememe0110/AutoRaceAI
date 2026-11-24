@@ -31,6 +31,24 @@
 | T20 | 削除直前の同時更新 | S5 PASS後、削除直前に対象行を追加・更新・削除 | 最終再スキャンでpreviewとの差異を検出し承認失効 | 禁止 | preview/current PK digest・row digest比較、DB identity |
 
 
+
+### T25固定fixture・期待canonical payload
+
+fixture table名は digest_fixture、列順は id、v_null、v_empty、v_blob、v_text、v_int、v_real、v_negzero、v_jp、v_boundary。1行を次の値で固定する。
+- id=1
+- v_null=NULL
+- v_empty=空文字
+- v_blob=X'4142'
+- v_text="AB"
+- v_int=整数1
+- v_real=REAL 1.0
+- v_negzero=REAL -0.0
+- v_jp="競走"
+- v_boundary="12345678"
+
+期待storage classは順に integer、null、text、blob、text、integer、real、real、text、text。fixture投入後にtypeof()を読み、1列でも一致しなければfixture作成をFAILにする。
+期待payloadは順に、id=0000000000000001、v_null=空payload、v_empty=長さ0のTEXT、v_blob=4142、v_text=4142、v_int=0000000000000001、v_real=3FF0000000000000、v_negzero=8000000000000000、v_jp=E7AB9FE8B5B0、v_boundary=3132333435363738。v_blobとv_textはpayload bytesが同一でもtagが異なるため別digestになる。
+
 ## T01〜T28 共通証跡スキーマ（必須）
 
 全テストで同じJSONL event schemaを使い、main DB外のappend-only test evidenceへ記録する。必須key:
@@ -77,10 +95,10 @@
 
 | ID | ケース | fixture・注入条件 | 期待結果 | 本体削除可否 | 個別証跡 |
 |---|---|---|---|---|---|
-| T21 | commit直後停止・外部完了ログ失敗 | 一時DBにhistory候補3行、lap候補2行、保護root37行、receipt表を作成。全gate PASS後DELETE transactionをcommitし、DELETE_COMMITTED receipt更新・外部完了ledger追記直前でkill。別ケースでCOMMIT前kill/rollback | commit後停止はreceipt=COMMIT_PENDING、両表候補PK=0、root37/37一致、ledger=DELETE_INTENTのみとなりread-only recoveryでcommit成立を確定。commit前停止はreceipt=PREPARED、候補3/3・2/2が元digestで存在しNOT_COMMITTED。いずれも同一IDでDELETE再実行なし | recovery中禁止。同一ID永久禁止 | receipt状態、PK/row digest、external ledger、kill位置、DELETE trace各表1回、recovery判定 |
+| T21 | commit直後停止・外部完了ログ失敗 | 一時DBにhistory候補PK=[101,102,103]の3行、lap候補PK=[201,202]の2行、保護root ID=[R001〜R037]の37行、receipt表を作成。全gate PASS後DELETE transactionをcommitし、DELETE_COMMITTED receipt更新・外部完了ledger追記直前でkill。別ケースでCOMMIT前kill/rollback | commit後停止はreceipt=COMMIT_PENDING、両表候補PK=0、root37/37一致、ledger=DELETE_INTENTのみとなりread-only recoveryでcommit成立を確定。commit前停止はreceipt=PREPARED、候補3/3・2/2が元digestで存在しNOT_COMMITTED。いずれも同一IDでDELETE再実行なし | recovery中禁止。同一ID永久禁止 | receipt状態、PK/row digest、external ledger、kill位置、DELETE trace各表1回、recovery判定 |
 | T22 | 外部監査ログ書き込み失敗 | DELETE開始意図の外部永続ログ書込み/flush/fsyncを失敗させる | DELETE開始前にfail closed。DB本体無変更 | 禁止 | ログ書込例外、永続化確認結果、DELETE SQL trace |
-| T23 | WAL snapshot・同時更新・checkpoint | journal_mode=WAL一時DBにhistory3行/lap2行/root37行。preview後に別接続で候補1行更新、1行追加、1行削除を個別注入。別試験でsnapshot中writer更新/checkpoint | preview中metadata変化はsnapshot破棄。preview後の変更はBEGIN IMMEDIATE後のprojection/PK/row digest不一致で拒否。writer lock中の別writerはbusy timeout/lock拒否。全ケースDELETE SQL=0 | 禁止 | identity、main/WAL stat+SHA、journal_mode、snapshot SHA、projection digest、PK/row差分、checkpoint/lock結果、DELETE trace |
-| T24 | nonce期限・取消・再利用 | OIDC issuer/subject/session/auth_time/amr=MFA fixture、256-bit nonce。10分期限直前/直後、取消後、CONSUMED後、同一/別operation_id再送、plan_digest変更、nonce ledger fsync失敗を注入 | 10分以内かつ未使用/未取消/認証有効のみ承認可能。期限切れ・取消・CONSUMED・別ID再送・計画変更・ledger fsync失敗は拒否。ledger状態は再起動後も維持 | 不正承認では禁止 | OIDC claim検証、nonce_digest、発行/期限/取消/消費時刻、ledger連番/fsync、拒否理由 |
+| T23 | WAL snapshot・同時更新・checkpoint | journal_mode=WAL一時DBにhistory PK=[101,102,103]の3行、lap PK=[201,202]の2行、root ID=[R001〜R037]の37行を作成。preview後に別接続で候補1行更新、1行追加、1行削除を個別注入。別試験でsnapshot中writer更新/checkpoint | preview中metadata変化はsnapshot破棄。preview後の変更はBEGIN IMMEDIATE後のprojection/PK/row digest不一致で拒否。writer lock中の別writerはbusy timeout/lock拒否。全ケースDELETE SQL=0 | 禁止 | identity、main/WAL stat+SHA、journal_mode、snapshot SHA、projection digest、PK/row差分、checkpoint/lock結果、DELETE trace |
+| T24 | nonce期限・取消・再利用 | OIDC fixtureをiss=https://idp.example.test、sub=operator-001、aud=autoraceai-cleanup、session_id=sess-001、amr=[pwd,otp]、auth_time=t0に固定し、256-bit nonceを発行。10分期限直前/直後、取消後、CONSUMED後、同一/別operation_id再送、plan_digest変更、nonce ledger fsync失敗を注入 | 10分以内かつ未使用/未取消/認証有効のみ承認可能。期限切れ・取消・CONSUMED・別ID再送・計画変更・ledger fsync失敗は拒否。ledger状態は再起動後も維持 | 不正承認では禁止 | OIDC claim検証、nonce_digest、発行/期限/取消/消費時刻、ledger連番/fsync、拒否理由 |
 | T25 | 型保持canonical row digest | NULL、空文字、BLOB 00 FF、TEXT、INTEGER 1、REAL 1.0、REAL -0.0、日本語UTF-8、境界長fixtureをarchive/restore | canonical frameを次で固定する。row frameは固定magic文字列 ROWv1、table名のUTF-8 byte長(u32 big-endian)とbytes、column数(u32)、各column名のbyte長(u32)とbytes、storage-class tag(1 byte)、payload長(u64 big-endian)、payload bytesをcolumn順に連結する。tag/payloadはNULL=N/空payload、INTEGER=I/signed 64-bit big-endian、REAL=R/IEEE754 binary64 big-endian、TEXT=T/UTF-8の生bytes、BLOB=B/生bytes。TEXTはUnicode正規化しない。REALはbit patternを保持し、-0.0を+0.0へ正規化しない。各row frameをu64 length prefix付きでPK canonical frameのbyte辞書順に並べ、TABLEv1 magic・row count・各frameを連結してSHA-256を取る。PK digestもPKv1 magic・各PK frameを同じ順序で連結してSHA-256を取る。NULL/空文字、BLOB/TEXT、INTEGER/REAL、+0.0/-0.0は別digest。fixture作成時にtypeof()を確認し、意図したstorage classでなければfixture自体をFAILとする。source/archive/restoreでPK/row digest完全一致 | 完全一致まで禁止 | typeof、tag、length、hex bytes、canonical byte SHA、PK/row digest、archive/restore比較 |
 | T26 | schema/index/constraint変更 | preview後に列定義、PK、index、UNIQUE/CHECK/FK制約を変更またはarchive側から欠落 | schema fingerprint不一致を検知しarchive/restore gateまたは削除直前gateで拒否 | 禁止 | schema SQL、index/constraint一覧、期待/実測fingerprint |
 | T27 | 同一operation_id並行実行 | 同一IDで複数worker/processから同時にpreview/approve/archive/deleteを開始 | 一意制約と排他lockにより一方だけが進行。他方は競合拒否。二重DELETEなし | 1 operationにつき最大1回、全gate後のみ | operation record、lock owner、競合ログ、DELETE SQL trace |
