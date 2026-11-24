@@ -161,3 +161,13 @@
 ### 変更禁止・未実施
 - app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更していない。
 - 実装・本番反映は未実施。実装開始には再レビュー完了後の明示承認が必要。
+
+## Issue #31 設計レビュー修正Git記録（2026-11-24）
+
+- 監査設計ブランチ: `tmp-audit-31-repeats`
+- 監査設計文書・補助STATUS commit: `1d3210b22958c83db7acf8f8778924ad6171093c`
+- 正式進捗正本ブランチ: `docs/status`
+- 正式進捗正本の今回の修正commit: `53b00494839aba9fe7fa952fc3d9d2ed322b7ff3`
+- Issue #31コメント: https://github.com/memememe0110/AutoRaceAI/issues/31#issuecomment-7133364016
+- 次の作業: R1〜R6およびT21〜T28を含む3文書の再レビュー。未解決があれば設計承認・実装開始は禁止。
+- 実装・本番反映は未実施。app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは未変更。
