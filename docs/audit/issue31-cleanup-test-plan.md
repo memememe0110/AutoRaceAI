@@ -49,7 +49,7 @@
 
 ## T21〜T28追加合格基準
 - T21 recoveryはreceipt、候補PK/row digest、root digest、外部ledgerが全条件一致した場合だけ結果確定。同一operation_idのDELETE trace追加なし。
-- T22は外部DELETE_INTENTとnonce CONSUMEDのfsync完了前にDELETE SQL/DELETE transaction開始が0回。
+- T22は外部DELETE_INTENTのfsync完了前にDELETE SQLが0回。
 - T23はWAL snapshot境界、取得前後metadata、BEGIN IMMEDIATE後の再照合を個別検証。
 - T24は10分期限、MFA claim、取消・使用済みledger永続性を境界時刻で検証。
 - T25は型fixtureごとのcanonical byte列と期待SHAをgolden valueとして固定。
@@ -78,9 +78,9 @@
 | ID | ケース | fixture・注入条件 | 期待結果 | 本体削除可否 | 個別証跡 |
 |---|---|---|---|---|---|
 | T21 | commit直後停止・外部完了ログ失敗 | 一時DBにhistory候補3行、lap候補2行、保護root37行、receipt表を作成。全gate PASS後DELETE transactionをcommitし、DELETE_COMMITTED receipt更新・外部完了ledger追記直前でkill。別ケースでCOMMIT前kill/rollback | commit後停止はreceipt=COMMIT_PENDING、両表候補PK=0、root37/37一致、ledger=DELETE_INTENTのみとなりread-only recoveryでcommit成立を確定。commit前停止はreceipt=PREPARED、候補3/3・2/2が元digestで存在しNOT_COMMITTED。いずれも同一IDでDELETE再実行なし | recovery中禁止。同一ID永久禁止 | receipt状態、PK/row digest、external ledger、kill位置、DELETE trace各表1回、recovery判定 |
-| T22 | 外部監査ログ書き込み失敗 | DELETE_INTENT追記・flush・fsyncを個別失敗注入。nonce ledger CONSUMEDのfsync失敗も別試験 | DELETE transactionを開始せず、業務表無変更、receipt PREPARED。DELETE SQL trace=0 | 禁止 | ログ例外、fsync結果、nonce台帳、transaction開始trace、DELETE trace |
+| T22 | 外部監査ログ書き込み失敗 | DELETE開始意図の外部永続ログ書込み/flush/fsyncを失敗させる | DELETE開始前にfail closed。DB本体無変更 | 禁止 | ログ書込例外、永続化確認結果、DELETE SQL trace |
 | T23 | WAL snapshot・同時更新・checkpoint | journal_mode=WAL一時DBにhistory3行/lap2行/root37行。preview後に別接続で候補1行更新、1行追加、1行削除を個別注入。別試験でsnapshot中writer更新/checkpoint | preview中metadata変化はsnapshot破棄。preview後の変更はBEGIN IMMEDIATE後のprojection/PK/row digest不一致で拒否。writer lock中の別writerはbusy timeout/lock拒否。全ケースDELETE SQL=0 | 禁止 | identity、main/WAL stat+SHA、journal_mode、snapshot SHA、projection digest、PK/row差分、checkpoint/lock結果、DELETE trace |
-| T24 | nonce期限・取消・再利用 | OIDC issuer/subject/session/auth_time/amr=MFA fixture、256-bit nonce。10分期限直前/直後、取消後、CONSUMED後、同一/別operation_id再送、plan_digest変更を注入 | 10分以内かつ未使用/未取消/認証有効のみ承認可能。期限切れ・取消・CONSUMED・別ID再送・計画変更は拒否。ledger状態は再起動後も維持 | 不正承認では禁止 | OIDC claim検証、nonce_digest、発行/期限/取消/消費時刻、ledger連番/fsync、拒否理由 |
+| T24 | nonce期限・取消・再利用 | OIDC issuer/subject/session/auth_time/amr=MFA fixture、256-bit nonce。10分期限直前/直後、取消後、CONSUMED後、同一/別operation_id再送、plan_digest変更、nonce ledger fsync失敗を注入 | 10分以内かつ未使用/未取消/認証有効のみ承認可能。期限切れ・取消・CONSUMED・別ID再送・計画変更・ledger fsync失敗は拒否。ledger状態は再起動後も維持 | 不正承認では禁止 | OIDC claim検証、nonce_digest、発行/期限/取消/消費時刻、ledger連番/fsync、拒否理由 |
 | T25 | 型保持canonical row digest | NULL、空文字、BLOB 00 FF、TEXT、INTEGER 1、REAL 1.0、REAL -0.0、日本語UTF-8、境界長fixtureをarchive/restore | canonical frameを次で固定する。row frameは固定magic文字列 ROWv1、table名のUTF-8 byte長(u32 big-endian)とbytes、column数(u32)、各column名のbyte長(u32)とbytes、storage-class tag(1 byte)、payload長(u64 big-endian)、payload bytesをcolumn順に連結する。tag/payloadはNULL=N/空payload、INTEGER=I/signed 64-bit big-endian、REAL=R/IEEE754 binary64 big-endian、TEXT=T/UTF-8の生bytes、BLOB=B/生bytes。TEXTはUnicode正規化しない。REALはbit patternを保持し、-0.0を+0.0へ正規化しない。各row frameをu64 length prefix付きでPK canonical frameのbyte辞書順に並べ、TABLEv1 magic・row count・各frameを連結してSHA-256を取る。PK digestもPKv1 magic・各PK frameを同じ順序で連結してSHA-256を取る。NULL/空文字、BLOB/TEXT、INTEGER/REAL、+0.0/-0.0は別digest。fixture作成時にtypeof()を確認し、意図したstorage classでなければfixture自体をFAILとする。source/archive/restoreでPK/row digest完全一致 | 完全一致まで禁止 | typeof、tag、length、hex bytes、canonical byte SHA、PK/row digest、archive/restore比較 |
 | T26 | schema/index/constraint変更 | preview後に列定義、PK、index、UNIQUE/CHECK/FK制約を変更またはarchive側から欠落 | schema fingerprint不一致を検知しarchive/restore gateまたは削除直前gateで拒否 | 禁止 | schema SQL、index/constraint一覧、期待/実測fingerprint |
 | T27 | 同一operation_id並行実行 | 同一IDで複数worker/processから同時にpreview/approve/archive/deleteを開始 | 一意制約と排他lockにより一方だけが進行。他方は競合拒否。二重DELETEなし | 1 operationにつき最大1回、全gate後のみ | operation record、lock owner、競合ログ、DELETE SQL trace |
