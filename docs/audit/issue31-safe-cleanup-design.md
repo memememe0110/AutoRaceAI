@@ -162,9 +162,10 @@ operation_idは作成後に別の対象集合へ再利用しない。同じopera
 3. Backup API開始直前にmain DBと存在するWALのdevice、inode、size、mtime_ns、SHA-256を採取する。WAL不存在も明示記録する。
 4. 読み取り専用接続をsource、専用一時SQLite接続をdestinationとしてSQLite Backup APIで全DBをコピーする。sourceとdestinationは別connectionとする。Backup APIは複数stepで進行し得るため、coordinatorのBEGIN IMMEDIATEを全step完了まで保持してsource更新を防ぐ。排他的な新規一意pathを使い、既存fileをunlink/上書きしない。Backup APIの非成功、busy/locked timeout、read error、中断は失敗とする。
 5. Backup完了後、出力接続でjournal_mode=DELETE、synchronous=FULLを設定しcommit・closeする。snapshot本体と親directoryをfsyncする。読み取り元transactionを維持したままmain/WAL metadataとSHA-256を再採取する。
-6. 取得前後のmain/WAL device、inode、size、mtime_ns、SHA-256、journal_mode、schema_versionのいずれかが変化した場合、snapshotを破棄し、そのoperation_idを終端化する。再取得は新しいpreviewと新しいoperation_idで行う。
-7. 検証順を固定する。①snapshot file SHA-256/size、②integrity_check、③schema fingerprintと対象table定義、④対象2表PK集合digest、⑤対象2表全行digest、⑥37 root digest、⑦source_db_identityとplan_digest。全PASS後にPREVIEWEDを永続化する。
-8. PK/row digestはsnapshot DBから読み取り専用で計算し、元DBの別接続から値を混在させない。
+6. 取得前後metadata採取が終わった後、読み取り元transactionをROLLBACKしてcloseし、coordinator transactionもROLLBACKしてwriter lockを解放する。snapshot検証はclose済みの一時ファイルを別のread-only接続で行う。
+7. 取得前後のmain/WAL device、inode、size、mtime_ns、SHA-256、journal_mode、schema_versionのいずれかが変化した場合、snapshotを破棄し、そのoperation_idを終端化する。再取得は新しいpreviewと新しいoperation_idで行う。
+8. 検証順を固定する。①snapshot file SHA-256/size、②integrity_check、③schema fingerprintと対象table定義、④対象2表PK集合digest、⑤対象2表全行digest、⑥37 root digest、⑦source_db_identityとplan_digest。全PASS後にPREVIEWEDを永続化する。
+9. PK/row digestはsnapshot DBから読み取り専用で計算し、元DBの別接続から値を混在させない。
 
 #### R1-2. WAL・checkpoint・transaction
 - WAL modeではBackup APIが読み取りtransactionから見える確定状態をコピーする。main DBファイル単体コピーは禁止。
