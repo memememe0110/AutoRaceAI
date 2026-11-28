@@ -219,3 +219,10 @@ app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更�
 - root STATUS追記commit: 作成後に監査ブランチHEADへ含めて記録する。
 
 再取得による自己確認ではR5/R6、T16、T22、T26〜T28の維持を確認した。SQLite小規模挙動確認は実施したが、SQLite/WAL実機競合、OIDC/MFA、fsync耐久、COMMIT_UNKNOWN強制停止復旧は未実施。文書修正は設計承認・安全性実証を意味しない。実装・テスト実装・PR・本番反映は引き続き禁止する。app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更していない。
+
+### receipt_digest canonicalization補正（2026-11-28 JST）
+- 追加精査でreceipt_digestの入力にreceipt_digest自身が含まれる循環定義を発見し、receipt_digest自身とreceipt_hmacを除く全receipt列をSHA-256対象とするよう修正。receipt_hmacは計算済みdigestを含むreceipt record全体を認証する。
+- 設計修正commit: 4561201a7a69641664f9b37b700a744438e9f572
+- root STATUS追記commit: 9a5643135db7e922e033af8cdd4952998cbc645a
+- 監査ブランチ最終HEAD: 9a5643135db7e922e033af8cdd4952998cbc645a
+- 設計承認・実装承認は未了。SQLite/WAL、OIDC/MFA、fsync、COMMIT_UNKNOWN実機試験は未実施。実装・テスト実装・PR・本番反映は禁止を維持。
