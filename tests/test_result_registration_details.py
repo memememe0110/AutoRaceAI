@@ -51,21 +51,27 @@ class ResultRegistrationDetailAuditTests(unittest.TestCase):
                         ('20261101_川口_1R', 1, 1, '通常'),
                         ('20261101_川口_1R', 2, 2, '通常'),
                         ('20261101_川口_1R', 3, 3, '通常'),
-                        ('20261101_川口_1R', 4, NULL, '競走中止等'),
+                        ('20261101_川口_1R', 4, NULL, '反妨'),
                         ('20261101_川口_2R', 1, 1, '通常'),
-                        ('20261101_川口_2R', 2, NULL, '通常'),
-                        ('20261101_川口_4R', 1, 1, '通常');
+                        ('20261101_川口_2R', 2, NULL, '反妨'),
+                        ('20261101_川口_4R', 1, 1, '通常'),
+                        ('20261101_川口_4R', 2, NULL, '通常');
                     INSERT INTO result_laps VALUES
                         ('20261101_川口_1R', '1周目', 1, 1, 1),
                         ('20261101_川口_1R', '1周目', 1, 2, 2),
                         ('20261101_川口_1R', '1周目', 1, 3, 3),
+                        ('20261101_川口_1R', '1周目', 1, 4, 4),
                         ('20261101_川口_1R', '2周目', 2, 1, 1),
                         ('20261101_川口_1R', '2周目', 2, 2, 2),
                         ('20261101_川口_1R', '2周目', 2, 3, 3),
+                        ('20261101_川口_1R', '2周目', 2, 4, 4),
                         ('20261101_川口_1R', 'ゴール線', 99, 1, 1),
                         ('20261101_川口_1R', 'ゴール線', 99, 2, 2),
+                        ('20261101_川口_1R', 'ゴール線', 99, 4, 3),
                         ('20261101_川口_2R', '1周目', 1, 1, 1),
-                        ('20261101_川口_2R', 'ゴール線', 99, 1, 1);
+                        ('20261101_川口_2R', '1周目', 1, 2, 2),
+                        ('20261101_川口_2R', 'ゴール線', 99, 1, 1),
+                        ('20261101_川口_2R', 'ゴール線', 99, 2, 2);
                     INSERT INTO result_payouts VALUES
                         ('20261101_川口_1R', '3連単', '1-2-3', 1230),
                         ('20261101_川口_2R', '単勝', '1', 100),
@@ -126,7 +132,7 @@ class ResultRegistrationDetailAuditTests(unittest.TestCase):
                 "20261101_川口_5R",
             ])
             self.assertEqual(summary["flagged_row_count_by_table"], {
-                "result_entries": 7, "result_laps": 10,
+                "result_entries": 8, "result_laps": 13,
                 "result_payouts": 4, "result_races": 4,
             })
 
@@ -138,13 +144,15 @@ class ResultRegistrationDetailAuditTests(unittest.TestCase):
                 row for row in lap_rows
                 if row["race_key"] == "20261101_川口_1R" and row["lap_no"] == "1"
             )
-            self.assertEqual(first_lap["missing_entry_car_nos_json"], '["4"]')
+            self.assertEqual(first_lap["missing_entry_car_nos_json"], "[]")
             self.assertEqual(first_lap["missing_finisher_car_nos_json"], "[]")
             goal_line = next(
                 row for row in lap_rows
                 if row["race_key"] == "20261101_川口_1R" and row["lap_label"] == "ゴール線"
             )
             self.assertEqual(goal_line["missing_finisher_car_nos_json"], '["3"]')
+            self.assertEqual(goal_line["goal_line_extra_car_nos_json"], "[]")
+            self.assertEqual(goal_line["goal_line_nonfinisher_car_nos_json"], '["4"]')
 
             with (out / "result_registration_race_classification.csv").open(
                 encoding="utf-8-sig", newline=""
@@ -159,10 +167,11 @@ class ResultRegistrationDetailAuditTests(unittest.TestCase):
             b = classifications["20261101_川口_2R"]
             self.assertEqual(b["finisher_based_classification"], "lap_data_matches_finishers")
             self.assertEqual(b["nonfinisher_count"], "1")
-            self.assertEqual(b["nonfinisher_status_review_car_nos_json"], '["2"]')
-            self.assertEqual(
-                b["goal_line_missing_finisher_car_nos_json"], "[]"
-            )
+            self.assertEqual(b["nonfinisher_status_review_car_nos_json"], "[]")
+            self.assertEqual(b["goal_line_missing_finisher_car_nos_json"], "[]")
+            self.assertEqual(b["goal_line_nonfinisher_car_nos_json"], '["2"]')
+            d = classifications["20261101_川口_4R"]
+            self.assertEqual(d["nonfinisher_status_review_car_nos_json"], '["2"]')
             self.assertEqual(
                 classifications["20261101_川口_4R"]["finisher_based_classification"],
                 "laps_empty",
