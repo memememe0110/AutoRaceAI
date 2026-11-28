@@ -466,3 +466,36 @@ Issue #31の正式判定は「主要監査完了・再発防止未完了」。37
 
 ### 禁止・変更なし
 app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更していない。実装・テスト実装・PR・本番反映は未実施。独立再レビューが完了するまで、これらを開始しない。
+
+## Issue #31 独立設計再レビュー指摘の反映（2026-11-28 JST）
+
+**正式判定：主要監査完了・再発防止未完了／設計レビュー要修正。設計承認・実装承認は未了。**
+
+### 独立再レビュー
+- レビュー対象: 監査ブランチHEAD `9131f427377f8cbd05d7b7856c872d35aa6a640b` の設計3文書。
+- Issue #31 comment: https://github.com/memememe0110/AutoRaceAI/issues/31#issuecomment-7239754361
+- 指摘: R3 receipt SHA-256単独の改ざん耐性、T25 REAL -0.0 fixture、R4比較readerのclose順、T25 BLOB fixture値不一致、source_projection_digestの行順、R2 MFA freshness/claim allowlist。
+
+### 文書反映
+- R3: receipt_digestに加え、外部secret manager鍵によるreceipt_hmac/key_idを必須化。状態遷移・復旧時にもHMACを再計算/検証し、未知鍵・鍵利用不能・不一致はfail closed。T19にdigest再計算を伴う改ざんケースを追加。
+- R2: issuer別acr/amr allowlist、step-up再認証、auth_timeの300秒鮮度と未来方向60秒の許容範囲を規範化。T24に境界・古い認証・許可外claimを追加。
+- R4: 比較snapshotのmetadata採取後、DELETE前にsource read-only接続をROLLBACK/closeし、destinationもcloseする順序を規範化。T01にWAL/DELETE journal両方の正常系、T23にrollback-journal reader競合を追加。
+- R1/T25: projection digestのtable/schema/row順序、PKv1/PROJv1 framing、PKなし・複合PK・WITHOUT ROWID・NULL許容PKの扱いを固定。virtual tableはcanonicalizationが未定義の間fail closed。
+- T25: BLOB値をX'4142'へ統一。SQLite SQL bindで-0.0を格納した場合のreadback +0.0をgolden payload `0000000000000000`とし、入力側Python floatのbit patternを期待値に流用しない。
+
+### Git記録
+- R3/R2/R4初回反映: e7f04765187f6741cc4b9ccf2bc003e3a9fa70e4
+- T19/T23/T24/T25テスト修正: ff91ea5a1244108229d782b958907ad97b33a33e
+- projection framing/auth freshness補完: 14a14daf48d7606002fc2c11accbc6a72f67698b
+- T01/T23両journal mode対応: 240dd0f1ea86e0e3202b1d5e865f712eba6e572a
+- recovery HMAC/R4 receipt HMAC補完: 8c799f381f8bf14935e88931a533d67c2ce4c060
+- 監査ブランチHEAD: 8c799f381f8bf14935e88931a533d67c2ce4c060
+
+### 自己レビュー
+- R5/R6本文は前回と一致。
+- T16、T22、T26〜T28の行は前回と一致。
+- R3 HMAC、R2 freshness、R4 reader close、PROJv1/PKv1、T19/T23/T24/T25の各修正をGitHubから再取得して確認。
+- SQLiteの小規模挙動確認では、通常SQL bindしたREAL -0.0のreadbackが+0.0、IEEE754 payloadが0000000000000000となることを確認。実機の耐久・競合試験ではない。
+
+### 未実施・禁止
+SQLite/WAL実機競合、OIDC/MFA連携、fsync耐久、COMMIT_UNKNOWN強制停止復旧は未実施。独立再レビューの再確認と設計承認は未了。実装・テスト実装・PR・本番反映は引き続き禁止。app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更していない。
