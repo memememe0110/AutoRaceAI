@@ -34,10 +34,13 @@ class PredictionVersionAuditTests(unittest.TestCase):
                         app_version TEXT, is_backtest INTEGER, race_date TEXT, venue TEXT, race_no TEXT
                     );
                     CREATE TABLE v187_mixed_plan_runs(
-                        app_version TEXT, source_prediction_version TEXT, plan_origin TEXT
+                        app_version TEXT, source_prediction_version TEXT, plan_origin TEXT,
+                        race_key TEXT, created_at TEXT, logic_version TEXT, plan_hash TEXT,
+                        include_in_live_stats INTEGER
                     );
                     CREATE TABLE v278_background_jobs(
-                        job_type TEXT, status TEXT, app_version TEXT, save_version TEXT
+                        job_type TEXT, status TEXT, app_version TEXT, save_version TEXT,
+                        job_id INTEGER, created_at TEXT, force_current INTEGER, result_blob BLOB
                     );
                     CREATE TABLE v326_import_queue(
                         task_id INTEGER, status TEXT, save_version TEXT, config_json TEXT
@@ -68,12 +71,32 @@ class PredictionVersionAuditTests(unittest.TestCase):
                     ],
                 )
                 con.execute(
-                    "INSERT INTO v187_mixed_plan_runs VALUES(?,?,?)",
-                    ("Ver330-A", "Ver326", "odds_replan"),
+                    """INSERT INTO v187_mixed_plan_runs
+                       (app_version,source_prediction_version,plan_origin,race_key,created_at,logic_version,plan_hash,include_in_live_stats)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    ("Ver330-A", "Ver326", "odds_replan", "20261101_川口_1R",
+                     "2026-11-01T12:00:00", "logic-v1", "plan-1", 1),
                 )
                 con.execute(
-                    "INSERT INTO v278_background_jobs VALUES(?,?,?,?)",
-                    ("official_import", "completed", "Ver326", "Ver330-A"),
+                    """INSERT INTO v187_mixed_plan_runs
+                       (app_version,source_prediction_version,plan_origin,race_key,created_at,logic_version,plan_hash,include_in_live_stats)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (None, None, "live", "20261001_飯塚_1R",
+                     "2026-10-01T12:00:00", "legacy", "plan-legacy", 1),
+                )
+                con.execute(
+                    """INSERT INTO v278_background_jobs
+                       (job_type,status,app_version,save_version,job_id,created_at,force_current,result_blob)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    ("official_import", "completed", "Ver326", "Ver330-A", 10,
+                     "2026-11-01T12:00:00", 0, sqlite3.Binary(b"DO_NOT_EXPORT_BLOB")),
+                )
+                con.execute(
+                    """INSERT INTO v278_background_jobs
+                       (job_type,status,app_version,save_version,job_id,created_at,force_current,result_blob)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    ("batch_rerun", "cancelled", None, None, 11,
+                     "2026-10-01T12:00:00", 1, sqlite3.Binary(b"PRIVATE_BLOB")),
                 )
                 con.execute(
                     "INSERT INTO v326_import_queue VALUES(?,?,?,?)",
@@ -96,6 +119,24 @@ class PredictionVersionAuditTests(unittest.TestCase):
             self.assertEqual(summary["queue_version_mismatch_count"], 1)
             self.assertEqual(summary["result_races_without_prediction_history"], 0)
             self.assertFalse(summary["database_modified"])
+            self.assertEqual(summary["plan_version_row_count"], 2)
+            self.assertEqual(summary["plan_rows_missing_app_version"], 1)
+            self.assertEqual(summary["plan_rows_missing_source_prediction_version"], 1)
+            self.assertEqual(summary["background_job_version_row_count"], 2)
+            self.assertEqual(summary["background_job_rows_missing_app_version"], 1)
+            self.assertEqual(summary["background_job_rows_missing_save_version"], 1)
+
+            plan_rows = (out / "plan_version_rows.csv").read_text(encoding="utf-8-sig")
+            self.assertIn("20261001_飯塚_1R", plan_rows)
+            plan_review = (out / "plan_version_metadata_review.csv").read_text(encoding="utf-8-sig")
+            self.assertIn("app_version_blank|source_prediction_version_blank", plan_review)
+
+            job_rows = (out / "background_job_version_rows.csv").read_text(encoding="utf-8-sig")
+            self.assertIn("official_import", job_rows)
+            self.assertNotIn("result_blob", job_rows)
+            self.assertNotIn("DO_NOT_EXPORT_BLOB", job_rows)
+            self.assertNotIn("PRIVATE_BLOB", job_rows)
+
             with sqlite3.connect(db) as con:
                 self.assertEqual(con.execute("SELECT COUNT(*) FROM v231_prediction_history").fetchone()[0], 2)
 

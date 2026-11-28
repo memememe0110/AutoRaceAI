@@ -338,6 +338,62 @@ def audit_db(db_path, outdir, db_info=None, expected_generation=""):
             plan_rows,
         )
 
+        # Row-level plan provenance: metadata only, never prediction payloads.
+        plan_detail_rows = []
+        plan_review_rows = []
+        if "v187_mixed_plan_runs" in tables:
+            cols = _columns(con, "v187_mixed_plan_runs")
+            detail_cols = [
+                c for c in (
+                    "race_key", "race_date", "venue", "race_no", "created_at",
+                    "app_version", "source_prediction_version", "plan_origin",
+                    "logic_version", "plan_hash", "include_in_live_stats",
+                    "grade", "starter_count", "role_count", "cover", "cost_yen",
+                    "model_expected_multiple", "model_return_rate",
+                ) if c in cols
+            ]
+            if detail_cols:
+                order_cols = [c for c in ("created_at", "race_key", "plan_origin") if c in detail_cols]
+                order_sql = " ORDER BY " + ",".join(_q(c) for c in order_cols) if order_cols else ""
+                for row in con.execute(
+                    "SELECT " + ",".join(_q(c) for c in detail_cols)
+                    + " FROM v187_mixed_plan_runs" + order_sql
+                ):
+                    values = {c: row[c] for c in detail_cols}
+                    plan_detail_rows.append(values)
+                    app_ver = str(values.get("app_version") or "").strip()
+                    source_ver = str(values.get("source_prediction_version") or "").strip()
+                    if not app_ver or not source_ver:
+                        reasons = []
+                        if not app_ver:
+                            reasons.append("app_version_blank")
+                        if not source_ver:
+                            reasons.append("source_prediction_version_blank")
+                        plan_review_rows.append({
+                            **values,
+                            "metadata_presence": "|".join(reasons),
+                        })
+        plan_detail_columns = list(dict.fromkeys(
+            [c for c in (
+                "race_key", "race_date", "venue", "race_no", "created_at",
+                "app_version", "source_prediction_version", "plan_origin",
+                "logic_version", "plan_hash", "include_in_live_stats",
+                "grade", "starter_count", "role_count", "cover", "cost_yen",
+                "model_expected_multiple", "model_return_rate",
+            ) if any(c in row for row in plan_detail_rows)]
+        ))
+        _write_csv(
+            out / "plan_version_rows.csv",
+            plan_detail_columns,
+            [tuple(row.get(c) for c in plan_detail_columns) for row in plan_detail_rows],
+        )
+        _write_csv(
+            out / "plan_version_metadata_review.csv",
+            plan_detail_columns + ["metadata_presence"],
+            [tuple(row.get(c) for c in plan_detail_columns) + (row["metadata_presence"],)
+             for row in plan_review_rows],
+        )
+
         queue_rows = []
         queue_mismatches = []
         if "v326_import_queue" in tables:
@@ -394,6 +450,60 @@ def audit_db(db_path, outdir, db_info=None, expected_generation=""):
             job_rows,
         )
 
+        # Background job metadata by job_id; result_blob is intentionally excluded.
+        job_detail_rows = []
+        job_review_rows = []
+        if "v278_background_jobs" in tables:
+            cols = _columns(con, "v278_background_jobs")
+            detail_cols = [
+                c for c in (
+                    "job_id", "job_type", "status", "created_at", "started_at",
+                    "finished_at", "updated_at", "app_version", "save_version",
+                    "force_current", "total_count", "done_count", "register_result",
+                    "error_text", "message",
+                ) if c in cols
+            ]
+            if detail_cols:
+                order_cols = [c for c in ("job_id",) if c in detail_cols]
+                order_sql = " ORDER BY " + ",".join(_q(c) for c in order_cols) if order_cols else ""
+                for row in con.execute(
+                    "SELECT " + ",".join(_q(c) for c in detail_cols)
+                    + " FROM v278_background_jobs" + order_sql
+                ):
+                    values = {c: row[c] for c in detail_cols}
+                    job_detail_rows.append(values)
+                    app_ver = str(values.get("app_version") or "").strip()
+                    save_ver = str(values.get("save_version") or "").strip()
+                    if not app_ver or not save_ver:
+                        reasons = []
+                        if not app_ver:
+                            reasons.append("app_version_blank")
+                        if not save_ver:
+                            reasons.append("save_version_blank")
+                        job_review_rows.append({
+                            **values,
+                            "metadata_presence": "|".join(reasons),
+                        })
+        job_detail_columns = list(dict.fromkeys(
+            [c for c in (
+                "job_id", "job_type", "status", "created_at", "started_at",
+                "finished_at", "updated_at", "app_version", "save_version",
+                "force_current", "total_count", "done_count", "register_result",
+                "error_text", "message",
+            ) if any(c in row for row in job_detail_rows)]
+        ))
+        _write_csv(
+            out / "background_job_version_rows.csv",
+            job_detail_columns,
+            [tuple(row.get(c) for c in job_detail_columns) for row in job_detail_rows],
+        )
+        _write_csv(
+            out / "background_job_metadata_review.csv",
+            job_detail_columns + ["metadata_presence"],
+            [tuple(row.get(c) for c in job_detail_columns) + (row["metadata_presence"],)
+             for row in job_review_rows],
+        )
+
         result_coverage = []
         if "result_races" in tables and "v231_prediction_history" in tables:
             result_keys = {str(row[0] or "") for row in con.execute("SELECT race_key FROM result_races")}
@@ -441,9 +551,27 @@ def audit_db(db_path, outdir, db_info=None, expected_generation=""):
             "lap_snapshot_rows_by_history_match_status": dict(sorted(lap_match_counts.items())),
             "lap_snapshot_race_version_groups": len(lap_race_rows),
             "plan_version_groups": len(plan_rows),
+            "plan_version_row_count": len(plan_detail_rows),
+            "plan_rows_missing_app_version": sum(
+                not str(row.get("app_version") or "").strip() for row in plan_detail_rows
+            ),
+            "plan_rows_missing_source_prediction_version": sum(
+                not str(row.get("source_prediction_version") or "").strip()
+                for row in plan_detail_rows
+            ),
+            "plan_version_rows_by_origin": dict(sorted(Counter(
+                str(row.get("plan_origin") or "(blank)") for row in plan_detail_rows
+            ).items())),
             "queue_rows": len(queue_rows),
             "queue_version_mismatch_count": len(queue_mismatches),
             "background_job_version_groups": len(job_rows),
+            "background_job_version_row_count": len(job_detail_rows),
+            "background_job_rows_missing_app_version": sum(
+                not str(row.get("app_version") or "").strip() for row in job_detail_rows
+            ),
+            "background_job_rows_missing_save_version": sum(
+                not str(row.get("save_version") or "").strip() for row in job_detail_rows
+            ),
             "result_race_count": len(result_coverage),
             "result_races_without_prediction_history": sum(not r[-1] for r in result_coverage),
             "database_modified": False,
