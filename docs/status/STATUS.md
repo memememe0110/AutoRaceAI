@@ -266,3 +266,23 @@ app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更�
 - main HEAD: `43895d9c7c882a5c328b1421bcf9f37663933290`。
 - mainへの変更は監査スクリプト/テスト/Workflow出力のみ。app.py/engine.py、予測式、APP_VERSION、DBスキーマ、保存処理、本番DBは変更していない。
 - Issue #28の測定条件・測定ファイル・作業ブランチ・過去データは変更していない。
+
+
+## Issue #29/#33 追加監査結果（2026-11-28 JST）
+
+### Issue #29
+- PR #50 merge: `a65f56e295e91eb7622c6b3f26e559612421701c`, run `46151064875` SUCCESS。generation705でv319_prediction_history_archiveは存在せず、restore orphan 55件にarchive matchなし。
+- _v319_clear_prediction()はhistory/prediction_snapshotsを消すがrestore/lap snapshotsを同期しない。job535（official_import, Ver326→save Ver330-A）の時間帯に20261114_山陽_4R restore Ver330-Aが更新され、同raceのlap snapshot Ver326×6、history 0。時間相関は強いがjob result_blobはdecodeしておらず、呼出し確定ではない。
+- 過去DB行の変更なし。Issue OPEN。
+
+### Issue #33
+- PR #51 merge: `e725f5462de3d666bd50972b7e9269be8b21a748`, run `46151371002` SUCCESS。
+- finishers/非完走車/未知車番を分離したgoal-line監査を追加。11件のentry-count flagsは完走車基準で整合。result_status誤り2件、entries/laps欠落1件、laps/time欠落1件を追跡対象として維持。
+- v41_register_result()がvalid空でも保存へ進む点、compact lap label/事故略記の正規化不足をVer327候補としてIssue #33 comment `7240253744` にまとめた。実装承認待ち。engine.py/APP_VERSION/結果保存処理は未変更。
+- Issue OPEN。
+
+### Issue #31 / #28
+- #31は「主要監査完了・再発防止未完了／設計レビュー要修正」を維持。実装承認なし。
+- #28の測定条件・測定ファイル・作業ブランチ・過去データは未変更。
+
+main HEAD: `e725f5462de3d666bd50972b7e9269be8b21a748`。Ver326固定。予測結果に影響するVer327候補は承認前実装禁止。
