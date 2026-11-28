@@ -151,8 +151,6 @@ class ResultRegistrationDetailAuditTests(unittest.TestCase):
                 if row["race_key"] == "20261101_川口_1R" and row["lap_label"] == "ゴール線"
             )
             self.assertEqual(goal_line["missing_finisher_car_nos_json"], '["3"]')
-            self.assertEqual(goal_line["goal_line_extra_car_nos_json"], "[]")
-            self.assertEqual(goal_line["goal_line_nonfinisher_car_nos_json"], '["4"]')
 
             with (out / "result_registration_race_classification.csv").open(
                 encoding="utf-8-sig", newline=""
@@ -164,6 +162,9 @@ class ResultRegistrationDetailAuditTests(unittest.TestCase):
                 classifications["20261101_川口_1R"]["finisher_based_classification"],
                 "goal_line_finisher_mismatch",
             )
+            a = classifications["20261101_川口_1R"]
+            self.assertEqual(a["goal_line_extra_car_nos_json"], "[]")
+            self.assertEqual(a["goal_line_nonfinisher_car_nos_json"], '["4"]')
             b = classifications["20261101_川口_2R"]
             self.assertEqual(b["finisher_based_classification"], "lap_data_matches_finishers")
             self.assertEqual(b["nonfinisher_count"], "1")
