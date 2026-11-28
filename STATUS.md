@@ -171,3 +171,31 @@
 - main最新HEAD: `43895d9c7c882a5c328b1421bcf9f37663933290`。
 - 今回のmainマージは監査スクリプト/テスト/Workflow出力のみ。予測式、APP_VERSION、DBスキーマ、保存処理、本番DBは変更していない。
 - Issue #28の測定条件・測定ファイル・作業ブランチ・過去データは変更していない。
+
+
+## 追加監査・保存経路確認（2026-11-28 JST）
+
+### Issue #29
+- PR #50 merge済み: `a65f56e295e91eb7622c6b3f26e559612421701c`。Workflow run `46151064875` SUCCESS。Artifact `prediction-version-audit-46151064875`。
+- generation705に `v319_prediction_history_archive` は存在せず、55 restore_without_historyに対するarchive matchは0。過去archive操作の不存在を意味するとは断定しない。
+- app.pyの `_v319_clear_prediction()` はv231_prediction_history/prediction_snapshotsを消すが、v222_prediction_restore/v252_lap_prediction_snapshotsを同期削除しない。結果登録Workerの再予測失敗・予測なし結果保存経路から呼ばれる。restore-onlyの有力候補経路として追跡する。
+- `20261114_山陽_4R`: restore Ver330-A at 15:20:30 JST、lap snapshot Ver326×6、history 0。job535（official_import, app_version Ver326, save_version Ver330-A, 13:57〜15:34 JST）の時間帯と整合。job result_blobはdecodeしておらず、race単位のtask証拠は未取得。
+- 55 restore orphan、50,230 v266 snapshot orphan、1,908 lap snapshot version mismatchは未修復。Issue OPEN維持。
+
+### Issue #33
+- PR #51 merge済み: `e725f5462de3d666bd50972b7e9269be8b21a748`。Workflow run `46151371002` SUCCESS。Artifact `result-registration-audit-46151371002`。
+- goal-line監査はfinishersとresult_entries上の非完走車を分離。反妨等でfinish=NULLでもゴール線通過する車を未知車番扱いしない。
+- generation705の11 entry-count flagsは全て完走車の周回/ゴール線が整合。2件のresult_status誤り（自落→通常、欠車→None）、1件のentries/laps完全欠落（20261013伊勢崎6R）、1件のlaps/time欠落（20261025伊勢崎12R）を維持。
+- engine.pyの現行経路では、v41_register_result()はvalidが空でも結果保存処理へ進む。compact lap parserのラベル期待値と公式ページの表記差、事故略記の正規化不足も候補として記録。
+- Ver327候補（result parser/registration integrity）はIssue #33 comment `7240253744` に一括報告し、実装承認待ち。承認前にengine.py/APP_VERSION/結果保存処理を変更しない。
+- Issue #33 OPEN維持。
+
+### Issue #31
+- 正式状態は **主要監査完了・再発防止未完了／設計レビュー要修正** を維持。監査ブランチHEAD `d1ee89e8567a4c7a2bcb3559a2e4daf252e733bc`。
+- SQLite/WAL実機競合、OIDC/MFA、fsync、COMMIT_UNKNOWN強制停止復旧は未実施。設計承認・実装承認なし。
+
+### 共通境界
+- main HEAD: `e725f5462de3d666bd50972b7e9269be8b21a748`。
+- mainへの変更は監査スクリプト/テスト/Workflow出力のみ。app.py/engine.py、予測式、APP_VERSION、DBスキーマ、保存処理、本番DBは未変更。
+- Ver326を固定基準とする。予測結果が変わるVer327候補は承認待ち。
+- Issue #28の測定条件・測定ファイル・作業ブランチ・過去データは変更していない。
