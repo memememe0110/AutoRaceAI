@@ -505,3 +505,11 @@ SQLite/WAL実機競合、OIDC/MFA連携、fsync耐久、COMMIT_UNKNOWN強制停�
 - receipt_digestはreceipt_digest自身とreceipt_hmacを除く全receipt列から計算し、receipt_hmacは計算済みreceipt_digest・receipt_key_id・他の全receipt列を認証する順序に固定。
 - 修正commit: 4561201a7a69641664f9b37b700a744438e9f572
 - 本追記時点の監査ブランチHEAD: 4561201a7a69641664f9b37b700a744438e9f572
+
+### canonical frameとreceipt digest最終補完（2026-11-28 JST）
+- receipt_digestの自己参照を除外し、receipt_digest自身とreceipt_hmac以外のreceipt列をSHA-256対象とする定義へ修正済み。receipt_hmacは計算済みdigestと全receipt fieldsを認証する。
+- PROJv1/SCHEMAv1/PKv1のframe長・件数・raw digestの表現を固定し、PKなし・複合PK・WITHOUT ROWID・NULL許容PKの順序規則を明記。
+- T25でTABLEv1のrow count、PKv1のPK countをu64 big-endianで固定。
+- 最終文書commit: 設計 `25686185048724c8310ff29f137a734bb2bb06e2`、テスト `98bac82f70a85ddaff07e0dc5148abeac22a77cc`。
+- 本追記直前の監査ブランチHEAD: `98bac82f70a85ddaff07e0dc5148abeac22a77cc`。
+- GitHub再取得の自己確認: receipt_digest非循環、receipt HMAC、R2 freshness、R4 close順、PROJv1/SCHEMAv1/PKv1、R5/R6、T16/T22/T26〜T28維持を確認。T25の期待payloadはv_negzero=0000000000000000、BLOB X'4142'へ統一。
