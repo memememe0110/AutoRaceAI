@@ -287,3 +287,9 @@ app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更�
 - #28の測定条件・測定ファイル・作業ブランチ・過去データは未変更。
 
 main HEAD: `e725f5462de3d666bd50972b7e9269be8b21a748`。Ver326固定。予測結果に影響するVer327候補は承認前実装禁止。
+
+
+### 追加のコード経路証拠と承認待ち（2026-11-28 JST）
+- Issue #29: _v319_import_one_race() の _force_register_without_prediction() が _v319_clear_prediction() の後に結果のみ保存する。clear関数はhistory/prediction snapshotsを削除するがrestore/lap snapshotsを同期しない。55 restore-onlyの有力生成経路として記録。job535と20261114_山陽_4Rの時刻/Ver330-A save_versionは整合するが、race単位の実行ログは未取得。IssueコメントID `7240285554`。
+- Issue #33: Ver327候補（周回ラベル互換、事故/欠車略記正規化、空結果の部分登録防止）を一括提示。result data/学習対象が変わり将来予測へ影響し得るため、engine.py/APP_VERSION/結果保存処理は明示承認まで未変更。承認依頼コメントID `7240253744`。
+- Ver326を固定基準。Ver327候補は承認待ち。#28は引き続き完全対象外。
