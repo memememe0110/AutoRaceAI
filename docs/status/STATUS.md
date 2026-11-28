@@ -264,7 +264,8 @@ app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更�
 
 ### 共通境界
 - main HEAD: `43895d9c7c882a5c328b1421bcf9f37663933290`。
-- mainへの変更は監査スクリプト/テスト/Workflow出力のみ。app.py/engine.py、予測式、APP_VERSION、DBスキーマ、保存処理、本番DBは変更していない。
+- PR #39（Issue #32）はapp.pyのWorker global isolation修正と回帰テスト/Workflowを含む。予測式・APP_VERSION・結果保存処理は変更なし。
+- PR #48〜#51（Issue #29/#33）は監査スクリプト/テスト/Workflow出力のみ。app.py/engine.py、予測式、APP_VERSION、DBスキーマ、保存処理、本番DBは変更なし。
 - Issue #28の測定条件・測定ファイル・作業ブランチ・過去データは変更していない。
 
 
