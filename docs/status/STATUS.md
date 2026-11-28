@@ -226,3 +226,12 @@ app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更�
 - root STATUS追記commit: 9a5643135db7e922e033af8cdd4952998cbc645a
 - 監査ブランチ最終HEAD: 9a5643135db7e922e033af8cdd4952998cbc645a
 - 設計承認・実装承認は未了。SQLite/WAL、OIDC/MFA、fsync、COMMIT_UNKNOWN実機試験は未実施。実装・テスト実装・PR・本番反映は禁止を維持。
+
+### canonical frame/receipt digestの最終補完（2026-11-28 JST）
+- receipt_digestの自己参照を除外し、receipt_digest自身とreceipt_hmac以外のreceipt列をSHA-256対象とする定義へ修正。receipt_hmacは計算済みdigestとreceipt record全体を認証する。
+- PROJv1/SCHEMAv1/PKv1のcanonical frameと件数・長さ表現を固定し、T25のTABLEv1/PKv1件数をu64 big-endianとした。
+- 設計commit: 25686185048724c8310ff29f137a734bb2bb06e2
+- テストcommit: 98bac82f70a85ddaff07e0dc5148abeac22a77cc
+- root STATUS追記commit: d1ee89e8567a4c7a2bcb3559a2e4daf252e733bc
+- 監査ブランチHEAD: d1ee89e8567a4c7a2bcb3559a2e4daf252e733bc
+- 正式状態は設計レビュー要修正を維持。実機検証・設計承認・実装承認は未了。実装・テスト実装・PR・本番反映は禁止。
