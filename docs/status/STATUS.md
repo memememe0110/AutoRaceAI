@@ -206,3 +206,16 @@ app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更�
 ### 正式進捗commit SHA追記（2026-11-24）
 - Issue #31設計再レビュー状態の正式進捗更新commit: 46299e927736be1826443e4a20f8ca4331c1617d
 - 上記commit SHAを記録した追記commit: 作成後にIssue #31コメントで最終HEADを報告する。
+
+## Issue #31 独立設計再レビュー指摘と文書反映（2026-11-28 JST）
+
+**正式状態：主要監査完了・再発防止未完了／設計レビュー要修正。設計承認・実装承認は未了。**
+
+監査ブランチ `tmp-audit-31-repeats` の設計文書を独立観点で再確認し、6点の指摘をIssue #31へ記録した（comment: https://github.com/memememe0110/AutoRaceAI/issues/31#issuecomment-7239754361）。R3 receipt HMAC、R2 MFA鮮度/claim allowlist、R4 snapshot reader close順、R1 projection canonical order、T19/T23/T24/T25 fixture/coverageを文書へ反映した。
+
+- 監査ブランチHEAD: `8c799f381f8bf14935e88931a533d67c2ce4c060`
+- 設計書更新commit: `e7f04765187f6741cc4b9ccf2bc003e3a9fa70e4`, `14a14daf48d7606002fc2c11accbc6a72f67698b`, `8c799f381f8bf14935e88931a533d67c2ce4c060`
+- テスト計画更新commit: `ff91ea5a1244108229d782b958907ad97b33a33e`, `240dd0f1ea86e0e3202b1d5e865f712eba6e572a`
+- root STATUS追記commit: 作成後に監査ブランチHEADへ含めて記録する。
+
+再取得による自己確認ではR5/R6、T16、T22、T26〜T28の維持を確認した。SQLite小規模挙動確認は実施したが、SQLite/WAL実機競合、OIDC/MFA、fsync耐久、COMMIT_UNKNOWN強制停止復旧は未実施。文書修正は設計承認・安全性実証を意味しない。実装・テスト実装・PR・本番反映は引き続き禁止する。app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更していない。
