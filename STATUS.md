@@ -131,3 +131,43 @@
 
 結論：Gen675→Gen676の37件消失について、消失境界・技術的再現・回収可能性の確認は完了。実際の操作イベントの証明と再発防止策の実装・検証は未完了。
 
+
+
+## 自律監査の進捗更新（2026-11-28 JST）
+
+### 共通運用
+- 現行Ver326を予測精度比較の固定基準とする。予測式・シミュレーション条件・買い目・EV・回収率計算は推測で変更しない。
+- 読み取り監査、既存Artifact分析、非予測系テスト/監査スクリプトは専用ブランチ・PRで自律的に進める。
+- 予測結果が変わる変更は、候補/影響/新バージョン/固定条件比較をまとめて事前承認。承認前に実装しない。
+- 本番DB書き込み、mainへの直接push、Issue #28の測定条件・測定ファイル・作業ブランチ・過去データ変更は禁止。
+
+### Issue #29 保存版整合性監査
+- PR #49をmerge済み。merge commit: `43895d9c7c882a5c328b1421bcf9f37663933290`。
+- read-only監査Workflow run `46150126357` SUCCESS。Artifact: `prediction-version-audit-46150126357`（ID `15265970427`）。DBはgeneration 705、commit `20c67a8450ea72d219c19601319faf558a2f93c1`、SHA256 `57a6f7d4e8db23e9560e66ffbc2130f3cf1156164b3d760513c3da33f7535e67`、integrity_check=ok。
+- v187 plan 10,345行。app_version NULL 32行は全てlive/2026-08-02。source_prediction_version NULL 185行は全てlive/2026-08-02〜08-09。non-live originのsource_prediction_version欠損は0。
+- v278 jobs 539行すべてapp_versionあり。save_version NULL 522行は記録したが、欠損/破損とは判定していない。17行のみofficial_importで明示save_versionあり。result_blobは新規decode/出力していない。
+- 既存監査のhistory payload mismatch=0、queue version mismatch=0を維持。restore_without_history 55件、v266 orphan 50,230行、lap snapshot version mismatch 1,908行は未修復。過去DB行のUPDATE/DELETE/再生成なし。
+- Issue #29はOPEN維持。次はVer330-A restore-only 1件 `20261114_山陽_4R` の保存経路と、v278 save_version NULL時の既定値決定を既存コード/テスト証拠で確認。
+
+### Issue #32 Worker並行性監査
+- PR #39 merge済み（merge commit `e284a1a19fc1825993be4dc75bca692bb2a0f473`）、Issue #32 CLOSED。
+- Worker Global Isolation Tests `44117149226`、Real lap count simulation tests `44117149186`、Lap Snapshot Save Version Tests `44117149149` はSUCCESS。
+- 追加の競合証拠が出ない限り完了扱いとし、#28測定には触れない。
+
+### Issue #33 結果登録完全性監査
+- PR #48 merge済み（merge commit `b92c7606e655cb310a91859b008f5143cc6e22c9`）。run `46149952713` SUCCESS。Artifact `result-registration-audit-46149952713`（ID `15265161636`）。
+- generation 705の11件のentry-count由来goal-line flagは、全件でゴール線行数=finishers、全完走車が各記録済み周回に存在。完走車の欠落は0。出走数基準の過剰検出であり、真の周回漏れとは扱わない。
+- 2件のresult_status誤りを確認: `20260723_伊勢崎_8R` 車番3は自落なのに通常、`20260803_川口_6R` 車番4は欠車なのにNone。
+- 2件の登録不備を確認: `20261013_伊勢崎_6R` は公式結果があるのにentries/laps=0、payouts=9。 `20261025_伊勢崎_12R` は公式ニュースで実施確認、entries=8/payouts=11に対してlaps=0、race_time/start_time全件NULL。
+- NULL auditのcutoff/naive ISO、start_time情報のみ、weather unknown、OtherRaceInfo no-joinの定義は変更していない。app.py/engine.py/DB/予測式は未変更。
+- Issue #33はOPEN維持。次は該当4件の保存関数・パーサー経路と異常系テストを追跡。
+
+### Issue #31 再発防止
+- 正式状態は引き続き **主要監査完了・再発防止未完了／設計レビュー要修正**。設計承認・実装承認なし。
+- 監査ブランチ `tmp-audit-31-repeats` HEAD: `d1ee89e8567a4c7a2bcb3559a2e4daf252e733bc`。SQLite/WAL実機競合、OIDC/MFA、fsync、COMMIT_UNKNOWN強制停止復旧は未実施。
+- 独立再レビューと別途明示承認が完了するまで、Issue #31の再発防止実装・テスト実装・PR・本番反映は行わない。ほかのIssueの安全な読み取り監査は停止しない。
+
+### 変更境界
+- main最新HEAD: `43895d9c7c882a5c328b1421bcf9f37663933290`。
+- 今回のmainマージは監査スクリプト/テスト/Workflow出力のみ。予測式、APP_VERSION、DBスキーマ、保存処理、本番DBは変更していない。
+- Issue #28の測定条件・測定ファイル・作業ブランチ・過去データは変更していない。
