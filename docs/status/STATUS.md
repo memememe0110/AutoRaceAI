@@ -235,3 +235,34 @@ app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更�
 - root STATUS追記commit: d1ee89e8567a4c7a2bcb3559a2e4daf252e733bc
 - 監査ブランチHEAD: d1ee89e8567a4c7a2bcb3559a2e4daf252e733bc
 - 正式状態は設計レビュー要修正を維持。実機検証・設計承認・実装承認は未了。実装・テスト実装・PR・本番反映は禁止。
+
+
+## 自律監査の進捗更新（2026-11-28 JST）
+
+**予測基準はVer326固定。Issue #28は完全に対象外。予測結果が変わる変更は事前承認境界で止め、読み取り監査・テスト・比較・ログは専用ブランチで継続する。**
+
+### Issue #29
+- PR #49 merge済み: `43895d9c7c882a5c328b1421bcf9f37663933290`。Workflow run `46150126357` SUCCESS、Artifact `prediction-version-audit-46150126357`。
+- generation 705でv187 plan 10,345行、v278 job 539行の行単位メタデータを出力。app_version NULL 32件は全てlive/8月2日、source_prediction_version NULL 185件は全てlive/8月2〜9日。non-live plan originにsource version欠損なし。
+- v278 app_version欠損0、save_version NULL 522件は記録したが異常とは断定しない。result_blobは出力・新規decodeしていない。
+- 既存の55 restore orphan、50,230 predicted-time snapshot orphan、1,908 lap snapshot version mismatchは未修復。Issue OPEN。次はVer330-A restore-only 1件とsave_version NULL時の既定値をコード証拠で追跡。
+
+### Issue #32
+- PR #39 merge済み、Issue CLOSED。merge commit `e284a1a19fc1825993be4dc75bca692bb2a0f473`。
+- Worker Global Isolation `44117149226`、real lap count `44117149186`、lap snapshot save version `44117149149` はすべてSUCCESS。追加の競合証拠がない限り完了扱い。
+
+### Issue #33
+- PR #48 merge済み: `b92c7606e655cb310a91859b008f5143cc6e22c9`。Workflow run `46149952713` SUCCESS、Artifact `result-registration-audit-46149952713`。
+- generation 705の11 entry-count goal-line flagsは全て完走車基準で整合。完走車欠落0で、出走数基準の過剰検出だった。
+- result_status誤り2件: 20260723伊勢崎8R車3（自落→通常）、20260803川口6R車4（欠車→None）。
+- 登録不備2件: 20261013伊勢崎6Rは公式結果ありだがentries/laps=0・payouts=9、20261025伊勢崎12Rは公式ニュースで実施確認だがlaps=0・race_time/start_time全件NULL。
+- NULL auditの定義は維持。Issue OPEN。次は4件の保存/パーサー経路と異常系テストを追跡。予測式・DB・APP_VERSIONは未変更。
+
+### Issue #31
+- 正式状態 **主要監査完了・再発防止未完了／設計レビュー要修正** を維持。設計承認・実装承認なし。
+- 監査ブランチHEAD `d1ee89e8567a4c7a2bcb3559a2e4daf252e733bc`。SQLite/WAL、OIDC/MFA、fsync、COMMIT_UNKNOWN実機試験は未実施。独立再レビューと明示承認前に再発防止実装へ進まない。
+
+### 共通境界
+- main HEAD: `43895d9c7c882a5c328b1421bcf9f37663933290`。
+- mainへの変更は監査スクリプト/テスト/Workflow出力のみ。app.py/engine.py、予測式、APP_VERSION、DBスキーマ、保存処理、本番DBは変更していない。
+- Issue #28の測定条件・測定ファイル・作業ブランチ・過去データは変更していない。
