@@ -251,7 +251,7 @@ operation_idはPRIMARY KEY。receipt_digestはreceipt_hmacを除く全receipt列
 - commit後の外部ledger追記失敗時、receiptはCOMMIT_PENDINGまたはDELETE_COMMITTED、候補PKは全件不存在となる。表の全条件を満たす場合だけcommit成立と判定し、DELETEせずreceipt/ledger完了記録だけを補完する。
 - PREPAREDかつ全対象行が元digestで存在し、receipt HMACと外部ledgerが正常に検証できる場合は、DELETE_INTENTの有無にかかわらずNOT_COMMITTED。同じoperation_idでDELETEを再試行しない。nonceがISSUEDならCANCELLEDを追記しfsync、CONSUMEDなら使用済み状態を維持する。新operation_idでpreview・承認・archive・restoreを最初から行う。ledgerまたはHMAC鍵が読めない場合はMANUAL_RECOVERY_REQUIRED。
 - receipt/PK状態の矛盾、一部だけ消失、外部ledger欠落/破損時は自動判定せずMANUAL_RECOVERY_REQUIRED。
-- recovery初動はread-only照合のみ。DB更新は判定確定後の専用recovery操作に限定し、その操作にDELETE SQLを含めない。
+- recovery初動はread-only照合のみ。NOT_COMMITTED/DELETE_COMMITTEDへのreceipt状態更新、updated_at_utc変更、receipt_digest/receipt_hmac再計算は、判定確定後の専用recovery操作で同一transactionにまとめる。その操作にDELETE SQLを含めない。HMAC検証鍵が利用不能ならreceiptを更新せず停止する。
 
 ### R4. 排他方式・削除transaction順（規範仕様）
 
@@ -265,7 +265,7 @@ SQLite排他方式はBEGIN IMMEDIATEに固定する。BEGIN、EXCLUSIVE、メモ
 4. 別read-only接続でBackup API比較snapshotを取得し、取得前後のmain/WAL metadata不変を確認する。比較snapshotの検証とmetadata採取が完了したら、source read-only接続をROLLBACKしてcloseし、destination接続もcloseする。これらのclose完了を確認する前にDELETE SQLを発行してはならない。close失敗・接続残存・metadata不一致、identity/schema/projection/対象digest不一致のいずれかがあればDELETE禁止。receiptはPREPAREDのまま、承認・archive/restore receiptを失効。
 5. 37 rootが全件本体に存在し、承認時PK/row digestと一致し、通常candidate混入0件を確認。1件でも欠落・変更・混入ならDELETE禁止。
 6. historyとlap snapshotの2表を同一BEGIN IMMEDIATE transaction内でDELETE。各表の削除件数は承認済みcandidate_countと完全一致させる。
-7. 2表DELETE成功後、DB receiptをCOMMIT_PENDINGへ更新しreceipt_digestを再計算。receipt更新/digest照合失敗なら両表DELETEをROLLBACK。
+7. 2表DELETE成功後、DB receiptをCOMMIT_PENDINGへ更新しreceipt_digestとreceipt_hmacを再計算・検証。receipt更新/digest/HMAC照合失敗なら両表DELETEをROLLBACK。
 8. DELETE SQL trace、削除件数、receipt更新をtransaction内で検査しCOMMITを1回だけ実行。commit応答喪失・停止・接続断はCOMMIT_UNKNOWN。
 9. commit前の例外、件数不一致、schema/digest不一致、root不一致、busy/locked timeoutはROLLBACK。同一operation_idのDELETE再試行は禁止し、新previewとoperation_idを要求。
 
