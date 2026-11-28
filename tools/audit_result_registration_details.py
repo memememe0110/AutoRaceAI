@@ -257,7 +257,12 @@ def run_audit(db_path: str | Path, audit_dir: str | Path,
                 missing_goal_finishers = (
                     _sorted_cars(finishers - goal_set) if finish_col else None
                 )
+                # Goal-line passage can include a non-finisher disqualified after crossing
+                # (e.g. 反妨). Only car numbers absent from result_entries are unknown extras.
                 extra_goal_cars = (
+                    _sorted_cars(goal_set - entry_cars) if entry_car_col else None
+                )
+                goal_line_nonfinishers = (
                     _sorted_cars(goal_set - finishers) if finish_col else None
                 )
                 duplicate_goal_cars = _sorted_cars({
@@ -329,6 +334,10 @@ def run_audit(db_path: str | Path, audit_dir: str | Path,
                         json.dumps(extra_goal_cars, ensure_ascii=False)
                         if extra_goal_cars is not None else None
                     ),
+                    "goal_line_nonfinisher_car_nos_json": (
+                        json.dumps(goal_line_nonfinishers, ensure_ascii=False)
+                        if goal_line_nonfinishers is not None else None
+                    ),
                     "goal_line_duplicate_car_nos_json": json.dumps(
                         duplicate_goal_cars, ensure_ascii=False
                     ),
@@ -368,8 +377,8 @@ def run_audit(db_path: str | Path, audit_dir: str | Path,
             "finisher_count", "nonfinisher_count", "nonfinisher_car_nos_json",
             "nonfinisher_status_review_car_nos_json", "goal_line_row_count",
             "goal_line_distinct_car_count", "goal_line_missing_finisher_car_nos_json",
-            "goal_line_extra_car_nos_json", "goal_line_duplicate_car_nos_json",
-            "non_goal_lap_group_count", "non_goal_lap_groups_with_finisher_mismatch",
+            "goal_line_extra_car_nos_json", "goal_line_nonfinisher_car_nos_json",
+            "goal_line_duplicate_car_nos_json", "non_goal_lap_group_count", "non_goal_lap_groups_with_finisher_mismatch",
             "bad_lap_group_details_json", "learning_eligible",
             "learning_exclusion_reason", "model_eligible", "model_exclusion_reason",
             "finisher_based_classification",
