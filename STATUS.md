@@ -196,6 +196,7 @@
 
 ### 共通境界
 - main HEAD: `e725f5462de3d666bd50972b7e9269be8b21a748`。
-- mainへの変更は監査スクリプト/テスト/Workflow出力のみ。app.py/engine.py、予測式、APP_VERSION、DBスキーマ、保存処理、本番DBは未変更。
+- PR #39（Issue #32）はapp.pyのWorker global isolation修正と回帰テスト/Workflowを含む。予測式・APP_VERSION・結果保存処理は変更なし。
+- PR #48〜#51（Issue #29/#33）は監査スクリプト/テスト/Workflow出力のみ。app.py/engine.py、予測式、APP_VERSION、DBスキーマ、保存処理、本番DBは変更なし。
 - Ver326を固定基準とする。予測結果が変わるVer327候補は承認待ち。
 - Issue #28の測定条件・測定ファイル・作業ブランチ・過去データは変更していない。
