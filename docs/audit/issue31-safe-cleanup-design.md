@@ -183,7 +183,7 @@ source_db_identityは次の値をキー順固定・空白なしUTF-8 JSONへ正�
 このidentityにはsize、mtime、main DB SHA、WAL SHAを混ぜない。これらはsnapshot_capture_evidenceとして別途保存し、取得前後一致を必須とする。
 - source_snapshot_sha256はBackup API snapshot file全体のSHA-256であり、監査証跡として不変保存する。
 - receipt管理表のPREPARED行・状態更新はsnapshot取得後に行うため、DB file全体のSHA-256はその更新で変化し得る。したがって削除直前の論理一致判定にfile SHAを直接使わず、source_db_identity、schema_fingerprint、source_projection_digest、対象digestの一致で判定する。source_snapshot_sha256は承認時snapshotの固定証拠として保持し、再計算値で上書きしない。
-- source_projection_digestはreceipt管理表を除く全通常ユーザーテーブルのschema定義と全行を、次の固定順で型付き正規化して集約したSHA-256とする。table一覧はUTF-8 byte辞書順、列は `PRAGMA table_xinfo` のcid順、schema定義はsqlite_schemaのtype/name/tbl_name/sqlをUTF-8 byte辞書順で固定する。各rowはcanonical row frameを作成し、PKが全列NOT NULLかつ一意である場合はPK frame順、そうでない場合またはPKがない場合はrow frame全体のbyte辞書順で整列する。同一row frameは重複数を保持する。複合PKはPRAGMA table_xinfoのpk ordinal順に各列のname/tag/payloadをframe化する。WITHOUT ROWIDも同じ規則を使う。virtual tableはshadow tableを含む完全な論理内容のcanonicalization方式が別途定義されるまで対象DBとして拒否する。target 2表はPKが一意・NOT NULLでない場合、対象集合を安全に固定できないため拒否する。receipt管理表以外を除外してはならない。
+- source_projection_digestはreceipt管理表を除く全通常ユーザーテーブルのschema定義と全行を、次の固定順で型付き正規化して集約したSHA-256とする。table一覧はUTF-8 byte辞書順、列は `PRAGMA table_xinfo` のcid順、schema定義はsqlite_schemaのtype/name/tbl_name/sqlをUTF-8 byte辞書順で固定する。各rowはcanonical row frameを作成し、PKが全列NOT NULLかつ一意である場合はPK frame順、そうでない場合またはPKがない場合はrow frame全体のbyte辞書順で整列する。同一row frameは重複数を保持する。PK frameは固定magic `PKv1`、PK列数(u32 big-endian)、各PK列の名前byte長(u32)・名前UTF-8 bytes・storage-class tag・payload長(u64)・payload bytesをPK ordinal順に連結する。複合PKはPRAGMA table_xinfoのpk ordinal順に各列をframe化する。WITHOUT ROWIDも同じ規則を使う。virtual tableはshadow tableを含む完全な論理内容のcanonicalization方式が別途定義されるまで対象DBとして拒否する。PROJv1 frameはmagic `PROJv1`、table数(u32)、各tableのUTF-8 name byte長/name bytes、schema frame長/schema frame、row count(u64)、table row digestの順で連結しSHA-256を取る。schema frameはsqlite_schemaのtype/name/tbl_name/sqlを各fieldのNULL tag・UTF-8 byte長・bytesで表し、type/name/tbl_name/sqlのUTF-8 byte辞書順で整列する。target 2表はPKが一意・NOT NULLでない場合、対象集合を安全に固定できないため拒否する。receipt管理表以外を除外してはならない。
 - 削除直前はsource_db_identity、schema_fingerprint、source_projection_digest、対象2表のPK/row digest、37 root digestを承認時と照合し、1つでも異なればDELETE禁止。
 - receipt管理表は事前作成しschema_fingerprintに含める。可変receipt行のみsource_projection_digestから除外する。他の除外table/columnは認めない。
 
@@ -192,7 +192,7 @@ source_db_identityは次の値をキー順固定・空白なしUTF-8 JSONへ正�
 #### R2-1. 操作者認証
 - 承認主体は許可リスト登録済みOpenID Connect Identity Providerが発行する署名検証済みID tokenのissuer（iss）とsubject（sub）の組で識別する。表示名・メール・ブラウザ入力文字列だけでは識別しない。
 - tokenの署名、許可issuer、audience、期限、発行時刻、auth_timeを検証する。承認時はMFA必須とし、IdPごとに事前登録したacr許可値とamr許可組合せの両方を満たさなければ拒否する。単一のamr値を全IdP共通でMFAとみなしてはならない。認証基盤が利用できない場合は承認/DELETE機能を無効化する。
-- 承認時はstep-up再認証を要求し、OIDC max_age=300秒相当を適用する。検証済みauth_timeは承認時刻から300秒以内かつ未来方向60秒以内でなければならない。境界判定は `0 <= approval_time - auth_time <= 300秒` を基本とし、許容clock skewは未来方向60秒のみとする。IdPがこの鮮度を保証できない場合は承認不可とする。
+- 承認時はstep-up再認証を要求し、OIDC max_age=300秒相当を適用する。検証済みauth_timeは承認時刻から300秒以内かつ未来方向60秒以内でなければならない。境界判定は `-60秒 <= approval_time - auth_time <= 300秒` とし、許容clock skewは未来方向60秒のみとする。IdPがこの鮮度を保証できない場合は承認不可とする。
 - issuer、subject、session_id、auth_time、acr、amr、ID token SHA-256、承認時刻を保存する。生token・秘密鍵・cookieは保存しない。
 
 #### R2-2. nonce・期限・台帳
