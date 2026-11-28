@@ -223,9 +223,14 @@ def audit_db(db_path, outdir, db_info=None, expected_generation=""):
                     c for c in ("history_id", "race_key", "app_version", "prediction_time")
                     if c in archive_cols
                 ]
+                archive_order = [c for c in ("race_key", "history_id") if c in archive_select]
+                archive_order_sql = (
+                    " ORDER BY " + ",".join(_q(c) for c in archive_order)
+                    if archive_order else ""
+                )
                 for row in con.execute(
                     "SELECT " + ",".join(_q(c) for c in archive_select)
-                    + " FROM v319_prediction_history_archive ORDER BY race_key,history_id"
+                    + " FROM v319_prediction_history_archive" + archive_order_sql
                 ):
                     item = {c: row[c] for c in archive_select}
                     archive_rows_by_race[str(item.get("race_key") or "")].append(item)
