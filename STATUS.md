@@ -499,3 +499,9 @@ app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更�
 
 ### 未実施・禁止
 SQLite/WAL実機競合、OIDC/MFA連携、fsync耐久、COMMIT_UNKNOWN強制停止復旧は未実施。独立再レビューの再確認と設計承認は未了。実装・テスト実装・PR・本番反映は引き続き禁止。app.py、本番DB、予測ロジック、APP_VERSION、既存Artifactは変更していない。
+
+### receipt_digest自己参照の除去（2026-11-28 JST）
+- 追加精査でreceipt_digestのcanonical inputにreceipt_digest自身を含める循環定義が残っていたため修正。
+- receipt_digestはreceipt_digest自身とreceipt_hmacを除く全receipt列から計算し、receipt_hmacは計算済みreceipt_digest・receipt_key_id・他の全receipt列を認証する順序に固定。
+- 修正commit: 4561201a7a69641664f9b37b700a744438e9f572
+- 本追記時点の監査ブランチHEAD: 4561201a7a69641664f9b37b700a744438e9f572
