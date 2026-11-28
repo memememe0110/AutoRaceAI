@@ -397,6 +397,7 @@ jobs:
               "notes": [
                   "All result_races rows are exported; no zero-only filtering is applied to the full CSV.",
                   "Zero counts are review flags, not automatic proof of incomplete registration.",
+                  "Goal-line and lap-group flags based on entrant counts are conservative screening only; non-finishers may legitimately have no goal-line or later-lap row. Consult result_registration_race_classification.csv for finisher-aware classification.",
                   "Goal-line rows are expanded one row per racer; n_goal_lines is compared with n_entries.",
                   "normal_candidate requires n_goal_lines == n_entries, n_laps divisible by n_entries, and every non-goal lap_no group to contain n_entries rows.",
                   "lap_no_bad_count detects per-lap row imbalances that a total-row modulo check alone could miss.",
