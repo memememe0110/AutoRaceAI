@@ -7,6 +7,8 @@ on:
   pull_request:
     paths:
       - ".github/workflows/daily-result-registration-audit.yml"
+      - "tools/audit_result_registration_details.py"
+      - "tests/test_result_registration_details.py"
   schedule:
     - cron: "0 22 * * *" # 07:00 JST every day
   workflow_dispatch:
@@ -47,6 +49,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Test read-only result detail audit
+        run: python tests/test_result_registration_details.py
 
       - name: Resolve inputs
         id: params
@@ -392,6 +397,7 @@ jobs:
               "notes": [
                   "All result_races rows are exported; no zero-only filtering is applied to the full CSV.",
                   "Zero counts are review flags, not automatic proof of incomplete registration.",
+                  "Goal-line and lap-group flags based on entrant counts are conservative screening only; non-finishers may legitimately have no goal-line or later-lap row. Consult result_registration_race_classification.csv for finisher-aware classification.",
                   "Goal-line rows are expanded one row per racer; n_goal_lines is compared with n_entries.",
                   "normal_candidate requires n_goal_lines == n_entries, n_laps divisible by n_entries, and every non-goal lap_no group to contain n_entries rows.",
                   "lap_no_bad_count detects per-lap row imbalances that a total-row modulo check alone could miss.",
@@ -615,6 +621,14 @@ jobs:
           )
           print(json.dumps(summary, ensure_ascii=False))
           PY
+
+      - name: Export row-level details for flagged races
+        run: |
+          set -euo pipefail
+          python tools/audit_result_registration_details.py \
+            --db work/autorace_players.sqlite3 \
+            --audit-dir work/result_audit \
+            --db-info work/db_info.json
 
       - name: Upload audit CSV and summary only
         uses: actions/upload-artifact@v4
