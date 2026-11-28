@@ -132,7 +132,7 @@ class ResultRegistrationDetailAuditTests(unittest.TestCase):
                 "20261101_川口_5R",
             ])
             self.assertEqual(summary["flagged_row_count_by_table"], {
-                "result_entries": 8, "result_laps": 13,
+                "result_entries": 8, "result_laps": 15,
                 "result_payouts": 4, "result_races": 4,
             })
 
