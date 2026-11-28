@@ -1,3 +1,4 @@
+import csv
 import json
 import pickle
 import sqlite3
@@ -27,6 +28,10 @@ class PredictionVersionAuditTests(unittest.TestCase):
                     CREATE TABLE v222_prediction_restore(
                         race_key TEXT PRIMARY KEY, payload BLOB, updated_at TEXT
                     );
+                    CREATE TABLE v319_prediction_history_archive(
+                        history_id INTEGER PRIMARY KEY, race_key TEXT, app_version TEXT,
+                        prediction_time TEXT
+                    );
                     CREATE TABLE v266_pred_time_snapshots(
                         history_id INTEGER, app_version TEXT, car_no INTEGER
                     );
@@ -55,9 +60,19 @@ class PredictionVersionAuditTests(unittest.TestCase):
                     "INSERT INTO v231_prediction_history VALUES(2,?,?,?)",
                     ("20261101_川口_1R", "Ver330-A", payload("Ver326")),
                 )
-                con.execute(
+                con.executemany(
                     "INSERT INTO v222_prediction_restore VALUES(?,?,?)",
-                    ("20261101_川口_1R", payload("Ver326"), "2026-11-01T12:00:00"),
+                    [
+                        ("20261101_川口_1R", payload("Ver326"), "2026-11-01T12:00:00"),
+                        ("20261001_飯塚_1R", payload("Ver323"), "2026-10-02T12:00:00"),
+                    ],
+                )
+                con.executemany(
+                    "INSERT INTO v319_prediction_history_archive VALUES(?,?,?,?)",
+                    [
+                        (101, "20261101_川口_1R", "Ver326", "2026-11-01T11:00:00"),
+                        (102, "20261001_飯塚_1R", "Ver323", "2026-10-02T11:00:00"),
+                    ],
                 )
                 con.execute(
                     "INSERT INTO v266_pred_time_snapshots VALUES(?,?,?)",
@@ -111,7 +126,11 @@ class PredictionVersionAuditTests(unittest.TestCase):
                 expected_generation=705,
             )
             self.assertEqual(summary["history_payload_mismatch_count"], 1)
-            self.assertEqual(summary["restore_mismatch_count"], 1)
+            self.assertEqual(summary["restore_mismatch_count"], 2)
+            self.assertTrue(summary["restore_archive_table_present"])
+            self.assertEqual(summary["restore_archive_history_row_count"], 2)
+            self.assertEqual(summary["restore_mismatch_races_with_archive_rows"], 2)
+            self.assertEqual(summary["restore_without_history_with_matching_archive_version"], 1)
             self.assertEqual(summary["pred_time_snapshot_mismatch_count"], 1)
             self.assertEqual(summary["pred_time_snapshot_version_mismatch_row_count"], 1)
             self.assertEqual(summary["lap_snapshot_rows_by_history_match_status"]["version_present_in_history"], 1)
@@ -136,6 +155,15 @@ class PredictionVersionAuditTests(unittest.TestCase):
             self.assertNotIn("result_blob", job_rows)
             self.assertNotIn("DO_NOT_EXPORT_BLOB", job_rows)
             self.assertNotIn("PRIVATE_BLOB", job_rows)
+
+            with (out / "restore_archive_matches.csv").open(
+                encoding="utf-8-sig", newline=""
+            ) as f:
+                archive_rows = list(csv.DictReader(f))
+            orphan = next(row for row in archive_rows if row["race_key"] == "20261001_飯塚_1R")
+            self.assertEqual(orphan["reason"], "restore_without_history")
+            self.assertEqual(orphan["matching_restore_version_archive_rows"], "1")
+            self.assertEqual(orphan["matching_archive_history_ids_json"], "[102]")
 
             with sqlite3.connect(db) as con:
                 self.assertEqual(con.execute("SELECT COUNT(*) FROM v231_prediction_history").fetchone()[0], 2)
