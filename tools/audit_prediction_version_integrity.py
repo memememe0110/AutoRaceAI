@@ -95,7 +95,7 @@ def audit_db(db_path, outdir, db_info=None, expected_generation=""):
             "v231_prediction_history", "v222_prediction_restore",
             "v252_lap_prediction_snapshots", "v266_pred_time_snapshots",
             "v187_mixed_plan_runs", "v278_background_jobs",
-            "v326_import_queue", "result_races",
+            "v326_import_queue", "result_races", "v319_prediction_history_archive",
         ]
         table_inventory = [
             (name, int(name in tables), ",".join(sorted(_columns(con, name))) if name in tables else "")
@@ -208,6 +208,60 @@ def audit_db(db_path, outdir, db_info=None, expected_generation=""):
             out / "restore_mismatches.csv",
             ["race_key", "restore_app_version", "latest_history_app_version", "updated_at", "reason"],
             restore_mismatches,
+        )
+
+        # Check whether restore-only/version-mismatched rows have a matching
+        # archived history row. This is evidence of a possible version-cleanup
+        # path, not proof that a particular UI action ran.
+        archive_rows_by_race = defaultdict(list)
+        archive_table_present = "v319_prediction_history_archive" in tables
+        archive_row_count = 0
+        if archive_table_present:
+            archive_cols = _columns(con, "v319_prediction_history_archive")
+            if {"race_key", "app_version"}.issubset(archive_cols):
+                archive_select = [
+                    c for c in ("history_id", "race_key", "app_version", "prediction_time")
+                    if c in archive_cols
+                ]
+                for row in con.execute(
+                    "SELECT " + ",".join(_q(c) for c in archive_select)
+                    + " FROM v319_prediction_history_archive ORDER BY race_key,history_id"
+                ):
+                    item = {c: row[c] for c in archive_select}
+                    archive_rows_by_race[str(item.get("race_key") or "")].append(item)
+                    archive_row_count += 1
+        restore_archive_matches = []
+        for race_key, restore_version, latest_version, updated_at, reason in restore_mismatches:
+            archived = archive_rows_by_race.get(str(race_key), [])
+            archived_versions = sorted({
+                str(row.get("app_version") or "") for row in archived
+            })
+            matching = [
+                row for row in archived
+                if str(row.get("app_version") or "") == str(restore_version or "")
+            ]
+            restore_archive_matches.append((
+                race_key, restore_version, latest_version, updated_at, reason,
+                len(archived), json.dumps(archived_versions, ensure_ascii=False),
+                len(matching),
+                json.dumps(
+                    [row.get("history_id") for row in matching],
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    [row.get("prediction_time") for row in matching],
+                    ensure_ascii=False,
+                ),
+            ))
+        _write_csv(
+            out / "restore_archive_matches.csv",
+            [
+                "race_key", "restore_app_version", "latest_history_app_version",
+                "updated_at", "reason", "archive_row_count",
+                "archive_app_versions_json", "matching_restore_version_archive_rows",
+                "matching_archive_history_ids_json", "matching_archive_prediction_times_json",
+            ],
+            restore_archive_matches,
         )
 
         v266_rows = []
@@ -542,6 +596,15 @@ def audit_db(db_path, outdir, db_info=None, expected_generation=""):
             "history_payload_mismatch_count": len(history_payload_mismatches),
             "restore_rows": len(restore_rows),
             "restore_mismatch_count": len(restore_mismatches),
+            "restore_archive_table_present": archive_table_present,
+            "restore_archive_history_row_count": archive_row_count,
+            "restore_mismatch_races_with_archive_rows": sum(
+                int(row[5] or 0) > 0 for row in restore_archive_matches
+            ),
+            "restore_without_history_with_matching_archive_version": sum(
+                row[4] == "restore_without_history" and int(row[7] or 0) > 0
+                for row in restore_archive_matches
+            ),
             "pred_time_snapshot_rows_by_app_version": dict(sorted(v266_counts.items())),
             "pred_time_snapshot_mismatch_count": sum(v266_reasons.values()),
             "pred_time_snapshot_orphan_row_count": v266_reasons.get("snapshot_without_history", 0),
